@@ -746,6 +746,7 @@ mod tests {
             gc: Default::default(),
             policy: None,
             resilience: Default::default(),
+            schedule: Default::default(),
         };
 
         let models = vec![
@@ -846,6 +847,7 @@ mod tests {
             gc: Default::default(),
             policy: None,
             resilience: Default::default(),
+            schedule: Default::default(),
         };
 
         let models = vec![Model {
@@ -948,6 +950,7 @@ mod tests {
             gc: Default::default(),
             policy: None,
             resilience: Default::default(),
+            schedule: Default::default(),
         };
 
         let index = build_doc_index(&[], &config, None, None);

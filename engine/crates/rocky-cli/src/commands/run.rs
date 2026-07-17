@@ -553,6 +553,22 @@ pub(crate) fn audit_to_record(ctx: &AuditContext) -> RunRecordAudit {
     }
 }
 
+/// Resolve the run trigger from `ROCKY_RUN_TRIGGER`, defaulting to `Manual`.
+///
+/// The reconciler sets `ROCKY_RUN_TRIGGER=schedule` on the children it spawns;
+/// Dagster sets `sensor`/`schedule`; CI wrappers may set `ci`. An absent or
+/// unrecognized value is `Manual` — the pre-existing behavior, so nothing
+/// changes for a directly-invoked `rocky run`.
+fn run_trigger_from_env() -> rocky_core::state::RunTrigger {
+    use rocky_core::state::RunTrigger;
+    match std::env::var("ROCKY_RUN_TRIGGER").ok().as_deref() {
+        Some("schedule") => RunTrigger::Schedule,
+        Some("sensor") => RunTrigger::Sensor,
+        Some("ci") => RunTrigger::Ci,
+        _ => RunTrigger::Manual,
+    }
+}
+
 pub(crate) fn persist_run_record(
     state_store: Option<&StateStore>,
     output: &RunOutput,
@@ -560,21 +576,35 @@ pub(crate) fn persist_run_record(
     started_at: DateTime<Utc>,
     config_hash: &str,
     audit: &RunRecordAudit,
+    // The pipeline this run built, when it was a single-pipeline run. Stamped
+    // onto the record so the schedule reconciler can answer "did pipeline X
+    // succeed?" for `after`/`freshness` demands. `None` for a model-only run or
+    // a multi-pipeline set (a backfill), which the reconciler never matches.
+    pipeline: Option<&str>,
 ) {
     let Some(store) = state_store else {
         return;
     };
     let finished_at = Utc::now();
     let status = output.derive_run_status();
-    let record = output.to_run_record(
+    let mut record = output.to_run_record(
         run_id,
         started_at,
         finished_at,
         config_hash.to_string(),
-        rocky_core::state::RunTrigger::Manual,
+        run_trigger_from_env(),
         status,
         audit.clone(),
     );
+    // Advisory attribution threaded by the reconciler (or any wrapper): how the
+    // run was initiated, and the schedule submission it belongs to. Both mirror
+    // the env-derived `ROCKY_SESSION_SOURCE` precedent — any caller may set them;
+    // nothing gates on them (they exist so `rocky history` tells operators how a
+    // run was launched, and so recovery can join a demand to *its* run).
+    record.pipeline = pipeline.map(str::to_string);
+    record.submission_id = std::env::var("ROCKY_SUBMISSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty());
     if let Err(e) = store.record_run(&record) {
         warn!(
             error = %e,
@@ -1539,6 +1569,8 @@ pub async fn run(
             started_at,
             &config_hash,
             &audit,
+            // Model-only run — no single pipeline to attribute.
+            None,
         );
         finalize_idempotency(
             &mut idempotency_ctx,
@@ -1632,6 +1664,10 @@ pub async fn run(
                 &run_id,
                 started_at,
                 &config_hash,
+                // The resolved pipeline name, stamped onto the persisted record
+                // so the schedule reconciler's `after`/`freshness` demands can
+                // observe this transformation pipeline's successes.
+                Some(pipeline_name),
                 // Raw `--idempotency-key` so the persisted audit records the
                 // claimed key, matching the model-only / replication paths.
                 // The claim is finalized under this same value just below.
@@ -3201,6 +3237,7 @@ pub async fn run(
                 started_at,
                 &config_hash,
                 &audit,
+                Some(pipeline_name),
             );
             finalize_idempotency(&mut idempotency_ctx, Some(state), &shared_run_id, &output).await;
         }
@@ -4378,6 +4415,7 @@ pub async fn run(
         started_at,
         &config_hash,
         &audit,
+        Some(pipeline_name),
     );
 
     // Post-apply `verify_after` gate for any additive drift this run
@@ -4415,6 +4453,7 @@ pub async fn run(
             started_at,
             &config_hash,
             &audit,
+            Some(pipeline_name),
         );
         finalize_idempotency(
             &mut idempotency_ctx,
@@ -5258,6 +5297,8 @@ pub(crate) async fn execute_backfill_set(
         started_at,
         &config_hash,
         &audit,
+        // A backfill spans a model set, not a single pipeline.
+        None,
     );
 
     output.status = output.derive_run_status();
@@ -9473,6 +9514,81 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
 mod tests {
     use super::*;
     use rocky_core::plan_partition::PartitionSelection;
+
+    // Serializes the process-global env-var mutations in the trigger-threading
+    // tests below (env is shared across the test binary's threads).
+    static TRIGGER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn run_trigger_from_env_maps_known_values() {
+        use rocky_core::state::RunTrigger;
+        let _g = TRIGGER_ENV_LOCK.lock().unwrap();
+        // SAFETY: serialized by TRIGGER_ENV_LOCK; no other thread reads the var
+        // concurrently while it is set here.
+        unsafe {
+            std::env::remove_var("ROCKY_RUN_TRIGGER");
+            assert!(matches!(run_trigger_from_env(), RunTrigger::Manual));
+            std::env::set_var("ROCKY_RUN_TRIGGER", "schedule");
+            assert!(matches!(run_trigger_from_env(), RunTrigger::Schedule));
+            std::env::set_var("ROCKY_RUN_TRIGGER", "sensor");
+            assert!(matches!(run_trigger_from_env(), RunTrigger::Sensor));
+            std::env::set_var("ROCKY_RUN_TRIGGER", "ci");
+            assert!(matches!(run_trigger_from_env(), RunTrigger::Ci));
+            std::env::set_var("ROCKY_RUN_TRIGGER", "manual");
+            assert!(matches!(run_trigger_from_env(), RunTrigger::Manual));
+            // An unrecognized value falls back to Manual (never guesses).
+            std::env::set_var("ROCKY_RUN_TRIGGER", "nonsense");
+            assert!(matches!(run_trigger_from_env(), RunTrigger::Manual));
+            std::env::remove_var("ROCKY_RUN_TRIGGER");
+        }
+    }
+
+    #[test]
+    fn persist_run_record_stamps_trigger_submission_and_pipeline() {
+        use rocky_core::state::{RunTrigger, StateStore};
+        let _g = TRIGGER_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        // SAFETY: serialized by TRIGGER_ENV_LOCK.
+        unsafe {
+            std::env::set_var("ROCKY_RUN_TRIGGER", "schedule");
+            std::env::set_var("ROCKY_SUBMISSION_ID", "sub-xyz");
+        }
+        let output = RunOutput::new(String::new(), 0, 1);
+        let audit = audit_to_record(&AuditContext::detect(None, None));
+        persist_run_record(
+            Some(&store),
+            &output,
+            "run-trigger-test",
+            Utc::now(),
+            "cfg",
+            &audit,
+            Some("raw"),
+        );
+        // SAFETY: serialized by TRIGGER_ENV_LOCK.
+        unsafe {
+            std::env::remove_var("ROCKY_RUN_TRIGGER");
+            std::env::remove_var("ROCKY_SUBMISSION_ID");
+        }
+        let rec = store
+            .get_run("run-trigger-test")
+            .unwrap()
+            .expect("record persisted");
+        assert!(
+            matches!(rec.trigger, RunTrigger::Schedule),
+            "ROCKY_RUN_TRIGGER stamps the trigger"
+        );
+        assert_eq!(
+            rec.submission_id.as_deref(),
+            Some("sub-xyz"),
+            "ROCKY_SUBMISSION_ID stamps the join key"
+        );
+        assert_eq!(
+            rec.pipeline.as_deref(),
+            Some("raw"),
+            "the resolved pipeline name is stamped"
+        );
+    }
 
     // -------------------------------------------------------------------
     // PR-A (RD-001) — `resolve_replication_authority`, the ONE site where
@@ -15290,6 +15406,8 @@ merge_keys = ["id"]
             hostname: "test".to_string(),
             rocky_version: "test".to_string(),
             check_outcomes: Vec::new(),
+            pipeline: None,
+            submission_id: None,
         };
         state.record_run(&failed).unwrap();
 
@@ -16496,6 +16614,8 @@ merge_keys = ["id"]
             hostname: "test".to_string(),
             rocky_version: "test".to_string(),
             check_outcomes: Vec::new(),
+            pipeline: None,
+            submission_id: None,
         };
         store.record_run(&run).unwrap();
         // The prior build's LIVE artifact — the ledger row the liveness gate
@@ -16680,6 +16800,8 @@ merge_keys = ["id"]
             hostname: "test".to_string(),
             rocky_version: "test".to_string(),
             check_outcomes: Vec::new(),
+            pipeline: None,
+            submission_id: None,
         };
         store.record_run(&run).unwrap();
 
@@ -17662,6 +17784,8 @@ merge_keys = ["id"]
                 hostname: "test".to_string(),
                 rocky_version: "test".to_string(),
                 check_outcomes: Vec::new(),
+                pipeline: None,
+                submission_id: None,
             };
             store.record_run(&run).unwrap();
             // The prior build's LIVE artifact row — the liveness gate resolves
@@ -17962,6 +18086,8 @@ merge_keys = ["id"]
                     hostname: "test".to_string(),
                     rocky_version: "test".to_string(),
                     check_outcomes: Vec::new(),
+                    pipeline: None,
+                    submission_id: None,
                 })
                 .unwrap();
             // The prior live_d build's LIVE artifact-ledger row — the liveness

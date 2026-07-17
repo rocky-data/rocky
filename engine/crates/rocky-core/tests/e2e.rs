@@ -511,6 +511,8 @@ fn test_run_history_flow() {
         hostname: "e2e-test-host".to_string(),
         rocky_version: "0.0.0-e2e".to_string(),
         check_outcomes: Vec::new(),
+        pipeline: None,
+        submission_id: None,
     };
 
     store.record_run(&run).unwrap();

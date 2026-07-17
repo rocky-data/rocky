@@ -319,6 +319,7 @@ mod tests {
             gc: Default::default(),
             policy: None,
             resilience: Default::default(),
+            schedule: Default::default(),
         }
     }
 

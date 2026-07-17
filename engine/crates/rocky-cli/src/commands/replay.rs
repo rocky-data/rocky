@@ -2001,6 +2001,8 @@ mod tests {
             hostname: "replay-test-host".to_string(),
             rocky_version: "0.0.0-test".to_string(),
             check_outcomes: Vec::new(),
+            pipeline: None,
+            submission_id: None,
         }
     }
 
@@ -2657,6 +2659,8 @@ mod tests {
                 hostname: "replay-live".to_string(),
                 rocky_version: VERSION.to_string(),
                 check_outcomes: Vec::new(),
+                pipeline: None,
+                submission_id: None,
             };
             store.record_run(&record).unwrap();
 

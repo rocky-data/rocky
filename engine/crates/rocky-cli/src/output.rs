@@ -4965,6 +4965,8 @@ impl RunOutput {
             hostname: audit.hostname,
             rocky_version: audit.rocky_version,
             check_outcomes,
+            pipeline: None,
+            submission_id: None,
         }
     }
 

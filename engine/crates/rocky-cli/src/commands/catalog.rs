@@ -1222,6 +1222,8 @@ mod tests {
                 hostname: "test-host".to_string(),
                 rocky_version: "test-version".to_string(),
                 check_outcomes: Vec::new(),
+                pipeline: None,
+                submission_id: None,
             }
         }
 

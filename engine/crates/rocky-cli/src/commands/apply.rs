@@ -6338,6 +6338,8 @@ schema_template = "s__{source}"
                     passed: *p,
                 })
                 .collect(),
+            pipeline: None,
+            submission_id: None,
         };
         store.record_run(&record).unwrap();
     }
