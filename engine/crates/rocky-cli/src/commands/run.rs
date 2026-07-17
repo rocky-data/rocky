@@ -1303,26 +1303,46 @@ pub async fn run(
         );
 
         let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
-        // Use the first transformation pipeline's target adapter, or fall back
-        // to the first replication pipeline's target adapter.
-        let target_adapter_name = rocky_cfg
-            .pipelines
-            .values()
-            .find_map(|p| match p {
+        let (target_adapter_name, auto_create_schemas) = if let Some(pipeline_name) =
+            pipeline_name_arg
+        {
+            match registry::resolve_pipeline(&rocky_cfg, Some(pipeline_name))?.1 {
                 rocky_core::config::PipelineConfig::Transformation(t) => {
-                    Some(t.target.adapter.clone())
+                    (
+                        t.target.adapter.clone(),
+                        t.target.governance.auto_create_schemas,
+                    )
                 }
-                _ => None,
-            })
-            .or_else(|| {
-                rocky_cfg.pipelines.values().find_map(|p| match p {
-                    rocky_core::config::PipelineConfig::Replication(r) => {
-                        Some(r.target.adapter.clone())
-                    }
-                    _ => None,
-                })
-            })
-            .unwrap_or_else(|| "default".to_string());
+                pipeline => anyhow::bail!(
+                    "pipeline '{pipeline_name}' is {}, not transformation (required for --model)",
+                    pipeline.pipeline_type_str()
+                ),
+            }
+        } else {
+            // Without an explicit pipeline, preserve the model-only fallback:
+            // first transformation adapter, then first replication adapter.
+            (
+                rocky_cfg
+                    .pipelines
+                    .values()
+                    .find_map(|p| match p {
+                        rocky_core::config::PipelineConfig::Transformation(t) => {
+                            Some(t.target.adapter.clone())
+                        }
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        rocky_cfg.pipelines.values().find_map(|p| match p {
+                            rocky_core::config::PipelineConfig::Replication(r) => {
+                                Some(r.target.adapter.clone())
+                            }
+                            _ => None,
+                        })
+                    })
+                    .unwrap_or_else(|| "default".to_string()),
+                false,
+            )
+        };
 
         let warehouse = adapter_registry.warehouse_adapter(&target_adapter_name)?;
         // Propagate state-store open errors with context, matching the
@@ -1366,7 +1386,7 @@ pub async fn run(
             None, // model-only run has no pipeline hooks
             None,
             &schema_cache_cfg,
-            false, // model-only entry point has no pipeline governance context
+            auto_create_schemas,
             defer_opts,
             skip_gate,
             // Reuse is active iff `[reuse]` is enabled AND `--no-reuse` was
