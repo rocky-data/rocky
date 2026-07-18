@@ -428,13 +428,32 @@ pub async fn plan(
                 run_plan_persisted = true;
             }
             Ok(None) => {
-                // `models/` exists but compile produced zero models —
+                // `models/` exists but compile produced zero models.
+                if let Some(model) = run_options.model.as_deref() {
+                    // `--model` names a transformation model, but the models
+                    // directory compiled to zero models — the requested model
+                    // does not exist. A model-scoped plan must never silently
+                    // degrade to a replication plan (#1171).
+                    anyhow::bail!(
+                        "model '{model}' not found (no transformation model with that name)"
+                    );
+                }
                 // fall through to the replication-plan branch below.
                 tracing::debug!(
                     "`models/` directory has no compiled models — building replication plan instead"
                 );
             }
             Err(e) => {
+                if run_options.model.is_some() {
+                    // A model-scoped plan must never silently degrade to a
+                    // replication plan (#1171): surface the run-plan
+                    // build/persist failure instead of falling through to the
+                    // replication-plan branch below.
+                    return Err(e).context(
+                        "failed to build a model-scoped run plan for --model; \
+                         refusing to fall back to a replication plan",
+                    );
+                }
                 tracing::warn!(
                     error = %e,
                     "failed to build/persist run plan; `rocky apply` will not be available for this invocation"
@@ -445,10 +464,12 @@ pub async fn plan(
 
     // Replication-plan branch — fires when there is no `models/`
     // directory or the directory exists but contains zero compiled
-    // models. The plan_id is content-addressed by the canonical
-    // `RockyConfig` snapshot + the discovered source state (sorted
-    // connectors + tables), so identical inputs produce an identical
-    // plan_id across machines.
+    // models. Never fires when `--model` is set: that path either
+    // persists a model-scoped run plan or errors above (#1171), so a
+    // model-scoped intent can never resolve to replication. The plan_id
+    // is content-addressed by the canonical `RockyConfig` snapshot + the
+    // discovered source state (sorted connectors + tables), so identical
+    // inputs produce an identical plan_id across machines.
     if !run_plan_persisted {
         match build_and_persist_replication_plan(
             &rocky_cfg,
