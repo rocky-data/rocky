@@ -8,6 +8,7 @@
 //! so credential resolution follows the standard AWS SDK / GCP ADC chains.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -20,6 +21,7 @@ use crate::object_store::{ObjectStoreError, ObjectStoreProvider};
 use crate::redacted::RedactedString;
 use crate::retry::compute_backoff;
 use crate::retry_budget::RetryBudget;
+use crate::state::StateStore;
 
 #[derive(Debug, Error)]
 pub enum StateSyncError {
@@ -524,6 +526,13 @@ pub struct RemoteStateSession {
     finalized: bool,
     /// The owned mid-run periodic uploader, when started.
     periodic: Option<tokio::task::JoinHandle<()>>,
+    /// Cooperative-drain signal for the periodic uploader. `stop_periodic` fires
+    /// it and joins, so an in-flight tick's `spawn_blocking` snapshot runs to
+    /// completion (releasing its `Arc<StateStore>` upgrade and cleaning up its
+    /// scratch guard) BEFORE the task exits — a plain `abort()` would instead
+    /// detach the blocking closure, leaking the scratch it recreates and holding
+    /// the upgrade past the run tail's `Arc::try_unwrap`.
+    periodic_shutdown: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RemoteStateSession {
@@ -541,6 +550,7 @@ impl RemoteStateSession {
             suppress_reason: None,
             finalized: false,
             periodic: None,
+            periodic_shutdown: None,
         }
     }
 
@@ -643,37 +653,110 @@ impl RemoteStateSession {
         }
     }
 
-    /// Start the owned mid-run periodic uploader: [`upload_state`] on the
-    /// session's config/path every `cadence`. The caller applies its own
-    /// spawn gating (estimated duration, suppression) — the session only owns
-    /// the task so [`stop_periodic`][Self::stop_periodic] /
-    /// [`finalize`][Self::finalize] can abort **and join** it. A no-op when a
+    /// Start the owned mid-run periodic uploader over a **`Weak`** handle to the
+    /// live [`StateStore`], dirty-gated on its [`write_epoch`][StateStore::write_epoch].
+    ///
+    /// Each tick, if the store's epoch has advanced since the last upload, it
+    /// exports a torn-read-free [`snapshot_to_excluding`][StateStore::snapshot_to_excluding]
+    /// (on the blocking pool) and uploads it via [`upload_state_snapshot`]; a
+    /// clean tick (epoch unchanged) costs zero I/O.
+    ///
+    /// The handle is [`Weak`], never a strong [`Arc`][std::sync::Arc] clone: the
+    /// run tail recovers the owned store with `Arc::try_unwrap`, which a lingering
+    /// strong clone here would block — silently dropping the owned store and
+    /// no-op'ing every terminal write. With `Weak`, `try_unwrap` is never held
+    /// up; a tick that races the run tail's `drop` simply fails to `upgrade` and
+    /// exits.
+    ///
+    /// The caller applies its own spawn gating (estimated duration, suppression)
+    /// — the session only owns the task so [`stop_periodic`][Self::stop_periodic]
+    /// / [`finalize`][Self::finalize] can drain **and join** it. A no-op when a
     /// periodic task is already running.
-    pub fn start_periodic_uploader(&mut self, cadence: Duration) {
+    ///
+    /// Shutdown is **cooperative**, not an `abort()`: an idle tick (parked on the
+    /// cadence sleep) breaks instantly, but a tick already inside its
+    /// `spawn_blocking` snapshot runs that snapshot to completion. `abort()`
+    /// would drop the `.await` and detach the blocking closure, which would then
+    /// (1) recreate the scratch file its [`ScratchGuard`] just removed on
+    /// cancellation (a leak) and (2) hold its `Arc<StateStore>` upgrade past the
+    /// run tail's `Arc::try_unwrap`, silently no-op'ing every terminal write.
+    pub fn start_periodic_uploader(&mut self, store: Weak<StateStore>, cadence: Duration) {
         if self.periodic.is_some() {
             return;
         }
         let cfg = self.cfg.clone();
         let path = self.state_path.clone();
+        // Derive the remote key ONCE from the REAL state path (namespace-correct)
+        // — never from the scratch temp path, which would resolve to the legacy
+        // `state.redb` key and clobber namespaced state (mirrors the invariant in
+        // `upload_state_with_excluded_tables`).
+        let remote_key = remote_state_key(&path);
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        self.periodic_shutdown = Some(Arc::clone(&shutdown));
         self.periodic = Some(tokio::spawn(async move {
+            let mut last_uploaded_epoch: u64 = 0;
             loop {
-                tokio::time::sleep(cadence).await;
-                if let Err(e) = upload_state(&cfg, &path).await {
-                    warn!(error = %e, "periodic state sync failed");
+                // Cooperative wait: a shutdown signal breaks the loop instead of
+                // sleeping out the cadence. `notify_one` sets a permit even with
+                // no waiter parked, so a signal that arrives mid-tick is consumed
+                // by the next iteration's `notified()`.
+                tokio::select! {
+                    _ = tokio::time::sleep(cadence) => {}
+                    _ = shutdown.notified() => break,
                 }
+
+                // The run tail dropped the owned store → nothing left to sync.
+                let Some(store) = store.upgrade() else {
+                    break;
+                };
+
+                // Capture the epoch BEFORE the read snapshot: recording an epoch
+                // <= the snapshot's content is a harmless re-upload next tick;
+                // recording > content would permanently skip a real change.
+                let epoch = store.write_epoch();
+                if epoch == last_uploaded_epoch {
+                    // Clean tick — no mutation since the last upload; zero I/O.
+                    continue;
+                }
+
+                // Build the consistent snapshot on the blocking pool (the redb
+                // export is fsync-bearing). Cooperative shutdown lets this
+                // `.await` finish rather than being cancelled, so the scratch
+                // guard's cleanup and the `Arc` release both happen in-task.
+                let scratch = ScratchGuard::new();
+                let scratch_path = scratch.path().to_path_buf();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    store.snapshot_to_excluding(&scratch_path, crate::state::LOCAL_ONLY_TABLE_NAMES)
+                })
+                .await;
+
+                match snapshot {
+                    Ok(Ok(())) => {
+                        match upload_state_snapshot(&cfg, scratch.path(), &remote_key).await {
+                            Ok(()) => last_uploaded_epoch = epoch,
+                            Err(e) => warn!(error = %e, "periodic state sync upload failed"),
+                        }
+                    }
+                    Ok(Err(e)) => warn!(error = %e, "periodic state snapshot failed"),
+                    Err(e) => warn!(error = %e, "periodic state snapshot task panicked"),
+                }
+                // `scratch` drops here → the temp snapshot file is removed.
             }
         }));
     }
 
-    /// Abort AND JOIN the periodic uploader (the RD-004 abort-without-await
-    /// fix: an aborted-but-unjoined task could still be mid-`put` when the
-    /// caller proceeds to its terminal upload). Idempotent — a no-op when no
-    /// periodic task is running.
+    /// Cooperatively DRAIN and JOIN the periodic uploader (the RD-004
+    /// stop-before-terminal-upload fix, hardened for the snapshot path): signal
+    /// shutdown, then await the task so it exits after any in-flight tick's
+    /// snapshot + upload complete — never mid-`put`, never leaking a detached
+    /// blocking closure. Idempotent — a no-op when no periodic task is running.
     pub async fn stop_periodic(&mut self) {
+        if let Some(shutdown) = self.periodic_shutdown.take() {
+            shutdown.notify_one();
+        }
         if let Some(handle) = self.periodic.take() {
-            handle.abort();
-            // Cancelled is the expected outcome; a JoinError panics-variant is
-            // surfaced by the task's own panic hook, not here.
+            // Cooperative exit is the expected outcome; a JoinError panics-variant
+            // is surfaced by the task's own panic hook, not here.
             let _ = handle.await;
         }
     }
@@ -817,8 +900,14 @@ impl Drop for RemoteStateSession {
             return;
         }
         // Resource net first (the debug_assert below panics in debug builds):
-        // a leaked periodic handle must not outlive the run. Abort only —
-        // `Drop` cannot await a join.
+        // a leaked periodic handle must not outlive the run. Signal cooperative
+        // shutdown, then `abort()` as the hard net — `Drop` cannot await a join,
+        // so this cannot guarantee the in-tick drain the normal
+        // `stop_periodic`/`finalize` paths provide; it is the leaked-session bug
+        // path, where the resource net wins over the drain guarantee.
+        if let Some(shutdown) = self.periodic_shutdown.take() {
+            shutdown.notify_one();
+        }
         if let Some(handle) = self.periodic.take() {
             handle.abort();
         }
@@ -1381,6 +1470,63 @@ pub async fn upload_state_with_excluded_tables(
     // cost the OS cleans up at reboot.
     let _ = std::fs::remove_file(&scratch);
     apply_upload_failure_policy(config, result)
+}
+
+/// Upload an already-built, already-filtered state **snapshot** to the remote.
+///
+/// Unlike [`upload_state`], this performs NO local-only table stripping — the
+/// snapshot was produced by [`StateStore::snapshot_to_excluding`], which already
+/// omitted the excluded tables under a single MVCC read (torn-read-free). The
+/// caller passes the schema-namespaced `remote_key`, derived ONCE from the real
+/// state path — NEVER re-derived from the scratch temp path, which would resolve
+/// to the legacy `state.redb` key and clobber namespaced state (the same
+/// invariant [`upload_state_with_excluded_tables`] documents). The configured
+/// `on_upload_failure` policy applies exactly as in [`upload_state`].
+pub async fn upload_state_snapshot(
+    config: &StateConfig,
+    snapshot_path: &Path,
+    remote_key: &str,
+) -> Result<(), StateSyncError> {
+    if !snapshot_path.exists() {
+        debug!("No state snapshot to upload");
+        return Ok(());
+    }
+    let result = dispatch_upload(config, snapshot_path, remote_key).await;
+    apply_upload_failure_policy(config, result)
+}
+
+/// A temp snapshot path removed on drop, so an aborted-mid-tick periodic upload
+/// leaks neither a scratch snapshot file nor a late upload.
+struct ScratchGuard {
+    path: PathBuf,
+}
+
+impl ScratchGuard {
+    /// Reserve a unique scratch path under the system temp dir. The file itself
+    /// is created by [`StateStore::snapshot_to_excluding`]; this owns its name
+    /// and its cleanup.
+    fn new() -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rocky-state-snapshot-{}-{}.redb",
+            std::process::id(),
+            nanos
+        ));
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Build a temp redb copy of `local_path` with `excluded_tables` removed.
@@ -3676,6 +3822,24 @@ mod tests {
         faults
     }
 
+    /// Like [`install_counting_provider`] but PROCESS-GLOBAL, so the counting
+    /// store is visible from the periodic uploader's own tokio worker thread
+    /// (the thread-local [`test_support::install`] only covers the test thread).
+    /// Hold the returned guard for the test's duration; pair with
+    /// [`test_support::serial_guard`] (the global override is shared state).
+    fn install_counting_provider_global() -> (
+        crate::fault_store::FaultHandle,
+        test_support::GlobalOverrideGuard,
+    ) {
+        let (store, faults) = crate::fault_store::FaultingStore::wrap(std::sync::Arc::new(
+            object_store::memory::InMemory::new(),
+        ));
+        let guard = test_support::install_global(ObjectStoreProvider::from_store(
+            store, "s3", "bucket", "",
+        ));
+        (faults, guard)
+    }
+
     /// Seed a real (empty) redb state file at `path` so the upload path has a
     /// file to strip/dispatch.
     fn seed_state_file(path: &Path) {
@@ -3952,13 +4116,14 @@ mod tests {
         );
         let _ = session.acquire().await.unwrap();
         // A cadence far beyond the test's lifetime: the loop must never fire,
-        // so the only Put observed below is the terminal finalize upload.
-        session.start_periodic_uploader(Duration::from_secs(3600));
+        // so the only Put observed below is the terminal finalize upload. A
+        // dangling Weak is fine — the loop never reaches an upgrade.
+        session.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
         // Idempotent no-op while one is running.
-        session.start_periodic_uploader(Duration::from_secs(3600));
+        session.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
         session.stop_periodic().await;
         session.stop_periodic().await; // idempotent after stop
-        session.start_periodic_uploader(Duration::from_secs(3600));
+        session.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
         session
             .finalize()
             .await
@@ -3968,6 +4133,209 @@ mod tests {
             faults.count(crate::fault_store::FaultOp::Put),
             1,
             "exactly the terminal upload — the periodic loop must never have fired"
+        );
+    }
+
+    fn wm_now() -> rocky_ir::WatermarkState {
+        let now = chrono::Utc::now();
+        rocky_ir::WatermarkState {
+            last_value: now,
+            updated_at: now,
+        }
+    }
+
+    async fn poll_until<F: Fn() -> bool>(f: F, budget: Duration) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        f()
+    }
+
+    /// The dirty-gated periodic uploader uploads when the store's write epoch
+    /// advances and SKIPS clean ticks (zero I/O when nothing changed) — the
+    /// `FaultHandle` put-counter is the instrument.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn periodic_uploader_uploads_on_dirty_epoch_and_skips_clean_ticks() {
+        let _serial = test_support::serial_guard();
+        let (faults, _override) = install_counting_provider_global();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        let store = Arc::new(StateStore::open(&local).unwrap());
+        // Dirty the store so the first tick has a change to replicate.
+        store.set_watermark("c.s.t", &wm_now()).unwrap();
+
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Fail),
+            &local,
+            FinalizeDurability::ConfigDefault,
+        );
+        let _ = session.acquire().await.unwrap();
+        session.start_periodic_uploader(Arc::downgrade(&store), Duration::from_millis(40));
+
+        // First dirty tick uploads.
+        let uploaded = poll_until(
+            || faults.count(crate::fault_store::FaultOp::Put) >= 1,
+            Duration::from_secs(10),
+        )
+        .await;
+        let after_first = faults.count(crate::fault_store::FaultOp::Put);
+
+        // No new writes → subsequent ticks are clean and skip (zero new Puts).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let clean_skipped = faults.count(crate::fault_store::FaultOp::Put) == after_first;
+
+        // A fresh write re-dirties the epoch → the uploader picks it up.
+        store.set_watermark("c.s.u", &wm_now()).unwrap();
+        let re_uploaded = poll_until(
+            || faults.count(crate::fault_store::FaultOp::Put) > after_first,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        // Consume the session BEFORE asserting: a failing assertion must not
+        // leave the session unconsumed, or its Drop tripwire fires during unwind
+        // (a destructor panic on top of the assert's panic) and aborts the
+        // process with truncated output — turning a clean, retryable FAIL into an
+        // un-debuggable SIGABRT.
+        session.abandon("test complete").await;
+
+        assert!(uploaded, "a dirty tick must upload the snapshot");
+        assert!(
+            clean_skipped,
+            "clean ticks must skip — the dirty-gate spends zero I/O when the epoch is unchanged"
+        );
+        assert!(re_uploaded, "a new epoch bump must trigger another upload");
+    }
+
+    /// Cooperative drain: after `stop_periodic` no late upload happens and no
+    /// scratch snapshot file is leaked — the in-flight tick's `spawn_blocking`
+    /// runs to completion in-task rather than being detached by an `abort()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopping_the_uploader_drains_without_scratch_leak_or_late_upload() {
+        let _serial = test_support::serial_guard();
+        let (faults, _override) = install_counting_provider_global();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        let store = Arc::new(StateStore::open(&local).unwrap());
+        store.set_watermark("c.s.t", &wm_now()).unwrap();
+
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Fail),
+            &local,
+            FinalizeDurability::ConfigDefault,
+        );
+        let _ = session.acquire().await.unwrap();
+        session.start_periodic_uploader(Arc::downgrade(&store), Duration::from_millis(30));
+
+        // Let at least one upload happen so a tick has genuinely run.
+        let uploaded = poll_until(
+            || faults.count(crate::fault_store::FaultOp::Put) >= 1,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        // Cooperative drain + join.
+        session.stop_periodic().await;
+        let after_stop = faults.count(crate::fault_store::FaultOp::Put);
+
+        // No further upload after the drain returns.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let no_late_upload = faults.count(crate::fault_store::FaultOp::Put) == after_stop;
+
+        // No scratch snapshot leaked for this process (the ScratchGuard removed
+        // every temp file in-task, uncancelled).
+        let pid_prefix = format!("rocky-state-snapshot-{}-", std::process::id());
+        let leaked: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+            .expect("read temp dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(&pid_prefix))
+            .collect();
+
+        // Consume the session BEFORE asserting (clean FAIL, never a Drop-tripwire
+        // double-panic SIGABRT on assertion failure — see the uploads/skips test).
+        session.abandon("test complete").await;
+
+        assert!(
+            uploaded,
+            "the uploader must run at least one tick before stop"
+        );
+        assert!(
+            no_late_upload,
+            "no late upload may fire after a cooperative stop"
+        );
+        assert!(
+            leaked.is_empty(),
+            "cooperative drain must leave no scratch snapshot behind, found: {leaked:?}"
+        );
+    }
+
+    /// The `Weak`-handle safety net (mirrors run.rs's serial tail): with the
+    /// periodic uploader wired and having run at least one tick, the run tail's
+    /// `Arc::try_unwrap` still recovers the owned store — a strong `Arc` clone
+    /// held by the uploader would have blocked it, leaving `None` and silently
+    /// no-op'ing every terminal write. After the drain, `try_unwrap` succeeds and
+    /// a terminal write persists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_writes_persist_with_periodic_wired() {
+        let _serial = test_support::serial_guard();
+        let (faults, _override) = install_counting_provider_global();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+
+        let shared_state = Arc::new(StateStore::open(&local).unwrap());
+        shared_state.set_watermark("c.s.t", &wm_now()).unwrap();
+
+        let mut session = RemoteStateSession::new(
+            &s3_session_config(StateUploadFailureMode::Fail),
+            &local,
+            FinalizeDurability::ConfigDefault,
+        );
+        let _ = session.acquire().await.unwrap();
+        session.start_periodic_uploader(Arc::downgrade(&shared_state), Duration::from_millis(20));
+
+        // Ensure a tick actually ran (so the uploader genuinely upgraded the
+        // Weak at least once — the case a strong clone would have made fatal).
+        let ticked = poll_until(
+            || faults.count(crate::fault_store::FaultOp::Put) >= 1,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        // Run tail: `abandon` drains the periodic (cooperative stop + join), and
+        // consuming the session here — BEFORE the recovery assertions — keeps a
+        // failure a clean FAIL rather than a Drop-tripwire double-panic SIGABRT.
+        session.abandon("test complete").await;
+
+        // The Weak periodic handle never blocked the run tail's try_unwrap.
+        let recovered = Arc::try_unwrap(shared_state).ok();
+        let terminal_persisted = if let Some(store) = recovered.as_ref() {
+            // The recovered store is real (not a no-op `None`): a terminal write
+            // persists. `store` drops at the end of scope, freeing the writer
+            // lock — the drop-before-finalize discipline.
+            store.set_watermark("c.s.terminal", &wm_now()).unwrap();
+            store.get_watermark("c.s.terminal").unwrap().is_some()
+        } else {
+            false
+        };
+
+        assert!(
+            ticked,
+            "the uploader must run a tick so the Weak is upgraded"
+        );
+        assert!(
+            recovered.is_some(),
+            "Arc::try_unwrap must succeed — the Weak periodic handle never blocks the run tail"
+        );
+        assert!(
+            terminal_persisted,
+            "the terminal write must persist on the recovered owned store"
         );
     }
 }

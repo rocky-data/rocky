@@ -1773,6 +1773,12 @@ pub async fn run(
         )
         .await;
 
+        // WP-01 PR-C: drop the owned state store BEFORE the finalize upload so
+        // its copy runs against a quiescent, unlocked file (the redb `Database`
+        // + advisory writer lock are released here). This is the model-only arm's
+        // last use of `state_store`.
+        drop(state_store);
+
         // WP-01 PR-B (2b): terminal upload AFTER the arm's terminal state
         // writes (run record → idempotency stamp) so they ride it — the same
         // reposition as the replication seam. Runs before the soft-failure
@@ -3196,7 +3202,15 @@ pub async fn run(
             cadence_secs, "adaptive state-sync cadence configured"
         );
         if let Some(session) = session_opt.as_mut() {
-            session.start_periodic_uploader(Duration::from_secs(cadence_secs));
+            // Hand the uploader a `Weak` handle to the live store (never a strong
+            // `Arc` clone): the serial tail below recovers the owned store with
+            // `Arc::try_unwrap`, which a lingering strong clone would block —
+            // silently no-op'ing every terminal write. The uploader snapshots the
+            // store via `begin_read` (MVCC) and uploads a consistent copy.
+            session.start_periodic_uploader(
+                Arc::downgrade(&shared_state),
+                Duration::from_secs(cadence_secs),
+            );
         }
     }
 
@@ -4874,6 +4888,10 @@ pub async fn run(
             &output,
         )
         .await;
+        // WP-01 PR-C: drop the owned state store BEFORE finalize so its copy is
+        // structurally lock-free. Legal here because this failure branch returns
+        // `verify_after_result` below and never touches `state_store` again.
+        drop(state_store);
         // WP-01 PR-B: finalize the state session on this failure branch too,
         // so the failing verify-after's custody row (re-persisted just above)
         // reaches the remote ledger — a deliberate improvement: before the
@@ -4920,6 +4938,12 @@ pub async fn run(
         &output,
     )
     .await;
+
+    // WP-01 PR-C: drop the owned state store BEFORE the terminal finalize so its
+    // copy runs against a quiescent, unlocked file (redb `Database` + advisory
+    // writer lock released here). This is the happy path's last use of
+    // `state_store` — every terminal state write above already completed.
+    drop(state_store);
 
     // WP-01 PR-B (§5): the terminal state upload, repositioned AFTER the
     // terminal state writes (run record → verify-after custody → idempotency

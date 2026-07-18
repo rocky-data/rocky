@@ -1,8 +1,10 @@
 use std::fs::File;
 use std::path::Path;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use fs4::FileExt;
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition, TableHandle, WriteTransaction};
 use thiserror::Error;
 
 use crate::config::SchemaMismatchPolicy;
@@ -249,6 +251,80 @@ const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 pub const LOCAL_ONLY_TABLE_NAMES: &[&str] =
     &["schema_cache", "jobs", "schedule_state", "schedule_claims"];
 
+/// The redb key/value shape of a state table, for the logical snapshot export.
+///
+/// The full table set is a **closed 2-type split**: exactly two tables are
+/// `TableDefinition<&str, &str>` ([`SOURCE_MARKERS`] and [`METADATA`]); every
+/// other table is `TableDefinition<&str, &[u8]>`. redb 2.6.3 has no
+/// `Database::backup` and no untyped row iteration, so
+/// [`StateStore::snapshot_to_excluding`] must open each table with its concrete
+/// typed definition to iterate it — this enum records which of the two to use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TableShape {
+    /// `TableDefinition<&str, &str>` — the two string-valued tables.
+    StrStr,
+    /// `TableDefinition<&str, &[u8]>` — every blob-valued table.
+    StrBytes,
+}
+
+/// Closed registry of every state table and its [`TableShape`], co-located with
+/// the table definitions above so the shape travels with the table name.
+///
+/// [`StateStore::snapshot_to_excluding`] consults this to open each live table
+/// with its concrete typed definition (redb has no untyped iteration). A table
+/// present in a fresh store's `list_tables()` but **absent here** is a hard
+/// error at snapshot time — never a silent drop, which would lose a replicated
+/// table on the next pod's download. The `snapshot_registry_matches_schema`
+/// test pins these names against the eager table set the golden
+/// (`on_disk_state_schema_format_is_pinned`) enumerates, so adding a table
+/// without registering it fails the build.
+const SNAPSHOT_TABLE_REGISTRY: &[(&str, TableShape)] = &[
+    ("watermarks", TableShape::StrBytes),
+    ("source_markers", TableShape::StrStr),
+    ("check_history", TableShape::StrBytes),
+    ("run_history", TableShape::StrBytes),
+    ("quality_history", TableShape::StrBytes),
+    ("dag_snapshots", TableShape::StrBytes),
+    ("run_progress", TableShape::StrBytes),
+    ("run_progress_entries", TableShape::StrBytes),
+    ("partitions", TableShape::StrBytes),
+    ("grace_periods", TableShape::StrBytes),
+    ("loaded_files", TableShape::StrBytes),
+    ("branches", TableShape::StrBytes),
+    ("schema_cache", TableShape::StrBytes),
+    ("idempotency_keys", TableShape::StrBytes),
+    ("output_artifacts", TableShape::StrBytes),
+    ("input_index", TableShape::StrBytes),
+    ("input_provenance", TableShape::StrBytes),
+    ("discover_snapshots", TableShape::StrBytes),
+    ("policy_decisions", TableShape::StrBytes),
+    ("jobs", TableShape::StrBytes),
+    ("tombstones", TableShape::StrBytes),
+    ("schedule_state", TableShape::StrBytes),
+    ("schedule_claims", TableShape::StrBytes),
+    ("metadata", TableShape::StrStr),
+];
+
+/// Look up a table's [`TableShape`] in [`SNAPSHOT_TABLE_REGISTRY`].
+fn snapshot_table_shape(name: &str) -> Option<TableShape> {
+    SNAPSHOT_TABLE_REGISTRY
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, shape)| *shape)
+}
+
+/// Soft warning threshold for a logical snapshot's in-transaction footprint.
+///
+/// [`StateStore::snapshot_to_excluding`] materializes the export in a single
+/// redb write transaction, so peak memory is proportional to the total
+/// replicated state size. State files this large are far outside the expected
+/// envelope (watermarks + run history + governance ledgers for a typical
+/// project are single-digit megabytes), so crossing this bound `warn!`s rather
+/// than failing. Deliberately NOT multipart: `PutMultipartOptions` has no
+/// conditional mode in object_store 0.14, so a streaming upload would fork off
+/// the CAS semantics a later PR needs.
+const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
+
 /// Schema version for the current set of state tables.
 ///
 /// Increment this constant whenever a table is added, removed, or structurally
@@ -447,6 +523,13 @@ pub enum StateError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error(
+        "state snapshot: table {0:?} exists on disk but is not registered in \
+         SNAPSHOT_TABLE_REGISTRY — refusing to produce a snapshot that would silently \
+         drop a replicated table"
+    )]
+    UnknownSnapshotTable(String),
 }
 
 impl From<redb::TransactionError> for StateError {
@@ -513,6 +596,17 @@ pub struct StateStore {
     // end-of-run upload, so a downgraded state is never written back over the
     // newer state that upgraded pods depend on.
     recreated_for_forward_incompat: bool,
+    // Monotonic counter bumped by [`StateStore::commit_write`] after every
+    // production write-transaction commit. **In-memory only — NEVER persisted
+    // to redb** (persisting it would break the byte-identical-on-local guard).
+    // The mid-run periodic uploader reads it via [`StateStore::write_epoch`] to
+    // dirty-gate its snapshot: a tick whose captured epoch matches the last
+    // uploaded one skips all I/O. Construction-time writes (`init_db`) happen
+    // before the store exists and leave this at its `0` baseline — the periodic
+    // uploader treats `0` as "nothing new since open", which is correct because
+    // the as-opened state is exactly what the start-of-run download already
+    // established remotely.
+    write_epoch: AtomicU64,
 }
 
 /// The schema version this binary supports.
@@ -700,6 +794,44 @@ impl StateStore {
         self.recreated_for_forward_incompat
     }
 
+    /// Commit a live-store write transaction and bump [`write_epoch`].
+    ///
+    /// **Every** production write path MUST commit through this rather than
+    /// calling [`redb::WriteTransaction::commit`] directly. redb's `commit` is
+    /// public, so the compiler cannot enforce it — the invariant is held by
+    /// grep-closure: the only bare `.commit()` calls left in this module are
+    /// this body, the construction-time `init_db` commit (pre-`self`, baseline
+    /// epoch), the snapshot export commit (writes a different database), the
+    /// test-support `force_schema_version` helper, and test code.
+    ///
+    /// A missed conversion is silent staleness: the mutation lands on disk but
+    /// the epoch stays put, so the periodic uploader's dirty-gate skips the tick
+    /// that would have replicated it. The epoch is bumped **after** a successful
+    /// commit — a failed commit changed nothing, so it must not advance the
+    /// counter.
+    ///
+    /// [`Ordering::Release`] pairs with the periodic uploader's
+    /// [`Ordering::Acquire`] load so a reader that observes the new epoch also
+    /// observes the committed bytes.
+    fn commit_write(&self, txn: WriteTransaction) -> Result<(), StateError> {
+        txn.commit()?;
+        self.write_epoch.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// The current write epoch — a monotonic count of committed production write
+    /// transactions since this store was opened (see [`commit_write`]).
+    ///
+    /// The mid-run periodic uploader captures this **before** its `begin_read`
+    /// and re-uploads only when it has advanced since the last upload, so a
+    /// clean tick costs zero I/O. Capturing before the read is the safe
+    /// direction: recording an epoch `<=` the snapshot's content merely triggers
+    /// a harmless re-upload next tick, whereas recording `>` the content would
+    /// permanently skip a real change.
+    pub fn write_epoch(&self) -> u64 {
+        self.write_epoch.load(Ordering::Acquire)
+    }
+
     fn open_inner(
         path: &Path,
         mode: OpenMode,
@@ -722,6 +854,7 @@ impl StateStore {
                 db,
                 _lock: lock,
                 recreated_for_forward_incompat: false,
+                write_epoch: AtomicU64::new(0),
             }),
             InitOutcome::RecreateForwardIncompat { found } => {
                 // Forward-incompatible store under `SchemaMismatchPolicy::Recreate`.
@@ -764,6 +897,7 @@ impl StateStore {
                         db,
                         _lock: lock,
                         recreated_for_forward_incompat: true,
+                        write_epoch: AtomicU64::new(0),
                     }),
                     // A file we just created cannot carry a newer schema version.
                     InitOutcome::RecreateForwardIncompat { found } => {
@@ -882,8 +1016,107 @@ impl StateStore {
             let _table = txn.open_table(SCHEDULE_STATE)?;
             let _table = txn.open_table(SCHEDULE_CLAIMS)?;
         }
+        // Construction-time commit: this runs on the raw `db` handle before any
+        // `StateStore` (and thus any `write_epoch`) exists, so it deliberately
+        // does NOT go through `commit_write`. The tables + version stamp it
+        // writes are the epoch-0 baseline the periodic uploader treats as
+        // "already on the remote from the start-of-run download".
         txn.commit()?;
         Ok(InitOutcome::Ready)
+    }
+
+    /// Export a **consistent logical snapshot** of the live state store to a
+    /// fresh redb database at `dest`, omitting every table named in `excluded`.
+    ///
+    /// This is the torn-read-free replacement for the mid-run periodic upload's
+    /// `std::fs::copy` of the live file: that copy races the run's own write
+    /// transactions (a redb file mutated under an unsynchronized `copy` yields a
+    /// torn read). Here the export runs against a single [`begin_read`] MVCC
+    /// snapshot, so every row it emits is drawn from **one** committed state —
+    /// no concurrent `commit_write` can tear a correlated row pair across
+    /// tables. The live store keeps taking writers throughout (this method only
+    /// holds a read transaction), so the run is never blocked.
+    ///
+    /// redb 2.6.3 exposes no `Database::backup` and no untyped row iteration, so
+    /// each table is opened with its concrete typed definition via the closed
+    /// [`SNAPSHOT_TABLE_REGISTRY`]. A table present in the live store's
+    /// `list_tables()` but **absent from the registry** is a hard
+    /// [`StateError::UnknownSnapshotTable`] — never a silent drop, which would
+    /// lose a replicated table on the next pod's download.
+    ///
+    /// The whole export commits under **one** write transaction on `dest`, so
+    /// peak memory is proportional to the total replicated state size; see
+    /// [`SNAPSHOT_MEMORY_WARN_BYTES`] for the soft bound this `warn!`s past.
+    ///
+    /// `dest` must not be a live state file — it is created fresh and written in
+    /// full. Callers use a scratch path guarded for cleanup.
+    pub fn snapshot_to_excluding(&self, dest: &Path, excluded: &[&str]) -> Result<(), StateError> {
+        let read_txn = self.db.begin_read()?;
+        // Enumerate the live table set from the consistent MVCC read snapshot.
+        let table_names: Vec<String> = read_txn
+            .list_tables()?
+            .map(|h| h.name().to_string())
+            .collect();
+
+        let dest_db = Database::create(dest)?;
+        let write_txn = dest_db.begin_write()?;
+        let mut total_bytes: u64 = 0;
+        {
+            for name in &table_names {
+                if excluded.contains(&name.as_str()) {
+                    continue;
+                }
+                let shape = snapshot_table_shape(name)
+                    .ok_or_else(|| StateError::UnknownSnapshotTable(name.clone()))?;
+                match shape {
+                    TableShape::StrStr => {
+                        let def: TableDefinition<&str, &str> = TableDefinition::new(name);
+                        let src = read_txn.open_table(def)?;
+                        let mut dst = write_txn.open_table(def)?;
+                        for entry in src.iter()? {
+                            let (k, v) = entry?;
+                            let (key, value) = (k.value(), v.value());
+                            total_bytes += (key.len() + value.len()) as u64;
+                            dst.insert(key, value)?;
+                        }
+                    }
+                    TableShape::StrBytes => {
+                        let def: TableDefinition<&str, &[u8]> = TableDefinition::new(name);
+                        let src = read_txn.open_table(def)?;
+                        let mut dst = write_txn.open_table(def)?;
+                        for entry in src.iter()? {
+                            let (k, v) = entry?;
+                            let (key, value) = (k.value(), v.value());
+                            total_bytes += (key.len() + value.len()) as u64;
+                            dst.insert(key, value)?;
+                        }
+                    }
+                }
+            }
+        }
+        // Commits the EXPORT database (`dest`), not the live store (`self.db`):
+        // deliberately NOT routed through `commit_write` — this writes the file
+        // being uploaded, it is not a live-state mutation, so it must not bump
+        // `write_epoch`.
+        write_txn.commit()?;
+        // Drop the export handle so the OS fully releases the file's flock + mmap
+        // before the caller uploads (or reopens) the scratch — same discipline as
+        // `state_sync::strip_local_only_tables`.
+        drop(dest_db);
+
+        if total_bytes > SNAPSHOT_MEMORY_WARN_BYTES {
+            tracing::warn!(
+                target: "rocky::state",
+                snapshot_bytes = total_bytes,
+                warn_bytes = SNAPSHOT_MEMORY_WARN_BYTES,
+                dest = %dest.display(),
+                "state snapshot exceeds the soft memory bound; the logical export is \
+                 materialized in a single redb write transaction (peak memory scales with \
+                 total replicated state size). Not multipart by design (object_store 0.14 \
+                 has no conditional multipart)."
+            );
+        }
+        Ok(())
     }
 
     /// Gets the watermark for a table (keyed by `catalog.schema.table`).
@@ -912,7 +1145,7 @@ impl StateStore {
             let mut table = txn.open_table(WATERMARKS)?;
             table.insert(table_key, bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -934,7 +1167,7 @@ impl StateStore {
             let mut table = txn.open_table(SOURCE_MARKERS)?;
             table.insert(table_key, marker)?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -963,7 +1196,7 @@ impl StateStore {
                 table.insert(*key, bytes.as_slice())?;
             }
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(entries.len())
     }
 
@@ -975,7 +1208,7 @@ impl StateStore {
             let mut table = txn.open_table(WATERMARKS)?;
             removed = table.remove(table_key)?.is_some();
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(removed)
     }
 
@@ -1022,7 +1255,7 @@ impl StateStore {
             let mut table = txn.open_table(CHECK_HISTORY)?;
             table.insert(table_key, bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -1058,7 +1291,7 @@ impl StateStore {
             let mut table = txn.open_table(PARTITIONS)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -1135,7 +1368,7 @@ impl StateStore {
             let mut table = txn.open_table(PARTITIONS)?;
             removed = table.remove(key.as_str())?.is_some();
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(removed)
     }
 }
@@ -1876,7 +2109,7 @@ impl StateStore {
             let mut table = txn.open_table(JOBS)?;
             table.insert(job.job_id.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -1916,7 +2149,7 @@ impl StateStore {
             let mut table = txn.open_table(RUN_HISTORY)?;
             table.insert(run.run_id.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -1988,7 +2221,7 @@ impl StateStore {
             let mut table = txn.open_table(QUALITY_HISTORY)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -2023,7 +2256,7 @@ impl StateStore {
             let mut table = txn.open_table(DAG_SNAPSHOTS)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -2063,7 +2296,7 @@ impl StateStore {
             let mut table = txn.open_table(RUN_PROGRESS)?;
             table.insert(run_id, bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -2093,7 +2326,7 @@ impl StateStore {
             let mut table = txn.open_table(RUN_PROGRESS_ENTRIES)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -2310,7 +2543,7 @@ impl StateStore {
                     table.remove(key.as_str())?;
                 }
             }
-            txn.commit()?;
+            self.commit_write(txn)?;
         }
 
         Ok((deleted, total.saturating_sub(deleted)))
@@ -2383,7 +2616,7 @@ impl StateStore {
                     table.remove(key.as_str())?;
                 }
             }
-            txn.commit()?;
+            self.commit_write(txn)?;
         }
 
         Ok((deleted, total.saturating_sub(deleted)))
@@ -2452,7 +2685,7 @@ impl StateStore {
                     table.remove(key.as_str())?;
                 }
             }
-            txn.commit()?;
+            self.commit_write(txn)?;
         }
 
         Ok((deleted, total.saturating_sub(deleted)))
@@ -2550,7 +2783,7 @@ impl StateStore {
             let mut table = txn.open_table(METADATA)?;
             table.insert(LAST_RETENTION_SWEEP_AT_KEY, formatted.as_str())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -2590,7 +2823,7 @@ impl StateStore {
             let mut table = txn.open_table(METADATA)?;
             table.insert(LAST_BRIEF_AT_KEY, formatted.as_str())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 }
@@ -2634,7 +2867,7 @@ impl StateStore {
             let mut table = txn.open_table(IDEMPOTENCY_KEYS)?;
             table.insert(entry.key.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -2646,7 +2879,7 @@ impl StateStore {
             let mut table = txn.open_table(IDEMPOTENCY_KEYS)?;
             removed = table.remove(key)?.is_some();
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(removed)
     }
 
@@ -2695,7 +2928,7 @@ impl StateStore {
                 }
             };
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(result)
     }
 
@@ -2758,7 +2991,7 @@ impl StateStore {
                 }
             }
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -2816,7 +3049,7 @@ impl StateStore {
                 }
             }
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(removed)
     }
 }
@@ -2852,7 +3085,7 @@ impl StateStore {
             let mut table = txn.open_table(SCHEDULE_STATE)?;
             table.insert(pipeline, bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -2887,7 +3120,7 @@ impl StateStore {
                 table.insert(pipeline, bytes.as_slice())?;
             }
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -2914,7 +3147,7 @@ impl StateStore {
             let bytes = serde_json::to_vec(&record)?;
             table.insert(pipeline, bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -2986,7 +3219,7 @@ impl StateStore {
             }
         }
         if won {
-            txn.commit()?;
+            self.commit_write(txn)?;
             Ok(ClaimCas::Won)
         } else {
             drop(txn);
@@ -3074,7 +3307,7 @@ impl StateStore {
                 removed += 1;
             }
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(removed)
     }
 
@@ -3089,7 +3322,7 @@ impl StateStore {
             let mut table = txn.open_table(RUN_HISTORY)?;
             table.insert(key, b"{not valid run record json".as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 }
@@ -3129,7 +3362,7 @@ impl StateStore {
             let mut table = txn.open_table(GRACE_PERIODS)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -3186,7 +3419,7 @@ impl StateStore {
             let mut table = txn.open_table(GRACE_PERIODS)?;
             removed = table.remove(key.as_str())?.is_some();
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(removed)
     }
 
@@ -3210,7 +3443,7 @@ impl StateStore {
             let mut table = txn.open_table(LOADED_FILES)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -3263,7 +3496,7 @@ impl StateStore {
             let mut table = txn.open_table(LOADED_FILES)?;
             removed = table.remove(key.as_str())?.is_some();
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(removed)
     }
 
@@ -3293,7 +3526,7 @@ impl StateStore {
             let mut table = txn.open_table(OUTPUT_ARTIFACTS)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -3391,7 +3624,7 @@ impl StateStore {
             };
         }
         if matches!(outcome, EvictOutcome::Evicted) {
-            txn.commit()?;
+            self.commit_write(txn)?;
         } else {
             // Nothing evicted — drop the transaction without committing so no
             // tombstone is recorded for a row that was absent or hash-mismatched.
@@ -3415,7 +3648,7 @@ impl StateStore {
             let mut table = txn.open_table(TOMBSTONES)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -3540,7 +3773,7 @@ impl StateStore {
             };
         }
         match outcome {
-            RestoreOutcome::Restored | RestoreOutcome::AlreadyRestored => txn.commit()?,
+            RestoreOutcome::Restored | RestoreOutcome::AlreadyRestored => self.commit_write(txn)?,
             _ => drop(txn),
         }
         Ok(outcome)
@@ -3568,7 +3801,7 @@ impl StateStore {
             let mut table = txn.open_table(POLICY_DECISIONS)?;
             table.insert(key.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -3637,7 +3870,7 @@ impl StateStore {
                 prov.insert(key.as_str(), bytes.as_slice())?;
             }
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -3824,7 +4057,7 @@ impl StateStore {
             let mut table = txn.open_table(BRANCHES)?;
             table.insert(branch.name.as_str(), bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -3859,7 +4092,7 @@ impl StateStore {
             let mut table = txn.open_table(BRANCHES)?;
             removed = table.remove(name)?.is_some();
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(removed)
     }
 
@@ -3903,7 +4136,7 @@ impl StateStore {
             let mut table = txn.open_table(SCHEMA_CACHE)?;
             table.insert(key, bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -3935,7 +4168,7 @@ impl StateStore {
                 table.insert(*key, bytes.as_slice())?;
             }
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(entries.len())
     }
 
@@ -3968,7 +4201,7 @@ impl StateStore {
             let mut table = txn.open_table(DISCOVER_SNAPSHOTS)?;
             table.insert(pipeline, bytes.as_slice())?;
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(())
     }
 
@@ -3985,7 +4218,7 @@ impl StateStore {
             let mut table = txn.open_table(SCHEMA_CACHE)?;
             removed = table.remove(key)?.is_some();
         }
-        txn.commit()?;
+        self.commit_write(txn)?;
         Ok(removed)
     }
 
@@ -8844,6 +9077,467 @@ mod tests {
              different set of redb tables than the pinned format contract. If intentional, \
              update EXPECTED_TABLES (and bump CURRENT_SCHEMA_VERSION + add the migration) in \
              the same PR."
+        );
+
+        // Registry-integrity: the snapshot table registry MUST enumerate exactly
+        // the same table set a fresh store materializes. `snapshot_to_excluding`
+        // hard-errors on any live table missing from the registry, so a table
+        // added to `init_db` without a `SNAPSHOT_TABLE_REGISTRY` row would break
+        // the mid-run upload — this pins them in lockstep at build time instead.
+        let mut registry_names: Vec<String> = SNAPSHOT_TABLE_REGISTRY
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        registry_names.sort_unstable();
+        assert_eq!(
+            registry_names, actual,
+            "SNAPSHOT_TABLE_REGISTRY drifted from the on-disk table set. Every table \
+             `init_db` eagerly creates must have a registry row (with its key/value shape) \
+             so `snapshot_to_excluding` can export it; adding a table without registering \
+             it would make the mid-run snapshot fail closed."
+        );
+
+        // The closed 2-type split the registry is built on: exactly two tables
+        // are `<&str, &str>` (metadata + source_markers); every other is
+        // `<&str, &[u8]>`. A drift here means a new string-valued table needs a
+        // `TableShape::StrStr` row (and this count updated).
+        let str_str = SNAPSHOT_TABLE_REGISTRY
+            .iter()
+            .filter(|(_, shape)| *shape == TableShape::StrStr)
+            .count();
+        assert_eq!(
+            str_str, 2,
+            "the closed 2-type split changed: exactly two tables are TableShape::StrStr \
+             (metadata, source_markers)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-C — consistent snapshot (`snapshot_to_excluding`) + write epoch
+    // -----------------------------------------------------------------------
+
+    fn wm_at(secs: i64) -> WatermarkState {
+        let ts = chrono::DateTime::from_timestamp(secs, 0).unwrap();
+        WatermarkState {
+            last_value: ts,
+            updated_at: ts,
+        }
+    }
+
+    /// The snapshot omits every `LOCAL_ONLY` table, copies every replicated
+    /// table byte-for-byte, and the exported blob reopens as a live store.
+    #[test]
+    fn snapshot_excludes_local_only_and_keeps_replicated_rows_byte_equal() {
+        let (store, dir) = temp_store();
+
+        // Replicated rows across both key/value shapes: watermarks (<&str,&[u8]>),
+        // source_markers + metadata (<&str,&str>).
+        store
+            .set_watermark("cat.sch.orders", &wm_at(1_700_000_000))
+            .unwrap();
+        store
+            .set_source_marker("cat.sch.orders", "2026-01-01T00:00:00Z|3|2048")
+            .unwrap();
+        // A local-only row that must NOT travel.
+        store.record_job(&sample_job("job-1", "running")).unwrap();
+
+        let dest = dir.path().join("snapshot.redb");
+        store
+            .snapshot_to_excluding(&dest, LOCAL_ONLY_TABLE_NAMES)
+            .unwrap();
+
+        // Verify the exported blob via raw redb (a fresh pod opens the downloaded
+        // snapshot with no contending handle; opening it in-process races the
+        // just-dropped export handle's flock, which is a test-only artifact).
+        let snap_db = Database::open(&dest).unwrap();
+        let read = snap_db.begin_read().unwrap();
+
+        // A replicated <&str,&[u8]> watermark survives byte-for-byte.
+        let wm_def: TableDefinition<&str, &[u8]> = TableDefinition::new("watermarks");
+        let wm_tbl = read.open_table(wm_def).unwrap();
+        let got: WatermarkState =
+            serde_json::from_slice(wm_tbl.get("cat.sch.orders").unwrap().unwrap().value()).unwrap();
+        assert_eq!(got.last_value, wm_at(1_700_000_000).last_value);
+        assert_eq!(got.updated_at, wm_at(1_700_000_000).updated_at);
+
+        // A replicated <&str,&str> source marker survives byte-for-byte.
+        let sm_def: TableDefinition<&str, &str> = TableDefinition::new("source_markers");
+        let sm_tbl = read.open_table(sm_def).unwrap();
+        assert_eq!(
+            sm_tbl.get("cat.sch.orders").unwrap().unwrap().value(),
+            "2026-01-01T00:00:00Z|3|2048"
+        );
+
+        // The replicated metadata table carries the schema version.
+        let md_def: TableDefinition<&str, &str> = TableDefinition::new("metadata");
+        let md_tbl = read.open_table(md_def).unwrap();
+        assert_eq!(
+            md_tbl.get("schema_version").unwrap().unwrap().value(),
+            CURRENT_SCHEMA_VERSION.to_string()
+        );
+
+        // The local-only `jobs` table was excluded entirely — it is not even
+        // created in the snapshot.
+        let jobs_def: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
+        assert!(
+            matches!(
+                read.open_table(jobs_def),
+                Err(redb::TableError::TableDoesNotExist(_))
+            ),
+            "the local-only `jobs` table must be excluded from the snapshot"
+        );
+    }
+
+    /// The snapshot reads via `begin_read` (MVCC), NOT a second `Database` open,
+    /// so it succeeds while the live handle still holds the redb flock — and the
+    /// flock is genuinely exclusive (a second `Database` open on the live path
+    /// errors, pinning that the snapshot did not take that path).
+    #[test]
+    fn snapshot_uses_begin_read_not_a_second_database_open() {
+        let (store, dir) = temp_store();
+        let live_path = dir.path().join("state.redb");
+        store.set_watermark("c.s.t", &wm_at(1_700_000_100)).unwrap();
+
+        // A second `Database` handle on the LIVE path is blocked by redb's flock
+        // (the `DatabaseAlreadyOpen` guard). If the snapshot opened the live file
+        // this way it would deadlock/err against the run's own handle.
+        assert!(
+            Database::create(&live_path).is_err(),
+            "a second Database open on the live path must be blocked by the flock"
+        );
+
+        // The snapshot nevertheless succeeds — it only takes a read txn on the
+        // already-open handle.
+        let dest = dir.path().join("snap.redb");
+        store
+            .snapshot_to_excluding(&dest, LOCAL_ONLY_TABLE_NAMES)
+            .unwrap();
+        let snap_db = Database::open(&dest).unwrap();
+        let read = snap_db.begin_read().unwrap();
+        let wm_def: TableDefinition<&str, &[u8]> = TableDefinition::new("watermarks");
+        let wm_tbl = read.open_table(wm_def).unwrap();
+        let got: WatermarkState =
+            serde_json::from_slice(wm_tbl.get("c.s.t").unwrap().unwrap().value()).unwrap();
+        assert_eq!(got.last_value, wm_at(1_700_000_100).last_value);
+    }
+
+    /// A table present on disk but absent from `SNAPSHOT_TABLE_REGISTRY` is a
+    /// hard error — never a silent drop (which would lose a replicated table on
+    /// the next pod's download).
+    #[test]
+    fn snapshot_errors_on_an_unregistered_table() {
+        let (store, dir) = temp_store();
+        // Fabricate a stray table directly on the live db (as a future schema
+        // addition that forgot its registry row would look).
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let def: TableDefinition<&str, &[u8]> =
+                    TableDefinition::new("__unregistered_future_table");
+                let mut t = txn.open_table(def).unwrap();
+                t.insert("k", b"v".as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        let dest = dir.path().join("snap.redb");
+        let err = store
+            .snapshot_to_excluding(&dest, LOCAL_ONLY_TABLE_NAMES)
+            .unwrap_err();
+        assert!(
+            matches!(err, StateError::UnknownSnapshotTable(ref n) if n == "__unregistered_future_table"),
+            "an unregistered table must fail closed, got: {err:?}"
+        );
+    }
+
+    /// The consistency crux: under a concurrent writer committing a correlated
+    /// row pair atomically, the MVCC snapshot NEVER observes a torn pair — while
+    /// a naive, non-atomic byte copy of the same live file under the same load
+    /// DOES tear. The byte-copy half is the RED demo that proves the MVCC
+    /// assertion is a real discriminator, not vacuously green.
+    ///
+    /// The RED demo uses an explicit chunked read/write (with a small pause
+    /// between chunks) rather than `std::fs::copy`: on macOS APFS `std::fs::copy`
+    /// is an atomic `clonefile` that captures a crash-consistent point-in-time
+    /// and would NOT tear, hiding the hazard — but on the Linux pods where
+    /// RD-004's torn read bites, a byte-level copy of a live redb file smears
+    /// across the writer's commits exactly like this stand-in.
+    #[test]
+    fn snapshot_under_concurrent_writes_never_tears_a_correlated_pair() {
+        use std::io::{Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering as O};
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let store = Arc::new(StateStore::open(&path).unwrap());
+
+        // Pad the store so the file spans enough pages that a chunked copy
+        // overlaps several writer commits — a few-KB file copies faster than the
+        // writer can move a page, hiding the hazard.
+        {
+            let pad: Vec<(String, WatermarkState)> = (0..600)
+                .map(|i| (format!("pad.table.{i}"), wm_at(1_600_000_000 + i)))
+                .collect();
+            let refs: Vec<(&str, &WatermarkState)> =
+                pad.iter().map(|(k, v)| (k.as_str(), v)).collect();
+            store.batch_set_watermarks(&refs).unwrap();
+        }
+        // Seed the correlated pair so both keys always exist for readers.
+        store
+            .batch_set_watermarks(&[
+                ("pair.a", &wm_at(1_700_000_000)),
+                ("pair.b", &wm_at(1_700_000_000)),
+            ])
+            .unwrap();
+
+        // Writer: set BOTH keys to the SAME value in ONE txn (so any consistent
+        // view sees `pair.a == pair.b`) and churn a growth key, so a byte-level
+        // copy is very likely to smear across a commit. redb commits atomically.
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut n: i64 = 0;
+                while !stop.load(O::Relaxed) {
+                    n += 1;
+                    let wm = wm_at(1_700_000_000 + n);
+                    store
+                        .batch_set_watermarks(&[("pair.a", &wm), ("pair.b", &wm)])
+                        .unwrap();
+                    store.set_watermark(&format!("grow.{n}"), &wm).unwrap();
+                }
+            })
+        };
+
+        // Read the correlated pair from a copied/exported redb file. `None` means
+        // the file could not be opened or a key was missing (a torn read).
+        let read_pair = |p: &std::path::Path| -> Option<(WatermarkState, WatermarkState)> {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let db = Database::open(p).ok()?;
+                let txn = db.begin_read().ok()?;
+                let def: TableDefinition<&str, &[u8]> = TableDefinition::new("watermarks");
+                let table = txn.open_table(def).ok()?;
+                let a: WatermarkState =
+                    serde_json::from_slice(table.get("pair.a").ok()??.value()).ok()?;
+                let b: WatermarkState =
+                    serde_json::from_slice(table.get("pair.b").ok()??.value()).ok()?;
+                Some((a, b))
+            }))
+            .unwrap_or(None)
+        };
+
+        // Non-atomic, chunked byte copy: pauses between chunks so the writer's
+        // commits smear across the read — the torn read `std::fs::copy` produces
+        // on the Linux pods where the bug bites.
+        let smeared_copy = |src: &std::path::Path, dst: &std::path::Path| -> std::io::Result<()> {
+            let mut r = std::fs::File::open(src)?;
+            let mut w = std::fs::File::create(dst)?;
+            let mut buf = vec![0u8; 8 * 1024];
+            loop {
+                let n = r.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                w.write_all(&buf[..n])?;
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(())
+        };
+
+        // GREEN — the MVCC snapshot is always internally consistent under load.
+        let mut snapshot_checks = 0usize;
+        for _ in 0..8 {
+            let snap = dir.path().join("snap.redb");
+            let _ = std::fs::remove_file(&snap);
+            store
+                .snapshot_to_excluding(&snap, LOCAL_ONLY_TABLE_NAMES)
+                .unwrap();
+            let (a, b) = read_pair(&snap).expect("the MVCC snapshot always reopens with both keys");
+            assert_eq!(
+                a.last_value, b.last_value,
+                "the MVCC snapshot must never tear the correlated pair"
+            );
+            snapshot_checks += 1;
+        }
+
+        // RED — the naive byte copy tears (unopenable OR a mismatched pair).
+        let mut torn = 0usize;
+        for _ in 0..60 {
+            let raw = dir.path().join("raw.redb");
+            let _ = std::fs::remove_file(&raw);
+            let is_torn = match smeared_copy(&path, &raw) {
+                Ok(()) => match read_pair(&raw) {
+                    Some((a, b)) => a.last_value != b.last_value,
+                    None => true,
+                },
+                Err(_) => true,
+            };
+            if is_torn {
+                torn += 1;
+                if torn >= 3 {
+                    break;
+                }
+            }
+        }
+
+        stop.store(true, O::Relaxed);
+        writer.join().unwrap();
+
+        assert!(snapshot_checks > 0);
+        assert!(
+            torn > 0,
+            "RED demo failed to observe any torn read from a non-atomic byte copy under \
+             writer load ({snapshot_checks} snapshot checks); without an observed tear the \
+             MVCC consistency assertion above is not a real discriminator"
+        );
+    }
+
+    /// `write_epoch` starts at 0 (construction does not bump) and every
+    /// production write method advances it by exactly 1 via `commit_write`.
+    ///
+    /// The EXHAUSTIVE guarantee that no write method skips the epoch is the
+    /// grep-closure (every production `.commit()` in this module routes through
+    /// `commit_write`); this is the behavioral confirmation that `commit_write`
+    /// itself bumps, across both table shapes and both insert + delete paths.
+    #[test]
+    fn write_epoch_bumps_on_production_write_methods() {
+        let (store, _dir) = temp_store();
+        assert_eq!(
+            store.write_epoch(),
+            0,
+            "a freshly opened store starts at epoch 0 — init_db's construction commit \
+             does not bump the epoch"
+        );
+
+        type WriteOp = (&'static str, Box<dyn Fn(&StateStore)>);
+        let ops: Vec<WriteOp> = vec![
+            (
+                "set_watermark",
+                Box::new(|s: &StateStore| s.set_watermark("c.s.t", &wm_at(1)).unwrap()),
+            ),
+            (
+                "batch_set_watermarks",
+                Box::new(|s: &StateStore| {
+                    s.batch_set_watermarks(&[("c.s.u", &wm_at(2))]).unwrap();
+                }),
+            ),
+            (
+                "set_source_marker",
+                Box::new(|s: &StateStore| s.set_source_marker("c.s.t", "m").unwrap()),
+            ),
+            (
+                "record_job",
+                Box::new(|s: &StateStore| s.record_job(&sample_job("j", "running")).unwrap()),
+            ),
+            (
+                "delete_watermark",
+                Box::new(|s: &StateStore| {
+                    s.delete_watermark("c.s.t").unwrap();
+                }),
+            ),
+            (
+                "delete_branch (no-op still commits)",
+                Box::new(|s: &StateStore| {
+                    s.delete_branch("nope").unwrap();
+                }),
+            ),
+            (
+                "delete_schema_cache_entry (no-op still commits)",
+                Box::new(|s: &StateStore| {
+                    s.delete_schema_cache_entry("nope").unwrap();
+                }),
+            ),
+        ];
+
+        let mut expected = 0u64;
+        for (name, op) in &ops {
+            op(&store);
+            expected += 1;
+            assert_eq!(
+                store.write_epoch(),
+                expected,
+                "`{name}` must bump write_epoch by exactly 1"
+            );
+        }
+    }
+
+    /// The safe epoch-capture direction: capturing the epoch BEFORE the read
+    /// snapshot means a write landing between the capture and the read is
+    /// INCLUDED in the snapshot content but recorded under the SMALLER epoch — so
+    /// the recorded epoch is always `<=` the content (a harmless re-upload next
+    /// tick), never `>` it (which would permanently skip a real change).
+    #[test]
+    fn epoch_capture_before_begin_read_is_the_safe_direction() {
+        let (store, dir) = temp_store();
+        store.set_watermark("c.s.a", &wm_at(10)).unwrap();
+
+        let captured = store.write_epoch(); // captured BEFORE the snapshot
+
+        // A write lands after the capture but before the snapshot's begin_read.
+        store.set_watermark("c.s.b", &wm_at(20)).unwrap();
+
+        let dest = dir.path().join("snap.redb");
+        store
+            .snapshot_to_excluding(&dest, LOCAL_ONLY_TABLE_NAMES)
+            .unwrap();
+
+        // The snapshot CONTENT includes the post-capture write...
+        let snap_db = Database::open(&dest).unwrap();
+        let read = snap_db.begin_read().unwrap();
+        let wm_def: TableDefinition<&str, &[u8]> = TableDefinition::new("watermarks");
+        let wm_tbl = read.open_table(wm_def).unwrap();
+        assert!(
+            wm_tbl.get("c.s.b").unwrap().is_some(),
+            "the snapshot content includes the write that landed after the epoch capture"
+        );
+        // ...so the captured epoch is strictly LESS than the content's epoch: the
+        // recorded 'uploaded-through' marker never overstates what shipped.
+        assert!(
+            captured < store.write_epoch(),
+            "captured epoch ({captured}) must be <= the snapshot content epoch ({}) — \
+             the safe direction",
+            store.write_epoch()
+        );
+    }
+
+    /// Lock-free discriminator for the end-of-run finalize (Step 4): once the
+    /// owned `StateStore` is dropped, the state file's writer lock is free, so
+    /// the finalize copy runs against a quiescent, unlocked file. This is a
+    /// genuine RED→GREEN test — the first assertion pins that the lock IS held
+    /// while the store is open, so removing the `drop` makes the second
+    /// assertion (run while the store is still open) FAIL.
+    #[test]
+    fn dropping_store_before_finalize_makes_upload_lock_free() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        let state_store = Some(StateStore::open(&path).unwrap());
+
+        // A terminal write, exactly as the run tail does before finalize.
+        state_store
+            .as_ref()
+            .unwrap()
+            .set_watermark("c.s.t", &wm_at(1_700_000_000))
+            .unwrap();
+
+        // While the store is open the writer lock is held — this guards the
+        // second assertion from being vacuous.
+        assert!(
+            try_acquire_writer_lock(&path).is_err(),
+            "the writer lock must be held while the state store is open"
+        );
+
+        // The drop-before-finalize under test.
+        drop(state_store);
+
+        // Now the end-of-run finalize copy runs lock-free. This assertion FAILS
+        // if the store is still open at finalize (i.e. if the drop is removed).
+        assert!(
+            try_acquire_writer_lock(&path).is_ok(),
+            "after dropping the state store the writer lock is free — the finalize copy \
+             is provably lock-free"
         );
     }
 
