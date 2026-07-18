@@ -196,10 +196,16 @@ impl SqlDialect for TrinoDialect {
         // else — notably numeric → VARCHAR — is rejected, so it degrades to a
         // full refresh instead of failing the run (#1115 / #1157).
         //
-        // Scoped to the Iceberg connector — Trino's common lakehouse target;
-        // other connectors accept a different (often empty) set and would fall
-        // back to a full refresh. Live-verified via the `trino-conformance`
-        // harness against an Iceberg REST catalog.
+        // Scoped to the Iceberg connector — Trino's common lakehouse target.
+        // NOTE: this classifier is connector-BLIND (the dialect can't see which
+        // Trino connector backs the table), so on a non-Iceberg connector an
+        // allowlisted widening is still ATTEMPTED — it emits `SET DATA TYPE` and
+        // the connector either accepts it or errors loudly; it is NOT silently
+        // downgraded to a full refresh. Only widenings OUTSIDE this allowlist
+        // degrade to a full refresh. The set here is Iceberg's (also broadly
+        // accepted by Delta); connector-aware scoping is a follow-up. Live-
+        // verified via the `trino-conformance` harness against an Iceberg REST
+        // catalog.
         let src = normalize_trino_type(source_type);
         let tgt = normalize_trino_type(target_type);
         // Tuple is (target = current type, source = new/incoming type).
