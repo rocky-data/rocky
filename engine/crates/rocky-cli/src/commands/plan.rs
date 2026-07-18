@@ -398,6 +398,18 @@ pub async fn plan(
         .clone()
         .unwrap_or_else(|| models_dir.clone());
     if let Some(model) = run_options.model.as_deref() {
+        // `--model` runs a single compiled model and skips replication;
+        // `--dag` runs every pipeline as a unified DAG (including
+        // replication). The two are contradictory, and the apply-time DAG
+        // runner is flag-light — it ignores the persisted model selector — so
+        // a `--model --dag` plan would apply the whole DAG rather than the
+        // named model (#1171). Reject the combination at plan time instead of
+        // persisting a plan that apply would over-execute.
+        anyhow::ensure!(
+            !run_options.dag,
+            "--model and --dag are mutually exclusive: --model runs a single model and skips \
+             replication, while --dag runs every pipeline as a unified DAG"
+        );
         anyhow::ensure!(
             blueprint_models_dir.exists(),
             "models directory '{}' not found (required for --model)",
@@ -428,13 +440,32 @@ pub async fn plan(
                 run_plan_persisted = true;
             }
             Ok(None) => {
-                // `models/` exists but compile produced zero models —
+                // `models/` exists but compile produced zero models.
+                if let Some(model) = run_options.model.as_deref() {
+                    // `--model` names a transformation model, but the models
+                    // directory compiled to zero models — the requested model
+                    // does not exist. A model-scoped plan must never silently
+                    // degrade to a replication plan (#1171).
+                    anyhow::bail!(
+                        "model '{model}' not found (no transformation model with that name)"
+                    );
+                }
                 // fall through to the replication-plan branch below.
                 tracing::debug!(
                     "`models/` directory has no compiled models — building replication plan instead"
                 );
             }
             Err(e) => {
+                if run_options.model.is_some() {
+                    // A model-scoped plan must never silently degrade to a
+                    // replication plan (#1171): surface the run-plan
+                    // build/persist failure instead of falling through to the
+                    // replication-plan branch below.
+                    return Err(e).context(
+                        "failed to build a model-scoped run plan for --model; \
+                         refusing to fall back to a replication plan",
+                    );
+                }
                 tracing::warn!(
                     error = %e,
                     "failed to build/persist run plan; `rocky apply` will not be available for this invocation"
@@ -443,12 +474,27 @@ pub async fn plan(
         }
     }
 
+    // Structural guard (#1171): a model-scoped plan must never reach the
+    // replication branch. The match arms above already fail on the reachable
+    // zero-model / persist-failure cases with specific messages; this closes
+    // any residual path — e.g. a models-directory TOCTOU that flips the
+    // `exists()` check between the preview and persistence — so replication is
+    // provably unreachable whenever `--model` is set.
+    if run_options.model.is_some() && !run_plan_persisted {
+        anyhow::bail!(
+            "failed to build a model-scoped run plan for --model; \
+             refusing to fall back to a replication plan"
+        );
+    }
+
     // Replication-plan branch — fires when there is no `models/`
     // directory or the directory exists but contains zero compiled
-    // models. The plan_id is content-addressed by the canonical
-    // `RockyConfig` snapshot + the discovered source state (sorted
-    // connectors + tables), so identical inputs produce an identical
-    // plan_id across machines.
+    // models. Never fires when `--model` is set: that path either
+    // persists a model-scoped run plan or errors above (#1171), so a
+    // model-scoped intent can never resolve to replication. The plan_id
+    // is content-addressed by the canonical `RockyConfig` snapshot + the
+    // discovered source state (sorted connectors + tables), so identical
+    // inputs produce an identical plan_id across machines.
     if !run_plan_persisted {
         match build_and_persist_replication_plan(
             &rocky_cfg,
