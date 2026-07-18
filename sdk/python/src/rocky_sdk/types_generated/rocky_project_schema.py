@@ -267,6 +267,22 @@ class CompositeKind(RootModel[CompositeKind1]):
     """
 
 
+class ConcurrencyControl1(StrEnum):
+    """
+    Unconditional last-writer-wins upload (default) — byte-identical to the pre-CAS behaviour. Correct for single-writer-per-prefix deployments (one run at a time, orchestrator-serialized).
+    """
+
+    off = "off"
+
+
+class ConcurrencyControl2(StrEnum):
+    """
+    Compare-and-swap: the end-of-run upload is conditional on the remote object still carrying the generation the run downloaded. A run that lost a cross-pod race fail-closes (nonzero exit) instead of erasing the winner. Requires a backend with a conditional-write object tier (`s3` / `gcs`); auto-downgrades to `off` (with a warn) on other backends.
+    """
+
+    cas = "cas"
+
+
 class ConcurrencyMode1(StrEnum):
     """
     Concurrency strategy: the literal `"adaptive"` for AIMD-based throttling, or a positive integer for fixed concurrency.
@@ -3304,6 +3320,10 @@ class StateConfig(BaseModel):
     """
     Storage backend: local (default), s3, gcs, valkey, or tiered (valkey + s3 fallback)
     """
+    concurrency_control: ConcurrencyControl1 | ConcurrencyControl2 | None = "off"
+    """
+    Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `"cas"` on live multi-pod object-store deployments so a run that lost a cross-pod race fail-closes instead of silently overwriting the winner's committed state. Auto-downgrades to `off` (with a warn) on backends without a conditional-write object tier.
+    """
     freeze_marker_writes: bool | None = False
     """
     Enable writing durable freeze/unfreeze marker objects (under `<prefix>/freeze/` and `<prefix>/unfreeze/`, beside the remote state file) when `rocky policy freeze` / `unfreeze` run against an object-store backend. Marker reading and enforcement are always on wherever a durable object tier exists; this flag gates only the write side, so a fleet can be upgraded to marker readers everywhere before any marker is written. Default `false`. Requires a backend with a durable object tier (`s3`, `gcs`, or `tiered`).
@@ -3883,6 +3903,7 @@ class RockyConfig(BaseModel):
     state: StateConfig | None = Field(
         {
             "backend": "local",
+            "concurrency_control": "off",
             "freeze_marker_writes": False,
             "gcs_bucket": None,
             "gcs_prefix": None,

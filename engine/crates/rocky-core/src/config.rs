@@ -537,6 +537,37 @@ impl std::fmt::Display for StateBackend {
     }
 }
 
+/// Concurrency control for remote `[state]` object writes.
+///
+/// Guards the cross-pod lost update where two runs sharing one `[state]` prefix
+/// race: one downloads the state, the other commits, and the first's end-of-run
+/// upload silently overwrites the second (last-writer-wins). See
+/// [`StateConfig::concurrency_control`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ConcurrencyControl {
+    /// Unconditional last-writer-wins upload (default) — byte-identical to the
+    /// pre-CAS behaviour. Correct for single-writer-per-prefix deployments
+    /// (one run at a time, orchestrator-serialized).
+    #[default]
+    Off,
+    /// Compare-and-swap: the end-of-run upload is conditional on the remote
+    /// object still carrying the generation the run downloaded. A run that lost
+    /// a cross-pod race fail-closes (nonzero exit) instead of erasing the
+    /// winner. Requires a backend with a conditional-write object tier (`s3` /
+    /// `gcs`); auto-downgrades to `off` (with a warn) on other backends.
+    Cas,
+}
+
+impl std::fmt::Display for ConcurrencyControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConcurrencyControl::Off => write!(f, "off"),
+            ConcurrencyControl::Cas => write!(f, "cas"),
+        }
+    }
+}
+
 /// Policy applied when state upload fails after retries + circuit-breaker
 /// are exhausted. See [`StateConfig::on_upload_failure`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
@@ -716,6 +747,15 @@ pub struct StateConfig {
     /// durable object tier (`s3`, `gcs`, or `tiered`).
     #[serde(default)]
     pub freeze_marker_writes: bool,
+
+    /// Concurrency control for remote state writes. Default
+    /// [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte-
+    /// identical to pre-CAS). Set to `"cas"` on live multi-pod object-store
+    /// deployments so a run that lost a cross-pod race fail-closes instead of
+    /// silently overwriting the winner's committed state. Auto-downgrades to
+    /// `off` (with a warn) on backends without a conditional-write object tier.
+    #[serde(default)]
+    pub concurrency_control: ConcurrencyControl,
 }
 
 impl Default for StateConfig {
@@ -736,6 +776,7 @@ impl Default for StateConfig {
             namespacing: StateNamespacing::default(),
             on_schema_mismatch: SchemaMismatchPolicy::default(),
             freeze_marker_writes: false,
+            concurrency_control: ConcurrencyControl::default(),
         }
     }
 }
