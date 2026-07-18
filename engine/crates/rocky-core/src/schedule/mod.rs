@@ -20,7 +20,7 @@ pub mod spawn;
 pub use claim::{
     Bookkeeping, CfDelta, ClaimCas, ClaimRecord, ClaimState, DemandKind, PostAttempt, PreSpawn,
     Resolved, TerminalOutcome, budget_remains, decide_post_attempt, decide_pre_spawn,
-    decide_resolver,
+    decide_resolver, sweep_terminal_claim,
 };
 pub use demand::{
     Catchup, Demand, EvaluatedPipeline, HistoryError, ResolvedSchedule, RunHistoryView, RunSuccess,

@@ -354,6 +354,26 @@ fn terminal_claim(
     }
 }
 
+/// The terminal claim state for an orphaned run, computed DIRECTLY from the
+/// source + outcome — no retry-budget logic.
+///
+/// The stuck-claim sweep uses this instead of [`decide_resolver`]: the resolver
+/// consults the retry budget (`budget_remains(cycle_attempts, retry_max)`), and
+/// a claim whose `cycle_attempts` is a serde-defaulted `0` would take the
+/// `ReleasedBudgetOpen` branch even at `retry_max = 0` (`0 < 1`), leaving the
+/// orphan un-terminalized. An orphan has already run to a terminal outcome, so
+/// it is unconditionally terminal regardless of budget; this computes exactly
+/// that (cron/webhook → completed; standing success → completed, standing
+/// failure/partial → released), so the sweep never leaks a claim.
+pub fn sweep_terminal_claim(
+    current: &ClaimRecord,
+    kind: DemandKind,
+    outcome: TerminalOutcome,
+    now: DateTime<Utc>,
+) -> ClaimRecord {
+    terminal_claim(current, kind, outcome, now)
+}
+
 /// Decide the transition after an in-tick attempt returns with `outcome`.
 ///
 /// A `failure` with budget remaining is an in-tick [`PostAttempt::Retry`]; any

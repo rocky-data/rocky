@@ -23,6 +23,11 @@ pub struct SpawnRequest {
     pub pipeline: String,
     /// The config file to run against (`-c <config>`).
     pub config_path: PathBuf,
+    /// The resolved state-store path, forwarded as `--state-path <path>` so the
+    /// child opens the SAME file the reconciler read demand from. Absolute. An
+    /// explicit `--state-path` disables the child's own namespacing, so parent
+    /// and child converge unconditionally.
+    pub state_path: PathBuf,
     /// The submission id passed as `ROCKY_SUBMISSION_ID`, stamped by the child
     /// into its run record.
     pub submission_id: String,
@@ -72,8 +77,19 @@ impl SubprocessSpawner {
     fn build_command(request: &SpawnRequest) -> tokio::process::Command {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rocky"));
         let mut cmd = tokio::process::Command::new(exe);
+        // Discard the child's stdout: the child runs with `--output json`, so its
+        // own `RunOutput` would otherwise be inherited onto the tick's stdout and
+        // corrupt the tick's `--output json` document (two JSON payloads on one
+        // stream). The tick reads the child's exit code and its persisted run
+        // record, never its stdout. The child's stderr (tracing/logs) is left
+        // inherited so operators still see it.
+        cmd.stdout(std::process::Stdio::null());
+        // `--state-path` is a top-level (non-global) arg, so it must precede the
+        // `run` subcommand token — same position as `-c`.
         cmd.arg("-c")
             .arg(&request.config_path)
+            .arg("--state-path")
+            .arg(&request.state_path)
             .arg("run")
             .arg("--pipeline")
             .arg(&request.pipeline)
@@ -236,5 +252,53 @@ impl Spawner for CapturingSpawner {
             exit_code,
             pid: Some(pid),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--state-path` is a top-level (non-global) `rocky` arg, so it MUST appear
+    /// before the `run` subcommand token, while `--pipeline` is a `run` arg and
+    /// must appear after it. If this ordering regresses, the child silently opens
+    /// a different state file than the reconciler read demand from.
+    #[test]
+    fn build_command_puts_state_path_before_run_and_pipeline_after() {
+        let request = SpawnRequest {
+            pipeline: "raw".to_string(),
+            config_path: PathBuf::from("/proj/rocky.toml"),
+            state_path: PathBuf::from("/proj/models/.rocky-state.redb"),
+            submission_id: "sub-1".to_string(),
+            traceparent: None,
+            timeout: None,
+        };
+        let cmd = SubprocessSpawner::build_command(&request);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        let run_pos = args.iter().position(|a| a == "run").expect("run token");
+        let sp_pos = args
+            .iter()
+            .position(|a| a == "--state-path")
+            .expect("--state-path");
+        let pipe_pos = args
+            .iter()
+            .position(|a| a == "--pipeline")
+            .expect("--pipeline");
+
+        assert!(
+            sp_pos < run_pos,
+            "--state-path must precede `run`: {args:?}"
+        );
+        assert_eq!(
+            args.get(sp_pos + 1).map(String::as_str),
+            Some("/proj/models/.rocky-state.redb"),
+            "--state-path value must follow the flag: {args:?}"
+        );
+        assert!(pipe_pos > run_pos, "--pipeline must follow `run`: {args:?}");
     }
 }
