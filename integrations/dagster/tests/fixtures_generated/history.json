@@ -20,7 +20,8 @@
             "hash_scheme": "v1"
           }
         }
-      ]
+      ],
+      "pipeline": "playground"
     },
     {
       "run_id": "run-SENTINEL",
@@ -40,7 +41,8 @@
             "hash_scheme": "v1"
           }
         }
-      ]
+      ],
+      "pipeline": "playground"
     }
   ],
   "count": 2

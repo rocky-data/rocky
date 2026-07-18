@@ -82,6 +82,10 @@ class RunHistoryRecord(BaseModel):
     Per-model execution details for this run.
     """
     models_executed: conint(ge=0)
+    pipeline: str | None = None
+    """
+    The pipeline this run executed (`rocky run --pipeline <name>`), when recorded. `None` for model-only or backfill runs. Not audit-gated — it is an operational join key, always emitted when present.
+    """
     rocky_version: str | None = None
     """
     `CARGO_PKG_VERSION` of the `rocky` binary, or `"<pre-audit>"` on schema-v5 rows that predate the audit trail.
@@ -93,6 +97,10 @@ class RunHistoryRecord(BaseModel):
     """
     started_at: AwareDatetime
     status: str
+    submission_id: str | None = None
+    """
+    The scheduler submission id — `rocky tick` stamps it via `ROCKY_SUBMISSION_ID`, so this is the join key to a tick's `TickOutput.executed[].submission_id`. `None` for manually launched runs.
+    """
     target_catalog: str | None = None
     """
     Best-available target catalog — the `catalog_template` for replication pipelines, the literal `target.catalog` for transformation/quality/snapshot/load.

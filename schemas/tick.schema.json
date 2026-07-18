@@ -1,0 +1,305 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ExecutedRunOutput": {
+      "description": "One demand that executed to a terminal outcome this tick.",
+      "properties": {
+        "attempts": {
+          "description": "Total submissions made for this demand (the claim's monotonic audit counter): `1` unless in-tick retries fired.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "exit_code": {
+          "description": "The child's exit code: `0` success, `2` partial, `1`/other failure.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "logical_ts": {
+          "description": "The logical timestamp of the demand.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "outcome": {
+          "description": "The mapped terminal outcome: `success` | `partial` | `failure`.",
+          "type": "string"
+        },
+        "pipeline": {
+          "description": "The pipeline that ran.",
+          "type": "string"
+        },
+        "source": {
+          "description": "The source that made it due: `cron` | `after` | `freshness` | `webhook`.",
+          "type": "string"
+        },
+        "submission_id": {
+          "description": "The submission id of the recorded attempt — the precise join key between this demand and *its* run record (`rocky history` shows the same id). This is the reconciler's demand↔run identity; there is no separate `run_id` field because a run is joined to its demand by `submission_id`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "attempts",
+        "exit_code",
+        "logical_ts",
+        "outcome",
+        "pipeline",
+        "source",
+        "submission_id"
+      ],
+      "type": "object"
+    },
+    "PipelineDemandStatus": {
+      "description": "One pipeline's demand evaluation this tick.",
+      "properties": {
+        "due": {
+          "description": "Whether any source made the pipeline due this tick.",
+          "type": "boolean"
+        },
+        "due_source": {
+          "description": "The source that made it due (`cron` | `after` | `freshness` | `webhook`), when `due` is true.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logical_ts": {
+          "description": "The logical timestamp of the due demand (the cron occurrence, the max upstream-success time, or the staleness-breach detection time), when `due` is true.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pipeline": {
+          "description": "The pipeline name.",
+          "type": "string"
+        },
+        "sources": {
+          "description": "Per-source outcome for every source considered (the due source included, with reason `due`).",
+          "items": {
+            "$ref": "#/definitions/SourceEvaluation"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "due",
+        "pipeline",
+        "sources"
+      ],
+      "type": "object"
+    },
+    "SkippedDemandOutput": {
+      "description": "One demand suppressed this tick.",
+      "properties": {
+        "missed": {
+          "description": "Number of missed cron occurrences — present for `catchup_skipped`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pipeline": {
+          "description": "The pipeline the skip belongs to. `None` for a whole-tick skip (`tick_in_progress`, `state_busy`), which is not tied to a single pipeline.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "Why it was skipped: `not_due` | `disabled` | `in_flight` | `tick_in_progress` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `dedup` | `history_unavailable` | `state_busy`.",
+          "type": "string"
+        },
+        "resume_at": {
+          "description": "When the demand becomes eligible again — present for `failure_backoff` and `partial_backoff`.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "The demand source, when the skip is source-specific: `cron` | `after` | `freshness` | `webhook`. `None` for a pipeline- or tick-level skip.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
+    "SourceEvaluation": {
+      "description": "One demand source's outcome within a pipeline's evaluation.",
+      "properties": {
+        "missed": {
+          "description": "Number of missed cron occurrences — present for `catchup_skipped`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "reason": {
+          "description": "The reason string for this source: `due` | `not_due` | `disabled` | `catchup_skipped` | `failure_backoff` | `partial_backoff` | `superseded` | `history_unavailable`.",
+          "type": "string"
+        },
+        "resume_at": {
+          "description": "When the source becomes eligible again — present for `failure_backoff` and `partial_backoff`.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "The demand source: `cron` | `after` | `freshness` | `webhook`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "source"
+      ],
+      "type": "object"
+    },
+    "TickCounts": {
+      "description": "Roll-up counts for a tick.",
+      "properties": {
+        "due": {
+          "description": "Pipelines found due.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "evaluated": {
+          "description": "Pipelines evaluated this tick.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "executed": {
+          "description": "Demands executed to a terminal outcome.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "failed": {
+          "description": "Executed runs that failed (exit 1/other).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "partial": {
+          "description": "Executed runs that were partial (exit 2).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "skipped": {
+          "description": "Demands suppressed (the length of `skipped`).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "succeeded": {
+          "description": "Executed runs that succeeded (exit 0).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "due",
+        "evaluated",
+        "executed",
+        "failed",
+        "partial",
+        "skipped",
+        "succeeded"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output for `rocky tick` — one demand-reconciliation pass.\n\nA tick evaluates every scheduled pipeline's standing demand once, runs what is due (sequentially, via child `rocky run` processes), and records the outcome. This payload is the machine surface: an orchestration wrapper (a systemd timer, cron, CI) reads it to see what ran, what was suppressed, and why.\n\n**Honesty note:** exit code `0` does NOT mean the estate is healthy. A pipeline sitting in `failure_backoff`/`partial_backoff` produces quiet exit-`0` ticks after the tick that first observed its failure. Exit codes alert on *this tick's* work; ongoing sickness is carried by the `skipped` reasons + `counts` here and the `consecutive_failures` metric. Alert on those, not on exit codes alone.\n\nThe feature is **experimental** while the native reconciler soaks.",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "counts": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/TickCounts"
+        }
+      ],
+      "description": "Roll-up counts across `evaluated`/`executed`/`skipped`."
+    },
+    "dry_run": {
+      "description": "True when invoked with `--dry-run`: demand was evaluated and reported, but nothing executed and no state was written.",
+      "type": "boolean"
+    },
+    "duration_ms": {
+      "description": "Wall-clock duration of the whole tick, including child run time.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "evaluated": {
+      "description": "Per-pipeline evaluation: the demand sources considered, whether the pipeline was due, and the per-source reason.",
+      "items": {
+        "$ref": "#/definitions/PipelineDemandStatus"
+      },
+      "type": "array"
+    },
+    "executed": {
+      "description": "Demands that ran to a terminal outcome this tick, in execution order.",
+      "items": {
+        "$ref": "#/definitions/ExecutedRunOutput"
+      },
+      "type": "array"
+    },
+    "lock_overridden": {
+      "description": "True when this tick proceeded via the wedge override — it found the tick lock held but its heartbeat stale past the takeover window, so it ran without the lock and leaned on the claim state machine for correctness. Surfaced loudly because it signals a wedged prior reconciler.",
+      "type": "boolean"
+    },
+    "now": {
+      "description": "The instant the tick evaluated demand against (`--now`, or the wall clock). Echoed for determinism and audit — occurrence math, `after`, and freshness are all resolved as of this instant.",
+      "format": "date-time",
+      "type": "string"
+    },
+    "skipped": {
+      "description": "Demands suppressed this tick, each with a stable reason string.",
+      "items": {
+        "$ref": "#/definitions/SkippedDemandOutput"
+      },
+      "type": "array"
+    },
+    "tick_in_progress": {
+      "description": "True when the whole tick was skipped because a live reconciler already held the tick lock (a `tick_in_progress` skip is also emitted in `skipped`). The CLI still exits `0`.",
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "counts",
+    "dry_run",
+    "duration_ms",
+    "evaluated",
+    "executed",
+    "lock_overridden",
+    "now",
+    "skipped",
+    "tick_in_progress",
+    "version"
+  ],
+  "title": "TickOutput",
+  "type": "object"
+}

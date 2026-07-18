@@ -135,6 +135,16 @@ export type { ClearSchemaCacheOutput } from "./state_clear_schema_cache";
 // Test (canonical source for TestFailure)
 export type { TestOutput, TestFailure } from "./test";
 
+// Tick (schedule demand reconciler)
+export type {
+  TickOutput,
+  PipelineDemandStatus,
+  SourceEvaluation,
+  ExecutedRunOutput,
+  SkippedDemandOutput,
+  TickCounts,
+} from "./tick";
+
 // Compare
 export type { CompareOutput, TableCompareResult } from "./compare";
 

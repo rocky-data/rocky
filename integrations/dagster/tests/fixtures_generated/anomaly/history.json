@@ -20,7 +20,8 @@
             "hash_scheme": "v1"
           }
         }
-      ]
+      ],
+      "pipeline": "poc"
     },
     {
       "run_id": "run-SENTINEL",
@@ -40,7 +41,8 @@
             "hash_scheme": "v1"
           }
         }
-      ]
+      ],
+      "pipeline": "poc"
     },
     {
       "run_id": "run-SENTINEL",
@@ -60,7 +62,8 @@
             "hash_scheme": "v1"
           }
         }
-      ]
+      ],
+      "pipeline": "poc"
     },
     {
       "run_id": "run-SENTINEL",
@@ -80,7 +83,8 @@
             "hash_scheme": "v1"
           }
         }
-      ]
+      ],
+      "pipeline": "poc"
     }
   ],
   "count": 4

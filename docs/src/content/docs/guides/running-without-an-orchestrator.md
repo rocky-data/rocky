@@ -276,7 +276,100 @@ rocky history --since 2026-03-01    # runs on or after a date
 rocky history --audit               # include the governance audit trail
 ```
 
-The `status` column tells partial from total after the fact (`Success`, `PartialFailure`, `Failure`), and `trigger` records how the run was started (CLI runs currently record `manual`). Combined with `rocky run --resume-latest` for replication pipelines, this is enough to see what a scheduled run did overnight and pick up a failed one where it left off.
+The `status` column tells partial from total after the fact (`Success`, `PartialFailure`, `Failure`), and `trigger` records how the run was started — a direct `rocky run` shows `"trigger": "Manual"`, and a run launched by `rocky tick` (below) shows `"trigger": "Schedule"`, joined to the tick that started it by a shared `submission_id`. Combined with `rocky run --resume-latest` for replication pipelines, this is enough to see what a scheduled run did overnight and pick up a failed one where it left off.
+
+## Native scheduling with `rocky tick` (experimental)
+
+Everything above drives `rocky run` from a timer and lets the timer decide *which* pipeline runs *when*. `rocky tick` moves that decision into `rocky.toml`: each pipeline declares its own demand — a `cron` schedule, an `after` dependency, or a `freshness` budget — and a single `rocky tick` evaluates all of it at once and runs what is due.
+
+There is still no daemon. The tick itself comes from the same cron or systemd timer you already have; you just point the timer at `rocky tick` on a short interval instead of at one specific `rocky run`. A one-minute timer turns the declarations below into SLO, cron, and dependency scheduling with nothing resident.
+
+This is **experimental** while the reconciler soaks. External orchestrators stay first-class — if you run Dagster or Airflow today, keep them.
+
+Scheduling is supported on `replication`, `transformation`, `quality`, and `snapshot` pipelines. `load` pipelines cannot participate yet — a load re-ingests every discovered file on each run rather than incrementally, so scheduling one would duplicate data, and it records no run the scheduler can observe. `rocky validate` rejects a scheduled load and rejects an `after` that references a load. Native load scheduling is a planned follow-up.
+
+### Declare demand in the pipeline
+
+```toml
+# rocky.toml
+[pipeline.raw]
+type = "replication"
+# ...adapter, source, target...
+[pipeline.raw.schedule]
+cron = "0 3 * * *"          # run at 03:00
+timezone = "Europe/Lisbon"  # IANA name; default is the project [schedule].timezone, else UTC
+
+[pipeline.staging]
+type = "transformation"
+models = "models/**"
+[pipeline.staging.schedule]
+after = ["raw"]             # run once raw has a newer success than staging's last
+```
+
+`cron`, `after`, and `freshness` can combine on one pipeline — any source being due makes it due. See the [`[pipeline.*.schedule]` reference](/reference/configuration/#pipelinenameschedule) for every key, the catch-up policy, and the freshness semantics.
+
+### Drive it from a one-minute timer
+
+```bash
+# /etc/cron.d/rocky-tick
+# Evaluate all standing demand every minute. flock makes a still-running tick
+# skip the next one rather than stacking a second reconciler on top.
+* * * * *  analytics  cd /srv/analytics && flock -n /var/lock/rocky-tick.lock rocky tick --output json >> /var/log/rocky/tick.log 2>&1
+```
+
+Or a systemd timer:
+
+```ini
+# /etc/systemd/system/rocky-tick.timer
+[Unit]
+Description=Evaluate Rocky schedule demand every minute
+
+[Timer]
+OnCalendar=*:0/1
+# Do not stack ticks if one runs long.
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+```
+
+```ini
+# /etc/systemd/system/rocky-tick.service
+[Unit]
+Description=Rocky demand reconciler tick
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/analytics
+ExecStart=/usr/local/bin/rocky tick --output json
+# Exit 2 (a due run failed or was partial) is not a unit failure — the wrapper
+# below routes it. Total failures (exit 1) still trip OnFailure.
+SuccessExitStatus=2
+```
+
+`rocky tick` takes its own non-blocking lock (`.rocky/tick.lock`, next to your config), so two ticks never reconcile at once even if a run outlives its interval — the outer `flock` above is just a cheap early skip.
+
+### One scheduler instance per project
+
+Run exactly one `rocky tick` timer per project, meaning per state file. All of the tick's mutual exclusion is local to one machine: the `.rocky/tick.lock` flock and the state store's own writer lock both live on that host's filesystem and cannot see a second host. Scheduler state (the cursor and claim tables) is deliberately local-only as well — a remote `[state]` backend (S3, GCS, Valkey, tiered) never uploads it and a download never overwrites it — so two hosts ticking the same project each keep an independent cursor and would both fire the same occurrence. Remote state is last-writer-wins today (there is no cross-host compare-and-swap yet), so there is no fence to lean on across machines. If you need timers on several hosts, give each host its own project and state file, or keep a single timer and let the other hosts invoke `rocky run` directly.
+
+### Preview before you wire the timer
+
+`rocky tick --dry-run` evaluates demand and reports exactly what *would* run, executing nothing and writing no state. Use it to confirm a new schedule does what you expect:
+
+```bash
+rocky tick --dry-run --now 2026-05-02T03:00:00Z --output json
+```
+
+`--now` pins the evaluation instant (RFC3339) so you can preview a future occurrence or a catch-up window deterministically; omit it and the tick uses the wall clock.
+
+### Exit codes and honest alerting
+
+`rocky tick` reuses the exit-code contract above: `0` when nothing was due or every run it launched succeeded, `2` when at least one launched run failed or came back partial, `1` when the tick could not proceed at all (invalid config, unopenable state — it runs nothing and fails closed). The same `rocky-run.sh` routing works unchanged.
+
+One honesty note worth internalizing: **exit `0` does not mean the estate is healthy.** After the tick that first observes a failure, a broken pipeline goes into `failure_backoff` — subsequent ticks correctly *skip* it (so they do not hammer it every minute) and therefore exit `0`. The ongoing problem lives in the tick's JSON, not its exit code: each suppressed demand appears in `skipped[]` with a reason (`failure_backoff`, `partial_backoff`) and a `resume_at`, and `counts` plus the `consecutive_failures` metric carry the running total. Alert on those, and on the [scheduler metrics](/guides/observability/), not on exit codes alone.
+
+A tick can also come back exit `0` having done nothing because another `rocky` process — a manual `rocky run`, or its own child from a still-running prior tick — held the state store when it tried to open it. That shows up as a single `state_busy` entry in `skipped[]`. One is normal contention and self-heals on the next tick; a `state_busy` on every tick for many minutes means a wedged writer holding the store, and is worth an alert.
 
 ## Where to go next
 

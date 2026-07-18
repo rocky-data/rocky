@@ -3311,6 +3311,31 @@ impl StateStore {
         Ok(removed)
     }
 
+    /// Every schedule claim as `(key, record)` pairs, read-only.
+    ///
+    /// Backs the tick's stuck-claim sweep: a `submitted` claim that outlived the
+    /// tick that created it is one whose terminal transaction never committed —
+    /// a reopen-after-child contention, or a crash between the child writing its
+    /// run record and the parent recording the outcome. The sweep enumerates
+    /// these and resolves each by the run-record join, independent of whether
+    /// the demand is due again (a cron occurrence advances its anchor on
+    /// submission, so its claim would otherwise never be re-evaluated).
+    pub fn list_schedule_claims(
+        &self,
+    ) -> Result<Vec<(String, crate::schedule::claim::ClaimRecord)>, StateError> {
+        use crate::schedule::claim::ClaimRecord;
+
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(SCHEDULE_CLAIMS)?;
+        let mut out = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let claim: ClaimRecord = serde_json::from_slice(value.value())?;
+            out.push((key.value().to_string(), claim));
+        }
+        Ok(out)
+    }
+
     /// Test-only: write a byte blob under a `run_history` key that is not valid
     /// `RunRecord` JSON, so a later scan (`latest_successful_run` /
     /// `find_terminal_run_by_submission_id`) hits a deserialization error. Used

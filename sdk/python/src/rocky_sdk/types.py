@@ -1247,6 +1247,7 @@ from .types_generated import (  # noqa: E402, F401
     EdgeConfidence,
     EnvMaskingStatus,
     ErrorEnvelope,
+    ExecutedRunOutput,
     FailedSourceOutput,
     FreshnessConfigOutput,
     GcApplyOutput,
@@ -1273,6 +1274,7 @@ from .types_generated import (  # noqa: E402, F401
     PermissionSummary,
     PerModelCostHistorical,
     PhaseTimings,
+    PipelineDemandStatus,
     PlanOutput,
     PreviewColumnTypeChange,
     PreviewCopiedModel,
@@ -1302,6 +1304,8 @@ from .types_generated import (  # noqa: E402, F401
     RunHistoryRecord,
     RunOutput,
     SignatureAlgorithm,
+    SkippedDemandOutput,
+    SourceEvaluation,
     SourceOutput,
     StatementResult,
     StateOutput,
@@ -1312,6 +1316,8 @@ from .types_generated import (  # noqa: E402, F401
     TestAdapterTestResult,
     TestFailure,
     TestOutput,
+    TickCounts,
+    TickOutput,
 )
 
 # Run-output nested types used to backfill the hand-written run models so the
@@ -1331,6 +1337,9 @@ from .types_generated.run_schema import (  # noqa: E402, F401
 DagResult = DagOutput
 DagNode = DagNodeOutput
 DagEdge = DagEdgeOutput
+
+# Python-flavored bridge alias for the tick reconciler output.
+TickResult = TickOutput
 
 # Soft-swap aliases — the hand-written ``HistoryResult`` /
 # ``ModelHistoryResult`` above diverged from what the Rust CLI emits (they
@@ -1461,6 +1470,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "validate-migration": ValidateMigrationResult,
     "doctor": DoctorResult,
     "dag": DagResult,
+    "tick": TickOutput,
     "compliance": ComplianceOutput,
     "retention-status": RetentionStatusOutput,
     "catalog": CatalogOutput,
