@@ -347,6 +347,12 @@ export type Dialect = "databricks" | "snowflake" | "bigquery" | "duckdb";
  */
 export type StateBackend = "local" | "s3" | "gcs" | "valkey" | "tiered";
 /**
+ * Concurrency control for remote `[state]` object writes.
+ *
+ * Guards the cross-pod lost update where two runs sharing one `[state]` prefix race: one downloads the state, the other commits, and the first's end-of-run upload silently overwrites the second (last-writer-wins). See [`StateConfig::concurrency_control`].
+ */
+export type ConcurrencyControl = "off" | "cas";
+/**
  * Policy controlling which terminal outcomes count for [`IdempotencyConfig::dedup_on`].
  */
 export type DedupPolicy = "success" | "any";
@@ -2208,6 +2214,10 @@ export interface StateConfig {
    * Storage backend: local (default), s3, gcs, valkey, or tiered (valkey + s3 fallback)
    */
   backend?: StateBackend & string;
+  /**
+   * Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `"cas"` on live multi-pod object-store deployments so a run that lost a cross-pod race fail-closes instead of silently overwriting the winner's committed state. Auto-downgrades to `off` (with a warn) on backends without a conditional-write object tier.
+   */
+  concurrency_control?: ConcurrencyControl & string;
   /**
    * Enable writing durable freeze/unfreeze marker objects (under `<prefix>/freeze/` and `<prefix>/unfreeze/`, beside the remote state file) when `rocky policy freeze` / `unfreeze` run against an object-store backend. Marker reading and enforcement are always on wherever a durable object tier exists; this flag gates only the write side, so a fleet can be upgraded to marker readers everywhere before any marker is written. Default `false`. Requires a backend with a durable object tier (`s3`, `gcs`, or `tiered`).
    */

@@ -30,7 +30,7 @@ use rocky_core::freeze_marker::{
     FreezeMarker, FreezeMarkerError, UnfreezeMarker, load_active_marker_freezes,
     write_freeze_marker, write_unfreeze_marker,
 };
-use rocky_core::object_store::{ObjectStoreProvider, PutIfNotExistsOutcome};
+use rocky_core::object_store::{ObjectStoreProvider, PutIfMatchOutcome, PutIfNotExistsOutcome};
 use rocky_core::state::StateStore;
 use rocky_core::state_sync::{download_state, upload_state};
 use rocky_ir::WatermarkState;
@@ -274,4 +274,92 @@ async fn live_freeze_marker_list_create_roundtrip() {
         }
         Err(e) => eprintln!("cleanup: failed to list {run_prefix}: {e}"),
     }
+}
+
+/// The compare-and-swap primitive against a real bucket — the S3-wire receipt
+/// for `concurrency_control = "cas"`, the path the InMemory harness cannot
+/// prove (ETag threading, `If-Match`, `PutResult` → new generation): a
+/// create-if-absent bootstrap, a matching-base conditional overwrite, and a
+/// stale-base conflict that never overwrites the winner.
+///
+/// Runs against any S3-compatible endpoint the AWS env chain resolves — real
+/// AWS, or a local MinIO (`AWS_ENDPOINT` + `AWS_ALLOW_HTTP=true` +
+/// path-style).
+#[tokio::test]
+#[ignore]
+async fn live_put_if_match_cas_roundtrip() {
+    let _serial = live_serial();
+    let Some(live) = live_s3_from_env() else {
+        eprintln!("SKIP live_put_if_match_cas_roundtrip: ROCKY_TEST_S3_* env not set");
+        return;
+    };
+    let provider = ObjectStoreProvider::from_uri(&format!("s3://{}/{}", live.bucket, live.prefix))
+        .expect("live provider");
+    let key = format!("cas-probe-{}", unique_suffix());
+
+    // 1. Bootstrap: create-if-absent commits, yields the first generation.
+    let PutIfMatchOutcome::Committed(g0) = provider
+        .put_if_match(&key, Bytes::from_static(b"v0"), None)
+        .await
+        .expect("bootstrap put")
+    else {
+        panic!("first CAS write must commit against an absent key");
+    };
+
+    // 2. A second bootstrap against the now-present key conflicts (no overwrite).
+    assert_eq!(
+        provider
+            .put_if_match(&key, Bytes::from_static(b"v0b"), None)
+            .await
+            .expect("bootstrap race put"),
+        PutIfMatchOutcome::Conflict,
+        "a concurrent first-writer must conflict, not blind-overwrite"
+    );
+
+    // 3. Matching base commits and advances the generation.
+    let PutIfMatchOutcome::Committed(g1) = provider
+        .put_if_match(&key, Bytes::from_static(b"v1"), Some(&g0))
+        .await
+        .expect("matching-base put")
+    else {
+        panic!("matching-base CAS must commit");
+    };
+    assert_ne!(g0, g1, "a committed write advances the generation");
+
+    // 4. Stale base (g0, superseded by g1) conflicts — the winner's bytes stand.
+    assert_eq!(
+        provider
+            .put_if_match(&key, Bytes::from_static(b"v2"), Some(&g0))
+            .await
+            .expect("stale-base put"),
+        PutIfMatchOutcome::Conflict,
+        "a stale base must conflict"
+    );
+    assert_eq!(
+        provider.get(&key).await.expect("read back").as_ref(),
+        b"v1",
+        "the losing CAS must not have overwritten the winner"
+    );
+
+    // 5. A base captured via download_file_capturing_version CAS-matches the live object.
+    let out = tempfile::tempdir().unwrap();
+    let out_path = out.path().join("dl");
+    let base = provider
+        .download_file_capturing_version(&key, &out_path)
+        .await
+        .expect("download capturing version")
+        .expect("S3 surfaces an ETag");
+    assert!(
+        matches!(
+            provider
+                .put_if_match(&key, Bytes::from_static(b"v3"), Some(&base))
+                .await
+                .expect("cas after download"),
+            PutIfMatchOutcome::Committed(_)
+        ),
+        "the base captured from download must CAS-match the live object"
+    );
+
+    let _ = provider.delete(&key).await;
+    println!("OK: S3 CAS roundtrip (bootstrap + match + stale-conflict + download-base) verified");
 }

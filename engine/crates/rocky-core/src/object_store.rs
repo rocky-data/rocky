@@ -89,6 +89,50 @@ pub enum PutIfNotExistsOutcome {
     AlreadyExists,
 }
 
+/// An object's version identity, for compare-and-swap writes.
+///
+/// Captured from the read that seeds a writer's *base*, then presented on the
+/// writer's next write so the store rejects it ([`PutIfMatchOutcome::Conflict`])
+/// if another writer committed in between. S3/Azure key on `e_tag` (`If-Match`),
+/// GCS on `version` (`x-goog-if-generation-match`) — both are carried so the
+/// primitive stays backend-agnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Generation {
+    /// Entity tag (S3 / Azure).
+    pub e_tag: Option<String>,
+    /// Version / generation id (GCS).
+    pub version: Option<String>,
+}
+
+impl Generation {
+    fn to_update_version(&self) -> object_store::UpdateVersion {
+        object_store::UpdateVersion {
+            e_tag: self.e_tag.clone(),
+            version: self.version.clone(),
+        }
+    }
+
+    fn from_put_result(result: &object_store::PutResult) -> Self {
+        Self {
+            e_tag: result.e_tag.clone(),
+            version: result.version.clone(),
+        }
+    }
+}
+
+/// Outcome of a compare-and-swap write
+/// ([`put_if_match`](ObjectStoreProvider::put_if_match)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PutIfMatchOutcome {
+    /// The write committed. Carries the NEW [`Generation`] the caller must
+    /// CAS against on its next write.
+    Committed(Generation),
+    /// Another writer committed since the base was read; no bytes were
+    /// written. The caller must re-read and decide (refuse, or replay a
+    /// single ledger record onto the winner's object).
+    Conflict,
+}
+
 /// Wraps an [`ObjectStore`] with a root path, providing a simple async API for
 /// reading and writing objects.
 ///
@@ -315,7 +359,41 @@ impl ObjectStoreProvider {
         local_path: &Path,
     ) -> ObjectStoreResult<()> {
         let bytes = self.get(relative_path).await?;
+        self.atomic_write(&bytes, local_path).await
+    }
 
+    /// Download an object, capturing its [`Generation`] from the same read.
+    ///
+    /// Like [`download_file`](Self::download_file) but returns the object's
+    /// version identity (S3 ETag / GCS generation) from the SAME GET that
+    /// fetched the bytes — never a separate HEAD, which would open a TOCTOU
+    /// between reading the version and reading the bytes the writer will
+    /// mutate. Returns `None` when the backend surfaces no version metadata.
+    pub async fn download_file_capturing_version(
+        &self,
+        relative_path: &str,
+        local_path: &Path,
+    ) -> ObjectStoreResult<Option<Generation>> {
+        let path = self.absolute_path(relative_path);
+        debug!(path = %path, "object_store download_file_capturing_version");
+        let result = self.store.get(&path).await?;
+        let generation = {
+            let meta = &result.meta;
+            (meta.e_tag.is_some() || meta.version.is_some()).then(|| Generation {
+                e_tag: meta.e_tag.clone(),
+                version: meta.version.clone(),
+            })
+        };
+        let bytes = result.bytes().await?;
+        self.atomic_write(&bytes, local_path).await?;
+        Ok(generation)
+    }
+
+    /// Atomically publish `bytes` to `local_path` via a same-directory temp
+    /// file + `rename` (POSIX rename is atomic within a filesystem), so a
+    /// reader never observes a half-written file. Writing in place would leave
+    /// a corrupt `state.redb` if the process died mid-write.
+    async fn atomic_write(&self, bytes: &[u8], local_path: &Path) -> ObjectStoreResult<()> {
         let parent = local_path.parent().unwrap_or_else(|| Path::new("."));
         let file_name = local_path
             .file_name()
@@ -335,13 +413,77 @@ impl ObjectStoreProvider {
         );
         let tmp_path = parent.join(unique);
 
-        tokio::fs::write(&tmp_path, &bytes).await?;
+        tokio::fs::write(&tmp_path, bytes).await?;
         // Atomic publish. On failure, best-effort clean up the temp file.
         if let Err(e) = tokio::fs::rename(&tmp_path, local_path).await {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
         Ok(())
+    }
+
+    /// Compare-and-swap write — the primitive behind `[state]
+    /// concurrency_control = "cas"`.
+    ///
+    /// - `expected = None` → create-if-absent ([`PutMode::Create`],
+    ///   `If-None-Match: *`); a concurrent first writer yields
+    ///   [`PutIfMatchOutcome::Conflict`]. This path is used only for the
+    ///   first-ever write to an empty key — it must **never** fall through to
+    ///   an unconditional put, which would reintroduce the lost update this
+    ///   primitive exists to prevent.
+    /// - `expected = Some(gen)` → conditional overwrite ([`PutMode::Update`],
+    ///   `If-Match: <etag>`); a base that no longer matches the object yields
+    ///   `Conflict`.
+    ///
+    /// On success returns [`PutIfMatchOutcome::Committed`] carrying the new
+    /// [`Generation`] so the caller can advance its base for a subsequent
+    /// write. A backend / transport error is returned as `Err` and is **never**
+    /// reported as a `Conflict` — only the store's own precondition failure is.
+    pub async fn put_if_match(
+        &self,
+        relative_path: &str,
+        data: Bytes,
+        expected: Option<&Generation>,
+    ) -> ObjectStoreResult<PutIfMatchOutcome> {
+        let path = self.absolute_path(relative_path);
+        let mode = match expected {
+            Some(base) => PutMode::Update(base.to_update_version()),
+            None => PutMode::Create,
+        };
+        debug!(
+            path = %path,
+            size = data.len(),
+            conditional = expected.is_some(),
+            "object_store put_if_match"
+        );
+        let opts = PutOptions {
+            mode,
+            ..Default::default()
+        };
+        match self.store.put_opts(&path, data.into(), opts).await {
+            Ok(result) => Ok(PutIfMatchOutcome::Committed(Generation::from_put_result(
+                &result,
+            ))),
+            // `Precondition` = failed `If-Match` (steady-state CAS miss);
+            // `AlreadyExists` = failed `If-None-Match: *` (bootstrap race).
+            // Both mean another writer won — a conflict, not an error.
+            Err(object_store::Error::Precondition { .. })
+            | Err(object_store::Error::AlreadyExists { .. }) => Ok(PutIfMatchOutcome::Conflict),
+            Err(e) => Err(ObjectStoreError::Backend(e)),
+        }
+    }
+
+    /// Upload a local file with compare-and-swap semantics — see
+    /// [`put_if_match`](Self::put_if_match).
+    pub async fn upload_file_if_match(
+        &self,
+        local_path: &Path,
+        relative_path: &str,
+        expected: Option<&Generation>,
+    ) -> ObjectStoreResult<PutIfMatchOutcome> {
+        let data = tokio::fs::read(local_path).await?;
+        self.put_if_match(relative_path, Bytes::from(data), expected)
+            .await
     }
 
     /// List objects under a relative prefix, returning their paths relative to
@@ -457,6 +599,77 @@ mod tests {
         // Original value preserved — second call was a no-op.
         let stored = provider.get("claim-key").await.unwrap();
         assert_eq!(stored.as_ref(), b"first");
+    }
+
+    #[tokio::test]
+    async fn put_if_match_create_conflicts_on_second_bootstrap() {
+        let provider = ObjectStoreProvider::in_memory();
+        let first = provider
+            .put_if_match("state", Bytes::from_static(b"v0"), None)
+            .await
+            .unwrap();
+        assert!(matches!(first, PutIfMatchOutcome::Committed(_)));
+        // A second create against the now-existing key is a bootstrap-race loss,
+        // NOT a blind overwrite.
+        let second = provider
+            .put_if_match("state", Bytes::from_static(b"v0b"), None)
+            .await
+            .unwrap();
+        assert_eq!(second, PutIfMatchOutcome::Conflict);
+        assert_eq!(provider.get("state").await.unwrap().as_ref(), b"v0");
+    }
+
+    #[tokio::test]
+    async fn put_if_match_updates_on_matching_base_conflicts_on_stale() {
+        let provider = ObjectStoreProvider::in_memory();
+        let PutIfMatchOutcome::Committed(g0) = provider
+            .put_if_match("state", Bytes::from_static(b"v0"), None)
+            .await
+            .unwrap()
+        else {
+            panic!("first write should commit");
+        };
+
+        // Matching base → commits, yields a fresh generation.
+        let PutIfMatchOutcome::Committed(g1) = provider
+            .put_if_match("state", Bytes::from_static(b"v1"), Some(&g0))
+            .await
+            .unwrap()
+        else {
+            panic!("matching-base write should commit");
+        };
+        assert_ne!(g0, g1, "a committed write advances the generation");
+        assert_eq!(provider.get("state").await.unwrap().as_ref(), b"v1");
+
+        // Stale base (g0, superseded by g1) → conflict, no write.
+        let stale = provider
+            .put_if_match("state", Bytes::from_static(b"v2"), Some(&g0))
+            .await
+            .unwrap();
+        assert_eq!(stale, PutIfMatchOutcome::Conflict);
+        assert_eq!(provider.get("state").await.unwrap().as_ref(), b"v1");
+    }
+
+    #[tokio::test]
+    async fn download_file_capturing_version_yields_a_cas_matchable_base() {
+        let provider = ObjectStoreProvider::in_memory();
+        provider
+            .put_if_match("state", Bytes::from_static(b"seed"), None)
+            .await
+            .unwrap();
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let base = provider
+            .download_file_capturing_version("state", out.path())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(out.path()).unwrap(), b"seed");
+        // The base captured from the download must CAS-match the live object.
+        let base = base.expect("in-memory backend surfaces a version");
+        let committed = provider
+            .put_if_match("state", Bytes::from_static(b"next"), Some(&base))
+            .await
+            .unwrap();
+        assert!(matches!(committed, PutIfMatchOutcome::Committed(_)));
     }
 
     #[tokio::test]

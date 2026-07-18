@@ -16,8 +16,10 @@ use thiserror::Error;
 use tracing::{Instrument, debug, info, info_span, warn};
 
 use crate::circuit_breaker::TransitionOutcome;
-use crate::config::{RetryConfig, StateBackend, StateConfig, StateUploadFailureMode};
-use crate::object_store::{ObjectStoreError, ObjectStoreProvider};
+use crate::config::{
+    ConcurrencyControl, RetryConfig, StateBackend, StateConfig, StateUploadFailureMode,
+};
+use crate::object_store::{Generation, ObjectStoreError, ObjectStoreProvider, PutIfMatchOutcome};
 use crate::redacted::RedactedString;
 use crate::retry::compute_backoff;
 use crate::retry_budget::RetryBudget;
@@ -59,6 +61,12 @@ pub enum StateSyncError {
 
     #[error("state retry budget exhausted (limit {limit}); aborting remaining retries")]
     RetryBudgetExhausted { limit: u32 },
+
+    #[error(
+        "state compare-and-swap conflict on '{key}': another writer committed since this run \
+         downloaded state; refusing to overwrite the winner (fail-closed)"
+    )]
+    CasConflict { key: String },
 }
 
 /// State file name within the configured prefix.
@@ -491,10 +499,16 @@ pub enum FinalizeDurability {
 ///   (around its merge + atomic publish), so a session-held store would
 ///   contend with the download's publish. Callers open/close their store
 ///   around the session as today.
-/// - **A `base` generation.** Deliberately absent this stage: the observed
-///   remote generation (the field the CAS PR reads and CAS-writes at
-///   `finalize`) is the concurrency PR's forward extension of this struct, not
-///   part of the lifecycle spine.
+/// - **The `StateStore` merge lock** — see above.
+///
+/// # Held only under CAS
+///
+/// - **A `base` generation** is captured at [`acquire`][Self::acquire] and held
+///   ONLY under `concurrency_control = "cas"` on an object-store backend: it is
+///   the remote object's generation at download time, which
+///   [`finalize`][Self::finalize] CAS-commits against so a run that lost a
+///   cross-pod race fail-closes instead of erasing the winner. `None` on the
+///   default `off` path (an unconditional upload, byte-identical to pre-CAS).
 ///
 /// # Drop tripwire
 ///
@@ -533,6 +547,11 @@ pub struct RemoteStateSession {
     /// detach the blocking closure, leaking the scratch it recreates and holding
     /// the upgrade past the run tail's `Arc::try_unwrap`.
     periodic_shutdown: Option<Arc<tokio::sync::Notify>>,
+    /// The remote object's generation captured at `acquire`, held ONLY under
+    /// `concurrency_control = "cas"` on an object-store backend. `finalize`
+    /// CAS-commits against it. `None` on the `off` path, on non-object-store
+    /// backends, or when the object was absent (bootstrap → create-if-absent).
+    base: Option<Generation>,
 }
 
 impl RemoteStateSession {
@@ -551,7 +570,17 @@ impl RemoteStateSession {
             finalized: false,
             periodic: None,
             periodic_shutdown: None,
+            base: None,
         }
+    }
+
+    /// Whether this session performs compare-and-swap state writes: configured
+    /// `concurrency_control = "cas"` AND a backend with a conditional-write
+    /// object tier (`s3` / `gcs`). On other backends `cas` auto-downgrades to
+    /// an unconditional upload.
+    fn cas_enabled(&self) -> bool {
+        self.cfg.concurrency_control == ConcurrencyControl::Cas
+            && matches!(self.cfg.backend, StateBackend::S3 | StateBackend::Gcs)
     }
 
     /// Download-before-read: resolve, record, and return the ledger's
@@ -590,7 +619,29 @@ impl RemoteStateSession {
             return Ok(self.authority);
         }
 
-        match download_state(&self.cfg, &self.state_path).await {
+        // Under CAS on an object-store backend, capture the downloaded object's
+        // generation as this run's base so `finalize` can conditionally commit
+        // against it. Other backends fall back to the plain download (and warn
+        // once if `cas` was configured but unsupported here).
+        let result = if self.cas_enabled() {
+            download_state_with_generation(&self.cfg, &self.state_path)
+                .await
+                .map(|(authority, base)| {
+                    self.base = base;
+                    authority
+                })
+        } else {
+            if self.cfg.concurrency_control == ConcurrencyControl::Cas {
+                warn!(
+                    backend = %self.cfg.backend,
+                    "concurrency_control = cas is not supported on this backend; using an \
+                     unconditional state upload (auto-downgraded to off)"
+                );
+            }
+            download_state(&self.cfg, &self.state_path).await
+        };
+
+        match result {
             Ok(authority) => {
                 self.authority = authority;
                 Ok(authority)
@@ -682,6 +733,18 @@ impl RemoteStateSession {
     /// run tail's `Arc::try_unwrap`, silently no-op'ing every terminal write.
     pub fn start_periodic_uploader(&mut self, store: Weak<StateStore>, cadence: Duration) {
         if self.periodic.is_some() {
+            return;
+        }
+        if self.cas_enabled() {
+            // Under CAS the mid-run periodic uploader is disabled: a correct
+            // periodic CAS write must advance a base shared with `finalize` and
+            // stop-without-refresh on conflict (ADR-CONCURRENCY §D2) — a
+            // follow-up. Finalize-only CAS against the acquire base is correct
+            // precisely because no mid-run upload bumps the remote generation.
+            debug!(
+                "periodic state uploader disabled under concurrency_control = cas \
+                 (finalize-only CAS)"
+            );
             return;
         }
         let cfg = self.cfg.clone();
@@ -806,6 +869,21 @@ impl RemoteStateSession {
             );
             return Ok(());
         }
+        // CAS terminal commit: conditionally upload against the base captured at
+        // acquire. A lost cross-pod race surfaces `CasConflict` (fail-closed,
+        // never swallowed). `Durable` still forces `on_upload_failure = Fail`
+        // for the transport-error case.
+        if self.cas_enabled() {
+            let cfg = match self.durability {
+                FinalizeDurability::Durable => StateConfig {
+                    on_upload_failure: StateUploadFailureMode::Fail,
+                    ..self.cfg.clone()
+                },
+                FinalizeDurability::ConfigDefault => self.cfg.clone(),
+            };
+            return upload_state_cas(&cfg, &self.state_path, self.base.as_ref()).await;
+        }
+
         match self.durability {
             FinalizeDurability::Durable => {
                 let durable_cfg = StateConfig {
@@ -990,6 +1068,31 @@ pub async fn download_state(
     config: &StateConfig,
     local_path: &Path,
 ) -> Result<StateAuthority, StateSyncError> {
+    download_state_impl(config, local_path, None).await
+}
+
+/// Download-before-read that ALSO captures the remote object's [`Generation`]
+/// for a compare-and-swap writer (`[state] concurrency_control = "cas"`).
+///
+/// The captured generation is the *base* the writer CAS-commits against at
+/// [`RemoteStateSession::finalize`]. `Ok((_, None))` means the object was
+/// absent (a bootstrap first-write, which CASes with `PutMode::Create`) or the
+/// backend surfaced no version metadata. Behaviour is otherwise identical to
+/// [`download_state`] — same staging, publish-lock, and local-only merge.
+pub async fn download_state_with_generation(
+    config: &StateConfig,
+    local_path: &Path,
+) -> Result<(StateAuthority, Option<Generation>), StateSyncError> {
+    let mut generation = None;
+    let authority = download_state_impl(config, local_path, Some(&mut generation)).await?;
+    Ok((authority, generation))
+}
+
+async fn download_state_impl(
+    config: &StateConfig,
+    local_path: &Path,
+    mut gen_sink: Option<&mut Option<Generation>>,
+) -> Result<StateAuthority, StateSyncError> {
     let remote_key = remote_state_key(local_path);
 
     // Local backend never replaces the file — nothing to stage, merge, or lock.
@@ -1001,7 +1104,7 @@ pub async fn download_state(
     // source of truth and must never be treated as an empty ledger to
     // bootstrap over.
     if matches!(config.backend, StateBackend::Local) {
-        download_state_inner(config, local_path, &remote_key).await?;
+        download_state_inner(config, local_path, &remote_key, gen_sink.take()).await?;
         return Ok(StateAuthority::Authoritative);
     }
 
@@ -1009,7 +1112,7 @@ pub async fn download_state(
     //    untouched; `Absent` leaves the staging file unwritten.
     let scratch_dir = sibling_scratch_dir(local_path);
     let staged = unique_scratch_path(&scratch_dir, "download");
-    let outcome = match download_state_inner(config, &staged, &remote_key).await {
+    let outcome = match download_state_inner(config, &staged, &remote_key, gen_sink.take()).await {
         Ok(outcome) => outcome,
         Err(e) => {
             let _ = std::fs::remove_file(&staged);
@@ -1271,6 +1374,7 @@ async fn download_state_inner(
     config: &StateConfig,
     dest_path: &Path,
     remote_key: &str,
+    gen_sink: Option<&mut Option<Generation>>,
 ) -> Result<DownloadOutcome, StateSyncError> {
     match config.backend {
         StateBackend::Local => {
@@ -1289,6 +1393,7 @@ async fn download_state_inner(
                 dest_path,
                 remote_key,
                 transfer_timeout(config),
+                gen_sink,
             )
             .await
         }
@@ -1304,6 +1409,7 @@ async fn download_state_inner(
                 dest_path,
                 remote_key,
                 transfer_timeout(config),
+                gen_sink,
             )
             .await
         }
@@ -1336,18 +1442,35 @@ async fn download_state_inner(
             // stale local file left by a previous run must NOT be mistaken for a
             // fresh Valkey hit (which would skip the S3 fallback and resume from
             // stale state).
-            match Box::pin(download_state_inner(&valkey_config, dest_path, remote_key)).await {
+            // CAS generation capture is deferred on tiered (D5 cache-coherence
+            // is a follow-up), so the recursive legs pass `None`; a tiered
+            // backend under `concurrency_control = cas` auto-downgrades to an
+            // unconditional upload at finalize.
+            match Box::pin(download_state_inner(
+                &valkey_config,
+                dest_path,
+                remote_key,
+                None,
+            ))
+            .await
+            {
                 Ok(DownloadOutcome::Restored) => {
                     debug!("State restored from Valkey");
                     Ok(DownloadOutcome::Restored)
                 }
                 Ok(DownloadOutcome::Absent) => {
                     debug!("Valkey miss, trying S3");
-                    Box::pin(download_state_inner(&s3_config, dest_path, remote_key)).await
+                    Box::pin(download_state_inner(
+                        &s3_config, dest_path, remote_key, None,
+                    ))
+                    .await
                 }
                 Err(e) => {
                     debug!(error = %e, "Valkey error, trying S3");
-                    Box::pin(download_state_inner(&s3_config, dest_path, remote_key)).await
+                    Box::pin(download_state_inner(
+                        &s3_config, dest_path, remote_key, None,
+                    ))
+                    .await
                 }
             }
         }
@@ -1690,6 +1813,118 @@ async fn dispatch_upload(
     }
 }
 
+/// End-of-run compare-and-swap upload for `concurrency_control = "cas"` on an
+/// object-store backend (`s3` / `gcs`).
+///
+/// Strips local-only tables exactly as [`upload_state`] does, then conditionally
+/// uploads against `base` (the generation captured at
+/// [`download_state_with_generation`]):
+/// - `Committed` → `Ok(())`.
+/// - `Conflict` → [`StateSyncError::CasConflict`] — another writer committed
+///   since this run's download; fail-closed, and NEVER swallowed by
+///   `on_upload_failure` (a lost cross-pod race is not a transient upload blip).
+/// - A genuine transport error is subject to `on_upload_failure` exactly as
+///   [`upload_state`].
+///
+/// `base = None` (the object was absent at acquire) maps to a create-if-absent
+/// write, so a concurrent bootstrap writer also conflicts rather than
+/// blind-overwriting.
+async fn upload_state_cas(
+    config: &StateConfig,
+    local_path: &Path,
+    base: Option<&Generation>,
+) -> Result<(), StateSyncError> {
+    if !local_path.exists() {
+        debug!("No local state file to upload");
+        return Ok(());
+    }
+    let remote_key = remote_state_key(local_path);
+    let excluded = crate::state::LOCAL_ONLY_TABLE_NAMES;
+
+    // Resolve the file to upload: a stripped copy when there are local-only
+    // tables, else the file as-is. Same fail-closed filter contract as
+    // `upload_state_with_excluded_tables` — never upload the unfiltered file.
+    let (upload_path, scratch) = if excluded.is_empty() {
+        (local_path.to_path_buf(), None)
+    } else {
+        match strip_local_only_tables(local_path, excluded) {
+            Ok(p) => (p.clone(), Some(p)),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    outcome = "filter_failed",
+                    "failed to build replicate-filtered state copy; refusing to upload \
+                     unfiltered local-only data (fail-closed)"
+                );
+                return apply_upload_failure_policy(config, Err(e));
+            }
+        }
+    };
+
+    let outcome = dispatch_upload_cas(config, &upload_path, &remote_key, base).await;
+    if let Some(scratch) = scratch {
+        let _ = std::fs::remove_file(&scratch);
+    }
+    match outcome {
+        Ok(PutIfMatchOutcome::Committed(_)) => Ok(()),
+        Ok(PutIfMatchOutcome::Conflict) => Err(StateSyncError::CasConflict { key: remote_key }),
+        // A transport / backend error is not a conflict — apply the configured
+        // liveness policy (Durable forces Fail upstream).
+        Err(e) => apply_upload_failure_policy(config, Err(e)),
+    }
+}
+
+/// CAS upload dispatch for the object-store backends. A non-object-store backend
+/// never reaches here — the session downgrades `cas` to an unconditional
+/// [`upload_state`] on `local` / `valkey` / `tiered`.
+async fn dispatch_upload_cas(
+    config: &StateConfig,
+    local_path: &Path,
+    remote_key: &str,
+    base: Option<&Generation>,
+) -> Result<PutIfMatchOutcome, StateSyncError> {
+    match config.backend {
+        StateBackend::S3 => {
+            let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
+                StateSyncError::MissingConfig("s3".into(), "state.s3_bucket".into())
+            })?;
+            let prefix = config.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX);
+            upload_to_object_store_cas(
+                "s3",
+                bucket,
+                prefix,
+                local_path,
+                remote_key,
+                transfer_timeout(config),
+                base,
+            )
+            .await
+        }
+        StateBackend::Gcs => {
+            let bucket = config.gcs_bucket.as_deref().ok_or_else(|| {
+                StateSyncError::MissingConfig("gcs".into(), "state.gcs_bucket".into())
+            })?;
+            let prefix = config.gcs_prefix.as_deref().unwrap_or(DEFAULT_GCS_PREFIX);
+            upload_to_object_store_cas(
+                "gs",
+                bucket,
+                prefix,
+                local_path,
+                remote_key,
+                transfer_timeout(config),
+                base,
+            )
+            .await
+        }
+        // Unreachable in practice — the session downgrades `cas` to an
+        // unconditional upload on non-object-store backends. Defensive only.
+        _ => Err(StateSyncError::MissingConfig(
+            config.backend.to_string(),
+            "an object-store backend (s3/gcs) for concurrency_control = cas".into(),
+        )),
+    }
+}
+
 /// Apply the `on_upload_failure` policy to a terminal upload result. `Skip`
 /// converts Err → Ok with a structured warn; `Fail` propagates Err unchanged.
 fn apply_upload_failure_policy(
@@ -1698,6 +1933,11 @@ fn apply_upload_failure_policy(
 ) -> Result<(), StateSyncError> {
     match result {
         Ok(()) => Ok(()),
+        // A CAS conflict ("another writer won the race") is a hard fail-closed
+        // regardless of `on_upload_failure` — `Skip` must never convert it to a
+        // silent success that erases the winner. (The CAS path returns this
+        // directly today; this guard keeps the invariant if it ever routes here.)
+        Err(e @ StateSyncError::CasConflict { .. }) => Err(e),
         Err(e) => match config.on_upload_failure {
             StateUploadFailureMode::Skip => {
                 warn!(
@@ -1751,6 +1991,11 @@ async fn download_from_object_store(
     dest_path: &Path,
     remote_key: &str,
     timeout: Duration,
+    // When `Some`, capture the downloaded object's [`Generation`] into the sink
+    // from the SAME GET that fetched the bytes (never a separate HEAD — that
+    // would open a TOCTOU between the version read and the bytes the writer
+    // mutates). `None` (every non-CAS caller) uses the plain download.
+    gen_sink: Option<&mut Option<Generation>>,
 ) -> Result<DownloadOutcome, StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
     // Qualify the object key by schema version so a v7 pod and a v9 pod never
@@ -1773,7 +2018,16 @@ async fn download_from_object_store(
         with_transfer_timeout(timeout, async {
             match probe_exists(&provider, &key).await {
                 Ok(true) => {
-                    provider.download_file(&key, dest_path).await?;
+                    match gen_sink {
+                        Some(sink) => {
+                            *sink = provider
+                                .download_file_capturing_version(&key, dest_path)
+                                .await?;
+                        }
+                        None => {
+                            provider.download_file(&key, dest_path).await?;
+                        }
+                    }
                     info!(
                         size = dest_path.metadata().map(|m| m.len()).unwrap_or(0),
                         outcome = "ok",
@@ -1850,6 +2104,58 @@ async fn upload_to_object_store(
             "state upload complete"
         );
         Ok(())
+    }
+    .instrument(span)
+    .await
+}
+
+/// Compare-and-swap variant of [`upload_to_object_store`]: conditionally upload
+/// `local_path` against `base`, returning the [`PutIfMatchOutcome`].
+///
+/// A `Conflict` is returned as `Ok(Conflict)` (never an `Err`), so the caller
+/// maps it to a fail-closed refusal. The `object_store` client applies its own
+/// transient-retry and, on S3, `retry_on_conflict` already absorbs the
+/// transient 409 — so a surfaced conflict is a genuine stale base, and the
+/// state-level `retry_transient` (which carries no return value) is not used on
+/// this path.
+async fn upload_to_object_store_cas(
+    scheme: &str,
+    bucket: &str,
+    prefix: &str,
+    local_path: &Path,
+    key: &str,
+    timeout: Duration,
+    base: Option<&Generation>,
+) -> Result<PutIfMatchOutcome, StateSyncError> {
+    let provider = cloud_provider(scheme, bucket, prefix)?;
+    let key = object_store_state_key(key);
+    let size_bytes = local_path.metadata().map(|m| m.len()).unwrap_or(0);
+    let span = info_span!(
+        "state.upload.cas",
+        backend = %provider.scheme(),
+        bucket = %provider.bucket(),
+        size_bytes,
+    );
+    async {
+        info!(
+            uri = format!("{scheme}://{bucket}/{prefix}{key}"),
+            conditional = base.is_some(),
+            "CAS-uploading state to object store"
+        );
+        let outcome = with_transfer_timeout(timeout, async {
+            provider
+                .upload_file_if_match(local_path, &key, base)
+                .await
+                .map_err(StateSyncError::from)
+        })
+        .await?;
+        info!(
+            bytes = size_bytes,
+            committed = matches!(outcome, PutIfMatchOutcome::Committed(_)),
+            outcome = "ok",
+            "CAS state upload complete"
+        );
+        Ok(outcome)
     }
     .instrument(span)
     .await
@@ -2321,7 +2627,11 @@ fn is_transient(err: &StateSyncError) -> bool {
         | StateSyncError::Io(_)
         | StateSyncError::MissingConfig(..)
         | StateSyncError::CircuitOpen { .. }
-        | StateSyncError::RetryBudgetExhausted { .. } => false,
+        | StateSyncError::RetryBudgetExhausted { .. }
+        // A CAS conflict is definitive (another writer won) — retrying against
+        // the same stale base would just conflict again and burn the budget.
+        // Fail closed immediately.
+        | StateSyncError::CasConflict { .. } => false,
     }
 }
 
@@ -3162,7 +3472,7 @@ mod tests {
             // before URL resolution, proving the fall-through independently.
             ..Default::default()
         };
-        let outcome = download_state_inner(&config, &local, &remote_state_key(&local))
+        let outcome = download_state_inner(&config, &local, &remote_state_key(&local), None)
             .await
             .unwrap();
         test_support::clear();
@@ -3199,7 +3509,7 @@ mod tests {
             s3_bucket: Some("bucket".into()),
             ..Default::default()
         };
-        let outcome = download_state_inner(&config, &local, &remote_state_key(&local))
+        let outcome = download_state_inner(&config, &local, &remote_state_key(&local), None)
             .await
             .unwrap();
         test_support::clear();
@@ -4096,6 +4406,86 @@ mod tests {
             .finalize()
             .await
             .expect("ConfigDefault must honor the configured skip (warn-and-Ok)");
+        test_support::clear();
+    }
+
+    /// CAS finalize fail-closes when the remote object advanced since acquire:
+    /// pod B captures its base, a racer commits and bumps the generation, and
+    /// B's terminal CAS upload conflicts instead of blind-overwriting the
+    /// winner. (Exercised against the InMemory conditional-put backend; the S3
+    /// wire path is covered by `tests/state_sync_s3_live.rs`.)
+    #[tokio::test]
+    async fn session_cas_finalize_conflicts_when_remote_advanced() {
+        test_support::clear();
+        let _faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+
+        let cfg = StateConfig {
+            backend: StateBackend::S3,
+            s3_bucket: Some("bucket".into()),
+            concurrency_control: ConcurrencyControl::Cas,
+            retry: RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+            ..Default::default()
+        };
+
+        // Bootstrap: first run creates the remote object (base None → Create).
+        let mut first = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let _ = first.acquire().await.unwrap();
+        first
+            .finalize()
+            .await
+            .expect("first CAS finalize creates the object");
+
+        // Pod B acquires and captures the current generation as its base.
+        let mut pod_b = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let _ = pod_b.acquire().await.unwrap();
+
+        // A racer commits in between, advancing the remote generation.
+        let mut racer = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let _ = racer.acquire().await.unwrap();
+        racer
+            .finalize()
+            .await
+            .expect("racer commits and advances the remote generation");
+
+        // Pod B's terminal CAS now conflicts (stale base) — fail-closed, not a
+        // silent overwrite of the racer's committed state.
+        let err = pod_b
+            .finalize()
+            .await
+            .expect_err("pod B lost the cross-pod race → CasConflict");
+        assert!(
+            matches!(err, StateSyncError::CasConflict { .. }),
+            "expected CasConflict, got: {err:?}"
+        );
+        test_support::clear();
+    }
+
+    /// The `off` default routes an unconditional upload even against an
+    /// already-present object — byte-identical to pre-CAS: two sequential runs
+    /// both finalize successfully, the second overwriting without a base.
+    #[tokio::test]
+    async fn session_off_default_overwrites_unconditionally() {
+        test_support::clear();
+        let _faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        // s3_session_config leaves concurrency_control at its Off default.
+        let cfg = s3_session_config(StateUploadFailureMode::Fail);
+
+        for _ in 0..2 {
+            let mut s = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+            let _ = s.acquire().await.unwrap();
+            s.finalize()
+                .await
+                .expect("off finalize is an unconditional put (no conflict)");
+        }
         test_support::clear();
     }
 

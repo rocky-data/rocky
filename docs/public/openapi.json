@@ -5205,6 +5205,25 @@
           }
         ]
       },
+      "ConcurrencyControl": {
+        "description": "Concurrency control for remote `[state]` object writes.\n\nGuards the cross-pod lost update where two runs sharing one `[state]` prefix race: one downloads the state, the other commits, and the first's end-of-run upload silently overwrites the second (last-writer-wins). See [`StateConfig::concurrency_control`].",
+        "oneOf": [
+          {
+            "description": "Unconditional last-writer-wins upload (default) — byte-identical to the pre-CAS behaviour. Correct for single-writer-per-prefix deployments (one run at a time, orchestrator-serialized).",
+            "enum": [
+              "off"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Compare-and-swap: the end-of-run upload is conditional on the remote object still carrying the generation the run downloaded. A run that lost a cross-pod race fail-closes (nonzero exit) instead of erasing the winner. Requires a backend with a conditional-write object tier (`s3` / `gcs`); auto-downgrades to `off` (with a warn) on other backends.",
+            "enum": [
+              "cas"
+            ],
+            "type": "string"
+          }
+        ]
+      },
       "ConcurrencyMode": {
         "anyOf": [
           {
@@ -15643,6 +15662,7 @@
             ],
             "default": {
               "backend": "local",
+              "concurrency_control": "off",
               "freeze_marker_writes": false,
               "gcs_bucket": null,
               "gcs_prefix": null,
@@ -17127,6 +17147,15 @@
             ],
             "default": "local",
             "description": "Storage backend: local (default), s3, gcs, valkey, or tiered (valkey + s3 fallback)"
+          },
+          "concurrency_control": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ConcurrencyControl"
+              }
+            ],
+            "default": "off",
+            "description": "Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `\"cas\"` on live multi-pod object-store deployments so a run that lost a cross-pod race fail-closes instead of silently overwriting the winner's committed state. Auto-downgrades to `off` (with a warn) on backends without a conditional-write object tier."
           },
           "freeze_marker_writes": {
             "default": false,
