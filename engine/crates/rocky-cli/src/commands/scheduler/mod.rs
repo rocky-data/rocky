@@ -283,7 +283,7 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
-    use rocky_core::schedule::CapturingSpawner;
+    use rocky_core::schedule::{CapturingSpawner, RunOutcome, SpawnRequest};
     use rocky_server::state::ServerState;
     use tokio::sync::Notify;
 
@@ -440,6 +440,84 @@ cron = "* * * * *"
             .unwrap();
 
         assert_eq!(capture.runs_for("raw").len(), 9);
+    }
+
+    /// A spawner that models a long-running child: `run` blocks until the shared
+    /// drain is raised, then returns success. It stands in for a real
+    /// [`SubprocessSpawner`] whose child keeps running until drained.
+    struct DrainBlockingSpawner {
+        drain: Drain,
+        started: Notify,
+        runs: AtomicU64,
+    }
+
+    #[async_trait]
+    impl Spawner for DrainBlockingSpawner {
+        async fn run(&self, _request: &SpawnRequest) -> RunOutcome {
+            self.runs.fetch_add(1, Ordering::Release);
+            self.started.notify_waiters();
+            // Model a child that runs until the server drains it.
+            self.drain.signalled().await;
+            RunOutcome {
+                exit_code: 0,
+                pid: Some(4242),
+            }
+        }
+    }
+
+    /// Shutdown while a child is running drains: the drain unblocks the child,
+    /// the tick completes, and the loop exits promptly — no orphaned wait.
+    #[tokio::test]
+    async fn shutdown_drains_a_running_child_and_exits() {
+        let (dir, config_path) = temp_project(CRON_EVERY_MINUTE);
+        let state = test_state(dir.path());
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+        let shutdown = Drain::new();
+        let heartbeat = Arc::new(AtomicU64::new(0));
+
+        let spawner = Arc::new(DrainBlockingSpawner {
+            drain: shutdown.clone(),
+            started: Notify::new(),
+            runs: AtomicU64::new(0),
+        });
+
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let spawner_dyn: Arc<dyn Spawner> = spawner.clone();
+        let task = tokio::spawn(run_scheduler(
+            Arc::clone(&state),
+            config_path,
+            SchedulerConfig {
+                poll_interval: Duration::from_secs(60),
+                drain_timeout: Duration::from_secs(60),
+            },
+            clock_dyn,
+            shutdown.clone(),
+            heartbeat,
+            spawner_dyn,
+        ));
+
+        // Tick 1 anchors (no fire). Advancing makes tick 2 due; its child then
+        // blocks in the spawner.
+        clock.wait_for_park(1).await;
+        let started = spawner.started.notified();
+        clock.advance(60);
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .expect("the due child started and is now 'running'");
+
+        // Shutdown while the child runs: the drain unblocks it, the tick
+        // finishes, and the loop exits — all within the timeout.
+        shutdown.signal();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("loop drains and exits promptly with a running child")
+            .unwrap();
+
+        assert_eq!(
+            spawner.runs.load(Ordering::Acquire),
+            1,
+            "the child ran exactly once and was drained, not re-run",
+        );
     }
 
     /// A config parse error on one iteration skips that tick and leaves the loop

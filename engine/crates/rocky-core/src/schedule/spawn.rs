@@ -429,4 +429,35 @@ mod tests {
         );
         assert!(pipe_pos > run_pos, "--pipeline must follow `run`: {args:?}");
     }
+
+    #[test]
+    fn drain_default_is_never_signalled() {
+        assert!(!Drain::default().is_signalled());
+    }
+
+    #[tokio::test]
+    async fn drain_signal_is_observed_and_wakes_waiters() {
+        let drain = Drain::new();
+        assert!(!drain.is_signalled());
+
+        // A waiter registered before the signal must resolve once it fires.
+        let waiter = {
+            let drain = drain.clone();
+            tokio::spawn(async move { drain.signalled().await })
+        };
+        // Give the waiter a chance to park, then raise the drain.
+        tokio::task::yield_now().await;
+        drain.signal();
+        assert!(drain.is_signalled());
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("a pre-registered waiter wakes on signal")
+            .unwrap();
+
+        // A waiter registered AFTER the signal resolves immediately (no lost
+        // wakeup — the flag is checked before awaiting).
+        tokio::time::timeout(Duration::from_secs(1), drain.signalled())
+            .await
+            .expect("an already-signalled drain resolves immediately");
+    }
 }
