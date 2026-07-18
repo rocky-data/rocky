@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-07-18
+
+### Added
+
+- Generated Pydantic models for the engine-v1.65.0 output surface: the `rocky tick` scheduler (`TickOutput`) and the object-store freeze markers surfaced by `rocky policy freeze` and `rocky brief`. `rocky history --output json` now carries the scheduler `submission_id` and `pipeline` join keys. Additive — existing models and every `RockyClient` method are unchanged.
+
 ## [0.8.3] — 2026-07-17
 
 ### Fixed

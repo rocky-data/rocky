@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.61.0] — 2026-07-18
+
+### Added
+
+- Re-exports the engine-v1.65.0 / rocky-sdk 0.9.0 output types — the `rocky tick` scheduler and the freeze-marker surfaces — via `dagster_rocky.types`.
+
+### Changed
+
+- Floors on `rocky-sdk>=0.9.0` so the re-exported result types (freeze markers, scheduler output) are guaranteed present in the published wheel.
+
 ### Fixed
 
 - **Model-aware resource methods now scan the configured `models_dir`** (via

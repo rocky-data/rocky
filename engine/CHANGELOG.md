@@ -7,9 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.65.0] - 2026-07-18
+
+### Security
+
+- **Remote-state protocol hardening for concurrent multi-writer deployments.** A series of correctness fixes to the remote `[state]` backend used by multi-pod / multi-host deployments:
+  - State authority is now typed and fail-closed. A run whose start-of-run remote-state download fails is treated as non-authoritative: it refuses to make governed decisions or to push local state over the remote it could not read, rather than silently proceeding as last-writer-wins. Uploads are suppressed whenever the ledger could not be read. (#1139, #1144)
+  - Governance decisions (apply gates, masking and tag reconciliation) are taken from the configuration and compiled-model snapshot captured at the policy gate, so a `rocky.toml` or model edit that lands mid-run can no longer change what a governed run applies (config-swap and within-apply time-of-check/time-of-use). (#1144)
+  - Mid-run state uploads capture a consistent MVCC snapshot instead of copying the live database file, eliminating a torn read that could publish an internally inconsistent ledger under write load. (#1158)
+  - `rocky policy freeze` gains an opt-in, upload-durable kill switch: with `[policy] freeze_markers = true`, a freeze is recorded as an object-store marker that survives a concurrent whole-ledger upload from another writer (previously the freeze row could be erased). Off by default; readers always honor any existing markers. (#1154)
+  - Additional garbage-collection liveness and remote-state integrity follow-ups from the earlier hardening waves. (#1089, #1090, #1095)
+- **CI credential containment.** Pull-request-triggered CI no longer exposes release or AI credentials to untrusted candidate code; the credentialed workflows run only trusted base code pinned to a frozen root. (#1107)
+
 ### Added
 
-- **`rocky tick` — a one-shot native demand reconciler (experimental).** Pipelines can declare when they should run directly in `rocky.toml` via `[pipeline.<name>.schedule]` (`cron`, `after`, `freshness`); `rocky tick` evaluates all standing demand once, runs what is due sequentially through child `rocky run` processes, records scheduler state, and emits a typed `TickOutput`. There is no daemon — drive it from cron, a systemd timer, or CI on a short interval and it becomes SLO/cron/dependency scheduling with nothing resident. `--dry-run` previews demand without executing or writing state; `--now <rfc3339>` pins the evaluation instant for deterministic previews and tests (the reconciler core reads no wall clock). Exit codes mirror `rocky run`: `0` nothing-due-or-all-succeeded, `2` a launched run failed or was partial, `1` the tick could not proceed (fails closed, runs nothing). The reconciler releases the state store around each child spawn (so the child `rocky run` can open it) and forwards the resolved `--state-path` to the child; contention with another live `rocky` process surfaces as an exit-`0` `state_busy` skip, never a failure. Tick-launched runs record `"trigger": "Schedule"` in `rocky history`, joined to their demand by `submission_id` (now surfaced on `rocky history --output json`, alongside `pipeline`). Scheduling supports replication, transformation, quality, and snapshot pipelines — each persists a submission-linked run record, so `after`/`freshness` and recovery work. Load pipelines cannot declare a `[schedule]` yet (a load re-ingests every discovered file each run rather than incrementally, so scheduling it would duplicate data — validation rejects it with `V044`); native load scheduling is a follow-up. Freshness budgets resolve from the tightest member-model `max_lag_seconds` (MIN), falling back to the project `[freshness]` default. Run one `rocky tick` timer per project: scheduler state is machine-local and remote state has no cross-host lock, so two hosts ticking the same project double-fire. Marked experimental while the reconciler soaks; external orchestrators (Dagster, Airflow) remain first-class. (#TBD)
+- **`rocky tick` — a one-shot native demand reconciler (experimental).** Pipelines can declare when they should run directly in `rocky.toml` via `[pipeline.<name>.schedule]` (`cron`, `after`, `freshness`); `rocky tick` evaluates all standing demand once, runs what is due sequentially through child `rocky run` processes, records scheduler state, and emits a typed `TickOutput`. There is no daemon — drive it from cron, a systemd timer, or CI on a short interval and it becomes SLO/cron/dependency scheduling with nothing resident. `--dry-run` previews demand without executing or writing state; `--now <rfc3339>` pins the evaluation instant for deterministic previews and tests (the reconciler core reads no wall clock). Exit codes mirror `rocky run`: `0` nothing-due-or-all-succeeded, `2` a launched run failed or was partial, `1` the tick could not proceed (fails closed, runs nothing). The reconciler releases the state store around each child spawn (so the child `rocky run` can open it) and forwards the resolved `--state-path` to the child; contention with another live `rocky` process surfaces as an exit-`0` `state_busy` skip, never a failure. Tick-launched runs record `"trigger": "Schedule"` in `rocky history`, joined to their demand by `submission_id` (now surfaced on `rocky history --output json`, alongside `pipeline`). Scheduling supports replication, transformation, quality, and snapshot pipelines — each persists a submission-linked run record, so `after`/`freshness` and recovery work. Load pipelines cannot declare a `[schedule]` yet (a load re-ingests every discovered file each run rather than incrementally, so scheduling it would duplicate data — validation rejects it with `V044`); native load scheduling is a follow-up. Freshness budgets resolve from the tightest member-model `max_lag_seconds` (MIN), falling back to the project `[freshness]` default. Run one `rocky tick` timer per project: scheduler state is machine-local and remote state has no cross-host lock, so two hosts ticking the same project double-fire. Marked experimental while the reconciler soaks; external orchestrators (Dagster, Airflow) remain first-class. (#1142, #1161)
 
 ### Changed
 
@@ -18,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Released binaries now include the OpenTelemetry exporter; `OTEL_EXPORTER_OTLP_ENDPOINT` was previously a no-op on release builds.
+- Type drift on Databricks and Trino now degrades to a full refresh instead of erroring, matching the other adapters. (#1156)
+- `TRY_CAST` and `SAFE_CAST` result columns are typed as nullable, and cast alias target types are inferred correctly. (#1155, #1147)
+- `rocky compare` fails closed on a cell read error rather than reporting a spurious match. (#1153)
+- Interval placeholders are no longer double-quoted in generated SQL. (#1151)
+- DAG transformation nodes are scoped to their models. (#1141)
+- An unrecognized `--model` selection is rejected instead of silently matching nothing. (#1160)
 
 ## [1.64.0] - 2026-07-12
 
