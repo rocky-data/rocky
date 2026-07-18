@@ -1,0 +1,76 @@
+# Writable Iceberg stack for the rocky-trino drift-widening conformance test.
+#
+# The stock `trinodb/trino` image only ships `tpch` (read-only) + `memory`
+# (no `ALTER COLUMN … SET DATA TYPE`), so type-widening evolution can't be
+# exercised there. This stack adds a REST-catalog-backed Iceberg connector so
+# the emitted `SET DATA TYPE` ALTERs run against a real Iceberg table.
+#
+#   Trino (8080)  ──▶  Iceberg REST catalog (8181)  ──▶  MinIO / S3 (9000)
+#
+# Start:
+#   docker compose -f engine/crates/rocky-trino/tests/iceberg/docker-compose.yml up -d
+# Wait for Trino health (starting:false), then:
+#   cargo test -p rocky-trino --features trino-conformance \
+#     --test conformance drift_widening -- --ignored --nocapture
+# Tear down:
+#   docker compose -f .../iceberg/docker-compose.yml down -v
+
+name: rocky-trino-iceberg
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: rocky-trino-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_DOMAIN: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  mc:
+    image: minio/mc:latest
+    container_name: rocky-trino-mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:9000 minioadmin minioadmin); do echo 'waiting for minio'; sleep 1; done;
+      /usr/bin/mc mb --ignore-existing minio/warehouse;
+      echo 'warehouse bucket ready';
+      tail -f /dev/null
+      "
+
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:latest
+    container_name: rocky-trino-iceberg-rest
+    depends_on:
+      - minio
+    ports:
+      - "8181:8181"
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+
+  trino:
+    image: trinodb/trino:latest
+    container_name: rocky-trino-iceberg
+    depends_on:
+      - iceberg-rest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino-catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/v1/info | grep -q '\"starting\":false'"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
