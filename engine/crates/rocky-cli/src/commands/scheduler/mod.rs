@@ -130,8 +130,8 @@ pub async fn run_scheduler(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .join(".rocky");
-    let state_path = std::path::absolute(state_path_for(&state))
-        .unwrap_or_else(|_| state_path_for(&state));
+    let state_path =
+        std::path::absolute(state_path_for(&state)).unwrap_or_else(|_| state_path_for(&state));
 
     tracing::info!(
         poll_interval_s = sched.poll_interval.as_secs(),

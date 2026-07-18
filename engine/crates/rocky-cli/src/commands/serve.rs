@@ -101,7 +101,12 @@ pub async fn run_serve(
         None
     };
 
-    let result = crate::api::serve(state, crate::api::ServeConfig { host, port }, shutdown.clone()).await;
+    let result = crate::api::serve(
+        state,
+        crate::api::ServeConfig { host, port },
+        shutdown.clone(),
+    )
+    .await;
 
     // The server has stopped (graceful shutdown, or a bind/runtime error). Ensure
     // the drain is raised so the scheduler stops evaluating, then wait for it to
@@ -120,15 +125,15 @@ pub async fn run_serve(
 async fn wait_for_shutdown() {
     #[cfg(unix)]
     {
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            Ok(s) => s,
-            Err(_) => {
-                // Fall back to ctrl-c only if SIGTERM can't be registered.
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => {
+                    // Fall back to ctrl-c only if SIGTERM can't be registered.
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = term.recv() => {}

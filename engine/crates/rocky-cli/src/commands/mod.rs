@@ -68,6 +68,7 @@ mod run_content_addressed;
 mod run_dag_exec;
 mod run_local;
 mod run_watch;
+pub mod scheduler;
 mod seed;
 mod serve;
 mod shell;
@@ -77,7 +78,6 @@ mod state;
 #[cfg(feature = "duckdb")]
 mod test;
 mod test_adapter;
-pub mod scheduler;
 mod tick;
 mod trace;
 mod validate;
