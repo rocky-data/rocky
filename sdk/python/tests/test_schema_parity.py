@@ -100,6 +100,7 @@ _COMMAND_SCHEMA: dict[str, str] = {
     "validate-migration": "validate_migration.schema.json",
     "doctor": "doctor.schema.json",
     "dag": "dag.schema.json",
+    "tick": "tick.schema.json",
     "compliance": "compliance.schema.json",
     "retention-status": "retention_status.schema.json",
     "catalog": "catalog.schema.json",

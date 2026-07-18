@@ -2202,6 +2202,16 @@ pub struct RunHistoryRecord {
     pub duration_ms: u64,
     /// Per-model execution details for this run.
     pub models: Vec<RunModelRecord>,
+    /// The pipeline this run executed (`rocky run --pipeline <name>`), when
+    /// recorded. `None` for model-only or backfill runs. Not audit-gated — it is
+    /// an operational join key, always emitted when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// The scheduler submission id — `rocky tick` stamps it via
+    /// `ROCKY_SUBMISSION_ID`, so this is the join key to a tick's
+    /// `TickOutput.executed[].submission_id`. `None` for manually launched runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission_id: Option<String>,
 
     // --- Governance audit trail (populated only with `--audit`) ---
     /// Resolved caller identity (Unix `$USER` / Windows `$USERNAME`).
@@ -5219,6 +5229,161 @@ pub struct DagRunNodeOutput {
     /// upstream failure).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// JSON output for `rocky tick` — one demand-reconciliation pass.
+///
+/// A tick evaluates every scheduled pipeline's standing demand once, runs what
+/// is due (sequentially, via child `rocky run` processes), and records the
+/// outcome. This payload is the machine surface: an orchestration wrapper (a
+/// systemd timer, cron, CI) reads it to see what ran, what was suppressed, and
+/// why.
+///
+/// **Honesty note:** exit code `0` does NOT mean the estate is healthy. A
+/// pipeline sitting in `failure_backoff`/`partial_backoff` produces quiet
+/// exit-`0` ticks after the tick that first observed its failure. Exit codes
+/// alert on *this tick's* work; ongoing sickness is carried by the `skipped`
+/// reasons + `counts` here and the `consecutive_failures` metric. Alert on
+/// those, not on exit codes alone.
+///
+/// The feature is **experimental** while the native reconciler soaks.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TickOutput {
+    pub version: String,
+    pub command: String,
+    /// True when invoked with `--dry-run`: demand was evaluated and reported,
+    /// but nothing executed and no state was written.
+    pub dry_run: bool,
+    /// The instant the tick evaluated demand against (`--now`, or the wall
+    /// clock). Echoed for determinism and audit — occurrence math, `after`, and
+    /// freshness are all resolved as of this instant.
+    pub now: DateTime<Utc>,
+    /// Per-pipeline evaluation: the demand sources considered, whether the
+    /// pipeline was due, and the per-source reason.
+    pub evaluated: Vec<PipelineDemandStatus>,
+    /// Demands that ran to a terminal outcome this tick, in execution order.
+    pub executed: Vec<ExecutedRunOutput>,
+    /// Demands suppressed this tick, each with a stable reason string.
+    pub skipped: Vec<SkippedDemandOutput>,
+    /// True when the whole tick was skipped because a live reconciler already
+    /// held the tick lock (a `tick_in_progress` skip is also emitted in
+    /// `skipped`). The CLI still exits `0`.
+    pub tick_in_progress: bool,
+    /// True when this tick proceeded via the wedge override — it found the tick
+    /// lock held but its heartbeat stale past the takeover window, so it ran
+    /// without the lock and leaned on the claim state machine for correctness.
+    /// Surfaced loudly because it signals a wedged prior reconciler.
+    pub lock_overridden: bool,
+    /// Roll-up counts across `evaluated`/`executed`/`skipped`.
+    pub counts: TickCounts,
+    /// Wall-clock duration of the whole tick, including child run time.
+    pub duration_ms: u64,
+}
+
+/// One pipeline's demand evaluation this tick.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PipelineDemandStatus {
+    /// The pipeline name.
+    pub pipeline: String,
+    /// Whether any source made the pipeline due this tick.
+    pub due: bool,
+    /// The source that made it due (`cron` | `after` | `freshness` | `webhook`),
+    /// when `due` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub due_source: Option<String>,
+    /// The logical timestamp of the due demand (the cron occurrence, the max
+    /// upstream-success time, or the staleness-breach detection time), when
+    /// `due` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_ts: Option<DateTime<Utc>>,
+    /// Per-source outcome for every source considered (the due source included,
+    /// with reason `due`).
+    pub sources: Vec<SourceEvaluation>,
+}
+
+/// One demand source's outcome within a pipeline's evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SourceEvaluation {
+    /// The demand source: `cron` | `after` | `freshness` | `webhook`.
+    pub source: String,
+    /// The reason string for this source: `due` | `not_due` | `disabled` |
+    /// `catchup_skipped` | `failure_backoff` | `partial_backoff` | `superseded`
+    /// | `history_unavailable`.
+    pub reason: String,
+    /// When the source becomes eligible again — present for `failure_backoff`
+    /// and `partial_backoff`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_at: Option<DateTime<Utc>>,
+    /// Number of missed cron occurrences — present for `catchup_skipped`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missed: Option<u32>,
+}
+
+/// One demand that executed to a terminal outcome this tick.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExecutedRunOutput {
+    /// The pipeline that ran.
+    pub pipeline: String,
+    /// The source that made it due: `cron` | `after` | `freshness` | `webhook`.
+    pub source: String,
+    /// The logical timestamp of the demand.
+    pub logical_ts: DateTime<Utc>,
+    /// The submission id of the recorded attempt — the precise join key between
+    /// this demand and *its* run record (`rocky history` shows the same id).
+    /// This is the reconciler's demand↔run identity; there is no separate
+    /// `run_id` field because a run is joined to its demand by `submission_id`.
+    pub submission_id: String,
+    /// The child's exit code: `0` success, `2` partial, `1`/other failure.
+    pub exit_code: i32,
+    /// The mapped terminal outcome: `success` | `partial` | `failure`.
+    pub outcome: String,
+    /// Total submissions made for this demand (the claim's monotonic audit
+    /// counter): `1` unless in-tick retries fired.
+    pub attempts: u32,
+}
+
+/// One demand suppressed this tick.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkippedDemandOutput {
+    /// The pipeline the skip belongs to. `None` for a whole-tick skip
+    /// (`tick_in_progress`, `state_busy`), which is not tied to a single
+    /// pipeline.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// The demand source, when the skip is source-specific: `cron` | `after` |
+    /// `freshness` | `webhook`. `None` for a pipeline- or tick-level skip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Why it was skipped: `not_due` | `disabled` | `in_flight` |
+    /// `tick_in_progress` | `catchup_skipped` | `failure_backoff` |
+    /// `partial_backoff` | `dedup` | `history_unavailable` | `state_busy`.
+    pub reason: String,
+    /// When the demand becomes eligible again — present for `failure_backoff`
+    /// and `partial_backoff`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_at: Option<DateTime<Utc>>,
+    /// Number of missed cron occurrences — present for `catchup_skipped`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missed: Option<u32>,
+}
+
+/// Roll-up counts for a tick.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TickCounts {
+    /// Pipelines evaluated this tick.
+    pub evaluated: usize,
+    /// Pipelines found due.
+    pub due: usize,
+    /// Demands executed to a terminal outcome.
+    pub executed: usize,
+    /// Executed runs that succeeded (exit 0).
+    pub succeeded: usize,
+    /// Executed runs that were partial (exit 2).
+    pub partial: usize,
+    /// Executed runs that failed (exit 1/other).
+    pub failed: usize,
+    /// Demands suppressed (the length of `skipped`).
+    pub skipped: usize,
 }
 
 /// When set, [`print_json`] emits compact (single-line) JSON instead of

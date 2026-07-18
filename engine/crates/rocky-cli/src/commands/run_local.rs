@@ -377,12 +377,29 @@ pub async fn run_transformation(
 /// Execute `rocky run` for a quality pipeline.
 ///
 /// Runs data quality checks against the specified tables without any data movement.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run_quality")]
 pub async fn run_quality(
     _config_path: &Path,
     pipeline: &rocky_core::config::QualityPipelineConfig,
     rocky_cfg: &rocky_core::config::RockyConfig,
     output_json: bool,
+    // Canonical state path resolved once by `main.rs`/`run()` — the SAME path
+    // every other pipeline type opens. The quality run persists its `RunRecord`
+    // here so the schedule reconciler's `after`/`freshness` demands and `rocky
+    // history` observe it. The dispatch site (`run::run`) owns the surrounding
+    // `RemoteStateSession` so this record rides the terminal upload.
+    state_path: &Path,
+    // `run()`'s `run_id` + `started_at`, threaded so the persisted
+    // `RunRecord::run_id` matches the idempotency stamp at the dispatch site.
+    run_id: &str,
+    started_at: DateTime<Utc>,
+    // Config fingerprint computed once in `run()` (mirrors every other
+    // `persist_run_record` call site).
+    config_hash: &str,
+    // The resolved `--pipeline` name, stamped onto the persisted `RunRecord` so
+    // the reconciler can answer `after`/`freshness` demands on this pipeline.
+    pipeline_name: &str,
 ) -> Result<()> {
     use rocky_core::checks::{CheckDetails, CheckResult};
 
@@ -602,6 +619,41 @@ pub async fn run_quality(
             output.duration_ms
         );
     }
+
+    // Quality status trap: `RunOutput::derive_run_status` keys only on
+    // `tables_copied`/`tables_failed`/`interrupted` and IGNORES `check_results`,
+    // and `run_quality` never touches `tables_failed` — so a quality run with
+    // FAILING error-severity checks would otherwise persist as `Success`, and the
+    // schedule reconciler would treat a failed quality gate as a satisfied
+    // `after`/`freshness` demand. Map the SAME condition the exit code uses
+    // (`error_failures > 0 && fail_on_error`) into `tables_failed` so the
+    // recorded status derives to `Failure` and AGREES with the non-zero exit
+    // below. Done after the JSON emit above so the `--output json` payload is
+    // unchanged — the persisted record, not the payload, carries the corrected
+    // status.
+    if error_failures > 0 && pipeline.checks.fail_on_error {
+        output.tables_failed = error_failures;
+    }
+
+    // Persist the canonical `RunRecord` (before the failure bail, so a failed
+    // gate is recorded as `Failure` for the reconciler). Opening the store is
+    // fatal on failure — a run that cannot record its outcome is not a usable
+    // success for the scheduler; the dispatch site abandons the session on the
+    // resulting `Err`. Mirrors the transformation call site: submission_id +
+    // trigger are read from the environment inside `persist_run_record`.
+    let store = StateStore::open(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let audit_ctx = super::run_audit::AuditContext::detect(None, None);
+    let audit = super::run::audit_to_record(&audit_ctx);
+    super::run::persist_run_record(
+        Some(&store),
+        &output,
+        run_id,
+        started_at,
+        config_hash,
+        &audit,
+        Some(pipeline_name),
+    );
 
     if error_failures > 0 && pipeline.checks.fail_on_error {
         anyhow::bail!("quality pipeline failed: {error_failures} error-severity check(s) failed");
@@ -911,15 +963,29 @@ fn count_failures_by_severity(output: &RunOutput) -> (usize, usize) {
 /// Execute `rocky run` for a snapshot (SCD Type 2) pipeline.
 ///
 /// Generates and executes SCD2 MERGE SQL against the target adapter.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run_snapshot")]
 pub async fn run_snapshot(
     _config_path: &Path,
     pipeline: &rocky_core::config::SnapshotPipelineConfig,
     rocky_cfg: &rocky_core::config::RockyConfig,
     output_json: bool,
+    // Canonical state path resolved once by `run()` — the SAME path every other
+    // pipeline type opens. The snapshot run persists its `RunRecord` here so the
+    // schedule reconciler's `after`/`freshness` demands and `rocky history`
+    // observe it. The dispatch site owns the surrounding `RemoteStateSession`.
+    state_path: &Path,
+    // `run()`'s `run_id` + `started_at`, threaded so the persisted
+    // `RunRecord::run_id` matches the idempotency stamp at the dispatch site
+    // (replacing the previously-local `Utc::now()` for consistency).
+    run_id: &str,
+    started_at: DateTime<Utc>,
+    // Config fingerprint computed once in `run()`.
+    config_hash: &str,
+    // The resolved `--pipeline` name, stamped onto the persisted `RunRecord`.
+    pipeline_name: &str,
 ) -> Result<()> {
     let start = Instant::now();
-    let started_at = chrono::Utc::now();
 
     let pipes = crate::pipes::PipesEmitter::detect();
     if let Some(p) = &pipes {
@@ -1038,6 +1104,27 @@ pub async fn run_snapshot(
             output.duration_ms
         );
     }
+
+    // Persist the canonical `RunRecord` (before the failure bail, so a failed
+    // snapshot is recorded as `Failure` for the reconciler). `output` already
+    // carries the correct `tables_copied`/`tables_failed` counters set above, so
+    // `derive_run_status` (inside `persist_run_record`) needs no status trap —
+    // unlike quality. Opening the store is fatal on failure; the dispatch site
+    // abandons the session on the resulting `Err`. submission_id + trigger are
+    // read from the environment inside `persist_run_record`.
+    let store = StateStore::open(state_path)
+        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    let audit_ctx = super::run_audit::AuditContext::detect(None, None);
+    let audit = super::run::audit_to_record(&audit_ctx);
+    super::run::persist_run_record(
+        Some(&store),
+        &output,
+        run_id,
+        started_at,
+        config_hash,
+        &audit,
+        Some(pipeline_name),
+    );
 
     if tables_failed > 0 {
         anyhow::bail!("snapshot pipeline failed");

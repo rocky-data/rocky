@@ -78,6 +78,8 @@ fn record_to_history(run: &RunRecord, audit: bool) -> RunHistoryRecord {
         models_executed: run.models_executed.len(),
         duration_ms,
         models,
+        pipeline: run.pipeline.clone(),
+        submission_id: run.submission_id.clone(),
         triggering_identity,
         session_source,
         git_commit,

@@ -599,6 +599,53 @@ table_retries = 1
 
 ---
 
+### `[pipeline.NAME.schedule]`
+
+Native demand declaration for [`rocky tick`](/guides/running-without-an-orchestrator/#native-scheduling-with-rocky-tick-experimental). All fields are optional — an absent block means the pipeline has no standing demand and only runs when invoked directly. **Experimental** while the reconciler soaks.
+
+Supported on `replication`, `transformation`, `quality`, and `snapshot` pipelines. `load` pipelines cannot participate in the schedule graph yet: a load re-ingests every discovered file on each run rather than incrementally, so scheduling it would duplicate data, and it records no run the scheduler can observe. `rocky validate` rejects a scheduled load pipeline (error `V044`) and rejects an `after` that references a load pipeline (error `V045`).
+
+Schedule state is per-machine: run one `rocky tick` timer per project. The scheduler's cursor and claim tables are never replicated by a remote `[state]` backend, and remote state has no cross-host locking, so two hosts ticking the same project will both fire the same occurrence.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `cron` | string | — | Standard 5-field cron expression (`minute hour day-of-month month day-of-week`). Due at each occurrence. First-ever evaluation anchors at "now" and waits for the next occurrence rather than firing immediately. |
+| `timezone` | string | project `[schedule].timezone`, else `"UTC"` | IANA timezone name (e.g. `"Europe/Lisbon"`) the `cron` occurrences are evaluated in. DST transitions are handled: a skipped wall-clock hour fires at the next valid instant once, a repeated hour fires on the first occurrence only. |
+| `after` | array of strings | `[]` | Upstream pipeline names. Due once **every** listed pipeline has a successful run that completed after this pipeline's own latest success *started*. A partial-success (exit 2) upstream run does **not** count. Cycles are a validation error. |
+| `freshness` | bool | `false` | When `true`, due once this pipeline's own run-staleness exceeds its freshness budget — the minimum of its member models' `max_lag_seconds`, falling back to the project `[freshness].expected_lag_seconds`. This is run-staleness, **not** a warehouse data-freshness probe; the reconciler issues no queries. `freshness = true` with no resolvable budget is a validation error. |
+| `catchup` | string | `"latest"` | Policy when more than one cron occurrence elapsed since the last fire. `"latest"` fires one demand at the most recent missed occurrence; `"skip"` advances the anchor and runs nothing. `"all"` is **rejected** at validation — Rocky runs are watermark-driven, not windowed, so replaying every missed occurrence is pure cost with no extra data. |
+| `retry` | table | `{ max = 0 }` | In-tick retry on failure. `retry.max` is the number of *additional* immediate re-submissions after the first attempt fails. The reconciler never sleeps between attempts; minutes-scale spacing between ticks is the always-on cross-tick backoff, not this knob. Partial (exit 2) runs are never retried. |
+| `timeout_minutes` | integer | `0` | Scheduler-level timeout for a launched run. `0` means none — the run's own limits apply. On elapse the child is terminated gracefully, then forcibly. |
+| `enabled` | bool | `true` | When `false`, demand is suppressed but the config is kept (it shows as `disabled` in the tick's `skipped[]`). |
+
+A pipeline may combine sources — any one being due makes the pipeline due. A `[schedule]` block with none of `cron`/`after`/`freshness` set and `enabled = true` is an inert-config warning.
+
+```toml
+[pipeline.raw]
+type = "replication"
+[pipeline.raw.schedule]
+cron = "0 3 * * *"
+timezone = "Europe/Lisbon"
+
+[pipeline.staging]
+type = "transformation"
+models = "models/**"
+[pipeline.staging.schedule]
+after = ["raw"]            # runs in the same tick, after raw, once raw has a newer success
+freshness = true          # ...and also whenever staging's output goes stale
+retry = { max = 2 }
+```
+
+Project-level defaults live in a top-level `[schedule]` block:
+
+```toml
+[schedule]
+timezone = "UTC"          # default timezone for every pipeline's cron
+poll_interval_seconds = 15 # resident-loop cadence; not consumed by the one-shot `rocky tick`
+```
+
+---
+
 ## `[state]`
 
 Global state persistence: where Rocky stores watermarks, run history, and checkpoint progress.

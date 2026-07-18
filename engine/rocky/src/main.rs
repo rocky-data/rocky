@@ -558,6 +558,43 @@ enum Command {
         since: BriefSinceArg,
     },
 
+    /// Evaluate standing schedule demand once and run what is due (EXPERIMENTAL).
+    ///
+    /// A one-shot demand reconciler: it reads each pipeline's
+    /// `[pipeline.<name>.schedule]` block (`cron`, `after`, `freshness`), works
+    /// out what is due right now, and runs it sequentially via child `rocky run`
+    /// processes. There is no daemon — drive it from an external timer (a
+    /// systemd timer, cron, or CI) on a short interval and it becomes
+    /// SLO/cron/dependency scheduling with no orchestrator.
+    ///
+    /// Exit codes mirror `rocky run`: `0` = nothing due or all runs succeeded,
+    /// `2` = at least one run failed or was partial, `1` = the tick could not
+    /// proceed (config invalid, state unopenable). Note that exit `0` does NOT
+    /// mean the estate is healthy — a pipeline in `failure_backoff` produces
+    /// quiet exit-`0` ticks; alert on the `skipped` reasons and
+    /// `consecutive_failures` in the JSON, not on exit codes alone. A tick that
+    /// finds the state store held by another `rocky` process skips whole with
+    /// exit `0` and a `state_busy` entry in `skipped[]` (normal contention with
+    /// a live run; the next timer tick retries).
+    ///
+    /// Experimental while the native reconciler soaks; external orchestrators
+    /// (Dagster, Airflow) remain first-class ways to run Rocky.
+    Tick {
+        /// Evaluate and report what would run, but execute nothing and write no
+        /// state. Use it to preview a schedule before wiring the timer.
+        #[arg(long)]
+        dry_run: bool,
+        /// Restrict the tick to a single pipeline; default = every scheduled
+        /// pipeline.
+        #[arg(long)]
+        pipeline: Option<String>,
+        /// Evaluate demand as of this RFC3339 instant instead of the wall clock.
+        /// Exists for determinism (tests, replay, catch-up previews); the
+        /// reconciler core reads no clock of its own.
+        #[arg(long, hide_short_help = true)]
+        now: Option<String>,
+    },
+
     /// Validate config without connecting to any APIs
     Validate,
 
@@ -2713,14 +2750,14 @@ fn parse_governance_override(
 /// |------|---------|
 /// | `0`  | success |
 /// | `1`  | total / generic failure (e.g. `rocky run` with no tables copied, config error) |
-/// | `2`  | `rocky run` partial success — some tables materialized, some failed (Dagster `allow_partial=True` keys on this) |
+/// | `2`  | partial/failed work: `rocky run` some tables materialized + some failed, or `rocky tick` had at least one executed run fail or come back partial (Dagster `allow_partial=True` keys on this) |
 /// | `3`  | `rocky doctor` found a Critical health check |
 /// | `4`  | `rocky ci` passed compile + tests but emitted advisory warnings |
 /// | `130`| interrupted by SIGINT / SIGTERM |
 ///
-/// `2` is reserved exclusively for run partial-success; doctor-critical
-/// and ci-warnings were split off to `3` / `4` so they no longer collide
-/// with it.
+/// `2` is reserved for run/tick partial-or-failed work (both surface it via the
+/// shared `PartialFailure` sentinel); doctor-critical and ci-warnings were split
+/// off to `3` / `4` so they no longer collide with it.
 /// Resolve the state-file namespace for this invocation, if any.
 ///
 /// Precedence:
@@ -2963,6 +3000,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         }
         Command::Brief { since } => {
             rocky_cli::commands::run_brief(&state_path, &cli.config, since.into(), json)
+        }
+        Command::Tick {
+            dry_run,
+            pipeline,
+            now,
+        } => {
+            rocky_cli::commands::run_tick(&cli.config, &state_path, dry_run, pipeline, now, json)
+                .await
         }
         Command::Validate => rocky_cli::commands::validate(&cli.config, json),
         Command::Discover {

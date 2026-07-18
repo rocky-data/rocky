@@ -49,6 +49,10 @@ export interface RunHistoryRecord {
   models: RunModelRecord[];
   models_executed: number;
   /**
+   * The pipeline this run executed (`rocky run --pipeline <name>`), when recorded. `None` for model-only or backfill runs. Not audit-gated — it is an operational join key, always emitted when present.
+   */
+  pipeline?: string | null;
+  /**
    * `CARGO_PKG_VERSION` of the `rocky` binary, or `"<pre-audit>"` on schema-v5 rows that predate the audit trail.
    */
   rocky_version?: string | null;
@@ -59,6 +63,10 @@ export interface RunHistoryRecord {
   session_source?: string | null;
   started_at: string;
   status: string;
+  /**
+   * The scheduler submission id — `rocky tick` stamps it via `ROCKY_SUBMISSION_ID`, so this is the join key to a tick's `TickOutput.executed[].submission_id`. `None` for manually launched runs.
+   */
+  submission_id?: string | null;
   /**
    * Best-available target catalog — the `catalog_template` for replication pipelines, the literal `target.catalog` for transformation/quality/snapshot/load.
    */

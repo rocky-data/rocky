@@ -2043,14 +2043,148 @@ pub async fn run(
             }
         }
         rocky_core::config::PipelineConfig::Quality(q) => {
-            super::run_local::run_quality(config_path, q, rocky_cfg, output_json).await?;
-            finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
-            return Ok(());
+            // Wrap the quality dispatch in its OWN remote-state session (never
+            // run()'s `session_opt`) so the `RunRecord` it now persists — for the
+            // schedule reconciler's `after`/`freshness` demands and `rocky
+            // history` — rides the terminal upload to the durable [state] backend.
+            // Mirrors the transformation arm: acquire before the dispatch,
+            // finalize after the delegated `Ok` (past the idempotency stamp), and
+            // abandon on the delegated `Err`. Durability keys on the governed
+            // context ALONE (parity with the transformation / load arms);
+            // `[policy]` remains only on the download-failure fail-closed bail.
+            let governed = exec_fp_gate.is_some();
+            let governed_with_policy = governed && rocky_cfg.policy.is_some();
+            let mut session = rocky_core::state_sync::RemoteStateSession::new(
+                &loaded.config.state,
+                state_path,
+                if governed {
+                    rocky_core::state_sync::FinalizeDurability::Durable
+                } else {
+                    rocky_core::state_sync::FinalizeDurability::ConfigDefault
+                },
+            );
+            if let Err(e) = session.acquire().await {
+                session.abandon("quality acquire misuse").await;
+                return Err(e.into());
+            }
+            match session.require_synced() {
+                // #1089 fail-closed: a governed run whose remote download failed
+                // cannot see a cross-pod freeze/budget.
+                Err(e) if governed_with_policy => {
+                    session
+                        .abandon("governed quality download failure (fail-closed)")
+                        .await;
+                    return Err(anyhow::Error::new(e).context(
+                        "refusing a governed run: the remote state download failed, so a \
+                         cross-pod freeze/budget in the durable state ledger cannot be seen \
+                         (fail-closed). Retry once the `[state]` backend is reachable.",
+                    ));
+                }
+                Err(e) => {
+                    warn!(error = %e, "state download failed, continuing with local state");
+                    session.set_suppress_upload("indeterminate download");
+                }
+                Ok(()) => {}
+            }
+            let dispatch_result = super::run_local::run_quality(
+                config_path,
+                q,
+                rocky_cfg,
+                output_json,
+                // Canonical state path + run identity + config fingerprint +
+                // resolved pipeline name, threaded so the persisted `RunRecord`
+                // lands on the same store the reconciler reads and is stamped
+                // with the pipeline the demand waits on.
+                state_path,
+                &run_id,
+                started_at,
+                &config_hash,
+                pipeline_name,
+            )
+            .await;
+            match dispatch_result {
+                Ok(()) => {
+                    finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id)
+                        .await;
+                    session.finalize().await.context(
+                        "refusing to exit 0: the state ledger mutation could not be \
+                         persisted to the remote [state] backend",
+                    )?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    session
+                        .abandon("quality exited before terminal state writes")
+                        .await;
+                    return Err(e);
+                }
+            }
         }
         rocky_core::config::PipelineConfig::Snapshot(s) => {
-            super::run_local::run_snapshot(config_path, s, rocky_cfg, output_json).await?;
-            finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id).await;
-            return Ok(());
+            // Same remote-state session wrapping as the quality arm above: the
+            // snapshot run now persists a `RunRecord`, so its terminal upload must
+            // ride a session for the reconciler to observe the pipeline's success.
+            let governed = exec_fp_gate.is_some();
+            let governed_with_policy = governed && rocky_cfg.policy.is_some();
+            let mut session = rocky_core::state_sync::RemoteStateSession::new(
+                &loaded.config.state,
+                state_path,
+                if governed {
+                    rocky_core::state_sync::FinalizeDurability::Durable
+                } else {
+                    rocky_core::state_sync::FinalizeDurability::ConfigDefault
+                },
+            );
+            if let Err(e) = session.acquire().await {
+                session.abandon("snapshot acquire misuse").await;
+                return Err(e.into());
+            }
+            match session.require_synced() {
+                Err(e) if governed_with_policy => {
+                    session
+                        .abandon("governed snapshot download failure (fail-closed)")
+                        .await;
+                    return Err(anyhow::Error::new(e).context(
+                        "refusing a governed run: the remote state download failed, so a \
+                         cross-pod freeze/budget in the durable state ledger cannot be seen \
+                         (fail-closed). Retry once the `[state]` backend is reachable.",
+                    ));
+                }
+                Err(e) => {
+                    warn!(error = %e, "state download failed, continuing with local state");
+                    session.set_suppress_upload("indeterminate download");
+                }
+                Ok(()) => {}
+            }
+            let dispatch_result = super::run_local::run_snapshot(
+                config_path,
+                s,
+                rocky_cfg,
+                output_json,
+                state_path,
+                &run_id,
+                started_at,
+                &config_hash,
+                pipeline_name,
+            )
+            .await;
+            match dispatch_result {
+                Ok(()) => {
+                    finalize_idempotency_on_success(&mut idempotency_ctx, state_path, &run_id)
+                        .await;
+                    session.finalize().await.context(
+                        "refusing to exit 0: the state ledger mutation could not be \
+                         persisted to the remote [state] backend",
+                    )?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    session
+                        .abandon("snapshot exited before terminal state writes")
+                        .await;
+                    return Err(e);
+                }
+            }
         }
         rocky_core::config::PipelineConfig::Replication(_) => {}
         rocky_core::config::PipelineConfig::Load(_) => {
