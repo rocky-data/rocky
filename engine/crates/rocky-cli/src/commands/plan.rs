@@ -18,6 +18,19 @@ use crate::registry;
 use super::run::PartitionRunOptions;
 use super::{filter_table_matches, matches_filter, parse_filter};
 
+/// A `--model` / filter named a model that does not exist in the compiled
+/// project.
+///
+/// Returned as a typed error (rather than a bare `anyhow` string) so callers
+/// that speak a stable error taxonomy — the `rocky mcp` `plan_preview` tool —
+/// can downcast and classify it as `model_not_found` instead of the generic
+/// compile-failure bucket. The `Display` text is byte-identical to the message
+/// `rocky run --model <name>` emits for the same condition (see
+/// `commands::run`), so CLI output and existing assertions are unchanged.
+#[derive(Debug, thiserror::Error)]
+#[error("model '{0}' not found (no transformation model with that name)")]
+pub struct ModelNotFound(pub String);
+
 /// Bundle of `rocky plan` execution flags persisted into `RunPlan` so
 /// `rocky apply <plan-id>` can honour them. Mirrors the flag surface of
 /// `rocky run`; `model` also scopes the SQL preview and model metadata.
@@ -312,6 +325,33 @@ pub async fn plan(
         models_dir_exists = models_dir.exists(),
         "plan: models_dir check"
     );
+
+    // Resolve the transformation models directory once: an explicit `--models`
+    // override, else the conventional `models/` beside the config. Used both for
+    // the `--model` preview here and the run-plan blueprint below.
+    let blueprint_models_dir = run_options
+        .models_dir
+        .clone()
+        .unwrap_or_else(|| models_dir.clone());
+
+    // `--model` scoping — validated BEFORE the governance/budget preview below.
+    // An unknown model (including a project that compiles to zero models) fails
+    // fast here with the same "model not found" error `rocky run` / `rocky apply`
+    // emit, rather than surfacing as a confusing governance-preview failure or —
+    // when no conventional `models/` exists — an empty preview that would mask a
+    // persisted full-replication plan `apply` then executes. On success the SQL
+    // preview is scoped to just the selected model.
+    if let Some(model) = run_options.model.as_deref() {
+        anyhow::ensure!(
+            blueprint_models_dir.exists(),
+            "models directory '{}' not found (required for --model)",
+            blueprint_models_dir.display()
+        );
+        output.statements =
+            plan_preview_output(Some(config_path), &blueprint_models_dir, Some(model), env)?
+                .statements;
+    }
+
     if models_dir.exists() {
         let adapter_type = rocky_cfg
             .adapters
@@ -391,22 +431,9 @@ pub async fn plan(
     // in CI environments without `.rocky/` write access still emit the
     // statement preview.
     //
-    // The run-plan compile honours `--models` when set; otherwise the
-    // conventional `models/` directory next to the config is used.
-    let blueprint_models_dir = run_options
-        .models_dir
-        .clone()
-        .unwrap_or_else(|| models_dir.clone());
-    if let Some(model) = run_options.model.as_deref() {
-        anyhow::ensure!(
-            blueprint_models_dir.exists(),
-            "models directory '{}' not found (required for --model)",
-            blueprint_models_dir.display()
-        );
-        output.statements =
-            plan_preview_output(Some(config_path), &blueprint_models_dir, Some(model), env)?
-                .statements;
-    }
+    // The run-plan compile honours `--models` when set (resolved into
+    // `blueprint_models_dir` above); otherwise the conventional `models/`
+    // directory next to the config is used.
     let mut run_plan_persisted = false;
     if blueprint_models_dir.exists() {
         match build_and_persist_run_plan(
@@ -793,6 +820,13 @@ pub fn plan_preview_output(
         Err(rocky_compiler::compile::CompileError::Project(
             rocky_compiler::project::ProjectError::NoModels { .. },
         )) => {
+            // A `--model` filter against a project with zero compiled models
+            // cannot name an existing model — fail loudly rather than returning
+            // an empty preview while `plan()` falls through to persist a
+            // full-replication plan that `apply` would silently execute.
+            if let Some(model) = filter {
+                return Err(anyhow::Error::new(ModelNotFound(model.to_string())));
+            }
             tracing::info!(
                 models_dir = %models_dir.display(),
                 "plan_preview: project has no compiled models — replication SQL preview \
@@ -806,6 +840,12 @@ pub fn plan_preview_output(
     };
 
     if result.project.models.is_empty() {
+        // Same guard as the `NoModels` arm above: a `--model` filter cannot
+        // match anything in a zero-model project, so error rather than emit an
+        // empty preview that masks a persisted full-replication plan.
+        if let Some(model) = filter {
+            return Err(anyhow::Error::new(ModelNotFound(model.to_string())));
+        }
         tracing::info!(
             models_dir = %models_dir.display(),
             "plan_preview: project has no compiled models — returning empty statements"
@@ -816,14 +856,13 @@ pub fn plan_preview_output(
     // Project the compile result to typed IR, reusing the shared
     // `project_ir_from_compile` helper so we don't re-derive IR by hand.
     let project_ir = super::ci_diff::project_ir_from_compile(&result);
-    if let Some(model) = filter {
-        anyhow::ensure!(
-            project_ir
-                .models
-                .iter()
-                .any(|candidate| candidate.name.as_ref() == model),
-            "model '{model}' not found (no transformation model with that name)"
-        );
+    if let Some(model) = filter
+        && !project_ir
+            .models
+            .iter()
+            .any(|candidate| candidate.name.as_ref() == model)
+    {
+        return Err(anyhow::Error::new(ModelNotFound(model.to_string())));
     }
 
     for model_ir in &project_ir.models {
@@ -2640,8 +2679,44 @@ table = "known"
         );
     }
 
-    /// A `models/` directory with no compiled models (replication-only)
-    /// returns empty statements rather than erroring.
+    /// A `--model` filter against a `models/` directory that compiles to zero
+    /// models must error — the model cannot exist. Otherwise `plan()` returns an
+    /// empty preview and falls through to persist a full-replication plan that
+    /// `apply` would silently execute (the regression this closes).
+    #[test]
+    fn plan_preview_filter_on_empty_models_dir_errors() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("rocky.toml");
+        fs::write(
+            &cfg_path,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+        )
+        .unwrap();
+        // models_dir exists but holds no model sidecars → zero compiled models.
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+
+        let err = plan_preview_output(Some(&cfg_path), &models_dir, Some("known"), None)
+            .expect_err("filter against a zero-model project must fail");
+        assert!(
+            err.to_string()
+                .contains("model 'known' not found (no transformation model with that name)"),
+            "unexpected error: {err}"
+        );
+        // The typed error must survive as an anyhow cause so the MCP tool can
+        // downcast it and classify it as `model_not_found`.
+        assert!(
+            err.downcast_ref::<ModelNotFound>().is_some(),
+            "error must downcast to ModelNotFound"
+        );
+    }
+
+    /// The zero-model, no-filter path is unchanged: a replication-only project
+    /// still returns empty statements rather than erroring.
     #[test]
     fn plan_preview_replication_only_returns_empty_statements() {
         let tmp = TempDir::new().unwrap();

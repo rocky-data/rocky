@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `rocky plan --model <name>` now previews only the selected model and reports the same model scope that `rocky apply` executes, instead of advertising skipped replication SQL and unrelated models. (#1165)
+- `rocky plan --model <name>` now fails fast with a "model not found" error when the named model does not exist — including a project that compiles to zero models — matching what `rocky apply` reports. Previously this surfaced as a confusing governance-preview failure, or (with a `--models` override pointing at a model-less directory) as an empty preview that masked a persisted full-replication plan `rocky apply` would then execute. The `rocky mcp` `plan_preview` tool now classifies an unknown model as `model_not_found` rather than `compile_failed`. (#1165)
 
 ## [1.65.0] - 2026-07-18
 

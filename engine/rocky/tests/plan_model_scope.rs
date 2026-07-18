@@ -117,3 +117,58 @@ fn model_plan_matches_applied_scope() {
         );
     }
 }
+
+/// Regression: `rocky plan --model <name>` against a project whose `models/`
+/// directory exists but compiles to zero models must FAIL with "model not
+/// found" — not succeed with an empty preview while silently persisting a
+/// full-replication plan that `apply` would then execute against every
+/// discovered table.
+#[test]
+fn model_plan_on_empty_models_dir_errors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let config = dir.join("rocky.toml");
+
+    {
+        let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+        conn.execute_batch(
+            "CREATE SCHEMA raw__orders;
+             CREATE TABLE raw__orders.orders AS SELECT 1 AS id;",
+        )
+        .expect("seed source");
+    }
+
+    fs::write(&config, ROCKY_TOML).expect("write config");
+    // The models directory exists but holds no model sidecars → zero compiled
+    // models. `--model` cannot name anything here.
+    fs::create_dir(dir.join("models")).expect("create empty models dir");
+
+    let plan = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .args(["--output", "json"])
+        .arg("--config")
+        .arg(&config)
+        .args(["plan", "--model", "known"])
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run plan");
+
+    assert!(
+        !plan.status.success(),
+        "plan --model against a zero-model project must fail, got success with stdout: {}",
+        String::from_utf8_lossy(&plan.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&plan.stderr);
+    assert!(
+        stderr.contains("model 'known' not found (no transformation model with that name)"),
+        "expected a model-not-found error, got stderr: {stderr}"
+    );
+
+    // No plan may have been persisted — otherwise a later `apply` would run the
+    // full replication the empty preview never advertised.
+    let plans_dir = dir.join(".rocky").join("plans");
+    let persisted = fs::read_dir(&plans_dir)
+        .map(|rd| rd.filter_map(Result::ok).count())
+        .unwrap_or(0);
+    assert_eq!(persisted, 0, "a failed model plan must not persist a plan");
+}
