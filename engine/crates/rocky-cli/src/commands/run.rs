@@ -6288,6 +6288,13 @@ pub(crate) async fn execute_models(
         }
     };
 
+    if let Some(name) = model_name_filter {
+        anyhow::ensure!(
+            compile_result.project.model(name).is_some(),
+            "model '{name}' not found (no transformation model with that name)"
+        );
+    }
+
     // Per-model surrogate-key specs — loaded ONCE here (execute-from-owned-value,
     // #1) so the SAME owned map feeds BOTH the TOCTOU fingerprint below AND
     // execution (via `ExecutionContext`), with no post-verification reload that
@@ -12908,6 +12915,26 @@ merge_keys = ["id"]
         ));
     }
 
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn unknown_model_filter_is_an_error_not_empty_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        write_plain_model(&models, "known", "SELECT 1 AS id");
+
+        let db_path = dir.path().join("t.duckdb");
+        let (output, result) =
+            run_filtered_models_against_duckdb(&models, &db_path, false, 1, Some("missing")).await;
+
+        let err = result.expect_err("an unknown model filter must fail");
+        assert_eq!(
+            err.to_string(),
+            "model 'missing' not found (no transformation model with that name)"
+        );
+        assert!(output.materializations.is_empty());
+    }
+
     /// Write a plain model carrying a `[governance.tags]` block.
     #[cfg(feature = "duckdb")]
     fn write_tagged_model(dir: &std::path::Path, name: &str, sql: &str) {
@@ -13420,6 +13447,18 @@ merge_keys = ["id"]
         concurrent_adapter: bool,
         parallel: u32,
     ) -> (RunOutput, Result<super::GovernanceSnapshot>) {
+        run_filtered_models_against_duckdb(models_dir, db_path, concurrent_adapter, parallel, None)
+            .await
+    }
+
+    #[cfg(feature = "duckdb")]
+    async fn run_filtered_models_against_duckdb(
+        models_dir: &std::path::Path,
+        db_path: &std::path::Path,
+        concurrent_adapter: bool,
+        parallel: u32,
+        model_name_filter: Option<&str>,
+    ) -> (RunOutput, Result<super::GovernanceSnapshot>) {
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
         let adapter = DuckDbWarehouseAdapter::open(db_path)
@@ -13436,7 +13475,7 @@ merge_keys = ["id"]
             None,
             &opts,
             "test-run",
-            None,
+            model_name_filter,
             None, // model_set: no backfill scope in this test
             &mut output,
             None,
