@@ -58,7 +58,7 @@ const RECOVERY_GRACE: Duration = Duration::minutes(5);
 
 /// A held tick lock whose heartbeat is older than this is a wedged owner: a
 /// later tick proceeds via the wedge override rather than skipping forever.
-const LOCK_TAKEOVER_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+pub const LOCK_TAKEOVER_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How often the lease heartbeat is refreshed while a child runs. Comfortably
 /// under the 60s staleness bound so a long but healthy run is never mistaken for
