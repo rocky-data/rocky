@@ -168,7 +168,11 @@ pub fn router(state: Arc<ServerState>) -> Router {
 ///   auth would leak model SQL, file paths, and run history;
 /// - the listener fails to bind (port in use, permissions, etc.);
 /// - the axum runtime returns an error.
-pub async fn serve(state: Arc<ServerState>, config: ServeConfig) -> anyhow::Result<()> {
+pub async fn serve(
+    state: Arc<ServerState>,
+    config: ServeConfig,
+    shutdown: rocky_core::schedule::Drain,
+) -> anyhow::Result<()> {
     if !is_loopback(&config.host) && state.auth_token.is_none() {
         anyhow::bail!(
             "rocky serve refuses to bind {host} without a Bearer token. \
@@ -203,7 +207,11 @@ pub async fn serve(state: Arc<ServerState>, config: ServeConfig) -> anyhow::Resu
     let bind_addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!(addr = %bind_addr, "rocky serve listening");
-    axum::serve(listener, app).await?;
+    // Graceful shutdown: on `shutdown` (SIGTERM/ctrl-c, shared with the scheduler
+    // loop) axum stops accepting and drains in-flight requests before returning.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.signalled().await })
+        .await?;
     Ok(())
 }
 
@@ -460,7 +468,7 @@ fn map_join_err(err: &tokio::task::JoinError) -> ApiError {
 }
 
 /// Resolve the state-store path for a read route the same way the CLI does.
-fn state_path_for(state: &ServerState) -> std::path::PathBuf {
+pub(crate) fn state_path_for(state: &ServerState) -> std::path::PathBuf {
     rocky_core::state::resolve_state_path(None, &state.models_dir).path
 }
 
@@ -836,7 +844,7 @@ fn new_job_id() -> String {
 }
 
 /// The persisted string form of a lifecycle state.
-fn job_state_str(state: JobState) -> &'static str {
+pub(crate) fn job_state_str(state: JobState) -> &'static str {
     match state {
         JobState::Queued => "queued",
         JobState::Running => "running",
@@ -940,7 +948,10 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
 /// run-download. (Merely being stripped on upload would NOT be enough on its
 /// own: without the download-side preservation, a run-download's wholesale file
 /// replace would still wipe the local `jobs` rows.)
-async fn persist_job(state_path: std::path::PathBuf, job: PersistedJob) -> anyhow::Result<()> {
+pub(crate) async fn persist_job(
+    state_path: std::path::PathBuf,
+    job: PersistedJob,
+) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let store = rocky_core::state::StateStore::open(&state_path)?;
         store.record_job(&job)?;
@@ -1653,6 +1664,7 @@ mod tests {
                 host: "0.0.0.0".to_string(),
                 port: 0,
             },
+            rocky_core::schedule::Drain::new(),
         )
         .await;
         let err = result.expect_err("expected 0.0.0.0 without token to be rejected");
@@ -1673,6 +1685,7 @@ mod tests {
                     host: "127.0.0.1".to_string(),
                     port: 0,
                 },
+                rocky_core::schedule::Drain::new(),
             )
             .await
         });

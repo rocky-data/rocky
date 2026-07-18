@@ -48,7 +48,7 @@ use super::demand::{
 };
 use super::lock::{TickAcquire, TickLock};
 use super::record::{ScheduleStateMutation, ScheduleStateRecord};
-use super::spawn::{SpawnRequest, Spawner};
+use super::spawn::{Drain, SpawnRequest, Spawner};
 
 /// A stuck `submitted` claim with no run record is held for this grace before
 /// its attempt is treated as lost (the owner crashed between committing the
@@ -101,6 +101,13 @@ pub struct TickOptions {
     /// absolutizes). The reconciler also re-opens this path between phases —
     /// see [`tick_once`]'s store lifecycle.
     pub state_path: PathBuf,
+    /// The drain signal (serve mode). When raised mid-tick, the reconciler stops
+    /// evaluating *further* pipelines after the current one (it does not abandon a
+    /// running child — the spawner drains that), so a shutdown never starts new
+    /// work. Default (`Drain::default()`, never raised) is the CLI `rocky tick`
+    /// behavior: every pipeline in scope is evaluated. Shared (an `Arc` clone)
+    /// with the serve loop and its [`SubprocessSpawner`].
+    pub drain: Drain,
 }
 
 /// How many times the reconciler re-opens the state store after a child before
@@ -293,6 +300,11 @@ pub struct TickReport {
     /// a child. Exit-0 semantics, like `skipped_whole_tick`; the deferred work is
     /// picked up by the next tick's stuck-claim resolution.
     pub state_busy: bool,
+    /// The tick stopped evaluating early because the drain was raised mid-pass
+    /// (serve shutdown). Pipelines already evaluated ran normally; the remainder
+    /// are left for the next process to pick up. Always `false` for `rocky tick`
+    /// (its drain is never raised).
+    pub drained: bool,
 }
 
 /// A fault that fails the whole tick closed — it runs nothing.
@@ -395,6 +407,14 @@ pub async fn tick_once(
 
     // 5. Evaluate + execute each pipeline in order against live state.
     for name in &order {
+        // Drain (serve shutdown): stop evaluating *further* pipelines. A child
+        // already running for an earlier pipeline this tick is drained by the
+        // spawner, not abandoned here; we simply start no new work. A dry run
+        // never drains (it spawns nothing and the serve loop never dry-runs).
+        if !opts.dry_run && opts.drain.is_signalled() {
+            report.drained = true;
+            break;
+        }
         let schedule = &schedules[name];
         if let Some(held) = &lock {
             let _ = held.heartbeat();
@@ -1224,6 +1244,7 @@ after = ["raw"]
             traceparent: None,
             member_budgets: BTreeMap::new(),
             state_path: state_path.clone(),
+            drain: Drain::default(),
         };
         (state_path, dir, opts)
     }

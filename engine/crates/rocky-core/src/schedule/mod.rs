@@ -33,4 +33,7 @@ pub use reconcile::{
     ExecutedDemand, SkippedDemand, TickError, TickOptions, TickReport, TickSkipReason, tick_once,
 };
 pub use record::{ScheduleStateMutation, ScheduleStateRecord, Throttle};
-pub use spawn::{CapturingSpawner, RunOutcome, SpawnRequest, Spawner, SubprocessSpawner};
+pub use spawn::{
+    CapturingSpawner, DEFAULT_DRAIN_TIMEOUT, Drain, RunOutcome, SpawnRequest, Spawner,
+    SubprocessSpawner,
+};

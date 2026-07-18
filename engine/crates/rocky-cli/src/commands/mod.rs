@@ -77,6 +77,7 @@ mod state;
 #[cfg(feature = "duckdb")]
 mod test;
 mod test_adapter;
+pub mod scheduler;
 mod tick;
 mod trace;
 mod validate;
