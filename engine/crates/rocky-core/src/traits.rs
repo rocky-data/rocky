@@ -1213,6 +1213,24 @@ pub trait SqlDialect: Send + Sync {
             "ALTER TABLE {table_ref} ALTER COLUMN {column} TYPE {new_type}"
         ))
     }
+
+    /// Optional statement to run **once** immediately before the per-column
+    /// `alter_column_type_sql` widenings, e.g. to enable a table feature the
+    /// `ALTER` depends on.
+    ///
+    /// Returns `None` when no prelude is needed — the default for every
+    /// dialect except Databricks, which enables the Delta
+    /// `delta.enableTypeWidening` table feature here so the subsequent
+    /// `ALTER COLUMN … TYPE …` is accepted on both freshly-created and
+    /// pre-existing tables. Emitted by
+    /// [`crate::drift::generate_alter_column_sql`] as the first statement of
+    /// the returned batch, so it runs before any column is altered.
+    ///
+    /// `table_ref` is already a fully formatted dialect-specific reference —
+    /// the caller obtains it via `format_table_ref`.
+    fn pre_alter_column_type_sql(&self, _table_ref: &str) -> Option<AdapterResult<String>> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
