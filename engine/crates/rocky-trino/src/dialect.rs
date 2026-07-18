@@ -188,6 +188,21 @@ impl SqlDialect for TrinoDialect {
         ])
     }
 
+    fn is_safe_type_widening(&self, _source_type: &str, _target_type: &str) -> bool {
+        // The trait-default `alter_column_type_sql` emits the ANSI `ALTER TABLE
+        // … ALTER COLUMN … TYPE …` form, which is not valid Trino syntax (Trino
+        // requires `… SET DATA TYPE …`), and the in-place type changes Trino
+        // accepts are connector-specific and narrow (e.g. no numeric → VARCHAR).
+        // So every widening the shared default classifies as safe would emit a
+        // statement Trino rejects, failing the table run (#1115).
+        //
+        // Report no widening as ALTER-safe: type drift then degrades to a full
+        // refresh (`DropAndRecreate`), which succeeds. A connector-scoped
+        // allowlist paired with the `SET DATA TYPE` form (live-verified via the
+        // `trino-conformance` harness) is a follow-up.
+        false
+    }
+
     // `view_ddl` defaults to `CREATE OR REPLACE VIEW <target> AS …`,
     // which Trino accepts natively (connector-gated — Iceberg + Hive
     // both support it) so the default impl is correct here.
@@ -435,5 +450,42 @@ mod tests {
         // refactor that changes the trait default is caught here.
         let d = TrinoDialect::new();
         assert_eq!(d.quote_identifier("col"), "\"col\"");
+    }
+
+    #[test]
+    fn type_widening_degrades_to_full_refresh() {
+        // The trait-default `ALTER COLUMN … TYPE` form is invalid Trino syntax
+        // and Trino's accepted in-place widenings are connector-specific, so
+        // drift the shared default classifies as a safe widening must degrade to
+        // a full refresh (`DropAndRecreate`) rather than emit a statement Trino
+        // rejects (#1115).
+        use rocky_core::drift::detect_drift;
+        use rocky_ir::{ColumnInfo, DriftAction, TableRef};
+
+        let d = TrinoDialect::new();
+        // Both of these are safe widenings under the shared default.
+        assert!(!d.is_safe_type_widening("BIGINT", "INT")); // INT → BIGINT
+        assert!(!d.is_safe_type_widening("STRING", "INT")); // numeric → STRING
+
+        let table = TableRef {
+            catalog: "iceberg".into(),
+            schema: "raw".into(),
+            table: "orders".into(),
+        };
+        let col = |name: &str, ty: &str| ColumnInfo {
+            name: name.to_string(),
+            data_type: ty.to_string(),
+            nullable: true,
+        };
+        for (src_ty, tgt_ty) in [("BIGINT", "INT"), ("STRING", "INT")] {
+            let source = vec![col("amount", src_ty)];
+            let target = vec![col("amount", tgt_ty)];
+            let result = detect_drift(&table, &source, &target, &d);
+            assert_eq!(
+                result.action,
+                DriftAction::DropAndRecreate,
+                "{tgt_ty} → {src_ty} must degrade to full refresh on Trino"
+            );
+        }
     }
 }
