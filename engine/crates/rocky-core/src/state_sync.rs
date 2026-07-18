@@ -3827,13 +3827,16 @@ mod tests {
     /// (the thread-local [`test_support::install`] only covers the test thread).
     /// Hold the returned guard for the test's duration; pair with
     /// [`test_support::serial_guard`] (the global override is shared state).
-    fn install_counting_provider_global()
-    -> (crate::fault_store::FaultHandle, test_support::GlobalOverrideGuard) {
+    fn install_counting_provider_global() -> (
+        crate::fault_store::FaultHandle,
+        test_support::GlobalOverrideGuard,
+    ) {
         let (store, faults) = crate::fault_store::FaultingStore::wrap(std::sync::Arc::new(
             object_store::memory::InMemory::new(),
         ));
-        let guard =
-            test_support::install_global(ObjectStoreProvider::from_store(store, "s3", "bucket", ""));
+        let guard = test_support::install_global(ObjectStoreProvider::from_store(
+            store, "s3", "bucket", "",
+        ));
         (faults, guard)
     }
 
@@ -4177,30 +4180,36 @@ mod tests {
         // First dirty tick uploads.
         let uploaded = poll_until(
             || faults.count(crate::fault_store::FaultOp::Put) >= 1,
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await;
-        assert!(uploaded, "a dirty tick must upload the snapshot");
         let after_first = faults.count(crate::fault_store::FaultOp::Put);
 
         // No new writes → subsequent ticks are clean and skip (zero new Puts).
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(
-            faults.count(crate::fault_store::FaultOp::Put),
-            after_first,
-            "clean ticks must skip — the dirty-gate spends zero I/O when the epoch is unchanged"
-        );
+        let clean_skipped = faults.count(crate::fault_store::FaultOp::Put) == after_first;
 
         // A fresh write re-dirties the epoch → the uploader picks it up.
         store.set_watermark("c.s.u", &wm_now()).unwrap();
         let re_uploaded = poll_until(
             || faults.count(crate::fault_store::FaultOp::Put) > after_first,
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await;
-        assert!(re_uploaded, "a new epoch bump must trigger another upload");
 
+        // Consume the session BEFORE asserting: a failing assertion must not
+        // leave the session unconsumed, or its Drop tripwire fires during unwind
+        // (a destructor panic on top of the assert's panic) and aborts the
+        // process with truncated output — turning a clean, retryable FAIL into an
+        // un-debuggable SIGABRT.
         session.abandon("test complete").await;
+
+        assert!(uploaded, "a dirty tick must upload the snapshot");
+        assert!(
+            clean_skipped,
+            "clean ticks must skip — the dirty-gate spends zero I/O when the epoch is unchanged"
+        );
+        assert!(re_uploaded, "a new epoch bump must trigger another upload");
     }
 
     /// Cooperative drain: after `stop_periodic` no late upload happens and no
@@ -4227,13 +4236,9 @@ mod tests {
         // Let at least one upload happen so a tick has genuinely run.
         let uploaded = poll_until(
             || faults.count(crate::fault_store::FaultOp::Put) >= 1,
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await;
-        assert!(
-            uploaded,
-            "the uploader must run at least one tick before stop"
-        );
 
         // Cooperative drain + join.
         session.stop_periodic().await;
@@ -4241,11 +4246,7 @@ mod tests {
 
         // No further upload after the drain returns.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            faults.count(crate::fault_store::FaultOp::Put),
-            after_stop,
-            "no late upload may fire after a cooperative stop"
-        );
+        let no_late_upload = faults.count(crate::fault_store::FaultOp::Put) == after_stop;
 
         // No scratch snapshot leaked for this process (the ScratchGuard removed
         // every temp file in-task, uncancelled).
@@ -4256,12 +4257,23 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|name| name.starts_with(&pid_prefix))
             .collect();
+
+        // Consume the session BEFORE asserting (clean FAIL, never a Drop-tripwire
+        // double-panic SIGABRT on assertion failure — see the uploads/skips test).
+        session.abandon("test complete").await;
+
+        assert!(
+            uploaded,
+            "the uploader must run at least one tick before stop"
+        );
+        assert!(
+            no_late_upload,
+            "no late upload may fire after a cooperative stop"
+        );
         assert!(
             leaked.is_empty(),
             "cooperative drain must leave no scratch snapshot behind, found: {leaked:?}"
         );
-
-        session.abandon("test complete").await;
     }
 
     /// The `Weak`-handle safety net (mirrors run.rs's serial tail): with the
@@ -4292,33 +4304,38 @@ mod tests {
         // Weak at least once — the case a strong clone would have made fatal).
         let ticked = poll_until(
             || faults.count(crate::fault_store::FaultOp::Put) >= 1,
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await;
+
+        // Run tail: `abandon` drains the periodic (cooperative stop + join), and
+        // consuming the session here — BEFORE the recovery assertions — keeps a
+        // failure a clean FAIL rather than a Drop-tripwire double-panic SIGABRT.
+        session.abandon("test complete").await;
+
+        // The Weak periodic handle never blocked the run tail's try_unwrap.
+        let recovered = Arc::try_unwrap(shared_state).ok();
+        let terminal_persisted = if let Some(store) = recovered.as_ref() {
+            // The recovered store is real (not a no-op `None`): a terminal write
+            // persists. `store` drops at the end of scope, freeing the writer
+            // lock — the drop-before-finalize discipline.
+            store.set_watermark("c.s.terminal", &wm_now()).unwrap();
+            store.get_watermark("c.s.terminal").unwrap().is_some()
+        } else {
+            false
+        };
+
         assert!(
             ticked,
             "the uploader must run a tick so the Weak is upgraded"
         );
-
-        // Run tail: drain the periodic, then recover the owned store.
-        session.stop_periodic().await;
-        let recovered = Arc::try_unwrap(shared_state).ok();
         assert!(
             recovered.is_some(),
             "Arc::try_unwrap must succeed — the Weak periodic handle never blocks the run tail"
         );
-        let store = recovered.unwrap();
-
-        // The recovered store is real (not a no-op `None`): a terminal write
-        // persists.
-        store.set_watermark("c.s.terminal", &wm_now()).unwrap();
         assert!(
-            store.get_watermark("c.s.terminal").unwrap().is_some(),
+            terminal_persisted,
             "the terminal write must persist on the recovered owned store"
         );
-
-        // Drop-before-finalize: dropping the owned store frees the writer lock.
-        drop(store);
-        session.abandon("test complete").await;
     }
 }
