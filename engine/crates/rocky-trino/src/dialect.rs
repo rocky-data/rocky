@@ -188,19 +188,40 @@ impl SqlDialect for TrinoDialect {
         ])
     }
 
-    fn is_safe_type_widening(&self, _source_type: &str, _target_type: &str) -> bool {
-        // The trait-default `alter_column_type_sql` emits the ANSI `ALTER TABLE
-        // … ALTER COLUMN … TYPE …` form, which is not valid Trino syntax (Trino
-        // requires `… SET DATA TYPE …`), and the in-place type changes Trino
-        // accepts are connector-specific and narrow (e.g. no numeric → VARCHAR).
-        // So every widening the shared default classifies as safe would emit a
-        // statement Trino rejects, failing the table run (#1115).
+    fn is_safe_type_widening(&self, source_type: &str, target_type: &str) -> bool {
+        // Trino's Iceberg connector allows a narrow set of in-place column type
+        // promotions via `ALTER TABLE … ALTER COLUMN … SET DATA TYPE …` (see
+        // `alter_column_type_sql`): INTEGER → BIGINT, REAL → DOUBLE, and
+        // DECIMAL(p,s) → DECIMAL(p2,s) with p2 > p at fixed scale. Everything
+        // else — notably numeric → VARCHAR — is rejected, so it degrades to a
+        // full refresh instead of failing the run (#1115 / #1157).
         //
-        // Report no widening as ALTER-safe: type drift then degrades to a full
-        // refresh (`DropAndRecreate`), which succeeds. A connector-scoped
-        // allowlist paired with the `SET DATA TYPE` form (live-verified via the
-        // `trino-conformance` harness) is a follow-up.
-        false
+        // Scoped to the Iceberg connector — Trino's common lakehouse target;
+        // other connectors accept a different (often empty) set and would fall
+        // back to a full refresh. Live-verified via the `trino-conformance`
+        // harness against an Iceberg REST catalog.
+        let src = normalize_trino_type(source_type);
+        let tgt = normalize_trino_type(target_type);
+        // Tuple is (target = current type, source = new/incoming type).
+        matches!(
+            (tgt.as_str(), src.as_str()),
+            ("INTEGER", "BIGINT") | ("REAL", "DOUBLE"),
+        ) || is_safe_iceberg_decimal_widening(&tgt, &src)
+    }
+
+    fn alter_column_type_sql(
+        &self,
+        table_ref: &str,
+        column: &str,
+        new_type: &str,
+    ) -> AdapterResult<String> {
+        // Trino requires the `SET DATA TYPE` form; the trait-default ANSI
+        // `ALTER COLUMN … TYPE …` is a syntax error in Trino.
+        validation::validate_identifier(column).map_err(AdapterError::new)?;
+        rocky_core::sql_gen::validate_sql_type(new_type).map_err(AdapterError::new)?;
+        Ok(format!(
+            "ALTER TABLE {table_ref} ALTER COLUMN {column} SET DATA TYPE {new_type}"
+        ))
     }
 
     // `view_ddl` defaults to `CREATE OR REPLACE VIEW <target> AS …`,
@@ -223,6 +244,31 @@ impl SqlDialect for TrinoDialect {
     // `xxhash64(varbinary)` and `to_hex(sha256(...))` but neither is
     // wired up in v0 — checksum-bisection diff against Trino is a
     // follow-up.
+}
+
+/// Normalizes a Trino type name for widening comparison: uppercases and folds
+/// the `INT` synonym to Trino's canonical `INTEGER` spelling. `DECIMAL(p,s)`
+/// and every other type pass through uppercased.
+fn normalize_trino_type(t: &str) -> String {
+    match t.trim().to_uppercase().as_str() {
+        "INT" => "INTEGER".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// `DECIMAL(p,s)` → `DECIMAL(p2,s)` at fixed scale with `p2 > p` — Iceberg's
+/// decimal promotion rule (precision may increase, scale cannot change). Both
+/// arguments are expected already normalized (uppercased).
+fn is_safe_iceberg_decimal_widening(target: &str, source: &str) -> bool {
+    fn parse(t: &str) -> Option<(u32, u32)> {
+        let inner = t.trim().strip_prefix("DECIMAL(")?.strip_suffix(')')?;
+        let (p, s) = inner.split_once(',')?;
+        Some((p.trim().parse().ok()?, s.trim().parse().ok()?))
+    }
+    match (parse(target), parse(source)) {
+        (Some((tp, ts)), Some((sp, ss))) => sp > tp && ss == ts,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -453,20 +499,51 @@ mod tests {
     }
 
     #[test]
-    fn type_widening_degrades_to_full_refresh() {
-        // The trait-default `ALTER COLUMN … TYPE` form is invalid Trino syntax
-        // and Trino's accepted in-place widenings are connector-specific, so
-        // drift the shared default classifies as a safe widening must degrade to
-        // a full refresh (`DropAndRecreate`) rather than emit a statement Trino
-        // rejects (#1115).
+    fn type_widening_scoped_to_iceberg_promotions() {
+        // `is_safe_type_widening(new, current)` — the current type widens to the
+        // new type. Only Iceberg's promotion set is ALTER-safe (#1157).
+        let d = TrinoDialect::new();
+
+        // Safe — Iceberg promotions.
+        assert!(d.is_safe_type_widening("BIGINT", "INTEGER")); // INTEGER → BIGINT
+        assert!(d.is_safe_type_widening("BIGINT", "INT")); // INT synonym folds
+        assert!(d.is_safe_type_widening("DOUBLE", "REAL")); // REAL → DOUBLE
+        assert!(d.is_safe_type_widening("DECIMAL(20,2)", "DECIMAL(10,2)")); // precision widen
+
+        // Unsafe — degrade to full refresh.
+        assert!(!d.is_safe_type_widening("VARCHAR", "INTEGER")); // numeric → VARCHAR
+        assert!(!d.is_safe_type_widening("DOUBLE", "INTEGER")); // int → double not an Iceberg promotion
+        assert!(!d.is_safe_type_widening("INTEGER", "BIGINT")); // BIGINT → INTEGER narrowing
+        assert!(!d.is_safe_type_widening("DECIMAL(10,2)", "DECIMAL(20,2)")); // precision narrowing
+        assert!(!d.is_safe_type_widening("DECIMAL(20,4)", "DECIMAL(10,2)")); // scale change
+        assert!(!d.is_safe_type_widening("DECIMAL(10,2)", "DECIMAL(10,2)")); // equal (p2 not > p)
+    }
+
+    #[test]
+    fn alter_column_type_uses_set_data_type_form() {
+        let d = TrinoDialect::new();
+        let sql = d
+            .alter_column_type_sql("\"iceberg\".\"raw\".\"orders\"", "amount", "BIGINT")
+            .expect("valid alter");
+        assert_eq!(
+            sql,
+            "ALTER TABLE \"iceberg\".\"raw\".\"orders\" ALTER COLUMN amount SET DATA TYPE BIGINT"
+        );
+        // Injection guard still applies.
+        assert!(
+            d.alter_column_type_sql("\"t\"", "bad; DROP", "BIGINT")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn type_widening_drives_alter_and_full_refresh_actions() {
+        // Iceberg promotions evolve in place; unsupported changes degrade to a
+        // full refresh — the same path other unsafe drifts take (#1115 / #1157).
         use rocky_core::drift::detect_drift;
         use rocky_ir::{ColumnInfo, DriftAction, TableRef};
 
         let d = TrinoDialect::new();
-        // Both of these are safe widenings under the shared default.
-        assert!(!d.is_safe_type_widening("BIGINT", "INT")); // INT → BIGINT
-        assert!(!d.is_safe_type_widening("STRING", "INT")); // numeric → STRING
-
         let table = TableRef {
             catalog: "iceberg".into(),
             schema: "raw".into(),
@@ -477,15 +554,23 @@ mod tests {
             data_type: ty.to_string(),
             nullable: true,
         };
-        for (src_ty, tgt_ty) in [("BIGINT", "INT"), ("STRING", "INT")] {
-            let source = vec![col("amount", src_ty)];
-            let target = vec![col("amount", tgt_ty)];
-            let result = detect_drift(&table, &source, &target, &d);
-            assert_eq!(
-                result.action,
-                DriftAction::DropAndRecreate,
-                "{tgt_ty} → {src_ty} must degrade to full refresh on Trino"
-            );
-        }
+
+        // INTEGER → BIGINT now evolves in place.
+        let r = detect_drift(
+            &table,
+            &[col("amount", "BIGINT")],
+            &[col("amount", "INTEGER")],
+            &d,
+        );
+        assert_eq!(r.action, DriftAction::AlterColumnTypes);
+
+        // numeric → VARCHAR still degrades to a full refresh.
+        let r = detect_drift(
+            &table,
+            &[col("amount", "VARCHAR")],
+            &[col("amount", "INTEGER")],
+            &d,
+        );
+        assert_eq!(r.action, DriftAction::DropAndRecreate);
     }
 }

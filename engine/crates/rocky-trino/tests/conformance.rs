@@ -216,3 +216,171 @@ async fn round_trip_create_insert_select_drop() {
         .await
         .expect("DROP should succeed");
 }
+
+/// Live Iceberg type-widening receipt (#1157): the SQL Rocky emits for a scoped
+/// safe widening — `detect_drift` → `generate_alter_column_sql` →
+/// `ALTER … SET DATA TYPE` — is accepted by Trino's Iceberg connector and
+/// preserves the seeded row.
+///
+/// Requires the writable-Iceberg stack in `tests/iceberg/`:
+///   docker compose -f engine/crates/rocky-trino/tests/iceberg/docker-compose.yml up -d
+/// Skips gracefully against a coordinator without an `iceberg` catalog (e.g.
+/// the stock memory-only image).
+#[tokio::test]
+#[ignore = "requires the Trino+Iceberg conformance stack (tests/iceberg/docker-compose.yml); run with --ignored"]
+async fn drift_widening_alters_iceberg_in_place() {
+    use rocky_core::drift::{detect_drift, generate_alter_column_sql};
+    use rocky_ir::{ColumnInfo, DriftAction, TableRef};
+
+    let adapter = build_adapter();
+
+    // Skip (don't fail) if this coordinator has no `iceberg` catalog.
+    let has_iceberg = adapter
+        .execute_query("SHOW CATALOGS")
+        .await
+        .map(|r| {
+            r.rows
+                .iter()
+                .any(|row| row.first().and_then(|v| v.as_str()) == Some("iceberg"))
+        })
+        .unwrap_or(false);
+    if !has_iceberg {
+        eprintln!("SKIP drift_widening_alters_iceberg_in_place: no `iceberg` catalog");
+        return;
+    }
+
+    let dialect = adapter.dialect();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let schema = format!("rocky_widen_{nanos}");
+    let table = "widen_target";
+
+    let _ = adapter
+        .execute_statement(&format!("DROP SCHEMA IF EXISTS iceberg.{schema}"))
+        .await;
+    adapter
+        .execute_statement(&format!("CREATE SCHEMA IF NOT EXISTS iceberg.{schema}"))
+        .await
+        .expect("create iceberg schema");
+    let table_ref = dialect
+        .format_table_ref("iceberg", &schema, table)
+        .expect("format table ref");
+    adapter
+        .execute_statement(&format!(
+            "CREATE TABLE {table_ref} (id INTEGER, amt REAL, price DECIMAL(10,2))"
+        ))
+        .await
+        .expect("create iceberg table");
+    adapter
+        .execute_statement(&format!(
+            "INSERT INTO {table_ref} VALUES (2147483647, REAL '2.5', DECIMAL '999.99')"
+        ))
+        .await
+        .expect("seed row");
+
+    let tref = TableRef {
+        catalog: "iceberg".into(),
+        schema: schema.clone(),
+        table: table.into(),
+    };
+    let current = adapter
+        .describe_table(&tref)
+        .await
+        .expect("describe current");
+    // Desired (new) types — each an Iceberg promotion.
+    let desired = vec![
+        ColumnInfo {
+            name: "id".into(),
+            data_type: "BIGINT".into(),
+            nullable: true,
+        },
+        ColumnInfo {
+            name: "amt".into(),
+            data_type: "DOUBLE".into(),
+            nullable: true,
+        },
+        ColumnInfo {
+            name: "price".into(),
+            data_type: "DECIMAL(20,2)".into(),
+            nullable: true,
+        },
+    ];
+
+    let drift = detect_drift(&tref, &desired, &current, dialect);
+    let stmts =
+        generate_alter_column_sql(&tref, &drift.drifted_columns, dialect).expect("emit alters");
+    let mut exec_err = None;
+    for s in &stmts {
+        if let Err(e) = adapter.execute_statement(s).await {
+            exec_err = Some(format!("{s}: {e:?}"));
+            break;
+        }
+    }
+
+    let after = adapter.describe_table(&tref).await.expect("describe after");
+    let rows = adapter
+        .execute_query(&format!("SELECT id, amt, price FROM {table_ref}"))
+        .await
+        .ok();
+
+    let _ = adapter
+        .execute_statement(&format!("DROP TABLE IF EXISTS {table_ref}"))
+        .await;
+    let _ = adapter
+        .execute_statement(&format!("DROP SCHEMA IF EXISTS iceberg.{schema}"))
+        .await;
+
+    println!("detect_drift action = {:?}", drift.action);
+    println!("emitted: {stmts:?}");
+    println!("after: {after:?}");
+    println!("rows: {rows:?}");
+
+    assert_eq!(
+        drift.action,
+        DriftAction::AlterColumnTypes,
+        "Iceberg promotions must evolve in place"
+    );
+    assert!(
+        stmts.iter().all(|s| s.contains("SET DATA TYPE")),
+        "Trino must use the SET DATA TYPE form"
+    );
+    if let Some(e) = exec_err {
+        panic!("emitted widening rejected by Trino Iceberg: {e}");
+    }
+    let ty = |n: &str| {
+        after
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(n))
+            .map(|c| c.data_type.to_lowercase())
+            .unwrap_or_default()
+    };
+    assert_eq!(ty("id"), "bigint");
+    assert_eq!(ty("amt"), "double");
+    assert_eq!(ty("price"), "decimal(20,2)");
+    assert_eq!(
+        rows.expect("rows queryable").rows.len(),
+        1,
+        "the seeded row survives the widening"
+    );
+
+    // Negative: numeric -> VARCHAR is not an Iceberg promotion → full refresh.
+    let neg = detect_drift(
+        &tref,
+        &[ColumnInfo {
+            name: "id".into(),
+            data_type: "VARCHAR".into(),
+            nullable: true,
+        }],
+        &[ColumnInfo {
+            name: "id".into(),
+            data_type: "integer".into(),
+            nullable: true,
+        }],
+        dialect,
+    );
+    assert_eq!(neg.action, DriftAction::DropAndRecreate);
+
+    println!("VERDICT: Iceberg SET DATA TYPE widening accepted; rows preserved.");
+}
