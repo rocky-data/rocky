@@ -47,9 +47,10 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// # Errors
 ///
-/// Returns an error (exit 1) when the config cannot be loaded, the state store
-/// cannot be opened, or the tick itself faults (state I/O, lock I/O, an `after`
-/// cycle). Every such case runs nothing — fail closed.
+/// Returns an error (exit 1) when the config cannot be loaded, the selected
+/// pipeline does not exist, the state store cannot be opened, or the tick itself
+/// faults (state I/O, lock I/O, an `after` cycle). Every such case runs nothing
+/// — fail closed.
 pub async fn run_tick(
     config_path: &Path,
     state_path: &Path,
@@ -71,6 +72,9 @@ pub async fn run_tick(
     // Config parse error ⇒ exit 1, nothing runs.
     let config = load_rocky_config(config_path)
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    if let Some(name) = pipeline.as_deref() {
+        crate::registry::resolve_pipeline(&config, Some(name))?;
+    }
 
     // The only wall-clock read in the reconciler. Everything downstream takes
     // this instant as a parameter.
@@ -492,6 +496,46 @@ mod tests {
 
     fn ts(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn unknown_pipeline_filter_fails_before_state_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+        std::fs::write(
+            &config_path,
+            r#"
+[adapter.db]
+type = "duckdb"
+
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[pipeline.raw.schedule]
+cron = "0 3 * * *"
+"#,
+        )
+        .unwrap();
+
+        let error = run_tick(
+            &config_path,
+            &state_path,
+            true,
+            Some("typo".to_string()),
+            Some("2026-07-18T03:00:00Z".to_string()),
+            false,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("pipeline 'typo' not found in config")
+        );
+        assert!(!state_path.exists());
     }
 
     #[test]
