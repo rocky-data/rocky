@@ -198,6 +198,10 @@ impl Spawner for SubprocessSpawner {
             }
         };
         let pid = child.id();
+        // When the child started, so a drain landing late in the child's own
+        // scheduler timeout doesn't reset that budget to the (usually longer)
+        // drain grace (see the `Interrupt::Drain` arm).
+        let started = std::time::Instant::now();
 
         // Race the child's natural completion against two interrupts: the
         // scheduler-level timeout and (serve mode only) the drain. The interrupt
@@ -221,9 +225,16 @@ impl Spawner for SubprocessSpawner {
                     wait_with_grace(&mut child).await
                 }
                 // Drain (server shutdown): give the child the drain grace to exit
-                // on its own, then the same graceful-then-forced termination.
+                // on its own, then the same graceful-then-forced termination. The
+                // grace never *extends* the child's own scheduler timeout: a child
+                // already near its `timeout` gets only the time it had left, so
+                // draining can shorten but never lengthen a run's bounded lifetime.
                 Interrupt::Drain => {
-                    let grace = self.drain_timeout.unwrap_or(DEFAULT_DRAIN_TIMEOUT);
+                    let drain_grace = self.drain_timeout.unwrap_or(DEFAULT_DRAIN_TIMEOUT);
+                    let grace = match request.timeout {
+                        Some(t) => t.saturating_sub(started.elapsed()).min(drain_grace),
+                        None => drain_grace,
+                    };
                     match tokio::time::timeout(grace, child.wait()).await {
                         Ok(status) => status,
                         Err(_) => {

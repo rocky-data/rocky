@@ -67,6 +67,10 @@ pub async fn run_serve(
     // SIGTERM/ctrl-c raises it; axum drains connections and the reconciler drains
     // its in-flight child before either returns.
     let shutdown = rocky_core::schedule::Drain::new();
+    // A readiness latch the server raises once its startup job sweep is done and
+    // the listener is bound; the scheduler awaits it before its first tick so a
+    // scheduled run never precedes (or outlives a failed) server startup.
+    let server_ready = rocky_core::schedule::Drain::new();
     {
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
@@ -96,6 +100,7 @@ pub async fn run_serve(
             resolved_config,
             sched_cfg,
             shutdown.clone(),
+            server_ready.clone(),
         ))
     } else {
         None
@@ -105,6 +110,7 @@ pub async fn run_serve(
         state,
         crate::api::ServeConfig { host, port },
         shutdown.clone(),
+        server_ready,
     )
     .await;
 

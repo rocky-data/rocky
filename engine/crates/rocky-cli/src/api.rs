@@ -172,6 +172,7 @@ pub async fn serve(
     state: Arc<ServerState>,
     config: ServeConfig,
     shutdown: rocky_core::schedule::Drain,
+    ready: rocky_core::schedule::Drain,
 ) -> anyhow::Result<()> {
     if !is_loopback(&config.host) && state.auth_token.is_none() {
         anyhow::bail!(
@@ -207,6 +208,13 @@ pub async fn serve(
     let bind_addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!(addr = %bind_addr, "rocky serve listening");
+    // Readiness: the startup job sweep has completed and the listener is bound, so
+    // it is now safe for the resident scheduler (if any) to take its first tick —
+    // any job it submits from here on is past the sweep and cannot be clobbered,
+    // and no scheduled child runs before the server is actually up. A bind failure
+    // returns above via `?` without raising this, so the scheduler — which awaits
+    // readiness against shutdown — exits without ticking.
+    ready.signal();
     // Graceful shutdown: on `shutdown` (SIGTERM/ctrl-c, shared with the scheduler
     // loop) axum stops accepting and drains in-flight requests before returning.
     axum::serve(listener, app)
@@ -1665,6 +1673,7 @@ mod tests {
                 port: 0,
             },
             rocky_core::schedule::Drain::new(),
+            rocky_core::schedule::Drain::new(),
         )
         .await;
         let err = result.expect_err("expected 0.0.0.0 without token to be rejected");
@@ -1686,6 +1695,13 @@ mod tests {
                     port: 0,
                 },
                 rocky_core::schedule::Drain::new(),
+                // Pre-signal readiness so this smoke test starts serving without a
+                // separate trigger; it asserts the loopback path keeps running.
+                {
+                    let r = rocky_core::schedule::Drain::new();
+                    r.signal();
+                    r
+                },
             )
             .await
         });

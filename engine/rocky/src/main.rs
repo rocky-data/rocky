@@ -1576,8 +1576,8 @@ enum Command {
         #[arg(long)]
         scheduler: bool,
         /// Seconds between scheduler ticks (default 15). Only meaningful with
-        /// `--scheduler`.
-        #[arg(long, value_name = "SECONDS")]
+        /// `--scheduler`. Must be ≥ 1 — a zero interval would busy-spin the loop.
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
         poll_interval_seconds: Option<u64>,
         /// Seconds a running scheduled child may keep going after a shutdown
         /// signal before it is terminated (default 60). Only meaningful with

@@ -42,6 +42,12 @@ use crate::commands::tick::build_member_budgets;
 /// The default poll interval between ticks (Hugo-overridable, O1-DESIGN §10).
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 
+/// The floor the loop enforces on the poll interval. The CLI already rejects a
+/// zero `--poll-interval-seconds`, but [`SchedulerConfig`] is public, so the loop
+/// clamps defensively: a zero interval would make `clock.sleep` return instantly
+/// and busy-spin the config/state/tick loop.
+const MIN_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The default drain grace on shutdown.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -84,6 +90,7 @@ pub fn spawn_scheduler(
     config_path: PathBuf,
     sched: SchedulerConfig,
     shutdown: Drain,
+    ready: Drain,
 ) -> tokio::task::JoinHandle<()> {
     let clock: Arc<dyn Clock> = Arc::new(TokioClock);
     let heartbeat = Arc::new(AtomicU64::new(now_millis(&*clock)));
@@ -100,6 +107,7 @@ pub fn spawn_scheduler(
         sched,
         clock,
         shutdown,
+        ready,
         heartbeat,
         spawner,
     ))
@@ -118,6 +126,7 @@ pub async fn run_scheduler(
     sched: SchedulerConfig,
     clock: Arc<dyn Clock>,
     shutdown: Drain,
+    ready: Drain,
     heartbeat: Arc<AtomicU64>,
     spawner: Arc<dyn Spawner>,
 ) {
@@ -132,12 +141,30 @@ pub async fn run_scheduler(
         .join(".rocky");
     let state_path =
         std::path::absolute(state_path_for(&state)).unwrap_or_else(|_| state_path_for(&state));
+    // Clamp defensively (see `MIN_POLL_INTERVAL`): a zero interval would busy-spin.
+    let poll_interval = sched.poll_interval.max(MIN_POLL_INTERVAL);
 
     tracing::info!(
-        poll_interval_s = sched.poll_interval.as_secs(),
+        poll_interval_s = poll_interval.as_secs(),
         config = %config_path.display(),
         "scheduler loop started",
     );
+
+    // Do not take the first tick until the server signals readiness — its startup
+    // job sweep has completed and the listener is bound. This keeps `serve
+    // --scheduler` atomic: a job the scheduler submits can never be clobbered by
+    // the sweep, and no scheduled child runs on a server that never came up. If
+    // shutdown wins this race (e.g. the bind failed, so `ready` is never raised),
+    // exit without ever ticking. Tests that drive the loop directly pass a
+    // pre-signalled `ready`.
+    tokio::select! {
+        biased;
+        () = shutdown.signalled() => {
+            tracing::info!("scheduler stopped before readiness (server did not start)");
+            return;
+        }
+        () = ready.signalled() => {}
+    }
 
     loop {
         if shutdown.is_signalled() {
@@ -165,7 +192,7 @@ pub async fn run_scheduler(
         tokio::select! {
             biased;
             () = shutdown.signalled() => break,
-            () = clock.sleep(sched.poll_interval) => {}
+            () = clock.sleep(poll_interval) => {}
         }
     }
 
@@ -401,6 +428,10 @@ cron = "* * * * *"
         let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
         let capture = Arc::new(CapturingSpawner::new(0));
         let shutdown = Drain::new();
+        // These tests drive the loop directly, not through the server, so there is
+        // no startup barrier — hand it a pre-signalled readiness latch.
+        let ready = Drain::new();
+        ready.signal();
         let heartbeat = Arc::new(AtomicU64::new(0));
 
         let clock_dyn: Arc<dyn Clock> = clock.clone();
@@ -414,6 +445,7 @@ cron = "* * * * *"
             },
             clock_dyn,
             shutdown.clone(),
+            ready.clone(),
             heartbeat,
             spawner,
         ));
@@ -473,6 +505,10 @@ cron = "* * * * *"
         let state = test_state(dir.path());
         let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
         let shutdown = Drain::new();
+        // These tests drive the loop directly, not through the server, so there is
+        // no startup barrier — hand it a pre-signalled readiness latch.
+        let ready = Drain::new();
+        ready.signal();
         let heartbeat = Arc::new(AtomicU64::new(0));
 
         let spawner = Arc::new(DrainBlockingSpawner {
@@ -492,6 +528,7 @@ cron = "* * * * *"
             },
             clock_dyn,
             shutdown.clone(),
+            ready.clone(),
             heartbeat,
             spawner_dyn,
         ));
@@ -529,6 +566,10 @@ cron = "* * * * *"
         let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
         let capture = Arc::new(CapturingSpawner::new(0));
         let shutdown = Drain::new();
+        // These tests drive the loop directly, not through the server, so there is
+        // no startup barrier — hand it a pre-signalled readiness latch.
+        let ready = Drain::new();
+        ready.signal();
         let heartbeat = Arc::new(AtomicU64::new(0));
 
         let clock_dyn: Arc<dyn Clock> = clock.clone();
@@ -542,6 +583,7 @@ cron = "* * * * *"
             },
             clock_dyn,
             shutdown.clone(),
+            ready.clone(),
             heartbeat,
             spawner,
         ));
@@ -582,6 +624,10 @@ cron = "* * * * *"
         let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
         let capture = Arc::new(CapturingSpawner::new(0));
         let shutdown = Drain::new();
+        // These tests drive the loop directly, not through the server, so there is
+        // no startup barrier — hand it a pre-signalled readiness latch.
+        let ready = Drain::new();
+        ready.signal();
         let heartbeat = Arc::new(AtomicU64::new(0));
 
         let clock_dyn: Arc<dyn Clock> = clock.clone();
@@ -595,6 +641,7 @@ cron = "* * * * *"
             },
             clock_dyn,
             shutdown.clone(),
+            ready.clone(),
             heartbeat,
             spawner,
         ));
@@ -626,5 +673,99 @@ cron = "* * * * *"
             .await
             .expect("loop exits promptly on shutdown")
             .unwrap();
+    }
+
+    /// The startup barrier: the loop takes no tick until the server signals
+    /// readiness (its job sweep done + listener bound). Withhold `ready` and the
+    /// loop parks at the barrier — no tick, no drift; signal it and the first tick
+    /// anchors.
+    #[tokio::test]
+    async fn scheduler_does_not_tick_until_ready() {
+        let (dir, config_path) = temp_project(CRON_EVERY_MINUTE);
+        let state = test_state(dir.path());
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+        let capture = Arc::new(CapturingSpawner::new(0));
+        let shutdown = Drain::new();
+        let ready = Drain::new(); // withheld — the server is not up yet
+        let heartbeat = Arc::new(AtomicU64::new(0));
+
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let spawner: Arc<dyn Spawner> = capture.clone();
+        let task = tokio::spawn(run_scheduler(
+            Arc::clone(&state),
+            config_path,
+            SchedulerConfig {
+                poll_interval: Duration::from_secs(60),
+                drain_timeout: Duration::from_secs(60),
+            },
+            clock_dyn,
+            shutdown.clone(),
+            ready.clone(),
+            heartbeat,
+            spawner,
+        ));
+
+        // Readiness withheld ⇒ the loop is blocked at the barrier: no first tick,
+        // so no park ever happens. Without the barrier the loop would anchor at once.
+        let parked = tokio::time::timeout(Duration::from_millis(200), clock.wait_for_park(1)).await;
+        assert!(
+            parked.is_err(),
+            "the loop must not tick before the server signals readiness",
+        );
+        assert_eq!(capture.run_count(), 0);
+
+        // Signal readiness ⇒ the barrier releases and the first tick anchors.
+        ready.signal();
+        clock.wait_for_park(1).await;
+        assert_eq!(capture.run_count(), 0, "first sight anchors, no fire");
+
+        shutdown.signal();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("loop exits promptly on shutdown")
+            .unwrap();
+    }
+
+    /// A shutdown that beats readiness — e.g. the listener failed to bind, so the
+    /// server future returns an error and raises the drain without ever signalling
+    /// readiness — exits the loop with zero ticks: `serve --scheduler` is atomic,
+    /// no scheduled run happens on a server that never came up.
+    #[tokio::test]
+    async fn shutdown_before_ready_exits_without_ticking() {
+        let (dir, config_path) = temp_project(CRON_EVERY_MINUTE);
+        let state = test_state(dir.path());
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+        let capture = Arc::new(CapturingSpawner::new(0));
+        let shutdown = Drain::new();
+        let ready = Drain::new(); // never signalled
+        let heartbeat = Arc::new(AtomicU64::new(0));
+
+        let clock_dyn: Arc<dyn Clock> = clock.clone();
+        let spawner: Arc<dyn Spawner> = capture.clone();
+        let task = tokio::spawn(run_scheduler(
+            Arc::clone(&state),
+            config_path,
+            SchedulerConfig {
+                poll_interval: Duration::from_secs(60),
+                drain_timeout: Duration::from_secs(60),
+            },
+            clock_dyn,
+            shutdown.clone(),
+            ready,
+            heartbeat,
+            spawner,
+        ));
+
+        // Shutdown wins the readiness race: the loop exits without ticking.
+        shutdown.signal();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("loop exits when shutdown beats readiness")
+            .unwrap();
+        assert_eq!(
+            capture.run_count(),
+            0,
+            "no scheduled run on a server that never came up",
+        );
     }
 }
