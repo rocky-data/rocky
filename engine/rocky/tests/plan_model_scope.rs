@@ -268,3 +268,51 @@ fn model_plan_persist_failure_errors_not_replication() {
         "must not emit a replication plan for a --model invocation; stdout: {stdout}"
     );
 }
+
+/// #1171 (Edge 3): `--model` and `--dag` are contradictory — `--model` runs a
+/// single model and skips replication, while the apply-time DAG runner ignores
+/// the model selector and executes every pipeline (including replication). The
+/// combination must be rejected at plan time so a plan that `apply` would
+/// over-execute as a full DAG is never persisted.
+#[test]
+fn model_plan_with_dag_is_rejected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    {
+        let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+        conn.execute_batch(
+            "CREATE SCHEMA raw__orders;
+             CREATE TABLE raw__orders.orders AS SELECT 1 AS id;",
+        )
+        .expect("seed source");
+    }
+
+    let config = dir.join("rocky.toml");
+    fs::write(&config, ROCKY_TOML).expect("write config");
+    let models = dir.join("models");
+    fs::create_dir(&models).expect("create models");
+    fs::write(models.join("known.sql"), "SELECT 1 AS id").expect("write model sql");
+    fs::write(models.join("known.toml"), MODEL_TOML).expect("write model config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .args(["--output", "json"])
+        .arg("--config")
+        .arg(&config)
+        .args(["plan", "--model", "known", "--dag"])
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .output()
+        .expect("run plan");
+
+    assert!(
+        !out.status.success(),
+        "--model + --dag must be rejected at plan time; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--model and --dag are mutually exclusive"),
+        "expected a mutual-exclusion error, got stderr: {stderr}"
+    );
+}

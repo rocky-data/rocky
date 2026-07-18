@@ -398,6 +398,18 @@ pub async fn plan(
         .clone()
         .unwrap_or_else(|| models_dir.clone());
     if let Some(model) = run_options.model.as_deref() {
+        // `--model` runs a single compiled model and skips replication;
+        // `--dag` runs every pipeline as a unified DAG (including
+        // replication). The two are contradictory, and the apply-time DAG
+        // runner is flag-light — it ignores the persisted model selector — so
+        // a `--model --dag` plan would apply the whole DAG rather than the
+        // named model (#1171). Reject the combination at plan time instead of
+        // persisting a plan that apply would over-execute.
+        anyhow::ensure!(
+            !run_options.dag,
+            "--model and --dag are mutually exclusive: --model runs a single model and skips \
+             replication, while --dag runs every pipeline as a unified DAG"
+        );
         anyhow::ensure!(
             blueprint_models_dir.exists(),
             "models directory '{}' not found (required for --model)",
@@ -460,6 +472,19 @@ pub async fn plan(
                 );
             }
         }
+    }
+
+    // Structural guard (#1171): a model-scoped plan must never reach the
+    // replication branch. The match arms above already fail on the reachable
+    // zero-model / persist-failure cases with specific messages; this closes
+    // any residual path — e.g. a models-directory TOCTOU that flips the
+    // `exists()` check between the preview and persistence — so replication is
+    // provably unreachable whenever `--model` is set.
+    if run_options.model.is_some() && !run_plan_persisted {
+        anyhow::bail!(
+            "failed to build a model-scoped run plan for --model; \
+             refusing to fall back to a replication plan"
+        );
     }
 
     // Replication-plan branch — fires when there is no `models/`

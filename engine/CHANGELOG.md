@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - `rocky plan --model <name>` now previews only the selected model and reports the same model scope that `rocky apply` executes, instead of advertising skipped replication SQL and unrelated models. (#1165)
-- `rocky plan --model <name>` no longer silently degrades to a replication plan when the model cannot be resolved to a run plan — an unknown model reached via `--models <dir>`, or a run-plan persistence failure, now errors instead of persisting a replication plan that `rocky apply` would execute as a full replication. A model-scoped plan can only resolve to that model or fail. (#1171)
+- `rocky plan --model <name>` no longer silently degrades to a full replication that `rocky apply` would execute without review. An unknown model reached via `--models <dir>`, or a run-plan persistence failure, now errors instead of persisting a replication plan; a model-scoped plan can only resolve to that model or fail. `--model` combined with `--dag` is now rejected at plan time (the two are contradictory — the DAG runner ignores the model selector and applies every pipeline). (#1171)
 
 ## [1.65.0] - 2026-07-18
 
