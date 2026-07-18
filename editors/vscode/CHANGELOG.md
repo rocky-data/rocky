@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.35.0] — 2026-07-18
+
+### Added
+
+- Generated TypeScript types for the engine-v1.65.0 output surface — the `rocky tick` scheduler and the freeze-marker fields on the policy and brief outputs. Additive; the LSP client and existing commands are unchanged.
+
 ## [1.34.4] — 2026-07-12
 
 ### Added
