@@ -252,6 +252,21 @@ impl SqlDialect for DatabricksSqlDialect {
             .join(", ");
         Ok(format!("xxhash64({arg_list})"))
     }
+
+    fn is_safe_type_widening(&self, _source_type: &str, _target_type: &str) -> bool {
+        // Delta tables reject `ALTER TABLE … ALTER COLUMN … TYPE …` for a type
+        // change unless the `delta.enableTypeWidening` table feature is enabled
+        // (Rocky never sets it), and numeric → STRING is not a supported Delta
+        // widening at all. So every widening the shared default classifies as
+        // safe would emit an `ALTER` the warehouse rejects, failing the table
+        // run instead of evolving in place (#1115).
+        //
+        // Report no widening as ALTER-safe: type drift then degrades to a full
+        // refresh (`DropAndRecreate`) — the same path other unsafe drifts take —
+        // which succeeds. Graceful in-place evolution (set `enableTypeWidening`
+        // at CREATE + a Delta-scoped allowlist, live-verified) is a follow-up.
+        false
+    }
 }
 
 #[cfg(test)]
@@ -557,5 +572,41 @@ mod tests {
         let d = dialect();
         // SQL-injection attempt: column name carrying a quote.
         assert!(d.row_hash_expr(&["a`; DROP TABLE x; --".into()]).is_err());
+    }
+
+    #[test]
+    fn type_widening_degrades_to_full_refresh() {
+        // Delta can't execute the trait-default `ALTER COLUMN … TYPE` widenings,
+        // so drift the shared default classifies as a safe in-place widening must
+        // instead degrade to a full refresh (`DropAndRecreate`) rather than emit
+        // an `ALTER` Databricks rejects (#1115).
+        use rocky_core::drift::detect_drift;
+        use rocky_ir::{ColumnInfo, DriftAction, TableRef};
+
+        let d = dialect();
+        // Both of these are safe widenings under the shared default.
+        assert!(!d.is_safe_type_widening("BIGINT", "INT")); // INT → BIGINT
+        assert!(!d.is_safe_type_widening("STRING", "INT")); // numeric → STRING
+
+        let table = TableRef {
+            catalog: "acme".into(),
+            schema: "raw".into(),
+            table: "orders".into(),
+        };
+        let col = |name: &str, ty: &str| ColumnInfo {
+            name: name.to_string(),
+            data_type: ty.to_string(),
+            nullable: true,
+        };
+        for (src_ty, tgt_ty) in [("BIGINT", "INT"), ("STRING", "INT")] {
+            let source = vec![col("amount", src_ty)];
+            let target = vec![col("amount", tgt_ty)];
+            let result = detect_drift(&table, &source, &target, &d);
+            assert_eq!(
+                result.action,
+                DriftAction::DropAndRecreate,
+                "{tgt_ty} → {src_ty} must degrade to full refresh on Databricks"
+            );
+        }
     }
 }

@@ -93,14 +93,18 @@ pub fn generate_drop_table_sql(
     Ok(dialect.drop_table_sql(&ref_str))
 }
 
-/// Default body of [`SqlDialect::is_safe_type_widening`] — Databricks /
-/// Spark / DuckDB / Snowflake share enough type-name conventions that
-/// a single allowlist covers them.
+/// Default body of [`SqlDialect::is_safe_type_widening`] — the
+/// Spark/ANSI type-name allowlist (`INT → BIGINT`, `DECIMAL(p,s)`
+/// precision, `VARCHAR(n)` length, numeric → `STRING`).
 ///
-/// Dialects with different type spellings (BigQuery `INT64` /
-/// `NUMERIC` / `FLOAT64` / `BIGNUMERIC`) override
-/// [`SqlDialect::is_safe_type_widening`] in their dialect impl rather
-/// than bolting names onto this list — keeping the global default
+/// Only DuckDB uses this default today: it executes the emitted
+/// `ALTER COLUMN … TYPE` widenings as-is. Every other adapter overrides
+/// [`SqlDialect::is_safe_type_widening`] in its dialect impl —
+/// Snowflake (`NUMBER`/`VARCHAR` precision) and BigQuery (`INT64` /
+/// `NUMERIC` / `BIGNUMERIC`) scope the allowlist to their own type
+/// system, while Databricks and Trino override to `false` because they
+/// can't execute the ANSI `ALTER COLUMN … TYPE` form and degrade type
+/// drift to a full refresh instead (#1115). Keeping the global default
 /// dialect-neutral (no BQ types here) avoids the asymmetry of having
 /// e.g. both `BIGINT → STRING` and `INT64 → STRING` for what is
 /// semantically the same conversion.

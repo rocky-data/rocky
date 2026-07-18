@@ -646,4 +646,33 @@ mod tests {
         assert!(stmts[2].starts_with("INSERT INTO marts.fct_daily_orders"));
         assert_eq!(stmts[3], "COMMIT");
     }
+
+    #[test]
+    fn type_widening_still_evolves_in_place() {
+        // DuckDB executes the shared-default `ALTER COLUMN … TYPE` widenings
+        // (verified live), so — unlike Databricks / Trino — it keeps inheriting
+        // the default and a safe widening stays `AlterColumnTypes` rather than a
+        // full refresh. Guards the working adapter against a regression to the
+        // default allowlist (#1115).
+        use rocky_core::drift::detect_drift;
+        use rocky_ir::{ColumnInfo, DriftAction, TableRef};
+
+        let d = dialect();
+        assert!(d.is_safe_type_widening("BIGINT", "INT")); // INT → BIGINT is safe
+
+        let table = TableRef {
+            catalog: "memory".into(),
+            schema: "raw".into(),
+            table: "orders".into(),
+        };
+        let col = |name: &str, ty: &str| ColumnInfo {
+            name: name.to_string(),
+            data_type: ty.to_string(),
+            nullable: true,
+        };
+        let source = vec![col("amount", "BIGINT")];
+        let target = vec![col("amount", "INT")];
+        let result = detect_drift(&table, &source, &target, &d);
+        assert_eq!(result.action, DriftAction::AlterColumnTypes);
+    }
 }
