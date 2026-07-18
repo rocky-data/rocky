@@ -1732,27 +1732,23 @@ impl ExecutionExtras {
 /// never here — so an env-var-templated advisory value cannot cause a
 /// cross-process routing false-refuse (finding #5).
 ///
-/// # KNOWN LIMITATION — config-swap TOCTOU (findings 1–4, tracked follow-up)
+/// # Config-swap TOCTOU — closed by single-snapshot threading (#1120 / #1144)
 ///
-/// `config_policy_identity` binds only **adapters + pipelines** (routing/
-/// destination). It does **not** bind `[policy]` or `[state]`. Meanwhile the
-/// governed `run` / `promote` / `propose` EXECUTION paths **re-read `rocky.toml`
-/// from disk** (see the seam note on [`GovernedRunContext::verify_routing_identity`]
-/// and `commands::run::run`'s L1212 snapshot): the apply-time freeze/policy gate
-/// reads the config once, and execution reads it again. An attacker with
-/// filesystem write access who swaps the on-disk `[policy]` / `[state]` block
-/// **between** the apply gate and execution can therefore bypass a freeze or a
-/// deny rule (or redirect the `[state]` backend) for those paths — the swap moves
-/// fields that are NOT in this routing identity, so the fingerprint gate does not
-/// catch it. The single-snapshot threading in this crate closes the swap **within
-/// each governed decision function** (the gate + guard + `verify_after` +
-/// models-dir all read one snapshot), but does not yet extend that snapshot
-/// through the `run()` execution engine. The sound fix — execute every governed
-/// mutation from the apply-verified config snapshot (thread the `&RockyConfig`
-/// through `execute_run_plan` → `run()`), or bind `[policy]`/`[state]` into the
-/// pre-mutation execution identity — is a tracked design follow-up, out of scope
-/// here. Mitigating factor: the threat requires local filesystem write access to
-/// `rocky.toml` during the apply window.
+/// `config_policy_identity` binds only **adapters + pipelines** (routing /
+/// destination); it deliberately does **not** bind `[policy]` or `[state]`.
+/// Those are env-`${VAR}`-templated, so binding them here would cause
+/// cross-process routing false-refusals on a legitimately-resolved value
+/// (finding #5, above). The config-swap they would otherwise expose — an
+/// on-disk `[policy]`/`[state]` swap timed between the apply gate and execution
+/// to bypass a freeze / deny or redirect the `[state]` backend — is closed by
+/// *threading*, not identity-binding: every governed mutation now executes from
+/// the caller's ONE fingerprinted `LoadedConfig`, threaded through
+/// `execute_run_plan` → `run()` (which takes an `Arc<LoadedConfig>` and never
+/// re-reads `rocky.toml`) and reused across
+/// backfill / promote / the DAG. A swap timed after the gate can therefore
+/// neither redirect execution nor stamp a `config_hash` that differs from what
+/// executed. The residual still tracked under #1120 is state-object durability
+/// (compare-and-swap on the remote `state.redb`), not config-swap.
 pub(crate) fn config_policy_identity(cfg: &rocky_core::config::RockyConfig) -> String {
     let adapters: BTreeMap<&str, serde_json::Value> = cfg
         .adapters
@@ -2021,15 +2017,14 @@ impl GovernedRunContext<'_> {
     /// genuinely-legacy plan (`!require` and no stored identity) is allowed
     /// through; a NEW plan with a missing identity is refused (#7).
     ///
-    /// KNOWN LIMITATION — config-swap TOCTOU (findings 1–4, tracked follow-up):
-    /// this gate binds ROUTING only ([`config_policy_identity`] = adapters +
-    /// pipelines), not `[policy]` / `[state]`. This governed EXECUTION seam
-    /// re-reads `rocky.toml` (the `cfg` here is `run`'s own re-read snapshot, not
-    /// the apply-time gate's), so an on-disk `[policy]`/`[state]` swap performed
-    /// between the apply gate and here is NOT caught — see the full note on
-    /// [`config_policy_identity`]. Closing it fully (execute from the
-    /// apply-verified snapshot, or fingerprint `[policy]`/`[state]`) is a tracked
-    /// design follow-up.
+    /// This gate binds ROUTING only ([`config_policy_identity`] = adapters +
+    /// pipelines), not `[policy]` / `[state]` — see the full note on
+    /// [`config_policy_identity`] for why that scope is deliberate and how the
+    /// config-swap TOCTOU is closed by single-snapshot threading (#1120 /
+    /// #1144). The `cfg` reaching this gate is the caller's one fingerprinted
+    /// snapshot (threaded into `run()` as an `Arc<LoadedConfig>`), not a fresh
+    /// re-read, so an on-disk `[policy]`/`[state]` swap timed after the apply
+    /// gate cannot change what executes.
     pub(crate) fn verify_routing_identity(
         &self,
         cfg: &rocky_core::config::RockyConfig,
