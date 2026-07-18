@@ -253,19 +253,84 @@ impl SqlDialect for DatabricksSqlDialect {
         Ok(format!("xxhash64({arg_list})"))
     }
 
-    fn is_safe_type_widening(&self, _source_type: &str, _target_type: &str) -> bool {
-        // Delta tables reject `ALTER TABLE … ALTER COLUMN … TYPE …` for a type
-        // change unless the `delta.enableTypeWidening` table feature is enabled
-        // (Rocky never sets it), and numeric → STRING is not a supported Delta
-        // widening at all. So every widening the shared default classifies as
-        // safe would emit an `ALTER` the warehouse rejects, failing the table
-        // run instead of evolving in place (#1115).
+    fn is_safe_type_widening(&self, source_type: &str, target_type: &str) -> bool {
+        // Delta's `delta.enableTypeWidening` table feature (DBR 15.4 LTS+)
+        // accepts a fixed, lossless set of in-place `ALTER COLUMN … TYPE`
+        // conversions. Rocky enables the feature on the ALTER path (see
+        // `pre_alter_column_type_sql`) and classifies only that set as
+        // ALTER-safe; everything else degrades to a full refresh.
         //
-        // Report no widening as ALTER-safe: type drift then degrades to a full
-        // refresh (`DropAndRecreate`) — the same path other unsafe drifts take —
-        // which succeeds. Graceful in-place evolution (set `enableTypeWidening`
-        // at CREATE + a Delta-scoped allowlist, live-verified) is a follow-up.
-        false
+        // Scoped to the lossless subset live-verified against a real Delta
+        // table (`tests/drift_widening_live.rs`): integer → wider integer, the
+        // exactly-lossless integer → DOUBLE (tinyint/smallint/int — NOT
+        // bigint, whose range exceeds a double's 53-bit mantissa), FLOAT →
+        // DOUBLE, and DECIMAL precision widening at fixed scale. Deliberately
+        // EXCLUDES numeric → STRING (Delta does not support it) and integer →
+        // DECIMAL (safe only when the decimal is wide enough for the integer's
+        // range — a flat rule would re-admit the #1115 loud failure). #1157.
+        let src = normalize_delta_type(source_type);
+        let tgt = normalize_delta_type(target_type);
+        // Tuple is (target = current type, source = new/incoming type): the
+        // current type widens to the new type.
+        matches!(
+            (tgt.as_str(), src.as_str()),
+            // integer → wider integer
+            ("TINYINT", "SMALLINT")
+                | ("TINYINT", "INT")
+                | ("TINYINT", "BIGINT")
+                | ("SMALLINT", "INT")
+                | ("SMALLINT", "BIGINT")
+                | ("INT", "BIGINT")
+                // exactly-lossless integer → DOUBLE (excludes BIGINT → DOUBLE)
+                | ("TINYINT", "DOUBLE")
+                | ("SMALLINT", "DOUBLE")
+                | ("INT", "DOUBLE")
+                // float → double
+                | ("FLOAT", "DOUBLE"),
+        ) || is_safe_delta_decimal_widening(&tgt, &src)
+    }
+
+    fn pre_alter_column_type_sql(&self, table_ref: &str) -> Option<AdapterResult<String>> {
+        // Enable Delta type widening before the `ALTER COLUMN … TYPE` widenings
+        // so they are accepted on both freshly-created and pre-existing tables
+        // (a CREATE-time-only property can't cover tables that already exist).
+        // Idempotent + metadata-only; `table_ref` is pre-validated by
+        // `format_table_ref`.
+        Some(Ok(format!(
+            "ALTER TABLE {table_ref} SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')"
+        )))
+    }
+}
+
+/// Normalizes a Databricks/Spark type name for widening comparison: uppercases
+/// and folds the common synonyms Spark accepts (`INTEGER`→`INT`, `LONG`→
+/// `BIGINT`, `SHORT`→`SMALLINT`, `BYTE`→`TINYINT`, `REAL`→`FLOAT`) to the
+/// canonical `DESCRIBE TABLE` spelling. `DECIMAL(p,s)` and every other type
+/// pass through uppercased.
+fn normalize_delta_type(t: &str) -> String {
+    match t.trim().to_uppercase().as_str() {
+        "INTEGER" => "INT".to_string(),
+        "LONG" => "BIGINT".to_string(),
+        "SHORT" => "SMALLINT".to_string(),
+        "BYTE" => "TINYINT".to_string(),
+        "REAL" => "FLOAT".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// `DECIMAL(p,s)` → `DECIMAL(p2,s)` at fixed scale with `p2 >= p` — the
+/// lossless precision-widening subset of Delta's decimal type widening.
+/// Scale changes are excluded (they can drop integer digits, i.e. lose range).
+/// Both arguments are expected already normalized (uppercased).
+fn is_safe_delta_decimal_widening(target: &str, source: &str) -> bool {
+    fn parse(t: &str) -> Option<(u32, u32)> {
+        let inner = t.trim().strip_prefix("DECIMAL(")?.strip_suffix(')')?;
+        let (p, s) = inner.split_once(',')?;
+        Some((p.trim().parse().ok()?, s.trim().parse().ok()?))
+    }
+    match (parse(target), parse(source)) {
+        (Some((tp, ts)), Some((sp, ss))) => sp >= tp && ss == ts,
+        _ => false,
     }
 }
 
@@ -575,19 +640,82 @@ mod tests {
     }
 
     #[test]
-    fn type_widening_degrades_to_full_refresh() {
-        // Delta can't execute the trait-default `ALTER COLUMN … TYPE` widenings,
-        // so drift the shared default classifies as a safe in-place widening must
-        // instead degrade to a full refresh (`DropAndRecreate`) rather than emit
-        // an `ALTER` Databricks rejects (#1115).
+    fn type_widening_scoped_to_delta_lossless_set() {
+        // `is_safe_type_widening(new, current)` — the current type widens to the
+        // new type. Only Delta's live-verified lossless set is ALTER-safe (#1157).
+        let d = dialect();
+
+        // Safe — in Delta's lossless widening set.
+        assert!(d.is_safe_type_widening("BIGINT", "INT")); // INT → BIGINT
+        assert!(d.is_safe_type_widening("INT", "SMALLINT")); // SMALLINT → INT
+        assert!(d.is_safe_type_widening("BIGINT", "TINYINT")); // TINYINT → BIGINT
+        assert!(d.is_safe_type_widening("DOUBLE", "INT")); // INT → DOUBLE
+        assert!(d.is_safe_type_widening("DOUBLE", "SMALLINT")); // SMALLINT → DOUBLE
+        assert!(d.is_safe_type_widening("DOUBLE", "FLOAT")); // FLOAT → DOUBLE
+        assert!(d.is_safe_type_widening("DECIMAL(20,2)", "DECIMAL(10,2)")); // precision widen
+        // Spark synonyms fold to the canonical spelling.
+        assert!(d.is_safe_type_widening("LONG", "INTEGER")); // INT → BIGINT
+        assert!(d.is_safe_type_widening("DOUBLE", "REAL")); // FLOAT → DOUBLE
+
+        // Unsafe — degrade to a full refresh.
+        assert!(!d.is_safe_type_widening("STRING", "INT")); // numeric → STRING (Delta unsupported)
+        assert!(!d.is_safe_type_widening("STRING", "BOOLEAN")); // → STRING
+        assert!(!d.is_safe_type_widening("DOUBLE", "BIGINT")); // BIGINT → DOUBLE is lossy
+        assert!(!d.is_safe_type_widening("DECIMAL(10,2)", "INT")); // integer → DECIMAL deferred
+        assert!(!d.is_safe_type_widening("INT", "BIGINT")); // BIGINT → INT is narrowing
+        assert!(!d.is_safe_type_widening("DECIMAL(20,4)", "DECIMAL(10,2)")); // scale change
+        assert!(!d.is_safe_type_widening("DECIMAL(5,2)", "DECIMAL(10,2)")); // precision narrowing
+    }
+
+    #[test]
+    fn pre_alter_enables_delta_type_widening() {
+        let d = dialect();
+        let prelude = d
+            .pre_alter_column_type_sql("cat.sch.tbl")
+            .expect("Databricks emits a prelude")
+            .expect("valid prelude SQL");
+        assert_eq!(
+            prelude,
+            "ALTER TABLE cat.sch.tbl SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')"
+        );
+    }
+
+    #[test]
+    fn generate_alter_prepends_enable_type_widening() {
+        // The full ALTER batch enables the feature once, then widens each column.
+        use rocky_core::drift::generate_alter_column_sql;
+        use rocky_ir::{DriftedColumn, TableRef};
+
+        let table = TableRef {
+            catalog: "acme".into(),
+            schema: "raw".into(),
+            table: "orders".into(),
+        };
+        let drifted = vec![DriftedColumn {
+            name: "amount".into(),
+            source_type: "BIGINT".into(),
+            target_type: "INT".into(),
+        }];
+        let stmts = generate_alter_column_sql(&table, &drifted, &dialect()).unwrap();
+        assert_eq!(stmts.len(), 2, "prelude + one ALTER");
+        assert_eq!(
+            stmts[0],
+            "ALTER TABLE acme.raw.orders SET TBLPROPERTIES ('delta.enableTypeWidening' = 'true')"
+        );
+        assert_eq!(
+            stmts[1],
+            "ALTER TABLE acme.raw.orders ALTER COLUMN amount TYPE BIGINT"
+        );
+    }
+
+    #[test]
+    fn type_widening_drives_alter_and_full_refresh_actions() {
+        // Safe widenings evolve in place; unsupported ones degrade to a full
+        // refresh — the same path other unsafe drifts take (#1115 / #1157).
         use rocky_core::drift::detect_drift;
         use rocky_ir::{ColumnInfo, DriftAction, TableRef};
 
         let d = dialect();
-        // Both of these are safe widenings under the shared default.
-        assert!(!d.is_safe_type_widening("BIGINT", "INT")); // INT → BIGINT
-        assert!(!d.is_safe_type_widening("STRING", "INT")); // numeric → STRING
-
         let table = TableRef {
             catalog: "acme".into(),
             schema: "raw".into(),
@@ -598,15 +726,23 @@ mod tests {
             data_type: ty.to_string(),
             nullable: true,
         };
-        for (src_ty, tgt_ty) in [("BIGINT", "INT"), ("STRING", "INT")] {
-            let source = vec![col("amount", src_ty)];
-            let target = vec![col("amount", tgt_ty)];
-            let result = detect_drift(&table, &source, &target, &d);
-            assert_eq!(
-                result.action,
-                DriftAction::DropAndRecreate,
-                "{tgt_ty} → {src_ty} must degrade to full refresh on Databricks"
-            );
-        }
+
+        // INT → BIGINT now evolves in place.
+        let r = detect_drift(
+            &table,
+            &[col("amount", "BIGINT")],
+            &[col("amount", "INT")],
+            &d,
+        );
+        assert_eq!(r.action, DriftAction::AlterColumnTypes);
+
+        // numeric → STRING still degrades to a full refresh.
+        let r = detect_drift(
+            &table,
+            &[col("amount", "STRING")],
+            &[col("amount", "INT")],
+            &d,
+        );
+        assert_eq!(r.action, DriftAction::DropAndRecreate);
     }
 }

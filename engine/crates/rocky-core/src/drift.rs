@@ -195,6 +195,12 @@ pub fn generate_alter_column_sql(
     let table_ref = dialect.format_table_ref(&table.catalog, &table.schema, &table.table)?;
 
     let mut statements = Vec::new();
+    // Some dialects need a one-time prelude before the widenings — Databricks
+    // enables the Delta type-widening table feature so the `ALTER COLUMN … TYPE`
+    // is accepted. Emit it once, ahead of the per-column ALTERs.
+    if let Some(prelude) = dialect.pre_alter_column_type_sql(&table_ref) {
+        statements.push(prelude?);
+    }
     for col in drifted_columns {
         statements.push(dialect.alter_column_type_sql(&table_ref, &col.name, &col.source_type)?);
     }
