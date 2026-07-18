@@ -18,9 +18,9 @@ use crate::registry;
 use super::run::PartitionRunOptions;
 use super::{filter_table_matches, matches_filter, parse_filter};
 
-/// Bundle of `rocky plan` flags that are not consumed by the SQL-generation
-/// preview but are persisted into `RunPlan` so `rocky apply <plan-id>` can
-/// honour them. Mirrors the flag surface of `rocky run`.
+/// Bundle of `rocky plan` execution flags persisted into `RunPlan` so
+/// `rocky apply <plan-id>` can honour them. Mirrors the flag surface of
+/// `rocky run`; `model` also scopes the SQL preview and model metadata.
 #[derive(Debug, Default, Clone)]
 pub struct PlanRunOptions {
     pub model: Option<String>,
@@ -397,6 +397,16 @@ pub async fn plan(
         .models_dir
         .clone()
         .unwrap_or_else(|| models_dir.clone());
+    if let Some(model) = run_options.model.as_deref() {
+        anyhow::ensure!(
+            blueprint_models_dir.exists(),
+            "models directory '{}' not found (required for --model)",
+            blueprint_models_dir.display()
+        );
+        output.statements =
+            plan_preview_output(Some(config_path), &blueprint_models_dir, Some(model), env)?
+                .statements;
+    }
     let mut run_plan_persisted = false;
     if blueprint_models_dir.exists() {
         match build_and_persist_run_plan(
@@ -806,6 +816,15 @@ pub fn plan_preview_output(
     // Project the compile result to typed IR, reusing the shared
     // `project_ir_from_compile` helper so we don't re-derive IR by hand.
     let project_ir = super::ci_diff::project_ir_from_compile(&result);
+    if let Some(model) = filter {
+        anyhow::ensure!(
+            project_ir
+                .models
+                .iter()
+                .any(|candidate| candidate.name.as_ref() == model),
+            "model '{model}' not found (no transformation model with that name)"
+        );
+    }
 
     for model_ir in &project_ir.models {
         let model_name = model_ir.name.as_ref();
@@ -902,16 +921,19 @@ fn build_and_persist_run_plan(
         return Ok(None);
     }
 
-    // Collect qualified model names from the project.
-    let models: Vec<String> = result
-        .project
-        .models
-        .iter()
-        .map(|m| m.config.name.clone())
-        .collect();
-
-    // Execution layers from the DAG (names only — informational).
-    let execution_layers: Vec<Vec<String>> = result.project.layers.clone();
+    let (models, execution_layers) = if let Some(model) = run_options.model.as_deref() {
+        (vec![model.to_string()], vec![vec![model.to_string()]])
+    } else {
+        (
+            result
+                .project
+                .models
+                .iter()
+                .map(|m| m.config.name.clone())
+                .collect(),
+            result.project.layers.clone(),
+        )
+    };
 
     let partition = &run_options.partition_opts;
     let run_plan = RunPlan {
@@ -2583,6 +2605,39 @@ database = ":memory:"
         assert_eq!(out.filter, "a");
         assert_eq!(out.statements.len(), 1);
         assert_eq!(out.statements[0].target, "c.s.a");
+    }
+
+    #[test]
+    fn plan_preview_unknown_filter_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "duckdb"
+database = ":memory:"
+"#,
+            &[(
+                "known",
+                r#"name = "known"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "known"
+"#,
+            )],
+        );
+
+        let err = plan_preview_output(Some(&cfg_path), &models_dir, Some("missing"), None)
+            .expect_err("unknown model filter must fail");
+        assert!(
+            err.to_string()
+                .contains("model 'missing' not found (no transformation model with that name)")
+        );
     }
 
     /// A `models/` directory with no compiled models (replication-only)

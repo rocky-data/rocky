@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `rocky plan --model <name>` now previews only the selected model and reports the same model scope that `rocky apply` executes, instead of advertising skipped replication SQL and unrelated models. (#1165)
+
 ## [1.65.0] - 2026-07-18
 
 ### Security
