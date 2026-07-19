@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.36.0] — 2026-07-19
+
+### Added
+
+- `rocky.toml` config completion + validation for the new `[state] concurrency_control` field (`"off"` | `"cas"`) from engine-v1.66.0, via regenerated project-schema types. The LSP client and existing commands are unchanged.
+
 ## [1.35.0] — 2026-07-18
 
 ### Added

@@ -1,6 +1,6 @@
 [project]
 name = "dagster-rocky"
-version = "1.61.0"
+version = "1.61.1"
 description = "Dagster integration for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -27,7 +27,7 @@ dependencies = [
     # freeze-marker and schedule/tick output types; an older SDK would be missing
     # them (and also the 0.8.3 `--models` forwarding + retention `env` guard fixes
     # the model-aware resource methods depend on).
-    "rocky-sdk>=0.9.0",
+    "rocky-sdk>=0.9.1",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.

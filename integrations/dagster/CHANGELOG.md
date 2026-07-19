@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.61.1] — 2026-07-19
+
+### Changed
+
+- Floors on `rocky-sdk>=0.9.1`, picking up the regenerated engine-v1.66.0 config bindings (the `[state] concurrency_control` compare-and-swap option) re-exported via `dagster_rocky.types`. No resource or asset behaviour changes.
+
 ## [1.61.0] — 2026-07-18
 
 ### Added

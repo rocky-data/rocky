@@ -1,6 +1,6 @@
 [project]
 name = "rocky-sdk"
-version = "0.9.0"
+version = "0.9.1"
 description = "Typed Python client for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
