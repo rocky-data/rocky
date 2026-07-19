@@ -7,10 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.66.0] - 2026-07-19
+
+### Added
+
+- In-place column type evolution is restored on Databricks: a safe type widening now emits a scoped Delta `ALTER COLUMN ... TYPE` instead of forcing a full table refresh. (#1167)
+- In-place column type evolution is restored on Trino Iceberg: a safe widening now emits a scoped `ALTER TABLE ... SET DATA TYPE`. (#1169)
+- `[state] concurrency_control = "cas"` for remote object-store state backends. The end-of-run state upload becomes a compare-and-swap conditional on the generation the run downloaded, so a run that lost a cross-pod race fail-closes (nonzero exit) instead of silently overwriting the winner's committed state. The default (`off`) keeps the previous last-writer-wins behaviour; `cas` requires a backend with a conditional-write object tier (`s3` / `gcs`) and auto-downgrades to `off` with a warning elsewhere. (#1170)
+
 ### Fixed
 
 - `rocky plan --model <name>` now previews only the selected model and reports the same model scope that `rocky apply` executes, instead of advertising skipped replication SQL and unrelated models. (#1165)
 - `rocky plan --model <name>` no longer silently degrades to a full replication that `rocky apply` would execute without review. An unknown model reached via `--models <dir>`, or a run-plan persistence failure, now errors instead of persisting a replication plan; a model-scoped plan can only resolve to that model or fail. `--model` combined with `--dag` is now rejected at plan time (the two are contradictory — the DAG runner ignores the model selector and applies every pipeline). (#1171)
+- `rocky tick` now rejects an unknown `--pipeline` instead of silently scheduling nothing. (#1164)
 - The `rocky mcp` `plan_preview` tool now classifies an unknown `model` argument as `model_not_found` (with its "list the models, retry" remediation) rather than the generic `compile_failed`, so an agent that typo'd or hallucinated a model name recovers correctly. (#1165)
 
 ## [1.65.0] - 2026-07-18

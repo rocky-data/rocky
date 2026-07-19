@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-07-19
+
+### Changed
+
+- Regenerated config bindings for engine-v1.66.0: the `rocky.toml` `[state]` block gains a `concurrency_control` field (`"off"` | `"cas"`) for compare-and-swap remote-state writes. Additive; every `RockyClient` method is unchanged.
+
 ## [0.9.0] — 2026-07-18
 
 ### Added
