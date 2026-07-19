@@ -538,7 +538,14 @@ impl RockyMcpServer {
         let model = params.0.model.as_deref();
         let output =
             commands::plan_preview_output(Some(&self.config_path), &self.models_dir, model, None)
-                .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
+                .map_err(|e| match e.downcast_ref::<commands::ModelNotFound>() {
+                // Preserve the stable taxonomy: an unknown `model` is
+                // `model_not_found` (with its "list the models, retry" hint),
+                // not the generic compile-failure bucket — so an agent that
+                // typo'd or hallucinated a model name recovers correctly.
+                Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
+                None => ToolError::compile_failed(format!("{e:#}")),
+            })?;
         let statements = output
             .statements
             .into_iter()
@@ -3967,6 +3974,46 @@ mod tests {
         let server = RockyMcpServer::new(PathBuf::from("/tmp/proj/rocky.toml"));
         assert_eq!(server.models_dir, PathBuf::from("/tmp/proj/models"));
         assert_eq!(server.root, PathBuf::from("/tmp/proj"));
+    }
+
+    /// `plan_preview` with an unknown model must surface the stable
+    /// `model_not_found` error class (with its "list the models, retry" hint),
+    /// not the generic `compile_failed` bucket — so an agent branches correctly.
+    #[tokio::test]
+    async fn plan_preview_unknown_model_is_model_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )
+        .expect("write config");
+        let models = root.join("models");
+        std::fs::create_dir(&models).expect("create models");
+        std::fs::write(models.join("known.sql"), "SELECT 1 AS id").expect("write sql");
+        std::fs::write(
+            models.join("known.toml"),
+            "name = \"known\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"known\"\n",
+        )
+        .expect("write sidecar");
+
+        let server = RockyMcpServer::new(root.join("rocky.toml"));
+        // `Json<PlanPreviewResult>` is not `Debug`, so match rather than `expect_err`.
+        let err = match server
+            .plan_preview(Parameters(PlanPreviewArgs {
+                model: Some("missing".into()),
+            }))
+            .await
+        {
+            Ok(_) => panic!("unknown model must error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0.code, crate::error::ToolErrorCode::ModelNotFound);
+        assert!(
+            err.0.message.contains("missing"),
+            "message should name the model: {:?}",
+            err.0
+        );
     }
 
     #[test]
