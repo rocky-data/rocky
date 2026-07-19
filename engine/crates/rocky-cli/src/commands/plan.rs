@@ -18,6 +18,20 @@ use crate::registry;
 use super::run::PartitionRunOptions;
 use super::{filter_table_matches, matches_filter, parse_filter};
 
+/// A model filter (`--model` / the MCP `plan_preview` `model` arg) named a model
+/// that does not exist in the compiled project.
+///
+/// [`plan_preview_output`] returns this as a typed error (rather than a bare
+/// `anyhow` string) so callers that speak a stable error taxonomy — the
+/// `rocky mcp` `plan_preview` tool — can downcast and classify it as
+/// `model_not_found` instead of the generic compile-failure bucket. The
+/// `Display` text is byte-identical to the message `rocky run --model <name>`
+/// emits for the same condition (see `commands::run`), so CLI output is
+/// unchanged.
+#[derive(Debug, thiserror::Error)]
+#[error("model '{0}' not found (no transformation model with that name)")]
+pub struct ModelNotFound(pub String);
+
 /// Bundle of `rocky plan` execution flags persisted into `RunPlan` so
 /// `rocky apply <plan-id>` can honour them. Mirrors the flag surface of
 /// `rocky run`; `model` also scopes the SQL preview and model metadata.
@@ -862,14 +876,16 @@ pub fn plan_preview_output(
     // Project the compile result to typed IR, reusing the shared
     // `project_ir_from_compile` helper so we don't re-derive IR by hand.
     let project_ir = super::ci_diff::project_ir_from_compile(&result);
-    if let Some(model) = filter {
-        anyhow::ensure!(
-            project_ir
-                .models
-                .iter()
-                .any(|candidate| candidate.name.as_ref() == model),
-            "model '{model}' not found (no transformation model with that name)"
-        );
+    if let Some(model) = filter
+        && !project_ir
+            .models
+            .iter()
+            .any(|candidate| candidate.name.as_ref() == model)
+    {
+        // Typed so `rocky mcp`'s `plan_preview` can classify it as
+        // `model_not_found`; `Display` is unchanged from the previous
+        // `anyhow::ensure!` string.
+        return Err(anyhow::Error::new(ModelNotFound(model.to_string())));
     }
 
     for model_ir in &project_ir.models {
@@ -2683,6 +2699,12 @@ table = "known"
         assert!(
             err.to_string()
                 .contains("model 'missing' not found (no transformation model with that name)")
+        );
+        // The typed error must survive as an anyhow cause so `rocky mcp`'s
+        // `plan_preview` can downcast it and classify it as `model_not_found`.
+        assert!(
+            err.downcast_ref::<ModelNotFound>().is_some(),
+            "error must downcast to ModelNotFound"
         );
     }
 

@@ -145,8 +145,8 @@ pub use lsp::run_lsp;
 pub use metrics::{metrics_output, run_metrics};
 pub use optimize::{optimize_output, run_optimize};
 pub use plan::{
-    PlanRunOptions, compute_embedded_capabilities, plan, plan_preview_output, plan_promote,
-    populate_governance_actions,
+    ModelNotFound, PlanRunOptions, compute_embedded_capabilities, plan, plan_preview_output,
+    plan_promote, populate_governance_actions,
 };
 pub use playground::{run_playground, run_playground_with_template};
 pub use policy::{run_policy_check, run_policy_freeze, run_policy_test};
