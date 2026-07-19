@@ -9641,6 +9641,28 @@ async fn process_table(
     let mut asset_key = task.asset_key_prefix.clone();
     asset_key.push(task.table_name.clone());
 
+    // Resolve the strategy and any state it requires before pruning or drift
+    // handling. A missing watermark means an incremental target cannot safely
+    // append, while a state read failure must stop before the target is
+    // mutated.
+    let strategy = build_replication_strategy_with_override(pipeline, &task.effective_override)?;
+    let uses_watermark = matches!(
+        &strategy,
+        MaterializationStrategy::Incremental { .. } | MaterializationStrategy::Microbatch { .. }
+    );
+    let prior_watermark = if uses_watermark {
+        let store = Arc::clone(state);
+        let key = target_table.state_key();
+        let table_name = target_table.full_name();
+        tokio::task::spawn_blocking(move || store.get_watermark(&key))
+            .await
+            .with_context(|| format!("watermark read task panicked for {table_name}"))?
+            .with_context(|| format!("could not read prior watermark for {table_name}"))?
+            .map(|watermark| watermark.last_value)
+    } else {
+        None
+    };
+
     // --- Skip-unchanged pruning (config `prune_unchanged`, off by default) ---
     //
     // Before doing any copy work, ask the adapter for a cheap change-marker on
@@ -9678,7 +9700,9 @@ async fn process_table(
                 .ok()
                 .flatten()
         };
-        if recorded.as_deref() == Some(live.as_str()) {
+        if (!uses_watermark || prior_watermark.is_some())
+            && recorded.as_deref() == Some(live.as_str())
+        {
             return Ok(TableOutcome::Pruned(PrunedTable {
                 asset_key,
                 source_schema: task.source_schema.clone(),
@@ -9705,7 +9729,7 @@ async fn process_table(
         };
     let target_exists = !target_cols.is_empty();
 
-    let mut use_full_refresh = !target_exists;
+    let mut use_full_refresh = !target_exists || (uses_watermark && prior_watermark.is_none());
     let mut drift_action: Option<DriftActionOutput> = None;
 
     if target_exists {
@@ -9863,10 +9887,6 @@ async fn process_table(
         }
     }
 
-    // Build replication IR directly. Applies any per-table override
-    // already resolved at the connector-loop level — see
-    // `TableTask::effective_override`.
-    let strategy = build_replication_strategy_with_override(pipeline, &task.effective_override)?;
     // Effective timestamp column after per-table override. Mirrors the same
     // override > pipeline-default precedence used inside
     // `build_replication_strategy_with_override` so the strategy's WHERE
@@ -9909,38 +9929,6 @@ async fn process_table(
             auto_create_schemas: pipeline.target.governance.auto_create_schemas,
         },
     );
-
-    // Source-side watermark: read the previous run's `MAX(ts) FROM source`
-    // from state. The dialect-level `watermark_where` substitutes this as
-    // a literal (no correlated subquery against target). On a first run /
-    // post-`delete_watermark`, `None` falls back to the 1970-01-01 sentinel
-    // so the whole source is scanned.
-    let prior_watermark: Option<chrono::DateTime<Utc>> = {
-        // Read on the blocking pool so the redb read transaction doesn't stall
-        // the async worker on the concurrent table path.
-        let store = Arc::clone(state);
-        let key = target_table.state_key();
-        match tokio::task::spawn_blocking(move || store.get_watermark(&key)).await {
-            Ok(Ok(Some(wm))) => Some(wm.last_value),
-            Ok(Ok(None)) => None,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    table = target_table.full_name(),
-                    error = %e,
-                    "could not read prior watermark from state — falling back to full scan"
-                );
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    table = target_table.full_name(),
-                    error = %e,
-                    "watermark read task panicked — falling back to full scan"
-                );
-                None
-            }
-        }
-    };
 
     let strategy_name;
     let sql = if use_full_refresh {
@@ -12527,6 +12515,111 @@ merge_keys = ["id"]
             mb_watermark, data_max,
             "microbatch must also record MAX(target.ts), not wall-clock now"
         );
+    }
+
+    /// Regression: losing state while an incremental target still exists must
+    /// rebuild that target. Treating the absent watermark as an epoch lower
+    /// bound appends the full source and silently duplicates every existing row.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn missing_watermark_on_existing_incremental_target_forces_full_refresh() {
+        use chrono::TimeZone;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_ir::WatermarkState;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES \
+                (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                (2, TIMESTAMP '2026-03-02 12:00:00')",
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(
+            r#"strategy = "incremental"
+timestamp_column = "ts"
+"#,
+        );
+        let task = TableTask {
+            source_catalog: String::new(),
+            source_schema: "src".into(),
+            target_catalog: String::new(),
+            target_schema: "tgt".into(),
+            table_name: "events".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            check_column_match: false,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude: vec![],
+            metadata_columns: vec![],
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        };
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("missing watermark should trigger a full refresh");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+
+        assert_eq!(result.materialization.metadata.strategy, "full_refresh");
+        let count = adapter
+            .execute_query("SELECT COUNT(*) FROM tgt.events")
+            .await
+            .unwrap();
+        assert_eq!(
+            count.rows[0][0], "2",
+            "full refresh must not duplicate existing rows"
+        );
+        let deferred = result
+            .deferred_watermark
+            .as_ref()
+            .expect("full refresh should rebuild the watermark");
+        assert_eq!(
+            deferred.timestamp,
+            Utc.with_ymd_and_hms(2026, 3, 2, 12, 0, 0).unwrap()
+        );
+
+        state
+            .set_watermark(
+                &deferred.state_key,
+                &WatermarkState {
+                    last_value: deferred.timestamp,
+                    updated_at: Utc::now(),
+                },
+            )
+            .unwrap();
+        adapter
+            .execute_statement("INSERT INTO src.events VALUES (3, TIMESTAMP '2026-03-03 14:00:00')")
+            .await
+            .unwrap();
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a present watermark should retain incremental behavior");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        assert_eq!(result.materialization.metadata.strategy, "incremental");
+        let count = adapter
+            .execute_query("SELECT COUNT(*) FROM tgt.events")
+            .await
+            .unwrap();
+        assert_eq!(count.rows[0][0], "3");
     }
 
     /// M2 regression: a row appended to SOURCE between the incremental INSERT's
