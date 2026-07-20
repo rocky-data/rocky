@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use rocky_core::config::{PolicyCapability, PolicyEffect, PolicyPrincipal, StateBackend};
@@ -224,6 +225,8 @@ async fn run_apply_run_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize run plan payload")?;
 
+    validate_run_plan_execution_shape(plan_id, &run_plan)?;
+
     // policy seam 2: an agent running `rocky apply` (`ROCKY_PRINCIPAL=agent`) is
     // gated as agent; a human applier resolves to human (humans are ungated in
     // v0). Enforcement uses the apply-time runtime principal, not the plan's
@@ -327,20 +330,65 @@ async fn run_apply_run_plan(
         governed.as_ref(),
     )
     .await?;
-    let verify_result = run_verify_after(
+    finish_apply_verify_after(
         plan_id,
         principal,
-        &verify_checks,
+        verify_checks,
         &apply_run_id,
         state_path,
-    );
-    // Finding 3 (post-verify half): the verify-after custody row `run_verify_after`
-    // just wrote lands AFTER `run`'s end-upload, so push it to remote (fail-closed)
-    // even when verification FAILED — the failure-custody row is the budget-burning
-    // half of the pair. Upload before propagating the verify result.
+        &loaded.config,
+        governed.as_ref(),
+    )
+    .await
+}
+
+/// Reject contradictory persisted run flags before an apply reads config or
+/// state. Plan-time validation prevents newly-created plans from carrying this
+/// shape, but plans written by an older binary still need an execution-time
+/// defence (#1173).
+fn validate_run_plan_execution_shape(plan_id: &str, run_plan: &RunPlan) -> Result<()> {
+    // `--model` is a one-model, no-replication run; the flag-light DAG runner
+    // executes every configured pipeline and does not consume that selector.
+    // Letting DAG precedence win would silently widen the authorized scope.
+    if run_plan.dag && run_plan.model.is_some() {
+        bail!(
+            "plan '{plan_id}' sets both a model selector and --dag; the DAG runner ignores \
+             the model selector. Re-plan without --dag."
+        );
+    }
+    Ok(())
+}
+
+/// Complete the post-run half of a governed apply for every plan shape that
+/// delegates to `commands::run::run`.
+///
+/// Replication targets do not exist until discovery runs, so their winning
+/// policy rules (including `verify_after`) are captured by the in-run gate and
+/// joined here with any checks resolved before execution. Keeping that join,
+/// custody decision, and remote upload in one helper prevents a plan-kind arm
+/// from accepting replication requirements without actually enforcing them.
+async fn finish_apply_verify_after(
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    mut verify_checks: Vec<String>,
+    apply_run_id: &str,
+    state_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
+    governed: Option<&GovernedRunContext<'_>>,
+) -> Result<()> {
+    if let Some(ctx) = governed {
+        verify_checks.extend(ctx.replication_verify_after()?);
+        verify_checks.sort();
+        verify_checks.dedup();
+    }
+
+    let verify_result =
+        run_verify_after(plan_id, principal, &verify_checks, apply_run_id, state_path);
+    // Finding 3 (post-verify half): the verify-after custody row lands AFTER
+    // `run`'s end-upload. Push it to remote fail-closed even when verification
+    // failed, then propagate the verification result.
     if !verify_checks.is_empty() {
-        upload_remote_ledger_fail_closed(Some(&loaded.config), state_path, "verify-after custody")
-            .await?;
+        upload_remote_ledger_fail_closed(Some(cfg), state_path, "verify-after custody").await?;
     }
     verify_result
 }
@@ -378,6 +426,7 @@ fn governed_run_context<'a>(
         // preflight (`preflight_snapshot`), not folded into this flag.
         require_fingerprint: embedded.fingerprint_version >= 1,
         reviewed_source_schemas: embedded.reviewed_source_schemas,
+        replication_verify_after: Mutex::new(BTreeSet::new()),
     })
 }
 
@@ -1984,9 +2033,33 @@ pub struct GovernedRunContext<'a> {
     /// e.g. a pure-replication run with no silver models) preserves the executor's
     /// legitimate silent-skip.
     pub expects_models: bool,
+    /// Verify-after names required by winning policy rules for replication
+    /// targets. Those targets are only known after discovery, inside `run`, so
+    /// the pre-mutation replication gate records the names here and the outer
+    /// apply frame consumes them after `run` persists this apply's check
+    /// outcomes under its forced run id.
+    #[doc(hidden)]
+    pub replication_verify_after: Mutex<BTreeSet<String>>,
 }
 
 impl GovernedRunContext<'_> {
+    /// Snapshot the sorted replication verify-after requirements captured by
+    /// [`Self::gate_replication_targets`]. A poisoned mutex is an internal
+    /// integrity failure, so applying must fail closed rather than silently
+    /// skip post-run verification.
+    fn replication_verify_after(&self) -> Result<Vec<String>> {
+        self.replication_verify_after
+            .lock()
+            .map(|required| required.iter().cloned().collect())
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "refusing to complete governed apply for plan '{}': replication \
+                     verify_after requirements became unavailable after a policy-gate failure",
+                    self.plan_id
+                )
+            })
+    }
+
     /// Build the execution-choke-point TOCTOU gate for this apply, pairing the
     /// plan-authorized fingerprint with the execute-time routing + governance
     /// identity. `env` is the plan's persisted `--env` (from the caller, which
@@ -2094,26 +2167,25 @@ impl GovernedRunContext<'_> {
         );
         apply_policy_gate(self.root, self.plan_id, gate)?;
 
-        // Finding 7: replication pipelines have NO post-run check substrate — a
-        // replication apply supplies no `verify_after` run id and nothing runs or
-        // records the named checks. A rule's required `verify_after` checks are
-        // contractually fail-closed (an absent check halts), so silently ALLOWING
-        // an unverified replication mutation under a rule that demands checks is a
-        // policy bypass. Refuse instead: if the matched allow-rule(s) for these
-        // targets require any `verify_after`, fail closed with a clear message.
+        // Replication targets are discovered too late for the outer apply gate
+        // to resolve their winning rules. Capture their verify-after names here,
+        // before any replication SQL executes. `run` already emits replication
+        // checks into `RunOutput`, persists their outcomes under the apply's
+        // forced run id, and the outer frame consumes this set through
+        // `run_verify_after`. Absent/failed checks therefore halt fail-closed
+        // after the mutation, matching the transformation contract.
         let required =
             required_verify_after(cfg.policy.as_ref(), self.principal, &touched, &models_dir);
-        if !required.is_empty() {
-            bail!(
-                "refusing governed replication apply for plan '{}': the matched policy rule \
-                 requires verify_after checks [{}], but `verify_after` is NOT supported for \
-                 replication pipelines — there is no post-run check substrate to run or record \
-                 them, so the mutation could not be verified. Remove `verify_after` from the \
-                 matching rule, or move these targets to a transformation pipeline.",
-                self.plan_id,
-                required.join(", ")
-            );
-        }
+        self.replication_verify_after
+            .lock()
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "refusing governed replication apply for plan '{}': could not retain its \
+                     verify_after requirements after policy evaluation",
+                    self.plan_id
+                )
+            })?
+            .extend(required);
         Ok(())
     }
 }
@@ -2498,6 +2570,8 @@ async fn run_apply_ai_authored_plan(
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
         .context("failed to deserialize ai_authored plan payload")?;
 
+    validate_run_plan_execution_shape(plan_id, &run_plan)?;
+
     // policy seam 2: rule-driven refusal. When a `[policy]` block is configured,
     // the per-model policy evaluation (over the authoring principal and the
     // embedded, reviewed capability classification) supersedes the fixed
@@ -2600,20 +2674,16 @@ async fn run_apply_ai_authored_plan(
         governed.as_ref(),
     )
     .await?;
-    let verify_result = run_verify_after(
+    finish_apply_verify_after(
         plan_id,
         principal,
-        &verify_checks,
+        verify_checks,
         &apply_run_id,
         state_path,
-    );
-    // Finding 3 (post-verify half): push the verify-after custody row to remote
-    // (fail-closed) even on failure — see the twin in `run_apply_run_plan`.
-    if !verify_checks.is_empty() {
-        upload_remote_ledger_fail_closed(Some(&loaded.config), state_path, "verify-after custody")
-            .await?;
-    }
-    verify_result
+        &loaded.config,
+        governed.as_ref(),
+    )
+    .await
 }
 
 /// Apply a `PlanKind::Backfill` plan — a scoped, review-gated recovery run.
@@ -3043,9 +3113,10 @@ async fn run_apply_replication_plan(
     // set inside `run` before any table is materialized (D). A pure replication
     // plan carries no models, so the fingerprint is absent and the TOCTOU reject
     // is a no-op.
+    let principal = plan.enforcement_principal(runtime_principal);
     let governed = governed_run_context(
         &plan,
-        plan.enforcement_principal(runtime_principal),
+        principal,
         plan_id,
         root,
         config_path,
@@ -3054,11 +3125,15 @@ async fn run_apply_replication_plan(
         // reviewed set, so the executor legs keep their legitimate silent-skip.
         false,
     );
+    // Force the replication run to record under the exact id that the
+    // post-apply gate will resolve. A concurrent run must never satisfy this
+    // plan's policy checks.
+    let apply_run_id = new_apply_run_id();
 
     crate::commands::run::run(
         config_path,
         // Execute-from-owned: the SAME snapshot the drift check read (#1120).
-        loaded,
+        std::sync::Arc::clone(&loaded),
         replication_plan.filter.as_deref(),
         replication_plan.pipeline.as_deref(),
         state_path,
@@ -3088,8 +3163,7 @@ async fn run_apply_replication_plan(
         &crate::commands::run::SkipRunOptions::default(),
         // Replication apply runs no transformation models; vars are inert.
         &rocky_core::run_vars::RunVars::new(),
-        // Replication apply has no `verify_after` gate; mint the usual id.
-        None,
+        Some(&apply_run_id),
         governed.as_ref(),
         // `--assume-fresh-state` is a `rocky run` runtime flag, never part of
         // a persisted plan — the replication apply path always runs without it.
@@ -3098,7 +3172,19 @@ async fn run_apply_replication_plan(
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
 
-    Ok(())
+    // Replication targets and their winning rules are discovered inside `run`.
+    // Enforce the captured requirements after the run and persist/upload the
+    // custody decision just like Run and AiAuthored plan shapes.
+    finish_apply_verify_after(
+        plan_id,
+        principal,
+        Vec::new(),
+        &apply_run_id,
+        state_path,
+        &loaded.config,
+        governed.as_ref(),
+    )
+    .await
 }
 
 /// Outcome of the symmetric source-state drift comparison at apply time,
@@ -5198,6 +5284,7 @@ auto_create_schemas = true
             require_fingerprint: require,
             reviewed_source_schemas: None,
             expects_models: true,
+            replication_verify_after: Mutex::new(BTreeSet::new()),
         };
         let authorized = super::config_policy_identity(&cfg_a);
         // Unchanged routing → proceeds.
@@ -5302,6 +5389,7 @@ auto_create_schemas = true
             require_fingerprint: require,
             reviewed_source_schemas: snapshot,
             expects_models: true,
+            replication_verify_after: Mutex::new(BTreeSet::new()),
         };
         // MODEL-EXECUTING (executes_models = true):
         // v1 / v2-capture-failure (require, None) → REFUSE.
@@ -5362,6 +5450,7 @@ effect = "deny"
             require_fingerprint: false,
             reviewed_source_schemas: None,
             expects_models: true,
+            replication_verify_after: Mutex::new(BTreeSet::new()),
         };
         let loaded_cfg = rocky_core::config::load_rocky_config(&config)?;
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
@@ -5410,6 +5499,7 @@ effect = "allow"
             require_fingerprint: false,
             reviewed_source_schemas: None,
             expects_models: true,
+            replication_verify_after: Mutex::new(BTreeSet::new()),
         };
         let loaded_cfg = rocky_core::config::load_rocky_config(&config)?;
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
@@ -5462,6 +5552,7 @@ effect = "allow"
             require_fingerprint: false,
             reviewed_source_schemas: None,
             expects_models: true,
+            replication_verify_after: Mutex::new(BTreeSet::new()),
         };
         let loaded_cfg =
             rocky_core::config::load_rocky_config(&dir.path().join("rocky.toml")).unwrap();
@@ -5471,11 +5562,12 @@ effect = "allow"
         Ok(())
     }
 
-    /// Finding 7: replication pipelines have NO post-run verify substrate, so a
-    /// governed replication apply whose matched allow-rule requires `verify_after`
-    /// must be REFUSED (not silently allowed as an unverified mutation).
-    #[test]
-    fn replication_gate_refuses_verify_after() -> anyhow::Result<()> {
+    /// #1120: replication checks already land in the apply-scoped `RunRecord`.
+    /// The in-run target gate must retain the winning rules' `verify_after`
+    /// names so the outer apply frame verifies those outcomes after execution.
+    #[tokio::test]
+    async fn replication_gate_captures_and_enforces_verify_after_for_post_run_custody()
+    -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         // An `allow` rule that ALSO demands a post-apply check.
         let config = write_config(
@@ -5502,17 +5594,51 @@ verify_after = ["row_count"]
             require_fingerprint: false,
             reviewed_source_schemas: None,
             expects_models: true,
+            replication_verify_after: Mutex::new(BTreeSet::new()),
         };
         let targets: BTreeSet<String> = ["raw_orders".to_string()].into_iter().collect();
-        let err = ctx
-            .gate_replication_targets(&targets, &ledger, &loaded_cfg, &[])
-            .expect_err(
-                "a replication apply under a verify_after rule must be refused (finding 7)",
-            );
+        ctx.gate_replication_targets(&targets, &ledger, &loaded_cfg, &[])
+            .expect("an allowed replication target should proceed to its configured checks");
+        assert_eq!(
+            ctx.replication_verify_after()?,
+            vec!["row_count".to_string()],
+            "the outer apply frame must receive the replication rule's verify_after names"
+        );
+
+        // Reproduce the replication-plan outer frame: the run succeeded and
+        // recorded the required outcome under the forced apply id. The shared
+        // completion path must consume the in-run gate's captured requirement
+        // and write an allow custody row; merely capturing it is insufficient.
+        drop(ledger);
+        let apply_run_id = "run-apply-replication";
+        record_run_with_checks_id(
+            &state,
+            apply_run_id,
+            chrono::Utc::now(),
+            &[("row_count", true)],
+        );
+        super::finish_apply_verify_after(
+            "plan_x",
+            PolicyPrincipal::Agent,
+            Vec::new(),
+            apply_run_id,
+            &state,
+            &loaded_cfg,
+            Some(&ctx),
+        )
+        .await?;
+
+        let custody = StateStore::open(&state)?
+            .list_policy_decisions()?
+            .into_iter()
+            .find(|d| {
+                d.plan_id == "plan_x"
+                    && d.verify_after == ["row_count".to_string()]
+                    && d.reason.starts_with("verify_after passed")
+            });
         assert!(
-            err.to_string()
-                .contains("verify_after` is NOT supported for replication"),
-            "the refusal must name the replication verify_after limitation; got: {err}"
+            matches!(custody, Some(ref d) if d.effect == PolicyEffect::Allow),
+            "the replication plan's post-run frame must persist allow custody"
         );
         Ok(())
     }
@@ -5677,6 +5803,46 @@ autonomy_budget = { failures = 3, window = "7d" }
         assert!(
             err.to_string().contains("not yet policy-gated"),
             "must refuse the governed dag apply, got: {err}"
+        );
+        Ok(())
+    }
+
+    /// #1173: plans persisted before the plan-time `--model` + `--dag`
+    /// rejection must also fail closed at apply time. The check deliberately
+    /// runs before config loading, proving this invalid legacy shape cannot
+    /// reach the full-DAG dispatcher or produce apply-time side effects.
+    #[tokio::test]
+    async fn persisted_model_and_dag_plan_is_refused_before_config_load() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut rp = minimal_run_plan();
+        rp.model = Some("orders".to_string());
+        rp.dag = true;
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+        let state = dir.path().join("state.redb");
+
+        // No rocky.toml is written. If the guard moves after config loading or
+        // disappears, this fails for the wrong reason instead of naming the
+        // contradictory persisted flags.
+        let err = super::run_apply_run_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .expect_err("a persisted --model + --dag plan must be refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "plan '{plan_id}' sets both a model selector and --dag; the DAG runner ignores \
+                 the model selector. Re-plan without --dag."
+            )
+        );
+        assert!(
+            !state.exists(),
+            "the invalid plan must be rejected before state is opened or mutated"
         );
         Ok(())
     }
