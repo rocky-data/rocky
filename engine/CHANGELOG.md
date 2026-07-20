@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Governed replication applies now carry the winning runtime-discovered targets' `verify_after` requirements into the apply-scoped post-run custody gate. Replication checks are persisted on a forced apply run id, and the apply frame verifies those named outcomes after discovery; a required check that failed or did not run now fails closed instead of every replication rule with `verify_after` being categorically refused. (#1120)
+- `rocky apply` now rejects a persisted run plan that combines a model selector with `--dag` before reading config or state. Plan-time validation already prevents new contradictory plans, but a plan written by an older binary could otherwise reach the flag-light DAG runner and execute every pipeline while silently ignoring its one-model scope. (#1173)
+
 ## [1.66.2] - 2026-07-20
 
 ### Fixed

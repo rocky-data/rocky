@@ -243,6 +243,7 @@ async fn drive_run_governed(
         require_fingerprint: false,
         reviewed_source_schemas: None,
         expects_models: false,
+        replication_verify_after: Default::default(),
     };
     let loaded = std::sync::Arc::new(rocky_core::config::load_rocky_config_fingerprinted(
         config_path,
