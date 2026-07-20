@@ -954,8 +954,10 @@ fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), 
     out.push_str("- **Singular tests** in `tests/` (custom SQL) — copy and rewrite manually.\n");
     out.push_str("- **dbt macros / `dbt_packages/`** — Rocky has no Jinja runtime. Hand-port any ");
     out.push_str("logic to plain SQL or to a Rocky AI prompt.\n");
-    out.push_str("- **Raw Jinja control flow** — unresolved Jinja that invokes ");
-    out.push_str("`is_incremental()` is refused on every raw import path. ");
+    out.push_str("- **Raw Jinja control flow** — unresolved Jinja that references the ");
+    out.push_str(
+        "`is_incremental` macro, including callable aliases, is refused on every raw import path. ",
+    );
     out.push_str("With `--no-manifest`, ");
     out.push_str("`{% for %}` / `{% set %}` models are also refused. Other `{% if %}` bodies ");
     out.push_str("are emitted with ");

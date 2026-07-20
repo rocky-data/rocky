@@ -33,7 +33,7 @@ use super::dbt_manifest::{
 use super::dbt_project::{self, DbtProjectConfig};
 use super::dbt_sources;
 
-const RAW_INCREMENTAL_ERROR: &str = "contains an unresolved `is_incremental()` guard; \
+const RAW_INCREMENTAL_ERROR: &str = "contains an unresolved reference to dbt's `is_incremental()` macro; \
 the raw SQL importer cannot preserve dbt's false-on-bootstrap, true-on-existing-target semantics \
 without either referencing a missing target during bootstrap or deleting bounded incremental \
 logic. Compile dbt in an incremental context, verify the compiled SQL retains its intended \
@@ -2130,19 +2130,111 @@ fn import_single_model(
 // is_incremental() detection
 // ---------------------------------------------------------------------------
 
-/// Whether a raw Jinja statement or expression invokes dbt's
-/// `is_incremental()` macro.
+/// Whether a raw Jinja statement or expression references dbt's
+/// `is_incremental` macro.
 ///
-/// This includes compound conditions and indirect forms such as assigning the
-/// result with `{% set %}`. Raw import cannot evaluate any of them faithfully.
+/// This includes compound conditions and aliases that capture the callable
+/// without invoking it in the same tag. Raw import cannot evaluate any of them
+/// faithfully.
 fn contains_unresolved_is_incremental(sql: &str) -> bool {
-    let jinja_re = Regex::new(r"(?s)(?:\{%-?(.*?)-?%\}|\{\{-?(.*?)-?\}\})").unwrap();
-    let invocation_re = Regex::new(r"\bis_incremental\s*\(\s*\)").unwrap();
-    jinja_re.captures_iter(sql).any(|caps| {
-        caps.get(1)
-            .or_else(|| caps.get(2))
-            .is_some_and(|body| invocation_re.is_match(body.as_str()))
-    })
+    let mut search_start = 0;
+
+    while search_start < sql.len() {
+        let rest = &sql[search_start..];
+        let statement_start = rest.find("{%");
+        let expression_start = rest.find("{{");
+        let (relative_start, closing_delimiter) = match (statement_start, expression_start) {
+            (Some(statement), Some(expression)) if statement <= expression => (statement, "%}"),
+            (Some(_), Some(expression)) => (expression, "}}"),
+            (Some(statement), None) => (statement, "%}"),
+            (None, Some(expression)) => (expression, "}}"),
+            (None, None) => break,
+        };
+
+        let tag_start = search_start + relative_start;
+        let body_start = tag_start + 2;
+        let Some(relative_end) = find_jinja_tag_end(&sql[body_start..], closing_delimiter) else {
+            // The template is malformed, but keep scanning in case a later
+            // complete tag contains the unsafe reference.
+            search_start = body_start;
+            continue;
+        };
+        let body_end = body_start + relative_end;
+
+        if contains_unquoted_jinja_identifier(&sql[body_start..body_end], "is_incremental") {
+            return true;
+        }
+
+        search_start = body_end + closing_delimiter.len();
+    }
+
+    false
+}
+
+/// Locate a Jinja tag's closing delimiter without treating delimiter text
+/// inside a quoted string as the end of the tag.
+fn find_jinja_tag_end(body: &str, closing_delimiter: &str) -> Option<usize> {
+    let mut chars = body.char_indices();
+    let mut quote = None;
+
+    while let Some((index, ch)) = chars.next() {
+        if let Some(delimiter) = quote {
+            if ch == '\\' {
+                chars.next();
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if body[index..].starts_with(closing_delimiter) {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+/// Find a standalone Jinja identifier while ignoring quoted string contents.
+/// A string value such as `{% set label = "is_incremental" %}` cannot capture
+/// the macro callable and should not make an otherwise safe model fail.
+fn contains_unquoted_jinja_identifier(body: &str, identifier: &str) -> bool {
+    let mut chars = body.char_indices();
+    let mut quote = None;
+
+    while let Some((index, ch)) = chars.next() {
+        if let Some(delimiter) = quote {
+            if ch == '\\' {
+                chars.next();
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+            continue;
+        }
+
+        if body[index..].starts_with(identifier) {
+            let before = body[..index].chars().next_back();
+            let after = body[index + identifier.len()..].chars().next();
+            let standalone = before.is_none_or(|c| !is_jinja_identifier_char(c))
+                && after.is_none_or(|c| !is_jinja_identifier_char(c));
+            if standalone {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn is_jinja_identifier_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Result of detecting `{% if is_incremental() %}` in SQL.
@@ -2687,7 +2779,19 @@ mod tests {
         assert!(contains_unresolved_is_incremental(
             "{% set incremental = is_incremental() %}"
         ));
+        assert!(contains_unresolved_is_incremental(
+            "{% set incremental_check = is_incremental %}"
+        ));
+        assert!(contains_unresolved_is_incremental(
+            "{% set incremental_check = '%}' and is_incremental %}"
+        ));
         assert!(contains_unresolved_is_incremental("{{ is_incremental() }}"));
+        assert!(!contains_unresolved_is_incremental(
+            "{% set label = 'is_incremental' %}"
+        ));
+        assert!(!contains_unresolved_is_incremental(
+            "{% set is_incrementally = true %}"
+        ));
         assert!(!contains_unresolved_is_incremental(
             "SELECT 'is_incremental()' AS text"
         ));
