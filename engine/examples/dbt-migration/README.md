@@ -33,7 +33,7 @@ rocky-project/
 | Config | `{{ config(materialized='table') }}` in SQL | Separate `.toml` sidecar file |
 | References | `{{ ref('model_name') }}` | Bare name `from stg_customers` |
 | Templating | Jinja2 | None — compiled DSL or plain SQL |
-| Incremental | `{% if is_incremental() %}` blocks | `type = "incremental"` in `.toml` + timestamp column |
+| Incremental | Compile or manually rewrite `{% if is_incremental() %}` blocks; raw imports fail closed | `type = "incremental"` in `.toml` + timestamp column |
 | Schema tests | YAML `schema.yml` files | Contracts (`.contract.toml`) or AI-generated tests |
 | CLI | `dbt run`, `dbt test` | `rocky run`, `rocky plan` |
 

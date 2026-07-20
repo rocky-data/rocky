@@ -8,11 +8,13 @@
 ## What it shows
 
 `rocky import-dbt` is opinionated about what it translates: canonical
-generic tests + `{{ ref }}` / `{{ source }}` / `{{ config }}` /
-`is_incremental()` translate cleanly, a growing set of common dbt
-constructs now **map** to native Rocky equivalents, and a small residue
-of genuinely runtime-only Jinja stays out of scope. This POC throws the
-edge cases at the importer in one go and verifies each is handled
+generic tests + `{{ ref }}` / `{{ source }}` / `{{ config }}` translate
+cleanly, a growing set of common dbt constructs now **map** to native
+Rocky equivalents, and genuinely runtime-only Jinja stays out of scope.
+In particular, every raw import path refuses references to dbt's
+`is_incremental` macro, including callable aliases, because Rocky cannot
+preserve its bootstrap semantics without compiled SQL. This POC throws
+other edge cases at the importer in one go and verifies each is handled
 cleanly — distinguishing the constructs that map from the ones that warn
 or are refused:
 
@@ -117,7 +119,8 @@ before pointing it at a real codebase.
 - **dbt generic tests outside the canonical four** ...
 - **Singular tests** in `tests/` (custom SQL) — copy and rewrite manually.
 - **dbt macros / `dbt_packages/`** — Rocky has no Jinja runtime. ...
-- **`{% if %}` / `{% for %}` / `{{ var() }}`** outside of `is_incremental()` — the body is emitted verbatim with `# TODO: dbt-jinja-not-translated` comments flagging the lines you need to revisit.
+- **Raw Jinja control flow** — unresolved Jinja that references the `is_incremental` macro, including callable aliases, is refused on every raw import path. With `--no-manifest`, `{% for %}` / `{% set %}` models are also refused. Other `{% if %}` bodies are emitted with `# TODO: dbt-jinja-not-translated` comments and must be reviewed.
+
 ## Warnings
 - `stg_variables` — MappedConstruct: {{ var() }} mapped to `@var()` ...
 - `stg_orders` — JinjaControlFlow: ...
