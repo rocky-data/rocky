@@ -551,8 +551,9 @@ impl RockyLsp {
 
             // Re-parse just for span info — the salsa cache hit above
             // returns a stringified error (incremental.rs maps the
-            // `ParseError` through `to_string` because `salsa::Update`
-            // values need `Clone`). The structured `ParseError` is what
+            // `ParseError` through `to_string` because cached values
+            // need `SalsaValue`, `PartialEq`, and—in clone return
+            // mode—`Clone`). The structured `ParseError` is what
             // `lsp_range_from_parse_error` needs to compute a real
             // squiggle range. Parsing the same content a second time
             // here only fires on the error path (rare; bounded by the

@@ -79,11 +79,11 @@ pub struct SourceFile {
 ///
 /// Returns `Err(Arc<String>)` when the wrapped parser rejects the
 /// input. The error is mapped to a stringly-typed `Arc` because
-/// [`ParseError`] doesn't implement `Clone` (and salsa requires
-/// [`salsa::Update`] on cached values). A follow-up PR routes
-/// diagnostics through a salsa accumulator instead of this `Arc<String>`
-/// shape.
-#[salsa::tracked]
+/// [`ParseError`] doesn't implement `Clone` (and salsa requires cached
+/// values to implement [`salsa::SalsaValue`] and [`PartialEq`]). A
+/// follow-up PR routes diagnostics through a salsa accumulator instead
+/// of this `Arc<String>` shape.
+#[salsa::tracked(returns(clone))]
 pub fn parse_file(
     db: &dyn salsa::Database,
     src: SourceFile,

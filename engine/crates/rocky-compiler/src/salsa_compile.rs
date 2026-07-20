@@ -145,7 +145,7 @@ pub struct FileTypecheck {
 /// returned (pointer-equal in practice). Accumulated
 /// [`CompileDiagnostic`] entries inherit the same backdating — a
 /// re-parse that produces an identical AST does NOT re-emit them.
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub fn file_typecheck(db: &dyn salsa::Database, src: SourceFile) -> Arc<FileTypecheck> {
     // Test-only invocation counter — gives integration tests a way to
     // assert the body really did (or did not) run on a given call.
@@ -190,7 +190,7 @@ pub fn file_typecheck(db: &dyn salsa::Database, src: SourceFile) -> Arc<FileType
 /// Used by the orchestrator to detect "this file's AST is structurally
 /// identical to the previous compile" — the cross-model typecheck can
 /// then skip dependents.
-#[salsa::tracked]
+#[salsa::tracked(returns(copy))]
 pub fn source_signature(db: &dyn salsa::Database, src: SourceFile) -> u64 {
     match parse_file(db, src) {
         Ok(ast) => hash_rocky_file(&ast),
