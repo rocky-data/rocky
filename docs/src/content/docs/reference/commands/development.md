@@ -116,7 +116,7 @@ rocky import-dbt --dbt-project <PATH> [flags]
 
 Connection secrets (passwords, API tokens, service-account JSON) are emitted as `${VAR}` env-var placeholders in `rocky.toml`; they are **never inlined**. The required env vars are listed in `MIGRATION-NOTES.md` so users know what to export before `rocky plan` + `rocky apply`.
 
-`materialized` mapping: `view → ephemeral`, `table → full_refresh`, `incremental` (with `unique_key`) → `merge`, `incremental` (without) → `incremental`, `microbatch` → `merge` (default) or `time_interval`, selected by [`--microbatch-as`](#flags). Anything else falls back to `full_refresh` with a TODO line in `MIGRATION-NOTES.md`. Profile types Rocky doesn't natively support stub a DuckDB `[adapter]` so the project still compiles, with the original type preserved under "Not Translated".
+`materialized` mapping: `view → view`, `table → full_refresh`, `incremental` (with `unique_key`) → `merge`, `incremental` (without) → `incremental`, `microbatch` → `merge` (default) or `time_interval`, selected by [`--microbatch-as`](#flags). On either raw SQL path — `--no-manifest` or a manifest node without `compiled_code` — a model whose raw Jinja invokes `is_incremental()` is refused and listed under `failed_details` because Rocky cannot preserve dbt's first-run/subsequent-run distinction without compiled SQL. Anything else falls back to `full_refresh` with a TODO line in `MIGRATION-NOTES.md`. Profile types Rocky doesn't natively support stub a DuckDB `[adapter]` so the project still compiles, with the original type preserved under "Not Translated".
 
 When reading `profiles.yml`, the importer resolves YAML anchors/aliases (`&anchor` / `*alias`) and `{{ env_var('VAR', 'default') }}` expressions in the adapter `type` field, so a profile that templates its warehouse type detects the right adapter instead of silently stubbing DuckDB. Override detection entirely with `--target-adapter`.
 
@@ -164,7 +164,7 @@ rocky import-dbt --dbt-project ~/projects/acme-dbt
 }
 ```
 
-`import_method` is `"manifest"` when a compiled `target/manifest.json` was found (pre-resolved Jinja), or `"regex"` when Rocky parsed the raw `.sql` files directly. The `emission` block is populated whenever `--output-dir` writes succeeded.
+`import_method` is `"manifest"` when a compiled `target/manifest.json` was found (pre-resolved Jinja), or `"regex"` when Rocky parsed the raw `.sql` files directly. The `emission` block is populated whenever `--output-dir` writes succeeded. Model-level import failures use the command's partial-import contract and do not make the process exit non-zero, so automation must check `failed` and `failed_details` before consuming the emitted repository.
 
 Import into a custom directory and override the target adapter (e.g. migrating a Postgres dbt project to Rocky-on-Snowflake):
 

@@ -8,7 +8,8 @@
 //! - `{{ source('source_name', 'table_name') }}` -> fully qualified ref
 //! - `{{ config(materialized='incremental', unique_key='id') }}` -> ModelConfig
 //! - `{{ this }}` -> target table ref
-//! - `{% if is_incremental() %}` -> Rocky incremental strategy
+//! - Raw Jinja that invokes `is_incremental()` -> refused because dbt's
+//!   first-run/subsequent-run distinction cannot be preserved
 //!
 //! **Import paths:**
 //! - **Manifest (preferred):** uses `compiled_code` from `target/manifest.json`
@@ -31,6 +32,13 @@ use super::dbt_manifest::{
 };
 use super::dbt_project::{self, DbtProjectConfig};
 use super::dbt_sources;
+
+const RAW_INCREMENTAL_ERROR: &str = "contains an unresolved `is_incremental()` guard; \
+the raw SQL importer cannot preserve dbt's false-on-bootstrap, true-on-existing-target semantics \
+without either referencing a missing target during bootstrap or deleting bounded incremental \
+logic. Compile dbt in an incremental context, verify the compiled SQL retains its intended \
+predicate and is valid for Rocky's initial target state, and import that manifest; otherwise, \
+rewrite the model with a Rocky-supported strategy";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -83,7 +91,7 @@ pub enum ImportMethod {
 pub enum WarningCategory {
     /// View or ephemeral materialization not natively supported.
     UnsupportedMaterialization,
-    /// Jinja control flow other than `is_incremental()`.
+    /// Jinja control flow that cannot be translated faithfully.
     JinjaControlFlow,
     /// Custom Jinja macro that couldn't be resolved.
     UnsupportedMacro,
@@ -997,6 +1005,13 @@ fn import_manifest_node(
     let mut sql = match &node.compiled_code {
         Some(code) => rewrite_upstream_refs_to_bare(code, node, model_relations),
         None => {
+            if contains_unresolved_is_incremental(&node.raw_code) {
+                result.failed.push(ImportFailure {
+                    name: node.name.clone(),
+                    reason: RAW_INCREMENTAL_ERROR.to_string(),
+                });
+                return;
+            }
             result.warnings.push(ImportWarning {
                 model: node.name.clone(),
                 category: WarningCategory::JinjaControlFlow,
@@ -1937,8 +1952,13 @@ fn import_single_model(
 
     let mut warnings = Vec::new();
 
-    // Detect is_incremental() before general Jinja handling
-    let (content_processed, incr_result) = detect_is_incremental(&content);
+    // Refuse is_incremental() before general Jinja handling. This must catch
+    // compound conditions too: otherwise the generic fallback removes the
+    // control tags and applies the guarded body unconditionally.
+    if contains_unresolved_is_incremental(&content) {
+        return Err(RAW_INCREMENTAL_ERROR.to_string());
+    }
+    let content_processed = content;
 
     // Check for remaining unsupported Jinja patterns
     if content_processed.contains("{%") {
@@ -1999,16 +2019,6 @@ fn import_single_model(
             "set `type = \"full_refresh\"` (or `\"ephemeral\"` for staging models) in the emitted sidecar".to_string(),
         ),
     }));
-
-    // If is_incremental() was detected and config didn't already set incremental,
-    // override the strategy
-    if let Some(ref incr) = incr_result
-        && matches!(strategy, StrategyConfig::FullRefresh)
-    {
-        strategy = StrategyConfig::Incremental {
-            timestamp_column: incr.timestamp_column.clone(),
-        };
-    }
 
     // Apply project config inheritance
     let (resolved_schema, resolved_tags) = if let Some(proj) = project_config {
@@ -2119,6 +2129,21 @@ fn import_single_model(
 // ---------------------------------------------------------------------------
 // is_incremental() detection
 // ---------------------------------------------------------------------------
+
+/// Whether a raw Jinja statement or expression invokes dbt's
+/// `is_incremental()` macro.
+///
+/// This includes compound conditions and indirect forms such as assigning the
+/// result with `{% set %}`. Raw import cannot evaluate any of them faithfully.
+fn contains_unresolved_is_incremental(sql: &str) -> bool {
+    let jinja_re = Regex::new(r"(?s)(?:\{%-?(.*?)-?%\}|\{\{-?(.*?)-?\}\})").unwrap();
+    let invocation_re = Regex::new(r"\bis_incremental\s*\(\s*\)").unwrap();
+    jinja_re.captures_iter(sql).any(|caps| {
+        caps.get(1)
+            .or_else(|| caps.get(2))
+            .is_some_and(|body| invocation_re.is_match(body.as_str()))
+    })
+}
 
 /// Result of detecting `{% if is_incremental() %}` in SQL.
 #[derive(Debug, Clone)]
@@ -2649,6 +2674,26 @@ mod tests {
     // --- is_incremental() detection tests ---
 
     #[test]
+    fn unresolved_incremental_detects_compound_and_indirect_jinja() {
+        assert!(contains_unresolved_is_incremental(
+            "{% if execute and is_incremental ( ) %}SELECT 1{% endif %}"
+        ));
+        assert!(contains_unresolved_is_incremental(
+            "{% if execute %}SELECT 1{% elif target.name == 'prod' and is_incremental() %}SELECT 2{% endif %}"
+        ));
+        assert!(contains_unresolved_is_incremental(
+            "{% if batch_id % 2 == 0 and is_incremental() %}SELECT 1{% endif %}"
+        ));
+        assert!(contains_unresolved_is_incremental(
+            "{% set incremental = is_incremental() %}"
+        ));
+        assert!(contains_unresolved_is_incremental("{{ is_incremental() }}"));
+        assert!(!contains_unresolved_is_incremental(
+            "SELECT 'is_incremental()' AS text"
+        ));
+    }
+
+    #[test]
     fn test_detect_is_incremental_standard() {
         let sql = r#"
 SELECT *
@@ -3024,7 +3069,7 @@ sources:
     }
 
     #[test]
-    fn test_import_dbt_project_is_incremental_integration() {
+    fn raw_append_incremental_guard_is_refused() {
         let dir = tempfile::TempDir::new().unwrap();
 
         std::fs::create_dir_all(dir.path().join("models")).unwrap();
@@ -3032,6 +3077,41 @@ sources:
         std::fs::write(
             dir.path().join("models/fct_events.sql"),
             r#"
+{{ config(materialized='incremental') }}
+
+SELECT *
+FROM {{ ref('stg_events') }}
+{% if execute and is_incremental ( ) %}
+  WHERE event_time > (SELECT MAX(event_time) FROM {{ this }})
+{% endif %}
+"#,
+        )
+        .unwrap();
+
+        let target = TargetConfig {
+            catalog: "warehouse".to_string(),
+            schema: "staging".to_string(),
+            table: String::new(),
+        };
+
+        let result = import_dbt_project(dir.path(), &target).unwrap();
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "fct_events");
+        assert!(result.failed[0].reason.contains("is_incremental()"));
+        assert!(result.failed[0].reason.contains("unresolved"));
+        assert!(result.failed[0].reason.contains("compiled SQL"));
+    }
+
+    #[test]
+    fn raw_incremental_guard_is_refused_for_keyed_merge() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("models/fct_events.sql"),
+            r#"
+{{ config(materialized='incremental', unique_key='id') }}
+
 SELECT *
 FROM {{ ref('stg_events') }}
 {% if is_incremental() %}
@@ -3048,15 +3128,10 @@ FROM {{ ref('stg_events') }}
         };
 
         let result = import_dbt_project(dir.path(), &target).unwrap();
-        assert_eq!(result.imported.len(), 1);
-        assert!(matches!(
-            result.imported[0].config.strategy,
-            StrategyConfig::Incremental {
-                ref timestamp_column
-            } if timestamp_column == "event_time"
-        ));
-        // Incremental block should be removed from SQL
-        assert!(!result.imported[0].sql.contains("is_incremental"));
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "fct_events");
+        assert!(result.failed[0].reason.contains("is_incremental()"));
     }
 
     #[test]
@@ -3470,6 +3545,49 @@ FROM {{ ref('stg_events') }}
                 .any(|w| matches!(w.category, WarningCategory::StaleManifest)),
             "a manifest with no compiled SQL must warn loudly"
         );
+    }
+
+    #[test]
+    fn manifest_raw_fallback_refuses_append_incremental_guard() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.events": {
+                "unique_id": "model.p.events", "name": "events", "resource_type": "model",
+                "raw_code": "SELECT * FROM raw.events\n{% if target.name == 'prod' and is_incremental() %}\nWHERE event_time > (SELECT MAX(event_time) FROM {{ this }})\n{% endif %}",
+                "depends_on": { "nodes": [], "macros": [] },
+                "config": { "materialized": "incremental" },
+                "columns": {}, "tags": [], "schema": "s", "database": "d"
+            }},
+            "sources": {}
+        });
+
+        let result = import_from_manifest_json(&manifest);
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "events");
+        assert!(result.failed[0].reason.contains("is_incremental()"));
+        assert!(result.failed[0].reason.contains("unresolved"));
+    }
+
+    #[test]
+    fn manifest_raw_fallback_refuses_incremental_guard_for_keyed_merge() {
+        let manifest = serde_json::json!({
+            "metadata": { "project_name": "p" },
+            "nodes": { "model.p.events": {
+                "unique_id": "model.p.events", "name": "events", "resource_type": "model",
+                "raw_code": "SELECT * FROM raw.events\n{% if is_incremental() %}\nWHERE event_time > (SELECT MAX(event_time) FROM {{ this }})\n{% endif %}",
+                "depends_on": { "nodes": [], "macros": [] },
+                "config": { "materialized": "incremental", "unique_key": "id" },
+                "columns": {}, "tags": [], "schema": "s", "database": "d"
+            }},
+            "sources": {}
+        });
+
+        let result = import_from_manifest_json(&manifest);
+        assert!(result.imported.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "events");
+        assert!(result.failed[0].reason.contains("is_incremental()"));
     }
 
     #[test]
