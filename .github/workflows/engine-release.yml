@@ -3,6 +3,17 @@ name: engine-release
 # Full cross-platform release matrix. Builds binaries for all supported
 # platforms and attaches them to the GitHub Release created by the tag push.
 #
+# The release is published atomically: `ensure-release` creates it as a
+# **draft**, the matrix and `checksums` attach every artifact, and only then
+# does `publish` flip it to a published release. This matters because
+# `engine/install.sh` resolves "latest" by listing `/releases` (unauthenticated)
+# and taking the highest `engine-v*` tag. Draft releases are omitted from that
+# listing, so the new version becomes resolvable only once its binaries exist.
+# Creating the release up front (as this workflow used to) made the tag
+# resolvable for the ~15-25 min the matrix was still building, so any
+# concurrent `install.sh` — a user's, or another PR's smoke job — resolved
+# `engine-v<new>` and 404'd on the not-yet-uploaded archive.
+#
 # scripts/release.sh remains as a local-build hotfix fallback.
 
 on:
@@ -146,12 +157,24 @@ jobs:
           Compress-Archive -Path target/${{ matrix.target }}/release/rocky.exe -DestinationPath ${{ matrix.archive }}
           Compress-Archive -Path target/${{ matrix.target }}/release/rocky-lsp.exe -DestinationPath ${{ matrix.lsp_archive }}
 
+      # Upload with `gh` rather than a release action: `gh release upload`
+      # touches assets only, so it cannot disturb the draft state that
+      # `publish` is responsible for clearing. (A release action that PATCHes
+      # the release would publish it early and reintroduce the race this
+      # workflow exists to avoid.) Same mechanism the `checksums` job uses.
+      # `shell: bash` so the windows-2022 runner doesn't run this under pwsh;
+      # paths are relative to the workflow-level `working-directory: engine`,
+      # which is where the packaging steps above wrote the archives.
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
-        with:
-          files: |
-            engine/${{ matrix.archive }}
-            engine/${{ matrix.lsp_archive }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" \
+            "${{ matrix.archive }}" \
+            "${{ matrix.lsp_archive }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber
 
   # Generate checksums.txt from all platform archives and attach to the release.
   # Runs after all build jobs so every archive is present before hashing.
@@ -206,9 +229,48 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --clobber
 
+  # Publish the draft, making the version resolvable by engine/install.sh.
+  # Depends on `checksums` as well as `build` so checksums.txt is in place
+  # before anyone can resolve the release — install.sh fetches it to verify
+  # the download.
+  #
+  # `--latest` here rather than at creation: the engine binary owns the repo's
+  # "Latest" badge, and asserting it at publish time also settles the ordering
+  # when a coupled release pushes engine/sdk/dagster/vscode tags together.
+  #
+  # Fail-closed by design: if any platform build or the checksums job fails,
+  # this job is skipped and the release stays an unpublished draft rather than
+  # going live half-populated. That leftover draft is the intended outcome, not
+  # a bug — re-run the failed jobs and this publishes it.
+  publish:
+    name: Publish release
+    needs: [ensure-release, build, checksums]
+    runs-on: ubuntu-24.04
+    # Override the workflow-level `working-directory: engine` — this job needs
+    # no checkout, so that directory does not exist here.
+    defaults:
+      run:
+        working-directory: ${{ github.workspace }}
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false \
+            --latest
+          echo "Published ${GITHUB_REF_NAME}"
+
   # Create the GitHub Release if it doesn't already exist (supports both
   # CI-only releases and the local scripts/release.sh workflow where the
   # release is created before the tag push).
+  #
+  # Created as a draft so it stays out of the public `/releases` listing until
+  # `publish` runs — see the header comment. An existing release (the
+  # scripts/release.sh path) is left exactly as it is: it already carries the
+  # artifacts that path uploaded, so forcing it back to draft would briefly
+  # retract something deliberately published.
   ensure-release:
     name: Ensure GitHub Release exists
     runs-on: ubuntu-24.04
@@ -226,10 +288,10 @@ jobs:
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "Release $TAG already exists (created by scripts/release.sh)"
           else
-            echo "Creating release $TAG"
+            echo "Creating draft release $TAG"
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --generate-notes \
-              --latest \
+              --draft \
               --title "$TAG"
           fi

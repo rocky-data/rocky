@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A new engine release is no longer installable before its binaries exist. `engine-release.yml` created the GitHub Release up front, which made the new tag resolvable by `install.sh` / `install.ps1` (both pick the highest `engine-v*` from the public `/releases` listing) for the ~15-25 minutes the build matrix was still running — so an install started in that window resolved the new version and failed with a 404 on the missing archive. The release is now created as a draft, which is omitted from that listing, and is published only after every platform archive and `checksums.txt` are attached. A failed build now leaves the release unpublished instead of live and half-populated.
+
 ## [1.66.1] - 2026-07-20
 
 ### Fixed
