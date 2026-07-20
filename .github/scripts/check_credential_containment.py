@@ -41,7 +41,7 @@ RUST_CACHE_SOURCE = (
 )
 SETUP_UV_SOURCE = "astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990"
 SETUP_NODE_SOURCE = (
-    "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e"
+    "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
 )
 MODEL_SECRET_RE = re.compile(r"\bANTHROPIC_API_KEY\b", re.IGNORECASE)
 CANDIDATE_JOBS = {
