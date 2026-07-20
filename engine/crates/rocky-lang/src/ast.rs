@@ -13,7 +13,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// A complete Rocky DSL file.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub struct RockyFile {
     /// Let bindings (CTE sub-pipelines) defined before the main pipeline.
     pub let_bindings: Vec<LetBinding>,
@@ -22,7 +22,7 @@ pub struct RockyFile {
 }
 
 /// A let binding defining a named sub-pipeline (compiles to a CTE).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub struct LetBinding {
     /// Name of the binding (used as CTE name).
     pub name: String,
@@ -31,7 +31,7 @@ pub struct LetBinding {
 }
 
 /// A single step in the pipeline.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub enum PipelineStep {
     /// `from <source>`
     From(FromClause),
@@ -56,7 +56,7 @@ pub enum PipelineStep {
 }
 
 /// FROM clause.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub struct FromClause {
     /// Source model or table reference.
     pub source: String,
@@ -65,7 +65,7 @@ pub struct FromClause {
 }
 
 /// GROUP clause with aggregations.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub struct GroupClause {
     /// Grouping keys.
     pub keys: Vec<String>,
@@ -74,7 +74,7 @@ pub struct GroupClause {
 }
 
 /// Type of join.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, salsa::Update)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, salsa::SalsaValue)]
 pub enum JoinType {
     #[default]
     Inner,
@@ -85,7 +85,7 @@ pub enum JoinType {
 }
 
 /// JOIN clause.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub struct JoinClause {
     /// Type of join (inner, left, right, full, cross).
     pub join_type: JoinType,
@@ -100,14 +100,14 @@ pub struct JoinClause {
 }
 
 /// Sort key with direction.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub struct SortKey {
     pub column: String,
     pub descending: bool,
 }
 
 /// Item in a select list.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub enum SelectItem {
     /// Simple column reference.
     Column(String),
@@ -118,7 +118,7 @@ pub enum SelectItem {
 }
 
 /// Expression in the DSL.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub enum Expr {
     /// Column reference.
     Column(String),
@@ -170,7 +170,7 @@ pub enum Expr {
 }
 
 /// Window specification for OVER clause.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub struct WindowSpec {
     /// PARTITION BY columns.
     pub partition_by: Vec<String>,
@@ -181,7 +181,7 @@ pub struct WindowSpec {
 }
 
 /// Window frame specification.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub struct WindowFrame {
     pub kind: FrameKind,
     pub start: FrameBound,
@@ -189,14 +189,14 @@ pub struct WindowFrame {
 }
 
 /// Frame kind: rows or range.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub enum FrameKind {
     Rows,
     Range,
 }
 
 /// Frame bound for window frames.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub enum FrameBound {
     Unbounded,
     Current,
@@ -204,7 +204,7 @@ pub enum FrameBound {
 }
 
 /// Binary operators.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub enum BinOp {
     Add,
     Sub,
@@ -222,14 +222,14 @@ pub enum BinOp {
 }
 
 /// Unary operators.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub enum UnaryOp {
     Not,
     Neg,
 }
 
 /// A match arm (pattern => result).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub struct MatchArm {
     /// Pattern (expression or `_` for default).
     pub pattern: MatchPattern,
@@ -238,7 +238,7 @@ pub struct MatchArm {
 }
 
 /// Pattern in a match expression.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, salsa::SalsaValue)]
 pub enum MatchPattern {
     /// Compare with an expression (e.g., `> 10_000`).
     Comparison(BinOp, Expr),
