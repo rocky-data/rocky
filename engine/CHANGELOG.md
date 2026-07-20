@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.66.0] - 2026-07-19
+## [1.66.1] - 2026-07-20
+
+### Fixed
+
+- Incremental and microbatch replication no longer duplicate every row when the persisted watermark is missing. An existing target with no watermark previously kept the incremental strategy and emitted an `INSERT` bounded by the dialect's 1970 epoch sentinel, appending the entire source to the existing target while still exiting `0` and reporting an `incremental` materialization — so each rerun after state loss silently multiplied the table (500 → 1000 → 1500 rows). Such a target now performs a replacement full refresh and rebuilds the watermark. A watermark **read failure** is no longer conflated with an absent watermark: it now fails the table before the target is mutated. Likewise, a failed or unparseable post-run `MAX(target.ts)` query propagates instead of persisting an epoch watermark that would make the next run append the full source again. This can be triggered by local state loss, a fresh worker or pod starting against an existing warehouse, or a remote-state schema/key change. (#1179, #1180)
 
 ### Added
 
