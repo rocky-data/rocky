@@ -290,7 +290,6 @@ What the importer translates cleanly:
 - `{{ var('name') }}` / `{{ var('name', default) }}` → an `@var(name)` / `@var(name, default)` run-variable marker left in the emitted SQL, resolved at run time by `rocky run --var name=value` (see [Handle unsupported Jinja](#3-handle-unsupported-jinja))
 - dbt **tags** (node- and folder-level) → the sidecar `[tags]` block (`<tag> = "true"`)
 - `{{ this }}` → the model's own fully-qualified `catalog.schema.table`
-- `is_incremental()` branches → stripped (Rocky derives the watermark filter from `[strategy]`)
 - **dbt generic tests** (`unique`, `not_null`, `accepted_values`, `relationships`) are translated column-by-column to `[[tests]]` blocks — including the *configured* forms that carry `severity:` (a `warn` becomes a Rocky warning, not a hard error) and `where:` (a row filter) (see [Generic test mapping](#generic-test-mapping) below)
 - model-level **`dbt_utils.unique_combination_of_columns`** → a Rocky `composite` uniqueness `[[tests]]` block over the same column tuple (the columns come from the test config, so no model schema is needed)
 - Top-level `dbt_project.yml`, used to detect project name and seeds path
@@ -302,7 +301,8 @@ By design, the importer does not translate the following. Rocky has no Jinja run
 - **dbt tests with no native Rocky equivalent.** Beyond the canonical four, the importer now converts several `dbt_utils` / `dbt_expectations` tests to native Rocky assertions — `unique_combination_of_columns`, `accepted_range` / `expect_column_values_to_be_between` (→ `in_range`), `expect_column_values_to_match_regex` (→ `regex_match`), `expect_column_values_to_be_in_set` (→ `accepted_values`), and `dbt_utils.expression_is_true` (→ `expression`); see [Generic test mapping](#generic-test-mapping). Everything still outside that set — other `dbt_utils.*` / `dbt_expectations.*` tests, project-defined generics, and other model-level tests — is surfaced as a structured `UnsupportedTest` warning per occurrence and not stubbed in the emitted TOML. Rewrite those as a Rocky `expression` test or a quality-pipeline check.
 - **Singular tests** in `tests/` (custom SQL): copy and rewrite manually.
 - **dbt macros and `dbt_packages/`.** Rocky has no Jinja runtime, so macro bodies do not expand.
-- **`{% for %}` / `{% set %}`** outside `is_incremental()` on the no-manifest path: **refused** — the model is listed as a failure rather than half-rendered into broken SQL (the loop/assignment body would survive exactly once). Re-run after `dbt compile` (the manifest path resolves them) or rewrite the model. A `{% if %}` is still emitted verbatim with a TODO marker — its body applies *unconditionally*, so review it. (`{{ var() }}` is not in this list: it converts to an `@var()` run-variable marker — see above.)
+- **Raw Jinja that invokes `is_incremental()`** on the no-manifest/raw-manifest path: **refused** — stripping the branch can delete bounded logic, while preserving it can reference a target that does not exist during bootstrap. This includes compound `if`/`elif` conditions and indirect `{% set %}` forms, and applies even when a `unique_key` would map the model to `merge`: a full-source merge is idempotent by key, but it is not equivalent to dbt's bounded query. Compile dbt in an incremental context and import that manifest only after verifying the compiled SQL retains its intended predicate and is valid for Rocky's initial target state; otherwise, rewrite the model with a Rocky-supported strategy.
+- **`{% for %}` / `{% set %}`** on the no-manifest path: **refused** — the model is listed as a failure rather than half-rendered into broken SQL (the loop/assignment body would survive exactly once). Re-run after `dbt compile` (the manifest path resolves them) or rewrite the model. Another `{% if %}` is still emitted verbatim with a TODO marker — its body applies *unconditionally*, so review it. (`{{ var() }}` is not in this list: it converts to an `@var()` run-variable marker — see above.)
 - **Unmapped `materialized` values** (`dynamic_table`, `seed`): flattened to `full_refresh` and listed in `MIGRATION-NOTES.md`. (`materialized_view` maps natively to Rocky's `materialized_view` strategy.)
 - **Adapters Rocky does not natively support** (e.g. Postgres, Redshift): the generated repo stubs DuckDB so the project still loads. Replace the `[adapter]` block once a Rocky adapter for the warehouse exists, or pass `--target-adapter <kind>` to skip detection.
 - **Custom Jinja macros emitting SQL** (e.g. `{{ generate_schema_name() }}`, dynamic `UNION ALL` macros): surfaced as failed models with the macro name in the reason.
@@ -406,10 +406,6 @@ SELECT
     total_amount,
     _fivetran_synced
 FROM {{ source('shopify', 'orders') }}
-
-{% if is_incremental() %}
-WHERE _fivetran_synced > (SELECT MAX(_fivetran_synced) FROM {{ this }})
-{% endif %}
 ```
 
 ### After (Rocky)
@@ -446,7 +442,7 @@ schema = "shopify"
 table = "orders"
 ```
 
-Notice that the `{{ config() }}` block became `[strategy]` and `{{ source() }}` became a fully qualified reference. A `config(unique_key=...)` with no explicit `incremental_strategy` maps to Rocky's `merge` strategy keyed on `unique_key` (not a bare `incremental` block). The `[[sources]]` block and its qualified coordinates come from the `sources.yml` definition for `shopify.orders`; without a matching `sources.yml` entry the importer emits a warning and no `[[sources]]` block. The `is_incremental()` guard and `{{ this }}` are gone: Rocky derives the merge logic from `[strategy]` and the target table from `[target]`.
+Notice that the `{{ config() }}` block became `[strategy]` and `{{ source() }}` became a fully qualified reference. A `config(unique_key=...)` with no explicit `incremental_strategy` maps to Rocky's `merge` strategy keyed on `unique_key` (not a bare `incremental` block). The `[[sources]]` block and its qualified coordinates come from the `sources.yml` definition for `shopify.orders`; without a matching `sources.yml` entry the importer emits a warning and no `[[sources]]` block.
 
 ## 3. Handle Unsupported Jinja
 
@@ -967,7 +963,7 @@ The importer names models after the SQL file's stem (e.g., `stg_orders.sql` beco
 
 ### Incremental models do not pick up the right watermark
 
-Rocky uses the `timestamp_column` from the `[strategy]` section, not Jinja logic. Make sure the column name matches what your data actually contains (e.g., `_fivetran_synced`, `updated_at`).
+Rocky transformation incrementals expect the model SQL to own its row filter; `timestamp_column` does not add one. The raw/no-manifest importer therefore refuses unresolved Jinja that invokes `is_incremental()` instead of silently deleting bounded logic. With manifest import, inspect the compiled SQL and make sure it contains the intended bound (for example on `_fivetran_synced` or `updated_at`).
 
 ### Environment-specific logic
 

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `rocky import-dbt` now refuses models whose unresolved raw Jinja invokes `is_incremental()` (`--no-manifest` or an uncompiled manifest node), instead of deleting bounded logic and potentially emitting an unbounded transformation. (#1183)
+
 ## [1.66.1] - 2026-07-20
 
 ### Fixed
