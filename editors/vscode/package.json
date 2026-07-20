@@ -990,7 +990,7 @@
   },
   "devDependencies": {
     "@dagrejs/dagre": "^3.0.0",
-    "@tailwindcss/cli": "^4.3.2",
+    "@tailwindcss/cli": "^4.3.3",
     "@tailwindplus/elements": "^1.0.22",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
@@ -1012,7 +1012,7 @@
     "react-dom": "^19.2.7",
     "tailwindcss": "^4.3.0",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.63.0",
+    "typescript-eslint": "^8.64.0",
     "vitest": "^4.1.10"
   },
   "overrides_comment": "Force-patch transitive deps that haven't been bumped upstream yet — fixes Dependabot alerts #17 (jsdiff DoS), #18 (serialize-javascript RCE), #19 (serialize-javascript CPU exhaustion), and the GHSA-q3j6-qgpj-74h6 / GHSA-v39h-62p7-jpjc fast-uri path-traversal/host-confusion advisories (transitive via ajv → @vscode/test-electron). Drop these once upstreams ship the bumps.",
