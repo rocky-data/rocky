@@ -9470,44 +9470,75 @@ fn resolve_merge_update_columns(
 /// `MAX(<timestamp_column>) FROM <target>` — the post-execute watermark for the
 /// replication path. Reads the **target** table so the recorded value reflects
 /// exactly what was loaded (closing the source-side TOCTOU described on
-/// [`resolve_new_watermark`]). Returns `None` on NULL / empty / failure so the
-/// caller can keep the prior watermark.
+/// [`resolve_new_watermark`]). Returns `Ok(None)` only when the aggregate is
+/// NULL (an empty target). Query, shape, and parse failures propagate so they
+/// cannot be mistaken for "no progress" and persisted as a valid epoch
+/// watermark.
 async fn query_target_max_timestamp(
     warehouse: &dyn WarehouseAdapter,
     dialect: &dyn rocky_core::traits::SqlDialect,
     target: &TableRef,
     timestamp_column: &str,
-) -> Option<chrono::DateTime<Utc>> {
-    if rocky_sql::validation::validate_identifier(timestamp_column).is_err() {
-        return None;
-    }
+) -> Result<Option<chrono::DateTime<Utc>>> {
+    rocky_sql::validation::validate_identifier(timestamp_column)
+        .with_context(|| format!("invalid watermark column '{timestamp_column}'"))?;
     let target_ref = dialect
         .format_table_ref(&target.catalog, &target.schema, &target.table)
-        .ok()?;
+        .map_err(anyhow::Error::from)
+        .with_context(|| {
+            format!(
+                "could not format target table {} for watermark query",
+                target.full_name()
+            )
+        })?;
     let sql = format!("SELECT MAX({timestamp_column}) FROM {target_ref}");
 
-    let result = match warehouse.execute_query(&sql).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                table = target.full_name(),
-                error = %e,
-                "target-side MAX(ts) query failed — keeping prior watermark"
-            );
-            return None;
-        }
-    };
+    let result = warehouse
+        .execute_query(&sql)
+        .await
+        .map_err(anyhow::Error::from)
+        .with_context(|| {
+            format!(
+                "target-side watermark query failed for {}",
+                target.full_name()
+            )
+        })?;
 
-    result.rows.first().and_then(|r| r.first()).and_then(|v| {
-        v.as_str().and_then(|s| {
-            s.parse::<chrono::DateTime<Utc>>().ok().or_else(|| {
-                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-                    .ok()
-                    .map(|naive| naive.and_utc())
-            })
+    let value = result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "target-side watermark query returned no aggregate value for {}",
+                target.full_name()
+            )
+        })?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = value.as_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "target-side watermark query returned a non-string value for {}: {value}",
+            target.full_name()
+        )
+    })?;
+    let parsed = raw
+        .parse::<chrono::DateTime<Utc>>()
+        .ok()
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S"))
+                .ok()
+                .map(|naive| naive.and_utc())
         })
-    })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not parse target-side watermark for {}: {raw}",
+                target.full_name()
+            )
+        })?;
+    Ok(Some(parsed))
 }
 
 /// Resolve the watermark to persist after copying into `target_table`.
@@ -9532,11 +9563,12 @@ async fn query_target_max_timestamp(
 /// `MAX` over an empty / freshly-truncated target returns NULL. On the
 /// incremental path `now` is NEVER a safe watermark — it is later than every
 /// real row and would skip any source row written after this run's snapshot.
-/// So a NULL / unparseable / failed target MAX falls back to the **prior
-/// watermark** (unchanged). When there is no prior watermark either (a true
-/// first run that loaded nothing), it falls back to the epoch sentinel
-/// (`1970-01-01`), which is "no progress" — the next run re-scans the whole
-/// source rather than advancing past unloaded rows.
+/// So a NULL target MAX falls back to the **prior watermark** (unchanged). When
+/// there is no prior watermark either (a true first run that loaded nothing),
+/// it falls back to the epoch sentinel (`1970-01-01`), which is "no progress" —
+/// the next run re-scans the whole source rather than advancing past unloaded
+/// rows. Query and parse failures propagate: persisting the epoch after a
+/// non-empty refresh would make the next run append the full source again.
 async fn resolve_new_watermark(
     strategy: &MaterializationStrategy,
     warehouse: &dyn WarehouseAdapter,
@@ -9545,22 +9577,27 @@ async fn resolve_new_watermark(
     timestamp_column: &str,
     prior_watermark: Option<chrono::DateTime<Utc>>,
     now: chrono::DateTime<Utc>,
-) -> chrono::DateTime<Utc> {
+) -> Result<chrono::DateTime<Utc>> {
     let advances_watermark = matches!(
         strategy,
         MaterializationStrategy::Incremental { .. } | MaterializationStrategy::Microbatch { .. }
     );
     if advances_watermark {
         // Record what was actually loaded (MAX over the target). On an empty
-        // target / NULL / failure, keep the prior watermark — never `now`,
-        // which would skip rows written to source after this run's snapshot.
-        // With no prior either, fall back to the epoch sentinel = no progress.
-        match query_target_max_timestamp(warehouse, dialect, target_table, timestamp_column).await {
-            Some(target_max) => target_max,
-            None => prior_watermark.unwrap_or_else(epoch_watermark_sentinel),
-        }
+        // target / NULL, keep the prior watermark — never `now`, which would
+        // skip rows written to source after this run's snapshot. With no prior
+        // either, fall back to the epoch sentinel = no progress. Failures
+        // propagate so an epoch cannot certify a non-empty target by mistake.
+        Ok(
+            match query_target_max_timestamp(warehouse, dialect, target_table, timestamp_column)
+                .await?
+            {
+                Some(target_max) => target_max,
+                None => prior_watermark.unwrap_or_else(epoch_watermark_sentinel),
+            },
+        )
     } else {
-        now
+        Ok(now)
     }
 }
 
@@ -9578,20 +9615,16 @@ fn epoch_watermark_sentinel() -> chrono::DateTime<Utc> {
 /// DuckDB). Tagging and watermark updates are returned as deferred
 /// operations and applied in a post-run batch phase for better concurrency.
 ///
-/// ## Source-side watermark semantics
+/// ## Target-side watermark semantics
 ///
 /// For incremental replication, the runner reads the previous run's
-/// `MAX({timestamp_column}) FROM source` from the state store **before**
-/// SQL gen — that value bounds the WHERE clause as a literal. **After** a
-/// successful execute, the runner issues a fresh
-/// `SELECT MAX({timestamp_column}) FROM source` query and records the
-/// result as the new watermark (replaces the older `Utc::now()` semantics) —
-/// including on the bootstrap full-refresh run of an incremental table, so the
-/// first incremental tick starts from the real data max. Falls back to
-/// `Utc::now()` only when the query returns no parseable timestamp (empty
-/// source, non-incremental strategies). See `resolve_new_watermark` for the
-/// per-strategy dispatch. The watermark reflects what's been processed *from*
-/// source — not what's *in* target.
+/// target-side watermark from the state store **before** SQL generation; that
+/// value bounds the source WHERE clause as a literal. **After** a successful
+/// execute, the runner records `MAX({timestamp_column}) FROM target`, which is
+/// exactly the data loaded by this run. An empty target keeps the prior value,
+/// or uses the epoch sentinel when no prior value exists. Query and parse
+/// failures fail the table so a non-empty refresh can never be certified by an
+/// epoch watermark. See `resolve_new_watermark` for the per-strategy dispatch.
 /// Record a per-table checkpoint on the blocking pool.
 ///
 /// The redb write transaction fsyncs on commit; running it inline on the async
@@ -9641,6 +9674,28 @@ async fn process_table(
     let mut asset_key = task.asset_key_prefix.clone();
     asset_key.push(task.table_name.clone());
 
+    // Resolve the strategy and any state it requires before pruning or drift
+    // handling. A missing watermark means an incremental target cannot safely
+    // append, while a state read failure must stop before the target is
+    // mutated.
+    let strategy = build_replication_strategy_with_override(pipeline, &task.effective_override)?;
+    let uses_watermark = matches!(
+        &strategy,
+        MaterializationStrategy::Incremental { .. } | MaterializationStrategy::Microbatch { .. }
+    );
+    let prior_watermark = if uses_watermark {
+        let store = Arc::clone(state);
+        let key = target_table.state_key();
+        let table_name = target_table.full_name();
+        tokio::task::spawn_blocking(move || store.get_watermark(&key))
+            .await
+            .with_context(|| format!("watermark read task panicked for {table_name}"))?
+            .with_context(|| format!("could not read prior watermark for {table_name}"))?
+            .map(|watermark| watermark.last_value)
+    } else {
+        None
+    };
+
     // --- Skip-unchanged pruning (config `prune_unchanged`, off by default) ---
     //
     // Before doing any copy work, ask the adapter for a cheap change-marker on
@@ -9678,7 +9733,9 @@ async fn process_table(
                 .ok()
                 .flatten()
         };
-        if recorded.as_deref() == Some(live.as_str()) {
+        if (!uses_watermark || prior_watermark.is_some())
+            && recorded.as_deref() == Some(live.as_str())
+        {
             return Ok(TableOutcome::Pruned(PrunedTable {
                 asset_key,
                 source_schema: task.source_schema.clone(),
@@ -9705,7 +9762,7 @@ async fn process_table(
         };
     let target_exists = !target_cols.is_empty();
 
-    let mut use_full_refresh = !target_exists;
+    let mut use_full_refresh = !target_exists || (uses_watermark && prior_watermark.is_none());
     let mut drift_action: Option<DriftActionOutput> = None;
 
     if target_exists {
@@ -9863,10 +9920,6 @@ async fn process_table(
         }
     }
 
-    // Build replication IR directly. Applies any per-table override
-    // already resolved at the connector-loop level — see
-    // `TableTask::effective_override`.
-    let strategy = build_replication_strategy_with_override(pipeline, &task.effective_override)?;
     // Effective timestamp column after per-table override. Mirrors the same
     // override > pipeline-default precedence used inside
     // `build_replication_strategy_with_override` so the strategy's WHERE
@@ -9909,38 +9962,6 @@ async fn process_table(
             auto_create_schemas: pipeline.target.governance.auto_create_schemas,
         },
     );
-
-    // Source-side watermark: read the previous run's `MAX(ts) FROM source`
-    // from state. The dialect-level `watermark_where` substitutes this as
-    // a literal (no correlated subquery against target). On a first run /
-    // post-`delete_watermark`, `None` falls back to the 1970-01-01 sentinel
-    // so the whole source is scanned.
-    let prior_watermark: Option<chrono::DateTime<Utc>> = {
-        // Read on the blocking pool so the redb read transaction doesn't stall
-        // the async worker on the concurrent table path.
-        let store = Arc::clone(state);
-        let key = target_table.state_key();
-        match tokio::task::spawn_blocking(move || store.get_watermark(&key)).await {
-            Ok(Ok(Some(wm))) => Some(wm.last_value),
-            Ok(Ok(None)) => None,
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    table = target_table.full_name(),
-                    error = %e,
-                    "could not read prior watermark from state — falling back to full scan"
-                );
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    table = target_table.full_name(),
-                    error = %e,
-                    "watermark read task panicked — falling back to full scan"
-                );
-                None
-            }
-        }
-    };
 
     let strategy_name;
     let sql = if use_full_refresh {
@@ -10161,7 +10182,7 @@ async fn process_table(
         prior_watermark,
         now,
     )
-    .await;
+    .await?;
 
     let deferred_watermark = Some(DeferredWatermark {
         state_key: target_table.state_key(),
@@ -12386,7 +12407,8 @@ merge_keys = ["id"]
             &source,
             "_fivetran_synced",
         )
-        .await;
+        .await
+        .unwrap();
 
         let expected = chrono::Utc.with_ymd_and_hms(2026, 3, 3, 12, 0, 0).unwrap();
         assert_eq!(
@@ -12431,7 +12453,8 @@ merge_keys = ["id"]
             &source,
             "_fivetran_synced",
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(
             watermark.is_none(),
@@ -12496,7 +12519,8 @@ merge_keys = ["id"]
             None,
             now,
         )
-        .await;
+        .await
+        .unwrap();
 
         let data_max = chrono::Utc.with_ymd_and_hms(2026, 3, 3, 12, 0, 0).unwrap();
         assert_eq!(
@@ -12522,10 +12546,240 @@ merge_keys = ["id"]
             None,
             now,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(
             mb_watermark, data_max,
             "microbatch must also record MAX(target.ts), not wall-clock now"
+        );
+    }
+
+    /// Regression: losing state while an incremental target still exists must
+    /// rebuild that target. Treating the absent watermark as an epoch lower
+    /// bound appends the full source and silently duplicates every existing row.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn missing_watermark_on_existing_incremental_target_forces_full_refresh() {
+        use chrono::TimeZone;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_ir::WatermarkState;
+
+        let adapter = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES \
+                (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                (2, TIMESTAMP '2026-03-02 12:00:00')",
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+        ] {
+            adapter.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(
+            r#"strategy = "incremental"
+timestamp_column = "ts"
+"#,
+        );
+        let task = TableTask {
+            source_catalog: String::new(),
+            source_schema: "src".into(),
+            target_catalog: String::new(),
+            target_schema: "tgt".into(),
+            table_name: "events".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            check_column_match: false,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude: vec![],
+            metadata_columns: vec![],
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        };
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("missing watermark should trigger a full refresh");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+
+        assert_eq!(result.materialization.metadata.strategy, "full_refresh");
+        let count = adapter
+            .execute_query("SELECT COUNT(*) FROM tgt.events")
+            .await
+            .unwrap();
+        assert_eq!(
+            count.rows[0][0], "2",
+            "full refresh must not duplicate existing rows"
+        );
+        let deferred = result
+            .deferred_watermark
+            .as_ref()
+            .expect("full refresh should rebuild the watermark");
+        assert_eq!(
+            deferred.timestamp,
+            Utc.with_ymd_and_hms(2026, 3, 2, 12, 0, 0).unwrap()
+        );
+
+        state
+            .set_watermark(
+                &deferred.state_key,
+                &WatermarkState {
+                    last_value: deferred.timestamp,
+                    updated_at: Utc::now(),
+                },
+            )
+            .unwrap();
+        adapter
+            .execute_statement("INSERT INTO src.events VALUES (3, TIMESTAMP '2026-03-03 14:00:00')")
+            .await
+            .unwrap();
+
+        let outcome = process_table(&adapter, &state, &pipeline, &task, false)
+            .await
+            .expect("a present watermark should retain incremental behavior");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("table should be materialized");
+        };
+        assert_eq!(result.materialization.metadata.strategy, "incremental");
+        let count = adapter
+            .execute_query("SELECT COUNT(*) FROM tgt.events")
+            .await
+            .unwrap();
+        assert_eq!(count.rows[0][0], "3");
+    }
+
+    /// Regression: if the target-MAX query fails after a missing-watermark
+    /// recovery refresh, the run must fail without manufacturing an epoch
+    /// watermark. The retry then still sees missing state and replaces the
+    /// target again instead of appending the full source.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn post_refresh_watermark_query_failure_fails_closed_and_retry_replaces() {
+        use async_trait::async_trait;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::{
+            AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        struct FailMaxDuckDb<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for FailMaxDuckDb<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                if sql.trim_start().starts_with("SELECT MAX(") {
+                    return Err(AdapterError::msg("injected target MAX failure"));
+                }
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                self.inner.describe_table(table).await
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES \
+                (1, TIMESTAMP '2026-03-01 10:00:00'), \
+                (2, TIMESTAMP '2026-03-02 12:00:00')",
+            "CREATE TABLE tgt.events AS SELECT * FROM src.events",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let pipeline = parse_pipeline(
+            r#"strategy = "incremental"
+timestamp_column = "ts"
+"#,
+        );
+        let task = TableTask {
+            source_catalog: String::new(),
+            source_schema: "src".into(),
+            target_catalog: String::new(),
+            target_schema: "tgt".into(),
+            table_name: "events".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            check_column_match: false,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude: vec![],
+            metadata_columns: vec![],
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        };
+
+        let failing = FailMaxDuckDb { inner: &inner };
+        let error = match process_table(&failing, &state, &pipeline, &task, false).await {
+            Ok(_) => panic!("a failed post-refresh watermark query must fail the table"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("injected target MAX failure"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            state
+                .get_watermark(
+                    &TableRef {
+                        catalog: String::new(),
+                        schema: "tgt".into(),
+                        table: "events".into(),
+                    }
+                    .state_key()
+                )
+                .unwrap()
+                .is_none(),
+            "a failed watermark query must leave state absent"
+        );
+
+        let outcome = process_table(&inner, &state, &pipeline, &task, false)
+            .await
+            .expect("retry with readable MAX should replace safely");
+        let TableOutcome::Materialized(result) = outcome else {
+            panic!("retry should materialize the table");
+        };
+        assert_eq!(result.materialization.metadata.strategy, "full_refresh");
+        let count = inner
+            .execute_query("SELECT COUNT(*) FROM tgt.events")
+            .await
+            .unwrap();
+        assert_eq!(
+            count.rows[0][0], "2",
+            "retry must replace rather than append the full source"
         );
     }
 
@@ -12599,7 +12853,8 @@ merge_keys = ["id"]
             None,
             now,
         )
-        .await;
+        .await
+        .unwrap();
         // It must reflect only what was loaded (max = 03-02), NOT the appended
         // source row (03-03).
         let loaded_max = chrono::Utc.with_ymd_and_hms(2026, 3, 2, 10, 0, 0).unwrap();
@@ -12672,17 +12927,18 @@ merge_keys = ["id"]
             table: "events".into(),
         };
 
-        let watermark = super::query_target_max_timestamp(
+        let error = super::query_target_max_timestamp(
             &adapter as &dyn WarehouseAdapter,
             &dialect as &dyn SqlDialect,
             &source,
             "'; DROP TABLE",
         )
-        .await;
+        .await
+        .expect_err("unsafe timestamp_column must be rejected");
 
         assert!(
-            watermark.is_none(),
-            "unsafe timestamp_column must be rejected before the SQL is built"
+            error.to_string().contains("invalid watermark column"),
+            "unexpected error: {error:#}"
         );
     }
 
