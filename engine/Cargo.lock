@@ -1971,17 +1971,6 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.16.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash 0.2.0",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
@@ -2487,9 +2476,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.46.9"
+version = "0.48.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d865ca7ca04445fcaa1d751fda3dc43b0113ba2fcddc65d5a0fcb474a7c3bba"
+checksum = "9baf521a926fd1e6f94af6922be9686b61c8a89a5fb7e14d6a1e21b79738d4cc"
 dependencies = [
  "ahash 0.8.12",
  "bytecount",
@@ -2514,9 +2503,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema-regex"
-version = "0.46.9"
+version = "0.48.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b7fc96cd6677cc81b00607d43477327d719419937ef1c44b3556a40f517d54c"
+checksum = "d668f4775619127513d9a4f190704d20a66d20ccf0efc258f8ed42548e5fd7cd"
 dependencies = [
  "regex-syntax",
 ]
@@ -3803,14 +3792,14 @@ dependencies = [
 
 [[package]]
 name = "referencing"
-version = "0.46.9"
+version = "0.48.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77954d81b2e1c5e8ab889f9f597a92f852ab073255de9e37ee3fb443efd57051"
+checksum = "df843f41f0cb459649f64a8b6b10579cf454f7a7420dc702767c81a26f23d780"
 dependencies = [
  "ahash 0.8.12",
  "fluent-uri 0.4.1",
  "getrandom 0.3.4",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "itoa",
  "micromap",
  "parking_lot",
