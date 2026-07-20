@@ -14,7 +14,13 @@ Single repository for the Rocky data platform — a typed-program layer above th
 
 Each subproject has its own `AGENTS.md` with build commands, coding standards, and architecture details (its `CLAUDE.md` is a thin shim that imports the `AGENTS.md`). **Always read the subproject `AGENTS.md` before working inside it.**
 
-> **Adversarial / red-team code review** (e.g. Codex via `codex-plugin-cc`): read [`CODEX_REVIEW.md`](CODEX_REVIEW.md) before reviewing engine changes. It is the grounded correctness profile — Rocky's real compiler pipeline (surface → SQL string → single `ModelIr`, no HIR), the incremental-recompute surfaces, the enum-exhaustiveness rule, the nullability/3VL invariants, and the test-evidence bar.
+## Agent-tool compatibility
+
+- `AGENTS.md` is the canonical, vendor-neutral source for persistent repository guidance. Tool-specific files and directories exist only for discovery compatibility.
+- Root task skills follow the Agent Skills format and are mirrored in `.agents/skills/` and `.claude/skills/`. Keep the two trees byte-identical and keep workflow text independent of any particular agent client, model, marketplace, or plugin.
+- If a client does not discover a relevant skill automatically, read its `SKILL.md` directly and follow the nearest applicable `AGENTS.md`.
+
+> **Adversarial / red-team code review** (regardless of agent client): read [`AGENT_REVIEW.md`](AGENT_REVIEW.md) before reviewing engine changes. It is the grounded correctness profile — Rocky's real compiler pipeline (surface → SQL string → single `ModelIr`, no HIR), the incremental-recompute surfaces, the enum-exhaustiveness rule, the nullability/3VL invariants, and the test-evidence bar.
 
 ## How they fit together
 
