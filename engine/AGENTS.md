@@ -331,7 +331,7 @@ Rocky uses a configurable schema pattern to map source schemas to target catalog
 
 **Time-interval materialization:** partition-keyed via `@start_date`/`@end_date` placeholders. CLI: `rocky run --partition KEY` / `--from KEY --to KEY` / `--latest` / `--missing`. Per-partition state in the `PARTITIONS` redb table. Compiler diagnostics E020-E026 + W003. See `../docs/src/content/docs/concepts/time-interval.md`.
 
-**Databricks-specific SQL, REST APIs, and auth:** see the `databricks` skill at `engine/.claude/skills/databricks/SKILL.md` and `crates/rocky-databricks/src/`.
+**Databricks-specific SQL, REST APIs, and auth:** use the engine-local `databricks` skill when the active agent client exposes it; otherwise start with `crates/rocky-databricks/src/` and the adapter's referenced API documentation.
 
 **Snowflake auth:** OAuth (highest priority) → RS256 key-pair JWT → password. See `crates/rocky-snowflake/src/auth.rs`.
 
@@ -399,7 +399,7 @@ Test fixtures for the dagster integration are captured from the live binary by `
 
 ## Configuration
 
-Rocky reads `rocky.toml`. Env vars substituted at parse time: `${VAR_NAME}` (with defaults: `${VAR:-default}`). Two top-level sections: `[adapter]` (warehouse connection) and `[pipeline.<name>]` (pipeline definition). For the full config reference, schema, and examples, see the `rocky-config` skill at the monorepo root (`.claude/skills/rocky-config/SKILL.md`).
+Rocky reads `rocky.toml`. Env vars substituted at parse time: `${VAR_NAME}` (with defaults: `${VAR:-default}`). Two top-level sections: `[adapter]` (warehouse connection) and `[pipeline.<name>]` (pipeline definition). For the full config reference, schema, and examples, see the `rocky-config` skill at the monorepo root (`.agents/skills/rocky-config/SKILL.md`).
 
 Section reference:
 
