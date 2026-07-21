@@ -5386,6 +5386,184 @@ pub struct TickCounts {
     pub skipped: usize,
 }
 
+/// A read-only snapshot of the scheduler: what is scheduled, when each pipeline
+/// last evaluated and fired, when it is next expected to, what is claimed in
+/// flight, and whether a reconciler holds the tick lock.
+///
+/// API-only (`GET /api/v1/schedule`), so it carries no `version`/`command`
+/// preamble — it mirrors [`MetaOutput`] and `JobStatus`, not the CLI-backed
+/// [`TickOutput`].
+///
+/// This is a **status read, not an evaluation**: it reports stored cursors,
+/// claims and lock state without deciding what is due. `rocky tick --dry-run`
+/// is the evaluation. Keeping the two apart makes this endpoint side-effect
+/// free and `O(pipelines)` rather than `O(runs × pipelines)`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleStatusOutput {
+    /// The instant this snapshot was taken. Every projection below is relative
+    /// to it.
+    pub now: DateTime<Utc>,
+    /// The project timezone cron occurrences resolve in.
+    pub timezone: String,
+    /// Whether a reconciler currently holds the tick lock.
+    pub tick_lock: ScheduleLockStatus,
+    /// Every schedulable pipeline declaring a `[schedule]`, sorted by name.
+    /// Load pipelines are excluded — they are not schedulable (a scheduled load
+    /// would re-ingest every discovered file), so reporting one as scheduled
+    /// would promise a fire that can never happen.
+    pub pipelines: Vec<SchedulePipelineStatus>,
+    /// Roll-up counts across `pipelines`.
+    pub counts: ScheduleStatusCounts,
+}
+
+/// The tick lock's state.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleLockStatus {
+    /// Lock state. Note `free` is the normal steady state — see
+    /// [`TickLockState`].
+    pub state: TickLockState,
+    /// Age of the lock's heartbeat in seconds, when one is readable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heartbeat_age_seconds: Option<u64>,
+}
+
+/// Tick-lock states.
+///
+/// **`free` is the normal steady state.** The lock is held only for the
+/// duration of a tick, and a tick is short relative to the poll interval, so a
+/// perfectly healthy scheduler reports `free` on almost every request. It does
+/// not mean "no scheduler is running" — for that, compare `last_evaluated_at`
+/// against the schedule's cadence.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TickLockState {
+    /// No lock file exists — no tick has ever run in this project.
+    Never,
+    /// Not currently held. The normal state between ticks.
+    Free,
+    /// Held by a live reconciler (fresh heartbeat) — a tick is in progress.
+    Held,
+    /// Held with a heartbeat stale past the takeover window: a wedged
+    /// reconciler. The next tick overrides the lock and proceeds.
+    Wedged,
+}
+
+/// One scheduled pipeline's status.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SchedulePipelineStatus {
+    /// The pipeline name.
+    pub pipeline: String,
+    /// False when the schedule declares `enabled = false`.
+    pub enabled: bool,
+    /// The cron expression, when one is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    /// Upstream pipelines driving the `after` trigger.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// The resolved freshness budget in seconds, when that trigger is active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness_budget_seconds: Option<u64>,
+    /// Catch-up policy: `latest` (fire the newest missed occurrence) or `skip`
+    /// (jump the anchor forward, firing none of them).
+    pub catchup: String,
+    /// When the reconciler last evaluated this pipeline's demand. Staleness
+    /// here — not the tick lock — is what indicates a dead timer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_evaluated_at: Option<DateTime<Utc>>,
+    /// The logical timestamp of the last occurrence that fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fire_logical_ts: Option<DateTime<Utc>>,
+    /// When the last attempt started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    /// The last attempt's terminal outcome (`success` | `partial` | `failure`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_attempt_outcome: Option<String>,
+    /// Consecutive failures driving the backoff ladder.
+    pub consecutive_failures: u32,
+    /// True when no tick has recorded a cron anchor yet. The first tick records
+    /// the anchor *without* firing, so `next_fire_at` is not yet projectable —
+    /// which is a different thing from "this will never fire".
+    pub awaiting_first_anchor: bool,
+    /// When the cron is next expected to fire.
+    ///
+    /// **A timestamp in the past means overdue.** The projection is anchored on
+    /// the stored cursor, not on the clock, so a stalled timer reports the slot
+    /// it missed rather than a healthy-looking future one. Null for
+    /// `after`/`freshness` schedules, which have no projectable instant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_fire_at: Option<DateTime<Utc>>,
+    /// The active backoff window, when the pipeline is throttled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throttle: Option<ScheduleThrottleStatus>,
+    /// Claims recorded for this pipeline, newest occurrence first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<ScheduleClaimStatus>,
+    /// The config error making this pipeline unschedulable, when its schedule
+    /// cannot be resolved. The reconciler fails closed and never fires it, so
+    /// this is why an otherwise-configured pipeline is silent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
+}
+
+/// An active backoff window.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleThrottleStatus {
+    /// Which backoff is suppressing the demand.
+    pub kind: ScheduleThrottleKind,
+    /// When the demand becomes eligible again.
+    pub resume_at: DateTime<Utc>,
+}
+
+/// Why a demand is currently suppressed.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleThrottleKind {
+    /// The failure backoff ladder (grows with `consecutive_failures`).
+    FailureBackoff,
+    /// The fixed backoff applied after a partial run.
+    PartialBackoff,
+}
+
+/// One claim recorded against a pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleClaimStatus {
+    /// The demand source (`cron` | `after` | `freshness` | `webhook`).
+    pub source: String,
+    /// Claim state (`submitted` | `released` | `completed`).
+    pub state: String,
+    /// The terminal outcome, when the claim is `completed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// The submission id — the join key to `GET /api/v1/jobs/{id}` and to run
+    /// history.
+    pub submission_id: String,
+    /// The occurrence this claim belongs to. Null for a webhook demand, whose
+    /// claim key carries a minted id rather than an instant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logical_ts: Option<DateTime<Utc>>,
+    /// Attempts made against this claim.
+    pub attempts: u32,
+}
+
+/// Roll-up counts over the reported pipelines.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleStatusCounts {
+    /// Pipelines declaring a schedule (the length of `pipelines`).
+    pub scheduled: usize,
+    /// Of those, how many are enabled.
+    pub enabled: usize,
+    /// How many are currently inside a backoff window.
+    pub throttled: usize,
+    /// How many have a `submitted` claim — a run believed to be in flight.
+    pub in_flight: usize,
+    /// How many have a `next_fire_at` in the past (overdue).
+    pub overdue: usize,
+    /// How many declare a schedule that cannot be resolved.
+    pub config_errors: usize,
+}
+
 /// When set, [`print_json`] emits compact (single-line) JSON instead of
 /// pretty-printed. Used by `rocky run --watch` to honour its
 /// newline-delimited-stream contract: each iteration's `RunOutput` lands

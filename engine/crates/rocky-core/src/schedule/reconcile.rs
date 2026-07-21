@@ -40,11 +40,12 @@ use crate::state::{StateError, StateStore};
 
 use super::claim::{
     ClaimCas, ClaimRecord, ClaimState, DemandKind, PostAttempt, PreSpawn, Resolved,
-    TerminalOutcome, decide_post_attempt, decide_pre_spawn, decide_resolver, sweep_terminal_claim,
+    TerminalOutcome, decide_post_attempt, decide_pre_spawn, decide_resolver, parse_claim_key,
+    sweep_terminal_claim,
 };
 use super::demand::{
     Demand, EvaluatedPipeline, HistoryError, ResolvedSchedule, RunHistoryView, RunSuccess,
-    ScheduleStateView, SkipReason, SourceSkip, evaluate_one, resolve_schedule,
+    ScheduleConfigError, ScheduleStateView, SkipReason, SourceSkip, evaluate_one, resolve_schedule,
 };
 use super::lock::{TickAcquire, TickLock};
 use super::record::{ScheduleStateMutation, ScheduleStateRecord};
@@ -530,10 +531,42 @@ fn resolve_all_schedules(
     filter: Option<&str>,
     member_budgets: &BTreeMap<String, Vec<u64>>,
 ) -> (BTreeMap<String, ResolvedSchedule>, Vec<SkippedDemand>) {
-    let default_tz = config.schedule.timezone.as_str();
-    let project_lag = config.freshness.expected_lag_seconds;
     let mut resolved = BTreeMap::new();
     let mut skips = Vec::new();
+    for (name, outcome) in resolve_schedules_detailed(config, filter, member_budgets) {
+        match outcome {
+            Ok(rs) => {
+                resolved.insert(name, rs);
+            }
+            Err(_) => skips.push(SkippedDemand {
+                pipeline: name,
+                source: None,
+                reason: TickSkipReason::NotDue,
+            }),
+        }
+    }
+    (resolved, skips)
+}
+
+/// Resolve every scheduled pipeline in scope, **keeping the config error**.
+///
+/// The reconciler's own view of "what is scheduled" — including the V044 load
+/// exclusion and the project-timezone/freshness-budget defaulting — so a status
+/// consumer reports the set that can actually fire. Iterating
+/// `config.pipelines` + `schedule()` directly does NOT: it includes load
+/// pipelines, which the reconciler skips, so such a consumer would report a
+/// pipeline as scheduled that will never run.
+///
+/// [`resolve_all_schedules`] is a thin lossy split over this, preserving the
+/// tick path's existing behavior of collapsing every config error to a skip.
+pub fn resolve_schedules_detailed(
+    config: &RockyConfig,
+    filter: Option<&str>,
+    member_budgets: &BTreeMap<String, Vec<u64>>,
+) -> BTreeMap<String, Result<ResolvedSchedule, ScheduleConfigError>> {
+    let default_tz = config.schedule.timezone.as_str();
+    let project_lag = config.freshness.expected_lag_seconds;
+    let mut out = BTreeMap::new();
     for (name, pipeline) in &config.pipelines {
         if let Some(f) = filter
             && name.as_str() != f
@@ -559,20 +592,12 @@ fn resolve_all_schedules(
         let members = member_budgets
             .get(name)
             .map_or(&[][..], |lags| lags.as_slice());
-        match resolve_schedule(name, schedule_cfg, default_tz, members, project_lag) {
-            Ok(rs) => {
-                resolved.insert(name.clone(), rs);
-            }
-            Err(_) => {
-                skips.push(SkippedDemand {
-                    pipeline: name.clone(),
-                    source: None,
-                    reason: TickSkipReason::NotDue,
-                });
-            }
-        }
+        out.insert(
+            name.clone(),
+            resolve_schedule(name, schedule_cfg, default_tz, members, project_lag),
+        );
     }
-    (resolved, skips)
+    out
 }
 
 /// Order the scheduled pipelines so every `after` upstream precedes its
@@ -979,7 +1004,10 @@ fn sweep_orphan_claims(
         if !matches!(claim.state, ClaimState::Submitted) {
             continue;
         }
-        let Some((pipeline, source)) = parse_claim_key(&key) else {
+        // The discriminator is deliberately ignored here: it is a timestamp for
+        // cron/after/freshness but a `demand_uid` for a webhook, and the sweep
+        // needs neither.
+        let Some((pipeline, source, _)) = parse_claim_key(&key) else {
             continue;
         };
         // Only sweep claims for pipelines in this tick's scope (honors
@@ -1011,22 +1039,6 @@ fn sweep_orphan_claims(
         )?;
     }
     Ok(())
-}
-
-/// Parse a claim key `<pipeline>\u{1f}<source>\u{1f}<logical_ts>` back into its
-/// pipeline and source. Returns `None` for an unrecognized shape — the sweep
-/// skips a key it cannot interpret rather than acting on it.
-fn parse_claim_key(key: &str) -> Option<(String, DemandKind)> {
-    let mut parts = key.split('\u{1f}');
-    let pipeline = parts.next()?.to_string();
-    let source = match parts.next()? {
-        "cron" => DemandKind::Cron,
-        "after" => DemandKind::After,
-        "freshness" => DemandKind::Freshness,
-        "webhook" => DemandKind::Webhook,
-        _ => return None,
-    };
-    Some((pipeline, source))
 }
 
 /// How a stuck `submitted` claim was resolved.

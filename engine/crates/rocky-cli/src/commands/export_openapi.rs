@@ -689,6 +689,35 @@ fn route_table() -> Vec<Route> {
             ],
             auth_exempt: false,
         },
+        Route {
+            method: "get",
+            path: "/api/v1/schedule",
+            operation_id: "getScheduleStatus",
+            tag: "schedule",
+            summary: "Scheduler status",
+            description: "A read-only scheduler snapshot: what is scheduled, each pipeline's \
+                 cursors, throttle and in-flight claims, the projected next fire, and the \
+                 tick-lock state. Reports stored state rather than evaluating demand, so it \
+                 is side-effect free. A `next_fire_at` in the past means overdue, and a \
+                 `tick_lock.state` of `free` is the normal state between ticks.",
+            path_params: &[],
+            header_params: &[],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "200",
+                    description: "The scheduler status snapshot.",
+                    body: Body::Component("ScheduleStatusOutput"),
+                },
+                Resp {
+                    status: "500",
+                    description: "The bound `rocky.toml` could not be read or parsed.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                ENGINE_BUSY_OR_NOT_READY,
+            ],
+            auth_exempt: false,
+        },
     ]
 }
 

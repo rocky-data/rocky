@@ -50,6 +50,16 @@ export type { ColumnLineageOutput } from "./column_lineage";
 export type { ErrorEnvelope } from "./error_envelope";
 export type { JobStatus } from "./job_status";
 export type { MetaOutput } from "./meta";
+export type {
+  ScheduleStatusOutput,
+  ScheduleLockStatus,
+  SchedulePipelineStatus,
+  ScheduleThrottleStatus,
+  ScheduleClaimStatus,
+  ScheduleStatusCounts,
+  ScheduleThrottleKind,
+  TickLockState,
+} from "./schedule_status";
 
 // Lineage (model-level shape)
 export type {
