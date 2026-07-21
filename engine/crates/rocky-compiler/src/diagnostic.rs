@@ -219,6 +219,18 @@ pub const W030: &str = "W030";
 /// be too small, hence a warning rather than silence.
 pub const W031: &str = "W031";
 
+// Lints — cardinality grain
+/// A join can duplicate left-hand rows: the joined relation's grain (the
+/// column set that uniquely identifies one of its rows) is not covered by the
+/// join keys, so more than one right-hand row can match each left-hand row.
+/// Every downstream aggregate over the result silently inflates.
+///
+/// Warning severity, and emitted only when the fan-out is *provable* — a
+/// relation whose grain cannot be established is silent, never warned about.
+/// Currently produced by the `grain` module's prototype only; not yet wired
+/// into the project compile path.
+pub const G001: &str = "G001";
+
 // Info
 /// Model dependency inferred from SQL.
 pub const I001: &str = "I001";

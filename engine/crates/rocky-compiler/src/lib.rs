@@ -21,6 +21,7 @@ pub mod compile;
 pub mod contracts;
 pub mod cost_check;
 pub mod diagnostic;
+pub mod grain;
 pub mod import;
 pub mod incrementality;
 pub mod limits;
