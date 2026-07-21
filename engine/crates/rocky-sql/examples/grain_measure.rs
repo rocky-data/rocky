@@ -591,6 +591,30 @@ fn strip_jinja(sql: &str) -> String {
     out
 }
 
+/// The project a model belongs to: the nearest ancestor directory (relative to
+/// `root`) containing a `rocky.toml`, else the top-level directory. Grain must
+/// be resolved within a project — a bare-stem repo-wide map silently attributes
+/// one project's grain to another project's identically-named model.
+fn project_of(root: &Path, rel: &str) -> String {
+    let mut dir = root.join(rel);
+    dir.pop();
+    loop {
+        if dir.join("rocky.toml").is_file() {
+            return dir
+                .strip_prefix(root)
+                .unwrap_or(&dir)
+                .to_string_lossy()
+                .to_string();
+        }
+        if !dir.pop() || !dir.starts_with(root) {
+            break;
+        }
+    }
+    // No enclosing rocky.toml — fall back to the first path segment so unrelated
+    // trees still cannot cross-contaminate.
+    rel.split('/').next().unwrap_or("").to_string()
+}
+
 fn declared_unique_key(sql_path: &Path) -> Option<Vec<String>> {
     let toml_path = sql_path.with_extension("toml");
     let text = fs::read_to_string(&toml_path).ok()?;
@@ -821,15 +845,21 @@ fn main() {
         });
     }
 
-    // Grain map keyed by model name (file stem, lowercased) for the
-    // determinable-grain multiplier.
-    let mut grain_map: BTreeMap<String, (Grain, &'static str)> = BTreeMap::new();
+    // Grain map keyed by (project, model stem). Keying by bare stem repo-wide
+    // would let one project's `customers.toml` supply the grain for another
+    // project's `customers` — a false attribution that inflates the coverage
+    // number. Project = nearest ancestor directory containing a `rocky.toml`.
+    let mut grain_map: BTreeMap<(String, String), (Grain, &'static str, String)> = BTreeMap::new();
     for r in &results {
         let stem = Path::new(&r.rel)
             .file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        grain_map.insert(stem, (r.grain.clone(), r.grain_source));
+        let proj = project_of(&root, &r.rel);
+        grain_map.insert(
+            (proj, stem),
+            (r.grain.clone(), r.grain_source, r.rel.clone()),
+        );
     }
 
     // -------------------------------------------------------------------
@@ -961,11 +991,14 @@ fn main() {
                     continue;
                 }
                 let base = s.relation.rsplit('.').next().unwrap_or(&s.relation);
-                if let Some((Grain::Known(g), src)) = grain_map.get(base) {
+                let proj = project_of(&root, &r.rel);
+                if let Some((Grain::Known(g), src, from)) =
+                    grain_map.get(&(proj, base.to_string()))
+                {
                     verdictable += 1;
                     verdictable_detail.push(format!(
-                        "      {} -> {} grain={:?} ({}) keys={:?}",
-                        r.rel, s.relation, g, src, s.join_keys
+                        "      {} -> {} grain={:?} ({}, from {}) keys={:?}",
+                        r.rel, s.relation, g, src, from, s.join_keys
                     ));
                 }
             }
