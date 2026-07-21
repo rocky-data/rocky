@@ -533,6 +533,11 @@ fn resolve_all_schedules(
 ) -> (BTreeMap<String, ResolvedSchedule>, Vec<SkippedDemand>) {
     let mut resolved = BTreeMap::new();
     let mut skips = Vec::new();
+    // Iteration is over the detailed BTreeMap (sorted by pipeline name). That
+    // matches the pre-split order: the old loop iterated `config.pipelines`,
+    // which `toml` (no `preserve_order` feature) already deserializes in sorted
+    // key order — so both produce the same skip order. `resolved` is a BTreeMap
+    // either way.
     for (name, outcome) in resolve_schedules_detailed(config, filter, member_budgets) {
         match outcome {
             Ok(rs) => {
@@ -1255,6 +1260,46 @@ after = ["raw"]
 
     fn cfg(toml_str: &str) -> RockyConfig {
         toml::from_str(toml_str).expect("valid rocky.toml")
+    }
+
+    /// The split of `resolve_all_schedules` into `resolve_schedules_detailed`
+    /// must not change the `skipped` Vec order (it flows verbatim into
+    /// `TickOutput.skipped`). The order is sorted by pipeline name — the old
+    /// loop iterated `config.pipelines`, which `toml` (no `preserve_order`)
+    /// deserializes in sorted key order, and the new BTreeMap iteration is
+    /// sorted too. Declaring `zzz` before `aaa` proves the input order does not
+    /// leak through: both land under the sorted `[aaa, zzz]`.
+    #[test]
+    fn resolve_all_schedules_skips_are_sorted_not_declaration_order() {
+        let config = cfg(r#"
+[adapter.db]
+type = "duckdb"
+
+[pipeline.zzz]
+type = "transformation"
+[pipeline.zzz.target]
+adapter = "db"
+[pipeline.zzz.schedule]
+cron = "not a cron"
+
+[pipeline.aaa]
+type = "transformation"
+[pipeline.aaa.target]
+adapter = "db"
+[pipeline.aaa.schedule]
+cron = "also invalid"
+"#);
+        let (resolved, skips) = resolve_all_schedules(&config, None, &BTreeMap::new());
+        assert!(
+            resolved.is_empty(),
+            "both crons are invalid → nothing resolves"
+        );
+        let order: Vec<&str> = skips.iter().map(|s| s.pipeline.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["aaa", "zzz"],
+            "skip order is sorted by pipeline name"
+        );
     }
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {

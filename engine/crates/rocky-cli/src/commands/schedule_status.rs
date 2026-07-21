@@ -17,8 +17,8 @@ use std::path::Path;
 use chrono::{DateTime, Utc};
 use rocky_core::config::{RockyConfig, load_rocky_config};
 use rocky_core::schedule::{
-    Catchup, ClaimState, LOCK_TAKEOVER_AFTER, Throttle, next_projected_fire, parse_claim_key,
-    probe_tick_lock, resolve_schedules_detailed,
+    Catchup, ClaimState, LOCK_TAKEOVER_AFTER, ResolvedSchedule, ScheduleStateRecord, Throttle,
+    next_projected_fire, parse_claim_key, probe_tick_lock, resolve_schedules_detailed,
 };
 use rocky_core::state::StateStore;
 
@@ -171,17 +171,6 @@ fn build_pipelines(
             .unwrap_or_default();
 
         let claims_here = claims.get(&name).cloned().unwrap_or_default();
-        let throttle = match cursor.standing_throttle(now) {
-            Throttle::Clear => None,
-            Throttle::FailureBackoff { resume_at } => Some(ScheduleThrottleStatus {
-                kind: ScheduleThrottleKind::FailureBackoff,
-                resume_at,
-            }),
-            Throttle::PartialBackoff { resume_at } => Some(ScheduleThrottleStatus {
-                kind: ScheduleThrottleKind::PartialBackoff,
-                resume_at,
-            }),
-        };
 
         let common = |config_error: Option<String>,
                       enabled: bool,
@@ -190,7 +179,8 @@ fn build_pipelines(
                       freshness_budget_seconds: Option<u64>,
                       catchup: String,
                       awaiting_first_anchor: bool,
-                      next_fire_at: Option<DateTime<Utc>>| {
+                      next_fire_at: Option<DateTime<Utc>>,
+                      throttle: Option<ScheduleThrottleStatus>| {
             SchedulePipelineStatus {
                 pipeline: name.clone(),
                 enabled,
@@ -205,7 +195,7 @@ fn build_pipelines(
                 consecutive_failures: cursor.consecutive_failures,
                 awaiting_first_anchor,
                 next_fire_at,
-                throttle: throttle.clone(),
+                throttle,
                 claims: claims_here.clone(),
                 config_error,
             }
@@ -214,6 +204,7 @@ fn build_pipelines(
         out.push(match resolved {
             Ok(schedule) => {
                 let has_cron = schedule.cron.is_some();
+                let throttle = reportable_throttle(&schedule, &cursor, now);
                 common(
                     None,
                     schedule.enabled,
@@ -225,6 +216,7 @@ fn build_pipelines(
                     catchup_str(schedule.catchup).to_string(),
                     has_cron && cursor.fire_anchor().is_none(),
                     next_projected_fire(&schedule, &cursor, now),
+                    throttle,
                 )
             }
             // An unresolvable schedule reports its reason instead of vanishing:
@@ -239,10 +231,42 @@ fn build_pipelines(
                 "unknown".to_string(),
                 false,
                 None,
+                None,
             ),
         });
     }
     out
+}
+
+/// The throttle to report, matching only what the reconciler actually honors.
+///
+/// The failure/partial backoff ladder applies to **standing** demands
+/// (`after` / `freshness`) alone. The reconciler never throttles a cron
+/// occurrence — `ScheduleStateRecord::standing_throttle`'s own contract says a
+/// cron demand must not be passed through it, because suppressing an occurrence
+/// would drop a legitimate fire. So a cron-only pipeline reports no throttle
+/// even when its cursor carries a failed last attempt; reporting one would
+/// signal a suppression window that does not exist.
+fn reportable_throttle(
+    schedule: &ResolvedSchedule,
+    cursor: &ScheduleStateRecord,
+    now: DateTime<Utc>,
+) -> Option<ScheduleThrottleStatus> {
+    let is_standing = !schedule.after.is_empty() || schedule.freshness_budget.is_some();
+    if !is_standing {
+        return None;
+    }
+    match cursor.standing_throttle(now) {
+        Throttle::Clear => None,
+        Throttle::FailureBackoff { resume_at } => Some(ScheduleThrottleStatus {
+            kind: ScheduleThrottleKind::FailureBackoff,
+            resume_at,
+        }),
+        Throttle::PartialBackoff { resume_at } => Some(ScheduleThrottleStatus {
+            kind: ScheduleThrottleKind::PartialBackoff,
+            resume_at,
+        }),
+    }
 }
 
 fn count(pipelines: &[SchedulePipelineStatus], now: DateTime<Utc>) -> ScheduleStatusCounts {
@@ -275,4 +299,65 @@ fn catchup_str(catchup: Catchup) -> &'static str {
 fn parse_ts(raw: Option<&str>) -> Option<DateTime<Utc>> {
     raw.and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn schedule(after: Vec<&str>, freshness: bool) -> ResolvedSchedule {
+        ResolvedSchedule {
+            pipeline: "p".to_string(),
+            enabled: true,
+            // The tz is inferred from the field type — the throttle helper never
+            // reads it, so this avoids naming `chrono_tz` directly.
+            cron: Some(("* * * * *".to_string(), "UTC".parse().unwrap())),
+            after: after.into_iter().map(String::from).collect(),
+            freshness_budget: freshness.then(|| chrono::Duration::seconds(3600)),
+            catchup: Catchup::Latest,
+            retry_max: 0,
+            timeout: None,
+        }
+    }
+
+    /// A cursor whose last attempt failed — enough to trip `standing_throttle`
+    /// into a FailureBackoff.
+    fn failed_cursor(now: DateTime<Utc>) -> ScheduleStateRecord {
+        ScheduleStateRecord {
+            last_attempt_at: Some(now.to_rfc3339()),
+            last_attempt_outcome: Some("failure".to_string()),
+            consecutive_failures: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The bug this guards: a cron-only pipeline that failed must NOT report a
+    /// throttle, because the reconciler never applies the backoff ladder to
+    /// cron — reporting one signals a suppression window that does not exist.
+    #[test]
+    fn cron_only_never_reports_a_throttle() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        assert!(reportable_throttle(&schedule(vec![], false), &failed_cursor(now), now).is_none());
+    }
+
+    #[test]
+    fn standing_demands_do_report_a_throttle() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        // `after` makes it standing.
+        assert!(
+            reportable_throttle(&schedule(vec!["upstream"], false), &failed_cursor(now), now)
+                .is_some()
+        );
+        // freshness makes it standing.
+        assert!(reportable_throttle(&schedule(vec![], true), &failed_cursor(now), now).is_some());
+    }
+
+    #[test]
+    fn a_clear_standing_cursor_reports_no_throttle() {
+        let now = Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap();
+        // No last attempt → Throttle::Clear even though it is standing.
+        let fresh = ScheduleStateRecord::default();
+        assert!(reportable_throttle(&schedule(vec!["upstream"], false), &fresh, now).is_none());
+    }
 }
