@@ -275,3 +275,16 @@ clean:
     cd integrations/dagster && rm -rf dist .pytest_cache .ruff_cache
     cd editors/vscode && rm -rf out node_modules .vscode-test
     rm -rf vendor
+
+# Needs a release binary from THIS branch: cd engine && cargo build --release -p rocky
+# 24h soak for `rocky serve --scheduler` (promotion gate — NOT wired into CI)
+soak-scheduler *ARGS:
+    bash scripts/soak-scheduler.sh {{ARGS}}
+
+# Re-run the verdict over an existing soak directory.
+soak-verdict DIR:
+    python3 scripts/soak_verdict.py {{DIR}}
+
+# Exercise the verdict's gate classification against synthetic fixtures.
+soak-verdict-selftest:
+    python3 scripts/soak_verdict.py --self-test
