@@ -49,8 +49,9 @@
 //! that commit.
 //!
 //! **Restorability is narrower than eligibility.** `rocky restore` today
-//! rebuilds only *single-input*, non-partitioned, content-addressed recipes: it
-//! refuses any recipe with recorded upstreams, because re-deriving a multi-input
+//! rebuilds only non-partitioned, content-addressed recipes that read *no
+//! recorded upstreams*: it refuses a recipe with ANY recorded upstream, because
+//! re-deriving a multi-input
 //! recipe from the recorded upstream bytes needs DAG re-derivation that is not
 //! yet implemented. The eviction checks below admit multi-input recipes (a
 //! `strong` closure over several content-hashed upstreams still passes
@@ -748,8 +749,9 @@ fn gc_plan_notes() -> Vec<String> {
          eviction (fail-closed)."
             .to_string(),
         "Every eviction writes a durable tombstone (recipe triple + restore pointer) BEFORE \
-         the ledger row is retired. `rocky restore` rebuilds single-input, non-partitioned \
-         recipes from that tombstone; a recipe with recorded upstreams is refused by restore \
+         the ledger row is retired. `rocky restore` rebuilds non-partitioned recipes that read \
+         no recorded upstreams from that tombstone; a recipe with ANY recorded upstream is \
+         refused by restore \
          today (multi-input DAG re-derivation is a later phase) and must be recovered by \
          re-running its pipeline."
             .to_string(),
@@ -1053,9 +1055,10 @@ fn gc_apply_notes() -> Vec<String> {
             .to_string(),
         "`rocky restore <target>` writes a review-gated plan that rebuilds the artifact from its \
          tombstone's recorded recipe and asserts the recomputed blake3 equals the tombstoned hash \
-         before any write becomes visible. KNOWN LIMITATION: restore covers single-input, \
-         non-partitioned, content-addressed recipes only — it refuses a recipe with recorded \
-         upstreams rather than substituting current data, so a multi-input artifact evicted here \
+         before any write becomes visible. KNOWN LIMITATION: restore covers non-partitioned, \
+         content-addressed recipes that read no recorded upstreams — it refuses a recipe with ANY \
+         recorded upstream rather than substituting current data, so a multi-input artifact \
+         evicted here \
          is recovered by re-running its pipeline, not by `rocky restore`."
             .to_string(),
         "KNOWN LIMITATION: the liveness gate is a conservative-best-effort reader of the Delta \
@@ -1626,9 +1629,9 @@ pub(crate) async fn run_gc_apply_in_with(
              content-addressed bytes requires a protocol-aware VACUUM (Delta tombstone-retention \
              windows + TOCTOU-safe deletion), which is not yet implemented. Unset `[gc] \
              physical_delete` — the durable tombstone + retired ledger row is the eviction of \
-             record, and it retains the full recorded recipe (`rocky restore` rebuilds \
-             single-input recipes from it; a multi-input recipe is recovered by re-running its \
-             pipeline)."
+             record, and it retains the full recorded recipe (`rocky restore` rebuilds recipes \
+             that read no recorded upstreams from it; a multi-input recipe is recovered by \
+             re-running its pipeline)."
         );
     }
 

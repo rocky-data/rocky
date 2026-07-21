@@ -659,7 +659,7 @@ class GcConfig(BaseModel):
 
     Eviction is **ledger-only**: an approved apply writes the durable tombstone and retires the artifact's ledger row (the eviction of record, retaining the full recorded recipe). Physical byte-deletion is not performed — reclaiming bytes safely requires a protocol-aware VACUUM (retention windows + TOCTOU-safe deletion), which is future work.
 
-    `rocky restore` rebuilds an evicted artifact from its tombstone when the recorded recipe is single-input, non-partitioned and content-addressed. A recipe with recorded upstreams is refused by restore today (multi-input DAG re-derivation is a later phase) and is recovered by re-running its pipeline.
+    `rocky restore` rebuilds an evicted artifact from its tombstone when the recorded recipe is non-partitioned, content-addressed, and reads no recorded upstreams. A recipe with ANY recorded upstream is refused by restore today (multi-input DAG re-derivation is a later phase) and is recovered by re-running its pipeline.
     """
 
     model_config = ConfigDict(

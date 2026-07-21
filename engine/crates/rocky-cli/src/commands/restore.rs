@@ -1657,7 +1657,7 @@ mod tests {
         /// upstream is a content hash", explicitly contemplating multi-input
         /// recipes, and `rocky gc` told users evictions were "always restorable
         /// from the recorded recipe". They are not — restore covers only the
-        /// single-input, non-partitioned case. The tombstone is durable and
+        /// zero-upstream, non-partitioned case. The tombstone is durable and
         /// records the full recipe, so nothing is destroyed, but the recovery
         /// route a user is pointed at does not work for these artifacts; they
         /// must re-run the pipeline instead. This PR corrects the misleading

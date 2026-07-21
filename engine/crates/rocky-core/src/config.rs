@@ -2733,8 +2733,9 @@ impl Default for ReuseConfig {
 /// TOCTOU-safe deletion), which is future work.
 ///
 /// `rocky restore` rebuilds an evicted artifact from its tombstone when the
-/// recorded recipe is single-input, non-partitioned and content-addressed. A
-/// recipe with recorded upstreams is refused by restore today (multi-input DAG
+/// recorded recipe is non-partitioned, content-addressed, and reads no
+/// recorded upstreams. A recipe with ANY recorded upstream is refused by
+/// restore today (multi-input DAG
 /// re-derivation is a later phase) and is recovered by re-running its pipeline.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
