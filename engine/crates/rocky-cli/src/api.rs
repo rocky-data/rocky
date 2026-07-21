@@ -1257,6 +1257,42 @@ mod tests {
         serde_json::to_string_pretty(output).unwrap() + "\n"
     }
 
+    /// The state path a test should pin, computed **directly**.
+    ///
+    /// Deliberately not `resolve_state_path`: that resolver prefers a
+    /// CWD-relative `.rocky-state.redb` whenever one exists, and the cwd is
+    /// global to this whole test binary, so calling it from a test is exactly
+    /// what makes a test repointable by its neighbours.
+    fn pinned_state_path(models_dir: &std::path::Path) -> PathBuf {
+        models_dir.join(rocky_core::state::STATE_FILE_NAME)
+    }
+
+    /// A `ServerState` whose state path is **pinned** to `state_path`.
+    ///
+    /// `ServerState::new` hardcodes the override to `None`, and
+    /// `state_path_for` then re-resolves through `resolve_state_path(None, ..)`
+    /// at *request* time — so an unpinned test server reads whatever the cwd
+    /// probe finds when the request lands, not what the test set up.
+    ///
+    /// Takes the path rather than deriving it so the caller controls ordering:
+    /// tests that must populate or sweep the store *before* the server exists
+    /// (the spawned `recompile()` contends for the same file) need the path
+    /// first and the server last.
+    fn pinned_server(
+        models_dir: PathBuf,
+        config_path: Option<PathBuf>,
+        state_path: &std::path::Path,
+    ) -> Arc<ServerState> {
+        ServerState::with_auth(
+            models_dir,
+            None,
+            config_path,
+            None,
+            Vec::new(),
+            Some(state_path.to_path_buf()),
+        )
+    }
+
     #[tokio::test]
     async fn test_health_endpoint() {
         let base = spawn_router(test_state()).await;
@@ -1437,13 +1473,13 @@ mod tests {
     #[tokio::test]
     async fn parity_dag() {
         let (_dir, models_dir, config_path) = minimal_dag_project();
-        let state = ServerState::new(models_dir.clone(), None, Some(config_path.clone()));
+        let state_path = pinned_state_path(&models_dir);
+        let state = pinned_server(models_dir.clone(), Some(config_path.clone()), &state_path);
         let base = spawn_router(state).await;
         let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let api = resp.text().await.unwrap();
 
-        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
         let reference = reference_bytes(
             &dag_output(
                 &config_path,
@@ -1467,6 +1503,19 @@ mod tests {
     /// correctly returns the retryable 503 rather than blocking forever. Real
     /// embedders back off and retry on that 503; the parity assertion should
     /// too, instead of demanding 200 on the first request.
+    ///
+    /// The contender is not only an external process. `ServerState::with_auth`
+    /// spawns `recompile()`, which opens the same store read-only via
+    /// `load_cached_source_schemas`, and `open_redb_with_retry` calls
+    /// `Database::create` for read-only opens too — so redb's in-process
+    /// `DatabaseAlreadyOpen` guard fires between two read-only opens in a
+    /// single test process. Rocky's own advisory lock is taken only for
+    /// `OpenMode::ReadWrite`, so it does not mediate this.
+    ///
+    /// The rule: **any** api test whose request can fall through to a durable
+    /// read must go through this helper. A test that pre-populates
+    /// `state.jobs` and returns from the in-memory registry does not open the
+    /// store and is exempt.
     async fn get_retrying_on_busy(url: &str) -> reqwest::Response {
         for _ in 0..40 {
             let resp = reqwest::get(url).await.unwrap();
@@ -1480,16 +1529,17 @@ mod tests {
 
     #[tokio::test]
     async fn parity_runs_history_metrics_on_empty_state() {
-        // A hermetic, empty state store. Both the API and the CLI core resolve
-        // the same path via `resolve_state_path`, so they read identical bytes.
+        // A hermetic, empty state store. The API and the CLI core share ONE
+        // pinned path, so they read identical bytes without either side
+        // re-resolving.
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
-        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+        let state_path = pinned_state_path(&models_dir);
         // Create + init the (empty) store so open_read_only succeeds.
         drop(rocky_core::state::StateStore::open(&state_path).unwrap());
 
-        let state = ServerState::new(models_dir.clone(), None, None);
+        let state = pinned_server(models_dir.clone(), None, &state_path);
         let base = spawn_router(state).await;
 
         // /runs
@@ -1878,7 +1928,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
-        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+        let state_path = pinned_state_path(&models_dir);
 
         // A job that was "running" when the (previous) sidecar died.
         {
@@ -1889,16 +1939,23 @@ mod tests {
         }
 
         // The "restart": `serve` runs the sweep once, before the router serves.
+        // The server is built only AFTER the sweep — its spawned `recompile()`
+        // opens the same store, and a concurrent open would make this
+        // `unwrap()` a new flake.
         let swept = sweep_interrupted_jobs(&state_path).unwrap();
         assert_eq!(swept, 1);
 
         // A brand-new server (empty in-memory registry) reads the durable record.
-        let state = ServerState::new(models_dir, None, None);
+        let state = pinned_server(models_dir, None, &state_path);
         let base = spawn_router(state).await;
 
-        let resp = reqwest::get(format!("{base}/api/v1/jobs/job_inflight"))
-            .await
-            .unwrap();
+        // This GET misses the in-memory registry and falls through to a durable
+        // read, so it races the `recompile()` this server spawned — see
+        // `get_retrying_on_busy`. Its sibling
+        // `job_running_in_current_process_is_not_swept` upserts first, returns
+        // from the registry, and never opens the store, which is why only this
+        // one flaked.
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/jobs/job_inflight")).await;
         assert_eq!(resp.status(), 200);
         let body: JobStatus = resp.json().await.unwrap();
         assert_eq!(body.job_id, "job_inflight");
@@ -1913,6 +1970,66 @@ mod tests {
             "the sweep stamps the terminal timestamp"
         );
         assert!(body.result.is_none());
+    }
+
+    /// The mechanism behind the `job_interrupted_by_restart_is_swept_to_failed`
+    /// flake, pinned deterministically.
+    ///
+    /// redb's `Database::create` is a single-open guard and
+    /// `open_redb_with_retry` uses it for read-only opens too, while Rocky's
+    /// advisory lock is taken only for `OpenMode::ReadWrite`. So two opens in
+    /// **one process** contend, with no second process involved: a durable read
+    /// blocked that way must surface as the retryable `503 engine_busy`, never
+    /// as a hard failure. Under full-suite load the server's spawned
+    /// `recompile()` plays the role the explicit `held` store plays here.
+    #[tokio::test]
+    async fn state_backed_read_under_held_store_is_retryable_503() {
+        use rocky_core::state::StateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = models_dir.join(".rocky-state.redb");
+
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_job(&persisted_job("job_held", "succeeded"))
+                .unwrap();
+        }
+
+        // Acquire BEFORE the server exists: nothing else holds the store yet,
+        // so this acquisition cannot itself lose the race.
+        let held = StateStore::open(&state_path).unwrap();
+
+        let state = ServerState::with_auth(
+            models_dir,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some(state_path.clone()),
+        );
+        let base = spawn_router(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/jobs/job_held"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            503,
+            "a durable read blocked by an in-process open must be retryable"
+        );
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "engine_busy");
+
+        drop(held);
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/jobs/job_held")).await;
+        assert_eq!(
+            resp.status(),
+            200,
+            "the same read must succeed once the contender releases"
+        );
     }
 
     /// The sweep reconciles ONLY non-terminal records: `running` and `queued`
@@ -1983,13 +2100,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
-        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+        let state_path = pinned_state_path(&models_dir);
 
         // Startup: nothing persisted yet, nothing to sweep.
         assert_eq!(sweep_interrupted_jobs(&state_path).unwrap(), 0);
 
         // A live submission in THIS process, after the sweep.
-        let state = ServerState::new(models_dir, None, None);
+        let state = pinned_server(models_dir, None, &state_path);
         let record = persisted_job("job_live", "running");
         state.jobs.upsert(record.clone()).await;
         StateStore::open(&state_path)
@@ -2038,9 +2155,9 @@ mod tests {
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
         // An initialized (empty) state store so the state-backed reads answer.
-        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+        let state_path = pinned_state_path(&models_dir);
         drop(rocky_core::state::StateStore::open(&state_path).unwrap());
-        let state = ServerState::new(models_dir, None, None);
+        let state = pinned_server(models_dir, None, &state_path);
         state.recompile().await;
         let base = spawn_router(state).await;
 

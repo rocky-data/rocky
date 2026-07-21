@@ -495,24 +495,50 @@ mod tests {
         assert_eq!(retain_runs_from_env(), DEFAULT_TRACE_RETAIN_RUNS);
     }
 
+    /// Serialise and *restore* around a cwd move.
+    ///
+    /// `JsonlMakeWriter::new` builds its path relative to [`TRACE_DIR`], so a
+    /// test wanting an isolated trace directory has to move the process cwd —
+    /// which is global to the whole test binary. Without the restore the cwd
+    /// keeps pointing into a `TempDir` after it drops, and every later
+    /// relative-path resolution in this binary (`read_trace` resolves
+    /// `TRACE_DIR` against the cwd) then runs against a deleted directory.
+    /// Modelled on `rocky-core`'s resolver-test helper, `catch_unwind` included
+    /// so a panicking body still restores.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_cwd<F: FnOnce() -> R, R>(dir: &std::path::Path, f: F) -> R {
+        let _guard = CWD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = std::env::current_dir().expect("current_dir");
+        std::env::set_current_dir(dir).expect("set_current_dir to temp");
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::env::set_current_dir(&prev).expect("restore cwd");
+        match out {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e),
+        }
+    }
+
     /// Lazy MakeWriter only creates the file once an actual write fires.
     #[test]
     fn makewriter_does_not_open_file_eagerly() {
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_current_dir(&tmp).unwrap();
-
-        let mw = JsonlMakeWriter::new(chrono::Utc::now());
-        // No file yet.
         let traces_dir = tmp.path().join(TRACE_DIR);
-        assert!(!traces_dir.exists());
 
-        // First write triggers the open.
-        {
+        with_cwd(tmp.path(), || {
+            let mw = JsonlMakeWriter::new(chrono::Utc::now());
+            // No file yet.
+            assert!(!traces_dir.exists());
+
+            // First write triggers the open.
             use tracing_subscriber::fmt::MakeWriter as _;
             let mut w = mw.make_writer();
             w.write_all(b"{\"hi\":1}\n").unwrap();
             w.flush().unwrap();
-        }
+        });
+
         assert!(traces_dir.exists(), "traces dir created on first write");
         let files: Vec<_> = std::fs::read_dir(&traces_dir).unwrap().flatten().collect();
         assert_eq!(files.len(), 1, "exactly one JSONL file written");
