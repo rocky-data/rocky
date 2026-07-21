@@ -13,7 +13,15 @@
 //! [`crate::compile::compile_project`]. It exists to answer one question — can
 //! grain be inferred and fan-out proven on the SQL the compiler already parses?
 //! — with executable evidence rather than prose. Scope, severity, and the
-//! acknowledgment mechanism are open design questions; see the spike notes.
+//! acknowledgment mechanism are open design questions.
+//!
+//! **Two limitations bound what this prototype demonstrates**, and both are
+//! pinned by tests below rather than left as prose: it produces a false
+//! positive when a grain column is pinned to a constant
+//! (`constant_pinned_grain_column_false_positives`), and it sees no joins at
+//! all inside a CTE (`join_inside_cte_is_invisible`). The second is the more
+//! consequential: CTE-wrapped joins are the dominant real-world shape, so
+//! useful coverage is gated on CTE-scope walking, which is not built here.
 //!
 //! # The rule
 //!
@@ -26,7 +34,9 @@
 //! # Quiet on unknown (deliberate)
 //!
 //! When a grain cannot be established, this module emits **nothing**. It reports
-//! only *provable* fan-out. This mirrors the convention already in
+//! only fan-out it can establish structurally — which is *not* the same as
+//! "only true fan-out": see the constant-pinned false-positive class above.
+//! This mirrors the convention already in
 //! `typecheck::check_join_keys`, which stays silent when either side's type is
 //! [`RockyType::Unknown`](crate::types) rather than warning on every
 //! unresolved pair. The alternative — "unknown grain ⇒ warn" — fires on nearly
@@ -549,6 +559,72 @@ mod tests {
             &grains(&[("customers", Grain::known(["customer_id", "valid_from"]))]),
         );
         assert!(diags.is_empty(), "unresolved keys must not warn");
+    }
+
+    // -- known limitations (pinned so they stay visible) --------------------
+
+    #[test]
+    fn constant_pinned_grain_column_false_positives() {
+        // KNOWN FALSE POSITIVE. `a.address_type = 'home'` pins the second grain
+        // column to a constant, so at most one `customer_addresses` row matches
+        // and there is no fan-out. But `collect_eq_pairs` records only
+        // qualified=qualified pairs, so the literal predicate is dropped and
+        // `address_type` looks unbound.
+        //
+        // This is an idiomatic "pick one variant" join, not an exotic shape, so
+        // it matters for the noise argument. The refinement is to also collect
+        // `col = <literal>` (in `ON` and in `WHERE`) and treat those grain
+        // columns as satisfied. Not built here — this test exists so the
+        // limitation is executable evidence rather than a footnote.
+        let sql = "SELECT o.id, a.city FROM orders o \
+                   JOIN customer_addresses a \
+                   ON o.customer_id = a.customer_id AND a.address_type = 'home'";
+        let diags = check_fanout(
+            "orders_enriched",
+            sql,
+            &grains(&[(
+                "customer_addresses",
+                Grain::known(["customer_id", "address_type"]),
+            )]),
+        );
+        assert_eq!(
+            diags.len(),
+            1,
+            "documents the current false positive; when literal predicates are \
+             honoured this should become 0 and the assertion should flip"
+        );
+    }
+
+    #[test]
+    fn join_inside_cte_is_invisible() {
+        // KNOWN BLIND SPOT, and the one that bounds real-world usefulness.
+        // `join_sites` walks only `query.body`'s top-level FROM, so a join
+        // living in `query.with` is not seen at all — no grain is consulted and
+        // no diagnostic can be produced, however clear the fan-out.
+        //
+        // CTE-wrapped joins are the dominant shape in real analytics models, so
+        // detection coverage is effectively zero until CTE-scope walking lands.
+        let sql = "WITH joined AS ( \
+                     SELECT o.id, a.city FROM orders o \
+                     JOIN customer_addresses a ON o.customer_id = a.customer_id \
+                   ) SELECT id, city FROM joined";
+        assert!(
+            join_sites(sql).is_empty(),
+            "top-level walk cannot see a join nested in a CTE"
+        );
+
+        let diags = check_fanout(
+            "orders_enriched",
+            sql,
+            &grains(&[(
+                "customer_addresses",
+                Grain::known(["customer_id", "address_type"]),
+            )]),
+        );
+        assert!(
+            diags.is_empty(),
+            "the same fan-out that fires when written flat is silent inside a CTE"
+        );
     }
 
     #[test]
