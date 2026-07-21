@@ -193,28 +193,53 @@ def gate_fires(run: dict) -> list[dict]:
             }
         ]
 
-    # Attribution guard BEFORE trusting the bucketing. Minute bucketing is valid
-    # only because catchup=latest coalescing needs a >60s tick-to-tick gap while
-    # this guard catches delays in [30,60)s. A >=60s delay would both misbucket a
-    # fire and coalesce the skipped occurrence — indistinguishable from a real
-    # miss. At playground speed (~100ms child, 15s poll) only host sleep can do
-    # that, and G0 catches host sleep.
+    # Proximity warning for the bucketing assumption — NOT a safety check.
+    #
+    # `floor_minute` truncates, so this skew is always in [0,60) and can never
+    # observe the failure it guards against directly. The actual failure is a
+    # fire delayed >=60s past its occurrence: it buckets into the NEXT minute,
+    # which surfaces as a duplicate there plus a miss where it belonged. What
+    # this measures is how close the run runs to that cliff.
+    #
+    # So it is graduated rather than absolute: one late fire in 1440 is noise
+    # and must not invalidate a 24h run, while a systematic drift toward the
+    # 60s boundary means G1/G2 verdicts can no longer be trusted.
     skewed = []
     for f in fires:
         started = parse_ts(f["started_at"])
         skew = (started - floor_minute(started)).total_seconds()
         if skew > 30:
             skewed.append({"run_id": f["run_id"], "started_at": f["started_at"], "skew_s": skew})
+
     if skewed:
-        return [
+        worst = max(s["skew_s"] for s in skewed)
+        rate = len(skewed) / len(fires)
+        run["metrics"]["skew"] = {
+            "late_fires": len(skewed),
+            "rate_pct": round(rate * 100, 2),
+            "max_skew_s": worst,
+        }
+        if rate > 0.01 or worst > 50:
+            return [
+                {
+                    "gate": "G1",
+                    "status": "INVALID",
+                    "detail": f"ATTRIBUTION_UNSAFE: {len(skewed)}/{len(fires)} fires "
+                    f"({rate * 100:.1f}%) land >30s past their minute, worst {worst:.0f}s. "
+                    "Fires approaching 60s late bucket into the following minute, which "
+                    "reads as a duplicate there and a miss where they belonged — so the "
+                    "missed/duplicate verdicts cannot be trusted.",
+                    "examples": skewed[:5],
+                }
+            ]
+        findings.append(
             {
                 "gate": "G1",
-                "status": "INVALID",
-                "detail": "ATTRIBUTION_UNSAFE: fires land >30s past their minute, "
-                "so minute bucketing cannot attribute them",
-                "examples": skewed[:5],
+                "status": "INFO",
+                "detail": f"{len(skewed)}/{len(fires)} fires landed >30s past their minute "
+                f"(worst {worst:.0f}s). Tolerated — attribution is still correct below 60s.",
             }
-        ]
+        )
 
     occurrences = [floor_minute(parse_ts(f["started_at"])) for f in fires]
 
@@ -679,6 +704,17 @@ def self_test() -> int:
     # cannot evaluate, and a green verdict there would claim evidence the run
     # does not contain.
     check("run shorter than warmup is INVALID", analyse(synth(5))["verdict"], "INVALID")
+
+    # One late fire in a long run is noise and must not throw away 24h of data;
+    # a systematic drift toward the 60s misattribution cliff must.
+    one_late = synth(180)
+    one_late["fires"][20]["started_at"] = one_late["fires"][20]["started_at"].replace(":03Z", ":35Z")
+    check("a single late fire is tolerated", analyse(one_late)["verdict"], "PASS")
+
+    many_late = synth(180)
+    for f in many_late["fires"][::10]:
+        f["started_at"] = f["started_at"].replace(":03Z", ":35Z")
+    check("systematic lateness is INVALID", analyse(many_late)["verdict"], "INVALID")
 
     for line in failures:
         print(f"  SELF-TEST FAIL: {line}")
