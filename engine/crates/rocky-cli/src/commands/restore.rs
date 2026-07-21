@@ -1659,9 +1659,10 @@ mod tests {
         /// from the recorded recipe". They are not — restore covers only the
         /// zero-upstream, non-partitioned case. The tombstone is durable and
         /// records the full recipe, so nothing is destroyed, but the recovery
-        /// route a user is pointed at does not work for these artifacts; they
-        /// must re-run the pipeline instead. This PR corrects the misleading
-        /// text; it does not close the gap.
+        /// route a user is pointed at does not work for these artifacts, and
+        /// re-running the pipeline is not a substitute: it recomputes from
+        /// current upstreams, which need not reproduce the evicted bytes.
+        /// This PR corrects the misleading text; it does not close the gap.
         ///
         /// **Expected to be inverted when fixed.** Two mutually exclusive
         /// fixes are possible — narrow gc's eligibility predicate to reject

@@ -970,7 +970,7 @@ export interface ProjectFreshnessConfig {
  *
  * Eviction is **ledger-only**: an approved apply writes the durable tombstone and retires the artifact's ledger row (the eviction of record, retaining the full recorded recipe). Physical byte-deletion is not performed — reclaiming bytes safely requires a protocol-aware VACUUM (retention windows + TOCTOU-safe deletion), which is future work.
  *
- * `rocky restore` rebuilds an evicted artifact from its tombstone when the recorded recipe is non-partitioned, content-addressed, and reads no recorded upstreams. A recipe with ANY recorded upstream is refused by restore today (multi-input DAG re-derivation is a later phase) and is recovered by re-running its pipeline.
+ * `rocky restore` rebuilds an evicted artifact from its tombstone when the recorded recipe is non-partitioned, content-addressed, and reads no recorded upstreams. A recipe with ANY recorded upstream cannot be restored today (multi-input DAG re-derivation is a later phase). Re-running the pipeline is not an equivalent: it recomputes the model from *current* upstreams and need not reproduce the evicted bytes, so if those upstreams have moved on the exact bytes are unrecoverable until multi-input restore lands. What the tombstone durably retains is the recipe and the eviction record, not a guarantee that the exact bytes remain recoverable.
  */
 export interface GcConfig {
   /**

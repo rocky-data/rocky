@@ -56,9 +56,13 @@
 //! yet implemented. The eviction checks below admit multi-input recipes (a
 //! `strong` closure over several content-hashed upstreams still passes
 //! [`check_recipe_recorded`]), so gc can evict artifacts restore cannot yet
-//! rebuild. The tombstone is still durable and still records the full recipe —
-//! nothing is lost — but recovery of a multi-input artifact currently means
-//! re-running its pipeline, not `rocky restore`.
+//! rebuild. The tombstone is still durable and still records the full recipe,
+//! but for a multi-input artifact that recipe has no route back to the evicted
+//! bytes today. Re-running the pipeline is not that route: it recomputes from
+//! *current* upstreams, and a recipe is only bit-reproducible against the
+//! inputs it recorded — if any upstream has moved on the re-run yields
+//! different bytes, a new artifact at the same logical path. Until multi-input
+//! restore lands, those exact bytes may be unrecoverable.
 //!
 //! # Reachability
 //!
@@ -750,10 +754,11 @@ fn gc_plan_notes() -> Vec<String> {
             .to_string(),
         "Every eviction writes a durable tombstone (recipe triple + restore pointer) BEFORE \
          the ledger row is retired. `rocky restore` rebuilds non-partitioned recipes that read \
-         no recorded upstreams from that tombstone; a recipe with ANY recorded upstream is \
-         refused by restore \
-         today (multi-input DAG re-derivation is a later phase) and must be recovered by \
-         re-running its pipeline."
+         no recorded upstreams from that tombstone; a recipe with ANY recorded upstream CANNOT \
+         be restored today (multi-input DAG re-derivation is a later phase). Re-running the \
+         pipeline is not an equivalent — it recomputes from current upstreams and need not \
+         reproduce the evicted bytes. The tombstone retains the recipe and the eviction record, \
+         not a guarantee that these exact bytes stay recoverable."
             .to_string(),
         "Deletion is symmetric-caution gated: review with `rocky review <plan-id> --approve`, \
          then `rocky apply <plan-id>`. There is no direct-delete path."
@@ -1058,8 +1063,9 @@ fn gc_apply_notes() -> Vec<String> {
          before any write becomes visible. KNOWN LIMITATION: restore covers non-partitioned, \
          content-addressed recipes that read no recorded upstreams — it refuses a recipe with ANY \
          recorded upstream rather than substituting current data, so a multi-input artifact \
-         evicted here \
-         is recovered by re-running its pipeline, not by `rocky restore`."
+         evicted here cannot be restored today. Re-running its pipeline recomputes the model from \
+         current upstreams and need not reproduce the evicted bytes; if those upstreams have \
+         moved on, the exact bytes are unrecoverable until multi-input restore lands."
             .to_string(),
         "KNOWN LIMITATION: the liveness gate is a conservative-best-effort reader of the Delta \
          log, not a full Delta-protocol implementation. It HOLDs on any log shape it cannot \
@@ -1630,8 +1636,9 @@ pub(crate) async fn run_gc_apply_in_with(
              windows + TOCTOU-safe deletion), which is not yet implemented. Unset `[gc] \
              physical_delete` — the durable tombstone + retired ledger row is the eviction of \
              record, and it retains the full recorded recipe (`rocky restore` rebuilds recipes \
-             that read no recorded upstreams from it; a multi-input recipe is recovered by \
-             re-running its pipeline)."
+             that read no recorded upstreams from it; a recipe with ANY recorded upstream cannot \
+             be restored today, and re-running its pipeline recomputes from current upstreams \
+             rather than reproducing the evicted bytes)."
         );
     }
 
