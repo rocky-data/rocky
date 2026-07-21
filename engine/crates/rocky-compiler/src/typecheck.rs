@@ -18,8 +18,8 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, I001, I002, SourceSpan, W001,
-    W002, W003, W004, W005,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E036, I001, I002, SourceSpan,
+    W001, W002, W003, W004, W005,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -513,13 +513,19 @@ fn compute_model_typecheck(
     diagnostics.extend(enhanced_diags);
 
     // Step 3: SELECT * warning
-    if model_schema.has_star {
-        let has_unknown_upstream = model_schema
+    //
+    // This also gates the merge-key existence check in step 5: when a
+    // `SELECT *` expands from an upstream we have no schema for, `typed_cols`
+    // is not the model's real output column set, so any "column is missing"
+    // conclusion drawn from it would be wrong.
+    let schema_incomplete = model_schema.has_star
+        && model_schema
             .upstream
             .iter()
             .any(|up| typed_models.get(up).is_none_or(std::vec::Vec::is_empty));
 
-        if has_unknown_upstream {
+    if model_schema.has_star {
+        if schema_incomplete {
             diagnostics.push(Diagnostic::warning(
                 W002,
                 model_name,
@@ -542,12 +548,15 @@ fn compute_model_typecheck(
     }
     diagnostics.extend(join_diags);
 
-    // Step 5: time_interval strategy validation. For models declaring
-    // `[strategy] type = "time_interval"` we need to confirm the partition
+    // Step 5: strategy validation against the typed output schema. For models
+    // declaring `[strategy] type = "time_interval"` we confirm the partition
     // column is real, has the right type, isn't nullable, etc. — see
     // `check_time_interval_strategy` for the full list of E020-E026 + W003.
+    // For `type = "merge"` we confirm every `unique_key` column is real — see
+    // `check_merge_strategy` (E036).
     if let Some(model) = model_by_name.get(model_name) {
         diagnostics.extend(check_time_interval_strategy(model, &typed_cols));
+        diagnostics.extend(check_merge_strategy(model, &typed_cols, !schema_incomplete));
     }
 
     // Step 6: Enrich diagnostics with the model's file path as a SourceSpan
@@ -726,6 +735,67 @@ fn check_time_interval_strategy(
     }
 
     diagnostics
+}
+
+/// Validate a model's `merge` strategy against its typed output schema.
+///
+/// Returns diagnostics for any of the following violations (no diagnostic if
+/// the model isn't using `merge`):
+///
+/// | Code  | Severity | Meaning |
+/// |-------|----------|---------|
+/// | E036  | Error    | `unique_key` column not in the model's output schema |
+///
+/// This is the merge-key counterpart to [`check_time_interval_strategy`]'s
+/// E020: a `unique_key` naming a column the model doesn't produce is a typo
+/// that would otherwise only surface when the warehouse rejects the generated
+/// `MERGE ... ON` clause.
+///
+/// `schema_known` is false when the model's output columns can't be fully
+/// enumerated (a `SELECT *` over an upstream with no known schema). The check
+/// is skipped in that case: `typed_cols` doesn't describe the real output, so
+/// every key would look missing. This mirrors the `type_known` guard the
+/// time_interval checks use before drawing type conclusions.
+fn check_merge_strategy(
+    model: &rocky_core::models::Model,
+    typed_cols: &[crate::types::TypedColumn],
+    schema_known: bool,
+) -> Vec<Diagnostic> {
+    use rocky_core::models::StrategyConfig;
+
+    let model_name = model.config.name.as_str();
+
+    let StrategyConfig::Merge { unique_key, .. } = &model.config.strategy else {
+        // Not a merge model — nothing to check.
+        return Vec::new();
+    };
+
+    // Can't enumerate the model's real output columns, so an existence check
+    // would be guesswork. Stay quiet rather than emit a false positive.
+    if !schema_known {
+        return Vec::new();
+    }
+
+    // E036: every unique_key entry must exist in the typed output schema.
+    unique_key
+        .iter()
+        .filter(|key| !typed_cols.iter().any(|c| c.name == **key))
+        .map(|key| {
+            Diagnostic::error(
+                E036,
+                model_name,
+                format!("unique_key '{key}' is not in the output schema of model '{model_name}'"),
+            )
+            .with_suggestion(format!(
+                "Available columns: {}",
+                typed_cols
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+        .collect()
 }
 
 /// E024 / W003 — both `@start_date` and `@end_date` placeholders should appear
@@ -3337,6 +3407,101 @@ mod tests {
         // Should fire E024 (neither placeholder present, since @start_date_extra
         // doesn't count) — not W003.
         assert!(diags.iter().any(|d| &*d.code == "E024"));
+    }
+
+    // ----- E036: merge unique_key existence -----
+
+    /// Build a `merge`-strategy model with the given `unique_key`. Mirrors
+    /// `make_time_interval_model` but swaps the strategy so the merge checks
+    /// have something to bite on.
+    fn make_merge_model(name: &str, unique_key: &[&str]) -> Model {
+        let mut m = make_time_interval_model(name, "order_date", TimeGrain::Day, None);
+        m.config.strategy = StrategyConfig::Merge {
+            unique_key: unique_key.iter().map(|k| (*k).to_string()).collect(),
+            update_columns: None,
+        };
+        m
+    }
+
+    #[test]
+    fn test_merge_clean_model_no_diags() {
+        let model = make_merge_model("m", &["customer_id"]);
+        let cols = vec![
+            typed_col("customer_id", RockyType::String, false),
+            typed_col("order_date", RockyType::Date, false),
+        ];
+        let diags = check_merge_strategy(&model, &cols, true);
+        assert!(
+            diags.is_empty(),
+            "expected no diagnostics for clean merge model, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_merge_non_merge_strategy_no_diags() {
+        // A FullRefresh model should produce zero diagnostics from the merge
+        // pass, even though it has no matching columns at all.
+        let mut model = make_merge_model("m", &["customer_id"]);
+        model.config.strategy = StrategyConfig::FullRefresh;
+        let diags = check_merge_strategy(&model, &[], true);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn test_e036_missing_unique_key() {
+        // `custommer_id` is a typo — the real column is `customer_id`.
+        let model = make_merge_model("m", &["custommer_id"]);
+        let cols = vec![typed_col("customer_id", RockyType::String, false)];
+        let diags = check_merge_strategy(&model, &cols, true);
+        assert!(diags.iter().any(|d| &*d.code == "E036"));
+    }
+
+    #[test]
+    fn test_e036_reports_every_missing_key() {
+        // A composite key with two typos should report both, not just the
+        // first — one diagnostic per missing key.
+        let model = make_merge_model("m", &["tenant_id", "custommer_id", "ordr_id"]);
+        let cols = vec![
+            typed_col("tenant_id", RockyType::String, false),
+            typed_col("customer_id", RockyType::String, false),
+            typed_col("order_id", RockyType::String, false),
+        ];
+        let diags = check_merge_strategy(&model, &cols, true);
+        let e036: Vec<_> = diags.iter().filter(|d| &*d.code == "E036").collect();
+        assert_eq!(e036.len(), 2, "expected both bad keys reported: {diags:?}");
+        assert!(e036.iter().any(|d| d.message.contains("custommer_id")));
+        assert!(e036.iter().any(|d| d.message.contains("ordr_id")));
+        // The valid key must not be reported.
+        assert!(!e036.iter().any(|d| d.message.contains("tenant_id")));
+    }
+
+    #[test]
+    fn test_e036_skipped_when_schema_unknown() {
+        // `SELECT *` over an unknown upstream: typed_cols isn't the model's
+        // real output, so we must stay quiet rather than flag every key.
+        let model = make_merge_model("m", &["customer_id"]);
+        let diags = check_merge_strategy(&model, &[], false);
+        assert!(
+            diags.is_empty(),
+            "must not fire when the output schema is incomplete, got: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_e036_suggestion_lists_available_columns() {
+        let model = make_merge_model("m", &["nope"]);
+        let cols = vec![
+            typed_col("customer_id", RockyType::String, false),
+            typed_col("order_date", RockyType::Date, false),
+        ];
+        let diags = check_merge_strategy(&model, &cols, true);
+        let d = diags
+            .iter()
+            .find(|d| &*d.code == "E036")
+            .expect("expected E036");
+        let suggestion = d.suggestion.as_deref().expect("expected a suggestion");
+        assert!(suggestion.contains("customer_id"));
+        assert!(suggestion.contains("order_date"));
     }
 
     // ----- W004: classification-tag completeness -----

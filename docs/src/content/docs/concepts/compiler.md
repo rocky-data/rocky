@@ -193,6 +193,7 @@ The compiler produces structured diagnostics with codes, severity levels, source
 | `E033` | Imported snapshot's recipe hash does not match the configured `pin` |
 | `E034` | Imported snapshot declares a format version newer than this build of rocky can read |
 | `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
+| `E036` | `merge` strategy declares a `unique_key` column the model does not output |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W003` | `time_column` is TIMESTAMP where DATE is preferred for the granularity |

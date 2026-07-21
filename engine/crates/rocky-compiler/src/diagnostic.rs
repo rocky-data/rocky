@@ -33,19 +33,22 @@ pub const E012: &str = "E012";
 pub const E013: &str = "E013";
 
 // Errors — time_interval validation
-/// Missing `@start_date` placeholder.
-pub const E020: &str = "E020";
-/// Missing `@end_date` placeholder.
-pub const E021: &str = "E021";
+//
+// The authoritative description of each code lives on
+// `rocky_compiler::typecheck::check_time_interval_strategy`, which emits them.
 /// `time_column` not in model output schema.
-pub const E022: &str = "E022";
-/// `time_column` has incompatible type for granularity.
-pub const E023: &str = "E023";
+pub const E020: &str = "E020";
+/// `time_column` is not a date/timestamp type.
+pub const E021: &str = "E021";
 /// `time_column` is nullable (must be NOT NULL).
+pub const E022: &str = "E022";
+/// `time_column` failed SQL identifier validation.
+pub const E023: &str = "E023";
+/// Neither `@start_date` nor `@end_date` referenced in the model SQL.
 pub const E024: &str = "E024";
-/// Placeholder used but strategy is not `time_interval`.
+/// `granularity = "hour"` requires a TIMESTAMP column, not DATE.
 pub const E025: &str = "E025";
-/// Duplicate `@start_date`/`@end_date` placeholder.
+/// `first_partition` is not a valid canonical key for the granularity.
 pub const E026: &str = "E026";
 /// Budget exceeded — projected spend exceeds the declared per-model cost ceiling.
 ///
@@ -130,6 +133,21 @@ pub const E034: &str = "E034";
 /// [`rocky_ir::lakehouse::validate_managed_iceberg_options`], so the two checks
 /// can never drift. (FR-044)
 pub const E035: &str = "E035";
+
+/// `merge` strategy declares a `unique_key` column the model does not output.
+///
+/// Emitted by `rocky compile` when a model sets `[strategy] type = "merge"`
+/// and one of its `unique_key` entries does not name a column in the model's
+/// typed output schema. This is the merge-key sibling of [`E020`] (the same
+/// existence check for `time_column`): without it a typo'd merge key compiles
+/// clean and only fails once the warehouse rejects the generated `MERGE ... ON`
+/// clause, so the mistake surfaces mid-run rather than at compile time.
+///
+/// Skipped when the model's output columns cannot be fully enumerated — a
+/// `SELECT *` over an upstream with no known schema — so a model whose shape
+/// the compiler can't infer never trips the check. One diagnostic is emitted
+/// per missing key, so a multi-column `unique_key` reports every typo at once.
+pub const E036: &str = "E036";
 
 // Warnings
 /// Unused model (no downstream consumers).

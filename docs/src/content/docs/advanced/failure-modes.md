@@ -39,8 +39,9 @@ The categories are **independent**: a single pipeline can hit several at once, a
 | `E020`–`E026` | `time_interval` model misconfiguration (placeholders, granularity, nullability) |
 | `E027` | Model's projected cost exceeds its `[budget]` ceiling |
 | `E028` | Unresolved `@var` reference |
+| `E036` | `merge` model's `unique_key` names a column it does not output |
 
-(Non-exhaustive: the compiler also emits `E010`–`E013` — see below — and `E030`–`E035`.)
+(Non-exhaustive: the compiler also emits `E010`–`E013` — see below — and `E030`–`E036`.)
 
 (See [Contract violations](#2-contract-violations) for `E010`–`E013`; they are formally compile-time but get their own section because the recovery is contract-shaped, not type-system-shaped.)
 
