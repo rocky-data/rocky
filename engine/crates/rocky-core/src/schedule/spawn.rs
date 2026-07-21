@@ -11,10 +11,70 @@
 //! termination). Keeping the wait here is what keeps the core deterministic.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tokio::sync::Notify;
+
+/// The default grace given to a running child to exit on its own after a drain
+/// is raised, before it is terminated. Matches the plan's `drain_timeout`
+/// default; the serve loop overrides it via [`SubprocessSpawner::with_drain`].
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A one-way drain signal shared between the serve scheduler loop, `tick_once`,
+/// and the [`SubprocessSpawner`].
+///
+/// `signal()` is raised once, on server shutdown: `tick_once` stops evaluating
+/// further demands (it checks [`Drain::is_signalled`] between pipelines) and the
+/// spawner bounds its running child's wait by the drain timeout before a
+/// graceful-then-forced termination. Cloneable (an `Arc` inside) so the loop,
+/// the [`crate::schedule::TickOptions`], and the spawner all share one signal.
+///
+/// The default is a drain that is never signalled — the CLI `rocky tick` path
+/// and every test that omits it behave exactly as before.
+#[derive(Clone, Debug, Default)]
+pub struct Drain(Arc<DrainInner>);
+
+#[derive(Debug, Default)]
+struct DrainInner {
+    signalled: AtomicBool,
+    notify: Notify,
+}
+
+impl Drain {
+    /// A fresh, un-raised drain.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Raise the drain. Idempotent; wakes every current and future waiter.
+    pub fn signal(&self) {
+        self.0.signalled.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
+    }
+
+    /// Whether the drain has been raised.
+    pub fn is_signalled(&self) -> bool {
+        self.0.signalled.load(Ordering::Acquire)
+    }
+
+    /// Resolve once the drain is raised (immediately if already raised).
+    ///
+    /// Interest is registered on the notifier *before* the flag is re-checked,
+    /// so a `signal()` that lands between the check and the await still wakes the
+    /// waiter — no lost-wakeup window.
+    pub async fn signalled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            if self.is_signalled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 /// A request to run one pipeline as a child process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,12 +126,31 @@ const KILL_GRACE: Duration = Duration::from_secs(60);
 /// and `ROCKY_SUBMISSION_ID`, honoring the scheduler-level timeout with a
 /// graceful-then-forced termination.
 #[derive(Debug, Default)]
-pub struct SubprocessSpawner;
+pub struct SubprocessSpawner {
+    /// The drain signal. Default (the CLI `rocky tick` path) is never raised, so
+    /// the drain arm of [`Self::run`] never fires. The serve loop constructs the
+    /// spawner via [`Self::with_drain`] and raises this on shutdown.
+    drain: Drain,
+    /// Grace for the running child to exit on its own after a drain, before a
+    /// graceful-then-forced termination. `None` (the default) disables the drain
+    /// arm entirely; `with_drain` sets it.
+    drain_timeout: Option<Duration>,
+}
 
 impl SubprocessSpawner {
-    /// Construct the subprocess spawner.
+    /// Construct the subprocess spawner (no drain — the CLI one-shot path).
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// A spawner whose running child is drained on `drain`: on shutdown the
+    /// child is given `drain_timeout` to exit on its own, then terminated
+    /// gracefully (SIGTERM), then forcibly after the kill grace.
+    pub fn with_drain(drain: Drain, drain_timeout: Duration) -> Self {
+        Self {
+            drain,
+            drain_timeout: Some(drain_timeout),
+        }
     }
 
     fn build_command(request: &SpawnRequest) -> tokio::process::Command {
@@ -107,6 +186,23 @@ impl SubprocessSpawner {
 #[async_trait]
 impl Spawner for SubprocessSpawner {
     async fn run(&self, request: &SpawnRequest) -> RunOutcome {
+        // Never start new work once the drain is raised. The reconciler already
+        // checks the drain between pipelines and suppresses further retries while
+        // draining, but both read it *before* reaching here — a shutdown landing
+        // in that window would otherwise spawn a child after shutdown was
+        // requested and then hand it the drain grace to do warehouse writes in.
+        // Gating here makes "no new child after the drain" hold by construction
+        // rather than by timing. Reported as a failure with no pid, exactly like
+        // a spawn that could not start; with the drain raised the reconciler
+        // finalizes it instead of retrying. Only the serve path arms the drain
+        // (`drain_timeout` is `None` on the CLI one-shot), so `rocky tick` is
+        // byte-unchanged.
+        if self.drain_timeout.is_some() && self.drain.is_signalled() {
+            return RunOutcome {
+                exit_code: 1,
+                pid: None,
+            };
+        }
         let mut cmd = Self::build_command(request);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -119,19 +215,48 @@ impl Spawner for SubprocessSpawner {
             }
         };
         let pid = child.id();
+        // When the child started, so a drain landing late in the child's own
+        // scheduler timeout doesn't reset that budget to the (usually longer)
+        // drain grace (see the `Interrupt::Drain` arm).
+        let started = std::time::Instant::now();
 
-        let status = match request.timeout {
-            None => child.wait().await,
-            Some(timeout) => match tokio::time::timeout(timeout, child.wait()).await {
-                Ok(status) => status,
-                Err(_) => {
-                    // Timed out: SIGTERM (graceful), then SIGKILL after the grace.
+        // Race the child's natural completion against two interrupts: the
+        // scheduler-level timeout and (serve mode only) the drain. The interrupt
+        // future never touches `child`, so when it wins, `select!` drops the
+        // `child.wait()` arm and the handler is free to re-borrow `child`.
+        let drains = self.drain_timeout.is_some();
+        let interrupt = async {
+            tokio::select! {
+                () = sleep_opt(request.timeout) => Interrupt::Timeout,
+                () = self.drain.signalled(), if drains => Interrupt::Drain,
+            }
+        };
+        tokio::pin!(interrupt);
+
+        let status = tokio::select! {
+            status = child.wait() => status,
+            kind = &mut interrupt => match kind {
+                // Timed out: SIGTERM (graceful), then SIGKILL after the grace.
+                Interrupt::Timeout => {
                     terminate_gracefully(&mut child, pid);
-                    match tokio::time::timeout(KILL_GRACE, child.wait()).await {
+                    wait_with_grace(&mut child).await
+                }
+                // Drain (server shutdown): give the child the drain grace to exit
+                // on its own, then the same graceful-then-forced termination. The
+                // grace never *extends* the child's own scheduler timeout: a child
+                // already near its `timeout` gets only the time it had left, so
+                // draining can shorten but never lengthen a run's bounded lifetime.
+                Interrupt::Drain => {
+                    let drain_grace = self.drain_timeout.unwrap_or(DEFAULT_DRAIN_TIMEOUT);
+                    let grace = match request.timeout {
+                        Some(t) => t.saturating_sub(started.elapsed()).min(drain_grace),
+                        None => drain_grace,
+                    };
+                    match tokio::time::timeout(grace, child.wait()).await {
                         Ok(status) => status,
                         Err(_) => {
-                            let _ = child.start_kill();
-                            child.wait().await
+                            terminate_gracefully(&mut child, pid);
+                            wait_with_grace(&mut child).await
                         }
                     }
                 }
@@ -143,6 +268,37 @@ impl Spawner for SubprocessSpawner {
             Err(_) => 1,
         };
         RunOutcome { exit_code, pid }
+    }
+}
+
+/// Which interrupt ended a child's wait early.
+enum Interrupt {
+    /// The scheduler-level `timeout_minutes` elapsed.
+    Timeout,
+    /// The server is draining for shutdown.
+    Drain,
+}
+
+/// A future that sleeps for `d` when `Some`, or pends forever when `None` (no
+/// scheduler timeout configured), so it can sit unarmed in a `select!`.
+async fn sleep_opt(d: Option<Duration>) {
+    match d {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Wait for a child that has already been sent a graceful signal, forcing a
+/// kill if it outlasts [`KILL_GRACE`].
+async fn wait_with_grace(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    match tokio::time::timeout(KILL_GRACE, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            let _ = child.start_kill();
+            child.wait().await
+        }
     }
 }
 
@@ -259,6 +415,34 @@ impl Spawner for CapturingSpawner {
 mod tests {
     use super::*;
 
+    /// A drain raised BEFORE the spawner runs must not start a child at all.
+    /// The reconciler checks the drain before it gets here, so a shutdown landing
+    /// in between would otherwise launch a child after shutdown was requested and
+    /// then grant it the drain grace to write in. `pid: None` is the proof: this
+    /// spawner would otherwise spawn `current_exe` successfully and report a pid.
+    #[tokio::test]
+    async fn a_raised_drain_starts_no_child() {
+        let drain = Drain::new();
+        drain.signal();
+        let spawner = SubprocessSpawner::with_drain(drain, Duration::from_secs(60));
+        let request = SpawnRequest {
+            pipeline: "raw".to_string(),
+            config_path: PathBuf::from("/proj/rocky.toml"),
+            state_path: PathBuf::from("/proj/models/.rocky-state.redb"),
+            submission_id: "sub-1".to_string(),
+            traceparent: None,
+            timeout: None,
+        };
+
+        let outcome = spawner.run(&request).await;
+
+        assert_eq!(outcome.pid, None, "no child may be spawned once drained");
+        assert_eq!(
+            outcome.exit_code, 1,
+            "reported as a failure, so the tick finalizes it"
+        );
+    }
+
     /// `--state-path` is a top-level (non-global) `rocky` arg, so it MUST appear
     /// before the `run` subcommand token, while `--pipeline` is a `run` arg and
     /// must appear after it. If this ordering regresses, the child silently opens
@@ -300,5 +484,36 @@ mod tests {
             "--state-path value must follow the flag: {args:?}"
         );
         assert!(pipe_pos > run_pos, "--pipeline must follow `run`: {args:?}");
+    }
+
+    #[test]
+    fn drain_default_is_never_signalled() {
+        assert!(!Drain::default().is_signalled());
+    }
+
+    #[tokio::test]
+    async fn drain_signal_is_observed_and_wakes_waiters() {
+        let drain = Drain::new();
+        assert!(!drain.is_signalled());
+
+        // A waiter registered before the signal must resolve once it fires.
+        let waiter = {
+            let drain = drain.clone();
+            tokio::spawn(async move { drain.signalled().await })
+        };
+        // Give the waiter a chance to park, then raise the drain.
+        tokio::task::yield_now().await;
+        drain.signal();
+        assert!(drain.is_signalled());
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("a pre-registered waiter wakes on signal")
+            .unwrap();
+
+        // A waiter registered AFTER the signal resolves immediately (no lost
+        // wakeup — the flag is checked before awaiting).
+        tokio::time::timeout(Duration::from_secs(1), drain.signalled())
+            .await
+            .expect("an already-signalled drain resolves immediately");
     }
 }

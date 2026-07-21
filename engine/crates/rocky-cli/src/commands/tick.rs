@@ -25,7 +25,7 @@ use chrono::{DateTime, Utc};
 use rocky_core::config::{RockyConfig, TransformationPipelineConfig, load_rocky_config};
 use rocky_core::schedule::demand::{SkipReason, SourceSkip};
 use rocky_core::schedule::{
-    DemandKind, SubprocessSpawner, TerminalOutcome, TickOptions, TickReport, TickSkipReason,
+    DemandKind, Drain, SubprocessSpawner, TerminalOutcome, TickOptions, TickReport, TickSkipReason,
     tick_once,
 };
 
@@ -122,9 +122,13 @@ pub async fn run_tick(
         traceparent: None,
         member_budgets,
         state_path: state_path.clone(),
+        // `rocky tick` is one-shot: there is no resident loop to drain, so the
+        // reconciler evaluates every scheduled pipeline. Serve mode supplies a
+        // real drain (see `commands::scheduler`).
+        drain: Drain::default(),
     };
 
-    let spawner = SubprocessSpawner;
+    let spawner = SubprocessSpawner::new();
     let start = Instant::now();
     // Any TickError (state fault, lock I/O fault, `after` cycle) is an infra
     // error ⇒ exit 1 with nothing run. Lock contention with a live `rocky run`
@@ -171,7 +175,7 @@ pub async fn run_tick(
 /// models cannot be loaded (missing dir, read fault) is simply omitted, so it
 /// falls back to the project default rather than aborting the tick; the
 /// `V043`-class validation warning is the pre-tick signal for that gap.
-fn build_member_budgets(
+pub(crate) fn build_member_budgets(
     config: &RockyConfig,
     config_path: &Path,
     filter: Option<&str>,
@@ -581,6 +585,7 @@ cron = "0 3 * * *"
             skipped_whole_tick: false,
             lock_overridden: false,
             state_busy: false,
+            drained: false,
         };
 
         let out = build_tick_output(&report, ts("2026-05-02T03:05:00Z"), false, 42);

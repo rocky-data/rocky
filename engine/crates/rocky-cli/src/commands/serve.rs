@@ -19,6 +19,11 @@ use std::path::Path;
 use anyhow::Result;
 
 /// Execute `rocky serve`.
+///
+/// When `scheduler` is set, a resident reconciler loop runs alongside the HTTP
+/// server (see [`crate::commands::scheduler`]): both share one shutdown signal,
+/// so a SIGTERM/ctrl-c gracefully drains in-flight HTTP requests AND a running
+/// scheduled child before the process exits.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
     models_dir: &Path,
@@ -29,6 +34,10 @@ pub async fn run_serve(
     watch: bool,
     auth_token: Option<String>,
     allowed_origins: Vec<String>,
+    scheduler: bool,
+    poll_interval_seconds: Option<u64>,
+    drain_timeout_seconds: Option<u64>,
+    state_path: Option<&Path>,
 ) -> Result<()> {
     // Token resolution: --token takes precedence over the env var so
     // CI / scripts can override an inherited environment.
@@ -40,6 +49,7 @@ pub async fn run_serve(
         config_path.map(std::path::Path::to_path_buf),
         token,
         allowed_origins,
+        state_path.map(std::path::Path::to_path_buf),
     );
 
     // Start filesystem watcher if requested
@@ -55,5 +65,90 @@ pub async fn run_serve(
     // Wait for initial compilation
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    crate::api::serve(state, crate::api::ServeConfig { host, port }).await
+    // One shutdown/drain signal shared by the HTTP server and the scheduler loop.
+    // SIGTERM/ctrl-c raises it; axum drains connections and the reconciler drains
+    // its in-flight child before either returns.
+    let shutdown = rocky_core::schedule::Drain::new();
+    // A readiness latch the server raises once its startup job sweep is done and
+    // the listener is bound; the scheduler awaits it before its first tick so a
+    // scheduled run never precedes (or outlives a failed) server startup.
+    let server_ready = rocky_core::schedule::Drain::new();
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            wait_for_shutdown().await;
+            tracing::info!("shutdown signal received; draining");
+            shutdown.signal();
+        });
+    }
+
+    // Spawn the resident reconciler alongside the server, if requested.
+    let scheduler_task = if scheduler {
+        let sched_cfg = crate::commands::scheduler::SchedulerConfig {
+            poll_interval: poll_interval_seconds
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(crate::commands::scheduler::DEFAULT_POLL_INTERVAL),
+            drain_timeout: drain_timeout_seconds
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(crate::commands::scheduler::DEFAULT_DRAIN_TIMEOUT),
+        };
+        // Read schedules from the config file the server bound (falls back to the
+        // conventional `rocky.toml`); a missing/invalid file just idles the loop.
+        let resolved_config = config_path
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("rocky.toml"));
+        Some(crate::commands::scheduler::spawn_scheduler(
+            state.clone(),
+            resolved_config,
+            sched_cfg,
+            shutdown.clone(),
+            server_ready.clone(),
+        ))
+    } else {
+        None
+    };
+
+    let result = crate::api::serve(
+        state,
+        crate::api::ServeConfig { host, port },
+        shutdown.clone(),
+        server_ready,
+    )
+    .await;
+
+    // The server has stopped (graceful shutdown, or a bind/runtime error). Ensure
+    // the drain is raised so the scheduler stops evaluating, then wait for it to
+    // finish draining any in-flight child before returning.
+    shutdown.signal();
+    if let Some(task) = scheduler_task
+        && let Err(e) = task.await
+    {
+        tracing::warn!(error = %e, "scheduler task did not shut down cleanly");
+    }
+    result
+}
+
+/// Resolve when the process should begin draining: a SIGTERM (unix) or a ctrl-c
+/// (SIGINT, all platforms). Mirrors the two-signal handling `rocky run` uses.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => {
+                    // Fall back to ctrl-c only if SIGTERM can't be registered.
+                    let _ = tokio::signal::ctrl_c().await;
+                    return;
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

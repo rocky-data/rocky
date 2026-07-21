@@ -263,7 +263,10 @@ Two commands turn a blind timer into an observable one.
 rocky doctor                  # all checks, exits 3 on any Critical
 rocky doctor --check config   # config only, offline and fast
 rocky doctor --check auth     # ping the warehouse to catch a rotated credential
+rocky doctor --check scheduler # is the reconciler alive and unwedged?
 ```
+
+When any pipeline declares a `[schedule]`, `rocky doctor` also runs a `scheduler` check (silent otherwise). It reads only the filesystem and the state store — never the warehouse — so it works offline and for both `rocky tick` and `rocky serve --scheduler`. It reports **Critical** when `.rocky/tick.lock` is held but its heartbeat has gone stale (a wedged reconciler that no restart-free takeover can dislodge; the fix is to restart the holding process), and **Warning** when no tick has evaluated any schedule in more than twice the shortest cron interval (the timer looks dead). It is a good `--check scheduler` cron of its own on the host that runs the reconciler.
 
 ### rocky history for run archaeology
 
@@ -349,9 +352,51 @@ SuccessExitStatus=2
 
 `rocky tick` takes its own non-blocking lock (`.rocky/tick.lock`, next to your config), so two ticks never reconcile at once even if a run outlives its interval — the outer `flock` above is just a cheap early skip.
 
+### The resident scheduler: `rocky serve --scheduler` (experimental)
+
+The timer approach keeps nothing resident: cron or systemd wakes `rocky tick`, it reconciles once, and it exits. If you already run `rocky serve` for the HTTP API, you can instead let the server drive the reconciler in-process, on a poll interval, with the `--scheduler` flag:
+
+```bash
+# The API plus a resident reconciler that ticks every 15 seconds (the default).
+rocky serve --scheduler
+
+# Tune the cadence and the shutdown drain window.
+rocky serve --scheduler --poll-interval-seconds 30 --drain-timeout-seconds 120
+```
+
+It is the same reconciler as `rocky tick` — the same `[schedule]` declarations, the same `cron`/`after`/`freshness` evaluation, the same `.rocky/tick.lock` and `schedule_state` — hosted inside a long-lived process instead of behind an external timer. A few things the resident form gives you:
+
+- **Runs show up as jobs.** Each scheduled run is recorded through the same jobs model as `POST /api/v1/jobs/run`, so `GET /api/v1/jobs/{submission_id}` reports it and a restarted server reports honest status for what it launched.
+- **It coordinates with API mutations.** A scheduler tick and an API `run`/`apply` never collide on the state store: whichever is second gets a clean `409 mutation_in_progress` (or, for the scheduler, simply skips the tick and re-evaluates next time) rather than racing the writer lock.
+- **Config is re-read every tick.** Edit `rocky.toml` under a running server and the next tick picks it up. A parse error on one tick is logged and skipped; the loop never dies on a bad edit and never runs a stale schedule.
+- **Shutdown drains.** On `SIGTERM` or `Ctrl-C` the server stops starting new work, gives a run already in flight up to `--drain-timeout-seconds` (but never beyond that run's own `timeout_minutes`) to finish on its own, and then terminates it — draining in-flight HTTP requests in the same window before the process exits. A run cut short by the drain is recorded as failed and is not retried until its next occurrence. The scheduler also holds its first tick until the server has finished starting up (its job sweep and listener bind), so a scheduled run never precedes — or outlives a failed — server startup.
+
+The resident reconciler is a single loop, so a scheduled run that hangs holds the loop until the run finishes or is terminated: the server keeps serving HTTP, but no further schedules are evaluated. Set `timeout_minutes` on a `[schedule]` so a stuck run is terminated and the loop moves on. Without one, a hung run stalls scheduling until the process is restarted — `rocky doctor --check scheduler` reports this as a dead timer. Automatic recovery of a wedged reconciler is a planned follow-up; until it lands, bound long runs with `timeout_minutes` and watch the doctor check.
+
+A minimal systemd unit for the resident form:
+
+```ini
+# /etc/systemd/system/rocky-serve.service
+[Unit]
+Description=Rocky API + resident scheduler
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/rocky/analytics
+ExecStart=/usr/local/bin/rocky serve --scheduler
+Restart=on-failure
+# Give an in-flight scheduled run time to drain before SIGKILL.
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Pick one form or the other, not both against the same project: a `rocky tick` timer *and* a `rocky serve --scheduler` on the same state file are two reconcilers (see below).
+
 ### One scheduler instance per project
 
-Run exactly one `rocky tick` timer per project, meaning per state file. All of the tick's mutual exclusion is local to one machine: the `.rocky/tick.lock` flock and the state store's own writer lock both live on that host's filesystem and cannot see a second host. Scheduler state (the cursor and claim tables) is deliberately local-only as well — a remote `[state]` backend (S3, GCS, Valkey, tiered) never uploads it and a download never overwrites it — so two hosts ticking the same project each keep an independent cursor and would both fire the same occurrence. Remote state is last-writer-wins today (there is no cross-host compare-and-swap yet), so there is no fence to lean on across machines. If you need timers on several hosts, give each host its own project and state file, or keep a single timer and let the other hosts invoke `rocky run` directly.
+Run exactly one reconciler per project, meaning per state file — one `rocky tick` timer, or one `rocky serve --scheduler`, not both and not several. All of a reconciler's mutual exclusion is local to one machine: the `.rocky/tick.lock` flock and the state store's own writer lock both live on that host's filesystem and cannot see a second host. Scheduler state (the cursor and claim tables) is deliberately local-only as well — a remote `[state]` backend (S3, GCS, Valkey, tiered) never uploads it and a download never overwrites it — so two hosts ticking the same project each keep an independent cursor and would both fire the same occurrence. Remote state is last-writer-wins today (there is no cross-host compare-and-swap yet), so there is no fence to lean on across machines. If you need timers on several hosts, give each host its own project and state file, or keep a single timer and let the other hosts invoke `rocky run` directly.
 
 ### Preview before you wire the timer
 

@@ -48,7 +48,7 @@ use super::demand::{
 };
 use super::lock::{TickAcquire, TickLock};
 use super::record::{ScheduleStateMutation, ScheduleStateRecord};
-use super::spawn::{SpawnRequest, Spawner};
+use super::spawn::{Drain, SpawnRequest, Spawner};
 
 /// A stuck `submitted` claim with no run record is held for this grace before
 /// its attempt is treated as lost (the owner crashed between committing the
@@ -58,7 +58,7 @@ const RECOVERY_GRACE: Duration = Duration::minutes(5);
 
 /// A held tick lock whose heartbeat is older than this is a wedged owner: a
 /// later tick proceeds via the wedge override rather than skipping forever.
-const LOCK_TAKEOVER_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+pub const LOCK_TAKEOVER_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// How often the lease heartbeat is refreshed while a child runs. Comfortably
 /// under the 60s staleness bound so a long but healthy run is never mistaken for
@@ -101,6 +101,13 @@ pub struct TickOptions {
     /// absolutizes). The reconciler also re-opens this path between phases —
     /// see [`tick_once`]'s store lifecycle.
     pub state_path: PathBuf,
+    /// The drain signal (serve mode). When raised mid-tick, the reconciler stops
+    /// evaluating *further* pipelines after the current one (it does not abandon a
+    /// running child — the spawner drains that), so a shutdown never starts new
+    /// work. Default (`Drain::default()`, never raised) is the CLI `rocky tick`
+    /// behavior: every pipeline in scope is evaluated. Shared (an `Arc` clone)
+    /// with the serve loop and its [`SubprocessSpawner`].
+    pub drain: Drain,
 }
 
 /// How many times the reconciler re-opens the state store after a child before
@@ -293,6 +300,11 @@ pub struct TickReport {
     /// a child. Exit-0 semantics, like `skipped_whole_tick`; the deferred work is
     /// picked up by the next tick's stuck-claim resolution.
     pub state_busy: bool,
+    /// The tick stopped evaluating early because the drain was raised mid-pass
+    /// (serve shutdown). Pipelines already evaluated ran normally; the remainder
+    /// are left for the next process to pick up. Always `false` for `rocky tick`
+    /// (its drain is never raised).
+    pub drained: bool,
 }
 
 /// A fault that fails the whole tick closed — it runs nothing.
@@ -395,6 +407,14 @@ pub async fn tick_once(
 
     // 5. Evaluate + execute each pipeline in order against live state.
     for name in &order {
+        // Drain (serve shutdown): stop evaluating *further* pipelines. A child
+        // already running for an earlier pipeline this tick is drained by the
+        // spawner, not abandoned here; we simply start no new work. A dry run
+        // never drains (it spawns nothing and the serve loop never dry-runs).
+        if !opts.dry_run && opts.drain.is_signalled() {
+            report.drained = true;
+            break;
+        }
         let schedule = &schedules[name];
         if let Some(held) = &lock {
             let _ = held.heartbeat();
@@ -830,11 +850,27 @@ async fn execute_claimed(
         }
         let outcome = TerminalOutcome::from_exit_code(run_outcome.exit_code);
         let next_id = new_submission_id();
+        // On shutdown, do not start another attempt. A drain raised during this
+        // attempt means the child was likely SIGTERM'd by the spawner (→ nonzero
+        // exit → `Failure`), and retrying would CAS a new submission and respawn a
+        // fresh child *after* shutdown was requested — once per remaining retry,
+        // each granted its own drain grace, so the drain would no longer be bounded
+        // by a single `drain_timeout`. Forcing `retry_max = 0` here routes a
+        // would-be retry through the existing, separately-tested Terminal path
+        // (`budget_remains(cycle_attempts ≥ 1, 0)` is false), so this attempt
+        // finalizes exactly once and nothing respawns. Consequence (failure-mode
+        // ledger): a drain-interrupted run finalizes as failed and does not
+        // auto-resume on restart; shutdown stays bounded to one in-flight child.
+        let effective_retry_max = if opts.drain.is_signalled() {
+            0
+        } else {
+            schedule.retry_max
+        };
         match decide_post_attempt(
             &claim,
             outcome,
             demand.source,
-            schedule.retry_max,
+            effective_retry_max,
             next_id.clone(),
             now,
         ) {
@@ -1224,6 +1260,7 @@ after = ["raw"]
             traceparent: None,
             member_budgets: BTreeMap::new(),
             state_path: state_path.clone(),
+            drain: Drain::default(),
         };
         (state_path, dir, opts)
     }
@@ -1741,6 +1778,85 @@ after = ["raw"]
             .map(|c| c.request.submission_id.clone())
             .collect();
         assert_eq!(subs.len(), 3, "each attempt has a distinct submission id");
+    }
+
+    // --- regression: shutdown during an in-tick retry must not respawn -------
+
+    /// A spawner that raises a shared drain the instant it runs, then returns a
+    /// failure exit code — modelling a child SIGTERM'd by a server shutdown while
+    /// it was running (a killed child exits nonzero). `retry.max > 0` would
+    /// normally make that failure retry.
+    struct DrainOnRunSpawner {
+        drain: Drain,
+        runs: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait]
+    impl Spawner for DrainOnRunSpawner {
+        async fn run(&self, _request: &SpawnRequest) -> RunOutcome {
+            self.runs.fetch_add(1, std::sync::atomic::Ordering::Release);
+            // Shutdown lands while this attempt is in flight.
+            self.drain.signal();
+            RunOutcome {
+                exit_code: 1,
+                pid: Some(4242),
+            }
+        }
+    }
+
+    #[test]
+    fn shutdown_during_in_tick_retry_finalizes_without_respawn() {
+        let (state_path, _dir, mut opts) = temp_env();
+        // A shared drain: the spawner raises it mid-attempt; the reconciler reads
+        // it when deciding whether to retry.
+        let drain = Drain::new();
+        opts.drain = drain.clone();
+        // `retry.max = 2` ⇒ up to THREE attempts absent the fix.
+        let config = cfg(CRON_RETRY2);
+        let spawner = DrainOnRunSpawner {
+            drain,
+            runs: std::sync::atomic::AtomicU32::new(0),
+        };
+
+        // Tick 1: first sight of the cron anchors, nothing fires (so the drain is
+        // not raised yet).
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 1, 12, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(
+            spawner.runs.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "first sight anchors, no fire",
+        );
+
+        // Tick 2: the occurrence is due → attempt 1 runs and raises the drain. The
+        // reconciler must NOT spawn attempts 2 and 3 after shutdown was requested.
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                at(2026, 5, 2, 4, 0),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            spawner.runs.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "a drain raised mid-attempt finalizes the run; it must not respawn a retry",
+        );
+        assert_eq!(report.executed.len(), 1);
+        assert_eq!(report.executed[0].outcome, TerminalOutcome::Failure);
+        assert_eq!(
+            report.executed[0].attempts, 1,
+            "the single attempt is terminal"
+        );
     }
 
     // --- regression vii: crash-safe retry budget (standing demand) -----------

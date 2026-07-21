@@ -68,6 +68,7 @@ mod run_content_addressed;
 mod run_dag_exec;
 mod run_local;
 mod run_watch;
+pub mod scheduler;
 mod seed;
 mod serve;
 mod shell;

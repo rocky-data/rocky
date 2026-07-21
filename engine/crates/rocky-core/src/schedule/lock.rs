@@ -111,6 +111,62 @@ fn read_heartbeat_age(path: &Path) -> Option<Duration> {
     SystemTime::now().duration_since(modified).ok()
 }
 
+/// A read-only snapshot of the tick lock's state, for `rocky doctor`.
+#[derive(Debug, Clone)]
+pub struct LockProbe {
+    /// `true` when another process currently holds the flock (a live or wedged
+    /// reconciler); `false` when the lock exists but is free (no reconciler
+    /// running right now).
+    pub held: bool,
+    /// Age of the heartbeat sidecar relative to the real clock, or `None` when
+    /// it is absent or unreadable.
+    pub heartbeat_age: Option<Duration>,
+}
+
+/// Probe the tick lock **without acquiring it for real** — for `rocky doctor`.
+///
+/// Returns `Ok(None)` when no lock file exists (no reconciler has ever run in
+/// this project). Otherwise reports whether the flock is currently held and the
+/// heartbeat's age. Probing has NO side effect on the liveness signals: the
+/// heartbeat age is read first, and a momentarily-acquired free lock is released
+/// on drop **without** a heartbeat write (unlike [`TickLock::try_acquire`]).
+///
+/// `held = true` with a stale `heartbeat_age` is the wedged-reconciler signal
+/// (doctor Critical); `held = false` means no reconciler is running (the stale
+/// heartbeat is just a past run's residue — the dead-timer signal is the
+/// pipeline's `last_evaluated_at`, read separately).
+///
+/// # Errors
+///
+/// Returns an I/O error if the lock file exists but cannot be opened, or the
+/// flock probe fails for a reason other than contention.
+pub fn probe_tick_lock(rocky_dir: &Path) -> io::Result<Option<LockProbe>> {
+    let lock_path = rocky_dir.join(LOCK_FILE);
+    if !lock_path.exists() {
+        return Ok(None);
+    }
+    // Read the heartbeat age BEFORE touching the flock, so the probe never
+    // reflects its own momentary acquisition.
+    let heartbeat_age = read_heartbeat_age(&rocky_dir.join(HEARTBEAT_FILE));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)?;
+    match FileExt::try_lock(&file) {
+        // Free: we hold it only until `file` drops at the end of this function,
+        // and we never heartbeat, so no liveness signal is disturbed.
+        Ok(()) => Ok(Some(LockProbe {
+            held: false,
+            heartbeat_age,
+        })),
+        Err(fs4::TryLockError::WouldBlock) => Ok(Some(LockProbe {
+            held: true,
+            heartbeat_age,
+        })),
+        Err(fs4::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +206,36 @@ mod tests {
             age < Duration::from_secs(5),
             "heartbeat just written must be fresh"
         );
+    }
+
+    #[test]
+    fn probe_reports_none_held_and_never_heartbeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let rocky = dir.path().join(".rocky");
+
+        // No lock file yet ⇒ None (no reconciler has ever run here).
+        assert!(probe_tick_lock(&rocky).unwrap().is_none());
+
+        // A held lock is reported held; a freed one is reported free.
+        {
+            let TickAcquire::Acquired(_held) = TickLock::try_acquire(&rocky).unwrap() else {
+                panic!("expected acquire");
+            };
+            let probe = probe_tick_lock(&rocky).unwrap().expect("lock file exists");
+            assert!(probe.held, "a held flock probes as held");
+        } // _held drops here, freeing the flock.
+
+        let probe = probe_tick_lock(&rocky).unwrap().expect("lock file exists");
+        assert!(!probe.held, "a freed flock probes as free");
+
+        // Probing a free lock must NOT write a heartbeat: the sidecar's age is
+        // whatever the last real acquire left, never refreshed by the probe.
+        let before = read_heartbeat_age(&rocky.join(HEARTBEAT_FILE));
+        let _ = probe_tick_lock(&rocky).unwrap();
+        let after = read_heartbeat_age(&rocky.join(HEARTBEAT_FILE));
+        // Ages only grow (or stay) across a probe — a refresh would reset toward 0.
+        if let (Some(b), Some(a)) = (before, after) {
+            assert!(a >= b, "probe must not refresh the heartbeat");
+        }
     }
 }

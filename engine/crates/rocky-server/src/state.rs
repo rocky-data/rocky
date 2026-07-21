@@ -39,6 +39,14 @@ pub struct ServerState {
     /// CORS allowlist passed to [`crate::auth::build_cors_layer`]. An
     /// empty list means same-origin only.
     pub allowed_origins: Vec<String>,
+    /// An explicit `--state-path` override for this process, when one was given.
+    /// `None` means "derive the conventional path from `models_dir`" — the
+    /// historical behavior. Callers that resolve a state path themselves (the
+    /// CLI's global flag) pass it here so every state-backed surface of the
+    /// server — the job records AND the resident scheduler's cursors, claims,
+    /// and child run history — agrees on one file instead of silently splitting
+    /// across two.
+    pub state_path: Option<PathBuf>,
     /// Per-session throttle for the "N sources hit" info log so it
     /// emits once per server start, not once per recompile. Keyed on
     /// `models_dir`, which stays constant.
@@ -56,21 +64,33 @@ impl ServerState {
         contracts_dir: Option<PathBuf>,
         config_path: Option<PathBuf>,
     ) -> Arc<Self> {
-        Self::with_auth(models_dir, contracts_dir, config_path, None, Vec::new())
+        Self::with_auth(
+            models_dir,
+            contracts_dir,
+            config_path,
+            None,
+            Vec::new(),
+            None,
+        )
     }
 
     /// Create new server state with explicit auth + CORS configuration.
+    ///
+    /// `state_path` is an explicit `--state-path` override; `None` derives the
+    /// conventional path from `models_dir` (see [`ServerState::state_path`]).
     pub fn with_auth(
         models_dir: PathBuf,
         contracts_dir: Option<PathBuf>,
         config_path: Option<PathBuf>,
         auth_token: Option<String>,
         allowed_origins: Vec<String>,
+        state_path: Option<PathBuf>,
     ) -> Arc<Self> {
         let state = Arc::new(Self {
             models_dir,
             contracts_dir,
             config_path,
+            state_path,
             compile_result: RwLock::new(None),
             dag_status: DagStatusStore::new(),
             mutation_permit: crate::jobs::MutationPermit::new(),

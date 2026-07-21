@@ -66,6 +66,25 @@ pub fn parse_cron(cron_expr: &str) -> Result<Cron, OccurrenceError> {
 ///
 /// Returns [`OccurrenceError::Parse`] for a malformed expression, or
 /// [`OccurrenceError::Search`] if no occurrence can be found.
+/// Estimate the spacing between consecutive `cron` occurrences, in the named
+/// timezone, as of `at` — the "expected interval" `rocky doctor` compares a
+/// scheduler's `last_evaluated_at` staleness against.
+///
+/// Returns `None` when `tz_name` or `cron_expr` is unparseable, or no two
+/// occurrences can be found. This is an estimate: for an irregular schedule
+/// (e.g. weekdays only) the spacing varies, and a DST boundary at `at` shifts it
+/// by an hour — both immaterial for a 2×-interval staleness threshold.
+pub fn cron_interval_estimate(
+    cron_expr: &str,
+    tz_name: &str,
+    at: DateTime<Utc>,
+) -> Option<std::time::Duration> {
+    let tz: Tz = tz_name.parse().ok()?;
+    let occ1 = next_occurrence(cron_expr, tz, at).ok()?;
+    let occ2 = next_occurrence(cron_expr, tz, occ1).ok()?;
+    (occ2 - occ1).to_std().ok()
+}
+
 pub fn next_occurrence(
     cron_expr: &str,
     tz: Tz,

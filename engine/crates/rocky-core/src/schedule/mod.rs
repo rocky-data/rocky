@@ -27,10 +27,17 @@ pub use demand::{
     ScheduleConfigError, ScheduleStateView, SkipReason, evaluate_demands, evaluate_one,
     resolve_freshness_budget, resolve_schedule,
 };
-pub use lock::TickLock;
-pub use occurrence::{OccurrenceError, next_occurrence, parse_cron, previous_or_equal_occurrence};
+pub use lock::{LockProbe, TickLock, probe_tick_lock};
+pub use occurrence::{
+    OccurrenceError, cron_interval_estimate, next_occurrence, parse_cron,
+    previous_or_equal_occurrence,
+};
 pub use reconcile::{
-    ExecutedDemand, SkippedDemand, TickError, TickOptions, TickReport, TickSkipReason, tick_once,
+    ExecutedDemand, LOCK_TAKEOVER_AFTER, SkippedDemand, TickError, TickOptions, TickReport,
+    TickSkipReason, tick_once,
 };
 pub use record::{ScheduleStateMutation, ScheduleStateRecord, Throttle};
-pub use spawn::{CapturingSpawner, RunOutcome, SpawnRequest, Spawner, SubprocessSpawner};
+pub use spawn::{
+    CapturingSpawner, DEFAULT_DRAIN_TIMEOUT, Drain, RunOutcome, SpawnRequest, Spawner,
+    SubprocessSpawner,
+};

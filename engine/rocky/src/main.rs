@@ -1568,6 +1568,22 @@ enum Command {
         /// allowlist is empty (same-origin only).
         #[arg(long = "allowed-origin", value_name = "ORIGIN")]
         allowed_origins: Vec<String>,
+        /// Run the resident scheduler alongside the API: a timer-driven loop
+        /// that evaluates every pipeline's `[schedule]` and runs what is due,
+        /// exactly like `rocky tick` on a cron, but in-process (experimental).
+        /// On SIGTERM/ctrl-c the server drains a running scheduled child before
+        /// exiting. One instance per project directory.
+        #[arg(long)]
+        scheduler: bool,
+        /// Seconds between scheduler ticks (default 15). Only meaningful with
+        /// `--scheduler`. Must be ≥ 1 — a zero interval would busy-spin the loop.
+        #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+        poll_interval_seconds: Option<u64>,
+        /// Seconds a running scheduled child may keep going after a shutdown
+        /// signal before it is terminated (default 60). Only meaningful with
+        /// `--scheduler`.
+        #[arg(long, value_name = "SECONDS")]
+        drain_timeout_seconds: Option<u64>,
     },
 
     /// Start Language Server Protocol server for IDE integration
@@ -3716,6 +3732,9 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             watch,
             token,
             allowed_origins,
+            scheduler,
+            poll_interval_seconds,
+            drain_timeout_seconds,
         } => {
             let config = if cli.config.exists() {
                 Some(cli.config.as_path())
@@ -3731,6 +3750,14 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 watch,
                 token,
                 allowed_origins,
+                scheduler,
+                poll_interval_seconds,
+                drain_timeout_seconds,
+                // The raw `--state-path` override, not the namespaced resolution
+                // above: serve derives its default from its own `--models`, so
+                // passing the resolved default here would repoint a
+                // `serve --models <dir>` at `models/.rocky-state.redb`.
+                cli.state_path.as_deref(),
             )
             .await
         }

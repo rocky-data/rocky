@@ -168,7 +168,12 @@ pub fn router(state: Arc<ServerState>) -> Router {
 ///   auth would leak model SQL, file paths, and run history;
 /// - the listener fails to bind (port in use, permissions, etc.);
 /// - the axum runtime returns an error.
-pub async fn serve(state: Arc<ServerState>, config: ServeConfig) -> anyhow::Result<()> {
+pub async fn serve(
+    state: Arc<ServerState>,
+    config: ServeConfig,
+    shutdown: rocky_core::schedule::Drain,
+    ready: rocky_core::schedule::Drain,
+) -> anyhow::Result<()> {
     if !is_loopback(&config.host) && state.auth_token.is_none() {
         anyhow::bail!(
             "rocky serve refuses to bind {host} without a Bearer token. \
@@ -203,7 +208,18 @@ pub async fn serve(state: Arc<ServerState>, config: ServeConfig) -> anyhow::Resu
     let bind_addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!(addr = %bind_addr, "rocky serve listening");
-    axum::serve(listener, app).await?;
+    // Readiness: the startup job sweep has completed and the listener is bound, so
+    // it is now safe for the resident scheduler (if any) to take its first tick —
+    // any job it submits from here on is past the sweep and cannot be clobbered,
+    // and no scheduled child runs before the server is actually up. A bind failure
+    // returns above via `?` without raising this, so the scheduler — which awaits
+    // readiness against shutdown — exits without ticking.
+    ready.signal();
+    // Graceful shutdown: on `shutdown` (SIGTERM/ctrl-c, shared with the scheduler
+    // loop) axum stops accepting and drains in-flight requests before returning.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.signalled().await })
+        .await?;
     Ok(())
 }
 
@@ -320,6 +336,19 @@ impl ApiError {
     /// poll it. Distinct from `503 engine_busy` (redb lock contention), which is
     /// the cross-process backstop, not this app-level guard.
     fn mutation_in_progress(running_job_id: &str) -> Self {
+        // The resident scheduler holds the permit for a whole tick under a
+        // SENTINEL id, not a job id — its runs are recorded per-demand under
+        // generated submission ids, so `GET /api/v1/jobs/scheduler` would 404.
+        // Hand those clients a truthful message and NO pollable id rather than
+        // pointing them at a route that cannot resolve.
+        if running_job_id == crate::commands::scheduler::SCHEDULER_PERMIT_HOLDER {
+            return Self::new(
+                StatusCode::CONFLICT,
+                "mutation_in_progress",
+                "a scheduled run is in progress on this project",
+                Some("wait for the scheduler tick to finish, then resubmit"),
+            );
+        }
         let mut err = Self::new(
             StatusCode::CONFLICT,
             "mutation_in_progress",
@@ -460,8 +489,16 @@ fn map_join_err(err: &tokio::task::JoinError) -> ApiError {
 }
 
 /// Resolve the state-store path for a read route the same way the CLI does.
-fn state_path_for(state: &ServerState) -> std::path::PathBuf {
-    rocky_core::state::resolve_state_path(None, &state.models_dir).path
+pub(crate) fn state_path_for(state: &ServerState) -> std::path::PathBuf {
+    // An explicit `--state-path` is a hard override — honor it verbatim. Without
+    // this, a `rocky --state-path <p> serve --scheduler` resolved the default
+    // instead, so the scheduler's cursors, claims, and child run history landed
+    // in a different file than the one the operator selected (and than a
+    // `rocky tick` on the same project would use), silently re-firing occurrences.
+    match &state.state_path {
+        Some(explicit) => explicit.clone(),
+        None => rocky_core::state::resolve_state_path(None, &state.models_dir).path,
+    }
 }
 
 /// The `/api/v1` routes this build serves — the feature-detection surface
@@ -836,7 +873,7 @@ fn new_job_id() -> String {
 }
 
 /// The persisted string form of a lifecycle state.
-fn job_state_str(state: JobState) -> &'static str {
+pub(crate) fn job_state_str(state: JobState) -> &'static str {
     match state {
         JobState::Queued => "queued",
         JobState::Running => "running",
@@ -940,7 +977,10 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
 /// run-download. (Merely being stripped on upload would NOT be enough on its
 /// own: without the download-side preservation, a run-download's wholesale file
 /// replace would still wipe the local `jobs` rows.)
-async fn persist_job(state_path: std::path::PathBuf, job: PersistedJob) -> anyhow::Result<()> {
+pub(crate) async fn persist_job(
+    state_path: std::path::PathBuf,
+    job: PersistedJob,
+) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let store = rocky_core::state::StateStore::open(&state_path)?;
         store.record_job(&job)?;
@@ -1587,6 +1627,41 @@ mod tests {
 
     // --- Auth (moved from rocky-server) ---
 
+    /// An explicit `--state-path` must win over the conventional
+    /// `<models>/.rocky-state.redb`. Without this, `rocky --state-path <p> serve
+    /// --scheduler` put the scheduler's cursors, claims, and child run history in
+    /// a different file than the operator selected — so switching to it from a
+    /// `rocky tick` timer silently re-fired occurrences against fresh state.
+    // `with_auth` spawns the initial compile, so this needs a runtime.
+    #[tokio::test]
+    async fn state_path_for_honors_an_explicit_override() {
+        let models = simple_project_models();
+        let explicit = std::path::PathBuf::from("/tmp/rocky-explicit-state.redb");
+
+        let overridden = ServerState::with_auth(
+            models.clone(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some(explicit.clone()),
+        );
+        assert_eq!(
+            state_path_for(&overridden),
+            explicit,
+            "an explicit --state-path is a hard override",
+        );
+
+        // Without an override the conventional resolution is unchanged.
+        let default_state =
+            ServerState::with_auth(models.clone(), None, None, None, Vec::new(), None);
+        assert_eq!(
+            state_path_for(&default_state),
+            rocky_core::state::resolve_state_path(None, &models).path,
+            "no override ⇒ historical behavior",
+        );
+    }
+
     fn test_state_with_token(token: &str) -> Arc<ServerState> {
         ServerState::with_auth(
             simple_project_models(),
@@ -1594,6 +1669,7 @@ mod tests {
             None,
             Some(token.to_string()),
             Vec::new(),
+            None,
         )
     }
 
@@ -1646,13 +1722,16 @@ mod tests {
 
     #[tokio::test]
     async fn serve_refuses_non_loopback_without_token() {
-        let state = ServerState::with_auth(simple_project_models(), None, None, None, Vec::new());
+        let state =
+            ServerState::with_auth(simple_project_models(), None, None, None, Vec::new(), None);
         let result = serve(
             state,
             ServeConfig {
                 host: "0.0.0.0".to_string(),
                 port: 0,
             },
+            rocky_core::schedule::Drain::new(),
+            rocky_core::schedule::Drain::new(),
         )
         .await;
         let err = result.expect_err("expected 0.0.0.0 without token to be rejected");
@@ -1665,13 +1744,22 @@ mod tests {
     #[tokio::test]
     async fn serve_allows_loopback_without_token() {
         // The historical default (loopback, no token) must keep working.
-        let state = ServerState::with_auth(simple_project_models(), None, None, None, Vec::new());
+        let state =
+            ServerState::with_auth(simple_project_models(), None, None, None, Vec::new(), None);
         let task = tokio::spawn(async move {
             serve(
                 state,
                 ServeConfig {
                     host: "127.0.0.1".to_string(),
                     port: 0,
+                },
+                rocky_core::schedule::Drain::new(),
+                // Pre-signal readiness so this smoke test starts serving without a
+                // separate trigger; it asserts the loopback path keeps running.
+                {
+                    let r = rocky_core::schedule::Drain::new();
+                    r.signal();
+                    r
                 },
             )
             .await
