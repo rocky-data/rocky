@@ -768,6 +768,35 @@ fn check_time_interval_strategy(
 /// would be reported missing. Since E036 is an error, a false positive breaks
 /// a valid build, which is strictly worse than missing a typo in a model whose
 /// output set isn't knowable at compile time anyway.
+///
+/// # Why this matches case-insensitively when E010/E020 do not
+///
+/// Deliberate, not an oversight. `unique_key` entries are constrained to
+/// `^[a-zA-Z0-9_]+$` by [`rocky_sql::validation::validate_identifier`], so a
+/// merge key can never be a quoted identifier — the dialects interpolate it
+/// into `MERGE ... ON t.<key> = s.<key>` as a bare unquoted name. Every
+/// warehouse Rocky targets resolves unquoted identifiers case-insensitively
+/// (Snowflake folds them to uppercase, Postgres/Trino to lowercase, DuckDB and
+/// Databricks match case-insensitively while preserving the stored case). So a
+/// key differing from a real output column only in case always resolves at run
+/// time: there is no true positive in that class to detect, and flagging it can
+/// only fail a build that would have worked. This mirrors the adapter layer,
+/// which already matches warehouse-returned column names with
+/// `eq_ignore_ascii_case`.
+///
+/// E010 (contract `required` columns) and E020 (`time_column`) still compare
+/// exactly. Those are pre-existing and out of scope here rather than
+/// deliberately different — see the E036 review discussion.
+///
+/// # Boundary
+///
+/// Case-insensitive matching cannot disambiguate a model that projects two
+/// columns differing only in case (`Order_ID` and `order_id`). `unique_key =
+/// ["ORDER_ID"]` matches both, and E036 stays quiet. That is acceptable: E036
+/// is an existence check, and the column does exist. Such a model is already
+/// ambiguous on every case-insensitive warehouse — the ambiguity is the
+/// projection's, and diagnosing it belongs to a duplicate-column check, not
+/// here.
 fn check_merge_strategy(
     model: &rocky_core::models::Model,
     typed_cols: &[crate::types::TypedColumn],
@@ -789,9 +818,12 @@ fn check_merge_strategy(
     }
 
     // E036: every unique_key entry must exist in the typed output schema.
+    //
+    // Matched case-insensitively — see this function's doc comment for why
+    // that differs from the exact matching E010/E020 use nearby.
     unique_key
         .iter()
-        .filter(|key| !typed_cols.iter().any(|c| c.name == **key))
+        .filter(|key| !typed_cols.iter().any(|c| c.name.eq_ignore_ascii_case(key)))
         .map(|key| {
             Diagnostic::error(
                 E036,
@@ -3630,6 +3662,92 @@ mod tests {
             !result.diagnostics.iter().any(|d| &*d.code == "E036"),
             "E036 must not fire when the key is a real column: {:?}",
             result.diagnostics
+        );
+    }
+
+    // ----- E036: identifier case -----
+
+    #[test]
+    fn test_e036_not_fired_for_case_mismatched_unique_key() {
+        // `ORDER_ID` vs the projected `order_id`. Rocky interpolates the key
+        // into `MERGE ... ON t.ORDER_ID = s.ORDER_ID` as a bare unquoted
+        // identifier, which every supported warehouse resolves
+        // case-insensitively, so this model is valid and must compile.
+        let models = vec![make_merge_project_model(
+            "ingest_orders",
+            "SELECT order_id, amount FROM poc.raw.orders",
+            &["ORDER_ID"],
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E036"),
+            "E036 must not fire on a case-mismatched but valid key: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_e036_case_insensitive_match_both_directions() {
+        // Mixed case on either side must match: the model may project
+        // `Order_ID` just as easily as the key may be written `order_id`.
+        let model = make_merge_model("m", &["order_id"]);
+        let cols = vec![typed_col("Order_ID", RockyType::String, false)];
+        assert!(
+            check_merge_strategy(&model, &cols, true).is_empty(),
+            "lowercase key must match a mixed-case column"
+        );
+
+        let model = make_merge_model("m", &["Order_ID"]);
+        let cols = vec![typed_col("order_id", RockyType::String, false)];
+        assert!(
+            check_merge_strategy(&model, &cols, true).is_empty(),
+            "mixed-case key must match a lowercase column"
+        );
+    }
+
+    #[test]
+    fn test_e036_case_insensitivity_does_not_swallow_near_miss_typos() {
+        // The true positive must survive: `order_idd` differs from `order_id`
+        // by more than case, so case-insensitive matching must still reject
+        // it. Guards against a fix that over-corrects into fuzzy matching.
+        let models = vec![make_merge_project_model(
+            "orders",
+            "SELECT order_id, amount FROM poc.raw.orders",
+            &["order_idd"],
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        let e036: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "E036")
+            .collect();
+        assert_eq!(
+            e036.len(),
+            1,
+            "expected E036 for a genuine typo: {:?}",
+            result.diagnostics
+        );
+        assert!(e036[0].message.contains("order_idd"));
+    }
+
+    #[test]
+    fn test_e036_case_insensitive_only_ignores_case_not_separators() {
+        // `orderid` (no underscore) is a different identifier, not a case
+        // variant, and must still error.
+        let model = make_merge_model("m", &["ORDERID"]);
+        let cols = vec![typed_col("order_id", RockyType::String, false)];
+        let diags = check_merge_strategy(&model, &cols, true);
+        assert!(
+            diags.iter().any(|d| &*d.code == "E036"),
+            "separator differences are not case differences: {diags:?}"
         );
     }
 

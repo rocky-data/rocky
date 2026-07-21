@@ -148,6 +148,12 @@ pub const E035: &str = "E035";
 /// from a raw source it has no schema for, or from a model joined to one. Only
 /// models with explicit column lists are checked. One diagnostic is emitted per
 /// missing key, so a multi-column `unique_key` reports every typo at once.
+///
+/// Column names are matched **case-insensitively**: a merge key is always
+/// emitted as a bare unquoted identifier, which every supported warehouse
+/// resolves without regard to case, so a case-only difference is never a real
+/// defect. See `rocky_compiler::typecheck::check_merge_strategy` for the full
+/// rationale and the one boundary this trades away.
 pub const E036: &str = "E036";
 
 // Warnings
