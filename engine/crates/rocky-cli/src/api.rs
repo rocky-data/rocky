@@ -336,6 +336,19 @@ impl ApiError {
     /// poll it. Distinct from `503 engine_busy` (redb lock contention), which is
     /// the cross-process backstop, not this app-level guard.
     fn mutation_in_progress(running_job_id: &str) -> Self {
+        // The resident scheduler holds the permit for a whole tick under a
+        // SENTINEL id, not a job id — its runs are recorded per-demand under
+        // generated submission ids, so `GET /api/v1/jobs/scheduler` would 404.
+        // Hand those clients a truthful message and NO pollable id rather than
+        // pointing them at a route that cannot resolve.
+        if running_job_id == crate::commands::scheduler::SCHEDULER_PERMIT_HOLDER {
+            return Self::new(
+                StatusCode::CONFLICT,
+                "mutation_in_progress",
+                "a scheduled run is in progress on this project",
+                Some("wait for the scheduler tick to finish, then resubmit"),
+            );
+        }
         let mut err = Self::new(
             StatusCode::CONFLICT,
             "mutation_in_progress",
@@ -477,7 +490,15 @@ fn map_join_err(err: &tokio::task::JoinError) -> ApiError {
 
 /// Resolve the state-store path for a read route the same way the CLI does.
 pub(crate) fn state_path_for(state: &ServerState) -> std::path::PathBuf {
-    rocky_core::state::resolve_state_path(None, &state.models_dir).path
+    // An explicit `--state-path` is a hard override — honor it verbatim. Without
+    // this, a `rocky --state-path <p> serve --scheduler` resolved the default
+    // instead, so the scheduler's cursors, claims, and child run history landed
+    // in a different file than the one the operator selected (and than a
+    // `rocky tick` on the same project would use), silently re-firing occurrences.
+    match &state.state_path {
+        Some(explicit) => explicit.clone(),
+        None => rocky_core::state::resolve_state_path(None, &state.models_dir).path,
+    }
 }
 
 /// The `/api/v1` routes this build serves — the feature-detection surface
@@ -1606,6 +1627,41 @@ mod tests {
 
     // --- Auth (moved from rocky-server) ---
 
+    /// An explicit `--state-path` must win over the conventional
+    /// `<models>/.rocky-state.redb`. Without this, `rocky --state-path <p> serve
+    /// --scheduler` put the scheduler's cursors, claims, and child run history in
+    /// a different file than the operator selected — so switching to it from a
+    /// `rocky tick` timer silently re-fired occurrences against fresh state.
+    // `with_auth` spawns the initial compile, so this needs a runtime.
+    #[tokio::test]
+    async fn state_path_for_honors_an_explicit_override() {
+        let models = simple_project_models();
+        let explicit = std::path::PathBuf::from("/tmp/rocky-explicit-state.redb");
+
+        let overridden = ServerState::with_auth(
+            models.clone(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some(explicit.clone()),
+        );
+        assert_eq!(
+            state_path_for(&overridden),
+            explicit,
+            "an explicit --state-path is a hard override",
+        );
+
+        // Without an override the conventional resolution is unchanged.
+        let default_state =
+            ServerState::with_auth(models.clone(), None, None, None, Vec::new(), None);
+        assert_eq!(
+            state_path_for(&default_state),
+            rocky_core::state::resolve_state_path(None, &models).path,
+            "no override ⇒ historical behavior",
+        );
+    }
+
     fn test_state_with_token(token: &str) -> Arc<ServerState> {
         ServerState::with_auth(
             simple_project_models(),
@@ -1613,6 +1669,7 @@ mod tests {
             None,
             Some(token.to_string()),
             Vec::new(),
+            None,
         )
     }
 
@@ -1665,7 +1722,8 @@ mod tests {
 
     #[tokio::test]
     async fn serve_refuses_non_loopback_without_token() {
-        let state = ServerState::with_auth(simple_project_models(), None, None, None, Vec::new());
+        let state =
+            ServerState::with_auth(simple_project_models(), None, None, None, Vec::new(), None);
         let result = serve(
             state,
             ServeConfig {
@@ -1686,7 +1744,8 @@ mod tests {
     #[tokio::test]
     async fn serve_allows_loopback_without_token() {
         // The historical default (loopback, no token) must keep working.
-        let state = ServerState::with_auth(simple_project_models(), None, None, None, Vec::new());
+        let state =
+            ServerState::with_auth(simple_project_models(), None, None, None, Vec::new(), None);
         let task = tokio::spawn(async move {
             serve(
                 state,

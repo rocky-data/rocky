@@ -55,7 +55,7 @@ pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
 /// individual runs are recorded as jobs keyed by their `submission_id`; this id
 /// only ever surfaces as the `running_job_id` of a `409 mutation_in_progress`
 /// returned to an API `run`/`apply` submitted mid-tick.
-const SCHEDULER_PERMIT_HOLDER: &str = "scheduler";
+pub(crate) const SCHEDULER_PERMIT_HOLDER: &str = "scheduler";
 
 /// Tunables for the resident scheduler loop.
 #[derive(Debug, Clone)]
@@ -411,7 +411,7 @@ cron = "* * * * *"
     /// A config-less server state rooted at `models_dir` — enough for the
     /// mutation permit and state-path resolution the loop needs.
     fn test_state(models_dir: &Path) -> Arc<ServerState> {
-        ServerState::with_auth(models_dir.to_path_buf(), None, None, None, Vec::new())
+        ServerState::with_auth(models_dir.to_path_buf(), None, None, None, Vec::new(), None)
     }
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {

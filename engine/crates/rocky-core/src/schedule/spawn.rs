@@ -186,6 +186,23 @@ impl SubprocessSpawner {
 #[async_trait]
 impl Spawner for SubprocessSpawner {
     async fn run(&self, request: &SpawnRequest) -> RunOutcome {
+        // Never start new work once the drain is raised. The reconciler already
+        // checks the drain between pipelines and suppresses further retries while
+        // draining, but both read it *before* reaching here — a shutdown landing
+        // in that window would otherwise spawn a child after shutdown was
+        // requested and then hand it the drain grace to do warehouse writes in.
+        // Gating here makes "no new child after the drain" hold by construction
+        // rather than by timing. Reported as a failure with no pid, exactly like
+        // a spawn that could not start; with the drain raised the reconciler
+        // finalizes it instead of retrying. Only the serve path arms the drain
+        // (`drain_timeout` is `None` on the CLI one-shot), so `rocky tick` is
+        // byte-unchanged.
+        if self.drain_timeout.is_some() && self.drain.is_signalled() {
+            return RunOutcome {
+                exit_code: 1,
+                pid: None,
+            };
+        }
         let mut cmd = Self::build_command(request);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
@@ -397,6 +414,34 @@ impl Spawner for CapturingSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drain raised BEFORE the spawner runs must not start a child at all.
+    /// The reconciler checks the drain before it gets here, so a shutdown landing
+    /// in between would otherwise launch a child after shutdown was requested and
+    /// then grant it the drain grace to write in. `pid: None` is the proof: this
+    /// spawner would otherwise spawn `current_exe` successfully and report a pid.
+    #[tokio::test]
+    async fn a_raised_drain_starts_no_child() {
+        let drain = Drain::new();
+        drain.signal();
+        let spawner = SubprocessSpawner::with_drain(drain, Duration::from_secs(60));
+        let request = SpawnRequest {
+            pipeline: "raw".to_string(),
+            config_path: PathBuf::from("/proj/rocky.toml"),
+            state_path: PathBuf::from("/proj/models/.rocky-state.redb"),
+            submission_id: "sub-1".to_string(),
+            traceparent: None,
+            timeout: None,
+        };
+
+        let outcome = spawner.run(&request).await;
+
+        assert_eq!(outcome.pid, None, "no child may be spawned once drained");
+        assert_eq!(
+            outcome.exit_code, 1,
+            "reported as a failure, so the tick finalizes it"
+        );
+    }
 
     /// `--state-path` is a top-level (non-global) `rocky` arg, so it MUST appear
     /// before the `run` subcommand token, while `--pipeline` is a `run` arg and

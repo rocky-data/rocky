@@ -37,6 +37,7 @@ pub async fn run_serve(
     scheduler: bool,
     poll_interval_seconds: Option<u64>,
     drain_timeout_seconds: Option<u64>,
+    state_path: Option<&Path>,
 ) -> Result<()> {
     // Token resolution: --token takes precedence over the env var so
     // CI / scripts can override an inherited environment.
@@ -48,6 +49,7 @@ pub async fn run_serve(
         config_path.map(std::path::Path::to_path_buf),
         token,
         allowed_origins,
+        state_path.map(std::path::Path::to_path_buf),
     );
 
     // Start filesystem watcher if requested

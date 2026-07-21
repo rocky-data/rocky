@@ -599,17 +599,11 @@ async fn collect_health_checks(
 
     // N. Scheduler health (native orchestration). Silent when no pipeline
     //    declares a `[schedule]` — the check simply isn't emitted.
+    // The check records its own remediation hints as it decides status, so a
+    // config-load failure no longer draws a misleading "a reconciler is wedged".
     if should_run("scheduler", check_filter)
-        && let Some(check) = scheduler_check(config_path, state_path, verbose)
+        && let Some(check) = scheduler_check(config_path, state_path, verbose, &mut suggestions)
     {
-        if matches!(check.status, HealthStatus::Critical) {
-            suggestions
-                .push("a reconciler is wedged — restart the `rocky serve --scheduler` (or the process running `rocky tick`) that holds `.rocky/tick.lock`".into());
-        } else if matches!(check.status, HealthStatus::Warning) {
-            suggestions.push(
-                "no recent scheduler tick — confirm `rocky serve --scheduler` or the cron driving `rocky tick` is running".into(),
-            );
-        }
         checks.push(check);
     }
 
@@ -631,11 +625,25 @@ async fn collect_health_checks(
 ///
 /// Works for both `rocky serve --scheduler` and cron-driven `rocky tick`, since
 /// both write the same `tick.lock` heartbeat and `schedule_state`.
-fn scheduler_check(config_path: &Path, state_path: &Path, verbose: bool) -> Option<HealthCheck> {
+fn scheduler_check(
+    config_path: &Path,
+    state_path: &Path,
+    verbose: bool,
+    suggestions: &mut Vec<String>,
+) -> Option<HealthCheck> {
     use rocky_core::schedule::{LOCK_TAKEOVER_AFTER, cron_interval_estimate, probe_tick_lock};
 
     let start = Instant::now();
-    let config = rocky_core::config::load_rocky_config(config_path).ok()?;
+    // A config we cannot READ is not the same as a project with no schedules.
+    // Swallowing the error here emitted no check at all, so `rocky doctor
+    // --check scheduler` on a broken `rocky.toml` reported `overall: healthy`
+    // with exit 0 while the resident scheduler skipped every iteration. Fail
+    // loudly instead — the same treatment the adapters/pipelines/state checks
+    // already give an unreadable config.
+    let config = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(c) => c,
+        Err(e) => return Some(config_load_failed("scheduler", &e, start, suggestions)),
+    };
     let scheduled: Vec<(&String, &rocky_core::config::ScheduleConfig)> = config
         .pipelines
         .iter()
@@ -661,6 +669,7 @@ fn scheduler_check(config_path: &Path, state_path: &Path, verbose: bool) -> Opti
         Ok(Some(probe)) if probe.held => match probe.heartbeat_age {
             Some(age) if age > LOCK_TAKEOVER_AFTER => {
                 status = HealthStatus::Critical;
+                suggestions.push("a reconciler is wedged — restart the `rocky serve --scheduler` (or the process running `rocky tick`) that holds `.rocky/tick.lock`".into());
                 messages.push(format!(
                     "a reconciler holds .rocky/tick.lock but its heartbeat is {}s stale — it is wedged; restart the holding process",
                     age.as_secs()
@@ -670,7 +679,13 @@ fn scheduler_check(config_path: &Path, state_path: &Path, verbose: bool) -> Opti
         },
         Ok(Some(_)) => details.push(("tick_lock".into(), "free".into())),
         Ok(None) => details.push(("tick_lock".into(), "never taken".into())),
-        Err(e) => messages.push(format!("could not probe the tick lock: {e}")),
+        // A probe we could not perform is not evidence of health: recording the
+        // error while leaving the status Healthy reported a green check whose
+        // own message said it could not tell.
+        Err(e) => {
+            status = HealthStatus::Warning;
+            messages.push(format!("could not probe the tick lock: {e}"));
+        }
     }
 
     // 2. Dead timer: the newest last_evaluated_at across scheduled pipelines is
@@ -684,7 +699,22 @@ fn scheduler_check(config_path: &Path, state_path: &Path, verbose: bool) -> Opti
         })
         .min();
 
-    let store = rocky_core::state::StateStore::open_read_only(state_path).ok();
+    // An ABSENT state file is normal — no tick has run yet — and stays healthy.
+    // A file that EXISTS but cannot be opened (corrupt, unreadable, forward-
+    // incompatible) is a real fault, and discarding that error left the check
+    // reporting "reconciler healthy" over a broken store.
+    let store = match rocky_core::state::StateStore::open_read_only(state_path) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            if state_path.exists() {
+                if !matches!(status, HealthStatus::Critical) {
+                    status = HealthStatus::Warning;
+                }
+                messages.push(format!("could not read scheduler state: {e}"));
+            }
+            None
+        }
+    };
     let most_recent_eval = store.as_ref().and_then(|store| {
         scheduled
             .iter()
@@ -709,6 +739,9 @@ fn scheduler_check(config_path: &Path, state_path: &Path, verbose: bool) -> Opti
                 if !matches!(status, HealthStatus::Critical) {
                     status = HealthStatus::Warning;
                 }
+                suggestions.push(
+                    "no recent scheduler tick — confirm `rocky serve --scheduler` or the cron driving `rocky tick` is running".into(),
+                );
                 messages.push(format!(
                     "no tick has evaluated any schedule in {}s (>2× the shortest interval, {}s) — the scheduler timer may be dead",
                     age.as_secs(),
@@ -896,6 +929,31 @@ mod tests {
     // -----------------------------------------------------------------------
     // scheduler check — silent unless scheduled; emitted (healthy) otherwise
     // -----------------------------------------------------------------------
+
+    /// A config that cannot be parsed is NOT "no schedules": swallowing the load
+    /// error emitted no check at all, so `rocky doctor --check scheduler` on a
+    /// broken `rocky.toml` reported healthy with exit 0 while a resident
+    /// scheduler was skipping every iteration.
+    #[tokio::test]
+    async fn scheduler_check_fails_loudly_on_unreadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, "this is not valid toml : : :").unwrap();
+        let state_path = dir.path().join("state.redb");
+
+        let (checks, _) =
+            collect_health_checks(&config_path, &state_path, Some("scheduler"), false).await;
+
+        let check = checks
+            .iter()
+            .find(|c| c.name == "scheduler")
+            .expect("an unreadable config must still emit a scheduler check");
+        assert!(
+            !matches!(check.status, HealthStatus::Healthy),
+            "a config we cannot read must not report healthy, got {:?}",
+            check.status,
+        );
+    }
 
     #[tokio::test]
     async fn scheduler_check_is_silent_without_a_schedule() {

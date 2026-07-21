@@ -3753,6 +3753,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 scheduler,
                 poll_interval_seconds,
                 drain_timeout_seconds,
+                // The raw `--state-path` override, not the namespaced resolution
+                // above: serve derives its default from its own `--models`, so
+                // passing the resolved default here would repoint a
+                // `serve --models <dir>` at `models/.rocky-state.redb`.
+                cli.state_path.as_deref(),
             )
             .await
         }
