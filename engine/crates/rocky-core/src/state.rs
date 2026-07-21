@@ -3588,9 +3588,14 @@ impl StateStore {
     /// This is the durability guarantee at the heart of `rocky gc`: the
     /// tombstone (the restore safety net) is committed **in the same
     /// transaction** as the ledger-row removal, so a crash can never leave a
-    /// retired reference without its restore record. The physical object-store
-    /// delete happens *after* this call returns — an orphaned byte with a
-    /// tombstone is safe; a deleted byte without one is not.
+    /// retired reference without its restore record.
+    ///
+    /// Ordering, for whenever physical reclamation lands: any object-store
+    /// delete must happen *after* this call returns — an orphaned byte with a
+    /// tombstone is safe; a deleted byte without one is not. Today `rocky gc`
+    /// performs no physical delete at all (eviction is ledger-only, and `[gc]
+    /// physical_delete = true` is a hard error), so this call is the whole
+    /// eviction.
     ///
     /// The **hash check is the eviction's identity guard**: the caller
     /// derives eligibility from a specific content hash, but the ledger key is

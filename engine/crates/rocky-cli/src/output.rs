@@ -7773,18 +7773,25 @@ pub struct ReplayExecuteModelOutput {
 
 /// JSON output for `rocky gc --derivable --dry-run`.
 ///
-/// A read-only inventory of Rocky-managed content-addressed artifacts that
-/// are provably rebuildable — *derivable* — and therefore reclamation
-/// candidates. Nothing is deleted or planned for deletion: this surface is
-/// inventory-only, so the whole product is the report.
+/// A read-only inventory of Rocky-managed content-addressed artifacts whose
+/// recorded recipe makes them reclamation candidates — *derivable*. Nothing
+/// is deleted or planned for deletion: this surface is inventory-only, so the
+/// whole product is the report.
+///
+/// `derivable` is an eligibility verdict, not a rebuild guarantee. It states
+/// that a recipe was recorded and bound to this artifact's bytes — not that
+/// `rocky restore` can rebuild them. Restore covers a narrower set (recipes
+/// that read no recorded upstreams; see [`Self::notes`]), so an artifact can
+/// be `derivable` here and still have no working recovery route today.
 ///
 /// The candidate universe is the content-addressed artifact ledger, grouped
 /// by content hash (each distinct hash is one physical artifact; managed
 /// bytes count each hash once). An artifact is `derivable` only when **all
-/// five** eligibility checks hold — recipe recorded, replayable,
-/// unreferenced, policy allows, past the age threshold. Every check fails
-/// closed (any doubt keeps the artifact non-derivable) and is reported per
-/// candidate, so each verdict is auditable rather than asserted.
+/// six** eligibility checks hold — recipe recorded, recipe bound to this
+/// artifact's output hash, replayable, unreferenced, policy allows, past the
+/// age threshold. Every check fails closed (any doubt keeps the artifact
+/// non-derivable) and is reported per candidate, so each verdict is auditable
+/// rather than asserted.
 ///
 /// Scope caveat surfaced in [`Self::notes`]: refcounts see *Rocky's* pointers
 /// only. A warehouse-side reference Rocky never recorded (a BI extract, a
@@ -7798,7 +7805,7 @@ pub struct GcReportOutput {
     /// distinct content hash once.
     pub managed_bytes: u64,
     /// Physical bytes of the derivable subset (distinct content hashes whose
-    /// five checks all pass).
+    /// six checks all pass).
     pub derivable_bytes: u64,
     /// [`Self::derivable_bytes`] as a percentage of [`Self::managed_bytes`];
     /// `null` when there are no managed bytes (nothing to divide by).
@@ -7857,20 +7864,20 @@ pub struct GcCandidateOutput {
     pub rebuild_cost: GcRebuildCostOutput,
     /// `true` iff every one of [`Self::checks`] passed.
     pub derivable: bool,
-    /// The five eligibility checks, each with its pass/fail and a
+    /// The six eligibility checks, each with its pass/fail and a
     /// human-readable justification. Order is stable:
-    /// `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`,
-    /// `age_threshold`.
+    /// `recipe_recorded`, `recipe_produces_output`, `replayable`,
+    /// `unreferenced`, `policy_allows`, `age_threshold`.
     pub checks: Vec<GcCheckOutput>,
 }
 
 /// One printed eligibility check inside a [`GcCandidateOutput`].
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct GcCheckOutput {
-    /// Stable check id: `recipe_recorded`, `replayable`, `unreferenced`,
-    /// `policy_allows`, or `age_threshold`.
+    /// Stable check id: `recipe_recorded`, `recipe_produces_output`,
+    /// `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.
     pub check: String,
-    /// Whether the check passed. A candidate is derivable only when all five
+    /// Whether the check passed. A candidate is derivable only when all six
     /// are `true`.
     pub passed: bool,
     /// Why the check reached that verdict — the auditable justification.

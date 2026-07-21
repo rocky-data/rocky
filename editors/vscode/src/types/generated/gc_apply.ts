@@ -93,7 +93,7 @@ export interface GcRefusedOutput {
  */
 export interface GcCheckOutput {
   /**
-   * Stable check id: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.
+   * Stable check id: `recipe_recorded`, `recipe_produces_output`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.
    */
   check: string;
   /**
@@ -101,7 +101,7 @@ export interface GcCheckOutput {
    */
   detail: string;
   /**
-   * Whether the check passed. A candidate is derivable only when all five are `true`.
+   * Whether the check passed. A candidate is derivable only when all six are `true`.
    */
   passed: boolean;
   [k: string]: unknown;

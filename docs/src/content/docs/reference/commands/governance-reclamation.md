@@ -13,7 +13,7 @@ For the concepts behind the policy plane and the agent authoring loop, see [Oper
 
 ## `rocky gc`
 
-Inventory Rocky-managed, content-addressed artifacts that are provably rebuildable, and plan their eviction.
+Inventory Rocky-managed, content-addressed artifacts whose recorded recipe makes them reclamation candidates, and plan their eviction.
 
 ```bash
 # Read-only inventory: what is derivable, and why (or why not)
@@ -37,9 +37,9 @@ An artifact is *derivable* only when every eligibility check passes: its recipe 
 
 A `gc` plan is **unconditionally review-gated**: `rocky apply <plan-id>` refuses it until `rocky review <plan-id> --approve` records a sign-off, and at apply time every eviction is re-verified against the live ledger. An entry that is no longer derivable (for example, a new reference appeared since plan time) is refused, with the failing checks reported.
 
-Eviction itself is a ledger operation first: a durable restore tombstone is written and the ledger row retired in one transaction, then the bytes are deleted through the object-store adapter on a best-effort basis. A deferred or failed physical delete leaves a safe orphan; the tombstone stands either way.
+Eviction is ledger-only: a durable restore tombstone is written and the ledger row retired in one transaction. No physical byte-delete follows. Reclaiming the bytes safely needs a protocol-aware VACUUM (retention windows plus TOCTOU-safe deletion against concurrent re-adds), which is future work, so `[gc] physical_delete = true` is a hard error rather than a silent no-op.
 
-**Honest boundary:** the tombstone records everything a restore will need (the recipe identity and restore pointer), but `rocky restore` itself is not yet shipped. Treat eviction as removal with a recorded rebuild path, not as a reversible operation today. `rocky gc` applies to the content-addressed write path only.
+**Honest boundary:** `rocky restore` rebuilds an evicted artifact from the recipe its tombstone references, and refuses unless the recomputed content hash matches the tombstoned one. Its coverage is narrower than gc's eviction set: it attempts a rebuild only for a recipe that is non-partitioned, content-addressed, and reads no recorded upstreams, and it refuses a recipe with any recorded upstream outright (multi-input DAG re-derivation is a later phase). Even a supported recipe can refuse — a missing provenance binding, canonical IR that will not deserialize, unreachable object store or table state, a hash that no longer reproduces, a path outside the storage prefix, or a lost race on ledger reinstatement. Re-running the pipeline is not a substitute: it recomputes from current upstreams and need not reproduce the evicted bytes. Treat eviction as removal with a recorded rebuild path that may not work for every artifact, not as a reversible operation. `rocky gc` applies to the content-addressed write path only.
 
 ---
 

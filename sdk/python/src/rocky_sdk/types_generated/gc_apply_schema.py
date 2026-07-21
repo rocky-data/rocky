@@ -13,7 +13,7 @@ class GcCheckOutput(BaseModel):
 
     check: str
     """
-    Stable check id: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.
+    Stable check id: `recipe_recorded`, `recipe_produces_output`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.
     """
     detail: str
     """
@@ -21,7 +21,7 @@ class GcCheckOutput(BaseModel):
     """
     passed: bool
     """
-    Whether the check passed. A candidate is derivable only when all five are `true`.
+    Whether the check passed. A candidate is derivable only when all six are `true`.
     """
 
 

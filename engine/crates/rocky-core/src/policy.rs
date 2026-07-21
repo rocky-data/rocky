@@ -1167,68 +1167,6 @@ mod tests {
         assert_eq!(d.matched_rule, None);
     }
 
-    /// PINS CURRENT BEHAVIOR (KNOWN GAP — gc policy is unenforceable).
-    ///
-    /// **Current behavior:** a governor writes `deny agent gc`, but the rule
-    /// never fires. `rocky gc` plans resolve to `PolicyPrincipal::Human`
-    /// (`plan_store::default_principal_for_kind` maps every kind except
-    /// `AiAuthored`/`Backfill` to `Human`), and an unmatched rule under
-    /// `Human` returns a hardcoded `Allow` — "humans are not gated". The
-    /// agent-scoped rule is not a candidate for a human principal, so the
-    /// evaluation falls straight through to the fail-open default.
-    ///
-    /// **Why this is wrong:** `default_principal_for_kind`'s own doc comment
-    /// explains that `AiAuthored`/`Backfill` are special-cased *precisely* so
-    /// they never evaluate as `human`, "which would let it escape the
-    /// agent-scoped policy rules a governor writes". Gc is machine-composed by
-    /// exactly the same argument — it is on the wrong side of that
-    /// distinction. The net effect is that `deny agent gc` is silently
-    /// inert: a governor writes a rule that gates storage reclamation and gets
-    /// no gating at all, with no diagnostic.
-    ///
-    /// **Expected to be inverted when fixed.** The fix (routing `PlanKind::Gc`
-    /// to `Agent`, and/or gating humans on machine-composed kinds) is a
-    /// behavior change to a public policy surface and needs a deprecation
-    /// path, so it is deferred to an owner decision. When it lands, this
-    /// assertion should flip to `Deny` and the test should be renamed.
-    ///
-    /// The companion pin on the principal mapping itself is
-    /// `gc_kind_resolves_to_human_so_agent_rules_never_fire_known_gap` in
-    /// `rocky-cli/src/plan_store.rs`.
-    #[test]
-    fn deny_agent_gc_does_not_fire_for_human_principal_known_gap() {
-        let p = policy(vec![rule(
-            PolicyPrincipal::Agent,
-            PolicyCapability::Gc,
-            PolicyScope::default(),
-            PolicyEffect::Deny,
-        )]);
-        // The principal a gc plan actually evaluates as today.
-        let d = evaluate(
-            &p,
-            PolicyPrincipal::Human,
-            PolicyCapability::Gc,
-            &contracted_model(),
-        );
-        assert_eq!(
-            d.effect,
-            PolicyEffect::Allow,
-            "KNOWN GAP: a `deny agent gc` rule is inert because gc plans evaluate as human"
-        );
-        assert_eq!(d.matched_rule, None, "the agent rule was never a candidate");
-
-        // Non-vacuous: the SAME policy does deny when the principal is `Agent`,
-        // so the rule itself is well-formed — only the principal routing is
-        // wrong.
-        let d_agent = evaluate(
-            &p,
-            PolicyPrincipal::Agent,
-            PolicyCapability::Gc,
-            &contracted_model(),
-        );
-        assert_eq!(d_agent.effect, PolicyEffect::Deny);
-    }
-
     #[test]
     fn agent_default_posture_uses_default_agent_effect() {
         let mut p = policy(vec![]);

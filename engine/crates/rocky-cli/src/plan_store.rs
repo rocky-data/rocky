@@ -977,48 +977,62 @@ mod tests {
         );
     }
 
-    /// PINS CURRENT BEHAVIOR (KNOWN GAP — gc escapes agent-scoped policy).
+    /// PINS INTENDED BEHAVIOR: a gc plan **is** governable — a `deny agent gc`
+    /// rule fires against an agent applier.
     ///
-    /// **Current behavior:** `PlanKind::Gc` falls into the `_ => Human` arm of
-    /// [`default_principal_for_kind`], so an unstamped gc plan evaluates as a
-    /// human principal. `rocky_core::policy::evaluate` returns a hardcoded
-    /// `Allow` for an unmatched rule under `Human`, so a governor's
-    /// `deny agent gc` rule can never fire.
+    /// Gc carries no kind-forced principal (it falls into the `_ => Human` arm
+    /// of [`default_principal_for_kind`]), but that is only *half* of the
+    /// enforcement input. [`PersistedPlan::enforcement_principal`] takes the
+    /// [`most_restrictive`] of the kind default and the **apply-time runtime
+    /// principal**, so `ROCKY_PRINCIPAL=agent rocky apply <gc-plan>` enforces
+    /// as `Agent` and an agent-scoped rule is a live candidate. Storage
+    /// reclamation is governable; reading the kind default alone would suggest
+    /// otherwise, which is exactly the misreading this test exists to prevent.
     ///
-    /// **Why this is wrong:** this function's own doc comment says
-    /// `AiAuthored`/`Backfill` are special-cased so they never evaluate as
-    /// `human`, "which would let it escape the agent-scoped policy rules a
-    /// governor writes". A gc plan is machine-composed by the same argument —
-    /// the eviction set is computed by the engine, not typed by a person — so
-    /// it belongs on the `Agent` side of that exact distinction. Today it is
-    /// on the wrong side, and storage reclamation is ungovernable as a result.
+    /// The complementary case is deliberate design, not a gap: a **human**
+    /// applying a gc plan enforces as `human` — the "human vouches" model
+    /// documented on `enforcement_principal`, where the human applier is the
+    /// responsible party. Kind-forcing to `Agent` is reserved for
+    /// `AiAuthored`/`Backfill`, which are machine-composed *by construction*
+    /// and so cannot have a vouching human.
     ///
-    /// **Expected to be inverted when fixed.** Moving `PlanKind::Gc` to
-    /// `Agent` changes the effective policy outcome for existing deployments —
-    /// a public surface since 1.0 — so it needs a deprecation path and an
-    /// owner decision. When that lands this assertion flips to
-    /// `PolicyPrincipal::Agent` and the test should be renamed.
-    ///
-    /// The companion pin on the fail-open evaluation is
-    /// `deny_agent_gc_does_not_fire_for_human_principal_known_gap` in
-    /// `rocky-core/src/policy.rs`.
+    /// This asserts through `enforcement_principal` — the function the gc apply
+    /// gate actually calls (`commands/gc.rs`) — rather than
+    /// `default_principal_for_kind` in isolation, so it would fail if kind
+    /// routing or the `most_restrictive` combination regressed.
     #[test]
-    fn gc_kind_resolves_to_human_so_agent_rules_never_fire_known_gap() {
+    fn gc_plan_enforces_as_agent_for_an_agent_applier() {
+        let gc = PersistedPlan {
+            plan_id: "x".to_string(),
+            kind: PlanKind::Gc,
+            created_at: Utc::now(),
+            format_version: 1,
+            principal: None,
+            payload: serde_json::json!({}),
+        };
+        // The load-bearing assertion: an agent applier is gated as agent, so a
+        // governor's `deny agent gc` rule DOES fire.
         assert_eq!(
-            super::default_principal_for_kind(&PlanKind::Gc),
+            gc.enforcement_principal(PolicyPrincipal::Agent),
+            PolicyPrincipal::Agent,
+            "an agent applying a gc plan must enforce as agent — `deny agent gc` fires"
+        );
+        // Intended counterpart: a human applier vouches, so gc enforces as human.
+        assert_eq!(
+            gc.enforcement_principal(PolicyPrincipal::Human),
             PolicyPrincipal::Human,
-            "KNOWN GAP: gc plans evaluate as human, escaping agent-scoped policy rules"
+            "a human applying a gc plan enforces as human (the human-vouches model)"
         );
-        // Non-vacuous contrast: the two kinds that ARE special-cased resolve to
-        // `Agent`, which is the treatment gc should receive.
-        assert_eq!(
-            super::default_principal_for_kind(&PlanKind::AiAuthored),
-            PolicyPrincipal::Agent
-        );
-        assert_eq!(
-            super::default_principal_for_kind(&PlanKind::Backfill),
-            PolicyPrincipal::Agent
-        );
+        // Contrast: the kinds that ARE machine-composed by construction stay
+        // agent even under a human applier — the distinction gc deliberately
+        // does not share.
+        for kind in [PlanKind::AiAuthored, PlanKind::Backfill] {
+            assert_eq!(
+                super::default_principal_for_kind(&kind),
+                PolicyPrincipal::Agent,
+                "{kind} is agent by kind"
+            );
+        }
     }
 
     #[test]

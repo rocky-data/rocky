@@ -1949,15 +1949,18 @@ enum Command {
         by: Option<String>,
     },
 
-    /// Inventory Rocky-managed artifacts that are provably rebuildable.
+    /// Inventory Rocky-managed artifacts eligible for reclamation.
     ///
     /// `--derivable --dry-run` joins the content-addressed artifact ledger
     /// against replayability verdicts, ledger refcounts, and recipe
-    /// provenance to report which stored bytes Rocky can prove it can rebuild
-    /// bit-exact — and are therefore reclaimable cache rather than assets.
-    /// Each candidate prints all five eligibility checks (recipe recorded,
-    /// replayable, unreferenced, policy allows, past the age threshold), and
-    /// the header states how much of managed storage is derivable.
+    /// provenance to report which stored bytes carry a recorded recipe bound
+    /// to them — reclamation candidates rather than assets. Each candidate
+    /// prints all six eligibility checks (recipe recorded, recipe bound to
+    /// this artifact's output hash, replayable, unreferenced, policy allows,
+    /// past the age threshold), and the header states how much of managed
+    /// storage is derivable. `derivable` is an eligibility verdict, not a
+    /// promise that `rocky restore` can rebuild the artifact — restore covers
+    /// only recipes that read no recorded upstreams.
     ///
     /// `--dry-run` is the read-only inventory. Without it, `--derivable` writes
     /// a review-gated GC *plan* (it never deletes directly) — approve it with
