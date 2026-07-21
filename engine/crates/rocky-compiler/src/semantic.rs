@@ -35,12 +35,58 @@ pub struct ModelSchema {
     pub columns: Vec<ColumnDef>,
     /// Whether this model uses SELECT * (schema depends on upstream).
     pub has_star: bool,
+    /// Projection items whose true output column name the extractor could not
+    /// determine — carried through from
+    /// [`rocky_sql::lineage::LineageResult::unresolved_projections`].
+    ///
+    /// [`Self::columns`] is the model's **complete** output schema only when
+    /// this is `0` *and* [`Self::has_star`] is `false`; see
+    /// [`Self::schema_is_complete`]. `has_star` alone is not a completeness
+    /// proxy: `SELECT (order_id) FROM raw.t` has no star yet yields no column
+    /// entry at all, and `SELECT (order_id), amount FROM raw.t` yields a
+    /// non-empty but incomplete set — so an emptiness check doesn't cover it
+    /// either.
+    ///
+    /// `#[serde(default)]` keeps graphs serialized by an older build loadable;
+    /// they deserialize as "fully understood", matching how they behaved then.
+    #[serde(default)]
+    pub unresolved_projections: usize,
     /// Models this model depends on.
     pub upstream: Vec<String>,
     /// Models that depend on this model.
     pub downstream: Vec<String>,
     /// Natural language intent (from model config).
     pub intent: Option<String>,
+}
+
+impl ModelSchema {
+    /// Whether [`Self::columns`] is provably the model's **entire** output
+    /// schema, so that "column X is absent" is a fact rather than a gap in
+    /// what the compiler could recover.
+    ///
+    /// Two independent things can leave the enumeration short, and a check that
+    /// must not fire on a valid model has to rule out both:
+    ///
+    /// - **A star.** `SELECT *` expands from whatever the source turns out to
+    ///   be. The builder resolves it when every source is a known model or has
+    ///   a cached schema, but it cannot when the star expands a raw table Rocky
+    ///   has never described — and a root `SELECT * FROM raw.t` records *no*
+    ///   upstream models, so "is any upstream unknown?" is vacuously false
+    ///   there. Any star is therefore treated as not-provably-complete.
+    /// - **A projection item lineage could not name**, counted in
+    ///   [`Self::unresolved_projections`]. This is the part `has_star` says
+    ///   nothing about: `SELECT (order_id) FROM raw.t` is star-free and yields
+    ///   zero columns; `SELECT (order_id), amount FROM raw.t` yields exactly
+    ///   one. Neither is empty-vs-non-empty distinguishable from a genuinely
+    ///   one-column model, which is why this needs a signal from the extractor
+    ///   rather than a heuristic here.
+    ///
+    /// Absence-style diagnostics (today: W006) must gate on this. Presence-style
+    /// ones need not — a column that *is* listed really is produced.
+    #[must_use]
+    pub fn schema_is_complete(&self) -> bool {
+        !self.has_star && self.unresolved_projections == 0
+    }
 }
 
 /// The full semantic graph for a project.
@@ -413,6 +459,7 @@ pub fn build_semantic_graph(
             ModelSchema {
                 columns: output_columns,
                 has_star: lineage_result.has_star,
+                unresolved_projections: lineage_result.unresolved_projections,
                 upstream: upstream_map
                     .get(model_name.as_str())
                     .map(|deps| deps.iter().map(std::string::ToString::to_string).collect())
@@ -489,6 +536,49 @@ mod tests {
         assert!(!c_edges.is_empty());
         assert_eq!(&*c_edges[0].source.model, "b");
         assert_eq!(&*c_edges[0].source.column, "id");
+    }
+
+    // ----- `schema_is_complete` -----
+    //
+    // The flag that absence-style diagnostics gate on. It must be derived from
+    // the extractor rather than guessed at the consumer, so these pin the
+    // derivation end-to-end through `build_semantic_graph`.
+
+    #[test]
+    fn test_schema_is_complete_for_explicit_projection() {
+        let models = vec![make_model("a", "SELECT id, name FROM source.raw.users")];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        let schema = graph.models.get("a").expect("model present");
+        assert_eq!(schema.unresolved_projections, 0);
+        assert!(schema.schema_is_complete());
+    }
+
+    #[test]
+    fn test_schema_not_complete_for_star() {
+        let models = vec![make_model("a", "SELECT * FROM source.raw.users")];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        let schema = graph.models.get("a").expect("model present");
+        assert!(!schema.schema_is_complete());
+    }
+
+    #[test]
+    fn test_schema_not_complete_for_unnameable_projection_item() {
+        // Star-free and yet not enumerable — the case `has_star` alone cannot
+        // express, and the reason this flag exists as a separate signal.
+        let models = vec![make_model("a", "SELECT (id), name FROM source.raw.users")];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+
+        let schema = graph.models.get("a").expect("model present");
+        assert!(!schema.has_star, "no star in this projection");
+        assert_eq!(schema.unresolved_projections, 1);
+        assert!(!schema.schema_is_complete());
+        // Non-empty but incomplete: an emptiness heuristic would miss this.
+        assert_eq!(schema.columns.len(), 1);
     }
 
     #[test]

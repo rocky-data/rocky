@@ -18,8 +18,8 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E036, I001, I002, SourceSpan,
-    W001, W002, W003, W004, W005,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, I001, I002, SourceSpan, W001,
+    W002, W003, W004, W005, W006,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{RockyType, TypedColumn};
@@ -548,24 +548,23 @@ fn compute_model_typecheck(
     // column is real, has the right type, isn't nullable, etc. — see
     // `check_time_interval_strategy` for the full list of E020-E026 + W003.
     // For `type = "merge"` we confirm every `unique_key` column is real — see
-    // `check_merge_strategy` (E036).
+    // `check_merge_strategy` (W006).
     //
-    // E036 is an *error*, so it only runs when `typed_cols` is provably the
-    // model's whole output — i.e. the model has no `SELECT *`. A star is not
-    // enumerable in general: it may expand from a raw source (no schema at
-    // all), or from a model *plus* a raw source in a join. Neither shows up as
-    // an "unknown upstream", because `ModelSchema::upstream` records only
-    // models — a root `SELECT * FROM raw.t` has an empty `upstream`. Gating on
-    // upstream knowledge therefore let the check run against a partial (often
-    // empty) column set and reject valid keys. Explicit column lists — the
-    // common case, and the only one where a typo is provable — keep full
-    // coverage.
+    // W006 is an *absence* check, so it only runs when `typed_cols` is provably
+    // the model's whole output. That question is answered by
+    // `ModelSchema::schema_is_complete`, which the semantic-graph builder
+    // derives from the lineage extractor — not reconstructed here. Deriving it
+    // locally is what produced this check's false positives twice over: neither
+    // "is any upstream unknown?" nor "is there a star?" is a completeness
+    // signal, because a star-free projection can still fail to enumerate (a
+    // parenthesised or computed item lineage cannot name) and an emptiness
+    // check misses the partial case.
     if let Some(model) = model_by_name.get(model_name) {
         diagnostics.extend(check_time_interval_strategy(model, &typed_cols));
         diagnostics.extend(check_merge_strategy(
             model,
             &typed_cols,
-            !model_schema.has_star,
+            model_schema.schema_is_complete(),
         ));
     }
 
@@ -754,53 +753,83 @@ fn check_time_interval_strategy(
 ///
 /// | Code  | Severity | Meaning |
 /// |-------|----------|---------|
-/// | E036  | Error    | `unique_key` column not in the model's output schema |
+/// | W006  | Warning  | `unique_key` column not in the model's output schema |
 ///
 /// This is the merge-key counterpart to [`check_time_interval_strategy`]'s
 /// E020: a `unique_key` naming a column the model doesn't produce is a typo
 /// that would otherwise only surface when the warehouse rejects the generated
 /// `MERGE ... ON` clause.
 ///
-/// `schema_known` is false when the model's output columns can't be fully
-/// enumerated — in practice, whenever the model's SQL contains a `SELECT *`.
-/// The check is skipped in that case: `typed_cols` may be a partial (or empty)
-/// view of the real output, so a key that is genuinely produced by the star
-/// would be reported missing. Since E036 is an error, a false positive breaks
-/// a valid build, which is strictly worse than missing a typo in a model whose
-/// output set isn't knowable at compile time anyway.
+/// # Why this warns rather than errors
 ///
-/// # Why this matches case-insensitively when E010/E020 do not
+/// The check can only be as trustworthy as the compiler's enumeration of a
+/// model's output columns, and that enumeration is recovered from lineage
+/// extraction rather than a full semantic analysis of the SQL. Three distinct
+/// false-positive classes were found in this check before it ever shipped, each
+/// one a different way the enumeration falls short. Under an error severity
+/// every such gap fails a valid build; under a warning it costs a line of
+/// output. Given a soft input signal, the soft severity is the honest one.
 ///
-/// Deliberate, not an oversight. `unique_key` entries are constrained to
-/// `^[a-zA-Z0-9_]+$` by [`rocky_sql::validation::validate_identifier`], so a
-/// merge key can never be a quoted identifier — the dialects interpolate it
-/// into `MERGE ... ON t.<key> = s.<key>` as a bare unquoted name. Every
-/// warehouse Rocky targets resolves unquoted identifiers case-insensitively
-/// (Snowflake folds them to uppercase, Postgres/Trino to lowercase, DuckDB and
-/// Databricks match case-insensitively while preserving the stored case). So a
-/// key differing from a real output column only in case always resolves at run
-/// time: there is no true positive in that class to detect, and flagging it can
-/// only fail a build that would have worked. This mirrors the adapter layer,
-/// which already matches warehouse-returned column names with
-/// `eq_ignore_ascii_case`.
+/// # `schema_complete`
 ///
-/// E010 (contract `required` columns) and E020 (`time_column`) still compare
-/// exactly. Those are pre-existing and out of scope here rather than
-/// deliberately different — see the E036 review discussion.
+/// Supplied by [`crate::semantic::ModelSchema::schema_is_complete`] — the check
+/// runs only when the model's output columns are *provably* the whole set. It
+/// deliberately does not re-derive that locally: this is an absence check, and
+/// "column X is not here" is only meaningful against a complete list. A star
+/// may expand from a raw source with no known schema; an unnamed non-identifier
+/// projection item (`SELECT (order_id)`) contributes no entry at all. In both
+/// cases `typed_cols` is a partial view and every key would look missing.
+///
+/// # Case sensitivity — matched case-insensitively, with one known gap
+///
+/// `unique_key` entries are constrained to `^[a-zA-Z0-9_]+$` by
+/// [`rocky_sql::validation::validate_identifier`], so a key is always a plain
+/// identifier. What each dialect then does with it differs, and the survey
+/// matters because it bounds what this check can honestly claim:
+///
+/// | Adapter    | `merge_into` renders the key as | Case behaviour |
+/// |------------|---------------------------------|----------------|
+/// | Databricks | `t.{key} = s.{key}` — bare      | resolves case-insensitively |
+/// | DuckDB     | `t.{key} = s.{key}` — bare      | resolves case-insensitively |
+/// | `BigQuery` | `target.{key} = source.{key}` — bare | resolves case-insensitively |
+/// | Snowflake  | `t.{q} = s.{q}` — **double-quoted** via `quote_identifier` | case-**sensitive** |
+/// | Trino      | n/a — returns `not_supported`; `merge` is rejected at validate time | n/a |
+///
+/// Snowflake quotes deliberately: it folds unquoted identifiers to uppercase,
+/// so a lowercase stored column only resolves under explicit quoting. The
+/// consequence for this check is a real, accepted limitation: `unique_key =
+/// ["ORDER_ID"]` against a projected `order_id` passes here and then fails at
+/// run time on Snowflake alone.
+///
+/// Matching case-insensitively anyway is the correct trade:
+///
+/// - Exact matching would emit on every case-only difference, which is valid on
+///   four of the five adapters — trading a Snowflake-only false negative for a
+///   false positive on everything else.
+/// - Deciding per dialect is not possible here. The target adapter is not
+///   reachable at typecheck time: neither
+///   [`crate::compile::CompilerConfig`] nor `typecheck_project_with_models`
+///   carries one, and callers such as the LSP and `rocky-ai` legitimately have
+///   no adapter configured at all. Plumbing one through to serve a single
+///   warning is not a trade worth making.
+/// - The failure this check exists to prevent — a typo'd key — is caught
+///   regardless; only the case-variant subset escapes, and only on Snowflake.
+///
+/// The Snowflake gap is documented rather than closed. Closing it belongs with
+/// a dialect-aware validation pass that has the adapter in hand, not here.
 ///
 /// # Boundary
 ///
 /// Case-insensitive matching cannot disambiguate a model that projects two
 /// columns differing only in case (`Order_ID` and `order_id`). `unique_key =
-/// ["ORDER_ID"]` matches both, and E036 stays quiet. That is acceptable: E036
-/// is an existence check, and the column does exist. Such a model is already
-/// ambiguous on every case-insensitive warehouse — the ambiguity is the
-/// projection's, and diagnosing it belongs to a duplicate-column check, not
-/// here.
+/// ["ORDER_ID"]` matches both and the check stays quiet. That is acceptable:
+/// this is an existence check, and the column does exist. Such a model is
+/// already ambiguous on every case-insensitive warehouse — the ambiguity is the
+/// projection's, and diagnosing it belongs to a duplicate-column check.
 fn check_merge_strategy(
     model: &rocky_core::models::Model,
     typed_cols: &[crate::types::TypedColumn],
-    schema_known: bool,
+    schema_complete: bool,
 ) -> Vec<Diagnostic> {
     use rocky_core::models::StrategyConfig;
 
@@ -811,22 +840,22 @@ fn check_merge_strategy(
         return Vec::new();
     };
 
-    // Can't enumerate the model's real output columns, so an existence check
+    // Can't enumerate the model's real output columns, so an absence check
     // would be guesswork. Stay quiet rather than emit a false positive.
-    if !schema_known {
+    if !schema_complete {
         return Vec::new();
     }
 
-    // E036: every unique_key entry must exist in the typed output schema.
+    // W006: every unique_key entry must exist in the typed output schema.
     //
-    // Matched case-insensitively — see this function's doc comment for why
-    // that differs from the exact matching E010/E020 use nearby.
+    // Matched case-insensitively — see this function's doc comment for the
+    // per-adapter survey behind that choice and the gap it accepts.
     unique_key
         .iter()
         .filter(|key| !typed_cols.iter().any(|c| c.name.eq_ignore_ascii_case(key)))
         .map(|key| {
-            Diagnostic::error(
-                E036,
+            Diagnostic::warning(
+                W006,
                 model_name,
                 format!("unique_key '{key}' is not in the output schema of model '{model_name}'"),
             )
@@ -3453,7 +3482,7 @@ mod tests {
         assert!(diags.iter().any(|d| &*d.code == "E024"));
     }
 
-    // ----- E036: merge unique_key existence -----
+    // ----- W006: merge unique_key existence -----
 
     /// Build a `merge`-strategy model with the given `unique_key`. Mirrors
     /// `make_time_interval_model` but swaps the strategy so the merge checks
@@ -3492,16 +3521,16 @@ mod tests {
     }
 
     #[test]
-    fn test_e036_missing_unique_key() {
+    fn test_w006_missing_unique_key() {
         // `custommer_id` is a typo — the real column is `customer_id`.
         let model = make_merge_model("m", &["custommer_id"]);
         let cols = vec![typed_col("customer_id", RockyType::String, false)];
         let diags = check_merge_strategy(&model, &cols, true);
-        assert!(diags.iter().any(|d| &*d.code == "E036"));
+        assert!(diags.iter().any(|d| &*d.code == "W006"));
     }
 
     #[test]
-    fn test_e036_reports_every_missing_key() {
+    fn test_w006_reports_every_missing_key() {
         // A composite key with two typos should report both, not just the
         // first — one diagnostic per missing key.
         let model = make_merge_model("m", &["tenant_id", "custommer_id", "ordr_id"]);
@@ -3511,16 +3540,16 @@ mod tests {
             typed_col("order_id", RockyType::String, false),
         ];
         let diags = check_merge_strategy(&model, &cols, true);
-        let e036: Vec<_> = diags.iter().filter(|d| &*d.code == "E036").collect();
-        assert_eq!(e036.len(), 2, "expected both bad keys reported: {diags:?}");
-        assert!(e036.iter().any(|d| d.message.contains("custommer_id")));
-        assert!(e036.iter().any(|d| d.message.contains("ordr_id")));
+        let w006: Vec<_> = diags.iter().filter(|d| &*d.code == "W006").collect();
+        assert_eq!(w006.len(), 2, "expected both bad keys reported: {diags:?}");
+        assert!(w006.iter().any(|d| d.message.contains("custommer_id")));
+        assert!(w006.iter().any(|d| d.message.contains("ordr_id")));
         // The valid key must not be reported.
-        assert!(!e036.iter().any(|d| d.message.contains("tenant_id")));
+        assert!(!w006.iter().any(|d| d.message.contains("tenant_id")));
     }
 
     #[test]
-    fn test_e036_skipped_when_schema_unknown() {
+    fn test_w006_skipped_when_schema_unknown() {
         // `SELECT *` over an unknown upstream: typed_cols isn't the model's
         // real output, so we must stay quiet rather than flag every key.
         let model = make_merge_model("m", &["customer_id"]);
@@ -3532,7 +3561,7 @@ mod tests {
     }
 
     #[test]
-    fn test_e036_suggestion_lists_available_columns() {
+    fn test_w006_suggestion_lists_available_columns() {
         let model = make_merge_model("m", &["nope"]);
         let cols = vec![
             typed_col("customer_id", RockyType::String, false),
@@ -3541,17 +3570,35 @@ mod tests {
         let diags = check_merge_strategy(&model, &cols, true);
         let d = diags
             .iter()
-            .find(|d| &*d.code == "E036")
-            .expect("expected E036");
+            .find(|d| &*d.code == "W006")
+            .expect("expected W006");
         let suggestion = d.suggestion.as_deref().expect("expected a suggestion");
         assert!(suggestion.contains("customer_id"));
         assert!(suggestion.contains("order_date"));
     }
 
-    // ----- E036 end-to-end: the `schema_known` argument as the caller computes
-    // it. The unit tests above hand the flag to `check_merge_strategy`, so they
-    // can only prove the check behaves correctly *given* a correct flag. These
-    // go through `typecheck_project_with_models`, which derives it. -----
+    #[test]
+    fn test_w006_is_a_warning_not_an_error() {
+        // Severity in this codebase follows the code prefix, so a `W` code
+        // emitted at `Error` severity would be a contradiction — and would
+        // silently reintroduce the build-breaking behaviour this check was
+        // downgraded away from.
+        let model = make_merge_model("m", &["nope"]);
+        let cols = vec![typed_col("customer_id", RockyType::String, false)];
+        let diags = check_merge_strategy(&model, &cols, true);
+        let d = diags
+            .iter()
+            .find(|d| &*d.code == "W006")
+            .expect("expected W006");
+        assert_eq!(d.severity, crate::diagnostic::Severity::Warning);
+    }
+
+    // ----- W006 end-to-end: the completeness flag as the caller computes it.
+    // The unit tests above hand the flag to `check_merge_strategy`, so they can
+    // only prove the check behaves correctly *given* a correct flag — the two
+    // false-positive classes this check shipped with were both a caller
+    // computing it wrong, which such a test can never catch. Everything below
+    // goes through `typecheck_project_with_models`, which derives it. -----
 
     /// A `merge` model with the given SQL and `unique_key`, suitable for
     /// building a real `Project` (unlike `make_merge_model`, which is shaped
@@ -3566,7 +3613,7 @@ mod tests {
     }
 
     #[test]
-    fn test_e036_not_fired_for_select_star_over_non_model_source() {
+    fn test_w006_not_fired_for_select_star_over_non_model_source() {
         // Regression: `SELECT *` over a raw (non-model) source produces an
         // empty typed output schema, because `ModelSchema::upstream` lists
         // only *models*. The original guard asked "does any upstream have an
@@ -3584,14 +3631,14 @@ mod tests {
             typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
 
         assert!(
-            !result.diagnostics.iter().any(|d| &*d.code == "E036"),
-            "E036 must not fire for `SELECT *` over a non-model source: {:?}",
+            !result.diagnostics.iter().any(|d| &*d.code == "W006"),
+            "W006 must not fire for `SELECT *` over a non-model source: {:?}",
             result.diagnostics
         );
     }
 
     #[test]
-    fn test_e036_not_fired_for_select_star_joining_non_model_source() {
+    fn test_w006_not_fired_for_select_star_joining_non_model_source() {
         // The under-inclusive sibling of the case above: here `upstream` is
         // `["up"]` and `up`'s schema *is* known, so an "any upstream unknown?"
         // guard is false — yet the star also pulls columns from
@@ -3612,14 +3659,14 @@ mod tests {
             typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
 
         assert!(
-            !result.diagnostics.iter().any(|d| &*d.code == "E036"),
-            "E036 must not fire when a star also expands a non-model source: {:?}",
+            !result.diagnostics.iter().any(|d| &*d.code == "W006"),
+            "W006 must not fire when a star also expands a non-model source: {:?}",
             result.diagnostics
         );
     }
 
     #[test]
-    fn test_e036_still_fires_end_to_end_for_explicit_columns() {
+    fn test_w006_still_fires_end_to_end_for_explicit_columns() {
         // The true positive must survive the fix: an explicit column list is
         // fully enumerable, so a typo'd `unique_key` is provably wrong.
         let models = vec![make_merge_project_model(
@@ -3632,22 +3679,22 @@ mod tests {
         let result =
             typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
 
-        let e036: Vec<_> = result
+        let w006: Vec<_> = result
             .diagnostics
             .iter()
-            .filter(|d| &*d.code == "E036")
+            .filter(|d| &*d.code == "W006")
             .collect();
         assert_eq!(
-            e036.len(),
+            w006.len(),
             1,
-            "expected exactly one E036 for the typo'd key: {:?}",
+            "expected exactly one W006 for the typo'd key: {:?}",
             result.diagnostics
         );
-        assert!(e036[0].message.contains("ordr_id"));
+        assert!(w006[0].message.contains("ordr_id"));
     }
 
     #[test]
-    fn test_e036_not_fired_end_to_end_for_correct_explicit_key() {
+    fn test_w006_not_fired_end_to_end_for_correct_explicit_key() {
         let models = vec![make_merge_project_model(
             "orders",
             "SELECT order_id, amount FROM poc.raw.orders",
@@ -3659,16 +3706,146 @@ mod tests {
             typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
 
         assert!(
-            !result.diagnostics.iter().any(|d| &*d.code == "E036"),
-            "E036 must not fire when the key is a real column: {:?}",
+            !result.diagnostics.iter().any(|d| &*d.code == "W006"),
+            "W006 must not fire when the key is a real column: {:?}",
             result.diagnostics
         );
     }
 
-    // ----- E036: identifier case -----
+    #[test]
+    fn test_w006_not_fired_for_parenthesised_projection() {
+        // Regression: `(order_id)` parses as `Expr::Nested`, which the lineage
+        // extractor does not resolve — so the item yields no output column, and
+        // being unnamed it gets no alias fallback either. The projection has no
+        // star, so a `!has_star` completeness test called this schema fully
+        // known while `typed_cols` was in fact *empty*, and the check flagged a
+        // model whose generated MERGE runs perfectly well.
+        let models = vec![make_merge_project_model(
+            "orders",
+            "SELECT (order_id) FROM poc.raw.orders",
+            &["order_id"],
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "W006"),
+            "W006 must not fire when a projection item could not be enumerated: {:?}",
+            result.diagnostics
+        );
+    }
 
     #[test]
-    fn test_e036_not_fired_for_case_mismatched_unique_key() {
+    fn test_w006_not_fired_for_partially_parenthesised_projection() {
+        // The partial sibling of the case above, and the reason a
+        // `typed_cols.is_empty()` guard is not a sufficient fix: `amount`
+        // resolves, `(order_id)` does not, so the enumerated schema is
+        // non-empty *and* incomplete. Only a completeness signal from the
+        // extractor itself distinguishes this from a genuinely one-column
+        // model with a typo'd key.
+        let models = vec![make_merge_project_model(
+            "orders",
+            "SELECT (order_id), amount FROM poc.raw.orders",
+            &["order_id"],
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "W006"),
+            "a non-empty but incomplete schema must still suppress W006: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_w006_not_fired_for_unnamed_computed_projection() {
+        // The general form of the same defect: an unnamed item the extractor
+        // *can* trace still has no predictable output name — `UPPER(order_id)`
+        // is recorded as lineage from `order_id`, which is the right answer for
+        // impact analysis and the wrong one for "what columns does this model
+        // output?". The schema is therefore not complete and the check must
+        // stay quiet. Guards against a fix that only special-cases `Nested`.
+        let models = vec![make_merge_project_model(
+            "orders",
+            "SELECT UPPER(order_id), amount FROM poc.raw.orders",
+            &["order_key"],
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "W006"),
+            "W006 must not fire when an unnamed expression has no predictable name: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_w006_still_fires_when_expressions_are_aliased() {
+        // The flip side: aliasing restores completeness, because `expr AS name`
+        // always yields a correctly named output column. A model that computes
+        // things is still fully checkable as long as it names its outputs — so
+        // the completeness gate costs coverage only on genuinely unnameable
+        // projections, not on every model that uses an expression.
+        let models = vec![make_merge_project_model(
+            "orders",
+            "SELECT UPPER(order_id) AS order_key, amount FROM poc.raw.orders",
+            &["ordr_key"],
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        let w006: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "W006")
+            .collect();
+        assert_eq!(
+            w006.len(),
+            1,
+            "aliased expressions keep the schema complete: {:?}",
+            result.diagnostics
+        );
+        assert!(w006[0].message.contains("ordr_key"));
+    }
+
+    #[test]
+    fn test_w006_qualified_identifier_projection_stays_complete() {
+        // `o.order_id` is a `CompoundIdentifier` — still a bare identifier with
+        // a predictable output name (`order_id`), so it must not be counted as
+        // unresolved. Without this the completeness gate would silently switch
+        // the check off for every model that qualifies its columns, which is
+        // most joined models.
+        let models = vec![make_merge_project_model(
+            "orders",
+            "SELECT o.order_id, o.amount FROM poc.raw.orders o",
+            &["ordr_id"],
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            result.diagnostics.iter().any(|d| &*d.code == "W006"),
+            "qualified identifiers must not suppress W006: {:?}",
+            result.diagnostics
+        );
+    }
+
+    // ----- W006: identifier case -----
+
+    #[test]
+    fn test_w006_not_fired_for_case_mismatched_unique_key() {
         // `ORDER_ID` vs the projected `order_id`. Rocky interpolates the key
         // into `MERGE ... ON t.ORDER_ID = s.ORDER_ID` as a bare unquoted
         // identifier, which every supported warehouse resolves
@@ -3684,14 +3861,14 @@ mod tests {
             typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
 
         assert!(
-            !result.diagnostics.iter().any(|d| &*d.code == "E036"),
-            "E036 must not fire on a case-mismatched but valid key: {:?}",
+            !result.diagnostics.iter().any(|d| &*d.code == "W006"),
+            "W006 must not fire on a case-mismatched but valid key: {:?}",
             result.diagnostics
         );
     }
 
     #[test]
-    fn test_e036_case_insensitive_match_both_directions() {
+    fn test_w006_case_insensitive_match_both_directions() {
         // Mixed case on either side must match: the model may project
         // `Order_ID` just as easily as the key may be written `order_id`.
         let model = make_merge_model("m", &["order_id"]);
@@ -3710,7 +3887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_e036_case_insensitivity_does_not_swallow_near_miss_typos() {
+    fn test_w006_case_insensitivity_does_not_swallow_near_miss_typos() {
         // The true positive must survive: `order_idd` differs from `order_id`
         // by more than case, so case-insensitive matching must still reject
         // it. Guards against a fix that over-corrects into fuzzy matching.
@@ -3724,29 +3901,29 @@ mod tests {
         let result =
             typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
 
-        let e036: Vec<_> = result
+        let w006: Vec<_> = result
             .diagnostics
             .iter()
-            .filter(|d| &*d.code == "E036")
+            .filter(|d| &*d.code == "W006")
             .collect();
         assert_eq!(
-            e036.len(),
+            w006.len(),
             1,
-            "expected E036 for a genuine typo: {:?}",
+            "expected W006 for a genuine typo: {:?}",
             result.diagnostics
         );
-        assert!(e036[0].message.contains("order_idd"));
+        assert!(w006[0].message.contains("order_idd"));
     }
 
     #[test]
-    fn test_e036_case_insensitive_only_ignores_case_not_separators() {
+    fn test_w006_case_insensitive_only_ignores_case_not_separators() {
         // `orderid` (no underscore) is a different identifier, not a case
         // variant, and must still error.
         let model = make_merge_model("m", &["ORDERID"]);
         let cols = vec![typed_col("order_id", RockyType::String, false)];
         let diags = check_merge_strategy(&model, &cols, true);
         assert!(
-            diags.iter().any(|d| &*d.code == "E036"),
+            diags.iter().any(|d| &*d.code == "W006"),
             "separator differences are not case differences: {diags:?}"
         );
     }
