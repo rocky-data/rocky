@@ -65,6 +65,9 @@ async-trait = { workspace = true }
 rocky-core = { path = "../rocky-core", features = ["test-support"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
+# Capturing Layer for the `scheduler.tick` span assertions — the span surface
+# is a deliverable, so it is asserted rather than assumed.
+tracing-subscriber = { workspace = true }
 # Holds the advisory write lock directly (no redb handle) in the policy-ledger
 # snapshot tests, mirroring rocky-core/tests/state_lock.rs — proves the
 # read-only snapshot ignores a concurrent writer's advisory lock.

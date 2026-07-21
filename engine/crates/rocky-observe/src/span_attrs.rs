@@ -120,8 +120,50 @@ pub const STATEMENT_KIND: &str = "rocky.statement.kind";
 pub const RETRY_ATTEMPT: &str = "rocky.retry.attempt";
 
 // ---------------------------------------------------------------------------
+// Resident scheduler
+// ---------------------------------------------------------------------------
+
+/// Why a `scheduler.tick` span ended — one of the values in
+/// [`SCHEDULER_OUTCOMES`]. Without it the three early-exit paths (config
+/// error, permit held, another reconciler holds the lock) would produce a
+/// field-less span, and "the loop ticked but ran nothing" is exactly what an
+/// operator reads the trace to explain.
+pub const SCHEDULER_OUTCOME: &str = "rocky.scheduler.outcome";
+
+/// Demands that came due on this tick.
+pub const SCHEDULER_DUE: &str = "rocky.scheduler.due";
+
+/// Demands actually executed on this tick.
+pub const SCHEDULER_EXECUTED: &str = "rocky.scheduler.executed";
+
+/// Executed demands whose child run did not succeed.
+pub const SCHEDULER_FAILED: &str = "rocky.scheduler.failed";
+
+/// Demands skipped on this tick (throttled, claimed elsewhere, or the store
+/// could not be reopened after the child ran).
+pub const SCHEDULER_SKIPPED: &str = "rocky.scheduler.skipped";
+
+/// Whether this tick took over a stale tick lock from a dead reconciler.
+pub const SCHEDULER_LOCK_OVERRIDDEN: &str = "rocky.scheduler.lock_overridden";
+
+/// Whether the state store was contended at some point during this tick.
+pub const SCHEDULER_STATE_BUSY: &str = "rocky.scheduler.state_busy";
+
+/// Whether a drain was signalled mid-tick, cutting evaluation short.
+pub const SCHEDULER_DRAINED: &str = "rocky.scheduler.drained";
+
+// ---------------------------------------------------------------------------
 // Enumerations
 // ---------------------------------------------------------------------------
+
+/// Recognised values for [`SCHEDULER_OUTCOME`].
+pub const SCHEDULER_OUTCOMES: &[&str] = &[
+    "completed",
+    "config_error",
+    "permit_held",
+    "lock_skipped",
+    "fault",
+];
 
 /// Recognised warehouse-adapter values for [`ADAPTER_NAME`] /
 /// [`WAREHOUSE_NAME`]. Source-side adapters (`airbyte`, `fivetran`)
@@ -140,21 +182,33 @@ pub const WAREHOUSE_NAMES: &[&str] = &[
 mod tests {
     use super::*;
 
+    /// Every canonical key, in one place. Both invariants below check this
+    /// same list — keeping two copies in sync by hand is how a new key ends up
+    /// covered by one test and not the other.
+    const ALL_KEYS: &[&str] = &[
+        ADAPTER_NAME,
+        WAREHOUSE_NAME,
+        WAREHOUSE_QUERY_ID,
+        WAREHOUSE_BYTES_SCANNED,
+        WAREHOUSE_TABLE_REF,
+        STATEMENT_KIND,
+        RETRY_ATTEMPT,
+        SCHEDULER_OUTCOME,
+        SCHEDULER_DUE,
+        SCHEDULER_EXECUTED,
+        SCHEDULER_FAILED,
+        SCHEDULER_SKIPPED,
+        SCHEDULER_LOCK_OVERRIDDEN,
+        SCHEDULER_STATE_BUSY,
+        SCHEDULER_DRAINED,
+    ];
+
     /// Every canonical key must use the `rocky.<resource>.<field>` shape
     /// — three dot-segments, lower-snake. Guards against typos that
     /// would silently fragment dashboards back into per-adapter chaos.
     #[test]
     fn all_keys_match_rocky_prefix_convention() {
-        const KEYS: &[&str] = &[
-            ADAPTER_NAME,
-            WAREHOUSE_NAME,
-            WAREHOUSE_QUERY_ID,
-            WAREHOUSE_BYTES_SCANNED,
-            WAREHOUSE_TABLE_REF,
-            STATEMENT_KIND,
-            RETRY_ATTEMPT,
-        ];
-        for key in KEYS {
+        for key in ALL_KEYS {
             assert!(key.starts_with("rocky."), "{key} must start with 'rocky.'");
             let segments: Vec<&str> = key.split('.').collect();
             assert_eq!(
@@ -177,17 +231,8 @@ mod tests {
     /// constant name.
     #[test]
     fn all_keys_are_unique() {
-        const KEYS: &[&str] = &[
-            ADAPTER_NAME,
-            WAREHOUSE_NAME,
-            WAREHOUSE_QUERY_ID,
-            WAREHOUSE_BYTES_SCANNED,
-            WAREHOUSE_TABLE_REF,
-            STATEMENT_KIND,
-            RETRY_ATTEMPT,
-        ];
         let mut seen = std::collections::HashSet::new();
-        for k in KEYS {
+        for k in ALL_KEYS {
             assert!(seen.insert(*k), "duplicate canonical key: {k}");
         }
     }
