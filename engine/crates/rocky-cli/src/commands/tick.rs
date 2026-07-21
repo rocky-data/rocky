@@ -116,9 +116,12 @@ pub async fn run_tick(
         pipeline_filter: pipeline,
         config_path: config_path.to_path_buf(),
         rocky_dir,
-        // Connected orchestrator→engine tracing (a `scheduler.tick` root span
-        // whose `traceparent` the child honors) lands in P3; today the child's
-        // run trace stands alone.
+        // Connected orchestrator→engine tracing is still blocked on the CHILD
+        // side: `extract_remote_context` has no call site at the `rocky run`
+        // entry point, so a `TRACEPARENT` handed to the child is not read and
+        // its run trace stands alone. (`serve --scheduler` does emit a
+        // `scheduler.tick` span; `rocky tick` is one-shot and has no loop to
+        // anchor one to.)
         traceparent: None,
         member_budgets,
         state_path: state_path.clone(),

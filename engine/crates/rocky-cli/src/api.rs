@@ -70,12 +70,12 @@ use rocky_server::dashboard;
 use rocky_server::state::ServerState;
 
 use crate::commands::{
-    column_lineage_output, compile_output, dag_output, history_runs_output, lineage_output,
-    metrics_output, model_history_output, schemas_hash,
+    ScheduleStatusError, column_lineage_output, compile_output, dag_output, history_runs_output,
+    lineage_output, metrics_output, model_history_output, schedule_status_output, schemas_hash,
 };
 use crate::output::{
     ColumnLineageOutput, CompileOutput, DagOutput, ErrorEnvelope, HistoryOutput, JobKind, JobState,
-    JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelHistoryOutput,
+    JobStatus, LineageOutput, MetaOutput, MetricsOutput, ModelHistoryOutput, ScheduleStatusOutput,
 };
 
 /// Bind config for [`serve`].
@@ -138,6 +138,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/plan", post(submit_plan))
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/{id}", get(get_job))
+        .route("/api/v1/schedule", get(schedule_status))
         // Envelope fallbacks (see the module doc's error contract). Both are
         // registered BEFORE the auth layer so they are auth-wrapped like every
         // route: with a token configured, an unauthenticated probe of an
@@ -300,6 +301,17 @@ impl ApiError {
     /// `running_job_id` carries its id so the embedder can poll
     /// `GET /api/v1/jobs/{id}` instead of blind-retrying. An external writer
     /// (e.g. a concurrent CLI `rocky run`) has no job id, so it stays `None`.
+    /// `500` — a `rocky.toml` the engine could not read or parse. Deliberately
+    /// not the retryable `503`: retrying will not make an invalid config parse.
+    fn config_invalid(message: &str) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_invalid",
+            message,
+            Some("fix the config and retry; `rocky validate` reports the specific error"),
+        )
+    }
+
     fn engine_busy(running_job_id: Option<String>) -> Self {
         let mut err = Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -420,6 +432,21 @@ impl IntoResponse for ApiError {
 /// [`StateError::Busy`]: rocky_core::state::StateError::Busy
 /// [`StateError::LockHeldByOther`]: rocky_core::state::StateError::LockHeldByOther
 /// [`MutationPermit::running_job`]: rocky_server::jobs::MutationPermit::running_job
+/// Map a schedule-status failure to its honest status.
+///
+/// A `rocky.toml` the engine cannot read is **not** a transient busy condition,
+/// so it must not borrow the retryable `503` — a client would back off and
+/// retry forever against a config that will never parse on its own. Nor is it a
+/// `200` with an empty pipeline list: that asserts "nothing is scheduled" when
+/// the truth is "we cannot tell what is scheduled". State-store failures keep
+/// the existing mapping, including `503` on flock contention.
+fn map_schedule_err(err: ScheduleStatusError, running_job_id: Option<String>) -> ApiError {
+    match err {
+        ScheduleStatusError::ConfigInvalid(message) => ApiError::config_invalid(&message),
+        ScheduleStatusError::State(e) => map_state_err(e, running_job_id),
+    }
+}
+
 fn map_state_err(err: anyhow::Error, running_job_id: Option<String>) -> ApiError {
     use rocky_core::state::StateError;
     match err.downcast::<StateError>() {
@@ -527,6 +554,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/plan",
         "POST /api/v1/jobs/apply",
         "GET /api/v1/jobs/{id}",
+        "GET /api/v1/schedule",
     ]
     .into_iter()
     .map(String::from)
@@ -547,6 +575,7 @@ fn capabilities() -> Vec<String> {
         "meta",
         "error_envelope",
         "jobs",
+        "schedule",
     ]
     .into_iter()
     .map(String::from)
@@ -833,6 +862,37 @@ async fn dag_status(
         Some(status) => Ok(Json(serde_json::json!(status))),
         None => Err(ApiError::engine_not_ready()),
     }
+}
+
+/// `GET /api/v1/schedule` — a read-only scheduler snapshot.
+///
+/// Reports stored cursors, claims and tick-lock state. It deliberately does
+/// **not** evaluate demand — `rocky tick --dry-run` is the evaluation — so it
+/// stays side-effect free and `O(pipelines)` rather than `O(runs × pipelines)`.
+async fn schedule_status(
+    State(state): State<Arc<ServerState>>,
+) -> Result<PrettyJson<ScheduleStatusOutput>, ApiError> {
+    let Some(config_path) = state.config_path.clone() else {
+        return Err(ApiError::engine_not_ready());
+    };
+    let state_path = state_path_for(&state);
+    // Anchor `.rocky` to the config's directory (the project root), not the
+    // process cwd — the same derivation the reconciler uses, so a `serve
+    // --scheduler` and a cron `rocky tick` are reported against one tick lock.
+    let rocky_dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(".rocky");
+    let running_job_id = state.mutation_permit.running_job();
+
+    let output = tokio::task::spawn_blocking(move || {
+        schedule_status_output(&config_path, &state_path, &rocky_dir, chrono::Utc::now())
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?
+    .map_err(|e| map_schedule_err(e, running_job_id))?;
+    Ok(PrettyJson(output))
 }
 
 // --- Job model (POST /api/v1/jobs/{run|plan|apply}, GET /api/v1/jobs/{id}) ---
@@ -1257,6 +1317,42 @@ mod tests {
         serde_json::to_string_pretty(output).unwrap() + "\n"
     }
 
+    /// The state path a test should pin, computed **directly**.
+    ///
+    /// Deliberately not `resolve_state_path`: that resolver prefers a
+    /// CWD-relative `.rocky-state.redb` whenever one exists, and the cwd is
+    /// global to this whole test binary, so calling it from a test is exactly
+    /// what makes a test repointable by its neighbours.
+    fn pinned_state_path(models_dir: &std::path::Path) -> PathBuf {
+        models_dir.join(rocky_core::state::STATE_FILE_NAME)
+    }
+
+    /// A `ServerState` whose state path is **pinned** to `state_path`.
+    ///
+    /// `ServerState::new` hardcodes the override to `None`, and
+    /// `state_path_for` then re-resolves through `resolve_state_path(None, ..)`
+    /// at *request* time — so an unpinned test server reads whatever the cwd
+    /// probe finds when the request lands, not what the test set up.
+    ///
+    /// Takes the path rather than deriving it so the caller controls ordering:
+    /// tests that must populate or sweep the store *before* the server exists
+    /// (the spawned `recompile()` contends for the same file) need the path
+    /// first and the server last.
+    fn pinned_server(
+        models_dir: PathBuf,
+        config_path: Option<PathBuf>,
+        state_path: &std::path::Path,
+    ) -> Arc<ServerState> {
+        ServerState::with_auth(
+            models_dir,
+            None,
+            config_path,
+            None,
+            Vec::new(),
+            Some(state_path.to_path_buf()),
+        )
+    }
+
     #[tokio::test]
     async fn test_health_endpoint() {
         let base = spawn_router(test_state()).await;
@@ -1437,13 +1533,13 @@ mod tests {
     #[tokio::test]
     async fn parity_dag() {
         let (_dir, models_dir, config_path) = minimal_dag_project();
-        let state = ServerState::new(models_dir.clone(), None, Some(config_path.clone()));
+        let state_path = pinned_state_path(&models_dir);
+        let state = pinned_server(models_dir.clone(), Some(config_path.clone()), &state_path);
         let base = spawn_router(state).await;
         let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
         assert_eq!(resp.status(), 200);
         let api = resp.text().await.unwrap();
 
-        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
         let reference = reference_bytes(
             &dag_output(
                 &config_path,
@@ -1467,6 +1563,19 @@ mod tests {
     /// correctly returns the retryable 503 rather than blocking forever. Real
     /// embedders back off and retry on that 503; the parity assertion should
     /// too, instead of demanding 200 on the first request.
+    ///
+    /// The contender is not only an external process. `ServerState::with_auth`
+    /// spawns `recompile()`, which opens the same store read-only via
+    /// `load_cached_source_schemas`, and `open_redb_with_retry` calls
+    /// `Database::create` for read-only opens too — so redb's in-process
+    /// `DatabaseAlreadyOpen` guard fires between two read-only opens in a
+    /// single test process. Rocky's own advisory lock is taken only for
+    /// `OpenMode::ReadWrite`, so it does not mediate this.
+    ///
+    /// The rule: **any** api test whose request can fall through to a durable
+    /// read must go through this helper. A test that pre-populates
+    /// `state.jobs` and returns from the in-memory registry does not open the
+    /// store and is exempt.
     async fn get_retrying_on_busy(url: &str) -> reqwest::Response {
         for _ in 0..40 {
             let resp = reqwest::get(url).await.unwrap();
@@ -1480,16 +1589,17 @@ mod tests {
 
     #[tokio::test]
     async fn parity_runs_history_metrics_on_empty_state() {
-        // A hermetic, empty state store. Both the API and the CLI core resolve
-        // the same path via `resolve_state_path`, so they read identical bytes.
+        // A hermetic, empty state store. The API and the CLI core share ONE
+        // pinned path, so they read identical bytes without either side
+        // re-resolving.
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
-        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+        let state_path = pinned_state_path(&models_dir);
         // Create + init the (empty) store so open_read_only succeeds.
         drop(rocky_core::state::StateStore::open(&state_path).unwrap());
 
-        let state = ServerState::new(models_dir.clone(), None, None);
+        let state = pinned_server(models_dir.clone(), None, &state_path);
         let base = spawn_router(state).await;
 
         // /runs
@@ -1549,6 +1659,118 @@ mod tests {
         .unwrap();
 
         (dir, models_dir, config_path)
+    }
+
+    /// A transformation project whose pipeline declares an every-minute cron
+    /// schedule, plus a pinned state path and a `ServerState` bound to the
+    /// config. The state store is created up front so the read path sees a real
+    /// (empty) store rather than the missing-file branch.
+    fn scheduled_project() -> (tempfile::TempDir, PathBuf, Arc<ServerState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(models_dir.join("m.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            models_dir.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.sales]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.sales.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.sales.schedule]\ncron = \"* * * * *\"\ntimezone = \"UTC\"\n",
+        )
+        .unwrap();
+
+        let state_path = pinned_state_path(&models_dir);
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        let state = ServerState::with_auth(
+            models_dir,
+            None,
+            Some(config_path.clone()),
+            None,
+            Vec::new(),
+            Some(state_path),
+        );
+        (dir, config_path, state)
+    }
+
+    #[tokio::test]
+    async fn schedule_status_reports_a_configured_cron() {
+        let (_dir, _config, state) = scheduled_project();
+        let base = spawn_router(state).await;
+
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/schedule")).await;
+        assert_eq!(resp.status(), 200);
+        let body: ScheduleStatusOutput = resp.json().await.unwrap();
+
+        assert_eq!(body.timezone, "UTC");
+        assert_eq!(body.counts.scheduled, 1);
+        assert_eq!(body.counts.enabled, 1);
+        let p = &body.pipelines[0];
+        assert_eq!(p.pipeline, "sales");
+        assert_eq!(p.cron.as_deref(), Some("* * * * *"));
+        // No tick has run, so the cron has no anchor yet — reported honestly
+        // rather than as a fabricated next fire.
+        assert!(p.awaiting_first_anchor);
+        assert!(p.next_fire_at.is_none());
+        assert!(p.last_evaluated_at.is_none());
+    }
+
+    /// The bytes the endpoint returns are exactly what the backing function
+    /// produces — the endpoint adds no reshaping.
+    #[tokio::test]
+    async fn schedule_status_matches_the_backing_output() {
+        let (_dir, config_path, state) = scheduled_project();
+        let state_path = state_path_for(&state);
+        let base = spawn_router(state).await;
+
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/schedule")).await;
+        let api = resp.json::<ScheduleStatusOutput>().await.unwrap();
+
+        let rocky_dir = config_path.parent().unwrap().join(".rocky");
+        let reference =
+            schedule_status_output(&config_path, &state_path, &rocky_dir, chrono::Utc::now())
+                .unwrap();
+        // `now` differs by the request latency; compare the stable parts.
+        assert_eq!(api.timezone, reference.timezone);
+        assert_eq!(api.counts.scheduled, reference.counts.scheduled);
+        assert_eq!(api.pipelines.len(), reference.pipelines.len());
+        assert_eq!(api.pipelines[0].cron, reference.pipelines[0].cron);
+    }
+
+    /// A `rocky.toml` the engine cannot parse is a `500 config_invalid`, never a
+    /// retryable `503` (retry will not fix a broken config) and never a `200`
+    /// with an empty list (which would falsely claim "nothing is scheduled").
+    #[tokio::test]
+    async fn schedule_status_on_unparseable_config_is_config_invalid() {
+        let (dir, config_path, _state) = scheduled_project();
+        std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
+        // Rebuild the server AFTER corrupting the config so the bound path
+        // points at the broken file.
+        let models_dir = dir.path().join("models");
+        let state_path = pinned_state_path(&models_dir);
+        let state = ServerState::with_auth(
+            models_dir,
+            None,
+            Some(config_path),
+            None,
+            Vec::new(),
+            Some(state_path),
+        );
+        let base = spawn_router(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/schedule"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 500);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "config_invalid");
     }
 
     /// The three state-backed read routes must remap a redb lock contention
@@ -1878,7 +2100,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
-        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+        let state_path = pinned_state_path(&models_dir);
 
         // A job that was "running" when the (previous) sidecar died.
         {
@@ -1889,16 +2111,23 @@ mod tests {
         }
 
         // The "restart": `serve` runs the sweep once, before the router serves.
+        // The server is built only AFTER the sweep — its spawned `recompile()`
+        // opens the same store, and a concurrent open would make this
+        // `unwrap()` a new flake.
         let swept = sweep_interrupted_jobs(&state_path).unwrap();
         assert_eq!(swept, 1);
 
         // A brand-new server (empty in-memory registry) reads the durable record.
-        let state = ServerState::new(models_dir, None, None);
+        let state = pinned_server(models_dir, None, &state_path);
         let base = spawn_router(state).await;
 
-        let resp = reqwest::get(format!("{base}/api/v1/jobs/job_inflight"))
-            .await
-            .unwrap();
+        // This GET misses the in-memory registry and falls through to a durable
+        // read, so it races the `recompile()` this server spawned — see
+        // `get_retrying_on_busy`. Its sibling
+        // `job_running_in_current_process_is_not_swept` upserts first, returns
+        // from the registry, and never opens the store, which is why only this
+        // one flaked.
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/jobs/job_inflight")).await;
         assert_eq!(resp.status(), 200);
         let body: JobStatus = resp.json().await.unwrap();
         assert_eq!(body.job_id, "job_inflight");
@@ -1913,6 +2142,66 @@ mod tests {
             "the sweep stamps the terminal timestamp"
         );
         assert!(body.result.is_none());
+    }
+
+    /// The mechanism behind the `job_interrupted_by_restart_is_swept_to_failed`
+    /// flake, pinned deterministically.
+    ///
+    /// redb's `Database::create` is a single-open guard and
+    /// `open_redb_with_retry` uses it for read-only opens too, while Rocky's
+    /// advisory lock is taken only for `OpenMode::ReadWrite`. So two opens in
+    /// **one process** contend, with no second process involved: a durable read
+    /// blocked that way must surface as the retryable `503 engine_busy`, never
+    /// as a hard failure. Under full-suite load the server's spawned
+    /// `recompile()` plays the role the explicit `held` store plays here.
+    #[tokio::test]
+    async fn state_backed_read_under_held_store_is_retryable_503() {
+        use rocky_core::state::StateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = models_dir.join(".rocky-state.redb");
+
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_job(&persisted_job("job_held", "succeeded"))
+                .unwrap();
+        }
+
+        // Acquire BEFORE the server exists: nothing else holds the store yet,
+        // so this acquisition cannot itself lose the race.
+        let held = StateStore::open(&state_path).unwrap();
+
+        let state = ServerState::with_auth(
+            models_dir,
+            None,
+            None,
+            None,
+            Vec::new(),
+            Some(state_path.clone()),
+        );
+        let base = spawn_router(state).await;
+
+        let resp = reqwest::get(format!("{base}/api/v1/jobs/job_held"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            503,
+            "a durable read blocked by an in-process open must be retryable"
+        );
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "engine_busy");
+
+        drop(held);
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/jobs/job_held")).await;
+        assert_eq!(
+            resp.status(),
+            200,
+            "the same read must succeed once the contender releases"
+        );
     }
 
     /// The sweep reconciles ONLY non-terminal records: `running` and `queued`
@@ -1983,13 +2272,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
-        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+        let state_path = pinned_state_path(&models_dir);
 
         // Startup: nothing persisted yet, nothing to sweep.
         assert_eq!(sweep_interrupted_jobs(&state_path).unwrap(), 0);
 
         // A live submission in THIS process, after the sweep.
-        let state = ServerState::new(models_dir, None, None);
+        let state = pinned_server(models_dir, None, &state_path);
         let record = persisted_job("job_live", "running");
         state.jobs.upsert(record.clone()).await;
         StateStore::open(&state_path)
@@ -2038,9 +2327,9 @@ mod tests {
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
         // An initialized (empty) state store so the state-backed reads answer.
-        let state_path = rocky_core::state::resolve_state_path(None, &models_dir).path;
+        let state_path = pinned_state_path(&models_dir);
         drop(rocky_core::state::StateStore::open(&state_path).unwrap());
-        let state = ServerState::new(models_dir, None, None);
+        let state = pinned_server(models_dir, None, &state_path);
         state.recompile().await;
         let base = spawn_router(state).await;
 

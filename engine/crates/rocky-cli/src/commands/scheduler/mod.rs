@@ -34,6 +34,7 @@ use std::time::Duration;
 
 use rocky_core::config::load_rocky_config;
 use rocky_core::schedule::{Drain, Spawner, TickOptions, TickReport, tick_once};
+use rocky_observe::span_attrs;
 use rocky_server::state::ServerState;
 
 use crate::api::state_path_for;
@@ -206,6 +207,28 @@ pub async fn run_scheduler(
 /// permit held by an API job, or a tick fault each skip this iteration and the
 /// loop lives on. The reconciler never runs stale demands — the config is
 /// re-read fresh every iteration (F11 §4.7).
+///
+/// Instrumented as the `scheduler.tick` span. The whole function is wrapped,
+/// not just the `tick_once` call: the config-error and permit-held paths below
+/// are precisely the "the loop ran but nothing happened" cases an operator
+/// reads a trace to explain, and wrapping only the reconcile would leave them
+/// outside it. `#[instrument]` on an `async fn` attaches the span to the future
+/// rather than holding an `EnteredSpan` guard, so it is correct across the
+/// child-process await inside `tick_once`.
+#[tracing::instrument(
+    skip_all,
+    name = "scheduler.tick",
+    fields(
+        rocky.scheduler.outcome,
+        rocky.scheduler.due,
+        rocky.scheduler.executed,
+        rocky.scheduler.failed,
+        rocky.scheduler.skipped,
+        rocky.scheduler.lock_overridden,
+        rocky.scheduler.state_busy,
+        rocky.scheduler.drained,
+    )
+)]
 #[allow(clippy::too_many_arguments)]
 async fn run_one_tick(
     state: &Arc<ServerState>,
@@ -226,6 +249,7 @@ async fn run_one_tick(
                 config = %config_path.display(),
                 "scheduler: config error this iteration; skipping (loop stays alive)",
             );
+            record_outcome(TickOutcome::ConfigError);
             return false;
         }
     };
@@ -241,6 +265,7 @@ async fn run_one_tick(
                 running_job_id = %holder,
                 "scheduler: a mutating job holds the permit; skipping this tick",
             );
+            record_outcome(TickOutcome::PermitHeld);
             return false;
         }
     };
@@ -251,8 +276,11 @@ async fn run_one_tick(
         pipeline_filter: None,
         config_path: config_path.to_path_buf(),
         rocky_dir: rocky_dir.to_path_buf(),
-        // A connected `scheduler.tick → run` trace is wired with the telemetry
-        // step; today each child's run trace stands alone.
+        // The `scheduler.tick` span above exists, but the child does NOT
+        // consume `TRACEPARENT`: `extract_remote_context` has no call site at
+        // the `rocky run` entry point, so a populated value would be an env
+        // var nothing reads. This stays `None` until the child side lands —
+        // setting it earlier would make propagation look wired when it is not.
         traceparent: None,
         member_budgets,
         state_path: state_path.to_path_buf(),
@@ -265,15 +293,98 @@ async fn run_one_tick(
     match tick_once(&config, state_path, now, spawner, &opts).await {
         Ok(report) => {
             log_tick(&report);
+            record_tick(&report);
             report.drained
         }
         Err(e) => {
             // A tick fault (state I/O, an `after` cycle) fails THIS tick closed;
             // the loop continues and the next tick re-evaluates.
             tracing::error!(error = %e, "scheduler: tick faulted; loop continues");
+            record_outcome(TickOutcome::Fault);
             false
         }
     }
+}
+
+/// Why a tick ended.
+///
+/// Recorded as `rocky.scheduler.outcome`. Three paths exit before any
+/// reconciliation happens, and without an outcome they would each produce a
+/// field-less span — leaving "the loop ticked but ran nothing", the single most
+/// important thing to see, indistinguishable from a tick that found no work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickOutcome {
+    Completed,
+    ConfigError,
+    PermitHeld,
+    LockSkipped,
+    Fault,
+}
+
+impl TickOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            TickOutcome::Completed => "completed",
+            TickOutcome::ConfigError => "config_error",
+            TickOutcome::PermitHeld => "permit_held",
+            TickOutcome::LockSkipped => "lock_skipped",
+            TickOutcome::Fault => "fault",
+        }
+    }
+}
+
+/// The counts a completed tick reports. Computed once and shared by the log
+/// event and the span, so the two can never disagree.
+struct TickCounts {
+    due: usize,
+    executed: usize,
+    failed: usize,
+    skipped: usize,
+}
+
+fn tick_counts(report: &TickReport) -> TickCounts {
+    TickCounts {
+        due: report.evaluated.iter().filter(|e| e.due.is_some()).count(),
+        executed: report.executed.len(),
+        failed: report
+            .executed
+            .iter()
+            .filter(|e| e.outcome != rocky_core::schedule::TerminalOutcome::Success)
+            .count(),
+        skipped: report.skipped.len(),
+    }
+}
+
+fn record_outcome(outcome: TickOutcome) {
+    tracing::Span::current().record(span_attrs::SCHEDULER_OUTCOME, outcome.as_str());
+}
+
+/// Record the tick's counts onto the enclosing `scheduler.tick` span.
+///
+/// Deliberately separate from [`log_tick`]: span attributes serve trace
+/// correlation, while the event remains the log surface that the metric
+/// instruments will be derived from.
+fn record_tick(report: &TickReport) {
+    if report.skipped_whole_tick {
+        record_outcome(TickOutcome::LockSkipped);
+        return;
+    }
+    let counts = tick_counts(report);
+    let span = tracing::Span::current();
+    span.record(
+        span_attrs::SCHEDULER_OUTCOME,
+        TickOutcome::Completed.as_str(),
+    );
+    span.record(span_attrs::SCHEDULER_DUE, counts.due);
+    span.record(span_attrs::SCHEDULER_EXECUTED, counts.executed);
+    span.record(span_attrs::SCHEDULER_FAILED, counts.failed);
+    span.record(span_attrs::SCHEDULER_SKIPPED, counts.skipped);
+    span.record(
+        span_attrs::SCHEDULER_LOCK_OVERRIDDEN,
+        report.lock_overridden,
+    );
+    span.record(span_attrs::SCHEDULER_STATE_BUSY, report.state_busy);
+    span.record(span_attrs::SCHEDULER_DRAINED, report.drained);
 }
 
 /// Emit a structured summary of a completed tick. (Real OTel instruments are
@@ -283,18 +394,12 @@ fn log_tick(report: &TickReport) {
         tracing::debug!("scheduler: tick skipped (another reconciler holds the lock)");
         return;
     }
-    let executed = report.executed.len();
-    let due = report.evaluated.iter().filter(|e| e.due.is_some()).count();
-    let failed = report
-        .executed
-        .iter()
-        .filter(|e| e.outcome != rocky_core::schedule::TerminalOutcome::Success)
-        .count();
+    let counts = tick_counts(report);
     tracing::info!(
-        due,
-        executed,
-        failed,
-        skipped = report.skipped.len(),
+        due = counts.due,
+        executed = counts.executed,
+        failed = counts.failed,
+        skipped = counts.skipped,
         lock_overridden = report.lock_overridden,
         state_busy = report.state_busy,
         drained = report.drained,
@@ -416,6 +521,203 @@ cron = "* * * * *"
 
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    // ---------------------------------------------------------------------
+    // `scheduler.tick` span capture
+    // ---------------------------------------------------------------------
+
+    type SpanFields = std::collections::BTreeMap<String, String>;
+
+    #[derive(Default)]
+    struct Captured {
+        open: std::collections::HashMap<tracing::span::Id, (String, SpanFields)>,
+        closed: Vec<(String, SpanFields)>,
+    }
+
+    /// Collects every closed span with the fields recorded on it. Fields set
+    /// after span entry (which is all of ours — the counts are only known once
+    /// the tick returns) arrive via `on_record`, not `on_new_span`.
+    #[derive(Clone, Default)]
+    struct SpanCapture(Arc<std::sync::Mutex<Captured>>);
+
+    impl SpanCapture {
+        fn spans_named(&self, name: &str) -> Vec<SpanFields> {
+            self.0
+                .lock()
+                .unwrap()
+                .closed
+                .iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, f)| f.clone())
+                .collect()
+        }
+    }
+
+    struct FieldVisitor<'a>(&'a mut SpanFields);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = SpanFields::new();
+            attrs.record(&mut FieldVisitor(&mut fields));
+            self.0
+                .lock()
+                .unwrap()
+                .open
+                .insert(id.clone(), (attrs.metadata().name().to_string(), fields));
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut guard = self.0.lock().unwrap();
+            if let Some((_, fields)) = guard.open.get_mut(id) {
+                values.record(&mut FieldVisitor(fields));
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let mut guard = self.0.lock().unwrap();
+            if let Some(entry) = guard.open.remove(&id) {
+                guard.closed.push(entry);
+            }
+        }
+    }
+
+    /// Drive ONE tick directly with a capturing subscriber installed.
+    ///
+    /// Deliberately not through `run_scheduler`: that spawns, and the capture
+    /// relies on a thread-local default subscriber. Awaiting `run_one_tick`
+    /// inline keeps it unambiguously in scope.
+    async fn capture_one_tick(config: &str) -> Vec<SpanFields> {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let (dir, config_path) = temp_project(config);
+        let state = test_state(dir.path());
+        let capture = SpanCapture::default();
+        let spawner = Arc::new(CapturingSpawner::new(0));
+        let shutdown = Drain::new();
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        run_one_tick(
+            &state,
+            &config_path,
+            &dir.path().join(".rocky-state.redb"),
+            &dir.path().join(".rocky"),
+            clock.as_ref(),
+            &shutdown,
+            spawner.as_ref(),
+        )
+        .await;
+
+        drop(_guard);
+        capture.spans_named("scheduler.tick")
+    }
+
+    /// Every `TickOutcome` must be a value `rocky-observe` documents, so the
+    /// enum and the published enumeration cannot drift apart across crates.
+    #[test]
+    fn tick_outcome_values_match_the_documented_enumeration() {
+        for outcome in [
+            TickOutcome::Completed,
+            TickOutcome::ConfigError,
+            TickOutcome::PermitHeld,
+            TickOutcome::LockSkipped,
+            TickOutcome::Fault,
+        ] {
+            assert!(
+                span_attrs::SCHEDULER_OUTCOMES.contains(&outcome.as_str()),
+                "{} is not in span_attrs::SCHEDULER_OUTCOMES",
+                outcome.as_str()
+            );
+        }
+    }
+
+    /// A completed tick emits exactly one `scheduler.tick` span carrying the
+    /// counts. Without the deferred `record` calls these fields are declared
+    /// but never filled, which is invisible to a compile check.
+    #[tokio::test]
+    async fn tick_emits_a_span_with_its_counts() {
+        let spans = capture_one_tick(CRON_EVERY_MINUTE).await;
+        assert_eq!(spans.len(), 1, "one tick ⇒ one span");
+        let fields = &spans[0];
+
+        assert_eq!(
+            fields
+                .get(span_attrs::SCHEDULER_OUTCOME)
+                .map(String::as_str),
+            Some("completed"),
+        );
+        for key in [
+            span_attrs::SCHEDULER_DUE,
+            span_attrs::SCHEDULER_EXECUTED,
+            span_attrs::SCHEDULER_FAILED,
+            span_attrs::SCHEDULER_SKIPPED,
+            span_attrs::SCHEDULER_LOCK_OVERRIDDEN,
+            span_attrs::SCHEDULER_STATE_BUSY,
+            span_attrs::SCHEDULER_DRAINED,
+        ] {
+            assert!(
+                fields.contains_key(key),
+                "{key} was declared but never recorded"
+            );
+        }
+    }
+
+    /// The path that most needs a trace: the loop ticked and did nothing. A
+    /// config error must still close a span, and that span must say why —
+    /// otherwise "scheduler alive but idle" is indistinguishable from
+    /// "scheduler found no work".
+    #[tokio::test]
+    async fn a_config_error_tick_still_reports_why() {
+        let spans = capture_one_tick("this is not valid toml {{{").await;
+        assert_eq!(spans.len(), 1, "an early exit still closes the span");
+        assert_eq!(
+            spans[0]
+                .get(span_attrs::SCHEDULER_OUTCOME)
+                .map(String::as_str),
+            Some("config_error"),
+        );
+        // Also proves the sibling test is not vacuous: a field declared by
+        // `#[instrument(fields(..))]` but never recorded does NOT surface, so
+        // asserting the counts are present there is a real assertion.
+        assert!(
+            !spans[0].contains_key(span_attrs::SCHEDULER_DUE),
+            "counts must be absent when the tick never reconciled",
+        );
     }
 
     /// The loop fires a due cron demand once per tick after the first-sight

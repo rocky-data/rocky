@@ -371,6 +371,17 @@ It is the same reconciler as `rocky tick` — the same `[schedule]` declarations
 - **Config is re-read every tick.** Edit `rocky.toml` under a running server and the next tick picks it up. A parse error on one tick is logged and skipped; the loop never dies on a bad edit and never runs a stale schedule.
 - **Shutdown drains.** On `SIGTERM` or `Ctrl-C` the server stops starting new work, gives a run already in flight up to `--drain-timeout-seconds` (but never beyond that run's own `timeout_minutes`) to finish on its own, and then terminates it — draining in-flight HTTP requests in the same window before the process exits. A run cut short by the drain is recorded as failed and is not retried until its next occurrence. The scheduler also holds its first tick until the server has finished starting up (its job sweep and listener bind), so a scheduled run never precedes — or outlives a failed — server startup.
 
+You can read the scheduler's state over HTTP:
+
+```
+GET /api/v1/schedule
+```
+
+It reports every scheduled pipeline with its cron/`after`/`freshness` configuration, when it last evaluated and fired, its next expected fire, any active backoff, and the claims currently in flight — plus the tick-lock state. Two things to read correctly:
+
+- **`tick_lock.state: free` is the normal steady state.** The lock is held only for the brief duration of a tick, so a healthy scheduler reports `free` on almost every request. `free` does not mean no scheduler is running — for that, look at `last_evaluated_at` against the cadence. `held` means a tick is in progress right now, and `wedged` means the lock's heartbeat has gone stale (a reconciler that needs restarting).
+- **A `next_fire_at` in the past means overdue.** The projection is anchored on the last occurrence that actually fired, not on the clock, so a stalled timer reports the slot it missed rather than a healthy-looking future one. Pipelines whose schedule cannot be resolved carry a `config_error` and never fire — the endpoint surfaces the reason rather than omitting the pipeline. The endpoint reads stored state only; it does not evaluate demand (that is `rocky tick --dry-run`), so it is a cheap, side-effect-free health read.
+
 The resident reconciler is a single loop, so a scheduled run that hangs holds the loop until the run finishes or is terminated: the server keeps serving HTTP, but no further schedules are evaluated. Set `timeout_minutes` on a `[schedule]` so a stuck run is terminated and the loop moves on. Without one, a hung run stalls scheduling until the process is restarted — `rocky doctor --check scheduler` reports this as a dead timer. Automatic recovery of a wedged reconciler is a planned follow-up; until it lands, bound long runs with `timeout_minutes` and watch the doctor check.
 
 A minimal systemd unit for the resident form:

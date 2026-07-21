@@ -60,3 +60,6 @@ docs/.astro/
 logs/
 scratch/
 tmp/
+
+# 24h scheduler soak output (scripts/soak-scheduler.sh)
+.soak/
