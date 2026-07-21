@@ -143,10 +143,11 @@ pub const E035: &str = "E035";
 /// clean and only fails once the warehouse rejects the generated `MERGE ... ON`
 /// clause, so the mistake surfaces mid-run rather than at compile time.
 ///
-/// Skipped when the model's output columns cannot be fully enumerated — a
-/// `SELECT *` over an upstream with no known schema — so a model whose shape
-/// the compiler can't infer never trips the check. One diagnostic is emitted
-/// per missing key, so a multi-column `unique_key` reports every typo at once.
+/// Skipped whenever the model's SQL uses `SELECT *`, since the compiler cannot
+/// then prove what the model's full output column set is — the star may expand
+/// from a raw source it has no schema for, or from a model joined to one. Only
+/// models with explicit column lists are checked. One diagnostic is emitted per
+/// missing key, so a multi-column `unique_key` reports every typo at once.
 pub const E036: &str = "E036";
 
 // Warnings

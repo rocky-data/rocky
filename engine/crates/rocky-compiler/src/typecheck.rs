@@ -513,11 +513,6 @@ fn compute_model_typecheck(
     diagnostics.extend(enhanced_diags);
 
     // Step 3: SELECT * warning
-    //
-    // This also gates the merge-key existence check in step 5: when a
-    // `SELECT *` expands from an upstream we have no schema for, `typed_cols`
-    // is not the model's real output column set, so any "column is missing"
-    // conclusion drawn from it would be wrong.
     let schema_incomplete = model_schema.has_star
         && model_schema
             .upstream
@@ -554,9 +549,24 @@ fn compute_model_typecheck(
     // `check_time_interval_strategy` for the full list of E020-E026 + W003.
     // For `type = "merge"` we confirm every `unique_key` column is real — see
     // `check_merge_strategy` (E036).
+    //
+    // E036 is an *error*, so it only runs when `typed_cols` is provably the
+    // model's whole output — i.e. the model has no `SELECT *`. A star is not
+    // enumerable in general: it may expand from a raw source (no schema at
+    // all), or from a model *plus* a raw source in a join. Neither shows up as
+    // an "unknown upstream", because `ModelSchema::upstream` records only
+    // models — a root `SELECT * FROM raw.t` has an empty `upstream`. Gating on
+    // upstream knowledge therefore let the check run against a partial (often
+    // empty) column set and reject valid keys. Explicit column lists — the
+    // common case, and the only one where a typo is provable — keep full
+    // coverage.
     if let Some(model) = model_by_name.get(model_name) {
         diagnostics.extend(check_time_interval_strategy(model, &typed_cols));
-        diagnostics.extend(check_merge_strategy(model, &typed_cols, !schema_incomplete));
+        diagnostics.extend(check_merge_strategy(
+            model,
+            &typed_cols,
+            !model_schema.has_star,
+        ));
     }
 
     // Step 6: Enrich diagnostics with the model's file path as a SourceSpan
@@ -752,10 +762,12 @@ fn check_time_interval_strategy(
 /// `MERGE ... ON` clause.
 ///
 /// `schema_known` is false when the model's output columns can't be fully
-/// enumerated (a `SELECT *` over an upstream with no known schema). The check
-/// is skipped in that case: `typed_cols` doesn't describe the real output, so
-/// every key would look missing. This mirrors the `type_known` guard the
-/// time_interval checks use before drawing type conclusions.
+/// enumerated — in practice, whenever the model's SQL contains a `SELECT *`.
+/// The check is skipped in that case: `typed_cols` may be a partial (or empty)
+/// view of the real output, so a key that is genuinely produced by the star
+/// would be reported missing. Since E036 is an error, a false positive breaks
+/// a valid build, which is strictly worse than missing a typo in a model whose
+/// output set isn't knowable at compile time anyway.
 fn check_merge_strategy(
     model: &rocky_core::models::Model,
     typed_cols: &[crate::types::TypedColumn],
@@ -3502,6 +3514,123 @@ mod tests {
         let suggestion = d.suggestion.as_deref().expect("expected a suggestion");
         assert!(suggestion.contains("customer_id"));
         assert!(suggestion.contains("order_date"));
+    }
+
+    // ----- E036 end-to-end: the `schema_known` argument as the caller computes
+    // it. The unit tests above hand the flag to `check_merge_strategy`, so they
+    // can only prove the check behaves correctly *given* a correct flag. These
+    // go through `typecheck_project_with_models`, which derives it. -----
+
+    /// A `merge` model with the given SQL and `unique_key`, suitable for
+    /// building a real `Project` (unlike `make_merge_model`, which is shaped
+    /// for direct `check_merge_strategy` calls).
+    fn make_merge_project_model(name: &str, sql: &str, unique_key: &[&str]) -> Model {
+        let mut m = make_model(name, sql);
+        m.config.strategy = StrategyConfig::Merge {
+            unique_key: unique_key.iter().map(|k| (*k).to_string()).collect(),
+            update_columns: None,
+        };
+        m
+    }
+
+    #[test]
+    fn test_e036_not_fired_for_select_star_over_non_model_source() {
+        // Regression: `SELECT *` over a raw (non-model) source produces an
+        // empty typed output schema, because `ModelSchema::upstream` lists
+        // only *models*. The original guard asked "does any upstream have an
+        // unknown schema?" — for a root model `upstream` is empty, so that was
+        // vacuously false and the check ran against zero columns, flagging
+        // every unique_key as missing on a perfectly valid model.
+        let models = vec![make_merge_project_model(
+            "ingest_orders",
+            "SELECT * FROM poc.raw.orders",
+            &["order_id"],
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E036"),
+            "E036 must not fire for `SELECT *` over a non-model source: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_e036_not_fired_for_select_star_joining_non_model_source() {
+        // The under-inclusive sibling of the case above: here `upstream` is
+        // `["up"]` and `up`'s schema *is* known, so an "any upstream unknown?"
+        // guard is false — yet the star also pulls columns from
+        // `poc.raw.orders`, which is not a model, so the enumerated output is
+        // still not the model's real output set. `order_id` lives in the raw
+        // side and must not be reported missing.
+        let models = vec![
+            make_model("up", "SELECT customer_id FROM poc.raw.customers"),
+            make_merge_project_model(
+                "joined",
+                "SELECT * FROM up JOIN poc.raw.orders o ON up.customer_id = o.customer_id",
+                &["order_id"],
+            ),
+        ];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E036"),
+            "E036 must not fire when a star also expands a non-model source: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn test_e036_still_fires_end_to_end_for_explicit_columns() {
+        // The true positive must survive the fix: an explicit column list is
+        // fully enumerable, so a typo'd `unique_key` is provably wrong.
+        let models = vec![make_merge_project_model(
+            "orders",
+            "SELECT order_id, amount FROM poc.raw.orders",
+            &["ordr_id"],
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        let e036: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "E036")
+            .collect();
+        assert_eq!(
+            e036.len(),
+            1,
+            "expected exactly one E036 for the typo'd key: {:?}",
+            result.diagnostics
+        );
+        assert!(e036[0].message.contains("ordr_id"));
+    }
+
+    #[test]
+    fn test_e036_not_fired_end_to_end_for_correct_explicit_key() {
+        let models = vec![make_merge_project_model(
+            "orders",
+            "SELECT order_id, amount FROM poc.raw.orders",
+            &["order_id"],
+        )];
+        let project = Project::from_models(models).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result =
+            typecheck_project_with_models(&graph, &HashMap::new(), None, &project.models, None);
+
+        assert!(
+            !result.diagnostics.iter().any(|d| &*d.code == "E036"),
+            "E036 must not fire when the key is a real column: {:?}",
+            result.diagnostics
+        );
     }
 
     // ----- W004: classification-tag completeness -----
