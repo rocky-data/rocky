@@ -45,8 +45,19 @@
 //! the live ledger and evicts only what is derivable *now* — a reference that
 //! appears between plan and apply refuses the eviction. Every eviction writes
 //! its tombstone (recipe triple + provenance pointer) atomically **before** the
-//! ledger row is retired, so an evicted cache entry is always restorable, and
-//! the physical byte-delete only ever happens after that commit.
+//! ledger row is retired, and the physical byte-delete only ever happens after
+//! that commit.
+//!
+//! **Restorability is narrower than eligibility.** `rocky restore` today
+//! rebuilds only *single-input*, non-partitioned, content-addressed recipes: it
+//! refuses any recipe with recorded upstreams, because re-deriving a multi-input
+//! recipe from the recorded upstream bytes needs DAG re-derivation that is not
+//! yet implemented. The eviction checks below admit multi-input recipes (a
+//! `strong` closure over several content-hashed upstreams still passes
+//! [`check_recipe_recorded`]), so gc can evict artifacts restore cannot yet
+//! rebuild. The tombstone is still durable and still records the full recipe —
+//! nothing is lost — but recovery of a multi-input artifact currently means
+//! re-running its pipeline, not `rocky restore`.
 //!
 //! # Reachability
 //!
@@ -98,7 +109,16 @@ type AdapterCost = (String, WarehouseType, f64, f64);
 /// (every upstream is a content hash). A `heuristic` closure means at least
 /// one input is a mutable-source freshness signal whose data may have moved
 /// on — such a table is not derivable.
-fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOutput {
+///
+/// **Known gap (asymmetry with `rocky restore`).** A `strong` closure over
+/// *several* content-hashed upstreams passes this check, but `restore` refuses
+/// any recipe with recorded upstreams (multi-input rebuild needs DAG
+/// re-derivation, not yet implemented). So this check's pass set is strictly
+/// larger than restore's recovery set. Pinned by
+/// `gc_admits_multi_input_recipe_that_restore_refuses_known_gap` in
+/// `commands/restore.rs`. Narrowing this predicate is a behavior change
+/// pending a design decision.
+pub(crate) fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOutput {
     let strong = class.proof_class.as_deref() == Some("strong");
     let passed = class.has_provenance && strong;
     let detail = if !class.has_provenance {
@@ -728,7 +748,10 @@ fn gc_plan_notes() -> Vec<String> {
          eviction (fail-closed)."
             .to_string(),
         "Every eviction writes a durable tombstone (recipe triple + restore pointer) BEFORE \
-         the ledger row is retired, so an evicted cache entry is always restorable."
+         the ledger row is retired. `rocky restore` rebuilds single-input, non-partitioned \
+         recipes from that tombstone; a recipe with recorded upstreams is refused by restore \
+         today (multi-input DAG re-derivation is a later phase) and must be recovered by \
+         re-running its pipeline."
             .to_string(),
         "Deletion is symmetric-caution gated: review with `rocky review <plan-id> --approve`, \
          then `rocky apply <plan-id>`. There is no direct-delete path."
@@ -1022,15 +1045,18 @@ fn gc_apply_notes() -> Vec<String> {
          gap, malformed commit, unsupported protocol, wrong prefix, unverifiable log) holds \
          (fail-closed)."
             .to_string(),
-        "The eviction of record is the durable tombstone + retired ledger row (always restorable \
-         from the recorded recipe). Physical byte-deletion is NOT performed: reclaiming bytes \
+        "The eviction of record is the durable tombstone + retired ledger row, which records the \
+         full recipe. Physical byte-deletion is NOT performed: reclaiming bytes \
          safely requires a protocol-aware VACUUM (Delta tombstone-retention windows plus \
          TOCTOU-safe deletion against concurrent re-adds), which is future work. Setting `[gc] \
          physical_delete = true` is a hard error until then."
             .to_string(),
-        "Every eviction is restorable: `rocky restore <target>` writes a review-gated plan that \
-         rebuilds the artifact from its tombstone's recorded recipe and asserts the recomputed \
-         blake3 equals the tombstoned hash before any write becomes visible."
+        "`rocky restore <target>` writes a review-gated plan that rebuilds the artifact from its \
+         tombstone's recorded recipe and asserts the recomputed blake3 equals the tombstoned hash \
+         before any write becomes visible. KNOWN LIMITATION: restore covers single-input, \
+         non-partitioned, content-addressed recipes only — it refuses a recipe with recorded \
+         upstreams rather than substituting current data, so a multi-input artifact evicted here \
+         is recovered by re-running its pipeline, not by `rocky restore`."
             .to_string(),
         "KNOWN LIMITATION: the liveness gate is a conservative-best-effort reader of the Delta \
          log, not a full Delta-protocol implementation. It HOLDs on any log shape it cannot \
@@ -1600,7 +1626,9 @@ pub(crate) async fn run_gc_apply_in_with(
              content-addressed bytes requires a protocol-aware VACUUM (Delta tombstone-retention \
              windows + TOCTOU-safe deletion), which is not yet implemented. Unset `[gc] \
              physical_delete` — the durable tombstone + retired ledger row is the eviction of \
-             record (always restorable from the recorded recipe)."
+             record, and it retains the full recorded recipe (`rocky restore` rebuilds \
+             single-input recipes from it; a multi-input recipe is recovered by re-running its \
+             pipeline)."
         );
     }
 

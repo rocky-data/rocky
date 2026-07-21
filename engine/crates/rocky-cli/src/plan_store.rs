@@ -977,6 +977,50 @@ mod tests {
         );
     }
 
+    /// PINS CURRENT BEHAVIOR (KNOWN GAP — gc escapes agent-scoped policy).
+    ///
+    /// **Current behavior:** `PlanKind::Gc` falls into the `_ => Human` arm of
+    /// [`default_principal_for_kind`], so an unstamped gc plan evaluates as a
+    /// human principal. `rocky_core::policy::evaluate` returns a hardcoded
+    /// `Allow` for an unmatched rule under `Human`, so a governor's
+    /// `deny agent gc` rule can never fire.
+    ///
+    /// **Why this is wrong:** this function's own doc comment says
+    /// `AiAuthored`/`Backfill` are special-cased so they never evaluate as
+    /// `human`, "which would let it escape the agent-scoped policy rules a
+    /// governor writes". A gc plan is machine-composed by the same argument —
+    /// the eviction set is computed by the engine, not typed by a person — so
+    /// it belongs on the `Agent` side of that exact distinction. Today it is
+    /// on the wrong side, and storage reclamation is ungovernable as a result.
+    ///
+    /// **Expected to be inverted when fixed.** Moving `PlanKind::Gc` to
+    /// `Agent` changes the effective policy outcome for existing deployments —
+    /// a public surface since 1.0 — so it needs a deprecation path and an
+    /// owner decision. When that lands this assertion flips to
+    /// `PolicyPrincipal::Agent` and the test should be renamed.
+    ///
+    /// The companion pin on the fail-open evaluation is
+    /// `deny_agent_gc_does_not_fire_for_human_principal_known_gap` in
+    /// `rocky-core/src/policy.rs`.
+    #[test]
+    fn gc_kind_resolves_to_human_so_agent_rules_never_fire_known_gap() {
+        assert_eq!(
+            super::default_principal_for_kind(&PlanKind::Gc),
+            PolicyPrincipal::Human,
+            "KNOWN GAP: gc plans evaluate as human, escaping agent-scoped policy rules"
+        );
+        // Non-vacuous contrast: the two kinds that ARE special-cased resolve to
+        // `Agent`, which is the treatment gc should receive.
+        assert_eq!(
+            super::default_principal_for_kind(&PlanKind::AiAuthored),
+            PolicyPrincipal::Agent
+        );
+        assert_eq!(
+            super::default_principal_for_kind(&PlanKind::Backfill),
+            PolicyPrincipal::Agent
+        );
+    }
+
     #[test]
     fn plan_kind_display() {
         assert_eq!(PlanKind::Compact.to_string(), "compact");
