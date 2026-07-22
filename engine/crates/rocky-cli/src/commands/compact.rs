@@ -1292,11 +1292,24 @@ fn generate_compact_sql(
 /// OPTIMIZE/VACUUM SQL for any dialect that doesn't advertise
 /// `supports_delta_maintenance()`, so applying a compact plan against a
 /// non-Databricks adapter fails fast with a clear known-limitation error.
+#[cfg(test)]
 fn regenerate_v2_compact_statements(
     plan_id: &str,
     payload: &serde_json::Value,
     dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> Result<Vec<NamedStatement>> {
+    let ir_plans = extract_compact_ir_plans(plan_id, payload)?;
+    compact_statements_from_ir(plan_id, &ir_plans, dialect)
+}
+
+/// Deserialize the per-table `CompactPlanIr` list from a v2 compact plan
+/// payload's `plans` field. Split out from [`regenerate_v2_compact_statements`]
+/// so the policy gate can build its touched-target set from the SAME typed IR
+/// that regenerates the SQL, deserialized once.
+fn extract_compact_ir_plans(
+    plan_id: &str,
+    payload: &serde_json::Value,
+) -> Result<Vec<CompactPlanIr>> {
     let plans_value = payload.get("plans").ok_or_else(|| {
         anyhow::anyhow!(
             "compact plan '{}' (v2) is missing the `plans` field; expected an envelope of \
@@ -1304,13 +1317,21 @@ fn regenerate_v2_compact_statements(
             plan_id,
         )
     })?;
-    let ir_plans: Vec<CompactPlanIr> = serde_json::from_value(plans_value.clone())
-        .with_context(|| format!(
-            "compact plan '{plan_id}' (v2) `plans` field failed to deserialize as Vec<CompactPlanIr>"
-        ))?;
+    serde_json::from_value(plans_value.clone()).with_context(|| {
+        format!("compact plan '{plan_id}' (v2) `plans` field failed to deserialize as Vec<CompactPlanIr>")
+    })
+}
 
+/// Regenerate the flat `(purpose, sql)` statement list from an already-parsed
+/// `CompactPlanIr` list. `compact_from_ir` refuses any dialect that doesn't
+/// advertise Delta maintenance, so a non-Databricks target fails fast here.
+fn compact_statements_from_ir(
+    plan_id: &str,
+    ir_plans: &[CompactPlanIr],
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> Result<Vec<NamedStatement>> {
     let mut statements = Vec::new();
-    for ir in &ir_plans {
+    for ir in ir_plans {
         let pairs = rocky_core::sql_gen::compact_from_ir(ir, dialect).with_context(|| {
             format!(
                 "compact plan '{plan_id}' (v2): failed to regenerate SQL for target \
@@ -1342,20 +1363,41 @@ fn regenerate_v2_compact_statements(
 /// DuckDB does not support `OPTIMIZE` or `VACUUM` — it will return a parse
 /// error from the adapter. That error surfaces cleanly through
 /// `StatementResult.error` and `success: false`; no special-casing is needed.
-pub async fn run_compact_apply(config_path: &Path, plan_id: &str, output_json: bool) -> Result<()> {
+pub async fn run_compact_apply(
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
+    output_json: bool,
+) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    run_compact_apply_in(&cwd, config_path, plan_id, output_json).await
+    run_compact_apply_in(
+        &cwd,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        output_json,
+    )
+    .await
 }
 
-/// Inner implementation of `rocky compact apply` that takes an explicit `root`
-/// for the plans directory. Extracted so tests can pass a temp dir without
-/// touching the process-global current working directory.
-pub(crate) async fn run_compact_apply_in(
+/// Read + validate the compact plan, gate it under the agent-policy plane, and
+/// regenerate the OPTIMIZE/VACUUM statements — everything up to (but not
+/// including) warehouse execution.
+///
+/// A single fingerprinted `rocky.toml` snapshot (#1120) backs the policy gate,
+/// the dialect resolution, and the returned `RockyConfig` the caller builds its
+/// adapter from — so a config swap timed between the gate and execution cannot
+/// redirect what runs. The gate refuses (Deny / unreviewed RequireReview)
+/// BEFORE any statement is generated or any adapter is constructed.
+async fn prepare_compact_apply(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
-    output_json: bool,
-) -> Result<()> {
+    state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
+) -> Result<(rocky_core::config::RockyConfig, Vec<NamedStatement>)> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read compact plan '{plan_id}'"))?;
 
@@ -1370,17 +1412,11 @@ pub(crate) async fn run_compact_apply_in(
         );
     }
 
-    // Resolve the configured target dialect (config-only) so SQL
-    // regeneration is gated on the real warehouse: applying a compact plan
-    // against a non-Databricks adapter fails fast with the limitation error.
-    let dialect = crate::commands::plan::resolve_configured_dialect(config_path)?;
-
     // Phase C — "SQL as `.o` files" — v2 plans carry a `CompactPlanIr`
-    // envelope and SQL is regenerated here via `sql_gen::compact_from_ir`.
-    // The v1 inline-SQL envelope was retired in C-7; v1-shaped compact
-    // payloads on disk (written by Rocky < engine-v1.35.0) are rejected
-    // with a migration error pointing at the recipe.
-    let statements: Vec<NamedStatement> = match plan.format_version {
+    // envelope. The v1 inline-SQL envelope was retired in C-7; a v1-shaped
+    // payload cannot be applied, so reject it before the gate rather than
+    // deserializing a shape that no longer exists.
+    match plan.format_version {
         1 => bail!(
             "compact plan '{}' is in format v1, which is no longer supported \
              (this plan was written by Rocky < engine-v1.35.0). \
@@ -1389,7 +1425,7 @@ pub(crate) async fn run_compact_apply_in(
              for the migration guide.",
             plan_id,
         ),
-        2 => regenerate_v2_compact_statements(plan_id, &plan.payload, dialect.as_ref())?,
+        2 => {}
         other => bail!(
             "compact plan '{}' has unknown format_version {}. \
              This binary supports v2 (typed CompactPlanIr) persisted plans; \
@@ -1397,21 +1433,91 @@ pub(crate) async fn run_compact_apply_in(
             plan_id,
             other
         ),
-    };
+    }
 
-    // Build the warehouse adapter from the config.
-    let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
-        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    // THE single fingerprinted config snapshot for this apply (#1120): the
+    // policy gate, the touched-target resolution, the dialect, and the adapter
+    // the caller builds all read THIS instance.
+    let loaded =
+        rocky_core::config::load_rocky_config_fingerprinted(config_path).with_context(|| {
+            format!(
+                "refusing to apply compact plan '{plan_id}': failed to load config from {}",
+                config_path.display()
+            )
+        })?;
+
+    // Deserialize the typed IR once — it drives BOTH the policy touched set and
+    // the SQL regeneration below.
+    let ir_plans = extract_compact_ir_plans(plan_id, &plan.payload)?;
+
+    // Gate under `PolicyCapability::Apply`, keyed on the touched targets
+    // (physical FQN → logical model name best-effort). Refuses before any SQL
+    // is generated or any warehouse statement runs.
+    let touched = crate::commands::apply::resolve_touched_apply_targets(
+        &loaded.config,
+        config_path,
+        ir_plans.iter().map(|ir| ir.target_table.clone()),
+    );
+    crate::commands::apply::gate_maintenance_apply(
+        root,
+        &plan,
+        plan_id,
+        &loaded.config,
+        config_path,
+        state_path,
+        runtime_principal,
+        &touched,
+    )
+    .await?;
+
+    // Resolve the dialect from the SAME snapshot (no reload) so SQL
+    // regeneration is gated on the real warehouse: a non-Databricks adapter
+    // fails fast with the known-limitation error.
+    let dialect = crate::commands::plan::resolve_dialect_from_config(&loaded.config)?;
+    let statements = compact_statements_from_ir(plan_id, &ir_plans, dialect.as_ref())?;
+
+    Ok((loaded.config, statements))
+}
+
+/// Inner implementation of `rocky compact apply` that takes an explicit `root`
+/// for the plans directory. Extracted so tests can pass a temp dir without
+/// touching the process-global current working directory.
+pub(crate) async fn run_compact_apply_in(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
+    output_json: bool,
+) -> Result<()> {
+    let (rocky_cfg, statements) =
+        prepare_compact_apply(root, config_path, plan_id, state_path, runtime_principal).await?;
+
+    // Build the warehouse adapter from the SAME snapshot the gate cleared, then
+    // execute. Only reached once the policy gate has passed.
     let registry = AdapterRegistry::from_config(&rocky_cfg)?;
     let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(&rocky_cfg, None)
         .context("failed to resolve pipeline for compact apply")?;
     let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
 
+    execute_compact_apply(adapter.as_ref(), plan_id, &statements, output_json).await
+}
+
+/// Execute the regenerated compact statements against `adapter` and emit the
+/// `CompactApplyOutput` envelope. Separated from the gate + adapter
+/// construction so tests can drive the executed-statement path with an
+/// injected recording adapter (see [`run_compact_apply_in_with`]).
+async fn execute_compact_apply(
+    adapter: &dyn WarehouseAdapter,
+    plan_id: &str,
+    statements: &[NamedStatement],
+    output_json: bool,
+) -> Result<()> {
     let executed_at = Utc::now();
     let mut results: Vec<StatementResult> = Vec::with_capacity(statements.len());
     let mut overall_success = true;
 
-    for stmt in &statements {
+    for stmt in statements {
         // After the v2 dispatch above, `sql` is always populated:
         // `compact_from_ir` returns `Some(sql)` for every statement.
         // A `None` here means a malformed plan file — surface a clear
@@ -1508,9 +1614,249 @@ pub(crate) async fn run_compact_apply_in(
     Ok(())
 }
 
+/// [`run_compact_apply_in`] with an injected warehouse adapter — runs the SAME
+/// policy gate + SQL regeneration, then executes against `adapter` instead of
+/// building the real one. Tests use this to prove a policy DENY refuses BEFORE
+/// any `execute_statement` reaches the adapter (zero recorded statements),
+/// while an allowed apply reaches it.
+#[cfg(test)]
+pub(crate) async fn run_compact_apply_in_with(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
+    output_json: bool,
+    adapter: &dyn WarehouseAdapter,
+) -> Result<()> {
+    let (_rocky_cfg, statements) =
+        prepare_compact_apply(root, config_path, plan_id, state_path, runtime_principal).await?;
+    execute_compact_apply(adapter, plan_id, &statements, output_json).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Policy-gate parity coverage for `compact apply` (PR-1). Proves the sink
+    /// gates under `PolicyCapability::Apply` on BOTH routes — the injectable
+    /// `run_compact_apply_in_with` sink (with a counting adapter, so a DENY is
+    /// observably zero-execution) and the generic `apply <compact-plan>` route
+    /// through `run_apply_in` (the documented-bug regression at apply.rs).
+    mod policy_gate {
+        use super::*;
+        use crate::plan_store::write_plan_v2;
+        use rocky_core::config::PolicyPrincipal;
+        use rocky_core::traits::{AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+        use std::sync::Mutex;
+
+        /// A warehouse adapter that records every statement it is asked to
+        /// execute (and always succeeds). `dialect` / `execute_query` are never
+        /// reached on the compact-apply path, so they panic if called.
+        struct CountingAdapter {
+            executed: Mutex<Vec<String>>,
+        }
+        impl CountingAdapter {
+            fn new() -> Self {
+                Self {
+                    executed: Mutex::new(Vec::new()),
+                }
+            }
+            fn count(&self) -> usize {
+                self.executed.lock().unwrap().len()
+            }
+        }
+        #[async_trait::async_trait]
+        impl WarehouseAdapter for CountingAdapter {
+            fn dialect(&self) -> &dyn SqlDialect {
+                unimplemented!("compact apply execute path never calls dialect()")
+            }
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.executed.lock().unwrap().push(sql.to_string());
+                Ok(())
+            }
+            async fn execute_query(&self, _sql: &str) -> AdapterResult<QueryResult> {
+                unimplemented!("compact apply execute path never calls execute_query()")
+            }
+            async fn describe_table(
+                &self,
+                _table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                unimplemented!("compact apply execute path never calls describe_table()")
+            }
+        }
+
+        /// A Databricks-typed config (so the Delta-maintenance SQL regenerates)
+        /// with the given `[policy]` rules spliced in. No credentials are used:
+        /// the injectable sink never builds the real adapter, and the gate/
+        /// dialect only read the parsed config.
+        fn write_config(dir: &Path, policy_rules: &str) -> std::path::PathBuf {
+            let toml = format!(
+                r#"
+[adapter]
+type = "databricks"
+host = "https://example.cloud.databricks.com"
+http_path = "/sql/1.0/warehouses/abc"
+token = "pat-xxx"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+default_agent_effect = "require_review"
+{policy_rules}
+"#
+            );
+            let path = dir.join("rocky.toml");
+            std::fs::write(&path, toml).unwrap();
+            path
+        }
+
+        const DENY_AGENT_APPLY: &str = r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#;
+
+        /// Write a v2 compact plan for a single concrete target, returning its
+        /// plan id. `write_plan_v2` stamps the kind default (`human`) — the
+        /// benign stored stamp the enforcement path deliberately ignores.
+        fn write_compact_plan(root: &Path, target: &str) -> String {
+            let payload = serde_json::json!({
+                "model": target,
+                "catalog": null,
+                "scope": null,
+                "dry_run": false,
+                "target_size_mb": 256,
+                "plans": [CompactPlanIr::for_table(target, 256)],
+            });
+            write_plan_v2(root, PlanKind::Compact, &payload).unwrap()
+        }
+
+        /// Freshly create (and drop) the state store so the gate's ledger
+        /// snapshot is readable-and-empty, matching the gc gate-test setup.
+        fn fresh_state(dir: &Path) -> std::path::PathBuf {
+            let state_path = dir.join("state.redb");
+            drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+            state_path
+        }
+
+        /// Direct-alias sink route: an agent applying a compact plan under
+        /// `deny agent apply` is REFUSED, and ZERO statements reach the adapter.
+        #[tokio::test]
+        async fn compact_apply_sink_denies_agent_and_executes_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_config(dir.path(), DENY_AGENT_APPLY);
+            let state = fresh_state(dir.path());
+            let plan_id = write_compact_plan(dir.path(), "orders");
+            let adapter = CountingAdapter::new();
+
+            let err = run_compact_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                true,
+                &adapter,
+            )
+            .await
+            .expect_err("agent apply must be denied by policy");
+            assert!(
+                err.to_string().contains("policy DENIES"),
+                "expected a policy-deny error, got: {err}"
+            );
+            assert_eq!(
+                adapter.count(),
+                0,
+                "a denied compact apply must not reach execute_statement"
+            );
+        }
+
+        /// A human applying the SAME plan under the SAME policy is allowed
+        /// (humans are ungated), and the statements DO reach the adapter.
+        #[tokio::test]
+        async fn compact_apply_sink_allows_human_and_executes() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_config(dir.path(), DENY_AGENT_APPLY);
+            let state = fresh_state(dir.path());
+            let plan_id = write_compact_plan(dir.path(), "orders");
+            let adapter = CountingAdapter::new();
+
+            run_compact_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Human,
+                true,
+                &adapter,
+            )
+            .await
+            .expect("a human compact apply must be allowed");
+            assert!(
+                adapter.count() > 0,
+                "an allowed compact apply must execute its statements"
+            );
+        }
+
+        /// Enforcement uses the runtime principal + plan kind, never the stored
+        /// stamp: a plan stamped `human` (a downgrade) is STILL denied when an
+        /// agent applies it.
+        #[tokio::test]
+        async fn compact_apply_ignores_downgraded_stored_stamp() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_config(dir.path(), DENY_AGENT_APPLY);
+            let state = fresh_state(dir.path());
+            // Stored stamp says human — but the agent runtime is what's enforced.
+            let plan_id = write_compact_plan(dir.path(), "orders");
+            let adapter = CountingAdapter::new();
+
+            let err = run_compact_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                true,
+                &adapter,
+            )
+            .await
+            .expect_err("a human-stamped plan applied by an agent must still be denied");
+            assert!(err.to_string().contains("policy DENIES"), "got: {err}");
+            assert_eq!(adapter.count(), 0);
+        }
+
+        /// Generic route (`rocky apply <compact-plan>` → `run_apply_in`): the
+        /// documented-bug regression. The gate refuses BEFORE the real adapter
+        /// is built, so no credentials are needed to observe the deny.
+        #[tokio::test]
+        async fn compact_apply_generic_route_denies_agent() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_config(dir.path(), DENY_AGENT_APPLY);
+            let state = fresh_state(dir.path());
+            let plan_id = write_compact_plan(dir.path(), "orders");
+
+            let err = crate::commands::apply::run_apply_in(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                true,
+            )
+            .await
+            .expect_err("agent apply via the generic route must be denied");
+            assert!(err.to_string().contains("policy DENIES"), "got: {err}");
+        }
+    }
 
     #[test]
     fn test_generate_compact_sql() {
@@ -2246,9 +2592,16 @@ schema_template = "staging__{{source}}"
         assert_eq!(plan.format_version, 1);
 
         // Apply must reject with the migration error.
-        let err = run_compact_apply_in(dir.path(), &config_path, &plan_id, false)
-            .await
-            .expect_err("v1 compact plan must be rejected by apply");
+        let err = run_compact_apply_in(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            &dir.path().join("state.redb"),
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect_err("v1 compact plan must be rejected by apply");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("format v1") || msg.contains("v1 plan"),
@@ -2310,9 +2663,16 @@ schema_template = "staging__{{source}}"
             &serde_json::json!({"dummy": true}),
         )?;
 
-        let err = run_compact_apply_in(dir.path(), &config_path, &plan_id, false)
-            .await
-            .unwrap_err();
+        let err = run_compact_apply_in(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            &dir.path().join("state.redb"),
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("archive plan, not a compact plan"),
@@ -2364,9 +2724,16 @@ schema_template = "staging__{{source}}"
 
         // No plan file exists for this id in dir.path().
         let fake_id = "a".repeat(64);
-        let err = run_compact_apply_in(dir.path(), &config_path, &fake_id, false)
-            .await
-            .unwrap_err();
+        let err = run_compact_apply_in(
+            dir.path(),
+            &config_path,
+            &fake_id,
+            &dir.path().join("state.redb"),
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .unwrap_err();
         // The error chain includes both the wrapper and the plan_store error.
         let full_err = format!("{err:#}");
         assert!(

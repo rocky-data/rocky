@@ -329,11 +329,24 @@ fn generate_archive_sql(
 /// regeneration is byte-equivalent to the v1 inline path; literal-
 /// timestamp cutoffs (`cutoff_resolved_at`) are a separate semantic
 /// improvement deferred to a follow-up PR.
+#[cfg(test)]
 fn regenerate_v2_archive_statements(
     plan_id: &str,
     payload: &serde_json::Value,
     dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> Result<Vec<NamedStatement>> {
+    let ir_plans = extract_archive_ir_plans(plan_id, payload)?;
+    archive_statements_from_ir(plan_id, &ir_plans, dialect)
+}
+
+/// Deserialize the per-table `ArchivePlanIr` list from a v2 archive plan
+/// payload's `plans` field. Split out from [`regenerate_v2_archive_statements`]
+/// so the policy gate can build its touched-target set from the SAME typed IR
+/// that regenerates the SQL, deserialized once.
+fn extract_archive_ir_plans(
+    plan_id: &str,
+    payload: &serde_json::Value,
+) -> Result<Vec<ArchivePlanIr>> {
     let plans_value = payload
         .get("plans")
         .ok_or_else(|| anyhow::anyhow!(
@@ -341,13 +354,21 @@ fn regenerate_v2_archive_statements(
              {{ model?, catalog?, scope?, older_than, older_than_days, dry_run, plans: [ArchivePlanIr, ...] }}",
             plan_id,
         ))?;
-    let ir_plans: Vec<ArchivePlanIr> = serde_json::from_value(plans_value.clone())
-        .with_context(|| format!(
-            "archive plan '{plan_id}' (v2) `plans` field failed to deserialize as Vec<ArchivePlanIr>"
-        ))?;
+    serde_json::from_value(plans_value.clone()).with_context(|| {
+        format!("archive plan '{plan_id}' (v2) `plans` field failed to deserialize as Vec<ArchivePlanIr>")
+    })
+}
 
+/// Regenerate the flat `(purpose, sql)` statement list from an already-parsed
+/// `ArchivePlanIr` list. `archive_from_ir` refuses any dialect that doesn't
+/// advertise Delta maintenance, so a non-Databricks target fails fast here.
+fn archive_statements_from_ir(
+    plan_id: &str,
+    ir_plans: &[ArchivePlanIr],
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> Result<Vec<NamedStatement>> {
     let mut statements = Vec::new();
-    for ir in &ir_plans {
+    for ir in ir_plans {
         let pairs = rocky_core::sql_gen::archive_from_ir(ir, dialect).with_context(|| {
             format!(
                 "archive plan '{plan_id}' (v2): failed to regenerate SQL for target {target}",
@@ -373,20 +394,45 @@ fn regenerate_v2_archive_statements(
 /// DuckDB does not support `VACUUM` with `RETAIN` syntax in the Databricks
 /// form — adapter errors surface cleanly through `StatementResult.error`
 /// and `success: false`; no special-casing is needed.
-pub async fn run_archive_apply(config_path: &Path, plan_id: &str, output_json: bool) -> Result<()> {
+pub async fn run_archive_apply(
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
+    output_json: bool,
+) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    run_archive_apply_in(&cwd, config_path, plan_id, output_json).await
+    run_archive_apply_in(
+        &cwd,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        output_json,
+    )
+    .await
 }
 
-/// Inner implementation of `rocky archive apply` that takes an explicit `root`
-/// for the plans directory. Extracted so tests can pass a temp dir without
-/// touching the process-global current working directory.
-pub(crate) async fn run_archive_apply_in(
+/// Read + validate the archive plan, gate it under the agent-policy plane, and
+/// regenerate the DELETE/VACUUM statements — everything up to (but not
+/// including) warehouse execution.
+///
+/// Mirrors [`super::compact::run_compact_apply_in`]'s preparation, plus the
+/// **targetless-archive guard**: an archive plan may carry `target_table = None`
+/// (the `DELETE FROM *` wildcard the inline CLI reaches when given neither
+/// `--model` nor `--catalog`). Such a plan has no concrete target to key a
+/// policy decision on, so treating it as an empty touched set would vacuously
+/// pass the gate. When a `[policy]` block is configured we therefore REFUSE a
+/// targetless archive outright — a wildcard delete cannot be safely gated. With
+/// no `[policy]` block there is nothing to enforce, so behaviour is unchanged
+/// (the wildcard flows through to the warehouse, which rejects `DELETE FROM *`).
+async fn prepare_archive_apply(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
-    output_json: bool,
-) -> Result<()> {
+    state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
+) -> Result<(rocky_core::config::RockyConfig, Vec<NamedStatement>)> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read archive plan '{plan_id}'"))?;
 
@@ -401,17 +447,11 @@ pub(crate) async fn run_archive_apply_in(
         );
     }
 
-    // Resolve the configured target dialect (config-only) so SQL
-    // regeneration is gated on the real warehouse: applying an archive plan
-    // against a non-Databricks adapter fails fast with the limitation error.
-    let dialect = crate::commands::plan::resolve_configured_dialect(config_path)?;
-
     // Phase C — "SQL as `.o` files" — v2 plans carry an `ArchivePlanIr`
-    // envelope and SQL is regenerated here via `sql_gen::archive_from_ir`.
-    // The v1 inline-SQL envelope was retired in C-7; v1-shaped archive
-    // payloads on disk (written by Rocky < engine-v1.35.0) are rejected
-    // with a migration error pointing at the recipe.
-    let statements: Vec<NamedStatement> = match plan.format_version {
+    // envelope. The v1 inline-SQL envelope was retired in C-7; a v1-shaped
+    // payload cannot be applied, so reject it before the gate rather than
+    // deserializing a shape that no longer exists.
+    match plan.format_version {
         1 => bail!(
             "archive plan '{}' is in format v1, which is no longer supported \
              (this plan was written by Rocky < engine-v1.35.0). \
@@ -420,7 +460,7 @@ pub(crate) async fn run_archive_apply_in(
              for the migration guide.",
             plan_id,
         ),
-        2 => regenerate_v2_archive_statements(plan_id, &plan.payload, dialect.as_ref())?,
+        2 => {}
         other => bail!(
             "archive plan '{}' has unknown format_version {}. \
              This binary supports v2 (typed ArchivePlanIr) persisted plans; \
@@ -428,21 +468,102 @@ pub(crate) async fn run_archive_apply_in(
             plan_id,
             other
         ),
-    };
+    }
 
-    // Build the warehouse adapter from the config.
-    let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
-        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    // THE single fingerprinted config snapshot for this apply (#1120): the
+    // policy gate, the touched-target resolution, the dialect, and the adapter
+    // the caller builds all read THIS instance.
+    let loaded =
+        rocky_core::config::load_rocky_config_fingerprinted(config_path).with_context(|| {
+            format!(
+                "refusing to apply archive plan '{plan_id}': failed to load config from {}",
+                config_path.display()
+            )
+        })?;
+
+    // Deserialize the typed IR once — it drives BOTH the policy touched set and
+    // the SQL regeneration below.
+    let ir_plans = extract_archive_ir_plans(plan_id, &plan.payload)?;
+
+    // Targetless-archive guard: a `target_table = None` IR regenerates
+    // `DELETE FROM *`. It has no concrete target to gate, so an enforced apply
+    // must refuse it rather than let it vacuously pass an empty touched set.
+    if loaded.config.policy.is_some() && ir_plans.iter().any(|ir| ir.target_table.is_none()) {
+        bail!(
+            "policy refuses archive plan '{plan_id}': it targets no concrete table \
+             (a `DELETE FROM *` wildcard) and so cannot be gated under [policy]. \
+             Re-scope the archive to an explicit `--model` or `--catalog` and re-plan."
+        );
+    }
+
+    // Gate under `PolicyCapability::Apply`, keyed on the touched targets
+    // (physical FQN → logical model name best-effort). The targetless guard
+    // above means every IR here carries a concrete `target_table`.
+    let touched = crate::commands::apply::resolve_touched_apply_targets(
+        &loaded.config,
+        config_path,
+        ir_plans.iter().filter_map(|ir| ir.target_table.clone()),
+    );
+    crate::commands::apply::gate_maintenance_apply(
+        root,
+        &plan,
+        plan_id,
+        &loaded.config,
+        config_path,
+        state_path,
+        runtime_principal,
+        &touched,
+    )
+    .await?;
+
+    // Resolve the dialect from the SAME snapshot (no reload) so SQL
+    // regeneration is gated on the real warehouse: a non-Databricks adapter
+    // fails fast with the known-limitation error.
+    let dialect = crate::commands::plan::resolve_dialect_from_config(&loaded.config)?;
+    let statements = archive_statements_from_ir(plan_id, &ir_plans, dialect.as_ref())?;
+
+    Ok((loaded.config, statements))
+}
+
+/// Inner implementation of `rocky archive apply` that takes an explicit `root`
+/// for the plans directory. Extracted so tests can pass a temp dir without
+/// touching the process-global current working directory.
+pub(crate) async fn run_archive_apply_in(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
+    output_json: bool,
+) -> Result<()> {
+    let (rocky_cfg, statements) =
+        prepare_archive_apply(root, config_path, plan_id, state_path, runtime_principal).await?;
+
+    // Build the warehouse adapter from the SAME snapshot the gate cleared, then
+    // execute. Only reached once the policy gate has passed.
     let registry = AdapterRegistry::from_config(&rocky_cfg)?;
     let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(&rocky_cfg, None)
         .context("failed to resolve pipeline for archive apply")?;
     let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
 
+    execute_archive_apply(adapter.as_ref(), plan_id, &statements, output_json).await
+}
+
+/// Execute the regenerated archive statements against `adapter` and emit the
+/// `ArchiveApplyOutput` envelope. Separated from the gate + adapter
+/// construction so tests can drive the executed-statement path with an
+/// injected recording adapter (see [`run_archive_apply_in_with`]).
+async fn execute_archive_apply(
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+    plan_id: &str,
+    statements: &[NamedStatement],
+    output_json: bool,
+) -> Result<()> {
     let executed_at = Utc::now();
     let mut results: Vec<StatementResult> = Vec::with_capacity(statements.len());
     let mut overall_success = true;
 
-    for stmt in &statements {
+    for stmt in statements {
         // After the v2 dispatch above, `sql` is always populated:
         // `archive_from_ir` returns `Some(sql)` for every statement.
         // A `None` here means a malformed plan file — surface a clear
@@ -537,9 +658,348 @@ pub(crate) async fn run_archive_apply_in(
     Ok(())
 }
 
+/// [`run_archive_apply_in`] with an injected warehouse adapter — runs the SAME
+/// policy gate (incl. the targetless-archive guard) + SQL regeneration, then
+/// executes against `adapter` instead of building the real one. Tests use this
+/// to prove a policy DENY refuses BEFORE any `execute_statement` reaches the
+/// adapter (zero recorded statements), while an allowed apply reaches it.
+#[cfg(test)]
+pub(crate) async fn run_archive_apply_in_with(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
+    output_json: bool,
+    adapter: &dyn rocky_core::traits::WarehouseAdapter,
+) -> Result<()> {
+    let (_rocky_cfg, statements) =
+        prepare_archive_apply(root, config_path, plan_id, state_path, runtime_principal).await?;
+    execute_archive_apply(adapter, plan_id, &statements, output_json).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Policy-gate parity coverage for `archive apply` (PR-1). Archive is the
+    /// destructive kind (DELETE + VACUUM), so the deny/no-execution assertions
+    /// carry the most weight. Covers BOTH routes (injectable sink + generic
+    /// `apply <archive-plan>`), the downgraded-stamp case, and the
+    /// targetless-archive (`DELETE FROM *`) refusal decision.
+    mod policy_gate {
+        use super::*;
+        use crate::plan_store::write_plan_v2;
+        use rocky_core::config::PolicyPrincipal;
+        use rocky_core::traits::{AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+        use std::sync::Mutex;
+
+        /// A warehouse adapter that records every statement it is asked to
+        /// execute (and always succeeds). `dialect` / `execute_query` are never
+        /// reached on the archive-apply path, so they panic if called.
+        struct CountingAdapter {
+            executed: Mutex<Vec<String>>,
+        }
+        impl CountingAdapter {
+            fn new() -> Self {
+                Self {
+                    executed: Mutex::new(Vec::new()),
+                }
+            }
+            fn count(&self) -> usize {
+                self.executed.lock().unwrap().len()
+            }
+        }
+        #[async_trait::async_trait]
+        impl WarehouseAdapter for CountingAdapter {
+            fn dialect(&self) -> &dyn SqlDialect {
+                unimplemented!("archive apply execute path never calls dialect()")
+            }
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.executed.lock().unwrap().push(sql.to_string());
+                Ok(())
+            }
+            async fn execute_query(&self, _sql: &str) -> AdapterResult<QueryResult> {
+                unimplemented!("archive apply execute path never calls execute_query()")
+            }
+            async fn describe_table(
+                &self,
+                _table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                unimplemented!("archive apply execute path never calls describe_table()")
+            }
+        }
+
+        /// A Databricks-typed config (so the Delta DELETE/VACUUM regenerates)
+        /// with the given `[policy]` rules spliced in. Passing an empty rules
+        /// string still emits a `[policy]` block (needed for the targetless
+        /// guard, which fires whenever any policy is configured).
+        fn write_config(dir: &Path, policy_rules: &str) -> std::path::PathBuf {
+            let toml = format!(
+                r#"
+[adapter]
+type = "databricks"
+host = "https://example.cloud.databricks.com"
+http_path = "/sql/1.0/warehouses/abc"
+token = "pat-xxx"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+default_agent_effect = "require_review"
+{policy_rules}
+"#
+            );
+            let path = dir.join("rocky.toml");
+            std::fs::write(&path, toml).unwrap();
+            path
+        }
+
+        /// A Databricks-typed config with NO `[policy]` block (nothing to
+        /// enforce) — used to prove the targetless guard is policy-conditional.
+        fn write_config_no_policy(dir: &Path) -> std::path::PathBuf {
+            let toml = r#"
+[adapter]
+type = "databricks"
+host = "https://example.cloud.databricks.com"
+http_path = "/sql/1.0/warehouses/abc"
+token = "pat-xxx"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+"#;
+            let path = dir.join("rocky.toml");
+            std::fs::write(&path, toml).unwrap();
+            path
+        }
+
+        const DENY_AGENT_APPLY: &str = r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "deny"
+"#;
+
+        /// Write a v2 archive plan for a single concrete target, returning its
+        /// plan id. `write_plan_v2` stamps the kind default (`human`) — the
+        /// benign stored stamp the enforcement path deliberately ignores.
+        fn write_archive_plan(root: &Path, target: &str) -> String {
+            let payload = serde_json::json!({
+                "model": target,
+                "catalog": null,
+                "scope": null,
+                "older_than": "90d",
+                "older_than_days": 90,
+                "dry_run": false,
+                "plans": [ArchivePlanIr::for_table(target, 90)],
+            });
+            write_plan_v2(root, PlanKind::Archive, &payload).unwrap()
+        }
+
+        /// Write a v2 archive plan whose single IR is TARGETLESS
+        /// (`target_table = None` → `DELETE FROM *`).
+        fn write_targetless_archive_plan(root: &Path) -> String {
+            let payload = serde_json::json!({
+                "model": null,
+                "catalog": null,
+                "scope": null,
+                "older_than": "30d",
+                "older_than_days": 30,
+                "dry_run": false,
+                "plans": [build_archive_ir(None, 30)],
+            });
+            write_plan_v2(root, PlanKind::Archive, &payload).unwrap()
+        }
+
+        fn fresh_state(dir: &Path) -> std::path::PathBuf {
+            let state_path = dir.join("state.redb");
+            drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+            state_path
+        }
+
+        /// Direct-alias sink route: an agent applying a destructive archive plan
+        /// under `deny agent apply` is REFUSED, and ZERO DELETE/VACUUM
+        /// statements reach the adapter.
+        #[tokio::test]
+        async fn archive_apply_sink_denies_agent_and_executes_nothing() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_config(dir.path(), DENY_AGENT_APPLY);
+            let state = fresh_state(dir.path());
+            let plan_id = write_archive_plan(dir.path(), "events");
+            let adapter = CountingAdapter::new();
+
+            let err = run_archive_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                true,
+                &adapter,
+            )
+            .await
+            .expect_err("agent archive apply must be denied by policy");
+            assert!(
+                err.to_string().contains("policy DENIES"),
+                "expected a policy-deny error, got: {err}"
+            );
+            assert_eq!(
+                adapter.count(),
+                0,
+                "a denied archive apply must not reach execute_statement (no DELETE/VACUUM)"
+            );
+        }
+
+        /// A human applying the SAME destructive plan under the SAME policy is
+        /// allowed, and the DELETE/VACUUM statements DO reach the adapter.
+        #[tokio::test]
+        async fn archive_apply_sink_allows_human_and_executes() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_config(dir.path(), DENY_AGENT_APPLY);
+            let state = fresh_state(dir.path());
+            let plan_id = write_archive_plan(dir.path(), "events");
+            let adapter = CountingAdapter::new();
+
+            run_archive_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Human,
+                true,
+                &adapter,
+            )
+            .await
+            .expect("a human archive apply must be allowed");
+            assert!(
+                adapter.count() > 0,
+                "an allowed archive apply must execute its statements"
+            );
+        }
+
+        /// Enforcement uses the runtime principal + plan kind, never the stored
+        /// stamp: a plan stamped `human` is STILL denied when an agent applies
+        /// it.
+        #[tokio::test]
+        async fn archive_apply_ignores_downgraded_stored_stamp() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_config(dir.path(), DENY_AGENT_APPLY);
+            let state = fresh_state(dir.path());
+            let plan_id = write_archive_plan(dir.path(), "events");
+            let adapter = CountingAdapter::new();
+
+            let err = run_archive_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                true,
+                &adapter,
+            )
+            .await
+            .expect_err("a human-stamped plan applied by an agent must still be denied");
+            assert!(err.to_string().contains("policy DENIES"), "got: {err}");
+            assert_eq!(adapter.count(), 0);
+        }
+
+        /// Generic route (`rocky apply <archive-plan>` → `run_apply_in`): the
+        /// documented-bug regression. The gate refuses BEFORE the real adapter
+        /// is built, so no credentials are needed to observe the deny.
+        #[tokio::test]
+        async fn archive_apply_generic_route_denies_agent() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_config(dir.path(), DENY_AGENT_APPLY);
+            let state = fresh_state(dir.path());
+            let plan_id = write_archive_plan(dir.path(), "events");
+
+            let err = crate::commands::apply::run_apply_in(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                true,
+            )
+            .await
+            .expect_err("agent archive apply via the generic route must be denied");
+            assert!(err.to_string().contains("policy DENIES"), "got: {err}");
+        }
+
+        /// Targetless-archive decision: a `DELETE FROM *` wildcard plan cannot
+        /// be gated, so with a `[policy]` block configured it is REFUSED
+        /// outright (never vacuously allowed), and nothing executes — even for a
+        /// human, since the plan itself is un-gateable.
+        #[tokio::test]
+        async fn archive_apply_refuses_targetless_under_policy() {
+            let dir = tempfile::tempdir().unwrap();
+            // Any policy at all (even with no rules) activates the guard.
+            let config = write_config(dir.path(), "");
+            let state = fresh_state(dir.path());
+            let plan_id = write_targetless_archive_plan(dir.path());
+            let adapter = CountingAdapter::new();
+
+            let err = run_archive_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Human,
+                true,
+                &adapter,
+            )
+            .await
+            .expect_err("a targetless archive must be refused under policy");
+            assert!(
+                err.to_string().contains("no concrete table"),
+                "expected the wildcard-refusal error, got: {err}"
+            );
+            assert_eq!(
+                adapter.count(),
+                0,
+                "a refused targetless archive executes nothing"
+            );
+        }
+
+        /// With NO `[policy]` block the targetless guard does NOT fire (there is
+        /// nothing to enforce): the wildcard flows through to the adapter,
+        /// preserving today's behaviour. Proves the guard is policy-conditional.
+        #[tokio::test]
+        async fn archive_apply_targetless_proceeds_without_policy() {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_config_no_policy(dir.path());
+            let state = fresh_state(dir.path());
+            let plan_id = write_targetless_archive_plan(dir.path());
+            let adapter = CountingAdapter::new();
+
+            run_archive_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Human,
+                true,
+                &adapter,
+            )
+            .await
+            .expect("without policy the targetless archive is not gate-refused");
+            assert!(
+                adapter.count() > 0,
+                "the un-gated wildcard still regenerates + reaches the adapter"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_duration_days() {
@@ -690,9 +1150,16 @@ schema_template = "staging__{{source}}"
         assert_eq!(plan.format_version, 1);
 
         // Apply must reject with the migration error.
-        let err = run_archive_apply_in(dir.path(), &config_path, &plan_id, false)
-            .await
-            .expect_err("v1 archive plan must be rejected by apply");
+        let err = run_archive_apply_in(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            &dir.path().join("state.redb"),
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect_err("v1 archive plan must be rejected by apply");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("format v1") || msg.contains("v1 plan"),
@@ -755,9 +1222,16 @@ schema_template = "staging__{{source}}"
             &serde_json::json!({"dummy": true}),
         )?;
 
-        let err = run_archive_apply_in(dir.path(), &config_path, &plan_id, false)
-            .await
-            .unwrap_err();
+        let err = run_archive_apply_in(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            &dir.path().join("state.redb"),
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("compact plan, not an archive plan"),

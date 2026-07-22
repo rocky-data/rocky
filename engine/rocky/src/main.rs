@@ -3919,7 +3919,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             all_tables,
         } => {
             if let Some(CompactAction::Apply { plan_id }) = action {
-                rocky_cli::commands::run_compact_apply(&cli.config, &plan_id, json).await
+                // Direct-alias route (`rocky compact apply --plan`): resolve the
+                // apply-time principal via the SAME resolver the generic `apply`
+                // arm uses, so the sink gates under `PolicyCapability::Apply`
+                // regardless of which route reached it.
+                let runtime_principal = resolve_cli_principal(cli.principal)?;
+                rocky_cli::commands::run_compact_apply(
+                    &cli.config,
+                    &plan_id,
+                    &state_path,
+                    runtime_principal,
+                    json,
+                )
+                .await
             } else if measure_dedup {
                 let cols = exclude_columns.as_deref().map(|s| {
                     s.split(',')
@@ -4289,7 +4301,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             dry_run,
         } => {
             if let Some(ArchiveAction::Apply { plan_id }) = action {
-                rocky_cli::commands::run_archive_apply(&cli.config, &plan_id, json).await
+                // Direct-alias route (`rocky archive apply --plan`): resolve the
+                // apply-time principal via the SAME resolver the generic `apply`
+                // arm uses, so the destructive DELETE + VACUUM gates under
+                // `PolicyCapability::Apply` regardless of which route reached it.
+                let runtime_principal = resolve_cli_principal(cli.principal)?;
+                rocky_cli::commands::run_archive_apply(
+                    &cli.config,
+                    &plan_id,
+                    &state_path,
+                    runtime_principal,
+                    json,
+                )
+                .await
             } else {
                 let older_than = older_than.ok_or_else(|| {
                     anyhow::anyhow!(
