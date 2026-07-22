@@ -8969,9 +8969,10 @@ async fn execute_time_interval_model(
     // Bootstrap-on-first-run: the time_interval DELETE+INSERT cycle requires
     // the target table to exist. If it doesn't (first run, or after manual
     // cleanup), render the model SQL with an empty `[start, start)` window
-    // and wrap in CREATE OR REPLACE TABLE AS to materialize an empty table
-    // with the right output schema. Subsequent partition runs use the
-    // normal DELETE+INSERT path.
+    // and wrap in non-replacing CREATE TABLE AS to materialize an empty table
+    // with the right output schema. If the metadata probe failed against a
+    // live target, CREATE fails without overwriting it. Subsequent partition
+    // runs use the normal DELETE+INSERT path.
     let target_ref_struct = rocky_ir::TableRef {
         catalog: model.config.target.catalog.clone(),
         schema: model.config.target.schema.clone(),
@@ -9748,7 +9749,7 @@ async fn process_table(
     // information_schema query), falling back to individual DESCRIBE TABLE
     // via WarehouseAdapter.
     let (source_cols, target_cols) =
-        if task.prefetched_source_cols.is_some() || task.prefetched_target_cols.is_some() {
+        if task.prefetched_source_cols.is_some() && task.prefetched_target_cols.is_some() {
             (
                 task.prefetched_source_cols.clone().unwrap_or_default(),
                 task.prefetched_target_cols.clone().unwrap_or_default(),
@@ -9966,7 +9967,11 @@ async fn process_table(
     let strategy_name;
     let sql = if use_full_refresh {
         strategy_name = "full_refresh";
-        sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
+        if target_exists {
+            sql_gen::generate_create_table_as_sql(&model_ir, dialect)?
+        } else {
+            sql_gen::generate_bootstrap_create_table_as_sql(&model_ir, dialect)?
+        }
     } else {
         match &strategy {
             MaterializationStrategy::FullRefresh => {
@@ -10120,12 +10125,10 @@ async fn process_table(
         "copying data"
     );
 
-    // Idempotent full refresh on dialects whose CTAS isn't `CREATE OR
-    // REPLACE` (Trino): drop the target first so a re-run doesn't fail with
-    // "table already exists". Issued as a separate statement because Trino's
-    // REST API runs one statement per request. Other dialects skip this —
-    // their CTAS already replaces atomically.
-    if strategy_name == "full_refresh" && dialect.full_refresh_needs_predrop() {
+    // Idempotent replacement on dialects whose full-refresh CTAS isn't
+    // `CREATE OR REPLACE` (Trino). A bootstrap target is never pre-dropped:
+    // plain CREATE must fail closed if the metadata probe missed a live table.
+    if target_exists && strategy_name == "full_refresh" && dialect.full_refresh_needs_predrop() {
         let target_ref = dialect.format_table_ref(
             &target_table.catalog,
             &target_table.schema,
@@ -12552,6 +12555,121 @@ merge_keys = ["id"]
             mb_watermark, data_max,
             "microbatch must also record MAX(target.ts), not wall-clock now"
         );
+    }
+
+    /// A failed target metadata probe must not turn bootstrap into destructive
+    /// replacement. Plain CREATE should reject the existing target and leave
+    /// its rows untouched.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn target_describe_failure_does_not_replace_existing_replication_target() {
+        use async_trait::async_trait;
+        use chrono::TimeZone;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::{
+            AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_ir::{TableRef, WatermarkState};
+
+        struct FailTargetDescribe<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for FailTargetDescribe<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                if table.schema == "tgt" {
+                    return Err(AdapterError::msg("injected target DESCRIBE failure"));
+                }
+                self.inner.describe_table(table).await
+            }
+        }
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for sql in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO src.events VALUES (1, TIMESTAMP '2026-03-02 12:00:00')",
+            "CREATE TABLE tgt.events (id INTEGER, ts TIMESTAMP)",
+            "INSERT INTO tgt.events VALUES (99, TIMESTAMP '2026-03-01 10:00:00')",
+        ] {
+            inner.execute_statement(sql).await.unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateStore::open(&dir.path().join("state.redb")).unwrap());
+        let target = TableRef {
+            catalog: String::new(),
+            schema: "tgt".into(),
+            table: "events".into(),
+        };
+        state
+            .set_watermark(
+                &target.state_key(),
+                &WatermarkState {
+                    last_value: Utc.with_ymd_and_hms(2026, 3, 1, 10, 0, 0).unwrap(),
+                    updated_at: Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let pipeline = parse_pipeline(
+            r#"strategy = "incremental"
+timestamp_column = "ts"
+"#,
+        );
+        let task = TableTask {
+            source_catalog: String::new(),
+            source_schema: "src".into(),
+            target_catalog: String::new(),
+            target_schema: "tgt".into(),
+            table_name: "events".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            check_column_match: false,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude: vec![],
+            metadata_columns: vec![],
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        };
+
+        let failing = FailTargetDescribe { inner: &inner };
+        let error = match process_table(&failing, &state, &pipeline, &task, false).await {
+            Ok(_) => panic!("a failed target probe must not replace an existing table"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("already exists"),
+            "bootstrap should fail on the existing target: {error:#}"
+        );
+
+        let rows = inner
+            .execute_query("SELECT id FROM tgt.events ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
     }
 
     /// Regression: losing state while an incremental target still exists must

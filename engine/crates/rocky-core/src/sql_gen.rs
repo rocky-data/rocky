@@ -151,6 +151,27 @@ pub fn generate_create_table_as_sql(
     model_ir: &ModelIr,
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
+    generate_replication_create_table_as_sql(model_ir, dialect, true)
+}
+
+/// Generates non-replacing CREATE TABLE AS SELECT for first-run bootstrap.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::InvalidRequest`] when `model_ir` was not
+/// a replication-variant [`ModelIr`] (see [`rocky_ir::ModelIrVariant`]).
+pub fn generate_bootstrap_create_table_as_sql(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+) -> Result<String, SqlGenError> {
+    generate_replication_create_table_as_sql(model_ir, dialect, false)
+}
+
+fn generate_replication_create_table_as_sql(
+    model_ir: &ModelIr,
+    dialect: &dyn SqlDialect,
+    replace: bool,
+) -> Result<String, SqlGenError> {
     if model_ir.variant() != ModelIrVariant::Replication {
         return Err(variant_mismatch(model_ir, "Replication"));
     }
@@ -173,7 +194,11 @@ pub fn generate_create_table_as_sql(
     let source_ref = dialect.format_table_ref(&source.catalog, &source.schema, &source.table)?;
     let select = format!("{select_clause}\nFROM {source_ref}");
 
-    Ok(dialect.create_table_as(&target, &select))
+    Ok(if replace {
+        dialect.create_table_as(&target, &select)
+    } else {
+        dialect.create_table_as_new(&target, &select)
+    })
 }
 
 /// Generates a MERGE INTO statement using the given dialect.
@@ -473,10 +498,10 @@ pub fn generate_transformation_sql_with_warehouse(
 /// table whose **schema** matches what the model would produce on a real
 /// run.
 ///
-/// Wrapping the rendered body in `dialect.create_table_as` gives us the
-/// per-warehouse syntax (Databricks `CREATE OR REPLACE TABLE ... AS`,
-/// Snowflake `CREATE OR REPLACE TABLE ... AS`, DuckDB `CREATE OR REPLACE
-/// TABLE ... AS`) without duplicating that logic here.
+/// Wrapping the rendered body in `dialect.create_table_as_new` deliberately
+/// uses non-replacing CREATE TABLE AS syntax. If the existence probe failed
+/// for a reason other than a missing target, CREATE fails without erasing the
+/// live table.
 ///
 /// Once the table exists, subsequent partition runs use the regular
 /// `insert_overwrite_partition` DELETE+INSERT cycle.
@@ -525,13 +550,14 @@ pub fn generate_time_interval_bootstrap_sql(
             .as_ref()
             .cloned()
             .unwrap_or_default();
-        let stmts = lakehouse::generate_lakehouse_ddl(format, &target, &body, &opts, dialect)?;
-        // generate_lakehouse_ddl returns Vec<String>; join into a single
+        let stmts =
+            lakehouse::generate_lakehouse_initial_ddl(format, &target, &body, &opts, dialect)?;
+        // The lakehouse generator returns Vec<String>; join into a single
         // statement since the bootstrap function returns String.
         return Ok(stmts.join(";\n"));
     }
 
-    Ok(dialect.create_table_as(&target, &body))
+    Ok(dialect.create_table_as_new(&target, &body))
 }
 
 /// Generates the initial DDL to create a target table with lakehouse format
@@ -543,7 +569,7 @@ pub fn generate_time_interval_bootstrap_sql(
 /// the table using format-specific DDL (e.g., `CREATE TABLE ... USING DELTA`).
 ///
 /// When `plan.format` is `None`, falls back to a plain
-/// `dialect.create_table_as`. The body SQL is the plan's `sql` field, so
+/// `dialect.create_table_as_new`. The body SQL is the plan's `sql` field, so
 /// the table schema matches what the model would produce.
 ///
 /// This is complementary to `generate_transformation_sql` — the runtime
@@ -573,7 +599,7 @@ pub fn generate_transformation_initial_ddl(
             .as_ref()
             .cloned()
             .unwrap_or_default();
-        return Ok(lakehouse::generate_lakehouse_ddl(
+        return Ok(lakehouse::generate_lakehouse_initial_ddl(
             format,
             &target,
             &model_ir.sql,
@@ -582,7 +608,7 @@ pub fn generate_transformation_initial_ddl(
         )?);
     }
 
-    Ok(vec![dialect.create_table_as(&target, &model_ir.sql)])
+    Ok(vec![dialect.create_table_as_new(&target, &model_ir.sql)])
 }
 
 /// Substitute `@start_date` / `@end_date` placeholders in the model SQL with
@@ -1370,6 +1396,17 @@ mod tests {
     }
 
     #[test]
+    fn test_bootstrap_create_table_as_sql_never_replaces() {
+        let sql =
+            generate_bootstrap_create_table_as_sql(&sample_incremental_ir(), &dialect()).unwrap();
+
+        assert!(sql.starts_with("CREATE TABLE acme_warehouse.staging__us_west__shopify.orders AS"));
+        assert!(!sql.contains("OR REPLACE"));
+        assert!(sql.contains("SELECT *, CAST(NULL AS STRING) AS _loaded_by"));
+        assert!(!sql.contains("WHERE"));
+    }
+
+    #[test]
     fn test_explicit_columns() {
         let mut ir = sample_full_refresh_ir();
         ir.columns = Some(ColumnSelection::Explicit(vec![
@@ -1940,11 +1977,12 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         );
         let sql = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap();
 
-        // Wrapped in CREATE OR REPLACE TABLE AS by the test dialect.
+        // Bootstrap uses non-replacing CREATE TABLE AS.
         assert!(
-            sql.starts_with("CREATE OR REPLACE TABLE cat.marts.fct_daily_orders AS"),
+            sql.starts_with("CREATE TABLE cat.marts.fct_daily_orders AS"),
             "expected CREATE TABLE AS, got: {sql}"
         );
+        assert!(!sql.contains("OR REPLACE"));
         // Both placeholders substituted to the sentinel.
         assert!(
             sql.contains("'1900-01-01 00:00:00'"),
@@ -2194,6 +2232,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             sql.contains("USING DELTA"),
             "initial DDL should use DELTA: {sql}"
         );
+        assert!(!sql.contains("OR REPLACE"));
         assert!(
             sql.contains("PARTITIONED BY (region)"),
             "initial DDL should include partitioning: {sql}"
@@ -2233,7 +2272,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     #[test]
     fn test_lakehouse_initial_ddl_fallback_no_format() {
         // When format is None, generate_transformation_initial_ddl should
-        // fall back to the plain dialect.create_table_as.
+        // fall back to non-replacing plain CTAS.
         let mut plan = lakehouse_ir(
             LakehouseFormat::DeltaTable,
             LakehouseOptions::default(),
@@ -2244,10 +2283,11 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         let stmts = generate_transformation_initial_ddl(&plan, &dialect()).unwrap();
         assert_eq!(stmts.len(), 1);
         assert!(
-            stmts[0].starts_with("CREATE OR REPLACE TABLE"),
+            stmts[0].starts_with("CREATE TABLE"),
             "should fall back to plain CTAS: {}",
             stmts[0]
         );
+        assert!(!stmts[0].contains("OR REPLACE"));
         assert!(
             !stmts[0].contains("USING"),
             "plain fallback should not contain USING: {}",
@@ -2276,6 +2316,7 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
             sql.contains("USING DELTA"),
             "bootstrap should use DELTA: {sql}"
         );
+        assert!(!sql.contains("OR REPLACE"));
         assert!(
             sql.contains("PARTITIONED BY (order_date)"),
             "bootstrap should include partitioning: {sql}"
@@ -2311,9 +2352,10 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
         );
         let sql = generate_time_interval_bootstrap_sql(&plan, &dialect()).unwrap();
         assert!(
-            sql.starts_with("CREATE OR REPLACE TABLE"),
+            sql.starts_with("CREATE TABLE"),
             "should use plain CTAS: {sql}"
         );
+        assert!(!sql.contains("OR REPLACE"));
         assert!(
             !sql.contains("USING"),
             "plain bootstrap should not contain USING: {sql}"

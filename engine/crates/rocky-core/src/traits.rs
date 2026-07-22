@@ -836,6 +836,15 @@ pub trait SqlDialect: Send + Sync {
     /// Databricks: `CREATE OR REPLACE TABLE {target} AS {select}`
     fn create_table_as(&self, target: &str, select_sql: &str) -> String;
 
+    /// CREATE TABLE AS SELECT for a target that is expected not to exist.
+    ///
+    /// Unlike [`SqlDialect::create_table_as`], this deliberately does not
+    /// replace an existing target. That makes bootstrap creation fail closed
+    /// if an existence probe was stale or failed for another reason.
+    fn create_table_as_new(&self, target: &str, select_sql: &str) -> String {
+        format!("CREATE TABLE {target} AS\n{select_sql}")
+    }
+
     /// INSERT INTO ... SELECT (incremental append).
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 
