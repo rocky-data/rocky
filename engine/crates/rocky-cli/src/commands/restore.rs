@@ -1739,23 +1739,62 @@ mod tests {
             store.record_artifact(&art_record).unwrap();
             record_run(&store, "r1", "orders");
 
+            // Seed ledger artifact rows for BOTH upstream hashes so the real
+            // `classify_model` resolves them exactly as production does: a
+            // `Content` upstream is replay-resolvable IFF its blake3 has an
+            // `ArtifactRecord` in the ledger (see `replay::classify_input`).
+            // Without these rows the upstreams classify NON-replayable and the
+            // whole recipe is non_replayable — the fabricated shortcut the
+            // earlier version of this test took, which production could never
+            // produce for a 2-upstream artifact.
+            for (hash, upstream_model) in [(HA, "customers"), (HB, "line_items")] {
+                store
+                    .record_artifact(&ArtifactRecord {
+                        blake3_hash: hash.to_string(),
+                        run_id: "r0".to_string(),
+                        model_name: upstream_model.to_string(),
+                        file_path: format!("{STORAGE_PREFIX}/{upstream_model}.parquet"),
+                        commit_version: 0,
+                        size_bytes: 1,
+                        written_at: written,
+                    })
+                    .unwrap();
+            }
+
             // --- gc side: this artifact passes the FULL 6-check gc admission
             // (`build_candidate`), not merely the recipe-recorded check — so the
             // eviction set `rocky gc` actually approves genuinely includes a
             // multi-input artifact that `restore_one` refuses below. A new
             // production check that rejected upstream-bearing recipes would flip
             // `derivable` to false here and fail this assertion.
-            let class = crate::output::ReplayCheckModelOutput {
-                model_name: "orders".to_string(),
-                verdict: "replayable".to_string(),
-                reasons: Vec::new(),
-                has_provenance: true,
-                ir_parseable: true,
-                nondeterministic: false,
-                // Read back off the record gc itself would classify from.
-                proof_class: Some(prov.proof_class.clone()),
-                inputs: Vec::new(),
-            };
+            //
+            // Drive the REAL `classify_model` — the exact verdict `rocky gc`
+            // reuses — rather than a hand-fabricated classification. With both
+            // upstream artifact rows seeded above, it NATURALLY yields
+            // `replayable` with two RESOLVABLE inputs: production-faithful for a
+            // genuine multi-input recipe whose upstreams are all resolvable.
+            let class = crate::commands::replay::classify_model(&store, "r1", "orders");
+            assert_eq!(
+                class.verdict, "replayable",
+                "the real classify_model must judge this multi-input recipe replayable: {:?}",
+                class.reasons
+            );
+            assert_eq!(
+                class.inputs.len(),
+                2,
+                "classify_model resolves BOTH recorded upstreams — not an empty input set: {:?}",
+                class.inputs
+            );
+            assert!(
+                class.inputs.iter().all(|i| i.resolvable),
+                "both recorded upstreams are ledger-resolvable: {:?}",
+                class.inputs
+            );
+            assert_eq!(
+                class.proof_class.as_deref(),
+                Some("strong"),
+                "the recorded strong closure carries through the real classification"
+            );
             // Exactly one live ledger reference (the candidate itself) — gc's
             // `unreferenced` check admits only refcount == 1.
             let refcount = store.refcount_for_hash(&wr.blake3_hash).unwrap();
