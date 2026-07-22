@@ -1038,6 +1038,7 @@ mod tests {
             ModelSchema {
                 columns: vec![],
                 has_star: true,
+                unresolved_projections: 0,
                 upstream: vec!["upstream".into()],
                 downstream: vec![],
                 intent: None,
@@ -1048,6 +1049,7 @@ mod tests {
             ModelSchema {
                 columns: vec![],
                 has_star: false,
+                unresolved_projections: 0,
                 upstream: vec!["upstream".into()],
                 downstream: vec![],
                 intent: None,

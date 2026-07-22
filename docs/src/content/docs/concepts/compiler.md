@@ -198,6 +198,7 @@ The compiler produces structured diagnostics with codes, severity levels, source
 | `W003` | `time_column` is TIMESTAMP where DATE is preferred for the granularity |
 | `W004` | Classification tag with no matching `[mask]` strategy |
 | `W005` | Temporal column present but no `freshness` declaration in scope |
+| `W006` | `merge` strategy declares a `unique_key` column the model does not output |
 | `W010` | Contract defines a column not in model output (not required) |
 | `W011` | Contract exists for a model not found in the project |
 | `W012` | An `[imports.<name>]` snapshot could not be loaded; `E030`/`E033` checks skipped |

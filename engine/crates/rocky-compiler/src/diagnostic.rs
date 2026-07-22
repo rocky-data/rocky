@@ -33,19 +33,22 @@ pub const E012: &str = "E012";
 pub const E013: &str = "E013";
 
 // Errors — time_interval validation
-/// Missing `@start_date` placeholder.
-pub const E020: &str = "E020";
-/// Missing `@end_date` placeholder.
-pub const E021: &str = "E021";
+//
+// The authoritative description of each code lives on
+// `rocky_compiler::typecheck::check_time_interval_strategy`, which emits them.
 /// `time_column` not in model output schema.
-pub const E022: &str = "E022";
-/// `time_column` has incompatible type for granularity.
-pub const E023: &str = "E023";
+pub const E020: &str = "E020";
+/// `time_column` is not a date/timestamp type.
+pub const E021: &str = "E021";
 /// `time_column` is nullable (must be NOT NULL).
+pub const E022: &str = "E022";
+/// `time_column` failed SQL identifier validation.
+pub const E023: &str = "E023";
+/// Neither `@start_date` nor `@end_date` referenced in the model SQL.
 pub const E024: &str = "E024";
-/// Placeholder used but strategy is not `time_interval`.
+/// `granularity = "hour"` requires a TIMESTAMP column, not DATE.
 pub const E025: &str = "E025";
-/// Duplicate `@start_date`/`@end_date` placeholder.
+/// `first_partition` is not a valid canonical key for the granularity.
 pub const E026: &str = "E026";
 /// Budget exceeded — projected spend exceeds the declared per-model cost ceiling.
 ///
@@ -148,6 +151,42 @@ pub const W004: &str = "W004";
 /// Soft hint that the model would benefit from a freshness expectation.
 /// Suppressed by adding a `[freshness]` block (per-model or project).
 pub const W005: &str = "W005";
+/// `merge` strategy declares a `unique_key` column the model does not output.
+///
+/// Emitted by `rocky compile` when a model sets `[strategy] type = "merge"`
+/// and one of its `unique_key` entries does not name a column in the model's
+/// output schema. Without it a typo'd merge key compiles clean and only fails
+/// once the warehouse rejects the generated `MERGE ... ON` clause, so the
+/// mistake surfaces mid-run rather than at compile time. One diagnostic per
+/// missing key, so a multi-column `unique_key` reports every typo at once.
+///
+/// # Why a warning and not an error
+///
+/// The check is only as good as the compiler's ability to enumerate a model's
+/// output columns, and that enumeration is best-effort — it is recovered from
+/// lineage extraction, which is not a full SQL semantic analysis. Every case it
+/// cannot enumerate is a potential false positive, and a false positive on an
+/// error breaks a valid build. Gating hard on a soft signal is the wrong trade,
+/// so this reports and does not block. Run it, read it, and fix the typo it
+/// finds; a build is never failed on it.
+///
+/// # When it is skipped
+///
+/// Only models whose output schema is *provably complete* are checked —
+/// [`crate::semantic::ModelSchema::schema_is_complete`], which requires both no
+/// `SELECT *` and no projection item lineage could not name. A star may expand
+/// from a raw source Rocky has no schema for; an unnamed non-identifier
+/// projection (`SELECT (order_id)`) yields no schema entry at all. In either
+/// case "the column is absent" would be an artefact of incomplete enumeration
+/// rather than a fact about the model.
+///
+/// # Case sensitivity
+///
+/// Column names are matched **case-insensitively**, which is the right default
+/// but is not uniformly sound — see
+/// `rocky_compiler::typecheck::check_merge_strategy` for the per-adapter survey
+/// and the Snowflake limitation it accepts.
+pub const W006: &str = "W006";
 /// Contract defines a column not in model output (but not required).
 pub const W010: &str = "W010";
 /// Contract exists for a model not found in the project.

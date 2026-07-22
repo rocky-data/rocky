@@ -74,6 +74,34 @@ pub struct LineageResult {
     pub columns: Vec<ColumnLineage>,
     /// Whether SELECT * was used (lineage is partial).
     pub has_star: bool,
+    /// How many projection items did **not** yield a column entry whose
+    /// `target_column` is the item's true output name.
+    ///
+    /// [`Self::columns`] is best-effort: it is a lineage graph first and an
+    /// output-schema enumeration second. Two kinds of projection item leave it
+    /// short of the real schema:
+    ///
+    /// - an unnamed expression the extractor cannot trace at all
+    ///   (`SELECT (order_id)` — a parenthesised expression, `SELECT 1`), which
+    ///   contributes no entry;
+    /// - an unnamed expression it *can* trace to an upstream column
+    ///   (`SELECT UPPER(name)`, `SELECT CAST(x AS INT)`), which contributes an
+    ///   entry named after the traced *source* column. That name is the lineage
+    ///   answer, not the output-schema answer: the warehouse names such a
+    ///   column by its own rules, which Rocky does not model.
+    ///
+    /// Both are counted here. A consumer that needs the model's *complete*
+    /// output column set — rather than whatever lineage could recover — must
+    /// treat `columns` as authoritative only when this is `0` (and
+    /// [`Self::has_star`] is `false`). Aliased items (`expr AS name`) always
+    /// yield a correctly named entry and are never counted, which is why the
+    /// overwhelmingly common explicit-projection model stays fully checkable.
+    ///
+    /// `#[serde(default)]` so a `LineageResult` cached by an older build
+    /// deserializes as "fully understood" rather than failing to load. That is
+    /// the pre-existing behaviour for such caches, not a new risk.
+    #[serde(default)]
+    pub unresolved_projections: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,13 +175,14 @@ fn extract_query_lineage(query: &Query) -> Result<LineageResult, String> {
         SetExpr::Select(select) => {
             let source_tables = extract_tables(&select.from);
             let alias_map = build_alias_map(&source_tables);
-            let (columns, has_star) =
+            let (columns, has_star, unresolved_projections) =
                 extract_select_columns(&select.projection, &alias_map, &source_tables);
 
             Ok(LineageResult {
                 source_tables,
                 columns,
                 has_star,
+                unresolved_projections,
             })
         }
         SetExpr::Query(inner) => extract_query_lineage(inner),
@@ -254,13 +283,17 @@ fn source_less_column(target: &str) -> ColumnLineage {
     }
 }
 
+/// Returns `(columns, has_star, unresolved_projections)` — see
+/// [`LineageResult::unresolved_projections`] for what the third element means
+/// and why `columns` alone cannot answer "is this the model's whole output?".
 fn extract_select_columns(
     projection: &[SelectItem],
     alias_map: &HashMap<String, String>,
     source_tables: &[TableReference],
-) -> (Vec<ColumnLineage>, bool) {
+) -> (Vec<ColumnLineage>, bool, usize) {
     let mut columns = Vec::new();
     let mut has_star = false;
+    let mut unresolved_projections = 0usize;
 
     for item in projection {
         match item {
@@ -271,13 +304,24 @@ fn extract_select_columns(
                 has_star = true;
             }
             SelectItem::UnnamedExpr(expr) => {
+                // An unnamed item has a predictable output name only when it is
+                // a bare (optionally table-qualified) identifier: `SELECT a` and
+                // `SELECT t.a` both output a column named `a`. Everything else —
+                // `SELECT (a)`, `SELECT a + b`, `SELECT UPPER(a)`, `SELECT 1` —
+                // is named by the warehouse's own rules, which Rocky does not
+                // model. Count those as unresolved even when `extract_expr_lineage`
+                // succeeds: the entry it produces is named after the *traced
+                // source* column, which is the right answer for lineage and the
+                // wrong one for the output schema.
+                if !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                    unresolved_projections += 1;
+                }
+                // Push whatever lineage we can recover regardless — the edge is
+                // still useful for impact analysis even when the output name
+                // isn't authoritative.
                 if let Some(lineage) = extract_expr_lineage(expr, alias_map, source_tables) {
                     columns.push(lineage);
                 }
-                // An unnamed expression with no traceable source (e.g. a bare
-                // `COUNT(*)` or a literal) has no portable output name, so we
-                // can't emit a column entry for it. Aliased forms below are the
-                // ones that matter — and models alias their aggregates.
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 match extract_expr_lineage(expr, alias_map, source_tables) {
@@ -315,7 +359,7 @@ fn extract_select_columns(
         }
     }
 
-    (columns, has_star)
+    (columns, has_star, unresolved_projections)
 }
 
 fn extract_expr_lineage(
@@ -429,6 +473,81 @@ mod tests {
         let result = extract_lineage("SELECT * FROM catalog.schema.users").unwrap();
         assert!(result.has_star);
         assert!(result.columns.is_empty()); // star doesn't produce individual lineage
+    }
+
+    // ----- projection completeness (`unresolved_projections`) -----
+    //
+    // `columns` is a lineage graph that doubles as a schema enumeration, and it
+    // is not always a faithful one. These pin the cases where it isn't, so a
+    // consumer that needs the model's *whole* output set has a signal to gate
+    // on rather than inferring completeness from `has_star` or emptiness.
+
+    #[test]
+    fn test_plain_identifiers_are_fully_resolved() {
+        let result = extract_lineage("SELECT id, name FROM catalog.schema.users").unwrap();
+        assert_eq!(result.unresolved_projections, 0);
+        assert!(!result.has_star);
+    }
+
+    #[test]
+    fn test_qualified_identifiers_are_fully_resolved() {
+        // `u.id` outputs a column named `id` — predictable, so not unresolved.
+        let result = extract_lineage("SELECT u.id, u.name FROM catalog.schema.users u").unwrap();
+        assert_eq!(result.unresolved_projections, 0);
+    }
+
+    #[test]
+    fn test_aliased_expressions_are_fully_resolved() {
+        // `expr AS name` always yields a correctly named output column, so
+        // computing something does not cost completeness — only *not naming*
+        // the result does.
+        let result = extract_lineage(
+            "SELECT UPPER(name) AS upper_name, COUNT(*) AS n FROM catalog.schema.users GROUP BY 1",
+        )
+        .unwrap();
+        assert_eq!(result.unresolved_projections, 0);
+        assert_eq!(result.columns.len(), 2);
+    }
+
+    #[test]
+    fn test_parenthesised_projection_counts_as_unresolved() {
+        // `(id)` is `Expr::Nested`, which the extractor does not trace: it
+        // yields no column entry, and with no star and no alias there is
+        // nothing else to signal the gap.
+        let result = extract_lineage("SELECT (id) FROM catalog.schema.users").unwrap();
+        assert_eq!(result.unresolved_projections, 1);
+        assert!(!result.has_star);
+        assert!(result.columns.is_empty());
+    }
+
+    #[test]
+    fn test_partial_parenthesised_projection_counts_as_unresolved() {
+        // The case that defeats an emptiness heuristic: one item resolves, one
+        // does not, so `columns` is non-empty and still short of the truth.
+        let result = extract_lineage("SELECT (id), name FROM catalog.schema.users").unwrap();
+        assert_eq!(result.unresolved_projections, 1);
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].target_column, "name");
+    }
+
+    #[test]
+    fn test_unnamed_traced_expression_counts_as_unresolved() {
+        // `UPPER(name)` *is* traced — to `name`. That entry is correct lineage
+        // and an incorrect output name (the warehouse names this column by its
+        // own rules), so completeness must not be claimed.
+        let result = extract_lineage("SELECT UPPER(name) FROM catalog.schema.users").unwrap();
+        assert_eq!(result.unresolved_projections, 1);
+        // The lineage edge is still recorded — the signal is additive and does
+        // not change what `columns` contains.
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].source_column, "name");
+    }
+
+    #[test]
+    fn test_unresolved_projections_counts_every_offending_item() {
+        let result =
+            extract_lineage("SELECT (id), (name), email FROM catalog.schema.users").unwrap();
+        assert_eq!(result.unresolved_projections, 2);
     }
 
     #[test]
