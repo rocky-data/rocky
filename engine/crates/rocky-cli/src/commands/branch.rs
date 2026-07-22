@@ -1617,12 +1617,24 @@ pub fn run_branch_show(state_path: &Path, name: &str, json: bool) -> Result<()> 
 /// validated against `promote_plan.branch_name`. A mismatch is an error —
 /// the user likely intended a different plan. Passing `None` (no positional)
 /// is accepted when `--plan` is the entry point.
+///
+/// ## Policy enforcement
+///
+/// `runtime_principal` is the promote-time identity (`--principal` /
+/// `ROCKY_PRINCIPAL`, resolved by the CLI). It is combined with the plan's
+/// kind-forced principal via
+/// [`crate::plan_store::PersistedPlan::enforcement_principal`] and
+/// gated — EXACTLY the enforcement `rocky apply <promote-plan>` performs, so
+/// the two entrypoints reach the identical verdict on the same plan. The
+/// plan's stored `principal` stamp is not consulted (it is not integrity
+/// protected).
 pub async fn run_branch_promote_from_plan(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
     name: Option<&str>,
     state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
     json: bool,
 ) -> Result<()> {
     use crate::output::{AuditEvent, AuditEventKind, PromotePlan, print_json};
@@ -1655,15 +1667,22 @@ pub async fn run_branch_promote_from_plan(
     // Route the `--plan` path through the canonical agent-policy gate BEFORE
     // any target SQL executes — the same gate `rocky apply <promote-plan>`
     // runs. Without this, an agent-authored Promote plan a `deny agent promote`
-    // rule (or freeze) would refuse could still execute here directly. The
-    // plan's stamped principal binds (an agent plan evaluates as agent). The
-    // gate returns the ONE config snapshot it verified; `run_promote_apply`
-    // below resolves its adapter from that same instance (#1120).
+    // rule (or freeze) would refuse could still execute here directly.
+    //
+    // Enforce on `enforcement_principal(runtime_principal)`, NOT the plan's
+    // stored stamp: the stamp is advisory and not integrity-protected
+    // (`compute_plan_id` digests only `{kind, payload}`), so trusting it would
+    // let a rehash-and-rename downgrade the identity. This is the SAME
+    // expression `rocky apply <promote-plan>` evaluates, so the two entrypoints
+    // gate identically — runtime + kind decide (an agent runner is gated as
+    // agent regardless of the file; a human runner vouches). The gate returns
+    // the ONE config snapshot it verified; `run_promote_apply` below resolves
+    // its adapter from that same instance (#1120).
     let loaded = crate::commands::apply::gate_promote_plan(
         root,
         config_path,
         plan_id,
-        plan.resolved_principal(),
+        plan.enforcement_principal(runtime_principal),
         &promote_plan,
         state_path,
     )?;
@@ -3299,10 +3318,14 @@ auto_create_schemas = true
     }
 
     /// 🔴 A regression: `rocky branch promote --plan <id>` must route through
-    /// the agent-policy gate. An agent-authored Promote plan under a
+    /// the agent-policy gate. An AGENT running the promote under a
     /// `deny agent promote { any }` rule must be REFUSED before any target SQL
     /// executes. Pre-fix `run_branch_promote_from_plan` called `run_promote_apply`
     /// directly with no policy evaluation, so the denied plan executed.
+    ///
+    /// Enforcement keys on the runtime principal (here `Agent`) combined with
+    /// the plan kind — NOT the plan's stored stamp — exactly as `rocky apply
+    /// <promote-plan>` does (see `promote_gate_is_identical_across_entrypoints`).
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn branch_promote_from_plan_gates_a_denied_agent_promote() {
@@ -3394,13 +3417,16 @@ effect = "deny"
             .plan_id
             .expect("plan_id");
 
-        // Now apply it via the --plan path — the gate must REFUSE it.
+        // Now apply it via the --plan path under an AGENT runtime — the gate
+        // must REFUSE it. Enforcement is on the runtime principal + kind, so an
+        // agent runner is denied regardless of the plan file.
         let result = crate::commands::run_branch_promote_from_plan(
             dir,
             &config_path,
             &plan_id,
             None,
             &state_path,
+            rocky_core::config::PolicyPrincipal::Agent,
             false,
         )
         .await;

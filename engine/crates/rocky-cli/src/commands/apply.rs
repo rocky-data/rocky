@@ -2193,13 +2193,18 @@ impl GovernedRunContext<'_> {
 /// Evaluate the agent-policy plane over a `Promote` plan and enforce the
 /// resulting gate, before any promote SQL executes.
 ///
-/// Shared by BOTH promote apply entry points — `rocky apply <promote-plan>`
-/// and `rocky branch promote --plan <id>` — so neither can execute a denied
-/// agent promote. Absent `[policy]` this is a no-op (`NotConfigured` → the
-/// pre-policy-plane behaviour). A human-authored promote resolves to `allow`;
-/// an agent-authored one is gated per target under the `promote` verb. The
-/// models dir is resolved from config so a name-scoped rule matches the
-/// target's logical name.
+/// Shared by BOTH promote entrypoints — `rocky apply <promote-plan>`
+/// (`run_apply_promote_plan`) and `rocky branch promote --plan <id>`
+/// (`run_branch_promote_from_plan`) — so neither can execute a denied agent
+/// promote. Both pass the SAME `principal`: `enforcement_principal(runtime)`,
+/// the most-restrictive of the promote-time runtime identity and the `Promote`
+/// kind default. The plan's stored stamp is NOT consulted, so the two
+/// entrypoints reach the identical verdict on the same plan — an agent runner
+/// is gated as agent regardless of the file, and a human runner vouches
+/// (gated per target under the `promote` verb only when the runtime is agent).
+/// Absent `[policy]` this is a no-op (`NotConfigured` → the pre-policy-plane
+/// behaviour). The models dir is resolved from config so a name-scoped rule
+/// matches the target's logical name.
 pub(crate) fn gate_promote_plan(
     root: &Path,
     config_path: &Path,
@@ -4277,6 +4282,156 @@ effect = "deny"
             PolicyGate::Allow,
             "a human applier is not caught by `deny agent gc`; got {human_gate:?}"
         );
+        Ok(())
+    }
+
+    /// Both promote entrypoints — `rocky apply <promote-plan>`
+    /// (`run_apply_promote_plan`) and `rocky branch promote --plan`
+    /// (`run_branch_promote_from_plan`) — must reach the IDENTICAL gate verdict
+    /// on the SAME plan, because both now pass `enforcement_principal(runtime)`
+    /// to the shared `gate_promote_plan`. The plan's stored stamp is `agent`;
+    /// pre-fix the branch path read that stamp (`resolved_principal()`) and so
+    /// DENIED an agent-stamped plan even under a human runtime, while apply
+    /// (correctly using the runtime principal) ALLOWED it — the divergence this
+    /// test locks shut.
+    ///
+    /// Drives the real entrypoints (hence the real `gate_promote_plan` →
+    /// `evaluate_apply_policy_with_policy`), not a reconstruction:
+    /// - AGENT runtime → BOTH are refused at the gate (`deny agent promote`),
+    /// - HUMAN runtime → BOTH pass the gate (human vouches) and execute the
+    ///   self-contained target SQL to success.
+    ///
+    /// Non-vacuous: the stored stamp really is `agent` (asserted first), so the
+    /// human-runtime ALLOW can only come from ignoring that stamp.
+    #[tokio::test]
+    async fn promote_gate_is_identical_across_entrypoints() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let warehouse = root.join("warehouse.duckdb");
+        let config = root.join("rocky.toml");
+        let state = root.join("state.redb");
+
+        std::fs::write(
+            &config,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target]
+adapter = "default"
+
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "promote"
+scope = {{ any = true }}
+effect = "deny"
+"#,
+                warehouse.display()
+            ),
+        )?;
+
+        // A promote plan with a self-contained, idempotent target statement so
+        // the human-runtime ALLOW path executes cleanly (no branch source table
+        // needed), and re-running it once per entrypoint is a no-op.
+        let promote_plan = crate::output::PromotePlan {
+            branch_name: "fix-price".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "deadbeef".to_string(),
+            branch_state_hash: "hash".to_string(),
+            approvals_used: Vec::new(),
+            approvals_rejected: Vec::new(),
+            breaking_changes: None,
+            allow_breaking: false,
+            targets: vec![crate::output::PromoteTargetPlan {
+                target: "main.promoted".to_string(),
+                source: "main.branch_src".to_string(),
+                statement: "CREATE OR REPLACE TABLE promoted AS SELECT 42 AS answer".to_string(),
+            }],
+            plan_audit: Vec::new(),
+            created_at: chrono::Utc::now(),
+        };
+
+        // Stamp the stored principal `agent` — the field the pre-fix branch path
+        // trusted.
+        let plan_id = crate::plan_store::write_plan_with_principal(
+            root,
+            PlanKind::Promote,
+            &promote_plan,
+            PolicyPrincipal::Agent,
+        )?;
+        let persisted = read_plan(root, &plan_id)?;
+        assert_eq!(persisted.kind, PlanKind::Promote);
+        assert_eq!(
+            persisted.resolved_principal(),
+            PolicyPrincipal::Agent,
+            "the stored stamp is agent — the OLD branch-promote code would DENY this even under a \
+             human runtime; the human-runtime ALLOW below proves the stamp is now ignored"
+        );
+
+        // AGENT runtime: both entrypoints refuse at the shared gate.
+        let apply_agent = run_apply_promote_plan(
+            root,
+            &config,
+            &plan_id,
+            &state,
+            PolicyPrincipal::Agent,
+            false,
+        )
+        .await;
+        let branch_agent = crate::commands::branch::run_branch_promote_from_plan(
+            root,
+            &config,
+            &plan_id,
+            None,
+            &state,
+            PolicyPrincipal::Agent,
+            false,
+        )
+        .await;
+        let ae = apply_agent.expect_err("agent apply-promote must be denied");
+        let be = branch_agent.expect_err("agent branch-promote must be denied");
+        assert!(
+            ae.to_string().contains("DENIES"),
+            "apply-promote must deny an agent runtime: {ae}"
+        );
+        assert!(
+            be.to_string().contains("DENIES"),
+            "branch-promote must deny an agent runtime IDENTICALLY: {be}"
+        );
+
+        // HUMAN runtime: both entrypoints pass the identical gate (human vouches)
+        // and execute the target SQL to success.
+        run_apply_promote_plan(
+            root,
+            &config,
+            &plan_id,
+            &state,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("human apply-promote passes the gate and executes");
+        crate::commands::branch::run_branch_promote_from_plan(
+            root,
+            &config,
+            &plan_id,
+            None,
+            &state,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("human branch-promote passes the IDENTICAL gate and executes");
+
         Ok(())
     }
 

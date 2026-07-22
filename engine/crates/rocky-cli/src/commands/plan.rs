@@ -1963,13 +1963,15 @@ pub(crate) async fn build_promote_plan_inner(
     allow_breaking: bool,
     state_path: &Path,
     // The resolved CLI authoring principal, stamped onto the persisted plan as
-    // an ADVISORY/display record. A later `rocky apply` does NOT enforce against
-    // this stored stamp: the gate evaluates `most_restrictive(apply-time runtime
-    // principal, default_principal_for_kind(Promote))`, and a `Promote` plan's
-    // kind default is `human`. So an AGENT applier is gated as agent — a `deny
-    // agent promote {…}` rule fires and agent freezes apply — regardless of who
-    // authored the plan, while a human applier resolves to `human` (ungated in
-    // v0). The stored stamp decides nothing at apply time.
+    // an ADVISORY/display record. Enforcement — `rocky apply <promote-plan>` AND
+    // `rocky branch promote --plan`, which gate IDENTICALLY through the shared
+    // `gate_promote_plan` — does NOT enforce against this stored stamp: the gate
+    // evaluates `most_restrictive(runtime principal, default_principal_for_kind(
+    // Promote))`, and a `Promote` plan's kind default is `human`. So an AGENT
+    // runner is gated as agent — a `deny agent promote {…}` rule fires and agent
+    // freezes apply — regardless of who authored the plan, while a human runner
+    // resolves to `human` (ungated in v0). The stored stamp decides nothing at
+    // enforcement time.
     principal: PolicyPrincipal,
 ) -> Result<PromotePlanResult> {
     use crate::commands::branch::{

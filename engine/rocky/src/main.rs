@@ -130,15 +130,17 @@ struct Cli {
     /// Authoring principal for the agent-policy plane (`human` | `agent`).
     ///
     /// Stamped onto plans created by `rocky plan` as an advisory/display
-    /// record. A later `rocky apply` does NOT enforce against that stored
-    /// stamp: the gate evaluates the most-restrictive of the *apply-time*
-    /// runtime principal and the plan's kind default, so an agent applier is
-    /// always gated as agent and a machine-composed kind (ai-authored /
-    /// backfill) stays agent even under a human applier. The CLI surface
-    /// default is `human`; a harness driving `rocky` announces itself with
-    /// `--principal agent` (or `ROCKY_PRINCIPAL=agent`). An explicit
-    /// `--principal` always wins and is the only way to lower an env-raised
-    /// floor (a downgrade warns). Absent `[policy]`, this flag has no effect.
+    /// record. Enforcement (`rocky apply`, and `rocky branch promote --plan`)
+    /// does NOT enforce against that stored stamp: the gate evaluates the
+    /// most-restrictive of the *runtime* principal (this flag) and the plan's
+    /// kind default, so an agent runner is always gated as agent and a
+    /// machine-composed kind (ai-authored / backfill) stays agent even under a
+    /// human runner. Both promote entrypoints resolve and enforce this identity
+    /// identically. The CLI surface default is `human`; a harness driving
+    /// `rocky` announces itself with `--principal agent` (or
+    /// `ROCKY_PRINCIPAL=agent`). An explicit `--principal` always wins and is
+    /// the only way to lower an env-raised floor (a downgrade warns). Absent
+    /// `[policy]`, this flag has no effect.
     #[arg(long, global = true, value_enum)]
     principal: Option<PolicyPrincipalArg>,
 
@@ -4023,7 +4025,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 models,
             } => {
                 if let Some(plan_id) = plan {
-                    // --plan flag: apply a pre-built promote plan, skipping gates.
+                    // --plan flag: apply a pre-built promote plan. The approval
+                    // and breaking-change gates already ran when the plan was
+                    // built, so they are not re-run here — but the agent-policy
+                    // gate IS enforced (same as `rocky apply <promote-plan>`),
+                    // keyed on the promote-time runtime principal, NOT the plan's
+                    // stored stamp.
+                    let runtime_principal = resolve_cli_principal(cli.principal)?;
                     let cwd = std::env::current_dir()
                         .context("failed to get current working directory")?;
                     rocky_cli::commands::run_branch_promote_from_plan(
@@ -4032,6 +4040,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         &plan_id,
                         name.as_deref(),
                         &state_path,
+                        runtime_principal,
                         json,
                     )
                     .await
