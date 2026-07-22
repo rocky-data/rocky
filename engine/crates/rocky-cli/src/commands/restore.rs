@@ -1,13 +1,19 @@
 //! `rocky restore <target>` — rebuild a gc-evicted artifact from its durable
 //! tombstone, hash-exact, and reinstate its ledger row.
 //!
-//! A gc tombstone is a claim: *these bytes were a cache entry Rocky can
-//! rebuild*. Restore is the proof. It resolves the target to exactly one
-//! tombstone, replays the recorded recipe (the tombstone's `run_id` +
-//! `model_name` → the [`rocky_core::state::ProvenanceRecord`]'s embedded
-//! canonical `ModelIr` — never the working tree), and asserts the recomputed
-//! blake3 equals [`rocky_core::state::TombstoneRecord::blake3_hash`] **before
-//! any write becomes visible**.
+//! A gc tombstone points at the recipe that produced the evicted bytes;
+//! restore *attempts* to rebuild them from it. It resolves the target to
+//! exactly one tombstone, replays the recorded recipe (the tombstone's
+//! `run_id` + `model_name` → the [`rocky_core::state::ProvenanceRecord`]'s
+//! embedded canonical `ModelIr` — never the working tree), and asserts the
+//! recomputed blake3 equals [`rocky_core::state::TombstoneRecord::blake3_hash`]
+//! **before any write becomes visible**. That rebuild route is narrower than
+//! gc's eviction set: restore attempts it only for a recipe that is
+//! non-partitioned, content-addressed, and reads *no recorded upstreams*, and
+//! it refuses a recipe with ANY recorded upstream outright (multi-input DAG
+//! re-derivation is a later phase), so not every evicted artifact has a working
+//! restore path. Even that supported shape is necessary, not sufficient — a
+//! supported recipe can still refuse (see below).
 //!
 //! Two surfaces, mirroring `rocky gc`'s symmetric-caution posture:
 //!
@@ -39,6 +45,13 @@
 //! - the ledger reinstatement is atomic and hash-guarded
 //!   ([`rocky_core::state::StateStore::restore_artifact`]) — a location
 //!   re-materialized to different bytes since the eviction refuses.
+//!
+//! One refusal is NOT pre-write: a re-derivation that hash-verified and wrote
+//! its content-addressed bytes can still refuse if the atomic ledger
+//! reinstatement then loses a race — the verified bytes stay safe at the
+//! tombstoned path (a re-apply re-verifies and completes idempotently), but the
+//! ledger row is NOT reinstated. A refusal therefore guarantees only that the
+//! ledger was not changed, not that nothing was written.
 //!
 //! # Reachability
 //!
@@ -489,10 +502,15 @@ async fn discover_table_state(
         .map_err(|e| anyhow!("could not discover the table's state from its _delta_log: {e}"))
 }
 
-/// Restore one planned tombstone. Every early exit is a refusal that wrote
-/// nothing; the happy path is: resolve live tombstone → bind recipe to the
-/// exact hash → re-derive → **hash-verify before any write** → materialize
-/// (verify-or-create-only) → reinstate the ledger row atomically.
+/// Restore one planned tombstone. Most early exits are refusals that wrote
+/// nothing — the pre-write verification is fail-closed — with ONE exception:
+/// an artifact that re-derived, hash-verified, and was written can still refuse
+/// if the atomic ledger reinstatement then fails, leaving the verified bytes
+/// safe at the tombstoned path while the ledger row is NOT reinstated (a re-run
+/// verifies and completes idempotently). The happy path is: resolve live
+/// tombstone → bind recipe to the exact hash → re-derive → **hash-verify before
+/// any write** → materialize (verify-or-create-only) → reinstate the ledger row
+/// atomically.
 async fn restore_one(
     store: &StateStore,
     stores: &dyn RestoreStores,
@@ -554,7 +572,7 @@ async fn restore_one(
     let bind = check_recipe_produces_output(&tomb.blake3_hash, &tomb.file_path, prov.as_ref());
     if !bind.passed {
         return refuse(format!(
-            "the tombstone's restore pointer no longer proves the recipe rebuilds these exact \
+            "the tombstone's restore pointer no longer binds the recorded recipe to these exact \
              bytes: {}",
             bind.detail
         ));
@@ -1639,6 +1657,248 @@ mod tests {
             drop(store);
             let _ = root; // root reserved for symmetry with plan-driven helpers
             (wr, obj_path)
+        }
+
+        /// PINS CURRENT BEHAVIOR (KNOWN GAP — gc's eviction set is strictly
+        /// larger than restore's recovery set).
+        ///
+        /// **Current behavior:** an artifact produced by a *multi-input*
+        /// recipe whose every upstream is a content hash has a `strong` input
+        /// closure, so gc's [`check_recipe_recorded`] passes it and it becomes
+        /// eligible for eviction. `restore_one` then refuses that very same
+        /// artifact, because it rejects any recipe with recorded upstreams:
+        /// re-deriving a multi-input recipe from the recorded upstream bytes
+        /// needs DAG re-derivation that is not yet implemented. This test
+        /// drives BOTH sides against ONE artifact and asserts the asymmetry.
+        ///
+        /// **Why this is wrong:** gc's own check detail advertises "every
+        /// upstream is a content hash", explicitly contemplating multi-input
+        /// recipes, and `rocky gc` told users evictions were "always restorable
+        /// from the recorded recipe". They are not — restore covers only the
+        /// zero-upstream, non-partitioned case. The tombstone is durable and
+        /// the custody state still retains the recipe (the canonical `ModelIr`
+        /// and recorded upstreams live in the `ProvenanceRecord` the tombstone
+        /// references), so nothing is destroyed, but the recovery route a user
+        /// is pointed at does not work for these artifacts, and re-running the
+        /// pipeline is not a substitute: it recomputes from current upstreams,
+        /// which need not reproduce the evicted bytes.
+        /// This PR corrects the misleading text; it does not close the gap.
+        ///
+        /// **Expected to invert when the gap is closed — but which half inverts
+        /// depends on the fix.** Two mutually exclusive fixes are possible, and
+        /// choosing between them is an owner decision:
+        /// - Narrow gc's eligibility predicate to reject recorded upstreams (a
+        ///   behavior change to a public surface): the `build_candidate`
+        ///   admission assertion above breaks — gc no longer admits the
+        ///   multi-input recipe — while `restore_one` keeps refusing (its
+        ///   behavior is unchanged).
+        /// - Build multi-input restore (DAG re-derivation from the recorded
+        ///   upstream bytes): the `restore_one` refusal assertion below breaks —
+        ///   restore now succeeds — while gc keeps admitting.
+        /// Either way this test must be revisited and renamed; it does not
+        /// self-adjust.
+        #[tokio::test]
+        async fn gc_admits_multi_input_recipe_that_restore_refuses_known_gap() {
+            let dir = TempDir::new().unwrap();
+            let root = dir.path();
+            let state_path = root.join("state.redb");
+            let cas = Arc::new(InMemory::new());
+            seed_bootstrap(&cas).await;
+            let ir = orders_ir();
+            let wr = produce_real_bytes(cas.clone(), &ir).await;
+
+            // A recipe with TWO recorded upstreams, both content-addressed —
+            // the `strong` closure gc's eligibility check is written to admit.
+            let upstreams = vec![
+                rocky_core::recipe_identity::UpstreamIdentity::Content {
+                    upstream_key: "tgt.raw.customers".to_string(),
+                    blake3_hash: HA.to_string(),
+                },
+                rocky_core::recipe_identity::UpstreamIdentity::Content {
+                    upstream_key: "tgt.raw.line_items".to_string(),
+                    blake3_hash: HB.to_string(),
+                },
+            ];
+            let outputs = vec![OutputArtifact {
+                blake3_hash: wr.blake3_hash.clone(),
+                file_path: wr.file_path.clone(),
+            }];
+            let written = Utc::now() - Duration::days(30);
+            let (entry, prov) =
+                rocky_core::reuse::build_records(&ir, "r1", &upstreams, &outputs, written).unwrap();
+            assert_eq!(
+                entry.proof_class, "strong",
+                "an all-content-hash closure is strong even with several upstreams"
+            );
+            assert_eq!(
+                prov.upstreams.len(),
+                2,
+                "the recipe really is multi-input — this is what makes the test non-vacuous"
+            );
+
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_reuse_spine(std::slice::from_ref(&entry), std::slice::from_ref(&prov))
+                .unwrap();
+            let art_record = ArtifactRecord {
+                blake3_hash: wr.blake3_hash.clone(),
+                run_id: "r1".to_string(),
+                model_name: "orders".to_string(),
+                file_path: wr.file_path.clone(),
+                commit_version: wr.commit_version,
+                size_bytes: wr.size_bytes,
+                written_at: written,
+            };
+            store.record_artifact(&art_record).unwrap();
+            record_run(&store, "r1", "orders");
+
+            // Seed ledger artifact rows for BOTH upstream hashes so the real
+            // `classify_model` resolves them exactly as production does: a
+            // `Content` upstream is replay-resolvable IFF its blake3 has an
+            // `ArtifactRecord` in the ledger (see `replay::classify_input`).
+            // Without these rows the upstreams classify NON-replayable and the
+            // whole recipe is non_replayable — the fabricated shortcut the
+            // earlier version of this test took, which production could never
+            // produce for a 2-upstream artifact.
+            for (hash, upstream_model) in [(HA, "customers"), (HB, "line_items")] {
+                store
+                    .record_artifact(&ArtifactRecord {
+                        blake3_hash: hash.to_string(),
+                        run_id: "r0".to_string(),
+                        model_name: upstream_model.to_string(),
+                        file_path: format!("{STORAGE_PREFIX}/{upstream_model}.parquet"),
+                        commit_version: 0,
+                        size_bytes: 1,
+                        written_at: written,
+                    })
+                    .unwrap();
+            }
+
+            // --- gc side: this artifact passes the FULL 6-check gc admission
+            // (`build_candidate`), not merely the recipe-recorded check — so the
+            // eviction set `rocky gc` actually approves genuinely includes a
+            // multi-input artifact that `restore_one` refuses below. A new
+            // production check that rejected upstream-bearing recipes would flip
+            // `derivable` to false here and fail this assertion.
+            //
+            // Drive the REAL `classify_model` — the exact verdict `rocky gc`
+            // reuses — rather than a hand-fabricated classification. With both
+            // upstream artifact rows seeded above, it NATURALLY yields
+            // `replayable` with two RESOLVABLE inputs: production-faithful for a
+            // genuine multi-input recipe whose upstreams are all resolvable.
+            let class = crate::commands::replay::classify_model(&store, "r1", "orders");
+            assert_eq!(
+                class.verdict, "replayable",
+                "the real classify_model must judge this multi-input recipe replayable: {:?}",
+                class.reasons
+            );
+            assert_eq!(
+                class.inputs.len(),
+                2,
+                "classify_model resolves BOTH recorded upstreams — not an empty input set: {:?}",
+                class.inputs
+            );
+            assert!(
+                class.inputs.iter().all(|i| i.resolvable),
+                "both recorded upstreams are ledger-resolvable: {:?}",
+                class.inputs
+            );
+            assert_eq!(
+                class.proof_class.as_deref(),
+                Some("strong"),
+                "the recorded strong closure carries through the real classification"
+            );
+            // Exactly one live ledger reference (the candidate itself) — gc's
+            // `unreferenced` check admits only refcount == 1.
+            let refcount = store.refcount_for_hash(&wr.blake3_hash).unwrap();
+            assert_eq!(
+                refcount, 1,
+                "the artifact is singly-referenced before eviction (gc's unreferenced check)"
+            );
+            let candidate = crate::commands::gc::build_candidate(
+                &art_record,
+                refcount,
+                &class,
+                None,
+                Some(&prov),
+                Utc::now(),
+                7,
+                None,
+            );
+            assert_eq!(
+                candidate.checks.len(),
+                6,
+                "the full admission is six checks"
+            );
+            assert!(
+                candidate.checks.iter().all(|c| c.passed),
+                "KNOWN GAP: gc's full 6-check admission marks a multi-input recipe derivable \
+                 (eligible for eviction): {:?}",
+                candidate.checks
+            );
+            assert!(
+                candidate.derivable,
+                "the multi-input artifact is admitted for eviction: {:?}",
+                candidate.checks
+            );
+
+            // Evict it, exactly as an approved gc apply would.
+            let tomb = TombstoneRecord {
+                size_bytes: wr.size_bytes,
+                commit_version: wr.commit_version,
+                ..tombstone(
+                    &wr.blake3_hash,
+                    "r1",
+                    "orders",
+                    &wr.file_path,
+                    Some("recipe-orders"),
+                )
+            };
+            store
+                .evict_artifact(&tomb, "r1", "orders", &wr.file_path)
+                .unwrap();
+            let tombstones = store.list_tombstones().unwrap();
+
+            // --- restore side: REFUSES the very same artifact.
+            let planned = RestorePlanRestoration {
+                model_name: "orders".to_string(),
+                run_id: "r1".to_string(),
+                blake3_hash: wr.blake3_hash.clone(),
+                file_path: wr.file_path.clone(),
+                size_bytes: wr.size_bytes,
+                commit_version: wr.commit_version,
+                evicted_at: tomb.evicted_at.to_rfc3339(),
+                gc_plan_id: "gc-plan".to_string(),
+                recipe_hash: Some("recipe-orders".to_string()),
+                input_hash: None,
+                input_proof_class: Some("strong".to_string()),
+            };
+            let outcome = restore_one(
+                &store,
+                &SharedStore(cas.clone()),
+                &fresh_duckdb(),
+                &tombstones,
+                "restore-plan",
+                &planned,
+                Utc::now(),
+            )
+            .await;
+
+            let RestoreOneOutcome::Refused(refused) = outcome else {
+                panic!(
+                    "KNOWN GAP pin is stale: restore no longer refuses multi-input recipes. If \
+                     multi-input restore has landed, invert this test rather than deleting it."
+                );
+            };
+            assert!(
+                refused.reason.contains("upstream"),
+                "the refusal must be the multi-input one, not an incidental failure: {}",
+                refused.reason
+            );
+            assert_eq!(refused.blake3_hash, wr.blake3_hash);
+
+            // Nothing was reinstated — the artifact gc evicted stays unrecovered.
+            assert_eq!(store.refcount_for_hash(&wr.blake3_hash).unwrap(), 0);
         }
 
         /// Regression (a): a tombstone whose claimed hash the recipe cannot
