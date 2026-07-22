@@ -65,16 +65,23 @@ pub struct ResolvedSchedule {
 
 /// A config error found while resolving a schedule. Mirrors the validation
 /// codes so the reconciler and `rocky validate` agree on what is invalid.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ScheduleConfigError {
     /// The cron expression did not parse.
+    #[error("invalid cron expression `{0}`")]
     BadCron(String),
     /// The timezone name is not a known IANA zone.
+    #[error("unknown timezone `{0}`")]
     BadTimezone(String),
     /// `catchup` was neither `skip` nor `latest`. `"all"` is called out
     /// specifically.
+    #[error("invalid catchup `{0}` (expected `skip` or `latest`)")]
     BadCatchup(String),
     /// `freshness = true` but no budget was resolvable anywhere.
+    #[error(
+        "freshness is enabled but no budget is resolvable — set a model \
+         `max_lag_seconds` or the project `[freshness] expected_lag_seconds`"
+    )]
     FreshnessNoBudget,
 }
 
@@ -335,6 +342,54 @@ fn evaluate_cron(
     }
 }
 
+/// The instant this schedule's cron will next fire at, as the reconciler would
+/// compute it.
+///
+/// Anchored on the stored `last_fire_logical_ts`, **never on `now`** — that is
+/// the whole point. `next_occurrence(expr, tz, now)` always returns a future
+/// slot, so a wedged or dead timer would report a healthy-looking next fire and
+/// hide the very failure a status consumer is looking for. Anchoring on the
+/// cursor means an overdue pipeline correctly reports an instant in the **past**.
+///
+/// Returns `None` when the schedule is disabled, has no cron (`after` /
+/// `freshness` demands have no projectable instant), has not yet been seen
+/// (first sight records the anchor without firing — report that separately
+/// rather than as a null), or when the cron cannot be evaluated.
+///
+/// Mirrors [`evaluate_cron`]'s branch structure so the projection and the
+/// decision cannot drift apart.
+pub fn next_projected_fire(
+    schedule: &ResolvedSchedule,
+    cursor: &ScheduleStateRecord,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    if !schedule.enabled {
+        return None;
+    }
+    let (expr, tz) = schedule.cron.as_ref()?;
+    let anchor = cursor.fire_anchor()?;
+
+    let next1 = next_occurrence(expr, *tz, anchor).ok()?;
+    if next1 > now {
+        return Some(next1);
+    }
+    // At least one occurrence has elapsed. Peek one more to tell "exactly one
+    // is due" from "several elapsed".
+    let next2 = next_occurrence(expr, *tz, next1).ok()?;
+    if next2 > now {
+        // Due now and not yet run: the honest answer is in the past.
+        return Some(next1);
+    }
+    let latest = previous_or_equal_occurrence(expr, *tz, now).ok()?;
+    match schedule.catchup {
+        // It will fire at the latest elapsed occurrence — also in the past.
+        Catchup::Latest => Some(latest),
+        // The anchor jumps forward and nothing fires until the next slot, so
+        // this one is correctly in the future.
+        Catchup::Skip => next_occurrence(expr, *tz, latest).ok(),
+    }
+}
+
 /// Whether `after` is due, and if so the logical timestamp
 /// (`max(upstream success completions)`).
 ///
@@ -579,6 +634,90 @@ mod tests {
 
     fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    // --- next_projected_fire ------------------------------------------------
+
+    fn hourly(catchup: Catchup) -> ResolvedSchedule {
+        ResolvedSchedule {
+            pipeline: "sales".to_string(),
+            enabled: true,
+            cron: Some(("0 * * * *".to_string(), chrono_tz::UTC)),
+            after: Vec::new(),
+            freshness_budget: None,
+            catchup,
+            retry_max: 0,
+            timeout: None,
+        }
+    }
+
+    fn cursor_fired_at(at: DateTime<Utc>) -> ScheduleStateRecord {
+        ScheduleStateRecord {
+            last_fire_logical_ts: Some(at.to_rfc3339()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn next_projected_fire_is_the_upcoming_slot_when_current() {
+        let cursor = cursor_fired_at(ts(2026, 5, 1, 9, 0));
+        let at = next_projected_fire(&hourly(Catchup::Latest), &cursor, ts(2026, 5, 1, 9, 30));
+        assert_eq!(at, Some(ts(2026, 5, 1, 10, 0)));
+    }
+
+    /// The load-bearing case. A timer that stopped four hours ago must report a
+    /// next fire in the PAST — that is the overdue signal. Anchoring the
+    /// projection on `now` instead of the cursor would return 13:00 here and
+    /// make a dead scheduler look perfectly healthy.
+    #[test]
+    fn next_projected_fire_is_in_the_past_when_overdue() {
+        let cursor = cursor_fired_at(ts(2026, 5, 1, 8, 0));
+        let now = ts(2026, 5, 1, 12, 30);
+        let at = next_projected_fire(&hourly(Catchup::Latest), &cursor, now)
+            .expect("an overdue schedule still projects");
+        assert!(at < now, "overdue must project into the past, got {at}");
+        assert_eq!(
+            at,
+            ts(2026, 5, 1, 12, 0),
+            "catchup=latest fires the newest slot"
+        );
+    }
+
+    /// With `catchup = skip` the anchor jumps forward and nothing fires until
+    /// the next slot, so the projection is correctly in the future even though
+    /// occurrences were missed.
+    #[test]
+    fn next_projected_fire_skips_forward_under_catchup_skip() {
+        let cursor = cursor_fired_at(ts(2026, 5, 1, 8, 0));
+        let now = ts(2026, 5, 1, 12, 30);
+        let at = next_projected_fire(&hourly(Catchup::Skip), &cursor, now);
+        assert_eq!(at, Some(ts(2026, 5, 1, 13, 0)));
+    }
+
+    #[test]
+    fn next_projected_fire_is_none_before_the_first_anchor() {
+        let never_seen = ScheduleStateRecord::default();
+        assert!(
+            next_projected_fire(&hourly(Catchup::Latest), &never_seen, ts(2026, 5, 1, 9, 0))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn next_projected_fire_is_none_when_disabled_or_cronless() {
+        let cursor = cursor_fired_at(ts(2026, 5, 1, 9, 0));
+        let now = ts(2026, 5, 1, 9, 30);
+
+        let mut disabled = hourly(Catchup::Latest);
+        disabled.enabled = false;
+        assert!(next_projected_fire(&disabled, &cursor, now).is_none());
+
+        let mut cronless = hourly(Catchup::Latest);
+        cronless.cron = None;
+        assert!(
+            next_projected_fire(&cronless, &cursor, now).is_none(),
+            "after/freshness demands have no projectable instant",
+        );
     }
 
     #[derive(Default)]

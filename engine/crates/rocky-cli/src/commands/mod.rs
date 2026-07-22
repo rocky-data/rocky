@@ -68,6 +68,7 @@ mod run_content_addressed;
 mod run_dag_exec;
 mod run_local;
 mod run_watch;
+pub mod schedule_status;
 pub mod scheduler;
 mod seed;
 mod serve;
@@ -162,6 +163,7 @@ pub use replay::{run_replay, run_replay_check, run_replay_execute, run_replay_ex
 pub use restore::run_restore_plan;
 pub use retention_status::run_retention_status;
 pub use review::{compute_review, compute_review_queue, run_review, run_review_queue};
+pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.
 pub use rocky_sql::transpile::Dialect;

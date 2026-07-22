@@ -189,6 +189,37 @@ impl ClaimRecord {
     }
 }
 
+/// Parse a claim storage key back into its parts.
+///
+/// The key is `<pipeline>\u{1f}<source>\u{1f}<discriminator>`. Returns `None`
+/// only for a genuinely unrecognized shape — the orphan sweep skips a key it
+/// cannot interpret rather than acting on it.
+///
+/// The discriminator is **not always a timestamp**: it is the `logical_ts`
+/// (RFC3339) for cron/after/freshness, but a minted `demand_uid` for a webhook
+/// demand. So it is returned as an `Option` and parsed only when it really is
+/// an instant. Treating an unparseable discriminator as a malformed key would
+/// make [`crate::schedule::sweep_orphan_claims`] skip every webhook claim,
+/// leaving a `submitted` webhook claim stuck forever — precisely the class of
+/// leak that sweep exists to clear.
+pub fn parse_claim_key(key: &str) -> Option<(String, DemandKind, Option<DateTime<Utc>>)> {
+    let mut parts = key.split('\u{1f}');
+    let pipeline = parts.next()?.to_string();
+    let source = match parts.next()? {
+        "cron" => DemandKind::Cron,
+        "after" => DemandKind::After,
+        "freshness" => DemandKind::Freshness,
+        "webhook" => DemandKind::Webhook,
+        _ => return None,
+    };
+    let logical_ts = parts.next().and_then(|d| {
+        DateTime::parse_from_rfc3339(d)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    });
+    Some((pipeline, source, logical_ts))
+}
+
 /// The outcome of a claim compare-and-swap against the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimCas {
@@ -487,6 +518,37 @@ mod tests {
             first_swept_at: None,
             last_transition_at: Some(now().to_rfc3339()),
         }
+    }
+
+    // --- claim-key parsing --------------------------------------------------
+
+    #[test]
+    fn parse_claim_key_reads_a_timestamped_key() {
+        let (pipeline, source, ts) =
+            parse_claim_key("sales\u{1f}cron\u{1f}2026-05-01T00:00:00+00:00").expect("parses");
+        assert_eq!(pipeline, "sales");
+        assert_eq!(source, DemandKind::Cron);
+        assert_eq!(ts, Some(now()));
+    }
+
+    /// A webhook claim key's third component is a minted `demand_uid`, NOT a
+    /// timestamp. Parsing must still succeed with `logical_ts: None` — a parser
+    /// that rejected the key outright would make `sweep_orphan_claims` skip
+    /// every webhook claim, leaving a `submitted` claim stuck forever.
+    #[test]
+    fn parse_claim_key_accepts_a_webhook_uid_discriminator() {
+        let (pipeline, source, ts) =
+            parse_claim_key("sales\u{1f}webhook\u{1f}0b9c1d2e-3f40-4a5b-8c6d-7e8f90a1b2c3")
+                .expect("a webhook key is well-formed, not malformed");
+        assert_eq!(pipeline, "sales");
+        assert_eq!(source, DemandKind::Webhook);
+        assert_eq!(ts, None, "a demand_uid is not an instant");
+    }
+
+    #[test]
+    fn parse_claim_key_rejects_an_unknown_source() {
+        assert!(parse_claim_key("sales\u{1f}telepathy\u{1f}whenever").is_none());
+        assert!(parse_claim_key("sales").is_none());
     }
 
     // --- budget guard (attempt-accounting matrix, regression viii) ---------

@@ -20,12 +20,12 @@ pub mod spawn;
 pub use claim::{
     Bookkeeping, CfDelta, ClaimCas, ClaimRecord, ClaimState, DemandKind, PostAttempt, PreSpawn,
     Resolved, TerminalOutcome, budget_remains, decide_post_attempt, decide_pre_spawn,
-    decide_resolver, sweep_terminal_claim,
+    decide_resolver, parse_claim_key, sweep_terminal_claim,
 };
 pub use demand::{
     Catchup, Demand, EvaluatedPipeline, HistoryError, ResolvedSchedule, RunHistoryView, RunSuccess,
     ScheduleConfigError, ScheduleStateView, SkipReason, evaluate_demands, evaluate_one,
-    resolve_freshness_budget, resolve_schedule,
+    next_projected_fire, resolve_freshness_budget, resolve_schedule,
 };
 pub use lock::{LockProbe, TickLock, probe_tick_lock};
 pub use occurrence::{
@@ -34,7 +34,7 @@ pub use occurrence::{
 };
 pub use reconcile::{
     ExecutedDemand, LOCK_TAKEOVER_AFTER, SkippedDemand, TickError, TickOptions, TickReport,
-    TickSkipReason, tick_once,
+    TickSkipReason, resolve_schedules_detailed, tick_once,
 };
 pub use record::{ScheduleStateMutation, ScheduleStateRecord, Throttle};
 pub use spawn::{
