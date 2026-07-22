@@ -716,8 +716,13 @@ async fn load_with_contract_gate(
         .map(|cols| !cols.is_empty())
         .unwrap_or(false);
 
+    // Fail-closed promote: a target `DESCRIBE` failure collapses to
+    // `target_exists = false` above, so a *non-replacing* CREATE must be used —
+    // if the probe missed a live target this fails ("already exists") instead
+    // of erasing it with `CREATE OR REPLACE`. Mirrors the bootstrap fix in
+    // `run.rs` / `sql_gen.rs`.
     let promote_stmts: Vec<String> = if !target_exists && options.create_table {
-        vec![dialect.create_table_as(&target_ref, &select_from_staging)]
+        vec![dialect.create_table_as_new(&target_ref, &select_from_staging)]
     } else {
         let mut stmts = Vec::new();
         if options.truncate_first {
@@ -1134,6 +1139,116 @@ required_columns = [
                 .warnings
                 .is_empty()
         );
+    }
+
+    /// Regression: a transient target `DESCRIBE` failure during contract-gated
+    /// promotion must not turn an append load into a destructive replace. The
+    /// probe collapses to `target_exists = false`, so the promote must use a
+    /// non-replacing CREATE that fails closed on the live target and leaves its
+    /// rows untouched. Sibling of the replication-path regression in `run.rs`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn target_describe_failure_does_not_replace_existing_load_target() {
+        use async_trait::async_trait;
+        use rocky_core::contracts::{ContractConfig, RequiredColumn};
+        use rocky_core::traits::{
+            AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter,
+        };
+        use rocky_duckdb::DuckDbConnector;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::loader::DuckDbLoaderAdapter;
+        use std::sync::{Arc, Mutex};
+
+        /// Delegates everything to the real DuckDB adapter but fails `DESCRIBE`
+        /// for the target table, simulating a transient metadata-probe failure.
+        struct FailTargetDescribe<'a> {
+            inner: &'a DuckDbWarehouseAdapter,
+            target_table: String,
+        }
+
+        #[async_trait]
+        impl WarehouseAdapter for FailTargetDescribe<'_> {
+            fn dialect(&self) -> &dyn SqlDialect {
+                self.inner.dialect()
+            }
+
+            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
+                self.inner.execute_statement(sql).await
+            }
+
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.inner.execute_query(sql).await
+            }
+
+            async fn describe_table(
+                &self,
+                table: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                if table.table == self.target_table {
+                    return Err(AdapterError::msg("injected target DESCRIBE failure"));
+                }
+                self.inner.describe_table(table).await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let csv_path = dir.path().join("orders.csv");
+        std::fs::write(&csv_path, "id,product\n1,Widget\n").unwrap();
+
+        // Loader + warehouse share one in-memory DuckDB so the staging table the
+        // loader writes is visible to the promote path.
+        let shared = Arc::new(Mutex::new(DuckDbConnector::in_memory().unwrap()));
+        let loader = DuckDbLoaderAdapter::new(Arc::clone(&shared));
+        let wh = DuckDbWarehouseAdapter::from_shared(Arc::clone(&shared));
+
+        // A live target with history that a destructive replace would erase.
+        wh.execute_statement("CREATE TABLE main.orders (id INTEGER)")
+            .await
+            .unwrap();
+        wh.execute_statement("INSERT INTO main.orders VALUES (99)")
+            .await
+            .unwrap();
+
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "id".into(),
+                data_type: "BIGINT".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let target = TableRef {
+            catalog: String::new(),
+            schema: "main".into(),
+            table: "orders".into(),
+        };
+        let source = LoadSource::LocalFile(csv_path);
+        // create_table = true, truncate_first = false → the append case a
+        // misprobe would otherwise convert into a full replace.
+        let options = LoadOptions {
+            format: Some(FileFormat::Csv),
+            ..LoadOptions::default()
+        };
+
+        let failing = FailTargetDescribe {
+            inner: &wh,
+            target_table: "orders".into(),
+        };
+        let error =
+            load_with_contract_gate(&loader, &failing, &source, &target, &options, &contract)
+                .await
+                .expect_err("a failed target probe must not replace an existing table");
+        assert!(
+            format!("{error:#}").contains("already exists"),
+            "promote should fail closed on the existing target: {error:#}"
+        );
+
+        // The pre-existing row survived — no destructive replace.
+        let rows = wh
+            .execute_query("SELECT id FROM main.orders ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
     }
 
     /// Drive `run_load` the way the CLI entries do: a fingerprinted config
