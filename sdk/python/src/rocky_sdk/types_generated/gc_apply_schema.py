@@ -34,11 +34,11 @@ class GcEvictedOutput(BaseModel):
     model_name: str
     physical_reclaimed: bool
     """
-    `true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone still records everything `rocky restore <target>` needs to rebuild and verify the artifact).
+    Whether the bytes were physically deleted through the object-store adapter. **Currently always `false`:** physical reclamation is not implemented (it needs a protocol-aware VACUUM), so eviction is ledger-only and `[gc] physical_delete = true` is a hard error. The bytes stay in place; the durable tombstone records the recipe pointer a later `rocky restore` uses to *attempt* a rebuild (see `physical_status`).
     """
     physical_status: str
     """
-    Human-readable physical-reclamation outcome (`deleted`, `deferred: …`, or `failed: …`).
+    Human-readable physical-reclamation outcome. Today this is always `not attempted — physical reclamation is future work`.
     """
     run_id: str
     size_bytes: conint(ge=0)
@@ -97,7 +97,7 @@ class GcApplyOutput(BaseModel):
     """
     notes: list[str]
     """
-    Operator caveats (e.g. physical-reclamation reachability). Each eviction's tombstone records everything `rocky restore <target>` needs to rebuild the artifact and verify it hash-exact.
+    Operator caveats (e.g. eviction is ledger-only, restore's narrower coverage). Each eviction's tombstone records a durable pointer to the recipe's provenance — the path `rocky restore <target>` *attempts* a hash-exact rebuild from, which succeeds only for a recipe that reads no recorded upstreams (a multi-input recipe is refused).
     """
     plan_id: str
     refused: list[GcRefusedOutput]

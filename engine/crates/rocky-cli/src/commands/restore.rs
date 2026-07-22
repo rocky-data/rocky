@@ -554,7 +554,7 @@ async fn restore_one(
     let bind = check_recipe_produces_output(&tomb.blake3_hash, &tomb.file_path, prov.as_ref());
     if !bind.passed {
         return refuse(format!(
-            "the tombstone's restore pointer no longer proves the recipe rebuilds these exact \
+            "the tombstone's restore pointer no longer binds the recorded recipe to these exact \
              bytes: {}",
             bind.detail
         ));

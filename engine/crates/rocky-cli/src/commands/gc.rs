@@ -1,9 +1,11 @@
 //! `rocky gc --derivable` — derivability inventory, plan, and eviction.
 //!
 //! Answers one question over the content-addressed artifact ledger: *which
-//! stored bytes can Rocky prove it can rebuild, and are therefore a cache
-//! entry rather than an asset?* The recipe is the truth; a rebuildable table
-//! is derivable, and derivable bytes are reclaimable.
+//! stored bytes did Rocky record a recipe for and bind to those exact bytes,
+//! so they are a cache entry rather than an asset?* Passing that bar makes an
+//! artifact *derivable* — a recorded-and-bound eligibility verdict, NOT a
+//! promise that `rocky restore` can rebuild the bytes (restore is narrower;
+//! see below) and NOT the same as *reclaimable* (no physical delete follows).
 //!
 //! Three surfaces, one eligibility path:
 //!
@@ -16,8 +18,9 @@
 //!   artifacts. Never deletes.
 //! - **apply** ([`run_gc_apply_in`], via `rocky apply <plan-id>`): after an
 //!   unconditional review gate, evicts each artifact that is *still* derivable
-//!   — a durable tombstone + ledger-row retirement committed atomically, then a
-//!   best-effort physical object-store delete.
+//!   — a durable tombstone + ledger-row retirement committed atomically. No
+//!   physical byte-delete follows (eviction is ledger-only; `[gc]
+//!   physical_delete = true` is a hard error — see below).
 //!
 //! All three consume the single [`gather_eviction_candidates`] verdict, so the
 //! eligibility logic is never forked or loosened between report, plan, and the
@@ -78,9 +81,10 @@
 //! Content-addressed writes are s3-only, so the creds-free playground holds no
 //! CAS artifacts. The plan → review → apply → tombstone → ledger-retire flow is
 //! driven creds-free over a ledger seeded through the production write APIs
-//! (see the `seed_demo_ledger` harness in the tests). The physical
-//! object-store delete ([`ObjectStoreEvictor`]) is s3-only and is
-//! **code-reviewed here, driven on the sandbox** — creds-free it defers.
+//! (see the `seed_demo_ledger` harness in the tests). Eviction is ledger-only:
+//! no physical object-store delete is performed. Physical byte reclamation is
+//! future work behind a protocol-aware VACUUM, and `[gc] physical_delete =
+//! true` is a hard error until then.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -161,7 +165,7 @@ pub(crate) fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOu
 /// provenance, but a `(run, model)` can have recorded a **different** output
 /// than the artifact under consideration — a sibling output, or a
 /// re-materialization at a new hash. Without this check, that artifact would
-/// inherit the recipe's "derivable" verdict even though the recipe rebuilds
+/// inherit the recipe's "derivable" verdict even though the recipe is bound to
 /// *other* bytes, and evicting it would delete bytes nothing can rebuild.
 ///
 /// So the verdict is bound to the specific candidate: its content hash (and,
@@ -206,7 +210,7 @@ pub(crate) fn check_recipe_produces_output(
             if matched {
                 (
                     true,
-                    "provenance records this exact output hash — the recipe rebuilds these bytes"
+                    "provenance records this exact output hash — the recipe is bound to these bytes"
                         .to_string(),
                 )
             } else {
@@ -214,7 +218,7 @@ pub(crate) fn check_recipe_produces_output(
                     false,
                     format!(
                         "the producing (run, model)'s provenance records a DIFFERENT output than \
-                         this artifact ({}…) — the recipe rebuilds other bytes, so evicting this \
+                         this artifact ({}…) — the recipe is bound to other bytes, so evicting this \
                          would be unrecoverable",
                         artifact_hash.get(..12).unwrap_or(artifact_hash)
                     ),
@@ -850,8 +854,12 @@ fn gc_plan_scope_summary(plan: &GcPlan) -> String {
 /// review-gated proposal.
 ///
 /// The `principal` is the CLI-resolved invoker (`ROCKY_PRINCIPAL` / default
-/// human). It rides on the plan so an agent-scoped `deny agent gc` rule fires
-/// on an agent-run GC; the review gate is unconditional regardless.
+/// human), stamped onto the plan as an advisory/display record. Apply does NOT
+/// enforce against that stored stamp: the gc apply gate evaluates the
+/// most-restrictive of the *apply-time* runtime principal and the plan-kind
+/// default, so an agent applier (`ROCKY_PRINCIPAL=agent rocky apply`) makes an
+/// agent-scoped `deny agent gc` rule fire, while a human applier vouches. The
+/// review gate is unconditional regardless.
 pub fn run_gc_plan(
     state_path: &Path,
     config_path: &Path,

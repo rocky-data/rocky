@@ -7830,7 +7830,7 @@ pub struct GcReportOutput {
 }
 
 /// One reclamation candidate inside a [`GcReportOutput`] — a single
-/// content-addressed artifact (identified by its content hash) with its five
+/// content-addressed artifact (identified by its content hash) with its six
 /// printed eligibility checks.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct GcCandidateOutput {
@@ -7959,7 +7959,7 @@ pub struct GcPlanEviction {
 /// ([`crate::plan_store::PlanKind::Gc`]).
 ///
 /// Lists only the artifacts the derivability inventory proved are **derivable**
-/// — every one passed all five fail-closed checks at plan time. Apply
+/// — every one passed all six fail-closed checks at plan time. Apply
 /// re-verifies each against the live ledger before evicting, so this list is a
 /// scoped proposal, never a blind delete order.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -7992,9 +7992,11 @@ pub struct GcPlanOutput {
     pub total_bytes: u64,
     /// Always `true`: a `gc` plan is unconditionally review-gated before apply.
     pub review_required: bool,
-    /// Operator caveats (e.g. re-verification at apply, scope). Each eviction
-    /// records everything `rocky restore <target>` needs to rebuild it
-    /// hash-exact.
+    /// Operator caveats (e.g. re-verification at apply, restore's narrower
+    /// coverage, scope). Each eviction records a durable tombstone pointing at
+    /// the recipe's provenance — the path `rocky restore <target>` *attempts* a
+    /// hash-exact rebuild from, which succeeds only for a recipe that reads no
+    /// recorded upstreams (a multi-input recipe is refused).
     pub notes: Vec<String>,
     /// The proposed evictions.
     pub evictions: Vec<GcPlanEviction>,
@@ -8011,13 +8013,15 @@ pub struct GcEvictedOutput {
     /// Always `true` on this list — the durable restore tombstone was written
     /// atomically with the ledger-row retirement before anything else happened.
     pub tombstone_recorded: bool,
-    /// `true` when the bytes were physically deleted through the object-store
-    /// adapter; `false` when the physical delete was deferred or failed (a safe
-    /// leaked orphan — the tombstone still records everything
-    /// `rocky restore <target>` needs to rebuild and verify the artifact).
+    /// Whether the bytes were physically deleted through the object-store
+    /// adapter. **Currently always `false`:** physical reclamation is not
+    /// implemented (it needs a protocol-aware VACUUM), so eviction is
+    /// ledger-only and `[gc] physical_delete = true` is a hard error. The bytes
+    /// stay in place; the durable tombstone records the recipe pointer a later
+    /// `rocky restore` uses to *attempt* a rebuild (see `physical_status`).
     pub physical_reclaimed: bool,
-    /// Human-readable physical-reclamation outcome (`deleted`, `deferred: …`,
-    /// or `failed: …`).
+    /// Human-readable physical-reclamation outcome. Today this is always
+    /// `not attempted — physical reclamation is future work`.
     pub physical_status: String,
 }
 
@@ -8063,9 +8067,11 @@ pub struct GcApplyOutput {
     pub evicted_count: usize,
     /// Count of refused artifacts.
     pub refused_count: usize,
-    /// Operator caveats (e.g. physical-reclamation reachability). Each
-    /// eviction's tombstone records everything `rocky restore <target>` needs
-    /// to rebuild the artifact and verify it hash-exact.
+    /// Operator caveats (e.g. eviction is ledger-only, restore's narrower
+    /// coverage). Each eviction's tombstone records a durable pointer to the
+    /// recipe's provenance — the path `rocky restore <target>` *attempts* a
+    /// hash-exact rebuild from, which succeeds only for a recipe that reads no
+    /// recorded upstreams (a multi-input recipe is refused).
     pub notes: Vec<String>,
 }
 

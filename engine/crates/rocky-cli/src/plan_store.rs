@@ -100,9 +100,11 @@ pub enum PlanKind {
     Backfill,
     /// A `rocky gc --derivable` reclamation plan. The payload is a `GcPlan`
     /// listing the content-addressed artifacts the engine proved are derivable
-    /// (rebuildable bit-exact) and therefore evictable cache. `rocky apply`
-    /// executes the eviction — a tombstone + ledger retirement per artifact,
-    /// then a best-effort physical object-store delete.
+    /// (a recipe was recorded and bound to their exact bytes — an eligibility
+    /// verdict, not a guarantee `rocky restore` can rebuild them). `rocky apply`
+    /// executes the eviction — a tombstone + ledger retirement per artifact. No
+    /// physical byte-delete follows (eviction is ledger-only; `[gc]
+    /// physical_delete = true` is a hard error).
     ///
     /// Deletion is the one verb that is review-gated **symmetrically**: a `gc`
     /// plan is **unconditionally** review-gated regardless of principal or of

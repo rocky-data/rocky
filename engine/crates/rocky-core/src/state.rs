@@ -192,12 +192,14 @@ const JOBS: TableDefinition<&str, &[u8]> = TableDefinition::new("jobs");
 /// Key format: `"{evicted_at_rfc3339}|{blake3_hash}"` (chronological under
 /// redb's lexicographic order, so a forward scan replays evictions
 /// oldest-first). Value: serialized [`TombstoneRecord`]. A row is the durable
-/// record that these bytes *were* a cache entry Rocky proved it could rebuild,
+/// record that these bytes *were* a cache entry whose recipe Rocky recorded and
+/// bound to them (a derivability verdict — NOT a proof `rocky restore` can
+/// rebuild them; restore covers only recipes that read no recorded upstreams),
 /// written **before** the artifact's ledger row is retired (in the same
 /// transaction — see [`StateStore::evict_artifact`]). It captures the
 /// recipe-identity triple and the provenance pointer (`run_id` / `model_name`)
-/// so a later `rocky restore` can replay the recipe and verify the rebuilt
-/// blake3 matches [`TombstoneRecord::blake3_hash`].
+/// so a later `rocky restore` can *attempt* to replay the recipe and verify the
+/// rebuilt blake3 matches [`TombstoneRecord::blake3_hash`].
 ///
 /// Mirrors [`POLICY_DECISIONS`] and [`OUTPUT_ARTIFACTS`]: replicates across
 /// backends by default (intentionally NOT in [`LOCAL_ONLY_TABLE_NAMES`]) so the
@@ -3665,11 +3667,14 @@ impl StateStore {
 
     /// Upsert a tombstone row (keyed by `evicted_at` + `blake3_hash`).
     ///
-    /// Used to update an existing tombstone's [`TombstoneRecord::physical_reclaimed`]
-    /// flag after a best-effort physical object-store delete succeeds — the
-    /// atomic [`Self::evict_artifact`] writes the tombstone with the flag
-    /// `false` (the byte-delete has not happened yet), and this flips it to
-    /// `true` once the bytes are gone.
+    /// A reserved in-place update of an existing tombstone — e.g. flipping
+    /// [`TombstoneRecord::physical_reclaimed`] once the bytes are physically
+    /// gone. The atomic [`Self::evict_artifact`] writes the tombstone with that
+    /// flag `false`. Physical byte reclamation is NOT implemented today (it
+    /// needs a protocol-aware VACUUM; `[gc] physical_delete = true` is a hard
+    /// error), so nothing flips the flag and `physical_reclaimed` currently
+    /// stays `false`. This upsert has no production caller yet; it is the seam
+    /// that future path would use.
     pub fn record_tombstone(&self, tombstone: &TombstoneRecord) -> Result<(), StateError> {
         let key = tombstone_key(&tombstone.evicted_at, &tombstone.blake3_hash);
         let bytes = serde_json::to_vec(tombstone)?;
@@ -4411,8 +4416,12 @@ pub struct ArtifactRecord {
 ///
 /// Written **before** (atomically with) the retirement of an artifact's
 /// [`OUTPUT_ARTIFACTS`] row, so a deleted cache entry always leaves a durable
-/// record of what it was and how to rebuild it. It captures everything a later
-/// `rocky restore` needs to re-derive the bytes and verify byte-identity:
+/// record of what it was and the recipe pointer a restore *attempts* a rebuild
+/// from. That recorded path is narrower than the gc-eligible set: `rocky
+/// restore` re-derives only recipes that read no recorded upstreams and refuses
+/// a multi-input recipe, so a tombstone can exist for bytes restore cannot
+/// rebuild today. It captures the identity and provenance pointer a supported
+/// restore needs to re-derive the bytes and verify byte-identity:
 ///
 /// - [`Self::blake3_hash`] — the identity a restore re-computes and compares
 ///   against, the byte-proof half of the roundtrip;
@@ -4424,8 +4433,9 @@ pub struct ArtifactRecord {
 ///   `input_proof_class` / `env_hash` / `hash_scheme`) captured from the
 ///   producing [`ModelExecution`], a self-describing redundant record of the
 ///   identity the eviction was justified against;
-/// - [`Self::file_path`] — the object-store location to physically reclaim
-///   and the target a restore re-materializes to.
+/// - [`Self::file_path`] — the object-store location the eviction records and
+///   the target a restore re-materializes to (physical reclamation of the bytes
+///   is future work; eviction leaves them in place).
 ///
 /// Forward-compatible via `#[serde(default)]` on any field added later, the
 /// same additive pattern [`ArtifactRecord`] and [`PolicyDecisionRecord`] use.

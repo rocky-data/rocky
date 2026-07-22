@@ -31,7 +31,7 @@ rocky gc --derivable
 | `--dry-run` | `bool` | `false` | Emit the read-only inventory instead of writing a plan. |
 | `--min-age-days <DAYS>` | `int` | `7` | Minimum written-age an artifact must reach to pass the age check. Measures build time, not read recency. |
 
-An artifact is *derivable* only when every eligibility check passes: its recipe identity was recorded, the ledger's replay-check verdict says it is replayable and deterministic, nothing references it, policy allows reclamation, and it is past the age threshold. Every check fails closed — any doubt keeps the artifact.
+An artifact is *derivable* only when all six eligibility checks pass: its recipe identity was recorded, the recipe's provenance records this artifact's exact output hash (the recipe is bound to these specific bytes, not a sibling output or a re-materialization at a new hash), the ledger's replay-check verdict says it is replayable and deterministic, nothing references it, policy allows reclamation, and it is past the age threshold. Every check fails closed — any doubt keeps the artifact.
 
 ### Review gating and what eviction means
 

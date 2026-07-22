@@ -52,7 +52,7 @@ class GcRebuildCostOutput(BaseModel):
 
 class GcCandidateOutput(BaseModel):
     """
-    One reclamation candidate inside a [`GcReportOutput`] — a single content-addressed artifact (identified by its content hash) with its five printed eligibility checks.
+    One reclamation candidate inside a [`GcReportOutput`] — a single content-addressed artifact (identified by its content hash) with its six printed eligibility checks.
     """
 
     blake3_hash: str

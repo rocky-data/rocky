@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
     "GcCandidateOutput": {
-      "description": "One reclamation candidate inside a [`GcReportOutput`] — a single content-addressed artifact (identified by its content hash) with its five printed eligibility checks.",
+      "description": "One reclamation candidate inside a [`GcReportOutput`] — a single content-addressed artifact (identified by its content hash) with its six printed eligibility checks.",
       "properties": {
         "blake3_hash": {
           "description": "Content hash (hex) of the artifact bytes — the reclamation unit.",

@@ -51,8 +51,10 @@ pub struct PlanRunOptions {
     pub models_dir: Option<PathBuf>,
     pub partition_opts: PartitionRunOptions,
     /// Resolved authoring principal (agent-policy plane). `None` ⇒ `human`
-    /// (the CLI-surface default). Stamped onto the persisted plan so a later
-    /// `rocky apply` evaluates the plan against the identity that authored it.
+    /// (the CLI-surface default). Stamped onto the persisted plan as an
+    /// advisory/display record — a later `rocky apply` does NOT enforce against
+    /// this stored stamp; the gate resolves the most-restrictive of the
+    /// apply-time runtime principal and the plan-kind default instead.
     pub principal: Option<PolicyPrincipal>,
 }
 
@@ -1030,10 +1032,11 @@ fn build_and_persist_run_plan(
 
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
 
-    // policy seam 1 + capability-embed: stamp the authoring principal and embed the propose-time
-    // change-classification into the plan payload, so a later `rocky apply`
-    // evaluates the plan against the identity that authored it and the exact
-    // capabilities that were reviewed.
+    // policy seam 1 + capability-embed: stamp the authoring principal (advisory
+    // only — apply enforces against the runtime applier, not this stored stamp)
+    // and embed the propose-time change-classification into the plan payload, so
+    // a later `rocky apply` evaluates the exact capabilities that were reviewed
+    // (the capability-embed IS read at apply; the principal stamp is not).
     let principal = run_options.principal.unwrap_or(PolicyPrincipal::Human);
     // Finding #4: bind the mask iff the apply reaches the mask-reconciling path —
     // a Replication pipeline whose model leg runs (`--all` / `--models`) on a full

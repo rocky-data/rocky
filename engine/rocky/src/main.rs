@@ -129,8 +129,12 @@ struct Cli {
 
     /// Authoring principal for the agent-policy plane (`human` | `agent`).
     ///
-    /// Stamped onto plans created by `rocky plan` so a later `rocky apply`
-    /// evaluates them against the identity that authored them. The CLI surface
+    /// Stamped onto plans created by `rocky plan` as an advisory/display
+    /// record. A later `rocky apply` does NOT enforce against that stored
+    /// stamp: the gate evaluates the most-restrictive of the *apply-time*
+    /// runtime principal and the plan's kind default, so an agent applier is
+    /// always gated as agent and a machine-composed kind (ai-authored /
+    /// backfill) stays agent even under a human applier. The CLI surface
     /// default is `human`; a harness driving `rocky` announces itself with
     /// `--principal agent` (or `ROCKY_PRINCIPAL=agent`). An explicit
     /// `--principal` always wins and is the only way to lower an env-raised
@@ -1983,8 +1987,12 @@ enum Command {
 
     /// Restore a gc-evicted artifact from its durable tombstone, hash-exact.
     ///
-    /// A gc tombstone claims "these bytes can be rebuilt"; `rocky restore` is
-    /// the proof. It resolves `<target>` (a model name, `model@<recipe-prefix>`,
+    /// A gc tombstone points at the recipe that produced the evicted bytes;
+    /// `rocky restore` attempts to rebuild them from that recipe and refuses
+    /// unless the recomputed hash matches. It can only do so for a recipe that
+    /// reads no recorded upstreams — a multi-input recipe is refused (multi-input
+    /// DAG re-derivation is a later phase), so not every evicted artifact has a
+    /// working restore path. It resolves `<target>` (a model name, `model@<recipe-prefix>`,
     /// or a content-hash prefix) to exactly one tombstone — refusing ambiguity
     /// with the candidates listed — and writes a review-gated *restore plan*
     /// (it never writes bytes directly). Approve it with `rocky review
@@ -4132,9 +4140,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 rocky_cli::commands::run_gc_derivable(&state_path, &cli.config, min_age_days, json)
             } else {
                 // Plan mode: write a review-gated GC plan. The invoker principal
-                // rides on the plan (an agent-scoped `deny agent gc` rule fires
-                // on an agent-run GC); the review gate is unconditional either
-                // way. Never deletes.
+                // is stamped on the plan as an advisory record; apply does not
+                // enforce against it. The gc apply gate evaluates the runtime
+                // applier (agent-scoped `deny agent gc` fires when an agent
+                // applies), so an agent-run *apply* — not the stored stamp — is
+                // what a deny rule catches. The review gate is unconditional
+                // either way. Never deletes.
                 let principal = resolve_cli_principal(cli.principal)?;
                 rocky_cli::commands::run_gc_plan(
                     &state_path,
@@ -4147,9 +4158,12 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         }
         Command::Restore { target } => {
             // Plan mode: resolve the tombstone and write a review-gated restore
-            // plan. The invoker principal rides on the plan (an agent-scoped
-            // `deny agent restore` rule fires on an agent-run restore); the
-            // review gate is unconditional either way. Writes no bytes.
+            // plan. The invoker principal is stamped on the plan as an advisory
+            // record; apply does not enforce against it. The apply gate
+            // evaluates the runtime applier (agent-scoped `deny agent restore`
+            // fires when an agent applies), so an agent-run *apply* — not the
+            // stored stamp — is what a deny rule catches. The review gate is
+            // unconditional either way. Writes no bytes.
             let principal = resolve_cli_principal(cli.principal)?;
             rocky_cli::commands::run_restore_plan(&state_path, &target, principal, json)
         }

@@ -4178,6 +4178,88 @@ effect = "deny"
         Ok(())
     }
 
+    /// The gc apply gate's CLAIMED denial behavior, driven end to end: a
+    /// `deny agent gc` policy rule DOES fire for an agent applier of a gc plan
+    /// and does NOT fire for a human applier.
+    ///
+    /// This complements `plan_store::gc_plan_enforces_as_agent_for_an_agent_applier`,
+    /// which pins only the principal *combination* that
+    /// [`PersistedPlan::enforcement_principal`] returns. Here we load a real
+    /// `[policy]` block carrying a `deny agent gc` rule and drive
+    /// [`evaluate_apply_policy`] — the exact function the gc apply gate calls
+    /// (`commands/gc.rs`) — with the principal `enforcement_principal` produces
+    /// and the `{model → Gc}` touched set the gate builds, so the assertion
+    /// covers the denial the test names rather than the principal math alone.
+    ///
+    /// The human case asserts the agent-scoped rule does not fire; it is NOT a
+    /// claim that a human gc is ungated — a gc plan is separately, and
+    /// unconditionally, review-gated by its approval marker, which this
+    /// policy-plane check does not stand in for.
+    #[test]
+    fn gc_deny_agent_rule_fires_for_agent_applier_not_human() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "gc"
+scope = { any = true }
+effect = "deny"
+"#,
+        )?;
+
+        // A gc plan. Its stored `principal` stamp is deliberately absent — the
+        // gate ignores it either way; enforcement is the runtime applier.
+        let gc = PersistedPlan {
+            plan_id: "gc-1".to_string(),
+            kind: PlanKind::Gc,
+            created_at: chrono::Utc::now(),
+            format_version: 1,
+            principal: None,
+            payload: serde_json::json!({}),
+        };
+
+        // The touched set the gc apply gate builds: one `Gc` capability per model.
+        let mut touched = BTreeMap::new();
+        touched.insert("orders".to_string(), PolicyCapability::Gc);
+        let models = dir.path().join("models");
+        let state = dir.path().join("state.redb");
+
+        // Agent applier: enforcement_principal(Agent) == Agent → deny fires.
+        let agent_gate = super::evaluate_apply_policy(
+            &config,
+            "gc-1",
+            gc.enforcement_principal(PolicyPrincipal::Agent),
+            &touched,
+            &models,
+            &state,
+            &[],
+        );
+        assert!(
+            matches!(agent_gate, PolicyGate::Deny { .. }),
+            "an agent applying a gc plan must be denied by `deny agent gc`; got {agent_gate:?}"
+        );
+
+        // Human applier: enforcement_principal(Human) == Human → the agent-scoped
+        // rule does not match (the review gate is a separate, unconditional gate).
+        let human_gate = super::evaluate_apply_policy(
+            &config,
+            "gc-1",
+            gc.enforcement_principal(PolicyPrincipal::Human),
+            &touched,
+            &models,
+            &state,
+            &[],
+        );
+        assert_eq!(
+            human_gate,
+            PolicyGate::Allow,
+            "a human applier is not caught by `deny agent gc`; got {human_gate:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn evaluate_apply_policy_not_configured_without_block() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
