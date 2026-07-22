@@ -20,6 +20,11 @@
 //! subset so SDK-only implementors have the same method surface available.
 //! All mirrored methods have default impls — adapters opt in by overriding.
 //!
+//! `SqlDialect::create_table_as_new` is part of this mirrored surface: it
+//! defaults to a non-replacing `CREATE TABLE … AS` so an out-of-tree dialect
+//! gets the same fail-closed-bootstrap primitive `rocky-core` uses, without
+//! having to re-derive it.
+//!
 //! Known non-additive divergences (defer to a follow-up — they require
 //! cross-crate type or signature changes that this PR deliberately doesn't
 //! land):
@@ -567,6 +572,17 @@ pub trait SqlDialect: Send + Sync {
     /// CREATE TABLE AS SELECT (full refresh).
     fn create_table_as(&self, target: &str, select_sql: &str) -> String;
 
+    /// CREATE TABLE AS SELECT for a target expected not to exist (fail-closed
+    /// bootstrap).
+    ///
+    /// Mirrors `rocky_core::traits::SqlDialect::create_table_as_new`. Unlike
+    /// [`SqlDialect::create_table_as`], this deliberately does not replace an
+    /// existing target, so bootstrap creation fails closed if an existence
+    /// probe was stale or failed for another reason.
+    fn create_table_as_new(&self, target: &str, select_sql: &str) -> String {
+        format!("CREATE TABLE {target} AS\n{select_sql}")
+    }
+
     /// INSERT INTO ... SELECT (incremental append).
     fn insert_into(&self, target: &str, select_sql: &str) -> String;
 
@@ -1080,6 +1096,20 @@ mod tests {
         // Snowflake-style warehouses opt in by overriding; everything
         // else gets None — used by the dialect's `CREATE DYNAMIC TABLE`.
         assert!(MinimalAdapter.warehouse_name().is_none());
+    }
+
+    #[test]
+    fn create_table_as_new_default_is_non_replacing() {
+        // The mirrored fail-closed-bootstrap primitive: a dialect that only
+        // implements the required `create_table_as` inherits a non-replacing
+        // `CREATE TABLE … AS` — never `CREATE OR REPLACE` — so a stale
+        // existence probe fails closed instead of erasing a live target.
+        let sql = StubDialect.create_table_as_new("analytics.mart", "SELECT 1");
+        assert_eq!(sql, "CREATE TABLE analytics.mart AS\nSELECT 1");
+        assert!(
+            !sql.to_uppercase().contains("OR REPLACE"),
+            "create_table_as_new must not emit OR REPLACE: {sql}"
+        );
     }
 
     #[test]
