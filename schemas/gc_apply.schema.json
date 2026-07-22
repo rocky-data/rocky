@@ -5,7 +5,7 @@
       "description": "One printed eligibility check inside a [`GcCandidateOutput`].",
       "properties": {
         "check": {
-          "description": "Stable check id: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.",
+          "description": "Stable check id: `recipe_recorded`, `recipe_produces_output`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.",
           "type": "string"
         },
         "detail": {
@@ -13,7 +13,7 @@
           "type": "string"
         },
         "passed": {
-          "description": "Whether the check passed. A candidate is derivable only when all five are `true`.",
+          "description": "Whether the check passed. A candidate is derivable only when all six are `true`.",
           "type": "boolean"
         }
       },
@@ -34,11 +34,11 @@
           "type": "string"
         },
         "physical_reclaimed": {
-          "description": "`true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone still records everything `rocky restore <target>` needs to rebuild and verify the artifact).",
+          "description": "Whether the bytes were physically deleted through the object-store adapter. **Currently always `false`:** physical reclamation is not implemented (it needs a protocol-aware VACUUM), so eviction is ledger-only and `[gc] physical_delete = true` is a hard error. The bytes stay in place; the durable tombstone records the recipe pointer a later `rocky restore` uses to *attempt* a rebuild (see `physical_status`).",
           "type": "boolean"
         },
         "physical_status": {
-          "description": "Human-readable physical-reclamation outcome (`deleted`, `deferred: …`, or `failed: …`).",
+          "description": "Human-readable physical-reclamation outcome. Since eviction is ledger-only, this is always `not attempted — physical reclamation is future protocol-aware VACUUM work; the tombstone + retired ledger row is the eviction of record`.",
           "type": "string"
         },
         "run_id": {
@@ -143,7 +143,7 @@
       "type": "integer"
     },
     "notes": {
-      "description": "Operator caveats (e.g. physical-reclamation reachability). Each eviction's tombstone records everything `rocky restore <target>` needs to rebuild the artifact and verify it hash-exact.",
+      "description": "Operator caveats (e.g. eviction is ledger-only, restore's narrower coverage). Each eviction's tombstone records a durable pointer to the recipe's provenance — the path `rocky restore <target>` *attempts* a hash-exact rebuild from, which succeeds only for a recipe that reads no recorded upstreams (a multi-input recipe is refused).",
       "items": {
         "type": "string"
       },

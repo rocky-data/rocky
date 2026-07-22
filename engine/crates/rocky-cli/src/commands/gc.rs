@@ -1,23 +1,26 @@
 //! `rocky gc --derivable` — derivability inventory, plan, and eviction.
 //!
 //! Answers one question over the content-addressed artifact ledger: *which
-//! stored bytes can Rocky prove it can rebuild, and are therefore a cache
-//! entry rather than an asset?* The recipe is the truth; a rebuildable table
-//! is derivable, and derivable bytes are reclaimable.
+//! stored bytes did Rocky record a recipe for and bind to those exact bytes,
+//! so they are a cache entry rather than an asset?* Passing that bar makes an
+//! artifact *derivable* — a recorded-and-bound eligibility verdict, NOT a
+//! promise that `rocky restore` can rebuild the bytes (restore is narrower;
+//! see below) and NOT the same as *reclaimable* (no physical delete follows).
 //!
 //! Three surfaces, one eligibility path:
 //!
 //! - **`--dry-run`** ([`run_gc_derivable`]): the read-only inventory — an
 //!   aggregate ("X bytes / Y% of managed storage is derivable") plus a
-//!   per-candidate justification printing all five eligibility checks. No
+//!   per-candidate justification printing all six eligibility checks. No
 //!   mutation.
 //! - **plan** ([`run_gc_plan`], no `--dry-run`): writes a review-gated
 //!   [`crate::plan_store::PlanKind::Gc`] plan listing only the derivable
 //!   artifacts. Never deletes.
 //! - **apply** ([`run_gc_apply_in`], via `rocky apply <plan-id>`): after an
 //!   unconditional review gate, evicts each artifact that is *still* derivable
-//!   — a durable tombstone + ledger-row retirement committed atomically, then a
-//!   best-effort physical object-store delete.
+//!   — a durable tombstone + ledger-row retirement committed atomically. No
+//!   physical byte-delete follows (eviction is ledger-only; `[gc]
+//!   physical_delete = true` is a hard error — see below).
 //!
 //! All three consume the single [`gather_eviction_candidates`] verdict, so the
 //! eligibility logic is never forked or loosened between report, plan, and the
@@ -31,12 +34,16 @@
 //!
 //! - its [`rocky_core::state::ProvenanceRecord`] + input match-strength (via
 //!   the shared [`crate::commands::replay::classify_model`] verdict) — checks
-//!   1 (recipe recorded) and 2 (replayable);
+//!   1 (recipe recorded), 2 (exact-output binding: the recipe provably produces
+//!   THIS artifact's exact bytes), and 3 (replayable);
 //! - its ledger refcount via
-//!   [`rocky_core::state::StateStore::refcount_for_hash`] — check 3
+//!   [`rocky_core::state::StateStore::refcount_for_hash`] — check 4
 //!   (unreferenced);
 //! - the recorded [`rocky_core::state::ModelExecution`] — the recipe-identity
 //!   id and the rebuild-cost estimate.
+//!
+//! Checks 5 (policy allows) and 6 (age threshold) round out the six
+//! [`build_candidate`] applies; they are not part of the join above.
 //!
 //! # Fail-closed — a false *derivable* is data loss
 //!
@@ -45,17 +52,43 @@
 //! the live ledger and evicts only what is derivable *now* — a reference that
 //! appears between plan and apply refuses the eviction. Every eviction writes
 //! its tombstone (recipe triple + provenance pointer) atomically **before** the
-//! ledger row is retired, so an evicted cache entry is always restorable, and
-//! the physical byte-delete only ever happens after that commit.
+//! ledger row is retired. No physical byte-delete follows: eviction is
+//! ledger-only today, and `[gc] physical_delete = true` is a hard error rather
+//! than a silent no-op (safe byte reclamation needs a protocol-aware VACUUM,
+//! which is future work).
+//!
+//! **Restorability is narrower than eligibility.** `rocky restore` today
+//! attempts a rebuild only for a recipe that is non-partitioned,
+//! content-addressed, and reads *no recorded upstreams* — it refuses a recipe
+//! with ANY recorded upstream, because re-deriving a multi-input recipe from
+//! the recorded upstream bytes needs DAG re-derivation that is not yet
+//! implemented. That shape is **necessary, not sufficient**: even a supported
+//! recipe can refuse (a missing tombstone/provenance binding, canonical
+//! `ModelIr` that will not deserialize, an unreachable object store or table
+//! state, a re-derivation whose blake3 differs from the tombstoned hash, a path
+//! outside the storage prefix, or a lost race on atomic ledger reinstatement).
+//! The eviction checks below admit multi-input recipes (a `strong` closure over
+//! several content-hashed upstreams still passes [`check_recipe_recorded`]), so
+//! gc can evict artifacts restore cannot yet rebuild. The tombstone is still
+//! durable, and the custody state still retains the recipe — the canonical
+//! `ModelIr` and recorded upstreams live in the `ProvenanceRecord` the
+//! tombstone's `(run_id, model_name)` points at, not in the tombstone itself —
+//! but for a multi-input artifact that recipe has no route back to the evicted
+//! bytes today. Re-running the pipeline is not that route: it recomputes from
+//! *current* upstreams, and a recipe is only bit-reproducible against the
+//! inputs it recorded — if any upstream has moved on the re-run yields
+//! different bytes, a new artifact at the same logical path. Until multi-input
+//! restore lands, those exact bytes may be unrecoverable.
 //!
 //! # Reachability
 //!
 //! Content-addressed writes are s3-only, so the creds-free playground holds no
 //! CAS artifacts. The plan → review → apply → tombstone → ledger-retire flow is
 //! driven creds-free over a ledger seeded through the production write APIs
-//! (see the `seed_demo_ledger` harness in the tests). The physical
-//! object-store delete ([`ObjectStoreEvictor`]) is s3-only and is
-//! **code-reviewed here, driven on the sandbox** — creds-free it defers.
+//! (see the `seed_demo_ledger` harness in the tests). Eviction is ledger-only:
+//! no physical object-store delete is performed. Physical byte reclamation is
+//! future work behind a protocol-aware VACUUM, and `[gc] physical_delete =
+//! true` is a hard error until then.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -98,7 +131,16 @@ type AdapterCost = (String, WarehouseType, f64, f64);
 /// (every upstream is a content hash). A `heuristic` closure means at least
 /// one input is a mutable-source freshness signal whose data may have moved
 /// on — such a table is not derivable.
-fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOutput {
+///
+/// **Known gap (asymmetry with `rocky restore`).** A `strong` closure over
+/// *several* content-hashed upstreams passes this check, but `restore` refuses
+/// any recipe with recorded upstreams (multi-input rebuild needs DAG
+/// re-derivation, not yet implemented). So this check's pass set is strictly
+/// larger than restore's recovery set. Pinned by
+/// `gc_admits_multi_input_recipe_that_restore_refuses_known_gap` in
+/// `commands/restore.rs`. Narrowing this predicate is a behavior change
+/// pending a design decision.
+pub(crate) fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOutput {
     let strong = class.proof_class.as_deref() == Some("strong");
     let passed = class.has_provenance && strong;
     let detail = if !class.has_provenance {
@@ -127,7 +169,7 @@ fn check_recipe_recorded(class: &ReplayCheckModelOutput) -> GcCheckOutput {
 /// provenance, but a `(run, model)` can have recorded a **different** output
 /// than the artifact under consideration — a sibling output, or a
 /// re-materialization at a new hash. Without this check, that artifact would
-/// inherit the recipe's "derivable" verdict even though the recipe rebuilds
+/// inherit the recipe's "derivable" verdict even though the recipe is bound to
 /// *other* bytes, and evicting it would delete bytes nothing can rebuild.
 ///
 /// So the verdict is bound to the specific candidate: its content hash (and,
@@ -172,7 +214,7 @@ pub(crate) fn check_recipe_produces_output(
             if matched {
                 (
                     true,
-                    "provenance records this exact output hash — the recipe rebuilds these bytes"
+                    "provenance records this exact output hash — the recipe is bound to these bytes"
                         .to_string(),
                 )
             } else {
@@ -180,7 +222,7 @@ pub(crate) fn check_recipe_produces_output(
                     false,
                     format!(
                         "the producing (run, model)'s provenance records a DIFFERENT output than \
-                         this artifact ({}…) — the recipe rebuilds other bytes, so evicting this \
+                         this artifact ({}…) — the recipe is bound to other bytes, so evicting this \
                          would be unrecoverable",
                         artifact_hash.get(..12).unwrap_or(artifact_hash)
                     ),
@@ -332,7 +374,7 @@ fn build_rebuild_cost(
 /// verdict is bound to *this artifact's* content hash, never inherited from a
 /// sibling output of the same recipe.
 #[allow(clippy::too_many_arguments)]
-fn build_candidate(
+pub(crate) fn build_candidate(
     artifact: &ArtifactRecord,
     refcount: u64,
     class: &ReplayCheckModelOutput,
@@ -371,11 +413,22 @@ fn build_candidate(
 /// numbers. These are the honesty guardrails the plan mandates.
 fn report_notes(min_age_days: i64) -> Vec<String> {
     vec![
-        "`derivable` means rebuildable from the recorded recipe — NOT that the file is safe to \
-         delete. `rocky apply` reclaims an artifact only when its file is a proven `remove` in \
-         its table's Delta log; the append-only writer keeps older versions live, so a derivable \
-         file still referenced by the live table is held (only an external compaction/VACUUM \
-         makes it reclaimable)."
+        "`derivable` means a recipe was recorded and bound to this artifact's bytes — NOT that \
+         the file is safe to delete, and NOT that `rocky restore` can rebuild it (restore covers \
+         only recipes that read no recorded upstreams; see the restore caveat below). `rocky \
+         apply` reclaims an artifact only when its file is a proven `remove` in its table's Delta \
+         log; the append-only writer keeps older versions live, so a derivable file still \
+         referenced by the live table is held (only an external compaction/VACUUM makes it \
+         reclaimable)."
+            .to_string(),
+        "Restore coverage is narrower than derivability. `rocky restore` rebuilds an evicted \
+         artifact only from a recipe that is non-partitioned, content-addressed, and reads no \
+         recorded upstreams — and even then it can refuse (missing tombstone/provenance binding, \
+         canonical IR that will not deserialize, unreachable object store or table state, a \
+         re-derivation whose blake3 differs, a path outside the storage prefix, or a lost race \
+         on ledger reinstatement). A recipe with ANY recorded upstream cannot be restored today. \
+         Re-running the pipeline is not an equivalent: it recomputes from current upstreams and \
+         need not reproduce the evicted bytes."
             .to_string(),
         "Scope: refcounts see Rocky-managed references only. A warehouse-side reference Rocky \
          never recorded (a BI extract, a notebook SELECT INTO) is invisible here."
@@ -715,12 +768,15 @@ pub fn run_gc_derivable(
 /// Operator caveats surfaced on a `gc` plan and its apply.
 fn gc_plan_notes() -> Vec<String> {
     vec![
-        "This plan lists artifacts proved *derivable* (rebuildable from the recorded recipe) at \
-         plan time. Derivable is NOT the same as reclaimable: `rocky apply` additionally requires \
-         each file to be a proven `remove` in its table's Delta log before deleting it. The \
+        "This plan lists artifacts proved *derivable* (a recipe was recorded and bound to the \
+         artifact's bytes) at plan time — derivable is an eligibility verdict, not a promise that \
+         `rocky restore` can rebuild them. Derivable is NOT the same as reclaimable: `rocky \
+         apply` additionally requires \
+         each file to be a proven `remove` in its table's Delta log before evicting it (a \
+         tombstone + retired ledger row — `rocky apply` performs no physical byte deletion). The \
          append-only writer never removes on its own, so a file still referenced by the live \
          table (including an older version) is HELD — only an external compaction/VACUUM makes it \
-         reclaimable. Expect apply to reclaim fewer artifacts than this plan lists (and none on a \
+         reclaimable. Expect apply to evict fewer artifacts than this plan lists (and none on a \
          creds-free run, where liveness cannot be verified)."
             .to_string(),
         "`rocky apply` re-verifies each artifact against the live ledger AND its table's Delta \
@@ -728,7 +784,17 @@ fn gc_plan_notes() -> Vec<String> {
          eviction (fail-closed)."
             .to_string(),
         "Every eviction writes a durable tombstone (recipe triple + restore pointer) BEFORE \
-         the ledger row is retired, so an evicted cache entry is always restorable."
+         the ledger row is retired. `rocky restore` attempts a rebuild only for a recipe that is \
+         non-partitioned, content-addressed, and reads no recorded upstreams — and that shape is \
+         necessary, not sufficient: a supported recipe can still refuse (missing \
+         tombstone/provenance binding, canonical IR that will not deserialize, unreachable object \
+         store or table state, a re-derivation whose blake3 differs, a path outside the storage \
+         prefix, or a lost race on ledger reinstatement). A recipe with ANY recorded upstream \
+         CANNOT be restored today (multi-input DAG re-derivation is a later phase). Re-running \
+         the pipeline is not an equivalent — it recomputes from current upstreams and need not \
+         reproduce the evicted bytes. What is durably retained is the eviction record plus the \
+         provenance the tombstone points at, not a guarantee that these exact bytes stay \
+         recoverable."
             .to_string(),
         "Deletion is symmetric-caution gated: review with `rocky review <plan-id> --approve`, \
          then `rocky apply <plan-id>`. There is no direct-delete path."
@@ -793,8 +859,12 @@ fn gc_plan_scope_summary(plan: &GcPlan) -> String {
 /// review-gated proposal.
 ///
 /// The `principal` is the CLI-resolved invoker (`ROCKY_PRINCIPAL` / default
-/// human). It rides on the plan so an agent-scoped `deny agent gc` rule fires
-/// on an agent-run GC; the review gate is unconditional regardless.
+/// human), stamped onto the plan as an advisory/display record. Apply does NOT
+/// enforce against that stored stamp: the gc apply gate evaluates the
+/// most-restrictive of the *apply-time* runtime principal and the plan-kind
+/// default, so an agent applier (`ROCKY_PRINCIPAL=agent rocky apply`) makes an
+/// agent-scoped `deny agent gc` rule fire, while a human applier vouches. The
+/// review gate is unconditional regardless.
 pub fn run_gc_plan(
     state_path: &Path,
     config_path: &Path,
@@ -910,7 +980,8 @@ fn print_plan_table(output: &GcPlanOutput) {
 }
 
 // ===========================================================================
-// Apply — `rocky apply <gc-plan>`: tombstone + evict + physical reclaim
+// Apply — `rocky apply <gc-plan>`: tombstone + retire ledger row (eviction is
+// ledger-only; no physical byte deletion)
 // ===========================================================================
 
 /// The manifest-truth reclaimability verdict for a candidate artifact.
@@ -1022,15 +1093,25 @@ fn gc_apply_notes() -> Vec<String> {
          gap, malformed commit, unsupported protocol, wrong prefix, unverifiable log) holds \
          (fail-closed)."
             .to_string(),
-        "The eviction of record is the durable tombstone + retired ledger row (always restorable \
-         from the recorded recipe). Physical byte-deletion is NOT performed: reclaiming bytes \
+        "The eviction of record is the durable tombstone + retired ledger row; the recipe itself \
+         (canonical IR and recorded upstreams) stays in the provenance the tombstone references. \
+         Physical byte-deletion is NOT performed: reclaiming bytes \
          safely requires a protocol-aware VACUUM (Delta tombstone-retention windows plus \
          TOCTOU-safe deletion against concurrent re-adds), which is future work. Setting `[gc] \
          physical_delete = true` is a hard error until then."
             .to_string(),
-        "Every eviction is restorable: `rocky restore <target>` writes a review-gated plan that \
-         rebuilds the artifact from its tombstone's recorded recipe and asserts the recomputed \
-         blake3 equals the tombstoned hash before any write becomes visible."
+        "`rocky restore <target>` writes a review-gated plan that rebuilds the artifact from the \
+         recipe its tombstone references and asserts the recomputed blake3 equals the tombstoned \
+         hash before any write becomes visible. KNOWN LIMITATION: restore attempts a rebuild only \
+         for non-partitioned, content-addressed recipes that read no recorded upstreams — it \
+         refuses a recipe with ANY recorded upstream rather than substituting current data, so a \
+         multi-input artifact evicted here cannot be restored today. That shape is necessary, not \
+         sufficient: a supported recipe can still refuse on a missing provenance binding, \
+         canonical IR that will not deserialize, unreachable object store or table state, a \
+         re-derivation whose blake3 differs, a path outside the storage prefix, or a lost race on \
+         ledger reinstatement. Re-running its pipeline recomputes the model from \
+         current upstreams and need not reproduce the evicted bytes; if those upstreams have \
+         moved on, the exact bytes are unrecoverable until multi-input restore lands."
             .to_string(),
         "KNOWN LIMITATION: the liveness gate is a conservative-best-effort reader of the Delta \
          log, not a full Delta-protocol implementation. It HOLDs on any log shape it cannot \
@@ -1408,7 +1489,8 @@ pub(crate) fn gc_models_dir(
 ///   rule hard-refuses even a reviewed plan.
 ///
 /// Once cleared, [`execute_gc_apply`] re-verifies each planned eviction against
-/// the live ledger before deleting anything.
+/// the live ledger before evicting anything (tombstone + retired ledger row;
+/// no physical byte deletion follows).
 pub(crate) async fn run_gc_apply_in(
     root: &Path,
     config_path: &Path,
@@ -1600,7 +1682,11 @@ pub(crate) async fn run_gc_apply_in_with(
              content-addressed bytes requires a protocol-aware VACUUM (Delta tombstone-retention \
              windows + TOCTOU-safe deletion), which is not yet implemented. Unset `[gc] \
              physical_delete` — the durable tombstone + retired ledger row is the eviction of \
-             record (always restorable from the recorded recipe)."
+             record, and the recipe stays in the provenance it references (`rocky restore` \
+             attempts a rebuild only for recipes that read no recorded upstreams, and can still \
+             refuse; a recipe with ANY recorded upstream cannot be restored today, and re-running \
+             its pipeline recomputes from current upstreams rather than reproducing the evicted \
+             bytes)."
         );
     }
 

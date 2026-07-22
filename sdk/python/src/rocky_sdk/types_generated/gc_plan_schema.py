@@ -81,7 +81,7 @@ class GcPlanOutput(BaseModel):
     """
     notes: list[str]
     """
-    Operator caveats (e.g. re-verification at apply, scope). Each eviction records everything `rocky restore <target>` needs to rebuild it hash-exact.
+    Operator caveats (e.g. re-verification at apply, restore's narrower coverage, scope). Each eviction records a durable tombstone pointing at the recipe's provenance — the path `rocky restore <target>` *attempts* a hash-exact rebuild from, which succeeds only for a recipe that reads no recorded upstreams (a multi-input recipe is refused).
     """
     plan_id: str
     """

@@ -2609,9 +2609,14 @@ pub struct RockyConfig {
     /// `(principal, capability, scope)`, whether an action is allowed,
     /// requires human review, or is denied; enforced at `apply`, `promote`,
     /// and the MCP write tools, with every decision recorded to the
-    /// ledger. Absent `[policy]` block ⇒ no
-    /// rules and the default posture applies (agents on mutating actions
-    /// fall to `default_agent_effect`, humans are never gated). See
+    /// ledger. Absent `[policy]` block ⇒ no rules and no enforcement: the
+    /// `apply` / `promote` / MCP-write gate returns `NotConfigured` and allows
+    /// the action regardless of principal, so an absent block leaves behavior
+    /// unchanged (it does NOT gate agents to review). One surface diverges:
+    /// `rocky policy check` *predicts* against
+    /// [`PolicyConfig::default_posture`] (agents on mutating actions →
+    /// `require_review`, humans never gated), so with no `[policy]` block its
+    /// prediction is stricter than what enforcement actually does. See
     /// [`PolicyConfig`] and [`crate::policy`] for the evaluator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyConfig>,
@@ -2727,10 +2732,26 @@ impl Default for ReuseConfig {
 /// review-gated `rocky apply <gc-plan>`.
 ///
 /// Eviction is **ledger-only**: an approved apply writes the durable tombstone
-/// and retires the artifact's ledger row (the eviction of record, always
-/// restorable from the recorded recipe). Physical byte-deletion is not
-/// performed — reclaiming bytes safely requires a protocol-aware VACUUM
-/// (retention windows + TOCTOU-safe deletion), which is future work.
+/// and retires the artifact's ledger row (the eviction of record; the recipe
+/// itself stays in the provenance the tombstone references). Physical
+/// byte-deletion is not performed — reclaiming bytes safely requires a
+/// protocol-aware VACUUM (retention windows + TOCTOU-safe deletion), which is
+/// future work.
+///
+/// `rocky restore` attempts to rebuild an evicted artifact only when the
+/// recorded recipe is non-partitioned, content-addressed, and reads no
+/// recorded upstreams. That shape is necessary, not sufficient: a supported
+/// recipe can still refuse on a missing tombstone/provenance binding,
+/// canonical IR that will not deserialize, unreachable object store or table
+/// state, a re-derivation whose blake3 differs from the tombstoned hash, a
+/// path outside the storage prefix, or a lost race on ledger reinstatement. A
+/// recipe with ANY recorded upstream cannot be restored today (multi-input DAG
+/// re-derivation is a later phase). Re-running the pipeline is not an
+/// equivalent: it recomputes the model from *current* upstreams and need not
+/// reproduce the evicted bytes, so if those upstreams have moved on the exact
+/// bytes are unrecoverable until multi-input restore lands. What is durably
+/// retained is the eviction record plus the referenced provenance, not a
+/// guarantee that the exact bytes remain recoverable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GcConfig {
@@ -2785,7 +2806,9 @@ pub enum PolicyCapability {
     Backfill,
     /// Garbage-collect / reclaim storage.
     Gc,
-    /// Restore a gc-evicted artifact from its tombstone (rebuild + verify).
+    /// Restore a gc-evicted artifact from its tombstone (*attempts* a rebuild,
+    /// then verifies hash-exact — supported only for a recipe that reads no
+    /// recorded upstreams; a multi-input recipe is refused).
     Restore,
     /// Retry a failed run.
     Retry,
