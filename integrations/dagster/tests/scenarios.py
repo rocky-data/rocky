@@ -381,8 +381,10 @@ APPLY: dict[str, Any] = {
             "run_id": "run-2026-01-01-000000-001",
             "blake3_hash": "deadbeefcafef00d",
             "size_bytes": 4096,
-            "physical_reclaimed": True,
-            "physical_status": "reclaimed",
+            # Eviction is ledger-only: physical reclamation is future work, so
+            # the engine always emits ``physical_reclaimed: false``.
+            "physical_reclaimed": False,
+            "physical_status": "not attempted — physical reclamation is future work",
             "tombstone_recorded": True,
         },
     ],
@@ -392,7 +394,7 @@ APPLY: dict[str, Any] = {
     "bytes_refused": 0,
     "evicted_count": 1,
     "refused_count": 0,
-    "notes": ["physical reclamation is object-store-only"],
+    "notes": ["eviction is ledger-only; physical reclamation is future work"],
 }
 
 # ---------------------------------------------------------------------------
