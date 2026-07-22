@@ -575,9 +575,13 @@ fn write_plan_inner<T: Serialize>(
     // (run/ai_authored); typed-IR compact/archive payloads never carry it.
     let payload_value = payload_with_capabilities(payload, capabilities)?;
 
-    // The authoring principal is part of the integrity digest (see
-    // `compute_plan_id`) so a later tamper of the stamped principal invalidates
-    // the id.
+    // The authoring principal is deliberately NOT part of the integrity digest:
+    // `compute_plan_id` hashes only `{kind, payload}`, so re-stamping the
+    // `principal` field on disk does not change (or invalidate) the `plan_id`.
+    // The stamp is intentionally tamperable, which is exactly why enforcement
+    // ignores it — `PersistedPlan::enforcement_principal` evaluates the
+    // apply-time runtime principal instead (see `compute_plan_id` /
+    // `PersistedPlan::principal`).
     let plan_id = compute_plan_id(&kind, &payload_value);
 
     let record = PersistedPlan {

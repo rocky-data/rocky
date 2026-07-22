@@ -38,7 +38,7 @@ class GcEvictedOutput(BaseModel):
     """
     physical_status: str
     """
-    Human-readable physical-reclamation outcome. Today this is always `not attempted — physical reclamation is future work`.
+    Human-readable physical-reclamation outcome. Since eviction is ledger-only, this is always `not attempted — physical reclamation is future protocol-aware VACUUM work; the tombstone + retired ledger row is the eviction of record`.
     """
     run_id: str
     size_bytes: conint(ge=0)

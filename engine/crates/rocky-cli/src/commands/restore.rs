@@ -489,10 +489,15 @@ async fn discover_table_state(
         .map_err(|e| anyhow!("could not discover the table's state from its _delta_log: {e}"))
 }
 
-/// Restore one planned tombstone. Every early exit is a refusal that wrote
-/// nothing; the happy path is: resolve live tombstone → bind recipe to the
-/// exact hash → re-derive → **hash-verify before any write** → materialize
-/// (verify-or-create-only) → reinstate the ledger row atomically.
+/// Restore one planned tombstone. Most early exits are refusals that wrote
+/// nothing — the pre-write verification is fail-closed — with ONE exception:
+/// an artifact that re-derived, hash-verified, and was written can still refuse
+/// if the atomic ledger reinstatement then fails, leaving the verified bytes
+/// safe at the tombstoned path while the ledger row is NOT reinstated (a re-run
+/// verifies and completes idempotently). The happy path is: resolve live
+/// tombstone → bind recipe to the exact hash → re-derive → **hash-verify before
+/// any write** → materialize (verify-or-create-only) → reinstate the ledger row
+/// atomically.
 async fn restore_one(
     store: &StateStore,
     stores: &dyn RestoreStores,
@@ -1666,12 +1671,19 @@ mod tests {
         /// which need not reproduce the evicted bytes.
         /// This PR corrects the misleading text; it does not close the gap.
         ///
-        /// **Expected to be inverted when fixed.** Two mutually exclusive
-        /// fixes are possible — narrow gc's eligibility predicate to reject
-        /// recorded upstreams, or build multi-input restore — and choosing
-        /// between them is an owner decision (the first is a behavior change to
-        /// a public surface). Whichever lands, the `restore_one` half of this
-        /// test stops refusing and the test should be renamed.
+        /// **Expected to invert when the gap is closed — but which half inverts
+        /// depends on the fix.** Two mutually exclusive fixes are possible, and
+        /// choosing between them is an owner decision:
+        /// - Narrow gc's eligibility predicate to reject recorded upstreams (a
+        ///   behavior change to a public surface): the `build_candidate`
+        ///   admission assertion above breaks — gc no longer admits the
+        ///   multi-input recipe — while `restore_one` keeps refusing (its
+        ///   behavior is unchanged).
+        /// - Build multi-input restore (DAG re-derivation from the recorded
+        ///   upstream bytes): the `restore_one` refusal assertion below breaks —
+        ///   restore now succeeds — while gc keeps admitting.
+        /// Either way this test must be revisited and renamed; it does not
+        /// self-adjust.
         #[tokio::test]
         async fn gc_admits_multi_input_recipe_that_restore_refuses_known_gap() {
             let dir = TempDir::new().unwrap();
@@ -1715,20 +1727,24 @@ mod tests {
             store
                 .record_reuse_spine(std::slice::from_ref(&entry), std::slice::from_ref(&prov))
                 .unwrap();
-            store
-                .record_artifact(&ArtifactRecord {
-                    blake3_hash: wr.blake3_hash.clone(),
-                    run_id: "r1".to_string(),
-                    model_name: "orders".to_string(),
-                    file_path: wr.file_path.clone(),
-                    commit_version: wr.commit_version,
-                    size_bytes: wr.size_bytes,
-                    written_at: written,
-                })
-                .unwrap();
+            let art_record = ArtifactRecord {
+                blake3_hash: wr.blake3_hash.clone(),
+                run_id: "r1".to_string(),
+                model_name: "orders".to_string(),
+                file_path: wr.file_path.clone(),
+                commit_version: wr.commit_version,
+                size_bytes: wr.size_bytes,
+                written_at: written,
+            };
+            store.record_artifact(&art_record).unwrap();
             record_run(&store, "r1", "orders");
 
-            // --- gc side: this artifact PASSES the eviction eligibility check.
+            // --- gc side: this artifact passes the FULL 6-check gc admission
+            // (`build_candidate`), not merely the recipe-recorded check — so the
+            // eviction set `rocky gc` actually approves genuinely includes a
+            // multi-input artifact that `restore_one` refuses below. A new
+            // production check that rejected upstream-bearing recipes would flip
+            // `derivable` to false here and fail this assertion.
             let class = crate::output::ReplayCheckModelOutput {
                 model_name: "orders".to_string(),
                 verdict: "replayable".to_string(),
@@ -1740,11 +1756,38 @@ mod tests {
                 proof_class: Some(prov.proof_class.clone()),
                 inputs: Vec::new(),
             };
-            let check = crate::commands::gc::check_recipe_recorded(&class);
+            // Exactly one live ledger reference (the candidate itself) — gc's
+            // `unreferenced` check admits only refcount == 1.
+            let refcount = store.refcount_for_hash(&wr.blake3_hash).unwrap();
+            assert_eq!(
+                refcount, 1,
+                "the artifact is singly-referenced before eviction (gc's unreferenced check)"
+            );
+            let candidate = crate::commands::gc::build_candidate(
+                &art_record,
+                refcount,
+                &class,
+                None,
+                Some(&prov),
+                Utc::now(),
+                7,
+                None,
+            );
+            assert_eq!(
+                candidate.checks.len(),
+                6,
+                "the full admission is six checks"
+            );
             assert!(
-                check.passed,
-                "KNOWN GAP: gc admits a multi-input recipe for eviction ({})",
-                check.detail
+                candidate.checks.iter().all(|c| c.passed),
+                "KNOWN GAP: gc's full 6-check admission marks a multi-input recipe derivable \
+                 (eligible for eviction): {:?}",
+                candidate.checks
+            );
+            assert!(
+                candidate.derivable,
+                "the multi-input artifact is admitted for eviction: {:?}",
+                candidate.checks
             );
 
             // Evict it, exactly as an approved gc apply would.

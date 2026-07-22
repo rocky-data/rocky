@@ -4479,12 +4479,14 @@ pub struct TombstoneRecord {
     pub evicted_at: chrono::DateTime<chrono::Utc>,
     /// The `rocky gc` plan that authorized this eviction (custody).
     pub plan_id: String,
-    /// `true` once the bytes were physically reclaimed through the object-store
-    /// adapter; `false` when the physical delete was deferred (no reachable
-    /// object store on this adapter) or failed. A `false` row is a safe leaked
-    /// orphan — the ledger reference is gone and the tombstone stands — that a
-    /// later sweep can reclaim after re-checking the refcount (a hash may have
-    /// been re-materialized in the meantime).
+    /// Whether the bytes were physically reclaimed through the object-store
+    /// adapter. **Always `false` today, by construction:** `rocky apply`
+    /// performs no physical byte deletion — eviction is ledger-only (tombstone +
+    /// retired ledger row), and `[gc] physical_delete = true` is a hard error
+    /// rather than a deferred or best-effort delete. Safe byte reclamation needs
+    /// a protocol-aware VACUUM (retention windows + TOCTOU-safe deletion), which
+    /// is future work; there is no reclaiming sweep. The tombstone + retired
+    /// ledger row is the eviction of record.
     #[serde(default)]
     pub physical_reclaimed: bool,
     /// The Delta `_delta_log` head version this eviction's removal proof

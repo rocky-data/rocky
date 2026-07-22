@@ -382,9 +382,14 @@ APPLY: dict[str, Any] = {
             "blake3_hash": "deadbeefcafef00d",
             "size_bytes": 4096,
             # Eviction is ledger-only: physical reclamation is future work, so
-            # the engine always emits ``physical_reclaimed: false``.
+            # the engine always emits ``physical_reclaimed: false`` and this
+            # exact ``physical_status`` string.
             "physical_reclaimed": False,
-            "physical_status": "not attempted — physical reclamation is future work",
+            "physical_status": (
+                "not attempted — physical reclamation is future protocol-aware "
+                "VACUUM work; the tombstone + retired ledger row is the eviction "
+                "of record"
+            ),
             "tombstone_recorded": True,
         },
     ],

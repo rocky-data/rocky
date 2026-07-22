@@ -26,7 +26,7 @@ export interface RestoreApplyOutput {
   notes: string[];
   plan_id: string;
   /**
-   * Artifacts refused by a fail-closed guard; nothing was written for them.
+   * Artifacts refused by a fail-closed guard; the ledger was not reinstated for them. Usually pre-write, but verified content-addressed bytes may already be on disk (a lost ledger-reinstatement race) and are safe to reuse on re-apply — a refusal means the ledger was not changed, not that nothing was written.
    */
   refused: RestoreRefusedOutput[];
   /**
@@ -45,7 +45,7 @@ export interface RestoreApplyOutput {
   [k: string]: unknown;
 }
 /**
- * One artifact `rocky apply <restore-plan>` **refused** to restore — the fail-closed verification caught a mismatch, so nothing was written for it.
+ * One artifact `rocky apply <restore-plan>` **refused** to restore: the ledger row was NOT reinstated (no restore of record). Most refusals are pre-write — a fail-closed verification caught a mismatch before anything was written — but a refusal can also follow a successful, hash-verified content-addressed write whose atomic ledger reinstatement then lost a race. In that case the verified bytes are already at the tombstoned path and are safe to reuse on a re-run (the re-apply verifies and completes idempotently). A refusal therefore guarantees only that the ledger was not changed, not that nothing was written.
  */
 export interface RestoreRefusedOutput {
   blake3_hash: string;

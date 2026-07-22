@@ -38,7 +38,7 @@
           "type": "boolean"
         },
         "physical_status": {
-          "description": "Human-readable physical-reclamation outcome. Today this is always `not attempted — physical reclamation is future work`.",
+          "description": "Human-readable physical-reclamation outcome. Since eviction is ledger-only, this is always `not attempted — physical reclamation is future protocol-aware VACUUM work; the tombstone + retired ledger row is the eviction of record`.",
           "type": "string"
         },
         "run_id": {

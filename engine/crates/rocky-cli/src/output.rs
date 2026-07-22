@@ -8020,8 +8020,10 @@ pub struct GcEvictedOutput {
     /// stay in place; the durable tombstone records the recipe pointer a later
     /// `rocky restore` uses to *attempt* a rebuild (see `physical_status`).
     pub physical_reclaimed: bool,
-    /// Human-readable physical-reclamation outcome. Today this is always
-    /// `not attempted — physical reclamation is future work`.
+    /// Human-readable physical-reclamation outcome. Since eviction is
+    /// ledger-only, this is always `not attempted — physical reclamation is
+    /// future protocol-aware VACUUM work; the tombstone + retired ledger row is
+    /// the eviction of record`.
     pub physical_status: String,
 }
 
@@ -8181,8 +8183,15 @@ pub struct RestoredOutput {
     pub status: String,
 }
 
-/// One artifact `rocky apply <restore-plan>` **refused** to restore — the
-/// fail-closed verification caught a mismatch, so nothing was written for it.
+/// One artifact `rocky apply <restore-plan>` **refused** to restore: the
+/// ledger row was NOT reinstated (no restore of record). Most refusals are
+/// pre-write — a fail-closed verification caught a mismatch before anything was
+/// written — but a refusal can also follow a successful, hash-verified
+/// content-addressed write whose atomic ledger reinstatement then lost a race.
+/// In that case the verified bytes are already at the tombstoned path and are
+/// safe to reuse on a re-run (the re-apply verifies and completes idempotently).
+/// A refusal therefore guarantees only that the ledger was not changed, not
+/// that nothing was written.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RestoreRefusedOutput {
     pub model_name: String,
@@ -8209,7 +8218,11 @@ pub struct RestoreApplyOutput {
     /// Artifacts restored — hash-verified bytes at the tombstoned path and a
     /// reinstated ledger row.
     pub restored: Vec<RestoredOutput>,
-    /// Artifacts refused by a fail-closed guard; nothing was written for them.
+    /// Artifacts refused by a fail-closed guard; the ledger was not reinstated
+    /// for them. Usually pre-write, but verified content-addressed bytes may
+    /// already be on disk (a lost ledger-reinstatement race) and are safe to
+    /// reuse on re-apply — a refusal means the ledger was not changed, not that
+    /// nothing was written.
     pub refused: Vec<RestoreRefusedOutput>,
     /// Content hashes of plan entries whose tombstone was already consumed by
     /// a prior restore and whose live bytes re-verified — idempotent no-ops.

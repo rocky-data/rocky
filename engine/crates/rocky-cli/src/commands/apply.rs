@@ -4178,18 +4178,30 @@ effect = "deny"
         Ok(())
     }
 
-    /// The gc apply gate's CLAIMED denial behavior, driven end to end: a
-    /// `deny agent gc` policy rule DOES fire for an agent applier of a gc plan
-    /// and does NOT fire for a human applier.
+    /// The gc apply gate's CLAIMED denial behavior: a `deny agent gc` policy
+    /// rule DOES fire for an agent applier of a gc plan and does NOT fire for a
+    /// human applier — AND the plan's stored `principal` stamp is ignored.
     ///
     /// This complements `plan_store::gc_plan_enforces_as_agent_for_an_agent_applier`,
     /// which pins only the principal *combination* that
     /// [`PersistedPlan::enforcement_principal`] returns. Here we load a real
     /// `[policy]` block carrying a `deny agent gc` rule and drive
-    /// [`evaluate_apply_policy`] — the exact function the gc apply gate calls
-    /// (`commands/gc.rs`) — with the principal `enforcement_principal` produces
-    /// and the `{model → Gc}` touched set the gate builds, so the assertion
-    /// covers the denial the test names rather than the principal math alone.
+    /// [`evaluate_apply_policy_with_policy`] — the exact function the gc apply
+    /// gate calls (`commands/gc.rs`, line ~1629) — passing the result of
+    /// `gc.enforcement_principal(runtime)`, the exact expression the gate
+    /// evaluates at its call site. The stored stamp is set to `Some(Human)`
+    /// while the runtime applier is `Agent`, so a Deny proves the *runtime*
+    /// principal (plus kind), not the stamp, decides: had the gate read the
+    /// stored `Human` stamp the agent rule would not fire.
+    ///
+    /// What this does NOT cover: the wiring inside `run_gc_apply_in` /
+    /// `run_gc_apply` — that `gc.rs:1632` computes the principal via
+    /// `enforcement_principal(runtime_principal)` (rather than the stamp-reading
+    /// `resolved_principal()`), that `runtime_principal` is the apply-time
+    /// `--principal` / `ROCKY_PRINCIPAL`, and that the gate's `touched` set is
+    /// built as one `Gc` capability per planned model. Those seam lines are not
+    /// exercised here; a regression that swapped `enforcement_principal` for
+    /// `resolved_principal` at the call site would stay green under this test.
     ///
     /// The human case asserts the agent-scoped rule does not fire; it is NOT a
     /// claim that a human gc is ungated — a gc plan is separately, and
@@ -4208,15 +4220,21 @@ scope = { any = true }
 effect = "deny"
 "#,
         )?;
+        // Load the `[policy]` snapshot and pass it directly, exactly as the gc
+        // apply gate does (`loaded_cfg.as_ref().and_then(|c| c.policy.as_ref())`)
+        // — never a disk reload inside the gate.
+        let policy = rocky_core::config::load_rocky_config(&config)?.policy;
+        assert!(policy.is_some(), "the fixture must carry a [policy] block");
 
-        // A gc plan. Its stored `principal` stamp is deliberately absent — the
-        // gate ignores it either way; enforcement is the runtime applier.
+        // A gc plan whose stored `principal` stamp is `Some(Human)` — a stamp
+        // that DIFFERS from the agent runtime below. If the gate trusted the
+        // stamp the agent rule could never fire; the Deny proves it is ignored.
         let gc = PersistedPlan {
             plan_id: "gc-1".to_string(),
             kind: PlanKind::Gc,
             created_at: chrono::Utc::now(),
             format_version: 1,
-            principal: None,
+            principal: Some(PolicyPrincipal::Human),
             payload: serde_json::json!({}),
         };
 
@@ -4226,9 +4244,10 @@ effect = "deny"
         let models = dir.path().join("models");
         let state = dir.path().join("state.redb");
 
-        // Agent applier: enforcement_principal(Agent) == Agent → deny fires.
-        let agent_gate = super::evaluate_apply_policy(
-            &config,
+        // Agent applier: enforcement_principal(Agent) == Agent (stored Human
+        // stamp ignored) → deny fires.
+        let agent_gate = super::evaluate_apply_policy_with_policy(
+            policy.as_ref(),
             "gc-1",
             gc.enforcement_principal(PolicyPrincipal::Agent),
             &touched,
@@ -4238,13 +4257,14 @@ effect = "deny"
         );
         assert!(
             matches!(agent_gate, PolicyGate::Deny { .. }),
-            "an agent applying a gc plan must be denied by `deny agent gc`; got {agent_gate:?}"
+            "an agent applying a gc plan must be denied by `deny agent gc` even though the plan's \
+             stored stamp is Human; got {agent_gate:?}"
         );
 
         // Human applier: enforcement_principal(Human) == Human → the agent-scoped
         // rule does not match (the review gate is a separate, unconditional gate).
-        let human_gate = super::evaluate_apply_policy(
-            &config,
+        let human_gate = super::evaluate_apply_policy_with_policy(
+            policy.as_ref(),
             "gc-1",
             gc.enforcement_principal(PolicyPrincipal::Human),
             &touched,

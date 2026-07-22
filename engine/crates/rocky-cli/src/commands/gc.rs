@@ -34,12 +34,16 @@
 //!
 //! - its [`rocky_core::state::ProvenanceRecord`] + input match-strength (via
 //!   the shared [`crate::commands::replay::classify_model`] verdict) — checks
-//!   1 (recipe recorded) and 2 (replayable);
+//!   1 (recipe recorded), 2 (exact-output binding: the recipe provably produces
+//!   THIS artifact's exact bytes), and 3 (replayable);
 //! - its ledger refcount via
-//!   [`rocky_core::state::StateStore::refcount_for_hash`] — check 3
+//!   [`rocky_core::state::StateStore::refcount_for_hash`] — check 4
 //!   (unreferenced);
 //! - the recorded [`rocky_core::state::ModelExecution`] — the recipe-identity
 //!   id and the rebuild-cost estimate.
+//!
+//! Checks 5 (policy allows) and 6 (age threshold) round out the six
+//! [`build_candidate`] applies; they are not part of the join above.
 //!
 //! # Fail-closed — a false *derivable* is data loss
 //!
@@ -370,7 +374,7 @@ fn build_rebuild_cost(
 /// verdict is bound to *this artifact's* content hash, never inherited from a
 /// sibling output of the same recipe.
 #[allow(clippy::too_many_arguments)]
-fn build_candidate(
+pub(crate) fn build_candidate(
     artifact: &ArtifactRecord,
     refcount: u64,
     class: &ReplayCheckModelOutput,
@@ -768,10 +772,11 @@ fn gc_plan_notes() -> Vec<String> {
          artifact's bytes) at plan time — derivable is an eligibility verdict, not a promise that \
          `rocky restore` can rebuild them. Derivable is NOT the same as reclaimable: `rocky \
          apply` additionally requires \
-         each file to be a proven `remove` in its table's Delta log before deleting it. The \
+         each file to be a proven `remove` in its table's Delta log before evicting it (a \
+         tombstone + retired ledger row — `rocky apply` performs no physical byte deletion). The \
          append-only writer never removes on its own, so a file still referenced by the live \
          table (including an older version) is HELD — only an external compaction/VACUUM makes it \
-         reclaimable. Expect apply to reclaim fewer artifacts than this plan lists (and none on a \
+         reclaimable. Expect apply to evict fewer artifacts than this plan lists (and none on a \
          creds-free run, where liveness cannot be verified)."
             .to_string(),
         "`rocky apply` re-verifies each artifact against the live ledger AND its table's Delta \
@@ -975,7 +980,8 @@ fn print_plan_table(output: &GcPlanOutput) {
 }
 
 // ===========================================================================
-// Apply — `rocky apply <gc-plan>`: tombstone + evict + physical reclaim
+// Apply — `rocky apply <gc-plan>`: tombstone + retire ledger row (eviction is
+// ledger-only; no physical byte deletion)
 // ===========================================================================
 
 /// The manifest-truth reclaimability verdict for a candidate artifact.
@@ -1483,7 +1489,8 @@ pub(crate) fn gc_models_dir(
 ///   rule hard-refuses even a reviewed plan.
 ///
 /// Once cleared, [`execute_gc_apply`] re-verifies each planned eviction against
-/// the live ledger before deleting anything.
+/// the live ledger before evicting anything (tombstone + retired ledger row;
+/// no physical byte deletion follows).
 pub(crate) async fn run_gc_apply_in(
     root: &Path,
     config_path: &Path,
