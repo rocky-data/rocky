@@ -1909,6 +1909,9 @@ pub async fn plan_promote(
         branch_name,
         filter,
         pipeline_name,
+        // `rocky plan promote` exposes no `--skip-approval` flag; the approval
+        // gate honors `ROCKY_BRANCH_APPROVAL_SKIP` only on this path.
+        false,
         allow_breaking,
         state_path,
         principal,
@@ -1968,13 +1971,23 @@ pub(crate) async fn build_promote_plan_inner(
     branch_name: &str,
     filter: Option<&str>,
     pipeline_name: Option<&str>,
+    // Bare `rocky branch promote <name>` also honors the `--skip-approval`
+    // CLI flag (not just `ROCKY_BRANCH_APPROVAL_SKIP`). `rocky plan promote`
+    // has no such flag and passes `false`. Threaded here so both plan-build
+    // call sites run the identical approval gate.
+    skip_approval_flag: bool,
     allow_breaking: bool,
     state_path: &Path,
-    // The resolved CLI authoring principal, stamped onto the persisted plan so
-    // a later `rocky apply` evaluates the promote against the identity that
-    // authored it. A human-invoked promote stays `human` (ungated in v0); an
-    // agent-invoked one (`--principal agent` / `ROCKY_PRINCIPAL=agent`) is
-    // gated by `deny agent promote {…}` rules and agent freezes.
+    // The resolved CLI authoring principal, stamped onto the persisted plan as
+    // an ADVISORY/display record. Enforcement — `rocky apply <promote-plan>`,
+    // `rocky branch promote --plan`, AND bare `rocky branch promote`, which all
+    // gate IDENTICALLY through the shared `gate_promote_plan` — does NOT enforce
+    // against this stored stamp: the gate evaluates `most_restrictive(runtime
+    // principal, default_principal_for_kind(Promote))`, and a `Promote` plan's
+    // kind default is `human`. So an AGENT runner is gated as agent — a
+    // `deny agent promote {…}` rule fires and agent freezes — regardless of who
+    // authored the plan, while a human runner resolves to `human` (ungated in
+    // v0). The stored stamp decides nothing at enforcement time.
     principal: PolicyPrincipal,
 ) -> Result<PromotePlanResult> {
     use crate::commands::branch::{
@@ -2011,9 +2024,16 @@ pub(crate) async fn build_promote_plan_inner(
     let env_skip_value = std::env::var(APPROVAL_SKIP_ENV)
         .ok()
         .filter(|v| !v.is_empty());
-    let skip_reason: Option<String> = env_skip_value
-        .as_ref()
-        .map(|v| format!("{APPROVAL_SKIP_ENV}={v}"));
+    // Explicit `--skip-approval` flag wins over the env var so the audit
+    // records the flag-origin reason even when both are set (matches the
+    // bare-verb path this function now backs).
+    let skip_reason: Option<String> = if skip_approval_flag {
+        Some("--skip-approval CLI flag".to_string())
+    } else {
+        env_skip_value
+            .as_ref()
+            .map(|v| format!("{APPROVAL_SKIP_ENV}={v}"))
+    };
 
     let mut audit: Vec<AuditEvent> = Vec::new();
 
