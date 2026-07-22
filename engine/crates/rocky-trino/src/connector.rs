@@ -27,6 +27,8 @@
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use rocky_core::failure_class::{FailureClass, TransientKind};
+use rocky_core::traits::AdapterError;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::time::Instant;
@@ -99,6 +101,72 @@ pub enum TrinoError {
 
     #[error("Trino spooled Arrow decode error: {0}")]
     ArrowDecode(String),
+}
+
+/// Trino [`StandardErrorCode`](https://github.com/trinodb/trino/blob/master/core/trino-spi/src/main/java/io/trino/spi/StandardErrorCode.java)
+/// names that are safe to retry: the query hit a cluster-side blip — a worker
+/// went away, the coordinator was starting/stopping, or an internal
+/// page-transport hiccup — not a deterministic user error. Retrying re-plans
+/// the query, typically onto a healthy set of nodes.
+///
+/// Deliberately conservative: everything not listed (SQL/user errors like
+/// `SYNTAX_ERROR` / `TABLE_NOT_FOUND` / `TYPE_MISMATCH`, permission errors,
+/// resource-exhaustion the retry can't fix) is permanent. A missed transient
+/// name just doesn't get retried; it is never unsafe.
+fn is_retryable_error_name(name: &str) -> bool {
+    matches!(
+        name,
+        "NO_NODES_AVAILABLE"
+            | "REMOTE_TASK_ERROR"
+            | "REMOTE_TASK_MISMATCH"
+            | "REMOTE_HOST_GONE"
+            | "PAGE_TRANSPORT_ERROR"
+            | "PAGE_TRANSPORT_TIMEOUT"
+            | "SERVER_STARTING_UP"
+            | "SERVER_SHUTTING_DOWN"
+    )
+}
+
+/// Classify a Trino [`AdapterError`] for the run loop's classified-retry layer,
+/// mirroring the Snowflake/BigQuery adapters.
+///
+/// Downcasts to the typed [`TrinoError`]: a network / 5xx / timeout /
+/// cluster-blip failure ⇒ [`FailureClass::Transient`]; every other recognised
+/// failure (SQL/user errors, auth, the security refusals, decode errors) ⇒
+/// [`FailureClass::Permanent`]; a non-[`TrinoError`] (e.g. the string-only
+/// "table not found" guard) ⇒ [`FailureClass::Unknown`] (fail closed).
+///
+/// Errs toward `Permanent`/`Unknown`: a missed transient simply isn't retried
+/// (no worse than the prior no-op default), and a mis-retried permanent costs
+/// only wasted attempts — never data loss (the non-replacing-CTAS bootstrap
+/// backstop still guards target creation). Only `Transient` is ever retried.
+#[must_use]
+pub(crate) fn classify_trino_failure(err: &AdapterError) -> FailureClass {
+    let Some(trino_err) = err.inner().downcast_ref::<TrinoError>() else {
+        return FailureClass::Unknown;
+    };
+    match trino_err {
+        TrinoError::Timeout { .. } => FailureClass::Transient(TransientKind::Timeout),
+        TrinoError::Http(e) if e.is_timeout() => FailureClass::Transient(TransientKind::Timeout),
+        TrinoError::Http(e) if e.is_connect() => FailureClass::Transient(TransientKind::Network),
+        TrinoError::Http(_) => FailureClass::Permanent,
+        TrinoError::HttpStatus { status: 429, .. } => {
+            FailureClass::Transient(TransientKind::RateLimit)
+        }
+        TrinoError::HttpStatus {
+            status: 502..=504, ..
+        } => FailureClass::Transient(TransientKind::ServerBusy),
+        TrinoError::HttpStatus { .. } => FailureClass::Permanent,
+        TrinoError::QueryFailed { error_name, .. } if is_retryable_error_name(error_name) => {
+            FailureClass::Transient(TransientKind::ServerBusy)
+        }
+        TrinoError::QueryFailed { .. } => FailureClass::Permanent,
+        TrinoError::Auth(_)
+        | TrinoError::MalformedResponse(_)
+        | TrinoError::UntrustedNextUri { .. }
+        | TrinoError::ArrowEncodingUnavailable
+        | TrinoError::ArrowDecode(_) => FailureClass::Permanent,
+    }
 }
 
 /// Returns `true` when `candidate` is on the same scheme + host + port as
@@ -499,6 +567,106 @@ struct QueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn query_failed(error_name: &str) -> AdapterError {
+        AdapterError::new(TrinoError::QueryFailed {
+            state: "FAILED".into(),
+            error_code: 0,
+            error_name: error_name.into(),
+            message: format!("{error_name} at line 1:1"),
+        })
+    }
+
+    #[test]
+    fn classify_trino_failure_maps_transient_and_permanent() {
+        // Cluster-side blips → Transient (retryable). These re-plan onto
+        // healthy nodes on retry.
+        for name in [
+            "NO_NODES_AVAILABLE",
+            "REMOTE_TASK_ERROR",
+            "REMOTE_TASK_MISMATCH",
+            "REMOTE_HOST_GONE",
+            "PAGE_TRANSPORT_ERROR",
+            "PAGE_TRANSPORT_TIMEOUT",
+            "SERVER_STARTING_UP",
+            "SERVER_SHUTTING_DOWN",
+        ] {
+            let class = classify_trino_failure(&query_failed(name));
+            assert!(
+                class.is_retryable(),
+                "{name} should classify Transient: {class:?}"
+            );
+        }
+
+        // User/SQL errors → Permanent, never retried (the dangerous direction).
+        for name in [
+            "SYNTAX_ERROR",
+            "TABLE_NOT_FOUND",
+            "COLUMN_NOT_FOUND",
+            "TYPE_MISMATCH",
+            "PERMISSION_DENIED",
+            "DIVISION_BY_ZERO",
+        ] {
+            let class = classify_trino_failure(&query_failed(name));
+            assert_eq!(class, FailureClass::Permanent, "{name} should be Permanent");
+            assert!(!class.is_retryable());
+        }
+
+        // HTTP: 429 / 502 / 503 / 504 transient; other statuses permanent.
+        for status in [429u16, 502, 503, 504] {
+            let err = AdapterError::new(TrinoError::HttpStatus {
+                status,
+                message: String::new(),
+            });
+            assert!(
+                classify_trino_failure(&err).is_retryable(),
+                "HTTP {status} should be Transient"
+            );
+        }
+        for status in [400u16, 401, 403, 404] {
+            let err = AdapterError::new(TrinoError::HttpStatus {
+                status,
+                message: String::new(),
+            });
+            assert_eq!(
+                classify_trino_failure(&err),
+                FailureClass::Permanent,
+                "HTTP {status} should be Permanent"
+            );
+        }
+
+        // A query timeout is transient.
+        assert!(
+            classify_trino_failure(&AdapterError::new(TrinoError::Timeout {
+                timeout_secs: 30,
+                last_state: "RUNNING".into(),
+            }))
+            .is_retryable()
+        );
+
+        // Security refusal / capability / decode → Permanent (retry can't fix).
+        for err in [
+            TrinoError::UntrustedNextUri {
+                coordinator: "https://a".into(),
+                next: "https://b".into(),
+            },
+            TrinoError::ArrowEncodingUnavailable,
+            TrinoError::ArrowDecode("bad ipc".into()),
+            TrinoError::MalformedResponse("no id".into()),
+        ] {
+            assert_eq!(
+                classify_trino_failure(&AdapterError::new(err)),
+                FailureClass::Permanent
+            );
+        }
+
+        // A non-TrinoError (e.g. the describe "table not found" guard is a
+        // type-erased `msg`) → Unknown → not retryable, so callers correctly
+        // treat it as absence rather than a transient blip.
+        let msg = AdapterError::msg("table iceberg.raw.orders not found");
+        assert_eq!(classify_trino_failure(&msg), FailureClass::Unknown);
+        assert!(!classify_trino_failure(&msg).is_retryable());
+    }
 
     #[test]
     fn same_origin_accepts_matching_host_and_scheme() {

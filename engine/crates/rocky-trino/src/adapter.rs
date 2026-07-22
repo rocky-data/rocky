@@ -51,6 +51,10 @@ impl WarehouseAdapter for TrinoAdapter {
         &self.dialect
     }
 
+    fn classify_failure(&self, err: &AdapterError) -> rocky_core::failure_class::FailureClass {
+        crate::connector::classify_trino_failure(err)
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.client
             .execute(sql)
