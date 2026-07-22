@@ -2331,11 +2331,23 @@ fn compile_target_to_name(models_dir: &Path) -> BTreeMap<String, String> {
 /// name); `--catalog` records the physical `catalog.schema.table` FQN. This
 /// maps a physical FQN back to its declaring model's name via the project's
 /// model sidecars so a classification/layer-scoped rule still fires on a
-/// catalog-scoped maintenance apply. An identifier that resolves to neither a
-/// known model name nor a known FQN is kept verbatim — the evaluator then sees
-/// default attributes, which is harmless: a selector-free (`any` / bare
-/// `deny agent apply`) rule still fires against default attributes; only
-/// attribute-scoped rules need the resolved name.
+/// catalog-scoped maintenance apply.
+///
+/// LIMITATION (a real parity gap vs the sibling apply arms, which always
+/// operate on resolved models): an identifier that resolves to neither a known
+/// model name nor a known target FQN is kept verbatim, so the evaluator sees
+/// default attributes. Two consequences:
+///
+/// - A selector-free rule (`scope = { any = true }` or a bare
+///   `deny/require_review agent apply`) still fires against default attributes,
+///   so an unresolved target is NEVER silently un-gated by a blanket rule.
+/// - An **attribute-scoped** rule (`layer = "gold"`, `classification = "pii"`,
+///   `tags`, `contracted`, …) can only match when the target resolves to a
+///   known model; against an unresolved target it does not match, and the
+///   target falls to `default_agent_effect` (factory default `require_review`;
+///   only an explicitly permissive `default_agent_effect = "allow"` yields
+///   auto-execution). This is the same physical-name fallback the replication
+///   apply gate already uses for runtime-discovered targets.
 ///
 /// Compact plans always carry a concrete `target_table`; the archive
 /// targetless (`None`, `DELETE FROM *`) case is refused by the caller before

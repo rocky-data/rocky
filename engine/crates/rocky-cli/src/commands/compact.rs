@@ -1856,6 +1856,65 @@ effect = "deny"
             .expect_err("agent apply via the generic route must be denied");
             assert!(err.to_string().contains("policy DENIES"), "got: {err}");
         }
+
+        /// End-to-end: a `require_review` verdict on a compact apply is REFUSED
+        /// without a marker and PROCEEDS once the real `rocky review --approve`
+        /// path (`compute_review`) has written the sign-off — proving the verdict
+        /// is actually clearable. Regression for the review-allowlist omission
+        /// that stranded compact plans in RequireReview forever. Drives the
+        /// actual review-compute function, not a hand-written marker file.
+        #[tokio::test]
+        async fn compact_apply_require_review_cleared_by_real_review_approve() {
+            let dir = tempfile::tempdir().unwrap();
+            // `default_agent_effect = require_review`, no explicit rule → an
+            // agent apply resolves to RequireReview (a human stays Allow).
+            let config = write_config(dir.path(), "");
+            let state = fresh_state(dir.path());
+            let plan_id = write_compact_plan(dir.path(), "orders");
+
+            // Without the marker: refused, nothing executed.
+            let adapter = CountingAdapter::new();
+            let err = run_compact_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                true,
+                &adapter,
+            )
+            .await
+            .expect_err("agent apply must require review without a marker");
+            assert!(
+                err.to_string().contains("requires human review"),
+                "got: {err}"
+            );
+            assert_eq!(adapter.count(), 0);
+
+            // Drive the REAL `rocky review --approve` path (fails on a head that
+            // omits Compact from the reviewable allowlist).
+            crate::commands::review::compute_review(dir.path(), &config, &plan_id, "HEAD", true)
+                .await
+                .expect("`rocky review --approve` must accept a compact plan");
+
+            // With the marker the apply proceeds and executes its statements.
+            let adapter2 = CountingAdapter::new();
+            run_compact_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                true,
+                &adapter2,
+            )
+            .await
+            .expect("agent apply must proceed once the review marker is written");
+            assert!(
+                adapter2.count() > 0,
+                "a reviewed compact apply must execute its statements"
+            );
+        }
     }
 
     #[test]

@@ -127,20 +127,24 @@ pub async fn compute_review(
     // `rocky review` writes the human sign-off marker that satisfies a
     // `require_review` policy effect. It applies to AI-authored plans and to
     // agent-authored `Run` plans (`rocky plan --principal agent`) — both carry
-    // the identical `RunPlan` payload shape. Human-authored plans are never
-    // gated, so reviewing one is a no-op the guard rejects rather than
-    // silently writing a marker that means nothing.
+    // the identical `RunPlan` payload shape — and to the marker-only kinds
+    // (gc, restore, compact, archive), whose apply gates on `require_review`
+    // the same way. Human-authored plans are never gated, so reviewing one is a
+    // no-op the guard rejects rather than silently writing a marker that means
+    // nothing.
     let reviewable = plan.kind == PlanKind::AiAuthored
         || plan.kind == PlanKind::Backfill
         || plan.kind == PlanKind::Gc
         || plan.kind == PlanKind::Restore
+        || plan.kind == PlanKind::Compact
+        || plan.kind == PlanKind::Archive
         || (plan.kind == PlanKind::Run
             && plan.resolved_principal() == rocky_core::config::PolicyPrincipal::Agent);
     if !reviewable {
         bail!(
             "plan '{plan_id}' is a {} plan authored by {}; `rocky review` only applies to \
-             AI-authored plans, agent-authored run plans, backfills, gc plans, and restore \
-             plans.",
+             AI-authored plans, agent-authored run plans, backfills, gc plans, restore plans, \
+             and compact / archive plans.",
             plan.kind,
             serde_json::to_value(plan.resolved_principal())
                 .ok()
@@ -149,12 +153,16 @@ pub async fn compute_review(
         );
     }
 
-    // A gc / restore plan carries its own payload shape (not a `RunPlan`) and
-    // changes no model definitions, so the breaking-change gate does not apply
-    // — reviewing it is purely the human sign-off that unblocks the apply.
-    // Branch here, before the `RunPlan` deserialize the other kinds need.
-    if plan.kind == PlanKind::Gc || plan.kind == PlanKind::Restore {
-        return compute_review_gc_plan(root, plan_id, approve, &plan.kind).await;
+    // The marker-only kinds (gc / restore / compact / archive) carry their own
+    // payload shape (not a `RunPlan`) and change no model definitions, so the
+    // breaking-change gate does not apply — reviewing is purely the human
+    // sign-off that unblocks the apply. Branch here, before the `RunPlan`
+    // deserialize the other kinds need.
+    if matches!(
+        plan.kind,
+        PlanKind::Gc | PlanKind::Restore | PlanKind::Compact | PlanKind::Archive
+    ) {
+        return compute_review_marker_only(root, plan_id, approve, &plan.kind).await;
     }
 
     let run_plan: RunPlan = serde_json::from_value(plan.payload.clone())
@@ -222,15 +230,18 @@ pub async fn compute_review(
 }
 
 /// Review (and optionally approve) a `PlanKind::Gc` reclamation plan or a
-/// `PlanKind::Restore` restoration plan.
+/// `PlanKind::Restore` restoration plan — and, since the compact/archive apply
+/// policy gate landed, `PlanKind::Compact` / `PlanKind::Archive` maintenance
+/// plans.
 ///
-/// Neither changes model definitions, so there is no breaking-change gate to
-/// compute — reviewing is the human sign-off that unblocks the apply.
+/// None of these change model definitions, so there is no breaking-change gate
+/// to compute — reviewing is the human sign-off that unblocks the apply.
 /// `--approve` writes the same marker (`<plan_id>.reviewed.json`) the apply gate
 /// checks; without it, apply stays blocked. The marker is payload-agnostic, so
-/// the existing `ai_plan_is_reviewed` gate in `commands::apply` recognises it.
-/// Both verbs are symmetric-caution gated: even a human goes through review.
-async fn compute_review_gc_plan(
+/// the existing `ai_plan_is_reviewed` gate in `commands::apply` recognises it —
+/// which is exactly what clears a `require_review` verdict on a compact/archive
+/// apply.
+async fn compute_review_marker_only(
     root: &Path,
     plan_id: &str,
     approve: bool,
@@ -258,7 +269,7 @@ async fn compute_review_gc_plan(
             target: "rocky::review",
             plan_id,
             kind = %kind,
-            "gc/restore plan approved — review marker written"
+            "marker-only plan approved — review marker written"
         );
     }
 
@@ -272,6 +283,22 @@ async fn compute_review_gc_plan(
             "reviewed restore plan '{plan_id}' — re-run with `--approve` to unblock \
              `rocky apply {plan_id}`. Restoration is symmetric-caution gated: even a human \
              restore goes through review."
+        ),
+        (PlanKind::Compact, true) => format!(
+            "approved compact plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. \
+             Apply runs the OPTIMIZE / VACUUM maintenance SQL against the target."
+        ),
+        (PlanKind::Compact, false) => format!(
+            "reviewed compact plan '{plan_id}' — re-run with `--approve` to unblock \
+             `rocky apply {plan_id}`."
+        ),
+        (PlanKind::Archive, true) => format!(
+            "approved archive plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. \
+             Apply runs the DELETE + VACUUM SQL against the target (a destructive operation)."
+        ),
+        (PlanKind::Archive, false) => format!(
+            "reviewed archive plan '{plan_id}' — re-run with `--approve` to unblock \
+             `rocky apply {plan_id}`. Archive is destructive (DELETE + VACUUM)."
         ),
         (_, true) => format!(
             "approved gc plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. Apply \

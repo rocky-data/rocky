@@ -999,6 +999,65 @@ effect = "deny"
                 "the un-gated wildcard still regenerates + reaches the adapter"
             );
         }
+
+        /// End-to-end: a `require_review` verdict on a destructive archive apply
+        /// is REFUSED without a marker and PROCEEDS once the real `rocky review
+        /// --approve` path (`compute_review`) has written the sign-off — proving
+        /// the verdict is clearable. Regression for the review-allowlist omission
+        /// that stranded archive plans in RequireReview forever. Drives the
+        /// actual review-compute function, not a hand-written marker file.
+        #[tokio::test]
+        async fn archive_apply_require_review_cleared_by_real_review_approve() {
+            let dir = tempfile::tempdir().unwrap();
+            // `default_agent_effect = require_review`, no explicit rule → an
+            // agent apply resolves to RequireReview (a human stays Allow).
+            let config = write_config(dir.path(), "");
+            let state = fresh_state(dir.path());
+            let plan_id = write_archive_plan(dir.path(), "events");
+
+            // Without the marker: refused, no DELETE/VACUUM executed.
+            let adapter = CountingAdapter::new();
+            let err = run_archive_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                true,
+                &adapter,
+            )
+            .await
+            .expect_err("agent archive apply must require review without a marker");
+            assert!(
+                err.to_string().contains("requires human review"),
+                "got: {err}"
+            );
+            assert_eq!(adapter.count(), 0);
+
+            // Drive the REAL `rocky review --approve` path (fails on a head that
+            // omits Archive from the reviewable allowlist).
+            crate::commands::review::compute_review(dir.path(), &config, &plan_id, "HEAD", true)
+                .await
+                .expect("`rocky review --approve` must accept an archive plan");
+
+            // With the marker the destructive apply proceeds and executes.
+            let adapter2 = CountingAdapter::new();
+            run_archive_apply_in_with(
+                dir.path(),
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Agent,
+                true,
+                &adapter2,
+            )
+            .await
+            .expect("agent archive apply must proceed once the review marker is written");
+            assert!(
+                adapter2.count() > 0,
+                "a reviewed archive apply must execute its statements"
+            );
+        }
     }
 
     #[test]
