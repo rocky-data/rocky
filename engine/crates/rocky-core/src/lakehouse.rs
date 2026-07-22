@@ -49,6 +49,31 @@ pub fn generate_lakehouse_ddl(
     options: &LakehouseOptions,
     dialect: &dyn SqlDialect,
 ) -> Result<Vec<String>, LakehouseError> {
+    generate_lakehouse_ddl_with_mode(format, target, select_sql, options, dialect, true)
+}
+
+/// Generates lakehouse DDL for a target that is expected not to exist.
+///
+/// Bootstrap creation deliberately omits `OR REPLACE` so a stale or failed
+/// metadata probe cannot overwrite an existing table.
+pub(crate) fn generate_lakehouse_initial_ddl(
+    format: &LakehouseFormat,
+    target: &str,
+    select_sql: &str,
+    options: &LakehouseOptions,
+    dialect: &dyn SqlDialect,
+) -> Result<Vec<String>, LakehouseError> {
+    generate_lakehouse_ddl_with_mode(format, target, select_sql, options, dialect, false)
+}
+
+fn generate_lakehouse_ddl_with_mode(
+    format: &LakehouseFormat,
+    target: &str,
+    select_sql: &str,
+    options: &LakehouseOptions,
+    dialect: &dyn SqlDialect,
+    replace: bool,
+) -> Result<Vec<String>, LakehouseError> {
     // Fail fast on dialects that can't render the lakehouse `format = X`
     // DDL. The generator below emits the Spark/Databricks `USING DELTA |
     // ICEBERG … TBLPROPERTIES(…)` grammar, which Snowflake / BigQuery /
@@ -79,16 +104,16 @@ pub fn generate_lakehouse_ddl(
     }
 
     match format {
-        LakehouseFormat::DeltaTable => generate_delta_ddl(target, select_sql, options),
-        LakehouseFormat::IcebergTable => generate_iceberg_ddl(target, select_sql, options),
+        LakehouseFormat::DeltaTable => generate_delta_ddl(target, select_sql, options, replace),
+        LakehouseFormat::IcebergTable => generate_iceberg_ddl(target, select_sql, options, replace),
         LakehouseFormat::MaterializedView => {
-            generate_materialized_view_ddl(target, select_sql, options)
+            generate_materialized_view_ddl(target, select_sql, options, replace)
         }
         LakehouseFormat::StreamingTable => {
-            generate_streaming_table_ddl(target, select_sql, options)
+            generate_streaming_table_ddl(target, select_sql, options, replace)
         }
-        LakehouseFormat::Table => generate_table_ddl(target, select_sql, options),
-        LakehouseFormat::View => generate_view_ddl(target, select_sql, options),
+        LakehouseFormat::Table => generate_table_ddl(target, select_sql, options, replace),
+        LakehouseFormat::View => generate_view_ddl(target, select_sql, options, replace),
     }
 }
 
@@ -178,12 +203,21 @@ fn cluster_clause(options: &LakehouseOptions) -> String {
 // Per-format generators
 // ---------------------------------------------------------------------------
 
+fn create_verb(replace: bool) -> &'static str {
+    if replace {
+        "CREATE OR REPLACE"
+    } else {
+        "CREATE"
+    }
+}
+
 fn generate_delta_ddl(
     target: &str,
     select_sql: &str,
     options: &LakehouseOptions,
+    replace: bool,
 ) -> Result<Vec<String>, LakehouseError> {
-    let mut sql = format!("CREATE OR REPLACE TABLE {target}");
+    let mut sql = format!("{} TABLE {target}", create_verb(replace));
     sql.push_str("\nUSING DELTA");
     sql.push_str(&partition_clause(options));
     sql.push_str(&cluster_clause(options));
@@ -197,8 +231,9 @@ fn generate_iceberg_ddl(
     target: &str,
     select_sql: &str,
     options: &LakehouseOptions,
+    replace: bool,
 ) -> Result<Vec<String>, LakehouseError> {
-    let mut sql = format!("CREATE OR REPLACE TABLE {target}");
+    let mut sql = format!("{} TABLE {target}", create_verb(replace));
     sql.push_str("\nUSING ICEBERG");
     sql.push_str(&partition_clause(options));
     sql.push_str(&cluster_clause(options));
@@ -212,8 +247,9 @@ fn generate_materialized_view_ddl(
     target: &str,
     select_sql: &str,
     options: &LakehouseOptions,
+    replace: bool,
 ) -> Result<Vec<String>, LakehouseError> {
-    let mut sql = format!("CREATE OR REPLACE MATERIALIZED VIEW {target}");
+    let mut sql = format!("{} MATERIALIZED VIEW {target}", create_verb(replace));
     sql.push_str(&comment_clause(options));
     // Materialized views support TBLPROPERTIES on Databricks.
     sql.push_str(&tblproperties_clause(options));
@@ -225,8 +261,9 @@ fn generate_streaming_table_ddl(
     target: &str,
     select_sql: &str,
     options: &LakehouseOptions,
+    replace: bool,
 ) -> Result<Vec<String>, LakehouseError> {
-    let mut sql = format!("CREATE OR REPLACE STREAMING TABLE {target}");
+    let mut sql = format!("{} STREAMING TABLE {target}", create_verb(replace));
     sql.push_str(&partition_clause(options));
     sql.push_str(&cluster_clause(options));
     sql.push_str(&comment_clause(options));
@@ -239,8 +276,9 @@ fn generate_table_ddl(
     target: &str,
     select_sql: &str,
     options: &LakehouseOptions,
+    replace: bool,
 ) -> Result<Vec<String>, LakehouseError> {
-    let mut sql = format!("CREATE OR REPLACE TABLE {target}");
+    let mut sql = format!("{} TABLE {target}", create_verb(replace));
     sql.push_str(&partition_clause(options));
     sql.push_str(&cluster_clause(options));
     sql.push_str(&comment_clause(options));
@@ -253,8 +291,9 @@ fn generate_view_ddl(
     target: &str,
     select_sql: &str,
     options: &LakehouseOptions,
+    replace: bool,
 ) -> Result<Vec<String>, LakehouseError> {
-    let mut sql = format!("CREATE OR REPLACE VIEW {target}");
+    let mut sql = format!("{} VIEW {target}", create_verb(replace));
     sql.push_str(&comment_clause(options));
     // Views support TBLPROPERTIES on Databricks.
     sql.push_str(&tblproperties_clause(options));
