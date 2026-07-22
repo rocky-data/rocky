@@ -8724,11 +8724,26 @@ async fn execute_one_plain_model(
             schema: model_ir.target.schema.clone(),
             table: model_ir.target.table.clone(),
         };
-        if warehouse
-            .describe_table(&target_table_struct)
-            .await
-            .is_err()
-        {
+        // Existence probe. A positively-*transient* probe failure (lock,
+        // timeout, 5xx, warehouse warm-up) leaves existence unknown *and* is
+        // likely to clear — fail closed (propagate) rather than assume absence
+        // and bootstrap over a target that may be live (the conflation behind
+        // #1206). Every other failure, including a genuine "not found", is
+        // treated as absent and bootstraps; #1207's non-replacing CTAS
+        // backstops it if the target was in fact live. A genuine not-found is
+        // never classified transient, so first-run bootstrap stays intact on
+        // every adapter.
+        let target_absent = match warehouse.describe_table(&target_table_struct).await {
+            Ok(_) => false,
+            Err(e) if warehouse.classify_failure(&e).is_retryable() => {
+                return Err(anyhow::Error::from(e).context(format!(
+                    "target existence probe for model '{model_name}' failed with a \
+                     retryable error; refusing to assume '{target_ref}' is absent"
+                )));
+            }
+            Err(_) => true,
+        };
+        if target_absent {
             let initial_ddls =
                 rocky_core::sql_gen::generate_transformation_initial_ddl(&model_ir, dialect)?;
             info!(
@@ -8978,7 +8993,20 @@ async fn execute_time_interval_model(
         schema: model.config.target.schema.clone(),
         table: model.config.target.table.clone(),
     };
-    let target_exists = warehouse.describe_table(&target_ref_struct).await.is_ok();
+    // Existence probe — see `execute_one_plain_model` for the rationale. A
+    // positively-transient probe failure propagates (fail closed); every other
+    // failure (incl. a genuine "not found") is treated as absent and
+    // bootstraps, backstopped by the non-replacing CTAS.
+    let target_exists = match warehouse.describe_table(&target_ref_struct).await {
+        Ok(_) => true,
+        Err(e) if warehouse.classify_failure(&e).is_retryable() => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "target existence probe for model '{model_name}' failed with a \
+                 retryable error; refusing to assume '{target_table}' is absent"
+            )));
+        }
+        Err(_) => false,
+    };
     if !target_exists {
         let bootstrap_ir = model.to_model_ir();
         let bootstrap_sql = sql_gen::generate_time_interval_bootstrap_sql(&bootstrap_ir, dialect)
@@ -9759,7 +9787,25 @@ async fn process_table(
                 warehouse.describe_table(&source_table),
                 warehouse.describe_table(&target_table),
             );
-            (src.unwrap_or_default(), tgt.unwrap_or_default())
+            // Source: a failed probe collapses to empty columns, which drift
+            // detection iterates as "no additive columns" (a no-op) — left as
+            // tolerable degradation rather than a hard failure. Target: a
+            // positively-transient probe failure propagates (fail closed)
+            // rather than collapse to "absent" and full-refresh a target that
+            // may be live; every other failure is treated as absent (the
+            // non-replacing CTAS backstops it — cf. #1206/#1207).
+            let target_cols = match tgt {
+                Ok(cols) => cols,
+                Err(e) if warehouse.classify_failure(&e).is_retryable() => {
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "target existence probe for '{}' failed with a retryable \
+                         error; refusing to assume it is absent",
+                        target_table.full_name()
+                    )));
+                }
+                Err(_) => Vec::new(),
+            };
+            (src.unwrap_or_default(), target_cols)
         };
     let target_exists = !target_cols.is_empty();
 
@@ -10585,16 +10631,23 @@ mod tests {
     static TRIGGER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A fault-injecting `WarehouseAdapter` that wraps a real in-memory DuckDB
-    /// adapter but returns `Err` from `describe_table` for the target schema
-    /// (`"tgt"`), delegating every other call to the inner adapter.
+    /// adapter but returns `Err(inject_msg)` from `describe_table` for the
+    /// target schema (`"tgt"`), delegating every other call — including
+    /// `classify_failure` — to the inner adapter.
     ///
-    /// Shared by the three executor fail-closed regression tests
-    /// (replication / transformation / time_interval): each proves that when a
-    /// target existence probe misfires, the bootstrap path must fail closed and
-    /// leave a live target untouched rather than replacing it.
+    /// Shared by the executor fail-closed regression tests (replication /
+    /// transformation / time_interval). Because `classify_failure` delegates to
+    /// real DuckDB, the injected message selects the scenario:
+    /// - a *non-transient* message (the default `"injected target DESCRIBE
+    ///   failure"`) → the caller treats the target as absent and bootstraps,
+    ///   which the non-replacing CTAS backstops against erasing a live target
+    ///   ("already exists");
+    /// - a *transient* message (e.g. a DuckDB lock-contention error) → the
+    ///   caller fails closed and propagates it, never touching the live target.
     #[cfg(feature = "duckdb")]
     struct FailTargetDescribe<'a> {
         inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+        inject_msg: &'static str,
     }
 
     #[cfg(feature = "duckdb")]
@@ -10622,14 +10675,19 @@ mod tests {
             self.inner.execute_query(sql).await
         }
 
+        fn classify_failure(
+            &self,
+            err: &rocky_core::traits::AdapterError,
+        ) -> rocky_core::failure_class::FailureClass {
+            self.inner.classify_failure(err)
+        }
+
         async fn describe_table(
             &self,
             table: &rocky_ir::TableRef,
         ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
             if table.schema == "tgt" {
-                return Err(rocky_core::traits::AdapterError::msg(
-                    "injected target DESCRIBE failure",
-                ));
+                return Err(rocky_core::traits::AdapterError::msg(self.inject_msg));
             }
             self.inner.describe_table(table).await
         }
@@ -12674,7 +12732,13 @@ timestamp_column = "ts"
             auto_apply_gate: None,
         };
 
-        let failing = FailTargetDescribe { inner: &inner };
+        let failing = FailTargetDescribe {
+            inner: &inner,
+            // Non-transient → the caller treats the target as absent and
+            // bootstraps; the non-replacing CTAS then fails closed on the live
+            // target ("already exists") without erasing it.
+            inject_msg: "injected target DESCRIBE failure",
+        };
         let error = match process_table(&failing, &state, &pipeline, &task, false).await {
             Ok(_) => panic!("a failed target probe must not replace an existing table"),
             Err(error) => error,
@@ -12762,7 +12826,13 @@ table = "fct_events"
             surrogate_keys: &surrogate_keys,
         };
 
-        let failing = FailTargetDescribe { inner: &inner };
+        let failing = FailTargetDescribe {
+            inner: &inner,
+            // Non-transient → the caller treats the target as absent and
+            // bootstraps; the non-replacing CTAS then fails closed on the live
+            // target ("already exists") without erasing it.
+            inject_msg: "injected target DESCRIBE failure",
+        };
         let error = match super::execute_one_plain_model(
             &model,
             &failing as &dyn WarehouseAdapter,
@@ -12874,7 +12944,13 @@ table = "fct_daily"
         };
         let mut output = RunOutput::new(String::new(), 0, 0);
 
-        let failing = FailTargetDescribe { inner: &inner };
+        let failing = FailTargetDescribe {
+            inner: &inner,
+            // Non-transient → the caller treats the target as absent and
+            // bootstraps; the non-replacing CTAS then fails closed on the live
+            // target ("already exists") without erasing it.
+            inject_msg: "injected target DESCRIBE failure",
+        };
         let error = match super::execute_time_interval_model(
             &model,
             &failing as &dyn WarehouseAdapter,
@@ -12902,6 +12978,217 @@ table = "fct_daily"
             .await
             .unwrap();
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    /// Inverse-design property: a *transient* target-probe failure must not be
+    /// mistaken for absence. The caller fails closed and propagates the
+    /// retryable error rather than bootstrapping — so on a live target it never
+    /// even reaches the CTAS backstop, and the target is left completely
+    /// untouched. Mirror of the non-transient survival tests above (which take
+    /// the treat-as-absent → bootstrap → "already exists" backstop path).
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn transient_target_probe_failure_propagates_without_touching_target() {
+        use std::time::Instant;
+
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, region VARCHAR)",
+            "INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            "CREATE TABLE tgt.fct_events (id INTEGER)",
+            "INSERT INTO tgt.fct_events VALUES (99)",
+        ] {
+            inner.execute_statement(ddl).await.unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("fct_events.toml"),
+            r#"
+name = "fct_events"
+
+[strategy]
+type = "incremental"
+timestamp_column = "id"
+
+[target]
+catalog = ""
+schema = "tgt"
+table = "fct_events"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_events.sql"),
+            "SELECT id FROM src.events",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_events.sql"),
+            &dir.path().join("fct_events.toml"),
+            None,
+        )
+        .expect("load incremental model");
+
+        let dialect = DuckDbSqlDialect;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        // A DuckDB lock-contention message → real `classify_failure` →
+        // `Transient` → the caller propagates instead of assuming absence.
+        let failing = FailTargetDescribe {
+            inner: &inner,
+            inject_msg: "IO Error: Could not set lock on file \"poc.duckdb\": Resource temporarily unavailable",
+        };
+        let error = match super::execute_one_plain_model(
+            &model,
+            &failing as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "fct_events",
+            Instant::now(),
+            exec_ctx,
+        )
+        .await
+        {
+            Ok(_) => panic!("a transient probe failure must not be treated as absence"),
+            Err(error) => error,
+        };
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("Could not set lock"),
+            "should propagate the retryable probe error: {rendered}"
+        );
+        assert!(
+            rendered.contains("retryable error"),
+            "should carry the fail-closed context: {rendered}"
+        );
+        assert!(
+            !rendered.contains("already exists"),
+            "must not have attempted a bootstrap over the live target: {rendered}"
+        );
+
+        // The target was never touched — its sentinel row survives.
+        let rows = inner
+            .execute_query("SELECT id FROM tgt.fct_events ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    /// First-run guard for the inverse design: a *non-transient* probe failure
+    /// on a genuinely-*absent* target must still bootstrap, not hard-fail.
+    ///
+    /// This is the exact property a "propagate on anything-but-NotFound"
+    /// contract would have broken for every adapter whose missing-relation
+    /// error is not a distinct `NotFound` signal (e.g. Snowflake's ambiguous
+    /// `002003`): treating that non-transient error as a hard probe failure
+    /// would refuse to create the target on first run. Because only
+    /// *positively-transient* failures propagate, a non-transient probe error
+    /// is treated as absence and the target is created + loaded.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn non_transient_probe_failure_on_absent_target_still_bootstraps() {
+        use std::time::Instant;
+
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, region VARCHAR)",
+            "INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            // NOTE: tgt.fct_events is deliberately NOT created — the target is
+            // genuinely absent, so first-run bootstrap must create it.
+        ] {
+            inner.execute_statement(ddl).await.unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("fct_events.toml"),
+            r#"
+name = "fct_events"
+
+[strategy]
+type = "incremental"
+timestamp_column = "id"
+
+[target]
+catalog = ""
+schema = "tgt"
+table = "fct_events"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_events.sql"),
+            "SELECT id FROM src.events",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_events.sql"),
+            &dir.path().join("fct_events.toml"),
+            None,
+        )
+        .expect("load incremental model");
+
+        let dialect = DuckDbSqlDialect;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        // A non-transient probe failure (not a lock/contention message) →
+        // `classify_failure` → not retryable → treated as absence → bootstrap.
+        let failing = FailTargetDescribe {
+            inner: &inner,
+            inject_msg: "injected non-transient probe failure",
+        };
+        super::execute_one_plain_model(
+            &model,
+            &failing as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "fct_events",
+            Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect("first-run bootstrap must succeed despite a non-transient probe failure");
+
+        // The target was created and loaded from source exactly once.
+        let rows = inner
+            .execute_query("SELECT id FROM tgt.fct_events ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.rows,
+            vec![
+                vec![serde_json::json!("1")],
+                vec![serde_json::json!("2")],
+                vec![serde_json::json!("3")],
+            ]
+        );
     }
 
     /// Regression: losing state while an incremental target still exists must

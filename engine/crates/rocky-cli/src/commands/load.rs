@@ -710,17 +710,27 @@ async fn load_with_contract_gate(
     // Gate open: promote staging into the target, mirroring the loader's
     // create/truncate semantics but sourced from the staging table.
     let select_from_staging = format!("SELECT * FROM {staging_ref}");
-    let target_exists = warehouse
-        .describe_table(&target_ir)
-        .await
-        .map(|cols| !cols.is_empty())
-        .unwrap_or(false);
+    // Existence probe. A positively-transient failure (lock, timeout, 5xx)
+    // propagates (fail closed) rather than assume absence and promote over a
+    // target that may be live (the conflation behind #1206). Every other
+    // failure, including a genuine "not found", is treated as absent so the
+    // load can create the target; a genuine not-found is never classified
+    // transient, so first-run load stays intact.
+    let target_exists = match warehouse.describe_table(&target_ir).await {
+        Ok(cols) => !cols.is_empty(),
+        Err(e) if warehouse.classify_failure(&e).is_retryable() => {
+            return Err(anyhow::Error::from(e).context(format!(
+                "target existence probe for load target '{target_ref}' failed with a \
+                 retryable error; refusing to assume it is absent"
+            )));
+        }
+        Err(_) => false,
+    };
 
-    // Fail-closed promote: a target `DESCRIBE` failure collapses to
-    // `target_exists = false` above, so a *non-replacing* CREATE must be used —
-    // if the probe missed a live target this fails ("already exists") instead
-    // of erasing it with `CREATE OR REPLACE`. Mirrors the bootstrap fix in
-    // `run.rs` / `sql_gen.rs`.
+    // Second line of defense: even if the probe treated a live target as
+    // absent, the create path uses the *non-replacing* `create_table_as_new`,
+    // so promotion fails ("already exists") instead of erasing it with
+    // `CREATE OR REPLACE`. Mirrors the bootstrap fix in `run.rs` / `sql_gen.rs`.
     let promote_stmts: Vec<String> = if !target_exists && options.create_table {
         vec![dialect.create_table_as_new(&target_ref, &select_from_staging)]
     } else {
