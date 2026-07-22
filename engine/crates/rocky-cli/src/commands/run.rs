@@ -10584,6 +10584,57 @@ mod tests {
     // tests below (env is shared across the test binary's threads).
     static TRIGGER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// A fault-injecting `WarehouseAdapter` that wraps a real in-memory DuckDB
+    /// adapter but returns `Err` from `describe_table` for the target schema
+    /// (`"tgt"`), delegating every other call to the inner adapter.
+    ///
+    /// Shared by the three executor fail-closed regression tests
+    /// (replication / transformation / time_interval): each proves that when a
+    /// target existence probe misfires, the bootstrap path must fail closed and
+    /// leave a live target untouched rather than replacing it.
+    #[cfg(feature = "duckdb")]
+    struct FailTargetDescribe<'a> {
+        inner: &'a rocky_duckdb::adapter::DuckDbWarehouseAdapter,
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for FailTargetDescribe<'_> {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            self.inner.dialect()
+        }
+
+        async fn execute_statement(&self, sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            self.inner.execute_statement(sql).await
+        }
+
+        async fn execute_statement_with_stats(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::ExecutionStats> {
+            self.inner.execute_statement_with_stats(sql).await
+        }
+
+        async fn execute_query(
+            &self,
+            sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            self.inner.execute_query(sql).await
+        }
+
+        async fn describe_table(
+            &self,
+            table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            if table.schema == "tgt" {
+                return Err(rocky_core::traits::AdapterError::msg(
+                    "injected target DESCRIBE failure",
+                ));
+            }
+            self.inner.describe_table(table).await
+        }
+    }
+
     #[test]
     fn run_trigger_from_env_maps_known_values() {
         use rocky_core::state::RunTrigger;
@@ -12563,43 +12614,11 @@ merge_keys = ["id"]
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn target_describe_failure_does_not_replace_existing_replication_target() {
-        use async_trait::async_trait;
         use chrono::TimeZone;
         use rocky_core::state::StateStore;
-        use rocky_core::traits::{
-            AdapterError, AdapterResult, QueryResult, SqlDialect, WarehouseAdapter,
-        };
+        use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
         use rocky_ir::{TableRef, WatermarkState};
-
-        struct FailTargetDescribe<'a> {
-            inner: &'a DuckDbWarehouseAdapter,
-        }
-
-        #[async_trait]
-        impl WarehouseAdapter for FailTargetDescribe<'_> {
-            fn dialect(&self) -> &dyn SqlDialect {
-                self.inner.dialect()
-            }
-
-            async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
-                self.inner.execute_statement(sql).await
-            }
-
-            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
-                self.inner.execute_query(sql).await
-            }
-
-            async fn describe_table(
-                &self,
-                table: &TableRef,
-            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
-                if table.schema == "tgt" {
-                    return Err(AdapterError::msg("injected target DESCRIBE failure"));
-                }
-                self.inner.describe_table(table).await
-            }
-        }
 
         let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
         for sql in [
@@ -12667,6 +12686,219 @@ timestamp_column = "ts"
 
         let rows = inner
             .execute_query("SELECT id FROM tgt.events ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    /// Fail-closed bootstrap — transformation path (`execute_one_plain_model`).
+    ///
+    /// Sibling of the replication regression above, for the second of the three
+    /// executor bootstrap paths. A strategy that mutates an existing target
+    /// (here `incremental`) probes the target with `describe_table` and, if it
+    /// reads as absent, bootstraps via the non-replacing
+    /// `generate_transformation_initial_ddl` CTAS. When that probe *misfires*
+    /// against a live target, the bootstrap must fail closed ("already exists")
+    /// and leave the target's rows untouched — never `CREATE OR REPLACE`.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn target_describe_failure_does_not_replace_existing_transformation_target() {
+        use std::time::Instant;
+
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, region VARCHAR)",
+            "INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            // A live incremental target carrying a sentinel row that must survive.
+            "CREATE TABLE tgt.fct_events (id INTEGER)",
+            "INSERT INTO tgt.fct_events VALUES (99)",
+        ] {
+            inner.execute_statement(ddl).await.unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("fct_events.toml"),
+            r#"
+name = "fct_events"
+
+[strategy]
+type = "incremental"
+timestamp_column = "id"
+
+[target]
+catalog = ""
+schema = "tgt"
+table = "fct_events"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_events.sql"),
+            "SELECT id FROM src.events",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_events.sql"),
+            &dir.path().join("fct_events.toml"),
+            None,
+        )
+        .expect("load incremental model");
+
+        let dialect = DuckDbSqlDialect;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        let failing = FailTargetDescribe { inner: &inner };
+        let error = match super::execute_one_plain_model(
+            &model,
+            &failing as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "fct_events",
+            Instant::now(),
+            exec_ctx,
+        )
+        .await
+        {
+            Ok(_) => {
+                panic!("a failed target probe must not replace an existing transformation target")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("already exists"),
+            "bootstrap should fail on the existing target: {error:#}"
+        );
+
+        let rows = inner
+            .execute_query("SELECT id FROM tgt.fct_events ORDER BY id")
+            .await
+            .unwrap();
+        assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    /// Fail-closed bootstrap — time_interval path (`execute_time_interval_model`).
+    ///
+    /// Third of the three executor bootstrap paths. The per-partition
+    /// DELETE+INSERT cycle needs the target to exist, so on first run the
+    /// executor probes with `describe_table` and, if absent, materializes an
+    /// empty target via the non-replacing `generate_time_interval_bootstrap_sql`
+    /// CTAS. A misfired probe against a live target must fail closed and leave
+    /// its rows untouched.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn target_describe_failure_does_not_replace_existing_time_interval_target() {
+        use rocky_core::models::load_model_pair;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, order_date DATE)",
+            "INSERT INTO src.events VALUES (1, DATE '2026-04-07')",
+            // A live time_interval target carrying a sentinel row that must survive.
+            "CREATE TABLE tgt.fct_daily (id INTEGER)",
+            "INSERT INTO tgt.fct_daily VALUES (99)",
+        ] {
+            inner.execute_statement(ddl).await.unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily.toml"),
+            r#"
+name = "fct_daily"
+
+[strategy]
+type = "time_interval"
+time_column = "order_date"
+granularity = "day"
+
+[target]
+catalog = ""
+schema = "tgt"
+table = "fct_daily"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily.sql"),
+            "SELECT id, order_date FROM src.events",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_daily.sql"),
+            &dir.path().join("fct_daily.toml"),
+            None,
+        )
+        .expect("load time_interval model");
+
+        let dialect = DuckDbSqlDialect;
+        let dir_state = tempfile::tempdir().unwrap();
+        let state = StateStore::open(&dir_state.path().join("state.redb")).unwrap();
+        // --latest deterministically plans exactly one partition (the current
+        // period), so planning succeeds and control reaches the bootstrap probe.
+        let opts = PartitionRunOptions {
+            partition: None,
+            from: None,
+            to: None,
+            latest: true,
+            missing: false,
+            lookback: None,
+            parallel: 0,
+        };
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+        let mut output = RunOutput::new(String::new(), 0, 0);
+
+        let failing = FailTargetDescribe { inner: &inner };
+        let error = match super::execute_time_interval_model(
+            &model,
+            &failing as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            Some(&state),
+            &opts,
+            "test-run",
+            &mut output,
+            &exec_ctx,
+        )
+        .await
+        {
+            Ok(()) => {
+                panic!("a failed target probe must not replace an existing time_interval target")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("already exists"),
+            "bootstrap should fail on the existing target: {error:#}"
+        );
+
+        let rows = inner
+            .execute_query("SELECT id FROM tgt.fct_daily ORDER BY id")
             .await
             .unwrap();
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
