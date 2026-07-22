@@ -680,8 +680,15 @@ _GC_APPLY_JSON = json.dumps(
                 "run_id": "run-1",
                 "blake3_hash": "deadbeef",
                 "size_bytes": 2048,
-                "physical_reclaimed": True,
-                "physical_status": "reclaimed",
+                # Eviction is ledger-only: the engine never emits a physical
+                # reclaim, so these mirror real output (always false + the exact
+                # future-work status string).
+                "physical_reclaimed": False,
+                "physical_status": (
+                    "not attempted — physical reclamation is future protocol-aware "
+                    "VACUUM work; the tombstone + retired ledger row is the eviction "
+                    "of record"
+                ),
                 "tombstone_recorded": True,
             }
         ],
@@ -691,7 +698,7 @@ _GC_APPLY_JSON = json.dumps(
         "bytes_refused": 0,
         "evicted_count": 1,
         "refused_count": 0,
-        "notes": ["physical reclamation is object-store-only"],
+        "notes": ["eviction is ledger-only; physical reclamation is future work"],
     }
 )
 
