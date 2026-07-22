@@ -1217,17 +1217,15 @@ mod tests {
         Ok(())
     }
 
-    /// 🔴 B regression: the authoring principal is bound into the plan_id
-    /// integrity digest. Tampering a written agent plan's `principal` down to
-    /// `human` (to drop agent-scoped denies/freezes) — while keeping the
-    /// filename/plan_id — must fail the integrity check on read. Pre-fix the
-    /// digest covered only `{kind, payload}`, so the tamper passed and the plan
-    /// resolved to an ungated `human`.
-    /// The authoring `principal` rides OUTSIDE the `plan_id` digest (it is not
-    /// an authorization boundary): a plan and its principal-stripped copy share
-    /// the same id, so stripping the field does not invalidate the plan. (The
-    /// tamper is neutralised at enforcement time by evaluating the apply-time
-    /// runtime principal, not this field — see the apply-seam tests.)
+    /// The authoring `principal` rides OUTSIDE the `plan_id` digest, by design.
+    /// `compute_plan_id` digests only `{kind, payload}`, so the principal is NOT
+    /// an integrity-protected field: a plan and its principal-stripped (or
+    /// down-stamped) copy share the same id, and stripping/rewriting the field
+    /// does not invalidate the plan. This is intentional — the stamp is not an
+    /// authorization boundary (an unkeyed hash is attacker-recomputable, so a
+    /// digest over it would be forgeable anyway). The tamper is instead
+    /// neutralised at enforcement time by evaluating the apply-time runtime
+    /// principal, never this stored field — see the apply-seam tests.
     #[test]
     fn principal_is_outside_the_plan_id_digest() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
