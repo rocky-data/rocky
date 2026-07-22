@@ -2341,13 +2341,18 @@ fn compile_target_to_name(models_dir: &Path) -> BTreeMap<String, String> {
 /// - A selector-free rule (`scope = { any = true }` or a bare
 ///   `deny/require_review agent apply`) still fires against default attributes,
 ///   so an unresolved target is NEVER silently un-gated by a blanket rule.
-/// - An **attribute-scoped** rule (`layer = "gold"`, `classification = "pii"`,
-///   `tags`, `contracted`, …) can only match when the target resolves to a
-///   known model; against an unresolved target it does not match, and the
-///   target falls to `default_agent_effect` (factory default `require_review`;
-///   only an explicitly permissive `default_agent_effect = "allow"` yields
-///   auto-execution). This is the same physical-name fallback the replication
-///   apply gate already uses for runtime-discovered targets.
+/// - An **attribute-scoped** rule is evaluated against the target's *default*
+///   attributes (`contracted = false`, empty `classifications`/`tags`, no
+///   `layer`). So a rule that requires a positive attribute the target lacks
+///   (`layer = "gold"`, `classifications = ["pii"]`) does not match an
+///   unresolved target — but a rule whose scope IS satisfied by the defaults
+///   (e.g. `contracted = false`, or `exclude_classifications = ["pii"]`) does
+///   match and takes effect, including an `allow`. An unresolved target
+///   therefore falls to `default_agent_effect` (factory default
+///   `require_review`) only when no configured rule's scope is satisfied by the
+///   default attribute set; it is NOT guaranteed to. This is the same
+///   physical-name fallback the replication apply gate already uses for
+///   runtime-discovered targets.
 ///
 /// Compact plans always carry a concrete `target_table`; the archive
 /// targetless (`None`, `DELETE FROM *`) case is refused by the caller before
