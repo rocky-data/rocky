@@ -13079,6 +13079,15 @@ table = "fct_events"
             !rendered.contains("already exists"),
             "must not have attempted a bootstrap over the live target: {rendered}"
         );
+        // The propagated error rides the same run-loop retry path as any other
+        // transient model failure: `classify_anyhow` walks the anyhow chain to
+        // the `AdapterError` and asks the adapter to classify it, so this is
+        // genuinely retried (not merely surfaced).
+        let class = crate::commands::resilience::classify_anyhow(&error, &failing);
+        assert!(
+            class.is_run_retryable(),
+            "a propagated transient probe failure must be run-retryable: {class:?}"
+        );
 
         // The target was never touched — its sentinel row survives.
         let rows = inner
@@ -13188,6 +13197,105 @@ table = "fct_events"
                 vec![serde_json::json!("2")],
                 vec![serde_json::json!("3")],
             ]
+        );
+    }
+
+    /// The fourth 2×2 cell — a *transient* probe failure on a genuinely-*absent*
+    /// target. This is the one case where the inverse design diverges from the
+    /// old collapse-to-absent behavior: rather than bootstrap *through* the blip
+    /// (masking a metadata failure), it fails closed so the run loop retries the
+    /// probe. The target is left uncreated; recovery is a rerun, not a silent
+    /// create on possibly-stale metadata.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn transient_probe_failure_on_absent_target_fails_closed_for_retry() {
+        use std::time::Instant;
+
+        use rocky_core::models::load_model_pair;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let inner = DuckDbWarehouseAdapter::in_memory().unwrap();
+        for ddl in [
+            "CREATE SCHEMA src",
+            "CREATE SCHEMA tgt",
+            "CREATE TABLE src.events (id INTEGER, region VARCHAR)",
+            "INSERT INTO src.events VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            // tgt.fct_events deliberately absent.
+        ] {
+            inner.execute_statement(ddl).await.unwrap();
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("fct_events.toml"),
+            r#"
+name = "fct_events"
+
+[strategy]
+type = "incremental"
+timestamp_column = "id"
+
+[target]
+catalog = ""
+schema = "tgt"
+table = "fct_events"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_events.sql"),
+            "SELECT id FROM src.events",
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_events.sql"),
+            &dir.path().join("fct_events.toml"),
+            None,
+        )
+        .expect("load incremental model");
+
+        let dialect = DuckDbSqlDialect;
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        let failing = FailTargetDescribe {
+            inner: &inner,
+            inject_msg: "IO Error: Could not set lock on file \"poc.duckdb\": Resource temporarily unavailable",
+        };
+        let error = super::execute_one_plain_model(
+            &model,
+            &failing as &dyn WarehouseAdapter,
+            &dialect as &dyn rocky_core::traits::SqlDialect,
+            "fct_events",
+            Instant::now(),
+            exec_ctx,
+        )
+        .await
+        .expect_err("a transient probe failure must fail closed, not bootstrap through the blip");
+        assert!(
+            crate::commands::resilience::classify_anyhow(&error, &failing).is_run_retryable(),
+            "the fail-closed error must be run-retryable so the run loop reruns the probe"
+        );
+
+        // The target was NOT created — recovery is a rerun, not a silent create.
+        let tables = inner
+            .execute_query(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'tgt'",
+            )
+            .await
+            .unwrap();
+        assert!(
+            tables.rows.is_empty(),
+            "the absent target must not have been created on a transient probe failure: {:?}",
+            tables.rows
         );
     }
 
