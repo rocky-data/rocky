@@ -3623,8 +3623,11 @@ async fn run_apply_promote_plan(
         breaking_changes: None,
     });
 
+    // `rocky apply <promote-plan>` has no `--pipeline` selector, so the executor
+    // resolves the default pipeline's adapter (`None`) — a multi-pipeline config
+    // still requires the branch-promote entrypoints to disambiguate.
     let (targets_out, overall_success) =
-        crate::commands::branch::run_promote_apply(&loaded, &promote_plan.targets).await?;
+        crate::commands::branch::run_promote_apply(&loaded, &promote_plan.targets, None).await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -4440,6 +4443,7 @@ effect = "deny"
                     &config,
                     &plan_a,
                     None,
+                    None, // pipeline
                     &state,
                     PolicyPrincipal::Agent,
                     false,
@@ -4476,6 +4480,7 @@ effect = "deny"
                     &config,
                     &plan_b,
                     None,
+                    None, // pipeline
                     &state,
                     PolicyPrincipal::Agent,
                     false,
@@ -4509,6 +4514,7 @@ effect = "deny"
             &config,
             &plan_a,
             None,
+            None, // pipeline
             &state,
             PolicyPrincipal::Human,
             false,

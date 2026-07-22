@@ -779,12 +779,18 @@ pub(crate) async fn run_promote_apply(
     // promote at a warehouse the gate never verified).
     loaded: &rocky_core::config::LoadedConfig,
     targets: &[crate::output::PromoteTargetPlan],
+    // The `--pipeline` selector, threaded so the executor resolves the SAME
+    // pipeline the promote targets were built against — not an arbitrary one.
+    // A multi-pipeline `rocky.toml` requires it (`resolve_pipeline` errors on
+    // `None`); `rocky apply <promote-plan>` has no selector and passes `None`
+    // (unchanged: it still errors on a multi-pipeline config, as before).
+    pipeline_name: Option<&str>,
 ) -> Result<(Vec<crate::output::PromoteTarget>, bool)> {
     use crate::registry::AdapterRegistry;
 
     let rocky_cfg = &loaded.config;
     let registry = AdapterRegistry::from_config(rocky_cfg)?;
-    let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(rocky_cfg, None)?;
+    let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(rocky_cfg, pipeline_name)?;
     let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
 
     let mut targets_out: Vec<crate::output::PromoteTarget> = Vec::new();
@@ -1218,7 +1224,7 @@ pub async fn run_branch_promote(
     // same verdict on the same promote.
 
     // ---- Plan-build: approval + breaking-change gates, then persist. --------
-    let result = crate::commands::plan::build_promote_plan_inner(
+    let result = match crate::commands::plan::build_promote_plan_inner(
         root,
         config_path,
         models_dir,
@@ -1231,7 +1237,31 @@ pub async fn run_branch_promote(
         state_path,
         runtime_principal,
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            // Preserve the bare-verb contract on a breaking-change block: the old
+            // inline path emitted the block JSON to stdout (success=false, empty
+            // targets, the findings + a leading `BreakingChangesBlocked` audit
+            // event) BEFORE bailing with a non-zero exit. `build_promote_plan_inner`
+            // now returns a typed `PromoteBlockedByBreakingChanges` instead of a
+            // flat error; catch it, re-emit that JSON, then propagate the error so
+            // the exit code + stderr message are unchanged. Consumers of the bare
+            // verb (the semantic-breaking-change POC / weekly smoke) parse this
+            // stdout JSON.
+            if let Some(block) =
+                err.downcast_ref::<crate::commands::plan::PromoteBlockedByBreakingChanges>()
+                && json
+            {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&breaking_block_output(branch_name, block))?
+                );
+            }
+            return Err(err);
+        }
+    };
     let promote_plan = result.plan;
     let plan_id = result
         .plan_output
@@ -1243,6 +1273,11 @@ pub async fn run_branch_promote(
     // `run_promote_apply` resolves its adapter from that same instance (#1120).
     let persisted = read_plan(root, &plan_id)
         .with_context(|| format!("failed to read just-built promote plan '{plan_id}'"))?;
+    // Enforce on `enforcement_principal(runtime_principal)`, NOT the stored
+    // stamp — identical to the other two routes. For the bare verb the plan is
+    // stamped with `runtime_principal` in the same call, so this happens to
+    // equal `resolved_principal()`; keep `enforcement_principal` regardless, so
+    // the seam stays correct if the stamp ever decouples from the runtime.
     let loaded = crate::commands::apply::gate_promote_plan(
         root,
         config_path,
@@ -1270,7 +1305,8 @@ pub async fn run_branch_promote(
         breaking_changes: None,
     });
 
-    let (targets_out, overall_success) = run_promote_apply(&loaded, &promote_plan.targets).await?;
+    let (targets_out, overall_success) =
+        run_promote_apply(&loaded, &promote_plan.targets, pipeline_name).await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -1322,6 +1358,31 @@ pub async fn run_branch_promote(
         );
     }
     Ok(())
+}
+
+/// Reconstruct the bare-verb `BranchPromoteOutput` for a breaking-change block
+/// from the typed [`crate::commands::plan::PromoteBlockedByBreakingChanges`]
+/// error, preserving the stdout contract the old inline path emitted:
+/// `success = false`, an empty `targets` array, the classified findings under
+/// `breaking_changes`, and the partial audit (whose last entry is
+/// `BreakingChangesBlocked`). The bare verb prints this to stdout on a block —
+/// the semantic-breaking-change POC and the weekly smoke `json.load` it.
+fn breaking_block_output(
+    branch: &str,
+    block: &crate::commands::plan::PromoteBlockedByBreakingChanges,
+) -> BranchPromoteOutput {
+    BranchPromoteOutput {
+        version: VERSION.to_string(),
+        command: "branch promote".to_string(),
+        branch: branch.to_string(),
+        branch_state_hash: block.branch_state_hash.clone(),
+        approvals_used: block.approvals_used.clone(),
+        approvals_rejected: block.approvals_rejected.clone(),
+        breaking_changes: Some(block.findings.clone()),
+        targets: Vec::new(),
+        audit: block.audit.clone(),
+        success: false,
+    }
 }
 
 /// Compute breaking-change findings between `base_ref` and HEAD for the
@@ -1493,11 +1554,13 @@ pub fn run_branch_show(state_path: &Path, name: &str, json: bool) -> Result<()> 
 /// EXACTLY the enforcement `rocky apply <promote-plan>` performs, so the two
 /// entrypoints reach the identical verdict on the same plan. The plan's stored
 /// `principal` stamp is not consulted (it is not integrity-protected).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_branch_promote_from_plan(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
     name: Option<&str>,
+    pipeline_name: Option<&str>,
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
     json: bool,
@@ -1571,7 +1634,8 @@ pub async fn run_branch_promote_from_plan(
         breaking_changes: None,
     });
 
-    let (targets_out, overall_success) = run_promote_apply(&loaded, &promote_plan.targets).await?;
+    let (targets_out, overall_success) =
+        run_promote_apply(&loaded, &promote_plan.targets, pipeline_name).await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -2863,7 +2927,7 @@ adapter = "default"
         std::fs::write(&config_path, config_for(&b_db)).unwrap();
 
         // EXECUTE from the threaded snapshot.
-        let (targets_out, ok) = run_promote_apply(&loaded, &promote_plan.targets)
+        let (targets_out, ok) = run_promote_apply(&loaded, &promote_plan.targets, None)
             .await
             .expect("promote apply executes");
         assert!(ok, "the promote statement must succeed: {targets_out:?}");
@@ -3294,6 +3358,7 @@ effect = "deny"
             &config_path,
             &plan_id,
             None,
+            None, // pipeline
             &state_path,
             rocky_core::config::PolicyPrincipal::Agent,
             false,
@@ -3460,6 +3525,7 @@ effect = "deny"
             &config_path,
             &shared_plan_id,
             None,
+            None, // pipeline
             &state_path,
             PolicyPrincipal::Agent,
             false,
@@ -3524,6 +3590,7 @@ effect = "deny"
             &config_path,
             &shared_plan_id,
             None,
+            None, // pipeline
             &state_path,
             PolicyPrincipal::Human,
             false,
@@ -3563,6 +3630,332 @@ effect = "deny"
         assert_eq!(
             count, 2,
             "an allowed human promote must copy all 2 branch rows into prod"
+        );
+    }
+
+    /// 🔴 BLOCKER 1 regression: bare `rocky branch promote --pipeline <name>`
+    /// must resolve the SELECTED pipeline's adapter for execution, not a
+    /// hardcoded `None`. On a multi-pipeline config, `--pipeline marts` must
+    /// promote (reach execution and copy rows) while omitting `--pipeline` must
+    /// still fail with "multiple pipelines" — proving the selector, not an
+    /// arbitrary default, drives disambiguation. Pre-fix `run_promote_apply`
+    /// passed `None`, so `--pipeline marts` reached execution and then failed
+    /// with "multiple pipelines defined".
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bare_promote_pipeline_selector_disambiguates_multi_pipeline() {
+        use rocky_core::config::PolicyPrincipal;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(models_dir.join("marts")).unwrap();
+        std::fs::create_dir_all(models_dir.join("staging")).unwrap();
+
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        // Two transformation pipelines (both on the default duckdb adapter) —
+        // enough to make `resolve_pipeline(None)` ambiguous.
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.marts]
+type = "transformation"
+models = "models/marts/**"
+
+[pipeline.marts.target]
+adapter = "default"
+
+[pipeline.marts.target.governance]
+auto_create_schemas = true
+
+[pipeline.staging]
+type = "transformation"
+models = "models/staging/**"
+
+[pipeline.staging.target]
+adapter = "default"
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        run_branch_create(&state_path, "fix", None, false).unwrap();
+
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("open duckdb");
+            for stmt in [
+                "CREATE SCHEMA IF NOT EXISTS warehouse",
+                "CREATE SCHEMA IF NOT EXISTS marts",
+                "CREATE SCHEMA IF NOT EXISTS \"branch__fix\"",
+                "CREATE TABLE \"branch__fix\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+            ] {
+                adapter.execute_statement(stmt).await.expect("seed");
+            }
+        }
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        // `--pipeline marts` disambiguates → the promote reaches execution.
+        let selected = run_branch_promote(
+            dir,
+            &state_path,
+            &config_path,
+            &models_dir,
+            "main",
+            "fix",
+            None,
+            Some("marts"),
+            false,
+            true,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await;
+
+        // Omitting `--pipeline` (None) on a multi-pipeline config must error.
+        let ambiguous = run_branch_promote(
+            dir,
+            &state_path,
+            &config_path,
+            &models_dir,
+            "main",
+            "fix",
+            None,
+            None,
+            false,
+            true,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await;
+
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        selected.expect("`--pipeline marts` must resolve the pipeline and promote");
+        let err = ambiguous.expect_err("omitting --pipeline on a multi-pipeline config must error");
+        assert!(
+            err.to_string().contains("multiple pipelines"),
+            "expected the multi-pipeline disambiguation error, got: {err}"
+        );
+
+        // The selected promote executed against marts' adapter and copied rows.
+        let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+        let rows = adapter
+            .execute_query("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders")
+            .await
+            .expect("prod table must exist after a `--pipeline marts` promote");
+        let v = &rows.rows[0][0];
+        let count = v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            .unwrap_or_else(|| panic!("count value not parseable: {v:?}"));
+        assert_eq!(
+            count, 2,
+            "`--pipeline marts` promote must copy both branch rows"
+        );
+    }
+
+    /// 🔴 BLOCKER 2 (content): the bare verb's breaking-change block must still
+    /// emit the stdout `BranchPromoteOutput` its consumers parse (the semantic-
+    /// breaking-change POC / weekly smoke). `breaking_block_output` reconstructs
+    /// it from the typed error; pin the exact fields the POC's `json.load`
+    /// reads: `success == false`, empty `targets`, findings under
+    /// `breaking_changes`, and a `breaking_changes_blocked` audit entry.
+    #[test]
+    fn breaking_block_output_preserves_stdout_contract() {
+        use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
+
+        let findings = vec![BreakingFinding {
+            change: BreakingChange::ColumnDropped {
+                model: "warehouse.marts.fct_orders".to_string(),
+                column: "amount".to_string(),
+                data_type: "INT".to_string(),
+            },
+            severity: BreakingSeverity::Breaking,
+        }];
+        let block = crate::commands::plan::PromoteBlockedByBreakingChanges {
+            findings: findings.clone(),
+            audit: vec![AuditEvent {
+                kind: AuditEventKind::BreakingChangesBlocked,
+                at: Utc::now(),
+                actor: ApproverIdentity {
+                    email: "x".into(),
+                    name: None,
+                    host: "h".into(),
+                    source: ApproverSource::Local,
+                },
+                branch: "fix".into(),
+                branch_state_hash: "hash".into(),
+                reason: None,
+                breaking_changes: Some(findings.clone()),
+            }],
+            approvals_used: Vec::new(),
+            approvals_rejected: Vec::new(),
+            branch_state_hash: "hash".to_string(),
+        };
+
+        let json = serde_json::to_value(breaking_block_output("fix", &block)).expect("serialize");
+        assert_eq!(json["success"], serde_json::json!(false));
+        assert!(
+            json["targets"].as_array().unwrap().is_empty(),
+            "targets must be empty on a block"
+        );
+        assert!(
+            !json["breaking_changes"].as_array().unwrap().is_empty(),
+            "breaking_changes must carry the findings"
+        );
+        let audit_kinds: Vec<&str> = json["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["kind"].as_str().unwrap())
+            .collect();
+        assert!(
+            audit_kinds.contains(&"breaking_changes_blocked"),
+            "audit must contain breaking_changes_blocked, got {audit_kinds:?}"
+        );
+    }
+
+    /// 🔴 BLOCKER 2 (end-to-end): a real breaking-change block via the bare verb
+    /// returns a non-zero exit (Err) AND routes through the typed
+    /// `PromoteBlockedByBreakingChanges` — the branch that emits the stdout JSON
+    /// (asserted content-wise by `breaking_block_output_preserves_stdout_contract`
+    /// and byte-wise end-to-end by the semantic-breaking-change POC). Pre-fix
+    /// this block `?`-swallowed into a stderr-only error with no stdout JSON.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bare_promote_breaking_block_errors_and_routes_stdout_json() {
+        use rocky_core::config::PolicyPrincipal;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+
+[pipeline.t.target.governance]
+auto_create_schemas = true
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        // Base commit: the model carries columns (id, amount).
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id, 2 AS amount",
+        );
+        for git_args in [
+            ["add", "-A"].as_slice(),
+            ["commit", "-q", "-m", "base"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git commit");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+        // Working tree drops `amount` → a `column_dropped` = Breaking finding.
+        std::fs::write(models_dir.join("fct_orders.sql"), "SELECT 1 AS id").unwrap();
+
+        run_branch_create(&state_path, "fix", None, false).unwrap();
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        // base_ref = HEAD (the committed 2-column model); working tree is 1-column.
+        let result = run_branch_promote(
+            dir,
+            &state_path,
+            &config_path,
+            &models_dir,
+            "HEAD",
+            "fix",
+            None,
+            None,
+            false,
+            false, // allow_breaking — the gate must fire
+            PolicyPrincipal::Human,
+            true, // json — the block JSON is emitted to stdout
+        )
+        .await;
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let err =
+            result.expect_err("a breaking-change block must fail the bare promote (non-zero exit)");
+        assert!(
+            err.downcast_ref::<crate::commands::plan::PromoteBlockedByBreakingChanges>()
+                .is_some(),
+            "the block must route through PromoteBlockedByBreakingChanges (the stdout-JSON branch), \
+             got: {err}"
         );
     }
 

@@ -1952,6 +1952,44 @@ pub(crate) struct PromotePlanResult {
     pub plan_output: PlanOutput,
 }
 
+/// Error returned by [`build_promote_plan_inner`] when the breaking-change gate
+/// fires and `--allow-breaking` was not set (the plan is NOT written).
+///
+/// Carries the classified findings plus the partial audit (whose last entry is
+/// `BreakingChangesBlocked`) so a caller can surface the block however it needs:
+/// bare `rocky branch promote` reconstructs its `BranchPromoteOutput` block JSON
+/// from this to preserve the stdout contract its smoke/POC consumers depend on,
+/// while `rocky plan promote` simply propagates the `Display` message. Its
+/// `Display` is byte-identical to the message the gate used to `bail!` with, so
+/// the non-zero exit + stderr text is unchanged on the `?`-propagating path.
+#[derive(Debug)]
+pub(crate) struct PromoteBlockedByBreakingChanges {
+    pub findings: Vec<rocky_core::breaking_change::BreakingFinding>,
+    pub audit: Vec<AuditEvent>,
+    pub approvals_used: Vec<ApprovalArtifact>,
+    pub approvals_rejected: Vec<RejectedApproval>,
+    pub branch_state_hash: String,
+}
+
+impl std::fmt::Display for PromoteBlockedByBreakingChanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let breaking: Vec<_> = self.findings.iter().filter(|f| f.is_breaking()).collect();
+        let summary = breaking
+            .iter()
+            .map(|finding| format!("{:?}", finding.change))
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            f,
+            "promote plan blocked by {} breaking change(s): {summary}. \
+             Re-run with `--allow-breaking` to override.",
+            breaking.len()
+        )
+    }
+}
+
+impl std::error::Error for PromoteBlockedByBreakingChanges {}
+
 /// Build and persist a `PromotePlan` from the given parameters.
 ///
 /// Extracted as a named function so both `plan_promote` (standalone command)
@@ -2080,16 +2118,18 @@ pub(crate) async fn build_promote_plan_inner(
                     reason: None,
                     breaking_changes: Some(findings.clone()),
                 });
-                let summary = breaking
-                    .iter()
-                    .map(|f| format!("{:?}", f.change))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                anyhow::bail!(
-                    "promote plan blocked by {} breaking change(s): {summary}. \
-                     Re-run with `--allow-breaking` to override.",
-                    breaking.len()
-                );
+                // Return a typed error (not a flat `bail!`) so the bare-verb
+                // caller can catch it and re-emit the block JSON to stdout that
+                // consumers expect, while `plan_promote`'s `?` still propagates
+                // the identical `Display` message + non-zero exit.
+                return Err(PromoteBlockedByBreakingChanges {
+                    findings: findings.clone(),
+                    audit: std::mem::take(&mut audit),
+                    approvals_used,
+                    approvals_rejected,
+                    branch_state_hash: branch_state_hash.clone(),
+                }
+                .into());
             }
         }
     }

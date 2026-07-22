@@ -4042,6 +4042,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         &cli.config,
                         &plan_id,
                         name.as_deref(),
+                        pipeline.as_deref(),
                         &state_path,
                         runtime_principal,
                         json,
