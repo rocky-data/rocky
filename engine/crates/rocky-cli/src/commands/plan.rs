@@ -615,7 +615,18 @@ pub(crate) fn resolve_configured_dialect(
 ) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path)
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
-    let (_name, pipeline) = registry::resolve_pipeline(&rocky_cfg, None)
+    resolve_dialect_from_config(&rocky_cfg)
+}
+
+/// Resolve the configured target adapter's standalone [`SqlDialect`] from an
+/// already-loaded config snapshot — the [`resolve_configured_dialect`] body
+/// without the reload, so a caller that already holds a fingerprinted config
+/// snapshot (e.g. `compact` / `archive` apply, which must gate + regenerate SQL
+/// against ONE snapshot) does not re-read `rocky.toml` a second time.
+pub(crate) fn resolve_dialect_from_config(
+    rocky_cfg: &rocky_core::config::RockyConfig,
+) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
+    let (_name, pipeline) = registry::resolve_pipeline(rocky_cfg, None)
         .context("failed to resolve pipeline to determine the target dialect")?;
     let adapter_name = pipeline.target_adapter();
     let adapter_type = rocky_cfg

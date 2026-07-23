@@ -105,13 +105,32 @@ pub(crate) async fn run_apply_in(
 
     match plan.kind {
         PlanKind::Compact => {
-            // Delegate to the existing compact apply path. It emits its own
-            // output directly; we don't need to re-wrap it for compat.
-            run_compact_apply_in(root, config_path, plan_id, output_json).await
+            // Delegate to the compact apply path. It emits its own output
+            // directly; we don't need to re-wrap it for compat. The apply-time
+            // principal + state path are threaded so the sink gates under
+            // `PolicyCapability::Apply` exactly like the sibling kinds.
+            run_compact_apply_in(
+                root,
+                config_path,
+                plan_id,
+                state_path,
+                runtime_principal,
+                output_json,
+            )
+            .await
         }
         PlanKind::Archive => {
-            // Delegate to the existing archive apply path.
-            run_archive_apply_in(root, config_path, plan_id, output_json).await
+            // Delegate to the archive apply path (destructive: DELETE + VACUUM),
+            // gated at the sink under `PolicyCapability::Apply`.
+            run_archive_apply_in(
+                root,
+                config_path,
+                plan_id,
+                state_path,
+                runtime_principal,
+                output_json,
+            )
+            .await
         }
         PlanKind::Run => {
             run_apply_run_plan(
@@ -2304,7 +2323,123 @@ fn compile_target_to_name(models_dir: &Path) -> BTreeMap<String, String> {
 ///
 /// The `NotConfigured` arm is handled by the caller (it needs the pre-policy-plane
 /// fallback), so this function is only called for a configured plane.
-fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) -> Result<()> {
+/// Resolve a maintenance plan's per-target identifiers to the logical model
+/// names the policy plane keys on, best-effort, and build the touched
+/// `(model, PolicyCapability::Apply)` set.
+///
+/// `rocky compact/archive --model X` records `X` (already the logical model
+/// name); `--catalog` records the physical `catalog.schema.table` FQN. This
+/// maps a physical FQN back to its declaring model's name via the project's
+/// model sidecars so a classification/layer-scoped rule still fires on a
+/// catalog-scoped maintenance apply.
+///
+/// LIMITATION (a real parity gap vs the sibling apply arms, which always
+/// operate on resolved models): an identifier that resolves to neither a known
+/// model name nor a known target FQN is kept verbatim, so the evaluator sees
+/// default attributes. Two consequences:
+///
+/// - A selector-free rule (`scope = { any = true }` or a bare
+///   `deny/require_review agent apply`) still fires against default attributes,
+///   so an unresolved target is NEVER silently un-gated by a blanket rule.
+/// - An **attribute-scoped** rule is evaluated against the target's *default*
+///   attributes (`contracted = false`, empty `classifications`/`tags`, no
+///   `layer`). So a rule that requires a positive attribute the target lacks
+///   (`layer = "gold"`, `classifications = ["pii"]`) does not match an
+///   unresolved target — but a rule whose scope IS satisfied by the defaults
+///   (e.g. `contracted = false`, or `exclude_classifications = ["pii"]`) does
+///   match and takes effect, including an `allow`. An unresolved target
+///   therefore falls to `default_agent_effect` (factory default
+///   `require_review`) only when no configured rule's scope is satisfied by the
+///   default attribute set; it is NOT guaranteed to. This is the same
+///   physical-name fallback the replication apply gate already uses for
+///   runtime-discovered targets.
+///
+/// Compact plans always carry a concrete `target_table`; the archive
+/// targetless (`None`, `DELETE FROM *`) case is refused by the caller before
+/// this is reached, so every identifier here is a concrete string.
+pub(crate) fn resolve_touched_apply_targets(
+    config: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+    targets: impl IntoIterator<Item = String>,
+) -> BTreeMap<String, PolicyCapability> {
+    let models_dir = super::gc::gc_models_dir(Some(config), config_path);
+    // Physical FQN (lowercased) → logical model name, plus the set of known
+    // logical names, from the project's model sidecars. Best-effort: a load
+    // failure just leaves the maps empty and every target falls through as-is.
+    let mut fqn_to_name: BTreeMap<String, String> = BTreeMap::new();
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    if let Ok(models) = crate::models_loader::load_project_models(&models_dir) {
+        for m in &models {
+            names.insert(m.config.name.clone());
+            let fqn = format!(
+                "{}.{}.{}",
+                m.config.target.catalog, m.config.target.schema, m.config.target.table
+            )
+            .to_lowercase();
+            fqn_to_name.insert(fqn, m.config.name.clone());
+        }
+    }
+
+    let mut touched = BTreeMap::new();
+    for target in targets {
+        let name = if names.contains(&target) {
+            target
+        } else if let Some(name) = fqn_to_name.get(&target.to_lowercase()) {
+            name.clone()
+        } else {
+            target
+        };
+        touched.insert(name, PolicyCapability::Apply);
+    }
+    touched
+}
+
+/// Gate a maintenance apply (`compact` / `archive`) under
+/// [`PolicyCapability::Apply`], reusing the exact seam the governed apply
+/// kinds run: resolve the models dir from the SAME config snapshot, pull the
+/// authoritative remote freeze/budget ledger + durable freeze markers before
+/// the gate reads them (a cross-pod freeze must deny — fail-closed on a backend
+/// blip), evaluate against the plan's enforcement principal
+/// (`most_restrictive(runtime, kind_default)`), and translate the verdict with
+/// the shared [`apply_policy_gate`] (Deny → refuse, RequireReview → require the
+/// `rocky review` marker, Allow / NotConfigured → proceed).
+///
+/// Runs BEFORE any warehouse statement executes. There is deliberately no
+/// post-apply upload half: compact/archive mutate no durable ledger state, so
+/// the gate's decision rows are local audit only (the freeze *enforcement* is
+/// the pre-gate download, which this performs).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn gate_maintenance_apply(
+    root: &Path,
+    plan: &PersistedPlan,
+    plan_id: &str,
+    config: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+    state_path: &Path,
+    runtime_principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+) -> Result<()> {
+    let models_dir = super::gc::gc_models_dir(Some(config), config_path);
+    // Pull the authoritative remote freeze/budget ledger before the gate reads
+    // it (fail-closed; a no-op unless a `[policy]` block + non-empty touched set
+    // + a remote backend mean the gate will actually consult the ledger).
+    sync_remote_ledger_before_gate(config, state_path, touched).await?;
+    // The durable freeze-marker LIST, same guard — a marker-only freeze whose
+    // ledger row was erased by a concurrent state upload must still deny.
+    let marker_freezes = marker_freezes_before_gate(config, touched).await?;
+    let gate = evaluate_apply_policy_with_policy(
+        config.policy.as_ref(),
+        plan_id,
+        plan.enforcement_principal(runtime_principal),
+        touched,
+        &models_dir,
+        state_path,
+        &marker_freezes,
+    );
+    apply_policy_gate(root, plan_id, gate)
+}
+
+pub(crate) fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) -> Result<()> {
     match gate {
         PolicyGate::NotConfigured | PolicyGate::Allow => Ok(()),
         PolicyGate::RequireReview {
