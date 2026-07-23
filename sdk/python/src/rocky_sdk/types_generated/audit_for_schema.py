@@ -126,7 +126,7 @@ class PolicyCapability18(StrEnum):
 
 class PolicyCapability19(StrEnum):
     """
-    Restore a gc-evicted artifact from its tombstone (rebuild + verify).
+    Restore a gc-evicted artifact from its tombstone (*attempts* a rebuild, then verifies hash-exact — supported only for a recipe that reads no recorded upstreams; a multi-input recipe is refused).
     """
 
     restore = "restore"

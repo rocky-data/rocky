@@ -2,14 +2,14 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
     "GcCandidateOutput": {
-      "description": "One reclamation candidate inside a [`GcReportOutput`] — a single content-addressed artifact (identified by its content hash) with its five printed eligibility checks.",
+      "description": "One reclamation candidate inside a [`GcReportOutput`] — a single content-addressed artifact (identified by its content hash) with its six printed eligibility checks.",
       "properties": {
         "blake3_hash": {
           "description": "Content hash (hex) of the artifact bytes — the reclamation unit.",
           "type": "string"
         },
         "checks": {
-          "description": "The five eligibility checks, each with its pass/fail and a human-readable justification. Order is stable: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, `age_threshold`.",
+          "description": "The six eligibility checks, each with its pass/fail and a human-readable justification. Order is stable: `recipe_recorded`, `recipe_produces_output`, `replayable`, `unreferenced`, `policy_allows`, `age_threshold`.",
           "items": {
             "$ref": "#/definitions/GcCheckOutput"
           },
@@ -83,7 +83,7 @@
       "description": "One printed eligibility check inside a [`GcCandidateOutput`].",
       "properties": {
         "check": {
-          "description": "Stable check id: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.",
+          "description": "Stable check id: `recipe_recorded`, `recipe_produces_output`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.",
           "type": "string"
         },
         "detail": {
@@ -91,7 +91,7 @@
           "type": "string"
         },
         "passed": {
-          "description": "Whether the check passed. A candidate is derivable only when all five are `true`.",
+          "description": "Whether the check passed. A candidate is derivable only when all six are `true`.",
           "type": "boolean"
         }
       },
@@ -140,7 +140,7 @@
       "type": "object"
     }
   },
-  "description": "JSON output for `rocky gc --derivable --dry-run`.\n\nA read-only inventory of Rocky-managed content-addressed artifacts that are provably rebuildable — *derivable* — and therefore reclamation candidates. Nothing is deleted or planned for deletion: this surface is inventory-only, so the whole product is the report.\n\nThe candidate universe is the content-addressed artifact ledger, grouped by content hash (each distinct hash is one physical artifact; managed bytes count each hash once). An artifact is `derivable` only when **all five** eligibility checks hold — recipe recorded, replayable, unreferenced, policy allows, past the age threshold. Every check fails closed (any doubt keeps the artifact non-derivable) and is reported per candidate, so each verdict is auditable rather than asserted.\n\nScope caveat surfaced in [`Self::notes`]: refcounts see *Rocky's* pointers only. A warehouse-side reference Rocky never recorded (a BI extract, a notebook `SELECT INTO`) is invisible here; the age threshold is the mitigation, and this release measures written-age, not read-recency.",
+  "description": "JSON output for `rocky gc --derivable --dry-run`.\n\nA read-only inventory of Rocky-managed content-addressed artifacts whose recorded recipe makes them reclamation candidates — *derivable*. Nothing is deleted or planned for deletion: this surface is inventory-only, so the whole product is the report.\n\n`derivable` is an eligibility verdict, not a rebuild guarantee. It states that a recipe was recorded and bound to this artifact's bytes — not that `rocky restore` can rebuild them. Restore covers a narrower set (recipes that read no recorded upstreams; see [`Self::notes`]), so an artifact can be `derivable` here and still have no working recovery route today.\n\nThe candidate universe is the content-addressed artifact ledger, grouped by content hash (each distinct hash is one physical artifact; managed bytes count each hash once). An artifact is `derivable` only when **all six** eligibility checks hold — recipe recorded, recipe bound to this artifact's output hash, replayable, unreferenced, policy allows, past the age threshold. Every check fails closed (any doubt keeps the artifact non-derivable) and is reported per candidate, so each verdict is auditable rather than asserted.\n\nScope caveat surfaced in [`Self::notes`]: refcounts see *Rocky's* pointers only. A warehouse-side reference Rocky never recorded (a BI extract, a notebook `SELECT INTO`) is invisible here; the age threshold is the mitigation, and this release measures written-age, not read-recency.",
   "properties": {
     "artifact_count": {
       "description": "Number of distinct content hashes considered.",
@@ -159,7 +159,7 @@
       "type": "string"
     },
     "derivable_bytes": {
-      "description": "Physical bytes of the derivable subset (distinct content hashes whose five checks all pass).",
+      "description": "Physical bytes of the derivable subset (distinct content hashes whose six checks all pass).",
       "format": "uint64",
       "minimum": 0.0,
       "type": "integer"

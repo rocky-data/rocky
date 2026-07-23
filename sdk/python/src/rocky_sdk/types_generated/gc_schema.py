@@ -13,7 +13,7 @@ class GcCheckOutput(BaseModel):
 
     check: str
     """
-    Stable check id: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.
+    Stable check id: `recipe_recorded`, `recipe_produces_output`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.
     """
     detail: str
     """
@@ -21,7 +21,7 @@ class GcCheckOutput(BaseModel):
     """
     passed: bool
     """
-    Whether the check passed. A candidate is derivable only when all five are `true`.
+    Whether the check passed. A candidate is derivable only when all six are `true`.
     """
 
 
@@ -52,7 +52,7 @@ class GcRebuildCostOutput(BaseModel):
 
 class GcCandidateOutput(BaseModel):
     """
-    One reclamation candidate inside a [`GcReportOutput`] — a single content-addressed artifact (identified by its content hash) with its five printed eligibility checks.
+    One reclamation candidate inside a [`GcReportOutput`] — a single content-addressed artifact (identified by its content hash) with its six printed eligibility checks.
     """
 
     blake3_hash: str
@@ -61,7 +61,7 @@ class GcCandidateOutput(BaseModel):
     """
     checks: list[GcCheckOutput]
     """
-    The five eligibility checks, each with its pass/fail and a human-readable justification. Order is stable: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, `age_threshold`.
+    The six eligibility checks, each with its pass/fail and a human-readable justification. Order is stable: `recipe_recorded`, `recipe_produces_output`, `replayable`, `unreferenced`, `policy_allows`, `age_threshold`.
     """
     derivable: bool
     """
@@ -105,9 +105,11 @@ class GcReportOutput(BaseModel):
     """
     JSON output for `rocky gc --derivable --dry-run`.
 
-    A read-only inventory of Rocky-managed content-addressed artifacts that are provably rebuildable — *derivable* — and therefore reclamation candidates. Nothing is deleted or planned for deletion: this surface is inventory-only, so the whole product is the report.
+    A read-only inventory of Rocky-managed content-addressed artifacts whose recorded recipe makes them reclamation candidates — *derivable*. Nothing is deleted or planned for deletion: this surface is inventory-only, so the whole product is the report.
 
-    The candidate universe is the content-addressed artifact ledger, grouped by content hash (each distinct hash is one physical artifact; managed bytes count each hash once). An artifact is `derivable` only when **all five** eligibility checks hold — recipe recorded, replayable, unreferenced, policy allows, past the age threshold. Every check fails closed (any doubt keeps the artifact non-derivable) and is reported per candidate, so each verdict is auditable rather than asserted.
+    `derivable` is an eligibility verdict, not a rebuild guarantee. It states that a recipe was recorded and bound to this artifact's bytes — not that `rocky restore` can rebuild them. Restore covers a narrower set (recipes that read no recorded upstreams; see [`Self::notes`]), so an artifact can be `derivable` here and still have no working recovery route today.
+
+    The candidate universe is the content-addressed artifact ledger, grouped by content hash (each distinct hash is one physical artifact; managed bytes count each hash once). An artifact is `derivable` only when **all six** eligibility checks hold — recipe recorded, recipe bound to this artifact's output hash, replayable, unreferenced, policy allows, past the age threshold. Every check fails closed (any doubt keeps the artifact non-derivable) and is reported per candidate, so each verdict is auditable rather than asserted.
 
     Scope caveat surfaced in [`Self::notes`]: refcounts see *Rocky's* pointers only. A warehouse-side reference Rocky never recorded (a BI extract, a notebook `SELECT INTO`) is invisible here; the age threshold is the mitigation, and this release measures written-age, not read-recency.
     """
@@ -123,7 +125,7 @@ class GcReportOutput(BaseModel):
     command: str
     derivable_bytes: conint(ge=0)
     """
-    Physical bytes of the derivable subset (distinct content hashes whose five checks all pass).
+    Physical bytes of the derivable subset (distinct content hashes whose six checks all pass).
     """
     derivable_count: conint(ge=0)
     """

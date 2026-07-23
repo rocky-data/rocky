@@ -302,8 +302,9 @@ async fn compute_review_marker_only(
         ),
         (_, true) => format!(
             "approved gc plan '{plan_id}' — `rocky apply {plan_id}` is now unblocked. Apply \
-             re-verifies each artifact against the live ledger before deleting, and every \
-             eviction is tombstoned for restore."
+             re-verifies each artifact against the live ledger before evicting (a tombstone + \
+             retired ledger row; no physical byte deletion), and every eviction is tombstoned \
+             for restore."
         ),
         (_, false) => format!(
             "reviewed gc plan '{plan_id}' — re-run with `--approve` to unblock \

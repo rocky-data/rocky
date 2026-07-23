@@ -33,7 +33,7 @@ export interface GcApplyOutput {
    */
   evicted_count: number;
   /**
-   * Operator caveats (e.g. physical-reclamation reachability). Each eviction's tombstone records everything `rocky restore <target>` needs to rebuild the artifact and verify it hash-exact.
+   * Operator caveats (e.g. eviction is ledger-only, restore's narrower coverage). Each eviction's tombstone records a durable pointer to the recipe's provenance — the path `rocky restore <target>` *attempts* a hash-exact rebuild from, which succeeds only for a recipe that reads no recorded upstreams (a multi-input recipe is refused).
    */
   notes: string[];
   plan_id: string;
@@ -55,11 +55,11 @@ export interface GcEvictedOutput {
   blake3_hash: string;
   model_name: string;
   /**
-   * `true` when the bytes were physically deleted through the object-store adapter; `false` when the physical delete was deferred or failed (a safe leaked orphan — the tombstone still records everything `rocky restore <target>` needs to rebuild and verify the artifact).
+   * Whether the bytes were physically deleted through the object-store adapter. **Currently always `false`:** physical reclamation is not implemented (it needs a protocol-aware VACUUM), so eviction is ledger-only and `[gc] physical_delete = true` is a hard error. The bytes stay in place; the durable tombstone records the recipe pointer a later `rocky restore` uses to *attempt* a rebuild (see `physical_status`).
    */
   physical_reclaimed: boolean;
   /**
-   * Human-readable physical-reclamation outcome (`deleted`, `deferred: …`, or `failed: …`).
+   * Human-readable physical-reclamation outcome. Since eviction is ledger-only, this is always `not attempted — physical reclamation is future protocol-aware VACUUM work; the tombstone + retired ledger row is the eviction of record`.
    */
   physical_status: string;
   run_id: string;
@@ -93,7 +93,7 @@ export interface GcRefusedOutput {
  */
 export interface GcCheckOutput {
   /**
-   * Stable check id: `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.
+   * Stable check id: `recipe_recorded`, `recipe_produces_output`, `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.
    */
   check: string;
   /**
@@ -101,7 +101,7 @@ export interface GcCheckOutput {
    */
   detail: string;
   /**
-   * Whether the check passed. A candidate is derivable only when all five are `true`.
+   * Whether the check passed. A candidate is derivable only when all six are `true`.
    */
   passed: boolean;
   [k: string]: unknown;

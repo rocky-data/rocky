@@ -7951,18 +7951,25 @@ pub struct ReplayExecuteModelOutput {
 
 /// JSON output for `rocky gc --derivable --dry-run`.
 ///
-/// A read-only inventory of Rocky-managed content-addressed artifacts that
-/// are provably rebuildable — *derivable* — and therefore reclamation
-/// candidates. Nothing is deleted or planned for deletion: this surface is
-/// inventory-only, so the whole product is the report.
+/// A read-only inventory of Rocky-managed content-addressed artifacts whose
+/// recorded recipe makes them reclamation candidates — *derivable*. Nothing
+/// is deleted or planned for deletion: this surface is inventory-only, so the
+/// whole product is the report.
+///
+/// `derivable` is an eligibility verdict, not a rebuild guarantee. It states
+/// that a recipe was recorded and bound to this artifact's bytes — not that
+/// `rocky restore` can rebuild them. Restore covers a narrower set (recipes
+/// that read no recorded upstreams; see [`Self::notes`]), so an artifact can
+/// be `derivable` here and still have no working recovery route today.
 ///
 /// The candidate universe is the content-addressed artifact ledger, grouped
 /// by content hash (each distinct hash is one physical artifact; managed
 /// bytes count each hash once). An artifact is `derivable` only when **all
-/// five** eligibility checks hold — recipe recorded, replayable,
-/// unreferenced, policy allows, past the age threshold. Every check fails
-/// closed (any doubt keeps the artifact non-derivable) and is reported per
-/// candidate, so each verdict is auditable rather than asserted.
+/// six** eligibility checks hold — recipe recorded, recipe bound to this
+/// artifact's output hash, replayable, unreferenced, policy allows, past the
+/// age threshold. Every check fails closed (any doubt keeps the artifact
+/// non-derivable) and is reported per candidate, so each verdict is auditable
+/// rather than asserted.
 ///
 /// Scope caveat surfaced in [`Self::notes`]: refcounts see *Rocky's* pointers
 /// only. A warehouse-side reference Rocky never recorded (a BI extract, a
@@ -7976,7 +7983,7 @@ pub struct GcReportOutput {
     /// distinct content hash once.
     pub managed_bytes: u64,
     /// Physical bytes of the derivable subset (distinct content hashes whose
-    /// five checks all pass).
+    /// six checks all pass).
     pub derivable_bytes: u64,
     /// [`Self::derivable_bytes`] as a percentage of [`Self::managed_bytes`];
     /// `null` when there are no managed bytes (nothing to divide by).
@@ -8001,7 +8008,7 @@ pub struct GcReportOutput {
 }
 
 /// One reclamation candidate inside a [`GcReportOutput`] — a single
-/// content-addressed artifact (identified by its content hash) with its five
+/// content-addressed artifact (identified by its content hash) with its six
 /// printed eligibility checks.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct GcCandidateOutput {
@@ -8035,20 +8042,20 @@ pub struct GcCandidateOutput {
     pub rebuild_cost: GcRebuildCostOutput,
     /// `true` iff every one of [`Self::checks`] passed.
     pub derivable: bool,
-    /// The five eligibility checks, each with its pass/fail and a
+    /// The six eligibility checks, each with its pass/fail and a
     /// human-readable justification. Order is stable:
-    /// `recipe_recorded`, `replayable`, `unreferenced`, `policy_allows`,
-    /// `age_threshold`.
+    /// `recipe_recorded`, `recipe_produces_output`, `replayable`,
+    /// `unreferenced`, `policy_allows`, `age_threshold`.
     pub checks: Vec<GcCheckOutput>,
 }
 
 /// One printed eligibility check inside a [`GcCandidateOutput`].
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct GcCheckOutput {
-    /// Stable check id: `recipe_recorded`, `replayable`, `unreferenced`,
-    /// `policy_allows`, or `age_threshold`.
+    /// Stable check id: `recipe_recorded`, `recipe_produces_output`,
+    /// `replayable`, `unreferenced`, `policy_allows`, or `age_threshold`.
     pub check: String,
-    /// Whether the check passed. A candidate is derivable only when all five
+    /// Whether the check passed. A candidate is derivable only when all six
     /// are `true`.
     pub passed: bool,
     /// Why the check reached that verdict — the auditable justification.
@@ -8130,7 +8137,7 @@ pub struct GcPlanEviction {
 /// ([`crate::plan_store::PlanKind::Gc`]).
 ///
 /// Lists only the artifacts the derivability inventory proved are **derivable**
-/// — every one passed all five fail-closed checks at plan time. Apply
+/// — every one passed all six fail-closed checks at plan time. Apply
 /// re-verifies each against the live ledger before evicting, so this list is a
 /// scoped proposal, never a blind delete order.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -8163,9 +8170,11 @@ pub struct GcPlanOutput {
     pub total_bytes: u64,
     /// Always `true`: a `gc` plan is unconditionally review-gated before apply.
     pub review_required: bool,
-    /// Operator caveats (e.g. re-verification at apply, scope). Each eviction
-    /// records everything `rocky restore <target>` needs to rebuild it
-    /// hash-exact.
+    /// Operator caveats (e.g. re-verification at apply, restore's narrower
+    /// coverage, scope). Each eviction records a durable tombstone pointing at
+    /// the recipe's provenance — the path `rocky restore <target>` *attempts* a
+    /// hash-exact rebuild from, which succeeds only for a recipe that reads no
+    /// recorded upstreams (a multi-input recipe is refused).
     pub notes: Vec<String>,
     /// The proposed evictions.
     pub evictions: Vec<GcPlanEviction>,
@@ -8182,13 +8191,17 @@ pub struct GcEvictedOutput {
     /// Always `true` on this list — the durable restore tombstone was written
     /// atomically with the ledger-row retirement before anything else happened.
     pub tombstone_recorded: bool,
-    /// `true` when the bytes were physically deleted through the object-store
-    /// adapter; `false` when the physical delete was deferred or failed (a safe
-    /// leaked orphan — the tombstone still records everything
-    /// `rocky restore <target>` needs to rebuild and verify the artifact).
+    /// Whether the bytes were physically deleted through the object-store
+    /// adapter. **Currently always `false`:** physical reclamation is not
+    /// implemented (it needs a protocol-aware VACUUM), so eviction is
+    /// ledger-only and `[gc] physical_delete = true` is a hard error. The bytes
+    /// stay in place; the durable tombstone records the recipe pointer a later
+    /// `rocky restore` uses to *attempt* a rebuild (see `physical_status`).
     pub physical_reclaimed: bool,
-    /// Human-readable physical-reclamation outcome (`deleted`, `deferred: …`,
-    /// or `failed: …`).
+    /// Human-readable physical-reclamation outcome. Since eviction is
+    /// ledger-only, this is always `not attempted — physical reclamation is
+    /// future protocol-aware VACUUM work; the tombstone + retired ledger row is
+    /// the eviction of record`.
     pub physical_status: String,
 }
 
@@ -8234,9 +8247,11 @@ pub struct GcApplyOutput {
     pub evicted_count: usize,
     /// Count of refused artifacts.
     pub refused_count: usize,
-    /// Operator caveats (e.g. physical-reclamation reachability). Each
-    /// eviction's tombstone records everything `rocky restore <target>` needs
-    /// to rebuild the artifact and verify it hash-exact.
+    /// Operator caveats (e.g. eviction is ledger-only, restore's narrower
+    /// coverage). Each eviction's tombstone records a durable pointer to the
+    /// recipe's provenance — the path `rocky restore <target>` *attempts* a
+    /// hash-exact rebuild from, which succeeds only for a recipe that reads no
+    /// recorded upstreams (a multi-input recipe is refused).
     pub notes: Vec<String>,
 }
 
@@ -8346,8 +8361,15 @@ pub struct RestoredOutput {
     pub status: String,
 }
 
-/// One artifact `rocky apply <restore-plan>` **refused** to restore — the
-/// fail-closed verification caught a mismatch, so nothing was written for it.
+/// One artifact `rocky apply <restore-plan>` **refused** to restore: the
+/// ledger row was NOT reinstated (no restore of record). Most refusals are
+/// pre-write — a fail-closed verification caught a mismatch before anything was
+/// written — but a refusal can also follow a successful, hash-verified
+/// content-addressed write whose atomic ledger reinstatement then lost a race.
+/// In that case the verified bytes are already at the tombstoned path and are
+/// safe to reuse on a re-run (the re-apply verifies and completes idempotently).
+/// A refusal therefore guarantees only that the ledger was not changed, not
+/// that nothing was written.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct RestoreRefusedOutput {
     pub model_name: String,
@@ -8374,7 +8396,11 @@ pub struct RestoreApplyOutput {
     /// Artifacts restored — hash-verified bytes at the tombstoned path and a
     /// reinstated ledger row.
     pub restored: Vec<RestoredOutput>,
-    /// Artifacts refused by a fail-closed guard; nothing was written for them.
+    /// Artifacts refused by a fail-closed guard; the ledger was not reinstated
+    /// for them. Usually pre-write, but verified content-addressed bytes may
+    /// already be on disk (a lost ledger-reinstatement race) and are safe to
+    /// reuse on re-apply — a refusal means the ledger was not changed, not that
+    /// nothing was written.
     pub refused: Vec<RestoreRefusedOutput>,
     /// Content hashes of plan entries whose tombstone was already consumed by
     /// a prior restore and whose live bytes re-verified — idempotent no-ops.

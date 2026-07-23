@@ -94,7 +94,7 @@ rocky policy test    # Run pinned policy scenarios through the real evaluator (C
 rocky review         # Approve plans; --queue ranks pending escalations
 rocky audit          # Query the decision ledger; --for walks a custody chain
 rocky brief          # Estate digest with every line cited to the ledger
-rocky gc             # Inventory provably-rebuildable artifacts; eviction behind review
+rocky gc             # Inventory derivable (recipe-bound) artifacts; eviction behind review
 rocky restore        # Rebuild an evicted artifact, hash-verified, or refuse
 rocky mcp            # Model Context Protocol server for AI agents (28 tools)
 rocky doctor         # Aggregate health checks

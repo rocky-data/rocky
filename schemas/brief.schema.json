@@ -756,7 +756,7 @@
           "type": "string"
         },
         {
-          "description": "Restore a gc-evicted artifact from its tombstone (rebuild + verify).",
+          "description": "Restore a gc-evicted artifact from its tombstone (*attempts* a rebuild, then verifies hash-exact — supported only for a recipe that reads no recorded upstreams; a multi-input recipe is refused).",
           "enum": [
             "restore"
           ],
