@@ -129,10 +129,14 @@ struct Cli {
 
     /// Authoring principal for the agent-policy plane (`human` | `agent`).
     ///
-    /// Stamped onto plans created by `rocky plan` so a later `rocky apply`
-    /// evaluates them against the identity that authored them. The CLI surface
-    /// default is `human`; a harness driving `rocky` announces itself with
-    /// `--principal agent` (or `ROCKY_PRINCIPAL=agent`). An explicit
+    /// Stamped onto plans created by `rocky plan` as an advisory/display
+    /// record. Enforcement (`rocky apply`, and every `rocky branch promote`
+    /// entrypoint) does NOT key off that stored stamp: the gate evaluates the
+    /// most-restrictive of the *runtime* principal (this flag) and the plan's
+    /// kind default, so an agent runner is always gated as agent — and all
+    /// three promote entrypoints resolve and enforce this identity identically.
+    /// The CLI surface default is `human`; a harness driving `rocky` announces
+    /// itself with `--principal agent` (or `ROCKY_PRINCIPAL=agent`). An explicit
     /// `--principal` always wins and is the only way to lower an env-raised
     /// floor (a downgrade warns). Absent `[policy]`, this flag has no effect.
     #[arg(long, global = true, value_enum)]
@@ -4024,7 +4028,13 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 models,
             } => {
                 if let Some(plan_id) = plan {
-                    // --plan flag: apply a pre-built promote plan, skipping gates.
+                    // --plan flag: apply a pre-built promote plan. The approval
+                    // and breaking-change gates already ran when the plan was
+                    // built, so they are not re-run here — but the agent-policy
+                    // gate IS enforced (same as `rocky apply <promote-plan>`),
+                    // keyed on the promote-time runtime principal, NOT the
+                    // plan's stored stamp.
+                    let runtime_principal = resolve_cli_principal(cli.principal)?;
                     let cwd = std::env::current_dir()
                         .context("failed to get current working directory")?;
                     rocky_cli::commands::run_branch_promote_from_plan(
@@ -4032,14 +4042,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         &cli.config,
                         &plan_id,
                         name.as_deref(),
+                        pipeline.as_deref(),
                         &state_path,
+                        runtime_principal,
                         json,
                     )
                     .await
                 } else {
-                    // Bare-verb: plan + apply inline (backward-compatible).
-                    // Phase 4 emits a deprecation notice; canonical flow is
-                    // `rocky plan promote <name>` + `rocky apply <plan-id>`.
+                    // Bare-verb: internally chains plan + apply (the flow its
+                    // deprecation notice documents). The approval + breaking
+                    // gates run at plan-build; the agent-policy gate runs at
+                    // apply, keyed on the runtime principal — so bare promote
+                    // gates identically to `rocky apply <promote-plan>` and
+                    // `rocky branch promote --plan`.
                     rocky_cli::deprecation::warn(
                         rocky_cli::deprecation::BRANCH_PROMOTE_DEPRECATION,
                     );
@@ -4050,7 +4065,11 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                              `rocky branch promote --plan <plan-id>`"
                         )
                     })?;
+                    let runtime_principal = resolve_cli_principal(cli.principal)?;
+                    let cwd = std::env::current_dir()
+                        .context("failed to get current working directory")?;
                     rocky_cli::commands::run_branch_promote(
+                        &cwd,
                         &state_path,
                         &cli.config,
                         &models,
@@ -4060,6 +4079,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                         pipeline.as_deref(),
                         skip_approval,
                         allow_breaking,
+                        runtime_principal,
                         json,
                     )
                     .await

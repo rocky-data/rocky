@@ -2212,13 +2212,20 @@ impl GovernedRunContext<'_> {
 /// Evaluate the agent-policy plane over a `Promote` plan and enforce the
 /// resulting gate, before any promote SQL executes.
 ///
-/// Shared by BOTH promote apply entry points — `rocky apply <promote-plan>`
-/// and `rocky branch promote --plan <id>` — so neither can execute a denied
-/// agent promote. Absent `[policy]` this is a no-op (`NotConfigured` → the
-/// pre-policy-plane behaviour). A human-authored promote resolves to `allow`;
-/// an agent-authored one is gated per target under the `promote` verb. The
-/// models dir is resolved from config so a name-scoped rule matches the
-/// target's logical name.
+/// Shared by ALL THREE promote entrypoints — `rocky apply <promote-plan>`
+/// (`run_apply_promote_plan`), `rocky branch promote --plan <id>`
+/// (`run_branch_promote_from_plan`), and bare `rocky branch promote <name>`
+/// (`run_branch_promote`, which builds+persists a plan then routes here) — so
+/// none can execute a denied agent promote. All three pass the SAME
+/// `principal`: `enforcement_principal(runtime)`, the most-restrictive of the
+/// promote-time runtime identity and the `Promote` kind default. The plan's
+/// stored stamp is NOT consulted, so every entrypoint reaches the identical
+/// verdict on the same plan — an agent runner is gated as agent regardless of
+/// the file, and a human runner vouches (gated per target under the `promote`
+/// verb only when the runtime is agent). Absent `[policy]` this is a no-op
+/// (`NotConfigured` → the pre-policy-plane behaviour). The models dir is
+/// resolved from config so a name-scoped rule matches the target's logical
+/// name.
 pub(crate) fn gate_promote_plan(
     root: &Path,
     config_path: &Path,
@@ -3616,8 +3623,11 @@ async fn run_apply_promote_plan(
         breaking_changes: None,
     });
 
+    // `rocky apply <promote-plan>` has no `--pipeline` selector, so the executor
+    // resolves the default pipeline's adapter (`None`) — a multi-pipeline config
+    // still requires the branch-promote entrypoints to disambiguate.
     let (targets_out, overall_success) =
-        crate::commands::branch::run_promote_apply(&loaded, &promote_plan.targets).await?;
+        crate::commands::branch::run_promote_apply(&loaded, &promote_plan.targets, None).await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -4310,6 +4320,208 @@ effect = "deny"
             &[],
         );
         assert_eq!(gate, PolicyGate::Allow);
+        Ok(())
+    }
+
+    /// The apply-side promote entrypoints — `rocky apply <promote-plan>`
+    /// (`run_apply_promote_plan`) and `rocky branch promote --plan`
+    /// (`run_branch_promote_from_plan`) — enforce on the RUNTIME principal
+    /// combined with the plan kind, NEVER the plan's stored `principal` stamp
+    /// (which is not integrity-protected). This test pins both directions of
+    /// "the stamp decides nothing," driving the REAL gate (`gate_promote_plan`
+    /// → `evaluate_apply_policy_with_policy`) via both entrypoints:
+    ///
+    /// - Plan A is stamped `agent`, yet a HUMAN runtime is ALLOWED on both
+    ///   routes (the stamp does not force a deny).
+    /// - Plan B is stamped `human` — a DOWNGRADED stamp — yet an AGENT runtime
+    ///   is still DENIED on both routes (the stamp does not buy an escape).
+    ///
+    /// The agent runtime is also denied on Plan A; the assertions are
+    /// non-vacuous because each plan's `resolved_principal()` is checked first.
+    #[tokio::test]
+    async fn promote_gate_enforces_runtime_principal_not_stored_stamp() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let warehouse = root.join("warehouse.duckdb");
+        let config = root.join("rocky.toml");
+        let state = root.join("state.redb");
+
+        std::fs::write(
+            &config,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target]
+adapter = "default"
+
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "promote"
+scope = {{ any = true }}
+effect = "deny"
+"#,
+                warehouse.display()
+            ),
+        )?;
+
+        // A self-contained, idempotent target so the human-runtime ALLOW path
+        // executes cleanly (no branch source table needed) and re-running it
+        // once per entrypoint is a no-op.
+        let make_plan = |table: &str| crate::output::PromotePlan {
+            branch_name: "fix".to_string(),
+            base_ref: "main".to_string(),
+            head_ref: "deadbeef".to_string(),
+            branch_state_hash: "hash".to_string(),
+            approvals_used: Vec::new(),
+            approvals_rejected: Vec::new(),
+            breaking_changes: None,
+            allow_breaking: false,
+            targets: vec![crate::output::PromoteTargetPlan {
+                target: "main.promoted".to_string(),
+                source: "main.branch_src".to_string(),
+                statement: format!("CREATE OR REPLACE TABLE {table} AS SELECT 42 AS answer"),
+            }],
+            plan_audit: Vec::new(),
+            created_at: chrono::Utc::now(),
+        };
+
+        // Plan A: stamped `agent`.
+        let plan_a = crate::plan_store::write_plan_with_principal(
+            root,
+            PlanKind::Promote,
+            &make_plan("promoted_a"),
+            PolicyPrincipal::Agent,
+        )?;
+        assert_eq!(
+            read_plan(root, &plan_a)?.resolved_principal(),
+            PolicyPrincipal::Agent,
+            "plan A's stored stamp must be agent for the human-ALLOW to be meaningful"
+        );
+
+        // Plan B: stamped `human` — a DOWNGRADED stamp.
+        let promote_b = make_plan("promoted_b");
+        let plan_b = crate::plan_store::write_plan_with_principal(
+            root,
+            PlanKind::Promote,
+            &promote_b,
+            PolicyPrincipal::Human,
+        )?;
+        assert_eq!(
+            read_plan(root, &plan_b)?.resolved_principal(),
+            PolicyPrincipal::Human,
+            "plan B's stored stamp must be human (downgraded) for the agent-DENY to be meaningful"
+        );
+
+        // AGENT runtime on the agent-stamped plan A: both routes deny.
+        for (route, res) in [
+            (
+                "apply",
+                run_apply_promote_plan(
+                    root,
+                    &config,
+                    &plan_a,
+                    &state,
+                    PolicyPrincipal::Agent,
+                    false,
+                )
+                .await,
+            ),
+            (
+                "from_plan",
+                crate::commands::branch::run_branch_promote_from_plan(
+                    root,
+                    &config,
+                    &plan_a,
+                    None,
+                    None, // pipeline
+                    &state,
+                    PolicyPrincipal::Agent,
+                    false,
+                )
+                .await,
+            ),
+        ] {
+            let err = res.expect_err(&format!("{route}: agent runtime must be denied"));
+            assert!(
+                err.to_string().contains("DENIES"),
+                "{route}: agent runtime deny expected, got: {err}"
+            );
+        }
+
+        // DOWNGRADED stamp (human) under an AGENT runtime on plan B: still denied
+        // on both routes — enforcement uses runtime + kind, not the stamp.
+        for (route, res) in [
+            (
+                "apply",
+                run_apply_promote_plan(
+                    root,
+                    &config,
+                    &plan_b,
+                    &state,
+                    PolicyPrincipal::Agent,
+                    false,
+                )
+                .await,
+            ),
+            (
+                "from_plan",
+                crate::commands::branch::run_branch_promote_from_plan(
+                    root,
+                    &config,
+                    &plan_b,
+                    None,
+                    None, // pipeline
+                    &state,
+                    PolicyPrincipal::Agent,
+                    false,
+                )
+                .await,
+            ),
+        ] {
+            let err = res.expect_err(&format!(
+                "{route}: a human-stamped plan under an agent runtime must STILL be denied"
+            ));
+            assert!(
+                err.to_string().contains("DENIES"),
+                "{route}: the downgraded stamp must not buy an escape, got: {err}"
+            );
+        }
+
+        // HUMAN runtime on the agent-stamped plan A: both routes pass the gate
+        // (the stamp does not force a deny) and execute to success.
+        run_apply_promote_plan(
+            root,
+            &config,
+            &plan_a,
+            &state,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("apply: human runtime passes the gate despite the agent stamp");
+        crate::commands::branch::run_branch_promote_from_plan(
+            root,
+            &config,
+            &plan_a,
+            None,
+            None, // pipeline
+            &state,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("from_plan: human runtime passes the IDENTICAL gate despite the agent stamp");
+
         Ok(())
     }
 

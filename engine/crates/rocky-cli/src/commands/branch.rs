@@ -37,7 +37,7 @@ use rocky_ir::{ModelIr, ProjectIr, TargetRef};
 use crate::output::{
     ApprovalArtifact, ApprovalSignature, ApproveOutput, ApproverIdentity, ApproverSource,
     AuditEvent, AuditEventKind, BranchDeleteOutput, BranchEntry, BranchListOutput, BranchOutput,
-    BranchPromoteOutput, PromoteTarget, RejectedApproval, SignatureAlgorithm, config_fingerprint,
+    BranchPromoteOutput, RejectedApproval, SignatureAlgorithm, config_fingerprint,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -779,12 +779,18 @@ pub(crate) async fn run_promote_apply(
     // promote at a warehouse the gate never verified).
     loaded: &rocky_core::config::LoadedConfig,
     targets: &[crate::output::PromoteTargetPlan],
+    // The `--pipeline` selector, threaded so the executor resolves the SAME
+    // pipeline the promote targets were built against — not an arbitrary one.
+    // A multi-pipeline `rocky.toml` requires it (`resolve_pipeline` errors on
+    // `None`); `rocky apply <promote-plan>` has no selector and passes `None`
+    // (unchanged: it still errors on a multi-pipeline config, as before).
+    pipeline_name: Option<&str>,
 ) -> Result<(Vec<crate::output::PromoteTarget>, bool)> {
     use crate::registry::AdapterRegistry;
 
     let rocky_cfg = &loaded.config;
     let registry = AdapterRegistry::from_config(rocky_cfg)?;
-    let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(rocky_cfg, None)?;
+    let (_pipeline_name, pipeline) = crate::registry::resolve_pipeline(rocky_cfg, pipeline_name)?;
     let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
 
     let mut targets_out: Vec<crate::output::PromoteTarget> = Vec::new();
@@ -1186,6 +1192,7 @@ fn discover_transformation_branch_targets(
 /// as a `BreakingChangesAllowed` audit event.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_branch_promote(
+    root: &Path,
     state_path: &Path,
     config_path: &Path,
     models_dir: &Path,
@@ -1195,216 +1202,111 @@ pub async fn run_branch_promote(
     pipeline_name: Option<&str>,
     skip_approval_flag: bool,
     allow_breaking: bool,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
     json: bool,
 ) -> Result<()> {
-    use crate::registry::AdapterRegistry;
+    use crate::plan_store::read_plan;
 
-    validate_branch_name(branch_name)?;
-
-    let store = StateStore::open_read_only(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let record = store
-        .get_branch(branch_name)?
-        .with_context(|| format!("branch '{branch_name}' not found — see 'rocky branch list'"))?;
-
-    let branch_state_hash = compute_branch_state_hash(&record, config_path)?;
-    let actor = approver_identity()?;
-
-    let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
-        "failed to load config from {}",
-        config_path.display()
-    ))?;
-    let approval_cfg = &rocky_cfg.branch.approval;
-
-    // Resolve skip origin: explicit flag wins over env var so an operator
-    // who passes `--skip-approval` always sees the flag-origin reason in
-    // the audit log even if the env var was also set.
-    let env_skip_value = std::env::var(APPROVAL_SKIP_ENV)
-        .ok()
-        .filter(|v| !v.is_empty());
-    let skip_reason: Option<String> = if skip_approval_flag {
-        Some("--skip-approval CLI flag".to_string())
-    } else {
-        env_skip_value
-            .as_ref()
-            .map(|v| format!("{APPROVAL_SKIP_ENV}={v}"))
-    };
-
-    let mut audit: Vec<AuditEvent> = Vec::new();
-    let mut approvals_used: Vec<ApprovalArtifact> = Vec::new();
-    let mut approvals_rejected: Vec<RejectedApproval> = Vec::new();
-
-    let now = Utc::now();
-    if let Some(reason) = &skip_reason {
-        audit.push(AuditEvent {
-            kind: AuditEventKind::ApprovalSkipped,
-            at: now,
-            actor: actor.clone(),
-            branch: record.name.clone(),
-            branch_state_hash: branch_state_hash.clone(),
-            reason: Some(reason.clone()),
-            breaking_changes: None,
-        });
-    } else if approval_cfg.required {
-        let (loaded, parse_rejected) = load_approvals_for_branch(&record.name)?;
-        approvals_rejected.extend(parse_rejected);
-        for (_path, artifact) in loaded {
-            match evaluate_artifact(&artifact, &branch_state_hash, approval_cfg, now) {
-                Ok(()) => approvals_used.push(artifact),
-                Err(rejected) => approvals_rejected.push(rejected),
-            }
-        }
-
-        if (approvals_used.len() as u32) < approval_cfg.min_approvers {
-            let valid = approvals_used.len();
-            let invalid_summary = if approvals_rejected.is_empty() {
-                "no rejected artifacts".to_string()
-            } else {
-                approvals_rejected
-                    .iter()
-                    .map(|r| format!("{}={}", r.approval_id, r.reason))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            anyhow::bail!(
-                "branch promote requires {} approval(s); found {} valid, {} invalid ({}). \
-                 Run `rocky branch approve {}`.",
-                approval_cfg.min_approvers,
-                valid,
-                approvals_rejected.len(),
-                invalid_summary,
-                record.name
-            );
-        }
-    }
-    // (When required = false and no skip, the gate is a no-op — proceed
-    // straight to PromoteStarted with no audit entry beyond the routine ones.)
-
-    // ---- Semantic breaking-change gate ------------------------------------
+    // Bare `rocky branch promote <name>` (no `--plan`) honors the contract its
+    // deprecation notice documents: it internally chains `plan + apply`.
     //
-    // Compile the project at the branch's base ref and at HEAD, classify the
-    // structural delta via `rocky_core::breaking_change::diff_project_ir`,
-    // and fail fast on any `Breaking`-severity finding unless the operator
-    // passed `--allow-breaking`.
+    // - Plan-build runs the SAME approval + breaking-change gates as before,
+    //   now via the shared `build_promote_plan_inner` (the extraction point
+    //   `rocky plan promote` already reuses), and persists a Promote plan.
+    // - Apply then runs the agent-policy gate that the old direct-execute path
+    //   NEVER hit — closing the promote bypass. An agent promote a
+    //   `deny agent promote` rule (or a freeze) would refuse can no longer
+    //   reach `execute_statement`.
     //
-    // Fail-open on compile failure: if either side does not compile under
-    // the current Rocky version (a stale base ref written before a parser
-    // change, a partial models tree, missing `models/` directory) the gate
-    // is *skipped*, the reason is recorded in a `BreakingChangesGateSkipped`
-    // audit event, and the promote proceeds. Failing the promote on a
-    // *compile* error in the gate would surprise users whose past commits
-    // don't compile under today's Rocky — the approval gate already guards
-    // the trust boundary.
-    let breaking_findings: Option<Vec<BreakingFinding>> = evaluate_breaking_change_gate(
+    // The gate enforces on `enforcement_principal(runtime_principal)`, NOT the
+    // plan's stored stamp — identical to `rocky apply <promote-plan>` and
+    // `rocky branch promote --plan`, so all three promote entrypoints reach the
+    // same verdict on the same promote.
+
+    // ---- Plan-build: approval + breaking-change gates, then persist. --------
+    let result = match crate::commands::plan::build_promote_plan_inner(
+        root,
         config_path,
         models_dir,
         base_ref,
-        &mut audit,
-        &actor,
-        &record,
-        &branch_state_hash,
-    );
-
-    if let Some(findings) = &breaking_findings {
-        let breaking: Vec<&BreakingFinding> = findings.iter().filter(|f| f.is_breaking()).collect();
-        if !breaking.is_empty() {
-            if allow_breaking {
-                audit.push(AuditEvent {
-                    kind: AuditEventKind::BreakingChangesAllowed,
-                    at: Utc::now(),
-                    actor: actor.clone(),
-                    branch: record.name.clone(),
-                    branch_state_hash: branch_state_hash.clone(),
-                    reason: Some("--allow-breaking CLI flag".to_string()),
-                    breaking_changes: Some(findings.clone()),
-                });
-            } else {
-                audit.push(AuditEvent {
-                    kind: AuditEventKind::BreakingChangesBlocked,
-                    at: Utc::now(),
-                    actor: actor.clone(),
-                    branch: record.name.clone(),
-                    branch_state_hash: branch_state_hash.clone(),
-                    reason: None,
-                    breaking_changes: Some(findings.clone()),
-                });
-
-                let summary = breaking
-                    .iter()
-                    .map(|f| format!("{:?}", f.change))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-
-                // Emit the JSON payload before bailing so operators with
-                // `--output json` still see the findings on a blocked promote.
-                let output = BranchPromoteOutput {
-                    version: VERSION.to_string(),
-                    command: "branch promote".to_string(),
-                    branch: record.name.clone(),
-                    branch_state_hash: branch_state_hash.clone(),
-                    approvals_used,
-                    approvals_rejected,
-                    breaking_changes: Some(findings.clone()),
-                    targets: Vec::new(),
-                    audit,
-                    success: false,
-                };
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&output)?);
-                }
-
-                anyhow::bail!(
-                    "branch promote blocked by {} breaking change(s): {summary}. \
-                     Review the findings and re-run with `--allow-breaking` to override.",
-                    breaking.len()
+        branch_name,
+        filter,
+        pipeline_name,
+        skip_approval_flag,
+        allow_breaking,
+        state_path,
+        runtime_principal,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            // Preserve the bare-verb contract on a breaking-change block: the old
+            // inline path emitted the block JSON to stdout (success=false, empty
+            // targets, the findings + a leading `BreakingChangesBlocked` audit
+            // event) BEFORE bailing with a non-zero exit. `build_promote_plan_inner`
+            // now returns a typed `PromoteBlockedByBreakingChanges` instead of a
+            // flat error; catch it, re-emit that JSON, then propagate the error so
+            // the exit code + stderr message are unchanged. Consumers of the bare
+            // verb (the semantic-breaking-change POC / weekly smoke) parse this
+            // stdout JSON.
+            if let Some(block) =
+                err.downcast_ref::<crate::commands::plan::PromoteBlockedByBreakingChanges>()
+                && json
+            {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&breaking_block_output(branch_name, block))?
                 );
             }
+            return Err(err);
         }
-    }
+    };
+    let promote_plan = result.plan;
+    let plan_id = result
+        .plan_output
+        .plan_id
+        .expect("build_promote_plan_inner persists a plan and sets plan_id");
 
+    // ---- Apply: agent-policy gate (shared seam) BEFORE any execute_statement.
+    // The gate returns the ONE fingerprinted config snapshot it verified;
+    // `run_promote_apply` resolves its adapter from that same instance (#1120).
+    let persisted = read_plan(root, &plan_id)
+        .with_context(|| format!("failed to read just-built promote plan '{plan_id}'"))?;
+    // Enforce on `enforcement_principal(runtime_principal)`, NOT the stored
+    // stamp — identical to the other two routes. For the bare verb the plan is
+    // stamped with `runtime_principal` in the same call, so this happens to
+    // equal `resolved_principal()`; keep `enforcement_principal` regardless, so
+    // the seam stays correct if the stamp ever decouples from the runtime.
+    let loaded = crate::commands::apply::gate_promote_plan(
+        root,
+        config_path,
+        &plan_id,
+        persisted.enforcement_principal(runtime_principal),
+        &promote_plan,
+        state_path,
+    )?;
+
+    let actor = approver_identity().unwrap_or_else(|_| ApproverIdentity {
+        email: "unknown".to_string(),
+        name: None,
+        host: "unknown".to_string(),
+        source: ApproverSource::Local,
+    });
+
+    let mut audit = promote_plan.plan_audit.clone();
     audit.push(AuditEvent {
         kind: AuditEventKind::PromoteStarted,
         at: Utc::now(),
         actor: actor.clone(),
-        branch: record.name.clone(),
-        branch_state_hash: branch_state_hash.clone(),
+        branch: promote_plan.branch_name.clone(),
+        branch_state_hash: promote_plan.branch_state_hash.clone(),
         reason: None,
         breaking_changes: None,
     });
 
-    let planned = discover_branch_targets(config_path, &record, filter, pipeline_name).await?;
-
-    let registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    let (_resolved_pipeline_name, pipeline) =
-        crate::registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
-    let adapter = registry.warehouse_adapter(pipeline.target_adapter())?;
-
-    let dialect = adapter.dialect();
-    let mut targets_out: Vec<PromoteTarget> = Vec::new();
-    let mut overall_success = true;
-    for step in &planned {
-        let statement = build_promote_sql(dialect, &step.prod, &step.branch_source);
-        match adapter.execute_statement(&statement).await {
-            Ok(()) => targets_out.push(PromoteTarget {
-                target: step.prod.full_name(),
-                source: step.branch_source.full_name(),
-                statement,
-                succeeded: true,
-                error: None,
-            }),
-            Err(e) => {
-                targets_out.push(PromoteTarget {
-                    target: step.prod.full_name(),
-                    source: step.branch_source.full_name(),
-                    statement,
-                    succeeded: false,
-                    error: Some(format!("{e}")),
-                });
-                overall_success = false;
-                break;
-            }
-        }
-    }
+    let (targets_out, overall_success) =
+        run_promote_apply(&loaded, &promote_plan.targets, pipeline_name).await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -1414,8 +1316,8 @@ pub async fn run_branch_promote(
         },
         at: Utc::now(),
         actor,
-        branch: record.name.clone(),
-        branch_state_hash: branch_state_hash.clone(),
+        branch: promote_plan.branch_name.clone(),
+        branch_state_hash: promote_plan.branch_state_hash.clone(),
         reason: None,
         breaking_changes: None,
     });
@@ -1423,11 +1325,11 @@ pub async fn run_branch_promote(
     let output = BranchPromoteOutput {
         version: VERSION.to_string(),
         command: "branch promote".to_string(),
-        branch: record.name.clone(),
-        branch_state_hash,
-        approvals_used,
-        approvals_rejected,
-        breaking_changes: breaking_findings,
+        branch: promote_plan.branch_name.clone(),
+        branch_state_hash: promote_plan.branch_state_hash.clone(),
+        approvals_used: promote_plan.approvals_used.clone(),
+        approvals_rejected: promote_plan.approvals_rejected.clone(),
+        breaking_changes: promote_plan.breaking_changes.clone(),
         targets: targets_out,
         audit,
         success: overall_success,
@@ -1452,10 +1354,35 @@ pub async fn run_branch_promote(
     if !overall_success {
         anyhow::bail!(
             "`rocky branch promote {}` did not complete successfully",
-            record.name
+            promote_plan.branch_name
         );
     }
     Ok(())
+}
+
+/// Reconstruct the bare-verb `BranchPromoteOutput` for a breaking-change block
+/// from the typed [`crate::commands::plan::PromoteBlockedByBreakingChanges`]
+/// error, preserving the stdout contract the old inline path emitted:
+/// `success = false`, an empty `targets` array, the classified findings under
+/// `breaking_changes`, and the partial audit (whose last entry is
+/// `BreakingChangesBlocked`). The bare verb prints this to stdout on a block —
+/// the semantic-breaking-change POC and the weekly smoke `json.load` it.
+fn breaking_block_output(
+    branch: &str,
+    block: &crate::commands::plan::PromoteBlockedByBreakingChanges,
+) -> BranchPromoteOutput {
+    BranchPromoteOutput {
+        version: VERSION.to_string(),
+        command: "branch promote".to_string(),
+        branch: branch.to_string(),
+        branch_state_hash: block.branch_state_hash.clone(),
+        approvals_used: block.approvals_used.clone(),
+        approvals_rejected: block.approvals_rejected.clone(),
+        breaking_changes: Some(block.findings.clone()),
+        targets: Vec::new(),
+        audit: block.audit.clone(),
+        success: false,
+    }
 }
 
 /// Compute breaking-change findings between `base_ref` and HEAD for the
@@ -1617,12 +1544,25 @@ pub fn run_branch_show(state_path: &Path, name: &str, json: bool) -> Result<()> 
 /// validated against `promote_plan.branch_name`. A mismatch is an error —
 /// the user likely intended a different plan. Passing `None` (no positional)
 /// is accepted when `--plan` is the entry point.
+///
+/// ## Policy enforcement
+///
+/// `runtime_principal` is the promote-time identity (`--principal` /
+/// `ROCKY_PRINCIPAL`, resolved by the CLI). It is combined with the plan's
+/// kind-forced principal via
+/// [`crate::plan_store::PersistedPlan::enforcement_principal`] and gated —
+/// EXACTLY the enforcement `rocky apply <promote-plan>` performs, so the two
+/// entrypoints reach the identical verdict on the same plan. The plan's stored
+/// `principal` stamp is not consulted (it is not integrity-protected).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_branch_promote_from_plan(
     root: &Path,
     config_path: &Path,
     plan_id: &str,
     name: Option<&str>,
+    pipeline_name: Option<&str>,
     state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
     json: bool,
 ) -> Result<()> {
     use crate::output::{AuditEvent, AuditEventKind, PromotePlan, print_json};
@@ -1655,15 +1595,22 @@ pub async fn run_branch_promote_from_plan(
     // Route the `--plan` path through the canonical agent-policy gate BEFORE
     // any target SQL executes — the same gate `rocky apply <promote-plan>`
     // runs. Without this, an agent-authored Promote plan a `deny agent promote`
-    // rule (or freeze) would refuse could still execute here directly. The
-    // plan's stamped principal binds (an agent plan evaluates as agent). The
-    // gate returns the ONE config snapshot it verified; `run_promote_apply`
-    // below resolves its adapter from that same instance (#1120).
+    // rule (or freeze) would refuse could still execute here directly.
+    //
+    // Enforce on `enforcement_principal(runtime_principal)`, NOT the plan's
+    // stored stamp: the stamp is advisory and not integrity-protected
+    // (`compute_plan_id` digests only `{kind, payload}`), so trusting it would
+    // let a rehash-and-rename downgrade the identity. This is the SAME
+    // expression `rocky apply <promote-plan>` evaluates, so the two entrypoints
+    // gate identically — runtime + kind decide (an agent runner is gated as
+    // agent regardless of the file; a human runner vouches). The gate returns
+    // the ONE config snapshot it verified; `run_promote_apply` below resolves
+    // its adapter from that same instance (#1120).
     let loaded = crate::commands::apply::gate_promote_plan(
         root,
         config_path,
         plan_id,
-        plan.resolved_principal(),
+        plan.enforcement_principal(runtime_principal),
         &promote_plan,
         state_path,
     )?;
@@ -1687,7 +1634,8 @@ pub async fn run_branch_promote_from_plan(
         breaking_changes: None,
     });
 
-    let (targets_out, overall_success) = run_promote_apply(&loaded, &promote_plan.targets).await?;
+    let (targets_out, overall_success) =
+        run_promote_apply(&loaded, &promote_plan.targets, pipeline_name).await?;
 
     audit.push(AuditEvent {
         kind: if overall_success {
@@ -2721,7 +2669,7 @@ mod tests {
             approvals_used: vec![],
             approvals_rejected: vec![],
             breaking_changes: None,
-            targets: vec![PromoteTarget {
+            targets: vec![crate::output::PromoteTarget {
                 target: "cat.schema.orders".to_string(),
                 source: "cat.branch__fix-price.orders".to_string(),
                 statement: "CREATE OR REPLACE TABLE ...".to_string(),
@@ -2979,7 +2927,7 @@ adapter = "default"
         std::fs::write(&config_path, config_for(&b_db)).unwrap();
 
         // EXECUTE from the threaded snapshot.
-        let (targets_out, ok) = run_promote_apply(&loaded, &promote_plan.targets)
+        let (targets_out, ok) = run_promote_apply(&loaded, &promote_plan.targets, None)
             .await
             .expect("promote apply executes");
         assert!(ok, "the promote statement must succeed: {targets_out:?}");
@@ -3143,15 +3091,17 @@ auto_create_schemas = true
         let saved_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir).unwrap();
         let result = run_branch_promote(
+            dir, // root for the internal plan store (cwd is set to `dir` here)
             &state_path,
             &config_path,
             &models_dir,
             "main", // base_ref — repo is uninitialized so the gate skips
             "fix-price",
-            None,  // no filter
+            None,                                       // no filter
             None,  // pipeline — only one pipeline, no need to disambiguate
             false, // skip_approval_flag
             true,  // allow_breaking — irrelevant here; gate skips fail-open anyway
+            rocky_core::config::PolicyPrincipal::Human, // human runtime — no [policy], ungated
             false, // json — suppress pretty stdout in tests
         )
         .await;
@@ -3269,9 +3219,10 @@ auto_create_schemas = true
             &models_dir,
             "main", // base_ref — repo is fresh so the breaking-change gate skips
             "fix-price",
-            None, // filter
-            None, // pipeline
-            true, // allow_breaking — irrelevant; gate skips fail-open anyway
+            None,  // filter
+            None,  // pipeline
+            false, // skip_approval_flag
+            true,  // allow_breaking — irrelevant; gate skips fail-open anyway
             &state_path,
             rocky_core::config::PolicyPrincipal::Agent, // the agent-invoked promote
         )
@@ -3299,10 +3250,14 @@ auto_create_schemas = true
     }
 
     /// 🔴 A regression: `rocky branch promote --plan <id>` must route through
-    /// the agent-policy gate. An agent-authored Promote plan under a
+    /// the agent-policy gate. An AGENT running the promote under a
     /// `deny agent promote { any }` rule must be REFUSED before any target SQL
     /// executes. Pre-fix `run_branch_promote_from_plan` called `run_promote_apply`
     /// directly with no policy evaluation, so the denied plan executed.
+    ///
+    /// Enforcement keys on the runtime principal (here `Agent`) combined with
+    /// the plan kind — NOT the plan's stored stamp — exactly as `rocky apply
+    /// <promote-plan>` and bare `rocky branch promote` do.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn branch_promote_from_plan_gates_a_denied_agent_promote() {
@@ -3383,7 +3338,8 @@ effect = "deny"
             "fix-price",
             None,
             None,
-            true,
+            false, // skip_approval_flag
+            true,  // allow_breaking
             &state_path,
             rocky_core::config::PolicyPrincipal::Agent,
         )
@@ -3394,13 +3350,17 @@ effect = "deny"
             .plan_id
             .expect("plan_id");
 
-        // Now apply it via the --plan path — the gate must REFUSE it.
+        // Now apply it via the --plan path under an AGENT runtime — the gate
+        // must REFUSE it. Enforcement is on the runtime principal + kind, so an
+        // agent runner is denied regardless of the plan file.
         let result = crate::commands::run_branch_promote_from_plan(
             dir,
             &config_path,
             &plan_id,
             None,
+            None, // pipeline
             &state_path,
+            rocky_core::config::PolicyPrincipal::Agent,
             false,
         )
         .await;
@@ -3410,6 +3370,592 @@ effect = "deny"
         assert!(
             err.to_string().contains("DENIES"),
             "the --plan path must be gated by the policy plane, got: {err}"
+        );
+    }
+
+    /// 🔴 THE PROMOTE-PARITY GUARD — all three promote entrypoints must reach
+    /// the IDENTICAL policy verdict on the same promote:
+    ///
+    /// 1. `rocky apply <promote-plan>`     → `run_apply_in` → `run_apply_promote_plan`
+    /// 2. `rocky branch promote --plan`    → `run_branch_promote_from_plan`
+    /// 3. bare `rocky branch promote`      → `run_branch_promote`
+    ///
+    /// Under a `deny agent promote { any }` rule:
+    /// - an AGENT runtime is REFUSED at the shared gate on every route, and
+    ///   **zero** target SQL executes (the prod table stays absent), while
+    /// - a HUMAN runtime passes the gate on every route and the self-contained
+    ///   target SQL copies the branch rows into prod.
+    ///
+    /// Route 3 is the bypass this PR closes: the pre-fix `run_branch_promote`
+    /// went straight to `execute_statement` with no policy evaluation, so the
+    /// AGENT case below would have CREATED `warehouse.marts.fct_orders` — the
+    /// "prod table absent after agent promote" assertion fails on unpatched
+    /// code. Routes 1/2 share the pre-built plan; route 3 rebuilds its own
+    /// (fresh plan_id) from the same branch — the "same verdict" is over the
+    /// same branch/targets, not a shared plan file.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn promote_gate_is_identical_across_all_three_entrypoints() {
+        use rocky_core::config::PolicyPrincipal;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+
+        // Self-contained git repo with a local identity (approver_identity runs
+        // `git config --get user.email` in cwd; CI runners have no ambient one).
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        // `[policy]` DENIES every agent promote — but no approval requirement,
+        // so the deny can only come from the policy gate (not the approval gate
+        // firing first) and the models compile cleanly (not the breaking gate).
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+
+[pipeline.t.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "promote"
+scope = {{ any = true }}
+effect = "deny"
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        run_branch_create(&state_path, "fix-price", None, false).unwrap();
+
+        // Seed prod schemas + the branch source table (2 rows). `branch promote`
+        // dispatches `CREATE OR REPLACE TABLE` directly and does NOT consult
+        // `auto_create_schemas`, so the prod `marts` schema must pre-exist; the
+        // prod TABLE `fct_orders` is what the promote creates (absent until an
+        // allowed promote runs).
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("open duckdb");
+            for stmt in [
+                "CREATE SCHEMA IF NOT EXISTS warehouse",
+                "CREATE SCHEMA IF NOT EXISTS marts",
+                "CREATE SCHEMA IF NOT EXISTS \"branch__fix-price\"",
+                "CREATE TABLE \"branch__fix-price\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+            ] {
+                adapter.execute_statement(stmt).await.expect("seed");
+            }
+        }
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        // A single AGENT-authored promote plan shared by routes 1 and 2.
+        let shared_plan_id = crate::commands::plan::build_promote_plan_inner(
+            dir,
+            &config_path,
+            &models_dir,
+            "main",
+            "fix-price",
+            None,
+            None,
+            false, // skip_approval_flag
+            true,  // allow_breaking (gate skips fail-open on a commit-less repo)
+            &state_path,
+            PolicyPrincipal::Agent,
+        )
+        .await
+        .expect("plan build must succeed — build does not gate")
+        .plan_output
+        .plan_id
+        .expect("plan_id");
+
+        // ---- AGENT runtime: every route is REFUSED at the shared gate. ------
+        let apply_agent = crate::commands::apply::run_apply_in(
+            dir,
+            &config_path,
+            &shared_plan_id,
+            &state_path,
+            PolicyPrincipal::Agent,
+            false,
+        )
+        .await;
+        let from_plan_agent = crate::commands::run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &shared_plan_id,
+            None,
+            None, // pipeline
+            &state_path,
+            PolicyPrincipal::Agent,
+            false,
+        )
+        .await;
+        let bare_agent = run_branch_promote(
+            dir,
+            &state_path,
+            &config_path,
+            &models_dir,
+            "main",
+            "fix-price",
+            None,
+            None,
+            false, // skip_approval_flag
+            true,  // allow_breaking
+            PolicyPrincipal::Agent,
+            false,
+        )
+        .await;
+
+        for (route, res) in [
+            ("apply <promote-plan>", &apply_agent),
+            ("branch promote --plan", &from_plan_agent),
+            ("bare branch promote", &bare_agent),
+        ] {
+            let err = res
+                .as_ref()
+                .expect_err(&format!("{route}: agent promote must be REFUSED"));
+            assert!(
+                err.to_string().contains("DENIES"),
+                "{route}: must be denied by the policy plane, got: {err}"
+            );
+        }
+
+        // Zero execution across all three: the prod table was never created.
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+            let promoted = adapter
+                .execute_query("SELECT COUNT(*) FROM warehouse.marts.fct_orders")
+                .await;
+            assert!(
+                promoted.is_err(),
+                "no promote target may execute under a denied agent runtime — \
+                 warehouse.marts.fct_orders must not exist"
+            );
+        }
+
+        // ---- HUMAN runtime: every route passes the gate and executes. -------
+        crate::commands::apply::run_apply_in(
+            dir,
+            &config_path,
+            &shared_plan_id,
+            &state_path,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("apply <promote-plan>: human runtime passes the gate and executes");
+        crate::commands::run_branch_promote_from_plan(
+            dir,
+            &config_path,
+            &shared_plan_id,
+            None,
+            None, // pipeline
+            &state_path,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("branch promote --plan: human runtime passes the gate and executes");
+        run_branch_promote(
+            dir,
+            &state_path,
+            &config_path,
+            &models_dir,
+            "main",
+            "fix-price",
+            None,
+            None,
+            false,
+            true,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect("bare branch promote: human runtime passes the gate and executes");
+
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        // The (idempotent `CREATE OR REPLACE`) promote copied the 2 branch rows.
+        let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+        let rows = adapter
+            .execute_query("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders")
+            .await
+            .expect("prod table must exist after an allowed human promote");
+        let v = &rows.rows[0][0];
+        let count = v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            .unwrap_or_else(|| panic!("count value not parseable: {v:?}"));
+        assert_eq!(
+            count, 2,
+            "an allowed human promote must copy all 2 branch rows into prod"
+        );
+    }
+
+    /// 🔴 BLOCKER 1 regression: bare `rocky branch promote --pipeline <name>`
+    /// must resolve the SELECTED pipeline's adapter for execution, not a
+    /// hardcoded `None`. On a multi-pipeline config, `--pipeline marts` must
+    /// promote (reach execution and copy rows) while omitting `--pipeline` must
+    /// still fail with "multiple pipelines" — proving the selector, not an
+    /// arbitrary default, drives disambiguation. Pre-fix `run_promote_apply`
+    /// passed `None`, so `--pipeline marts` reached execution and then failed
+    /// with "multiple pipelines defined".
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bare_promote_pipeline_selector_disambiguates_multi_pipeline() {
+        use rocky_core::config::PolicyPrincipal;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir_all(models_dir.join("marts")).unwrap();
+        std::fs::create_dir_all(models_dir.join("staging")).unwrap();
+
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        write_transformation_model(
+            &models_dir.join("marts"),
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id",
+        );
+
+        // Two transformation pipelines (both on the default duckdb adapter) —
+        // enough to make `resolve_pipeline(None)` ambiguous.
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.marts]
+type = "transformation"
+models = "models/marts/**"
+
+[pipeline.marts.target]
+adapter = "default"
+
+[pipeline.marts.target.governance]
+auto_create_schemas = true
+
+[pipeline.staging]
+type = "transformation"
+models = "models/staging/**"
+
+[pipeline.staging.target]
+adapter = "default"
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        run_branch_create(&state_path, "fix", None, false).unwrap();
+
+        {
+            let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("open duckdb");
+            for stmt in [
+                "CREATE SCHEMA IF NOT EXISTS warehouse",
+                "CREATE SCHEMA IF NOT EXISTS marts",
+                "CREATE SCHEMA IF NOT EXISTS \"branch__fix\"",
+                "CREATE TABLE \"branch__fix\".fct_orders AS SELECT 1 AS id UNION ALL SELECT 2",
+            ] {
+                adapter.execute_statement(stmt).await.expect("seed");
+            }
+        }
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+
+        // `--pipeline marts` disambiguates → the promote reaches execution.
+        let selected = run_branch_promote(
+            dir,
+            &state_path,
+            &config_path,
+            &models_dir,
+            "main",
+            "fix",
+            None,
+            Some("marts"),
+            false,
+            true,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await;
+
+        // Omitting `--pipeline` (None) on a multi-pipeline config must error.
+        let ambiguous = run_branch_promote(
+            dir,
+            &state_path,
+            &config_path,
+            &models_dir,
+            "main",
+            "fix",
+            None,
+            None,
+            false,
+            true,
+            PolicyPrincipal::Human,
+            false,
+        )
+        .await;
+
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        selected.expect("`--pipeline marts` must resolve the pipeline and promote");
+        let err = ambiguous.expect_err("omitting --pipeline on a multi-pipeline config must error");
+        assert!(
+            err.to_string().contains("multiple pipelines"),
+            "expected the multi-pipeline disambiguation error, got: {err}"
+        );
+
+        // The selected promote executed against marts' adapter and copied rows.
+        let adapter = DuckDbWarehouseAdapter::open(&duckdb_path).expect("reopen duckdb");
+        let rows = adapter
+            .execute_query("SELECT CAST(COUNT(*) AS BIGINT) FROM warehouse.marts.fct_orders")
+            .await
+            .expect("prod table must exist after a `--pipeline marts` promote");
+        let v = &rows.rows[0][0];
+        let count = v
+            .as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+            .unwrap_or_else(|| panic!("count value not parseable: {v:?}"));
+        assert_eq!(
+            count, 2,
+            "`--pipeline marts` promote must copy both branch rows"
+        );
+    }
+
+    /// 🔴 BLOCKER 2 (content): the bare verb's breaking-change block must still
+    /// emit the stdout `BranchPromoteOutput` its consumers parse (the semantic-
+    /// breaking-change POC / weekly smoke). `breaking_block_output` reconstructs
+    /// it from the typed error; pin the exact fields the POC's `json.load`
+    /// reads: `success == false`, empty `targets`, findings under
+    /// `breaking_changes`, and a `breaking_changes_blocked` audit entry.
+    #[test]
+    fn breaking_block_output_preserves_stdout_contract() {
+        use rocky_core::breaking_change::{BreakingChange, BreakingFinding, BreakingSeverity};
+
+        let findings = vec![BreakingFinding {
+            change: BreakingChange::ColumnDropped {
+                model: "warehouse.marts.fct_orders".to_string(),
+                column: "amount".to_string(),
+                data_type: "INT".to_string(),
+            },
+            severity: BreakingSeverity::Breaking,
+        }];
+        let block = crate::commands::plan::PromoteBlockedByBreakingChanges {
+            findings: findings.clone(),
+            audit: vec![AuditEvent {
+                kind: AuditEventKind::BreakingChangesBlocked,
+                at: Utc::now(),
+                actor: ApproverIdentity {
+                    email: "x".into(),
+                    name: None,
+                    host: "h".into(),
+                    source: ApproverSource::Local,
+                },
+                branch: "fix".into(),
+                branch_state_hash: "hash".into(),
+                reason: None,
+                breaking_changes: Some(findings.clone()),
+            }],
+            approvals_used: Vec::new(),
+            approvals_rejected: Vec::new(),
+            branch_state_hash: "hash".to_string(),
+        };
+
+        let json = serde_json::to_value(breaking_block_output("fix", &block)).expect("serialize");
+        assert_eq!(json["success"], serde_json::json!(false));
+        assert!(
+            json["targets"].as_array().unwrap().is_empty(),
+            "targets must be empty on a block"
+        );
+        assert!(
+            !json["breaking_changes"].as_array().unwrap().is_empty(),
+            "breaking_changes must carry the findings"
+        );
+        let audit_kinds: Vec<&str> = json["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["kind"].as_str().unwrap())
+            .collect();
+        assert!(
+            audit_kinds.contains(&"breaking_changes_blocked"),
+            "audit must contain breaking_changes_blocked, got {audit_kinds:?}"
+        );
+    }
+
+    /// 🔴 BLOCKER 2 (end-to-end): a real breaking-change block via the bare verb
+    /// returns a non-zero exit (Err) AND routes through the typed
+    /// `PromoteBlockedByBreakingChanges` — the branch that emits the stdout JSON
+    /// (asserted content-wise by `breaking_block_output_preserves_stdout_contract`
+    /// and byte-wise end-to-end by the semantic-breaking-change POC). Pre-fix
+    /// this block `?`-swallowed into a stderr-only error with no stdout JSON.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn bare_promote_breaking_block_errors_and_routes_stdout_json() {
+        use rocky_core::config::PolicyPrincipal;
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let duckdb_path = dir.join("warehouse.duckdb");
+        let config_path = dir.join("rocky.toml");
+        let state_path = dir.join("state.redb");
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+
+        for git_args in [
+            ["init", "-q", "."].as_slice(),
+            ["config", "user.email", "test@rocky.invalid"].as_slice(),
+            ["config", "user.name", "Rocky Test"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git setup");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+
+[pipeline.t.target.governance]
+auto_create_schemas = true
+"#,
+                duckdb_path.display()
+            ),
+        )
+        .unwrap();
+
+        // Base commit: the model carries columns (id, amount).
+        write_transformation_model(
+            &models_dir,
+            "fct_orders",
+            "warehouse",
+            "marts",
+            "fct_orders",
+            "SELECT 1 AS id, 2 AS amount",
+        );
+        for git_args in [
+            ["add", "-A"].as_slice(),
+            ["commit", "-q", "-m", "base"].as_slice(),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(git_args)
+                .current_dir(dir)
+                .status()
+                .expect("git commit");
+            assert!(status.success(), "git {git_args:?} failed");
+        }
+        // Working tree drops `amount` → a `column_dropped` = Breaking finding.
+        std::fs::write(models_dir.join("fct_orders.sql"), "SELECT 1 AS id").unwrap();
+
+        run_branch_create(&state_path, "fix", None, false).unwrap();
+
+        let _cwd_guard = cwd_lock();
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        // base_ref = HEAD (the committed 2-column model); working tree is 1-column.
+        let result = run_branch_promote(
+            dir,
+            &state_path,
+            &config_path,
+            &models_dir,
+            "HEAD",
+            "fix",
+            None,
+            None,
+            false,
+            false, // allow_breaking — the gate must fire
+            PolicyPrincipal::Human,
+            true, // json — the block JSON is emitted to stdout
+        )
+        .await;
+        std::env::set_current_dir(saved_cwd).unwrap();
+
+        let err =
+            result.expect_err("a breaking-change block must fail the bare promote (non-zero exit)");
+        assert!(
+            err.downcast_ref::<crate::commands::plan::PromoteBlockedByBreakingChanges>()
+                .is_some(),
+            "the block must route through PromoteBlockedByBreakingChanges (the stdout-JSON branch), \
+             got: {err}"
         );
     }
 

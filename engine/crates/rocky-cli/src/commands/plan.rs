@@ -1909,6 +1909,9 @@ pub async fn plan_promote(
         branch_name,
         filter,
         pipeline_name,
+        // `rocky plan promote` exposes no `--skip-approval` flag; the approval
+        // gate honors `ROCKY_BRANCH_APPROVAL_SKIP` only on this path.
+        false,
         allow_breaking,
         state_path,
         principal,
@@ -1949,6 +1952,44 @@ pub(crate) struct PromotePlanResult {
     pub plan_output: PlanOutput,
 }
 
+/// Error returned by [`build_promote_plan_inner`] when the breaking-change gate
+/// fires and `--allow-breaking` was not set (the plan is NOT written).
+///
+/// Carries the classified findings plus the partial audit (whose last entry is
+/// `BreakingChangesBlocked`) so a caller can surface the block however it needs:
+/// bare `rocky branch promote` reconstructs its `BranchPromoteOutput` block JSON
+/// from this to preserve the stdout contract its smoke/POC consumers depend on,
+/// while `rocky plan promote` simply propagates the `Display` message. Its
+/// `Display` is byte-identical to the message the gate used to `bail!` with, so
+/// the non-zero exit + stderr text is unchanged on the `?`-propagating path.
+#[derive(Debug)]
+pub(crate) struct PromoteBlockedByBreakingChanges {
+    pub findings: Vec<rocky_core::breaking_change::BreakingFinding>,
+    pub audit: Vec<AuditEvent>,
+    pub approvals_used: Vec<ApprovalArtifact>,
+    pub approvals_rejected: Vec<RejectedApproval>,
+    pub branch_state_hash: String,
+}
+
+impl std::fmt::Display for PromoteBlockedByBreakingChanges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let breaking: Vec<_> = self.findings.iter().filter(|f| f.is_breaking()).collect();
+        let summary = breaking
+            .iter()
+            .map(|finding| format!("{:?}", finding.change))
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            f,
+            "promote plan blocked by {} breaking change(s): {summary}. \
+             Re-run with `--allow-breaking` to override.",
+            breaking.len()
+        )
+    }
+}
+
+impl std::error::Error for PromoteBlockedByBreakingChanges {}
+
 /// Build and persist a `PromotePlan` from the given parameters.
 ///
 /// Extracted as a named function so both `plan_promote` (standalone command)
@@ -1968,13 +2009,23 @@ pub(crate) async fn build_promote_plan_inner(
     branch_name: &str,
     filter: Option<&str>,
     pipeline_name: Option<&str>,
+    // Bare `rocky branch promote <name>` also honors the `--skip-approval`
+    // CLI flag (not just `ROCKY_BRANCH_APPROVAL_SKIP`). `rocky plan promote`
+    // has no such flag and passes `false`. Threaded here so both plan-build
+    // call sites run the identical approval gate.
+    skip_approval_flag: bool,
     allow_breaking: bool,
     state_path: &Path,
-    // The resolved CLI authoring principal, stamped onto the persisted plan so
-    // a later `rocky apply` evaluates the promote against the identity that
-    // authored it. A human-invoked promote stays `human` (ungated in v0); an
-    // agent-invoked one (`--principal agent` / `ROCKY_PRINCIPAL=agent`) is
-    // gated by `deny agent promote {…}` rules and agent freezes.
+    // The resolved CLI authoring principal, stamped onto the persisted plan as
+    // an ADVISORY/display record. Enforcement — `rocky apply <promote-plan>`,
+    // `rocky branch promote --plan`, AND bare `rocky branch promote`, which all
+    // gate IDENTICALLY through the shared `gate_promote_plan` — does NOT enforce
+    // against this stored stamp: the gate evaluates `most_restrictive(runtime
+    // principal, default_principal_for_kind(Promote))`, and a `Promote` plan's
+    // kind default is `human`. So an AGENT runner is gated as agent — a
+    // `deny agent promote {…}` rule fires and agent freezes — regardless of who
+    // authored the plan, while a human runner resolves to `human` (ungated in
+    // v0). The stored stamp decides nothing at enforcement time.
     principal: PolicyPrincipal,
 ) -> Result<PromotePlanResult> {
     use crate::commands::branch::{
@@ -2011,9 +2062,16 @@ pub(crate) async fn build_promote_plan_inner(
     let env_skip_value = std::env::var(APPROVAL_SKIP_ENV)
         .ok()
         .filter(|v| !v.is_empty());
-    let skip_reason: Option<String> = env_skip_value
-        .as_ref()
-        .map(|v| format!("{APPROVAL_SKIP_ENV}={v}"));
+    // Explicit `--skip-approval` flag wins over the env var so the audit
+    // records the flag-origin reason even when both are set (matches the
+    // bare-verb path this function now backs).
+    let skip_reason: Option<String> = if skip_approval_flag {
+        Some("--skip-approval CLI flag".to_string())
+    } else {
+        env_skip_value
+            .as_ref()
+            .map(|v| format!("{APPROVAL_SKIP_ENV}={v}"))
+    };
 
     let mut audit: Vec<AuditEvent> = Vec::new();
 
@@ -2060,16 +2118,18 @@ pub(crate) async fn build_promote_plan_inner(
                     reason: None,
                     breaking_changes: Some(findings.clone()),
                 });
-                let summary = breaking
-                    .iter()
-                    .map(|f| format!("{:?}", f.change))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                anyhow::bail!(
-                    "promote plan blocked by {} breaking change(s): {summary}. \
-                     Re-run with `--allow-breaking` to override.",
-                    breaking.len()
-                );
+                // Return a typed error (not a flat `bail!`) so the bare-verb
+                // caller can catch it and re-emit the block JSON to stdout that
+                // consumers expect, while `plan_promote`'s `?` still propagates
+                // the identical `Display` message + non-zero exit.
+                return Err(PromoteBlockedByBreakingChanges {
+                    findings: findings.clone(),
+                    audit: std::mem::take(&mut audit),
+                    approvals_used,
+                    approvals_rejected,
+                    branch_state_hash: branch_state_hash.clone(),
+                }
+                .into());
             }
         }
     }
