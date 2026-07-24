@@ -36,15 +36,24 @@ Nothing here is hand-counted, and the corpus deliberately includes shapes that s
   Was: `assert_eq!(diags.len(), 1, "documents the current false positive …")`. Now:
   `assert!(diags.is_empty(), "a literal-pinned grain column cannot fan out …")`.
 
-### The detection is real, not green-by-construction (ablation)
+### The detection is real, not green-by-construction (two ablations)
 
-Temporarily replacing the CTE scope build with a no-op (`let scope = outer_scope.clone();` and
-dropping the `scope.insert(cte …)` loop) makes **exactly** the two CTE-detection tests fail —
-`join_inside_cte_is_detected` and `cte_joins_to_earlier_cte_with_inferred_grain` — while every
-silent-case test still passes. The decisive test `cte_joins_to_earlier_cte_with_inferred_grain`
-supplies **empty** `upstream_grains`, so the `addr` CTE's grain can only come from being inferred
-and placed in scope; its G001 is impossible without genuine propagation. This directly answers the
-red-team question "does the code SEE the CTE-nested join and infer the joined-to grain?" — yes.
+Both were run against the `measure_pr2` corpus, not just the named unit tests.
+
+- **Ablation A — CTE-scope walking off** (`let scope = outer_scope.clone();`, drop the
+  `scope.insert(cte …)` loop): corpus cases **C2, C3, C4 flip to MISS**; **C5 still fires**. PR-2
+  drops to TP=2 (C1 flat + C5 derived), coverage delta over the prototype falls to **+1**. The
+  decisive C3 supplies **empty** `upstream_grains`, so the `addr` CTE's grain can only come from
+  being inferred and placed in scope — its G001 is impossible without genuine propagation. And in
+  the non-ignored suite, exactly `join_inside_cte_is_detected` and
+  `cte_joins_to_earlier_cte_with_inferred_grain` fail under this ablation; every silent-case test
+  still passes.
+- **Ablation B — derived-subquery descent off** (`descend_factor` no-op): only **C5 flips to
+  MISS**; C2/C3/C4 stay TP. PR-2 drops to TP=4, coverage delta **+3**.
+
+Together these prove the coverage decomposition and answer the red-team question "does the code SEE
+the CTE-nested join and infer the joined-to grain?" — yes, and the two mechanisms are separable:
+**+3 of the coverage gain is CTE-scope walking (C2/C3/C4), +1 is derived-subquery descent (C5)**.
 
 ---
 
@@ -82,8 +91,11 @@ red-team question "does the code SEE the CTE-nested join and infer the joined-to
 | flat prototype | **1 / 8** | **2** | 7 |
 | PR-2 | **5 / 8** | **0** | 3 |
 
-- **Coverage delta CTE walking bought: +4 true fan-outs** (C2–C5 — all four CTE/derived-nested).
-  This is the load-bearing number: without CTE walking the prototype detects 1 of 8; with it, 5 of 8.
+- **Coverage delta over the flat prototype: +4 true fan-outs** (C2–C5, all four nested), which the
+  two ablations decompose into **+3 from CTE-scope walking (C2/C3/C4)** and **+1 from
+  derived-subquery descent (C5)**. This is the load-bearing number: the prototype detects 1 of 8;
+  PR-2 detects 5 of 8. CTE walking is the largest single contributor and is what recovers the
+  dominant real shape — but it is not solely responsible for the +4, and the doc does not claim so.
 - **Precision delta the literal-pin fix bought: −2 false positives** (C7, C8). PR-2 has **zero**
   false positives on the corpus.
 - **3 honest misses remain** and are all Unknown-grain (silent, the safe failure direction):
@@ -136,10 +148,12 @@ Two independent limits also surface here, and **neither is fixed by CTE walking*
 **Qualified GO on the mechanism; NOT YET a go for shipping useful coverage without more.**
 
 - CTE walking does exactly what the plan predicted it must: it takes detection on the dominant real
-  shape from ≈0 (prototype: 0/4 nested) to 4/4 nested + 1/1 flat, and the literal-pin fix removes
-  the confirmed false-positive class outright (2 → 0). On shapes that mimic real analytics models,
-  the coverage is real and the precision is clean. The plan's claim that CTE walking is *mandatory,
-  not a refinement* is confirmed empirically.
+  shape from 0 (prototype detects none of the 4 nested cases) to all 4 nested + 1 flat — of that +4,
+  +3 is CTE-scope walking and +1 is derived-subquery descent — and the literal-pin fix removes the
+  confirmed false-positive class outright (2 → 0). On shapes that mimic real analytics models, the
+  coverage is real and the precision is clean. The plan's claim that CTE walking is *mandatory, not
+  a refinement* is confirmed empirically: with it off, coverage over the prototype is +1; with it
+  on, +3 (CTE alone) or +4 (with derived descent).
 - But "worth it" for a shipped lint is **conditional on two things CTE walking does not provide**:
   (1) cross-model grain propagation in the wired pass, and (2) enough group-by-shaped upstreams —
   or a declaration surface — for the joined-to grain to actually be Known. The real corpus available
@@ -169,3 +183,13 @@ unearned: the real-project coverage is unproven, and the cross-model plumbing is
   (dedup/computed-grain/derived-target); PR-2 stays silent on all three — the safe direction.
 - **The playground `1`** is reachable only via a name-match cross-model hack in the harness; the
   module alone would report `0` on the playground. Do not read the `1` as module capability.
+- **`own_side_keys` soundness (contrived).** It binds an R-side column if *either* side of an
+  equality has qualifier == `key`, without checking that the *other* side belongs to the left
+  relation. So an intra-relation predicate `a.x = a.y` would count `a.x` (and `a.y`) as satisfied
+  join keys, producing an unsound false negative on a contrived self-referential `ON`. Not exercised
+  by any real shape here, but a real soundness seam if this is ever wired.
+- **`RIGHT`/`RIGHT OUTER` fan-out direction (pre-existing).** `join_constraint` routes right joins
+  through the same `grain(R) ⊆ K_R` rule, but a right join's fan-out is inverted (it duplicates the
+  *right* input per left grain). This is inherited from the flat prototype, not a PR-2 regression —
+  the plan only explicitly cleared `LEFT` — but it should be modelled (or right joins made silent)
+  before wiring.
