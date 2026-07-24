@@ -135,7 +135,7 @@ Unity Catalog grants, schema patterns, workspace isolation, tagging, classificat
 | [08-cross-team-contracts](pocs/04-governance/08-cross-team-contracts) | Consumer imports a producer's published IR snapshot via `[imports.<name>]`; `rocky compile` fails with E030 when the producer drops a column the consumer reads (E033 on pin mismatch) | none |
 | [09-model-tags-inheritance](pocs/04-governance/09-model-tags-inheritance) | A config-group `[tags]` baseline inherited by members and overridden per-key by a model's own `[tags]`, surfaced on `rocky compile --output json` as `models_detail[].tags` | none |
 | [10-recipe-provenance](pocs/04-governance/10-recipe-provenance) | Every materialization records a recipe-identity triple (`recipe_hash`, `input_hash`, `env_hash`); `rocky history --recipe <hash>` returns every execution of that exact program — the "what produced this?" audit one-liner, honest about `heuristic` vs `strong` input proof | none |
-| [11-agent-policy](pocs/04-governance/11-agent-policy) | `[policy]` block enforced at apply time under an agent principal — a denied change is refused before it touches the warehouse, and every decision lands in a ledger queryable via `rocky audit` | none |
+| [11-agent-policy](pocs/04-governance/11-agent-policy) | The agent-policy plane as an incident guardrail: an agent's breaking drop of a PII-classified column under a cross-team contract is DENIED at the `rocky apply` seam with the deciding rule named, the same plan applied by a human goes through, and every decision lands in a ledger queryable via `rocky audit` | none |
 
 ### 05 — Orchestration (11 POCs · DuckDB / docker)
 

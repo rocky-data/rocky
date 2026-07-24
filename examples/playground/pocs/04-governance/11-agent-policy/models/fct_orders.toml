@@ -1,9 +1,18 @@
 name = "fct_orders"
 
+# Materializes into the DuckDB default schema (poc.main) so a HUMAN apply in the
+# demo can actually land the table. The policy scope keys off the `layer` tag,
+# not the target schema, so this stays a gold-layer model for governance.
 [target]
 catalog = "poc"
-schema = "gold"
+schema = "main"
 table = "fct_orders"
 
 [tags]
 layer = "gold"
+
+# `email` is personal data. The classification travels with the column into the
+# policy plane's model attributes, so a rule scoped to `classifications = ["pii"]`
+# matches this model even after the column is dropped from the SQL.
+[classification]
+email = "pii"

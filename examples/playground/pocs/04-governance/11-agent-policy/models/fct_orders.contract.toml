@@ -1,5 +1,11 @@
-# A sibling contract makes fct_orders a contracted model — the policy plane's
-# `scope.contracted = true` guard matches it.
+# A sibling contract makes fct_orders a contracted model — a cross-team promise
+# about its shape. Its presence sets `contracted = true` in the policy plane's
+# model attributes, so a rule scoped to `contracted = true` matches it.
+#
+# `email` is declared here (it is part of the contracted shape) but is NOT in the
+# `required` list. Dropping it is therefore a W010 warning at compile — the
+# contract notices the column left — not a hard error, so the plan still builds
+# and the policy plane is what refuses the agent, not a broken compile.
 [[columns]]
 name = "order_id"
 type = "Int64"
@@ -8,6 +14,11 @@ nullable = true
 [[columns]]
 name = "amount"
 type = "Int64"
+nullable = true
+
+[[columns]]
+name = "email"
+type = "Utf8"
 nullable = true
 
 [rules]

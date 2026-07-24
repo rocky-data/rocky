@@ -6,14 +6,17 @@
 # seam: `rocky apply` consults the policy plane and refuses a denied change
 # before touching the warehouse.
 #
-#   fct_orders   — contracted (sibling .contract.toml), layer=gold  -> DENY apply
-#   dim_customer — layer=silver, column `email` classified pii
-#   raw_events   — layer=bronze, no classifications                 -> ALLOW additive
+#   fct_orders   — contracted (sibling .contract.toml), layer=gold, email=pii
+#                    -> a BREAKING drop of the PII column is DENIED for an agent
+#   dim_customer — layer=silver, email=pii, NOT contracted
+#                    -> PII alone falls to review, not a hard deny
+#   raw_events   — layer=bronze, no classifications
+#                    -> a net-new additive bronze model may flow autonomously
 #
 # `rocky plan` resolves a replication pipeline to reach its discovery gate, then
 # builds a run plan from `models/`. The pipeline below discovers `raw__`-prefixed
 # sources (there are none in a fresh DuckDB — discovery is empty), so the plan
-# is a pure transformation run plan over the three models.
+# is a pure transformation run plan over the models.
 
 [adapter]
 type = "duckdb"
@@ -43,16 +46,32 @@ version = 1
 # human. Adopting `[policy]` with only this line reproduces today's behaviour.
 default_agent_effect = "require_review"
 
-# A contracted model is a cross-team boundary — an agent may never apply a
-# change to it. A hard deny that no allow overturns and no review satisfies.
+# Rule 0 — the incident rule. An agent may not make a BREAKING schema change to
+# a model that is BOTH under a contract AND carries PII. This is the sentence no
+# warehouse GRANT can say: it needs the compiler's breaking-vs-additive verdict,
+# the column classifications, and the contract boundary at once. It names itself
+# in the deny error and in the audit ledger, so an incident review reads the
+# rule that fired, not a generic "permission denied".
+[[policy.rules]]
+principal = "agent"
+capability = "schema_change.breaking"
+scope = { contracted = true, classifications = ["pii"] }
+effect = "deny"
+
+# Rule 1 — the backstop. A contracted model is a cross-team boundary; no agent
+# apply crosses it, breaking or not. Rule 0 fires first on the PII-breaking case
+# (and names the incident precisely); rule 1 guarantees nothing else on a
+# contracted model slips through. A `deny` is a hard refusal — no review marker
+# satisfies it, which is the point of a contract boundary.
 [[policy.rules]]
 principal = "agent"
 capability = "apply"
 scope = { contracted = true }
 effect = "deny"
 
-# An agent may make additive schema changes to a bronze, non-PII model
-# autonomously — this is the dial turned up for a low-risk surface.
+# Rule 2 — the dial turned up for a low-risk surface. An agent may make additive
+# schema changes to a bronze, non-PII model autonomously (a net-new model is a
+# provably-additive `ModelAdded`).
 [[policy.rules]]
 principal = "agent"
 capability = "schema_change.additive"
