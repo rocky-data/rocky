@@ -29,11 +29,14 @@ pub use spawner::JobsModelSpawner;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use rocky_core::config::load_rocky_config;
-use rocky_core::schedule::{Drain, Spawner, TickOptions, TickReport, tick_once};
+use rocky_core::schedule::{
+    Drain, Spawner, TerminalOutcome, TickOptions, TickReport, TickSkipReason, tick_once,
+};
+use rocky_observe::scheduler_metrics::SchedulerMetrics;
 use rocky_observe::span_attrs;
 use rocky_server::state::ServerState;
 
@@ -77,24 +80,21 @@ impl Default for SchedulerConfig {
     }
 }
 
-/// The injected-clock millis of the loop's most recent iteration start, for the
-/// self-watchdog. A wedged loop stops updating this; the supervisor notices.
-fn now_millis(clock: &dyn Clock) -> u64 {
-    clock.now().timestamp_millis().max(0) as u64
-}
-
 /// Spawn the resident reconciler as a background task with the production
 /// [`TokioClock`], returning its handle. The handle resolves when the loop stops
 /// — after `shutdown` is raised and the in-flight tick has drained.
+///
+/// `metrics` is the process-lifetime recording handle; it is a no-op unless
+/// OTLP metrics are configured, so the loop records unconditionally.
 pub fn spawn_scheduler(
     state: Arc<ServerState>,
     config_path: PathBuf,
     sched: SchedulerConfig,
     shutdown: Drain,
     ready: Drain,
+    metrics: SchedulerMetrics,
 ) -> tokio::task::JoinHandle<()> {
     let clock: Arc<dyn Clock> = Arc::new(TokioClock);
-    let heartbeat = Arc::new(AtomicU64::new(now_millis(&*clock)));
     // Runs go through the persisted jobs model; the spawner shares the shutdown
     // signal so a running child drains on shutdown.
     let spawner: Arc<dyn Spawner> = Arc::new(JobsModelSpawner::new(
@@ -109,17 +109,15 @@ pub fn spawn_scheduler(
         clock,
         shutdown,
         ready,
-        heartbeat,
         spawner,
+        metrics,
     ))
 }
 
 /// Run the resident reconciler until `shutdown` is raised.
 ///
-/// `heartbeat` is stamped with the injected-clock time at the top of every
-/// iteration; the self-watchdog reads it to detect a wedged loop. `shutdown` is
-/// shared with the HTTP server's graceful-shutdown future and doubles as the
-/// drain signal handed to `tick_once` and the spawner.
+/// `shutdown` is shared with the HTTP server's graceful-shutdown future and
+/// doubles as the drain signal handed to `tick_once` and the spawner.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_scheduler(
     state: Arc<ServerState>,
@@ -128,8 +126,8 @@ pub async fn run_scheduler(
     clock: Arc<dyn Clock>,
     shutdown: Drain,
     ready: Drain,
-    heartbeat: Arc<AtomicU64>,
     spawner: Arc<dyn Spawner>,
+    metrics: SchedulerMetrics,
 ) {
     // The `.rocky` dir (tick lock; and, in PR 2, the webhook spool) is anchored
     // to the config file's directory — the project root — not the process cwd,
@@ -171,7 +169,6 @@ pub async fn run_scheduler(
         if shutdown.is_signalled() {
             break;
         }
-        heartbeat.store(now_millis(&*clock), Ordering::Relaxed);
 
         let drained = run_one_tick(
             &state,
@@ -181,6 +178,7 @@ pub async fn run_scheduler(
             &*clock,
             &shutdown,
             &*spawner,
+            &metrics,
         )
         .await;
 
@@ -238,7 +236,15 @@ async fn run_one_tick(
     clock: &dyn Clock,
     shutdown: &Drain,
     spawner: &dyn Spawner,
+    metrics: &SchedulerMetrics,
 ) -> bool {
+    // The tick counter is recorded once, at each terminal outcome below (never
+    // up front), so `.ticks` carries the outcome label: an execution-blocking
+    // pass (config error, held permit, fault) is its own alertable series
+    // instead of being metrically identical to a healthy idle tick. Every exit
+    // path from here reaches exactly one `record_outcome`/`record_tick` — keep
+    // it that way, or a pass will go uncounted.
+
     // Re-read config each iteration. A parse error skips THIS iteration only —
     // the loop must never die on a bad edit, and must never run stale demands.
     let config = match load_rocky_config(config_path) {
@@ -249,7 +255,7 @@ async fn run_one_tick(
                 config = %config_path.display(),
                 "scheduler: config error this iteration; skipping (loop stays alive)",
             );
-            record_outcome(TickOutcome::ConfigError);
+            record_outcome(TickOutcome::ConfigError, metrics);
             return false;
         }
     };
@@ -265,7 +271,7 @@ async fn run_one_tick(
                 running_job_id = %holder,
                 "scheduler: a mutating job holds the permit; skipping this tick",
             );
-            record_outcome(TickOutcome::PermitHeld);
+            record_outcome(TickOutcome::PermitHeld, metrics);
             return false;
         }
     };
@@ -293,14 +299,15 @@ async fn run_one_tick(
     match tick_once(&config, state_path, now, spawner, &opts).await {
         Ok(report) => {
             log_tick(&report);
-            record_tick(&report);
+            record_tick(&report, metrics);
+            record_metrics(&report, now, metrics);
             report.drained
         }
         Err(e) => {
             // A tick fault (state I/O, an `after` cycle) fails THIS tick closed;
             // the loop continues and the next tick re-evaluates.
             tracing::error!(error = %e, "scheduler: tick faulted; loop continues");
-            record_outcome(TickOutcome::Fault);
+            record_outcome(TickOutcome::Fault, metrics);
             false
         }
     }
@@ -355,26 +362,28 @@ fn tick_counts(report: &TickReport) -> TickCounts {
     }
 }
 
-fn record_outcome(outcome: TickOutcome) {
+/// Record a tick's terminal outcome onto both the `scheduler.tick` span and the
+/// `.ticks` counter, so the two can never disagree. The span field is always
+/// recorded; the counter call is a no-op when metrics are off.
+fn record_outcome(outcome: TickOutcome, metrics: &SchedulerMetrics) {
     tracing::Span::current().record(span_attrs::SCHEDULER_OUTCOME, outcome.as_str());
+    metrics.record_tick_outcome(outcome.as_str());
 }
 
-/// Record the tick's counts onto the enclosing `scheduler.tick` span.
+/// Record the tick's counts onto the enclosing `scheduler.tick` span and count
+/// the pass on the `.ticks` counter via [`record_outcome`].
 ///
 /// Deliberately separate from [`log_tick`]: span attributes serve trace
-/// correlation, while the event remains the log surface that the metric
-/// instruments will be derived from.
-fn record_tick(report: &TickReport) {
+/// correlation, while the event remains the log surface the metric instruments
+/// are derived from.
+fn record_tick(report: &TickReport, metrics: &SchedulerMetrics) {
     if report.skipped_whole_tick {
-        record_outcome(TickOutcome::LockSkipped);
+        record_outcome(TickOutcome::LockSkipped, metrics);
         return;
     }
+    record_outcome(TickOutcome::Completed, metrics);
     let counts = tick_counts(report);
     let span = tracing::Span::current();
-    span.record(
-        span_attrs::SCHEDULER_OUTCOME,
-        TickOutcome::Completed.as_str(),
-    );
     span.record(span_attrs::SCHEDULER_DUE, counts.due);
     span.record(span_attrs::SCHEDULER_EXECUTED, counts.executed);
     span.record(span_attrs::SCHEDULER_FAILED, counts.failed);
@@ -407,15 +416,64 @@ fn log_tick(report: &TickReport) {
     );
 }
 
+/// Feed a completed tick into the resident-scheduler OTLP instruments.
+///
+/// Reads the same [`tick_counts`] the span and the log event use, so the metric
+/// values can never disagree with them. A whole-tick lock skip records nothing
+/// beyond the tick counter already incremented at the top of the pass — there
+/// are no per-demand outcomes to attribute.
+fn record_metrics(report: &TickReport, now: DateTime<Utc>, metrics: &SchedulerMetrics) {
+    if report.skipped_whole_tick {
+        return;
+    }
+    let counts = tick_counts(report);
+    metrics.record_due(counts.due as u64);
+    metrics.record_executed(counts.executed as u64);
+
+    // Per-demand skips, each attributed to a bounded reason label. The sum
+    // across reasons equals `counts.skipped`, keeping the metric in step with
+    // the span's `rocky.scheduler.skipped`.
+    for skip in &report.skipped {
+        metrics.record_skip(skip_reason_label(&skip.reason));
+    }
+
+    // Per executed demand: its execution lag, and its outcome folded into the
+    // per-pipeline consecutive-failure gauge.
+    for run in &report.executed {
+        let lag_seconds = (now - run.logical_ts).num_seconds().max(0) as f64;
+        metrics.record_lag_seconds(lag_seconds);
+        metrics.record_execution_outcome(&run.pipeline, run.outcome == TerminalOutcome::Success);
+    }
+}
+
+/// Stable, bounded label for a per-demand skip. Every arm returns a value in
+/// [`span_attrs::SCHEDULER_SKIP_REASONS`], pinned by a test below so the
+/// metric's `reason` label can never drift into a free-form string.
+fn skip_reason_label(reason: &TickSkipReason) -> &'static str {
+    match reason {
+        TickSkipReason::NotDue => "not_due",
+        TickSkipReason::Disabled => "disabled",
+        TickSkipReason::InFlight => "in_flight",
+        TickSkipReason::CatchupSkipped { .. } => "catchup_skipped",
+        TickSkipReason::FailureBackoff { .. } => "failure_backoff",
+        TickSkipReason::PartialBackoff { .. } => "partial_backoff",
+        TickSkipReason::Dedup => "dedup",
+        TickSkipReason::HistoryUnavailable => "history_unavailable",
+        TickSkipReason::StateBusy => "state_busy",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use async_trait::async_trait;
     use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
     use rocky_core::schedule::{CapturingSpawner, RunOutcome, SpawnRequest};
+    use rocky_observe::scheduler_metrics::testing::MetricsHarness;
     use rocky_server::state::ServerState;
     use tokio::sync::Notify;
 
@@ -640,6 +698,7 @@ cron = "* * * * *"
             clock.as_ref(),
             &shutdown,
             spawner.as_ref(),
+            &SchedulerMetrics::disabled(),
         )
         .await;
 
@@ -647,8 +706,12 @@ cron = "* * * * *"
         capture.spans_named("scheduler.tick")
     }
 
-    /// Every `TickOutcome` must be a value `rocky-observe` documents, so the
-    /// enum and the published enumeration cannot drift apart across crates.
+    /// Every `TickOutcome` must be a value `rocky-observe` documents — it is
+    /// both the `scheduler.tick` span's outcome and the `.ticks` counter's
+    /// `outcome` label, so the enum and the published enumeration cannot drift
+    /// apart across crates. The exhaustive `match` (no wildcard) is exercised
+    /// per variant, so a new `TickOutcome` breaks this test's compile until it
+    /// is listed, and the assert then fails unless its value is pinned.
     #[test]
     fn tick_outcome_values_match_the_documented_enumeration() {
         for outcome in [
@@ -658,6 +721,14 @@ cron = "* * * * *"
             TickOutcome::LockSkipped,
             TickOutcome::Fault,
         ] {
+            // Exhaustiveness guard: a new variant fails to compile here.
+            match outcome {
+                TickOutcome::Completed
+                | TickOutcome::ConfigError
+                | TickOutcome::PermitHeld
+                | TickOutcome::LockSkipped
+                | TickOutcome::Fault => {}
+            }
             assert!(
                 span_attrs::SCHEDULER_OUTCOMES.contains(&outcome.as_str()),
                 "{} is not in span_attrs::SCHEDULER_OUTCOMES",
@@ -720,6 +791,178 @@ cron = "* * * * *"
         );
     }
 
+    // ---------------------------------------------------------------------
+    // OTLP scheduler metrics
+    // ---------------------------------------------------------------------
+
+    use rocky_observe::scheduler_metrics::testing::MetricPoint;
+
+    /// Drive `ticks` inline reconciliation passes over a shared state store and
+    /// metrics harness, advancing the clock one minute between passes, and
+    /// return the collected metric points. Inline (not the spawned loop) so the
+    /// harness's instruments are recorded synchronously on the test's runtime.
+    async fn drive_ticks_with_metrics(
+        config: &str,
+        spawner: Arc<dyn Spawner>,
+        ticks: usize,
+    ) -> Vec<MetricPoint> {
+        let (dir, config_path) = temp_project(config);
+        let state = test_state(dir.path());
+        let harness = MetricsHarness::new();
+        let metrics = harness.metrics();
+        let shutdown = Drain::new();
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+        let state_path = dir.path().join(".rocky-state.redb");
+        let rocky_dir = dir.path().join(".rocky");
+
+        for i in 0..ticks {
+            if i > 0 {
+                clock.advance(60);
+            }
+            run_one_tick(
+                &state,
+                &config_path,
+                &state_path,
+                &rocky_dir,
+                clock.as_ref(),
+                &shutdown,
+                spawner.as_ref(),
+                &metrics,
+            )
+            .await;
+        }
+        harness.collect()
+    }
+
+    fn metric<'a>(points: &'a [MetricPoint], name: &str) -> Option<&'a MetricPoint> {
+        points.iter().find(|p| p.name == name)
+    }
+
+    /// Every skip reason the reconciler can produce must map to a value the
+    /// metric label set pins — otherwise a new reason would ship as an
+    /// unbounded, unpinned label. The exhaustive `match` below (no wildcard) is
+    /// exercised for each reason, so adding a `TickSkipReason` variant breaks
+    /// this test's compile until it is listed here, and the runtime assert then
+    /// fails unless its label is a member of `SCHEDULER_SKIP_REASONS`.
+    #[test]
+    fn skip_reason_labels_are_all_pinned() {
+        let ts = at(2026, 5, 2, 3, 0);
+        let all = [
+            TickSkipReason::NotDue,
+            TickSkipReason::Disabled,
+            TickSkipReason::InFlight,
+            TickSkipReason::CatchupSkipped { missed: 3 },
+            TickSkipReason::FailureBackoff { resume_at: ts },
+            TickSkipReason::PartialBackoff { resume_at: ts },
+            TickSkipReason::Dedup,
+            TickSkipReason::HistoryUnavailable,
+            TickSkipReason::StateBusy,
+        ];
+        for reason in &all {
+            // Exhaustiveness guard: a new variant fails to compile here.
+            match reason {
+                TickSkipReason::NotDue
+                | TickSkipReason::Disabled
+                | TickSkipReason::InFlight
+                | TickSkipReason::CatchupSkipped { .. }
+                | TickSkipReason::FailureBackoff { .. }
+                | TickSkipReason::PartialBackoff { .. }
+                | TickSkipReason::Dedup
+                | TickSkipReason::HistoryUnavailable
+                | TickSkipReason::StateBusy => {}
+            }
+            let label = skip_reason_label(reason);
+            assert!(
+                span_attrs::SCHEDULER_SKIP_REASONS.contains(&label),
+                "{label} is not in span_attrs::SCHEDULER_SKIP_REASONS",
+            );
+        }
+    }
+
+    /// A completed tick that fired one successful occurrence exports two ticks
+    /// (the anchor pass plus the firing pass), one due, one executed, a lag
+    /// observation, and a zero failure streak keyed by the pipeline name.
+    #[tokio::test]
+    async fn completed_tick_emits_the_scheduler_instruments() {
+        let spawner: Arc<dyn Spawner> = Arc::new(CapturingSpawner::new(0));
+        // Tick 1 anchors; tick 2 (clock +60s) fires exactly one occurrence.
+        let points = drive_ticks_with_metrics(CRON_EVERY_MINUTE, spawner, 2).await;
+
+        // Both passes reconcile, so both count under outcome=completed.
+        let ticks = metric(&points, "rocky.scheduler.ticks").unwrap();
+        assert_eq!(ticks.value, 2.0);
+        assert_eq!(ticks.attr("outcome"), Some("completed"));
+        assert_eq!(metric(&points, "rocky.scheduler.due").unwrap().value, 1.0);
+        assert_eq!(
+            metric(&points, "rocky.scheduler.executed").unwrap().value,
+            1.0,
+        );
+        assert_eq!(
+            metric(&points, "rocky.scheduler.lag_seconds")
+                .unwrap()
+                .histogram_count,
+            1,
+            "one executed demand ⇒ one lag observation",
+        );
+
+        // The only `consecutive_failures` series is keyed by the configured
+        // pipeline name — never a free-form string.
+        let failure_gauges: Vec<&MetricPoint> = points
+            .iter()
+            .filter(|p| p.name == "rocky.scheduler.consecutive_failures")
+            .collect();
+        assert_eq!(failure_gauges.len(), 1);
+        assert_eq!(failure_gauges[0].attr("pipeline"), Some("raw"));
+        assert_eq!(
+            failure_gauges[0].value, 0.0,
+            "a success ⇒ zero-length failure streak",
+        );
+    }
+
+    /// A failing run climbs the per-pipeline consecutive-failure gauge — the
+    /// signal the alert rule fires on.
+    #[tokio::test]
+    async fn a_failed_run_climbs_the_consecutive_failure_gauge() {
+        // Exit 1 ⇒ a failed terminal outcome (no retry configured).
+        let spawner: Arc<dyn Spawner> = Arc::new(CapturingSpawner::new(1));
+        let points = drive_ticks_with_metrics(CRON_EVERY_MINUTE, spawner, 2).await;
+
+        assert_eq!(
+            metric(&points, "rocky.scheduler.executed").unwrap().value,
+            1.0,
+        );
+        let streak = points
+            .iter()
+            .find(|p| {
+                p.name == "rocky.scheduler.consecutive_failures"
+                    && p.attr("pipeline") == Some("raw")
+            })
+            .expect("a per-pipeline failure gauge point");
+        assert_eq!(streak.value, 1.0, "one failure ⇒ streak of one");
+    }
+
+    /// An execution-blocking outcome (here: an unparseable config every tick)
+    /// counts under its own `outcome` label, so a loop that ticks but never
+    /// reconciles is alertable rather than indistinguishable from a healthy
+    /// idle scheduler. Nothing executed, so no due/executed/lag is recorded.
+    #[tokio::test]
+    async fn config_error_ticks_count_under_their_outcome() {
+        let spawner: Arc<dyn Spawner> = Arc::new(CapturingSpawner::new(0));
+        let points = drive_ticks_with_metrics("not valid toml {{{", spawner, 2).await;
+
+        let ticks: Vec<&MetricPoint> = points
+            .iter()
+            .filter(|p| p.name == "rocky.scheduler.ticks")
+            .collect();
+        assert_eq!(ticks.len(), 1, "one bounded outcome series");
+        assert_eq!(ticks[0].attr("outcome"), Some("config_error"));
+        assert_eq!(ticks[0].value, 2.0, "both passes hit the config error");
+        assert!(
+            metric(&points, "rocky.scheduler.executed").is_none(),
+            "a config-error tick reconciles nothing, so executes nothing",
+        );
+    }
+
     /// The loop fires a due cron demand once per tick after the first-sight
     /// anchor, with no drift: N iterations ⇒ exactly N−1 fires (the first tick
     /// only anchors), each an occurrence of the every-minute schedule.
@@ -734,7 +977,6 @@ cron = "* * * * *"
         // no startup barrier — hand it a pre-signalled readiness latch.
         let ready = Drain::new();
         ready.signal();
-        let heartbeat = Arc::new(AtomicU64::new(0));
 
         let clock_dyn: Arc<dyn Clock> = clock.clone();
         let spawner: Arc<dyn Spawner> = capture.clone();
@@ -748,8 +990,8 @@ cron = "* * * * *"
             clock_dyn,
             shutdown.clone(),
             ready.clone(),
-            heartbeat,
             spawner,
+            SchedulerMetrics::disabled(),
         ));
 
         // Iteration 1 (now = 03:00): first sight ⇒ anchor, no fire.
@@ -811,7 +1053,6 @@ cron = "* * * * *"
         // no startup barrier — hand it a pre-signalled readiness latch.
         let ready = Drain::new();
         ready.signal();
-        let heartbeat = Arc::new(AtomicU64::new(0));
 
         let spawner = Arc::new(DrainBlockingSpawner {
             drain: shutdown.clone(),
@@ -831,8 +1072,8 @@ cron = "* * * * *"
             clock_dyn,
             shutdown.clone(),
             ready.clone(),
-            heartbeat,
             spawner_dyn,
+            SchedulerMetrics::disabled(),
         ));
 
         // Tick 1 anchors (no fire). Advancing makes tick 2 due; its child then
@@ -872,7 +1113,6 @@ cron = "* * * * *"
         // no startup barrier — hand it a pre-signalled readiness latch.
         let ready = Drain::new();
         ready.signal();
-        let heartbeat = Arc::new(AtomicU64::new(0));
 
         let clock_dyn: Arc<dyn Clock> = clock.clone();
         let spawner: Arc<dyn Spawner> = capture.clone();
@@ -886,8 +1126,8 @@ cron = "* * * * *"
             clock_dyn,
             shutdown.clone(),
             ready.clone(),
-            heartbeat,
             spawner,
+            SchedulerMetrics::disabled(),
         ));
 
         // Tick 1 anchors; tick 2 fires once.
@@ -930,7 +1170,6 @@ cron = "* * * * *"
         // no startup barrier — hand it a pre-signalled readiness latch.
         let ready = Drain::new();
         ready.signal();
-        let heartbeat = Arc::new(AtomicU64::new(0));
 
         let clock_dyn: Arc<dyn Clock> = clock.clone();
         let spawner: Arc<dyn Spawner> = capture.clone();
@@ -944,8 +1183,8 @@ cron = "* * * * *"
             clock_dyn,
             shutdown.clone(),
             ready.clone(),
-            heartbeat,
             spawner,
+            SchedulerMetrics::disabled(),
         ));
 
         // Anchor tick.
@@ -989,7 +1228,6 @@ cron = "* * * * *"
         let capture = Arc::new(CapturingSpawner::new(0));
         let shutdown = Drain::new();
         let ready = Drain::new(); // withheld — the server is not up yet
-        let heartbeat = Arc::new(AtomicU64::new(0));
 
         let clock_dyn: Arc<dyn Clock> = clock.clone();
         let spawner: Arc<dyn Spawner> = capture.clone();
@@ -1003,8 +1241,8 @@ cron = "* * * * *"
             clock_dyn,
             shutdown.clone(),
             ready.clone(),
-            heartbeat,
             spawner,
+            SchedulerMetrics::disabled(),
         ));
 
         // Readiness withheld ⇒ the loop is blocked at the barrier: no first tick,
@@ -1040,7 +1278,6 @@ cron = "* * * * *"
         let capture = Arc::new(CapturingSpawner::new(0));
         let shutdown = Drain::new();
         let ready = Drain::new(); // never signalled
-        let heartbeat = Arc::new(AtomicU64::new(0));
 
         let clock_dyn: Arc<dyn Clock> = clock.clone();
         let spawner: Arc<dyn Spawner> = capture.clone();
@@ -1054,8 +1291,8 @@ cron = "* * * * *"
             clock_dyn,
             shutdown.clone(),
             ready,
-            heartbeat,
             spawner,
+            SchedulerMetrics::disabled(),
         ));
 
         // Shutdown wins the readiness race: the loop exits without ticking.

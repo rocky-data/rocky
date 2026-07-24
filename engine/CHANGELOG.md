@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky serve --scheduler` now exports resident-scheduler metrics over OTLP (experimental).** When the scheduler is running and `OTEL_EXPORTER_OTLP_ENDPOINT` is set, a process-lifetime meter provider exports six instruments derived from the same per-tick accounting the `scheduler.tick` span and log event already share, so the three surfaces cannot disagree: `rocky.scheduler.ticks` (counter, split by an `outcome` label — `completed`, `config_error`, `permit_held`, `lock_skipped`, `fault` — so a loop that ticks but never reconciles is alertable rather than indistinguishable from a healthy idle one); `.due`, `.executed` (counters); `.skipped` (counter, split by a bounded `reason` label — `not_due`, `disabled`, `in_flight`, `catchup_skipped`, `failure_backoff`, `partial_backoff`, `dedup`, `history_unavailable`, `state_busy`); `.lag_seconds` (histogram of the gap between a demand's logical time and its execution); and `.consecutive_failures` (gauge, labeled by `pipeline`). Every label is drawn from a bounded set, so metric cardinality cannot blow up. The provider installs nothing unless the scheduler is active and an endpoint is configured, and flushes a final scrape on shutdown once the loop has drained. `consecutive_failures` is tracked in-process, so it resets to zero on restart and a pipeline removed from config leaves a stale series — alert on it alongside a freshness check, not on its own. The `deploy/observability/` quickstart gains a **Rocky Scheduler** Grafana dashboard (ticks-by-outcome, lag, due vs executed, skipped-by-reason, per-pipeline consecutive failures) and provisioned alert rules (ticking-but-not-reconciling on sustained `config_error`/`fault`; consecutive failures of three or more; execution-lag p95 above twice the shortest cron interval). Marked experimental while the reconciler soaks.
+
 ## [1.67.0] - 2026-07-24
 
 ### Added

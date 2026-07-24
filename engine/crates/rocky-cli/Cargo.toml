@@ -63,6 +63,9 @@ async-trait = { workspace = true }
 # harness, provider-override seam) for THIS crate's test targets only — the
 # `rocky` binary build never sees the feature.
 rocky-core = { path = "../rocky-core", features = ["test-support"] }
+# Exposes the in-memory scheduler-metrics harness for the `run_one_tick`
+# emission tests. Test-only; the `rocky` binary build never sees it.
+rocky-observe = { path = "../rocky-observe", features = ["test-support"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 tempfile = "3"
 # Capturing Layer for the `scheduler.tick` span assertions — the span surface

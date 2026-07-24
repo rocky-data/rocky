@@ -1,0 +1,128 @@
+{
+  "uid": "rocky-scheduler",
+  "title": "Rocky Scheduler",
+  "tags": ["rocky", "scheduler"],
+  "timezone": "",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Ticks per second, by outcome",
+      "description": "rate(rocky_scheduler_ticks) by outcome — reconciliation passes the resident scheduler runs, split by how each ended (completed, config_error, permit_held, lock_skipped, fault). Summed, this is the loop's liveness signal; a flat line at zero means the loop stopped ticking. A stack dominated by config_error or fault is the alive-but-not-reconciling case the tick-errors alert catches. rocky.scheduler.ticks is a true counter (add_metric_suffixes is off in the shipped Alloy config, so it arrives as rocky_scheduler_ticks with no _total), so read it with rate(), not last-value.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "pointSize": 6, "showPoints": "auto", "fillOpacity": 10, "spanNulls": false, "stacking": { "mode": "normal", "group": "A" } },
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "completed" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] },
+          { "matcher": { "id": "byName", "options": "config_error" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
+          { "matcher": { "id": "byName", "options": "fault" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(rocky_scheduler_ticks[5m])) by (outcome)", "legendFormat": "{{outcome}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Execution lag (seconds)",
+      "description": "Percentiles of rocky.scheduler.lag_seconds — the gap between a demand's logical timestamp and when the tick actually executed it. A rising lag means the loop is falling behind its schedules. Alerts fire when p95 lag exceeds twice the shortest cron interval.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "pointSize": 6, "showPoints": "auto", "fillOpacity": 10 },
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum(rate(rocky_scheduler_lag_seconds_bucket[5m])) by (le))", "legendFormat": "p50", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum(rate(rocky_scheduler_lag_seconds_bucket[5m])) by (le))", "legendFormat": "p95", "refId": "B" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Due vs executed per second",
+      "description": "rate(rocky_scheduler_due) and rate(rocky_scheduler_executed). Due counts demands that came due each tick; executed counts those that ran to a terminal outcome. A persistent gap between them means demand is being suppressed — see the skipped-by-reason panel for why.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "pointSize": 6, "showPoints": "auto", "fillOpacity": 10 },
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "due" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } } ] },
+          { "matcher": { "id": "byName", "options": "executed" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(rocky_scheduler_due[5m]))", "legendFormat": "due", "refId": "A" },
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(rocky_scheduler_executed[5m]))", "legendFormat": "executed", "refId": "B" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Skipped demands per second, by reason",
+      "description": "rate(rocky_scheduler_skipped) split by the reason label (not_due, disabled, in_flight, catchup_skipped, failure_backoff, partial_backoff, dedup, history_unavailable, state_busy). failure_backoff / partial_backoff climbing is the fingerprint of a sick pipeline the loop is deliberately backing off.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "line", "lineWidth": 2, "pointSize": 6, "showPoints": "auto", "fillOpacity": 10, "stacking": { "mode": "normal", "group": "A" } },
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(rocky_scheduler_skipped[5m])) by (reason)", "legendFormat": "{{reason}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Consecutive failures by pipeline",
+      "description": "rocky.scheduler.consecutive_failures — the current run of consecutive failed runs for each pipeline, as a gauge. Zero is healthy; a value climbing to 3+ is the consecutive-failures alert's trigger. Kept in-process, so it resets to zero when the scheduler restarts and a pipeline removed from config leaves a stale row.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" } },
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 3 } ] },
+          "unit": "short"
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Value" }, "properties": [ { "id": "displayName", "value": "consecutive failures" }, { "id": "custom.cellOptions", "value": { "type": "color-background" } } ] }
+        ]
+      },
+      "options": { "showHeader": true, "sortBy": [ { "displayName": "consecutive failures", "desc": true } ] },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "max(rocky_scheduler_consecutive_failures) by (pipeline)", "format": "table", "instant": true, "refId": "A" }
+      ],
+      "transformations": [
+        { "id": "organize", "options": { "excludeByName": { "Time": true }, "renameByName": { "pipeline": "pipeline", "Value": "consecutive failures" } } }
+      ]
+    }
+  ]
+}

@@ -82,6 +82,18 @@ pub async fn run_serve(
         });
     }
 
+    // Process-lifetime scheduler metrics. Stood up only under `--scheduler`, and
+    // only actually exporting when `OTEL_EXPORTER_OTLP_ENDPOINT` is set — a no-op
+    // guard otherwise, installing no meter provider. Bound at function scope so
+    // its `Drop` (a final flush + shutdown) runs AFTER the scheduler task is
+    // awaited below, letting the last tick's metrics reach the collector before
+    // the provider closes.
+    let meter_guard = if scheduler {
+        rocky_observe::scheduler_metrics::SchedulerMeterGuard::init_if_enabled()
+    } else {
+        rocky_observe::scheduler_metrics::SchedulerMeterGuard::disabled()
+    };
+
     // Spawn the resident reconciler alongside the server, if requested.
     let scheduler_task = if scheduler {
         let sched_cfg = crate::commands::scheduler::SchedulerConfig {
@@ -103,6 +115,7 @@ pub async fn run_serve(
             sched_cfg,
             shutdown.clone(),
             server_ready.clone(),
+            meter_guard.metrics(),
         ))
     } else {
         None

@@ -14,6 +14,9 @@ otel = [
     "opentelemetry-otlp",
     "tracing-opentelemetry",
 ]
+# Exposes the in-memory metrics harness used to assert scheduler instrument
+# emission. Test-only: never enabled for a release binary.
+test-support = ["otel", "opentelemetry_sdk/testing"]
 
 [dependencies]
 chrono = { workspace = true }

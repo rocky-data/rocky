@@ -165,6 +165,25 @@ pub const SCHEDULER_OUTCOMES: &[&str] = &[
     "fault",
 ];
 
+/// Recognised values for the `reason` attribute on the
+/// `rocky.scheduler.skipped` metric — one per way a single demand can be
+/// suppressed on a tick. Bounded and config-independent, so the metric's label
+/// cardinality can never blow up. Kept here (rather than beside the reconciler)
+/// so the metric-recording site and the mapper that produces these strings pin
+/// against one list across crates, exactly as [`SCHEDULER_OUTCOMES`] does for
+/// the tick outcome.
+pub const SCHEDULER_SKIP_REASONS: &[&str] = &[
+    "not_due",
+    "disabled",
+    "in_flight",
+    "catchup_skipped",
+    "failure_backoff",
+    "partial_backoff",
+    "dedup",
+    "history_unavailable",
+    "state_busy",
+];
+
 /// Recognised warehouse-adapter values for [`ADAPTER_NAME`] /
 /// [`WAREHOUSE_NAME`]. Source-side adapters (`airbyte`, `fivetran`)
 /// share the same [`ADAPTER_NAME`] key but live in their own
@@ -248,6 +267,22 @@ mod tests {
             assert!(
                 name.chars().all(|c| c.is_ascii_lowercase()),
                 "{name} must be lower-snake"
+            );
+        }
+    }
+
+    /// The skip-reason label set is a metric label vocabulary — it must stay a
+    /// small, unique, lower-snake set so it can never fragment a dashboard or
+    /// blow up label cardinality.
+    #[test]
+    fn scheduler_skip_reasons_well_formed() {
+        let mut seen = std::collections::HashSet::new();
+        for reason in SCHEDULER_SKIP_REASONS {
+            assert!(!reason.is_empty());
+            assert!(seen.insert(*reason), "duplicate skip reason: {reason}");
+            assert!(
+                reason.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{reason} must be lower-snake"
             );
         }
     }

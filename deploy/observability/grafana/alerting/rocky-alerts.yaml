@@ -99,35 +99,147 @@ groups:
                     params: [5]
 
 # ---------------------------------------------------------------------------
-# Scheduler alerts (stub — arrives with the native-scheduler work).
-#
-# Once `rocky serve --scheduler` / `rocky tick` ship their telemetry, a
-# consecutive-failures alert belongs here. Left commented until those metrics
-# exist so provisioning never references a metric that isn't emitted yet.
-#
-#      - uid: rocky-scheduler-consecutive-failures
-#        title: Rocky scheduled pipeline is failing repeatedly
-#        condition: C
-#        for: 0m
-#        labels:
-#          severity: critical
-#        annotations:
-#          summary: "A scheduled Rocky pipeline has failed repeatedly."
-#        data:
-#          - refId: A
-#            relativeTimeRange: { from: 900, to: 0 }
-#            datasourceUid: prometheus
-#            model:
-#              refId: A
-#              editorMode: code
-#              expr: max(rocky_scheduler_consecutive_failures) by (pipeline)
-#              instant: true
-#          - refId: C
-#            datasourceUid: __expr__
-#            model:
-#              refId: C
-#              type: threshold
-#              expression: A
-#              conditions:
-#                - type: query
-#                  evaluator: { type: gt, params: [3] }
+# Scheduler alerts. These reference metrics emitted only by a running
+# `rocky serve --scheduler` (experimental); with no scheduler running the
+# series are absent and noDataState keeps the rules quiet. rocky.scheduler.*
+# counters arrive with add_metric_suffixes off (see alloy/config.alloy), so the
+# Prometheus names carry no _total suffix.
+  - orgId: 1
+    name: rocky-scheduler
+    folder: Rocky
+    interval: 1m
+    rules:
+      # The loop is ticking but not reconciling: config_error or fault every
+      # tick. Excludes permit_held / lock_skipped, which are LEGITIMATE sustained
+      # states — a long API backfill holds the mutation permit across many ticks,
+      # and another reconciler may hold the tick lock — so alerting on
+      # "ticking but zero completed" would false-page a normal long run. A short
+      # rate window ([2m], a few default 15s poll intervals) so a transient bad
+      # edit drops the rate to zero well inside the 5m `for`, while an every-tick
+      # failure keeps it continuously positive; widen [2m] for a long poll
+      # interval. (A genuinely wedged permit, distinct from a long run, is not
+      # separable from these metrics alone — a known gap for the experimental cut.)
+      - uid: rocky-scheduler-tick-errors
+        title: Rocky scheduler is ticking but not reconciling
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: "The Rocky scheduler is ticking but failing to reconcile."
+          description: "rocky.scheduler.ticks with outcome=config_error or fault has been continuously non-zero for 5 minutes — the resident loop is alive but cannot reconcile (a bad rocky.toml every tick, or a repeated tick fault), so no scheduled work is running. Fix the config or investigate the fault."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              editorMode: code
+              expr: sum(rate(rocky_scheduler_ticks{outcome=~"config_error|fault"}[2m]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator:
+                    type: gt
+                    params: [0]
+
+      # A scheduled pipeline has failed 3 or more times in a row. gt [2] on an
+      # integer gauge is "3 or more".
+      - uid: rocky-scheduler-consecutive-failures
+        title: Rocky scheduled pipeline is failing repeatedly
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: "A scheduled Rocky pipeline has failed 3+ times in a row."
+          description: "rocky.scheduler.consecutive_failures reached 3 or more for at least one pipeline. The reconciler is backing it off; the count clears only when the pipeline next succeeds. This gauge is in-process — it also resets to zero if the scheduler restarts."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              editorMode: code
+              expr: max(rocky_scheduler_consecutive_failures) by (pipeline)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator:
+                    type: gt
+                    params: [2]
+
+      # Execution lag p95 above 120s (twice the one-minute cron granularity)
+      # for 5 minutes — the loop is running demands well after they came due.
+      # Tune the 120 to twice YOUR shortest cron interval.
+      - uid: rocky-scheduler-lag
+        title: Rocky scheduler is falling behind
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rocky scheduler execution lag p95 is above 120s."
+          description: "The p95 of rocky.scheduler.lag_seconds has stayed above 120 seconds for 5 minutes — the reconciler is executing demands well after their logical time. Tune the threshold to twice your shortest cron interval."
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: prometheus
+            model:
+              refId: A
+              editorMode: code
+              expr: histogram_quantile(0.95, sum(rate(rocky_scheduler_lag_seconds_bucket[15m])) by (le))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - type: query
+                  evaluator:
+                    type: gt
+                    params: [120]

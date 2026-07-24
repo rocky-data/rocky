@@ -30,12 +30,14 @@ Spans are created around the phases of a run, so a trace reads as the shape of t
 | `materialize.table` | model execution | building one model; one span per model, carrying `rocky.model.fqn` and `rocky.model.kind` |
 | `statement.execute` | warehouse adapter | one SQL statement sent to the warehouse |
 | `state.download` / `state.upload` / `state.probe` | object-store state sync | reading and writing remote state, carrying the `backend` and `bucket` |
+| `scheduler.tick` | resident scheduler | one reconciliation pass of `rocky serve --scheduler`, carrying `rocky.scheduler.outcome` and the pass's due/executed/failed/skipped counts (experimental) |
 
 When Rocky drives a warehouse, the `statement.execute` spans nest under the `materialize.table` span for the model being built, so a single model's SQL is grouped under it.
 
 A few honest limits worth knowing:
 
 - **`statement.execute` spans come from the warehouse adapters.** The Databricks, Snowflake, BigQuery, and Trino adapters emit them. The embedded DuckDB engine runs statements in-process and does not, so local DuckDB runs show model-level spans but no per-statement spans. The `rocky.adapter.name`, `rocky.statement.kind`, and `rocky.warehouse.name` attributes are carried by the Databricks, Snowflake, and BigQuery spans; Trino emits a simpler `statement.execute` span (and a separate `statement.execute_arrow` span on its Arrow path).
+- **`scheduler.tick` comes from the resident scheduler, not a run.** It is emitted once per poll interval by `rocky serve --scheduler` (experimental), so it is its own trace root rather than a child of a `run` span. Each pass records its outcome and counts even when nothing ran, so an idle loop and a wedged one stay distinguishable in the trace.
 - **`rocky.query_duration_ms` is populated by the Databricks adapter today.** Other adapters record their statement spans without feeding that metric yet.
 - **`governance_setup` and `batched_checks` are marker spans.** They are declared to delimit the governance and quality-check phases, but they do not currently parent the events emitted during those phases (those events stay at the root of the trace). Treat them as phase markers, not as subtrees.
 
@@ -56,6 +58,21 @@ Metrics are recorded in-process and exported when the run finishes (the recorded
 | `rocky.query_duration_ms` | histogram | per-statement warehouse time, in milliseconds |
 
 Not every metric is populated on every run — instrumentation is adapter- and pipeline-specific today. `rocky.statements_executed` is emitted by the Databricks adapter; the retry counters by the Databricks and BigQuery adapters; and the table counters and durations (`rocky.tables_processed`, `rocky.tables_failed`, `rocky.table_duration_ms`) by replication runs. Other adapters and pipeline types still emit spans and logs, but do not feed these particular counters yet, so a metric you don't see means that path isn't instrumented, not that nothing happened.
+
+#### Resident scheduler metrics
+
+`rocky serve --scheduler` (experimental) is a long-lived process, so its reconciler exports these for the lifetime of the process rather than at the end of a run. Unlike the run metrics above, the counters are true monotonic counters — read them with `rate()`, not last-value. They appear only while the scheduler is running:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `rocky.scheduler.ticks` | counter | reconciliation passes the loop has run, split by an `outcome` label |
+| `rocky.scheduler.due` | counter | demands that came due, summed across ticks |
+| `rocky.scheduler.executed` | counter | demands that ran to a terminal outcome |
+| `rocky.scheduler.skipped` | counter | demands suppressed, split by a `reason` label |
+| `rocky.scheduler.lag_seconds` | histogram | seconds between a demand's logical time and its execution |
+| `rocky.scheduler.consecutive_failures` | gauge | current run of consecutive failed runs, per `pipeline` |
+
+The `outcome` label on `rocky.scheduler.ticks` is one of `completed`, `config_error`, `permit_held`, `lock_skipped`, or `fault` — summed across outcomes it is the loop's liveness signal, and split by outcome it makes an execution-blocking pass visible: a scheduler that ticks every minute but fails to parse `rocky.toml` shows up as `outcome=config_error` rather than looking identical to a healthy idle loop. The `reason` label on `rocky.scheduler.skipped` is one of a small fixed set (`not_due`, `disabled`, `in_flight`, `catchup_skipped`, `failure_backoff`, `partial_backoff`, `dedup`, `history_unavailable`, `state_busy`), and the `pipeline` label is a configured pipeline name, so no label can grow unbounded. `rocky.scheduler.consecutive_failures` is kept in-process: it resets to zero when the scheduler restarts, and a pipeline removed from config leaves its last value behind as a stale series. Alert on it alongside a freshness check rather than on its own.
 
 ### Structured logs
 
@@ -115,7 +132,7 @@ OTEL_SERVICE_NAME=rocky \
 # 3. Open Grafana at http://localhost:3000.
 ```
 
-In Grafana, open the Tempo data source and search for traces where `service.name` is `rocky`. Pick a recent trace to see the run laid out span by span: the model-level `materialize.table` spans, and the `statement.execute` spans nested under them when the run drives a warehouse. The provisioned dashboard renders the run metrics (tables processed and failed, error rate, and the duration histograms) from Prometheus.
+In Grafana, open the Tempo data source and search for traces where `service.name` is `rocky`. Pick a recent trace to see the run laid out span by span: the model-level `materialize.table` spans, and the `statement.execute` spans nested under them when the run drives a warehouse. The provisioned **Rocky Runs** dashboard renders the run metrics (tables processed and failed, error rate, and the duration histograms) from Prometheus. A second **Rocky Scheduler** dashboard renders the resident scheduler's lag, due/executed/skipped-by-reason, and per-pipeline consecutive failures, and populates once a `rocky serve --scheduler` process is exporting.
 
 Tear the stack down when you are done. The exact commands, ports, and dashboard details live in the `deploy/observability/` README.
 
