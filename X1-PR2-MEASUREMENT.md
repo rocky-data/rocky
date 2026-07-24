@@ -24,9 +24,10 @@ Nothing here is hand-counted, and the corpus deliberately includes shapes that s
    `a.x = b.y` join keys and `a.x = <literal>` pins, from `ON` and `WHERE`. A pinned grain column
    counts as satisfied. It stops at `OR`, so a pin under an `OR` does **not** falsely satisfy grain.
 3. **Declared-key grain source** — `grain_of(sql, unique_key, kind)` prefers a declared
-   merge/upsert `unique_key` (`DeclaredKeyKind::MergeRowKey`), falling back to structural
-   inference. A snapshot (SCD2) entity key (`DeclaredKeyKind::SnapshotEntityKey`) is **not** a row
-   grain and yields `Unknown` — see the SCD2 seam under "For a red-teamer to attack".
+   merge/upsert `unique_key` (`DeclaredKeyKind::MergeRowKey`) — an *unverified assertion* trusted by
+   convention, not an engine-proven grain — falling back to structural inference (the only *sound*
+   source). A snapshot (SCD2) entity key (`DeclaredKeyKind::SnapshotEntityKey`) is **not** a row
+   grain and yields `Unknown`. Both caveats are detailed under "For a red-teamer to attack".
 
 ### The two pinned limitation tests were flipped from "pins the bug" to "proves the fix"
 
@@ -196,12 +197,26 @@ unearned: the real-project coverage is unproven, and the cross-model plumbing is
   the plan only explicitly cleared `LEFT` — but it should be modelled (or right joins made silent)
   before wiring.
 - **SCD2 snapshot entity key ≠ row grain (found by stop-time review, fixed).** The declared-key
-  path originally treated *any* `unique_key` as the row grain. That is true for a merge upsert (one
-  row per key) but false for an SCD2 snapshot, which keeps one row per entity *per version interval*
-  — its row grain is `entity_key ∪ {version columns}`. Trusting the entity key would *falsely clear*
-  a downstream `JOIN snapshot ON entity_key` that actually fans out across versions (the dangerous
-  direction — a false proof of safety, not a missed warning). Fixed: `grain_of` now takes a
-  `DeclaredKeyKind`; a `SnapshotEntityKey` yields `Unknown` (silent — an honest miss) rather than a
-  fabricated all-clear, pinned by `snapshot_entity_key_is_not_a_row_grain`. Firing on an *unfiltered*
-  SCD2 entity-key join (higher value, but unsound without point-in-time-filter detection) is a
-  documented follow-up, not attempted here.
+  path originally treated *any* `unique_key` as the row grain. That is defensible for a merge
+  (its declared row key, trusted by convention — see the next bullet) but false for an SCD2 snapshot,
+  which keeps one row per entity *per version interval* — its row grain is
+  `entity_key ∪ {version columns}`. Trusting the entity key would *falsely clear* a downstream
+  `JOIN snapshot ON entity_key` that actually fans out across versions (the dangerous direction — a
+  false proof of safety, not a missed warning). Fixed: `grain_of` now takes a `DeclaredKeyKind`; a
+  `SnapshotEntityKey` yields `Unknown` (silent — an honest miss) rather than a fabricated all-clear,
+  pinned by `snapshot_entity_key_is_not_a_row_grain`. Firing on an *unfiltered* SCD2 entity-key join
+  (higher value, but unsound without point-in-time-filter detection) is a documented follow-up, not
+  attempted here.
+- **A merge `unique_key` is asserted, not proven (found by stop-time review; framing corrected,
+  behavior kept).** `generate_merge_sql` emits `MERGE … ON target.key = source.key` — it does *not*
+  dedup the source and Rocky creates *no* enforced unique constraint, and the first-run
+  create-table-as-select can carry duplicate keys. So a declared merge key is the author's
+  *assertion* of the grain, not an engine-proven fact; an under-declaration (real data has more rows
+  per key than declared) would *falsely clear* a downstream join — the same dangerous direction as
+  the SCD2 case, one notch less blatant. The code no longer calls it "proven"/"authoritative"; it is
+  now documented as an unverified assertion trusted by convention (the posture every analytics tool
+  takes for a declared grain, paired with a uniqueness test). **Open design decision for wiring
+  (feeds D1):** should an unverified declared key justify *silence*, or only drive *firing* — or be
+  paired with a required uniqueness check? Only structural inference (`GROUP BY`/`DISTINCT`) is
+  compile-time *sound*; declared keys are trust, and the spike does not yet distinguish the two
+  provenances in the returned `Grain`.

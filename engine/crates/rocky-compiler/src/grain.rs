@@ -30,10 +30,12 @@
 //!    row matches on it. Those columns count as satisfied, killing the
 //!    constant-pinned false-positive class.
 //! 3. **Declared-key grain source.** [`grain_of`] reads a declared merge/upsert
-//!    `unique_key` as an authoritative grain, falling back to structural
-//!    inference when none is declared. A snapshot (SCD2) entity key is *not* a
-//!    row grain — SCD2 keeps multiple versions per entity — so it is never
-//!    trusted as one (see [`DeclaredKeyKind`]).
+//!    `unique_key` as the model's *asserted* grain (unverified — Rocky enforces
+//!    no unique constraint), falling back to structural inference when none is
+//!    declared. Only structural inference is *sound*; a declared key is trusted
+//!    by convention. A snapshot (SCD2) entity key is *not* a row grain — SCD2
+//!    keeps multiple versions per entity — so it is never trusted as one (see
+//!    [`DeclaredKeyKind`]).
 //!
 //! ## What still stays `Unknown` (⇒ silent) — honest residual gaps
 //!
@@ -117,8 +119,14 @@ impl Grain {
 /// key are spelled the same way but say different things about row counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclaredKeyKind {
-    /// A merge/upsert key. The materialization keeps exactly one row per key,
-    /// so the key *is* the output-row grain.
+    /// A merge/upsert key: the model's *declared* row key. Rocky merges on it
+    /// (`MERGE ... ON target.key = source.key`) and takes it as the grain, but
+    /// does **not** enforce it — no unique constraint is created, and an initial
+    /// full-refresh load or a duplicate-keyed source can leave more than one row
+    /// per key. So this grain is *asserted by the author*, not proven by the
+    /// engine, and is only as good as the declaration (a wrong one yields wrong
+    /// diagnostics in both directions). Trusting it is the posture every
+    /// analytics tool takes for a declared grain, paired with a uniqueness test.
     MergeRowKey,
     /// A snapshot (SCD2) entity key. The table keeps one row per entity *per
     /// version interval*, so the entity key is only part of the row grain
@@ -131,14 +139,22 @@ pub enum DeclaredKeyKind {
 /// Resolves a model's grain from its declared `unique_key` first, falling back
 /// to structural inference over its own SQL.
 ///
-/// Only a [`DeclaredKeyKind::MergeRowKey`] is authoritative — a merge upsert
-/// keeps one row per key, so the key is the grain. A
-/// [`DeclaredKeyKind::SnapshotEntityKey`] is *not* the row grain (SCD2 keeps
-/// multiple versions per entity); without the version columns we cannot form a
-/// sound grain, so it yields [`Grain::Unknown`] (silent) rather than a false
-/// proof of coverage. Firing on an unfiltered SCD2 entity-key join is a
-/// follow-up that needs the snapshot's version columns and point-in-time-filter
-/// detection.
+/// The two grain sources differ in how far they can be trusted. This spike does
+/// not yet reflect that difference in the returned [`Grain`] — whether an
+/// unverified declared key should justify *silence* is a wiring-step decision
+/// (see the trust-boundary note in `X1-PR2-MEASUREMENT.md`):
+///
+/// - **Structural inference** (`GROUP BY` / `DISTINCT`) is *sound* — the SQL
+///   guarantees the grain at compile time.
+/// - A [`DeclaredKeyKind::MergeRowKey`] is an *unverified assertion* — Rocky
+///   merges on it but enforces no unique constraint, so an under-declaration
+///   yields wrong diagnostics. Used by convention, like a declared grain in any
+///   analytics tool.
+/// - A [`DeclaredKeyKind::SnapshotEntityKey`] is *not* the row grain at all
+///   (SCD2 keeps multiple versions per entity); without the version columns we
+///   cannot form a sound grain, so it yields [`Grain::Unknown`] (silent) rather
+///   than a false proof of coverage. Firing on an unfiltered SCD2 entity-key
+///   join needs version columns + point-in-time-filter detection — a follow-up.
 #[must_use]
 pub fn grain_of(
     sql: &str,
@@ -727,8 +743,9 @@ mod tests {
 
     #[test]
     fn declared_key_overrides_inference_and_falls_back() {
-        // A declared unique_key is authoritative even when the SQL is a plain
-        // SELECT that would otherwise infer Unknown.
+        // A declared merge unique_key is TRUSTED (an author assertion, not a
+        // compile-time proof — Rocky enforces no uniqueness) even when the SQL
+        // is a plain SELECT that would otherwise infer Unknown.
         assert_eq!(
             grain_of(
                 "SELECT id, amount FROM orders",
@@ -768,8 +785,9 @@ mod tests {
             Grain::Unknown,
             "a snapshot entity key must not be treated as the output-row grain"
         );
-        // Contrast: the identical key on a MERGE upsert *is* the row grain,
-        // because a merge keeps exactly one row per key.
+        // Contrast: the identical key on a MERGE upsert is taken as the row
+        // grain — a merge is keyed on it, so it is the author's declared grain
+        // (trusted by convention, not enforced; see `DeclaredKeyKind`).
         assert_eq!(
             grain_of(snap_sql, &["customer_id"], DeclaredKeyKind::MergeRowKey),
             Grain::known(["customer_id"]),
