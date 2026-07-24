@@ -29,10 +29,44 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::state::ServerState;
 
-/// Path prefixes that bypass the auth middleware. `/api/v1/health` is
+/// Exact paths that bypass the Bearer-token middleware. `/api/v1/health` is
 /// the canonical liveness probe — orchestrators and load balancers need
 /// to hit it without a token.
+///
+/// This is an exact-match set. The one *class* of prefix exemption is the
+/// webhook ingress (see [`is_webhook_trigger_path`]), which carries its own
+/// HMAC authentication instead of the Bearer token.
 const AUTH_EXEMPT_PATHS: &[&str] = &["/api/v1/health"];
+
+/// The single-segment prefix under which webhook ingress routes live. A request
+/// to `<PREFIX><pipeline>` is exempt from the Bearer token because the handler
+/// verifies an `X-Rocky-Signature` HMAC over the raw body instead.
+const WEBHOOK_TRIGGER_PREFIX: &str = "/api/v1/hooks/trigger/";
+
+/// Whether `path` is a webhook-ingress route eligible for the HMAC-auth
+/// exemption from the Bearer middleware.
+///
+/// The exemption is deliberately the **tightest** possible: the path must be a
+/// single non-empty segment directly under [`WEBHOOK_TRIGGER_PREFIX`] — the
+/// remainder after the prefix must be non-empty and contain no `/`. This means
+/// none of the classic bypass shapes are ever exempted, because each contains a
+/// `/` in the post-prefix remainder:
+///
+/// - traversal: `/api/v1/hooks/trigger/../jobs` → remainder `../jobs`
+/// - percent-encoded traversal: `/api/v1/hooks/trigger/%2e%2e/jobs`
+/// - a trailing/extra segment: `/api/v1/hooks/trigger/x/y`
+/// - a bare/double slash: `/api/v1/hooks/trigger/` or `//`
+///
+/// axum's router matches these against the same raw `uri().path()` this checks
+/// (matchit does not collapse `..`), so a path that is not exempted here is also
+/// not routed to the single-segment `{pipeline}` handler — the middleware view
+/// and the router view cannot diverge into a bypass.
+fn is_webhook_trigger_path(path: &str) -> bool {
+    match path.strip_prefix(WEBHOOK_TRIGGER_PREFIX) {
+        Some(rest) => !rest.is_empty() && !rest.contains('/'),
+        None => false,
+    }
+}
 
 /// Bearer-token auth middleware.
 ///
@@ -53,7 +87,10 @@ pub async fn require_bearer_token(
     request: Request,
     next: Next,
 ) -> Response {
-    if AUTH_EXEMPT_PATHS.contains(&request.uri().path()) {
+    let path = request.uri().path();
+    // Health is exact-exempt; webhook ingress is prefix-exempt because it
+    // carries its own HMAC auth. Both bypass the Bearer token here.
+    if AUTH_EXEMPT_PATHS.contains(&path) || is_webhook_trigger_path(path) {
         return next.run(request).await;
     }
 
@@ -154,6 +191,45 @@ pub fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_exemption_matches_a_single_pipeline_segment() {
+        assert!(is_webhook_trigger_path("/api/v1/hooks/trigger/orders"));
+        assert!(is_webhook_trigger_path(
+            "/api/v1/hooks/trigger/my-pipeline.v2"
+        ));
+        // A percent-encoded slash in the pipeline name is one segment at the
+        // raw-path level (axum decodes it only when extracting the param), and
+        // still routes solely to the webhook handler — so exempting it is safe.
+        assert!(is_webhook_trigger_path(
+            "/api/v1/hooks/trigger/my%2fpipeline"
+        ));
+    }
+
+    #[test]
+    fn webhook_exemption_never_widens_to_another_route() {
+        // Every classic bypass shape has a `/` in the post-prefix remainder, so
+        // none is exempted — they fall through to the Bearer middleware.
+        assert!(!is_webhook_trigger_path("/api/v1/hooks/trigger/../jobs"));
+        assert!(!is_webhook_trigger_path(
+            "/api/v1/hooks/trigger/../../jobs/run"
+        ));
+        assert!(!is_webhook_trigger_path(
+            "/api/v1/hooks/trigger/%2e%2e/jobs"
+        ));
+        assert!(!is_webhook_trigger_path("/api/v1/hooks/trigger/x/y"));
+        assert!(!is_webhook_trigger_path("/api/v1/hooks/trigger//"));
+        // Empty pipeline segment and the bare prefix are not exempt.
+        assert!(!is_webhook_trigger_path("/api/v1/hooks/trigger/"));
+        assert!(!is_webhook_trigger_path("/api/v1/hooks/trigger"));
+        // Unrelated routes are never exempt.
+        assert!(!is_webhook_trigger_path("/api/v1/jobs/run"));
+        assert!(!is_webhook_trigger_path("/api/v1/health"));
+        // A path that merely embeds the prefix later is not exempt.
+        assert!(!is_webhook_trigger_path(
+            "/api/v1/jobs/../hooks/trigger/orders"
+        ));
+    }
 
     #[test]
     fn constant_time_eq_matches_strings() {

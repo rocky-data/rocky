@@ -127,12 +127,52 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Computes HMAC-SHA256 of `body` using `secret` and returns hex-encoded digest.
 pub fn compute_signature(secret: &str, body: &str) -> String {
+    compute_signature_bytes(secret, body.as_bytes())
+}
+
+/// Computes HMAC-SHA256 over the raw `body` bytes using `secret`, returning the
+/// lower-case hex digest.
+///
+/// The bytes-based sibling of [`compute_signature`]: inbound webhook
+/// verification must sign the *exact* request body it received, which is not
+/// guaranteed to be valid UTF-8, so it cannot go through the `&str` form.
+pub fn compute_signature_bytes(secret: &str, body: &[u8]) -> String {
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
-    mac.update(body.as_bytes());
+    mac.update(body);
     let result = mac.finalize();
     let bytes = result.into_bytes();
     hex::encode(bytes.as_slice())
+}
+
+/// Verify an inbound `X-Rocky-Signature` against the raw request body.
+///
+/// Returns `true` only when `provided_hex` is the lower-case hex HMAC-SHA256 of
+/// `body` under `secret`. The comparison is **constant-time** in the digest
+/// length so a timing oracle cannot recover the expected signature byte by byte;
+/// a length mismatch (including a non-hex or truncated header) returns `false`
+/// without leaking where it diverged. `provided_hex` is lower-cased before the
+/// compare so a caller sending upper-case hex still verifies.
+pub fn verify_signature(secret: &str, body: &[u8], provided_hex: &str) -> bool {
+    let expected = compute_signature_bytes(secret, body);
+    constant_time_eq(
+        expected.as_bytes(),
+        provided_hex.to_ascii_lowercase().as_bytes(),
+    )
+}
+
+/// Constant-time byte comparison: `true` only when both slices have the same
+/// length *and* every byte matches. Runtime is independent of the position of
+/// the first mismatch, so it is safe for comparing secrets and MACs.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 // Inline hex encoder to avoid an extra dependency
@@ -364,6 +404,42 @@ mod tests {
         let sig1 = compute_signature("secret", "body");
         let sig2 = compute_signature("secret", "body");
         assert_eq!(sig1, sig2);
+    }
+
+    #[test]
+    fn verify_accepts_a_valid_signature() {
+        let secret = "shhh";
+        let body = br#"{"event":"sync.done"}"#;
+        let sig = compute_signature_bytes(secret, body);
+        assert!(verify_signature(secret, body, &sig));
+        // Upper-case hex from a sender still verifies.
+        assert!(verify_signature(secret, body, &sig.to_ascii_uppercase()));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_missing_or_malformed_signatures() {
+        let secret = "shhh";
+        let body = b"payload";
+        let good = compute_signature_bytes(secret, body);
+        // Wrong secret.
+        assert!(!verify_signature("other", body, &good));
+        // Tampered body.
+        assert!(!verify_signature(secret, b"payload!", &good));
+        // Missing / empty header.
+        assert!(!verify_signature(secret, body, ""));
+        // Malformed (not hex, wrong length) never panics and never matches.
+        assert!(!verify_signature(secret, body, "not-a-signature"));
+        assert!(!verify_signature(secret, body, &good[..10]));
+    }
+
+    #[test]
+    fn verify_signs_the_raw_bytes_not_a_utf8_view() {
+        // A body that is not valid UTF-8 must still verify against its raw-byte
+        // HMAC — the whole reason inbound verification cannot go through `&str`.
+        let secret = "k";
+        let body: &[u8] = &[0xff, 0x00, 0xfe, 0x80];
+        let sig = compute_signature_bytes(secret, body);
+        assert!(verify_signature(secret, body, &sig));
     }
 
     #[test]

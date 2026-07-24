@@ -178,6 +178,12 @@ pub struct Demand {
     /// The logical timestamp: the cron occurrence, the max upstream success
     /// completion, or the staleness reference instant.
     pub logical_ts: DateTime<Utc>,
+    /// Overrides the claim-key discriminator when present. Coordinate-derived
+    /// demands (cron/`after`/freshness) leave this `None` and key on
+    /// `logical_ts`; a webhook demand carries its minted `demand_uid` here so
+    /// each accepted delivery gets its own claim (a webhook has no logical
+    /// occurrence to key on).
+    pub claim_discriminator: Option<String>,
 }
 
 /// Why a source did not produce a demand this tick. Every "do not run" path is
@@ -529,6 +535,7 @@ pub fn evaluate_one(
                     pipeline: schedule.pipeline.clone(),
                     source: DemandKind::Cron,
                     logical_ts,
+                    claim_discriminator: None,
                 });
             }
             Err(_) => {
@@ -553,6 +560,7 @@ pub fn evaluate_one(
                             pipeline: schedule.pipeline.clone(),
                             source: DemandKind::After,
                             logical_ts,
+                            claim_discriminator: None,
                         });
                     }
                     Err(reason) => out.skips.push(SourceSkip {
@@ -588,6 +596,7 @@ pub fn evaluate_one(
                             pipeline: schedule.pipeline.clone(),
                             source: DemandKind::Freshness,
                             logical_ts,
+                            claim_discriminator: None,
                         });
                     }
                     Err(reason) => out.skips.push(SourceSkip {

@@ -25,6 +25,8 @@ Thumbs.db
 *.duckdb
 *.duckdb.wal
 .rocky-state*
+# Resident-scheduler runtime dir: tick lock, heartbeat, and the webhook demand spool.
+.rocky/
 
 # --- Vendored binaries (downloaded by scripts/vendor_*.sh) ---
 vendor/

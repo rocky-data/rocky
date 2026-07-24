@@ -18,6 +18,10 @@ use std::path::Path;
 
 use anyhow::Result;
 
+/// The fixed webhook-ingress request rate (requests/second), with an equal
+/// burst. A flood guard shared across all callers, not a per-sender quota.
+const WEBHOOK_RATE_LIMIT_RPS: f64 = 10.0;
+
 /// Execute `rocky serve`.
 ///
 /// When `scheduler` is set, a resident reconciler loop runs alongside the HTTP
@@ -43,13 +47,40 @@ pub async fn run_serve(
     // CI / scripts can override an inherited environment.
     let token = auth_token.or_else(|| std::env::var("ROCKY_SERVE_TOKEN").ok());
 
-    let state = rocky_server::state::ServerState::with_auth(
+    // The config file the scheduler reads (falls back to the conventional
+    // `rocky.toml`); the webhook spool is anchored under its `.rocky` directory,
+    // so the accept path and the reconciler agree on one spool.
+    let resolved_config = config_path
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("rocky.toml"));
+
+    // Webhook ingress is live only alongside a resident reconciler (`--scheduler`)
+    // — nothing else would consume a spooled demand. The secret comes from
+    // `ROCKY_WEBHOOK_SECRET`; without one the route stays dark unless the bind is
+    // loopback (dev convenience).
+    let webhook = if scheduler {
+        Some(rocky_server::webhook_ingress::WebhookIngress {
+            secret: std::env::var("ROCKY_WEBHOOK_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            bind_is_loopback: crate::api::is_loopback(&host),
+            rocky_dir: crate::commands::scheduler::rocky_dir_for_config(&resolved_config),
+            rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(
+                WEBHOOK_RATE_LIMIT_RPS,
+            ),
+        })
+    } else {
+        None
+    };
+
+    let state = rocky_server::state::ServerState::with_auth_and_webhook(
         models_dir.to_path_buf(),
         contracts_dir.map(std::path::Path::to_path_buf),
         config_path.map(std::path::Path::to_path_buf),
         token,
         allowed_origins,
         state_path.map(std::path::Path::to_path_buf),
+        webhook,
     );
 
     // Start filesystem watcher if requested
@@ -104,14 +135,9 @@ pub async fn run_serve(
                 .map(std::time::Duration::from_secs)
                 .unwrap_or(crate::commands::scheduler::DEFAULT_DRAIN_TIMEOUT),
         };
-        // Read schedules from the config file the server bound (falls back to the
-        // conventional `rocky.toml`); a missing/invalid file just idles the loop.
-        let resolved_config = config_path
-            .map(std::path::Path::to_path_buf)
-            .unwrap_or_else(|| std::path::PathBuf::from("rocky.toml"));
         Some(crate::commands::scheduler::spawn_scheduler(
             state.clone(),
-            resolved_config,
+            resolved_config.clone(),
             sched_cfg,
             shutdown.clone(),
             server_ready.clone(),

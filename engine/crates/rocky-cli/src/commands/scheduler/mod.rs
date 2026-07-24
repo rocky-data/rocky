@@ -43,8 +43,20 @@ use rocky_server::state::ServerState;
 use crate::api::state_path_for;
 use crate::commands::tick::build_member_budgets;
 
-/// The default poll interval between ticks (Hugo-overridable, O1-DESIGN §10).
+/// The default poll interval between ticks.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The `.rocky` directory for a config file: its parent directory (the project
+/// root, not the process cwd) joined with `.rocky`. The single derivation shared
+/// by the reconciler loop, the schedule-status endpoint, and the webhook-ingress
+/// accept path, so all three agree on the tick lock and the demand spool.
+pub(crate) fn rocky_dir_for_config(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(".rocky")
+}
 
 /// The floor the loop enforces on the poll interval. The CLI already rejects a
 /// zero `--poll-interval-seconds`, but [`SchedulerConfig`] is public, so the loop
@@ -129,15 +141,11 @@ pub async fn run_scheduler(
     spawner: Arc<dyn Spawner>,
     metrics: SchedulerMetrics,
 ) {
-    // The `.rocky` dir (tick lock; and, in PR 2, the webhook spool) is anchored
-    // to the config file's directory — the project root — not the process cwd,
-    // so a `serve --scheduler` and a cron `rocky tick` launched from different
-    // cwds contend on the same lock.
-    let rocky_dir = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-        .join(".rocky");
+    // The `.rocky` dir (tick lock + the webhook demand spool) is anchored to the
+    // config file's directory — the project root — not the process cwd, so a
+    // `serve --scheduler` and a cron `rocky tick` launched from different cwds
+    // contend on the same lock and read the same spool.
+    let rocky_dir = rocky_dir_for_config(&config_path);
     let state_path =
         std::path::absolute(state_path_for(&state)).unwrap_or_else(|_| state_path_for(&state));
     // Clamp defensively (see `MIN_POLL_INTERVAL`): a zero interval would busy-spin.
@@ -458,6 +466,7 @@ fn skip_reason_label(reason: &TickSkipReason) -> &'static str {
         TickSkipReason::FailureBackoff { .. } => "failure_backoff",
         TickSkipReason::PartialBackoff { .. } => "partial_backoff",
         TickSkipReason::Dedup => "dedup",
+        TickSkipReason::ConfigError => "config_error",
         TickSkipReason::HistoryUnavailable => "history_unavailable",
         TickSkipReason::StateBusy => "state_busy",
     }
@@ -855,6 +864,7 @@ cron = "* * * * *"
             TickSkipReason::FailureBackoff { resume_at: ts },
             TickSkipReason::PartialBackoff { resume_at: ts },
             TickSkipReason::Dedup,
+            TickSkipReason::ConfigError,
             TickSkipReason::HistoryUnavailable,
             TickSkipReason::StateBusy,
         ];
@@ -868,6 +878,7 @@ cron = "* * * * *"
                 | TickSkipReason::FailureBackoff { .. }
                 | TickSkipReason::PartialBackoff { .. }
                 | TickSkipReason::Dedup
+                | TickSkipReason::ConfigError
                 | TickSkipReason::HistoryUnavailable
                 | TickSkipReason::StateBusy => {}
             }

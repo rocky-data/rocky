@@ -16,6 +16,7 @@ pub mod occurrence;
 pub mod reconcile;
 pub mod record;
 pub mod spawn;
+pub mod spool;
 
 pub use claim::{
     Bookkeeping, CfDelta, ClaimCas, ClaimRecord, ClaimState, DemandKind, PostAttempt, PreSpawn,
@@ -38,6 +39,7 @@ pub use reconcile::{
 };
 pub use record::{ScheduleStateMutation, ScheduleStateRecord, Throttle};
 pub use spawn::{
-    CapturingSpawner, DEFAULT_DRAIN_TIMEOUT, Drain, RunOutcome, SpawnRequest, Spawner,
-    SubprocessSpawner,
+    CapturingSpawner, DEFAULT_DRAIN_TIMEOUT, Drain, RunOutcome, RunTriggerKind, SpawnRequest,
+    Spawner, SubprocessSpawner,
 };
+pub use spool::{AcceptOutcome, PendingDemand, WebhookKind, accept, spool_dir};

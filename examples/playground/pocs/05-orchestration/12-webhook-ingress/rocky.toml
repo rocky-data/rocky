@@ -1,0 +1,18 @@
+# Webhook ingress (at-most-once) — trigger a pipeline over HTTP.
+#
+# `rocky serve --scheduler` exposes POST /api/v1/hooks/trigger/{pipeline}.
+# A signed webhook queues a durable, at-most-once run demand that the
+# resident reconciler consumes on its next tick. See run.sh.
+
+[adapter]
+type = "duckdb"
+path = "poc.duckdb"
+
+[state]
+backend = "local"
+
+[pipeline.hello]
+type = "transformation"
+
+[pipeline.hello.target]
+adapter = "default"

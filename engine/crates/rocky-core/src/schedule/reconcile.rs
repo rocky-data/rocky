@@ -49,7 +49,8 @@ use super::demand::{
 };
 use super::lock::{TickAcquire, TickLock};
 use super::record::{ScheduleStateMutation, ScheduleStateRecord};
-use super::spawn::{Drain, SpawnRequest, Spawner};
+use super::spawn::{Drain, RunTriggerKind, SpawnRequest, Spawner};
+use super::spool::{self, WebhookKind};
 
 /// A stuck `submitted` claim with no run record is held for this grace before
 /// its attempt is treated as lost (the owner crashed between committing the
@@ -257,6 +258,9 @@ pub enum TickSkipReason {
     /// The demand's key is already terminal (`completed`), or its run was
     /// observed and finalized by this tick's resolver — it will not run again.
     Dedup,
+    /// A spooled webhook demand targeted a pipeline no longer in config: it was
+    /// finalized without running (never left pending forever).
+    ConfigError,
     /// The run history could not be read (store fault or a corrupt row), so the
     /// standing demand was skipped rather than misclassified — fail-closed, and
     /// surfaced loudly rather than silently dropped.
@@ -478,16 +482,202 @@ pub async fn tick_once(
         }
     }
 
-    // 6. Sweep orphaned `submitted` claims — a prior tick's deferred or crashed
+    // 6. Consume durable webhook demands from the spool. Each spooled demand is
+    //    claimed (at most once) and its child spawned, then the spool file is
+    //    disposed. A dry run spawns nothing, so it never touches the spool.
+    if !opts.dry_run {
+        let consume = consume_webhook_demands(
+            config,
+            &schedules,
+            &mut phase,
+            now,
+            spawner,
+            opts,
+            lock.as_ref(),
+            &mut report,
+        )
+        .await?;
+        if consume == WebhookConsume::StoreBusy {
+            report.state_busy = true;
+            return Ok(report);
+        }
+    }
+
+    // 7. Sweep orphaned `submitted` claims — a prior tick's deferred or crashed
     //    terminal transaction — independent of whether their demand is due again
     //    (a cron occurrence advances its anchor on submission, so its claim is
     //    otherwise never re-evaluated). Only on a healthy real tick with the
     //    store still open.
     if !opts.dry_run {
         sweep_orphan_claims(&schedules, phase.store(), now)?;
+        // Bound the id-dedup window: drop `.done` tombstones past their TTL.
+        if let Err(e) = spool::sweep_tombstones(&spool::spool_dir(&opts.rocky_dir), now) {
+            tracing::warn!(error = %e, "webhook tombstone sweep failed");
+        }
     }
 
     Ok(report)
+}
+
+/// Whether the webhook consume phase completed or bailed on store contention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebhookConsume {
+    /// Every pending demand was processed (or deferred to a later tick).
+    Done,
+    /// The store could not be re-opened after a child ran; the caller must end
+    /// the pass. Any un-processed demand stays spooled for the next tick.
+    StoreBusy,
+}
+
+/// Build the schedule a webhook demand runs under: the pipeline's resolved
+/// schedule when it has one (so a webhook run inherits the scheduler-level
+/// timeout), else a minimal enabled schedule. `retry_max` is forced to `0` in
+/// both cases — a webhook is one-shot (consumed by being attempted), so a
+/// crashed attempt is finalized as a failure, never re-run.
+fn webhook_schedule(
+    schedules: &BTreeMap<String, ResolvedSchedule>,
+    pipeline: &str,
+) -> ResolvedSchedule {
+    match schedules.get(pipeline) {
+        Some(base) => ResolvedSchedule {
+            retry_max: 0,
+            ..base.clone()
+        },
+        None => ResolvedSchedule {
+            pipeline: pipeline.to_string(),
+            enabled: true,
+            cron: None,
+            after: Vec::new(),
+            freshness_budget: None,
+            catchup: super::demand::Catchup::Skip,
+            retry_max: 0,
+            timeout: None,
+        },
+    }
+}
+
+/// Consume the durable webhook spool: for each pending demand, drive its claim
+/// to a terminal state (spawning the child) and then dispose of the file.
+///
+/// The reconciler is the single-threaded dedup authority. For a
+/// [`WebhookKind::Id`] demand it consults the `.done` tombstone *before*
+/// claiming, so an accept-side race (a redelivery landing a fresh file after
+/// consumption) can never cause a second run — the tombstone drops the
+/// duplicate. A pipeline no longer in config is finalized and disposed loudly so
+/// it never lingers forever; an unparseable file is quarantined, never silently
+/// deleted.
+#[allow(clippy::too_many_arguments)]
+async fn consume_webhook_demands(
+    config: &RockyConfig,
+    schedules: &BTreeMap<String, ResolvedSchedule>,
+    phase: &mut PhaseStore,
+    now: DateTime<Utc>,
+    spawner: &dyn Spawner,
+    opts: &TickOptions,
+    lock: Option<&TickLock>,
+    report: &mut TickReport,
+) -> Result<WebhookConsume, TickError> {
+    let files = match spool::list_pending_files(&opts.rocky_dir) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "scanning the webhook spool failed; skipping this tick");
+            return Ok(WebhookConsume::Done);
+        }
+    };
+
+    for path in files {
+        // Stop starting new webhook work once a drain is raised, exactly like the
+        // per-pipeline loop; already-spooled demands survive to the next tick.
+        if opts.drain.is_signalled() {
+            report.drained = true;
+            break;
+        }
+
+        let demand_record = match spool::read_pending(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                match spool::quarantine(&path, now) {
+                    Ok(dest) => tracing::warn!(
+                        error = %e,
+                        quarantined = %dest.display(),
+                        "corrupt webhook spool file quarantined; not processed"
+                    ),
+                    Err(qe) => tracing::error!(
+                        error = %qe,
+                        file = %path.display(),
+                        "failed to quarantine a corrupt webhook spool file"
+                    ),
+                }
+                continue;
+            }
+        };
+
+        // A pipeline removed from config: finalize (never run) and dispose loudly
+        // so an orphaned demand does not linger forever.
+        if !config.pipelines.contains_key(&demand_record.pipeline) {
+            tracing::warn!(
+                pipeline = %demand_record.pipeline,
+                demand_uid = %demand_record.demand_uid,
+                "webhook demand targets a pipeline absent from config; finalizing without running"
+            );
+            if let Err(e) = spool::dispose(&path, demand_record.kind) {
+                tracing::error!(error = %e, "failed to dispose a config-orphaned webhook demand");
+            }
+            report.skipped.push(SkippedDemand {
+                pipeline: demand_record.pipeline.clone(),
+                source: Some(DemandKind::Webhook),
+                reason: TickSkipReason::ConfigError,
+            });
+            continue;
+        }
+
+        // Id-dedup authority: a tombstone means this delivery id already ran.
+        // Drop the (duplicate) pending file without running.
+        if demand_record.kind == WebhookKind::Id && spool::is_tombstoned(&path) {
+            if let Err(e) = spool::drop_pending(&path) {
+                tracing::warn!(error = %e, "failed to drop a duplicate webhook demand");
+            }
+            continue;
+        }
+
+        let schedule = webhook_schedule(schedules, &demand_record.pipeline);
+        let logical_ts = DateTime::parse_from_rfc3339(&demand_record.received_at)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or(now);
+        let demand = Demand {
+            pipeline: demand_record.pipeline.clone(),
+            source: DemandKind::Webhook,
+            logical_ts,
+            claim_discriminator: Some(demand_record.demand_uid.clone()),
+        };
+
+        match execute_demand(&demand, &schedule, phase, now, spawner, opts, lock).await? {
+            ExecOutcome::Executed(ed) => {
+                report.executed.push(ed);
+                if let Err(e) = spool::dispose(&path, demand_record.kind) {
+                    tracing::error!(error = %e, "failed to dispose a consumed webhook demand");
+                }
+            }
+            ExecOutcome::Skipped(sd) => {
+                let terminal = matches!(sd.reason, TickSkipReason::Dedup);
+                report.skipped.push(sd);
+                if terminal {
+                    // The claim reached (or was already) terminal — dispose.
+                    if let Err(e) = spool::dispose(&path, demand_record.kind) {
+                        tracing::error!(error = %e, "failed to dispose a finalized webhook demand");
+                    }
+                }
+                // Otherwise (in-flight / within crash grace): leave the file for
+                // the next tick to re-resolve.
+            }
+            ExecOutcome::StoreBusy(sd) => {
+                report.skipped.push(sd);
+                return Ok(WebhookConsume::StoreBusy);
+            }
+        }
+    }
+
+    Ok(WebhookConsume::Done)
 }
 
 /// A read-only [`ScheduleStateView`] backed by the live store.
@@ -688,13 +878,22 @@ fn map_skip(pipeline: &str, skip: &SourceSkip) -> Option<SkippedDemand> {
     })
 }
 
-/// The claim storage key for a coordinate-derived demand:
-/// `<pipeline>\u{1f}<source>\u{1f}<logical_ts>`.
-fn claim_key(pipeline: &str, source: DemandKind, logical_ts: DateTime<Utc>) -> String {
+/// The claim storage key for a demand: `<pipeline>\u{1f}<source>\u{1f}<disc>`.
+///
+/// The discriminator is the demand's `claim_discriminator` when set (a webhook's
+/// minted `demand_uid`) or its `logical_ts` otherwise (the cron occurrence /
+/// standing reference instant). [`parse_claim_key`](crate::schedule::parse_claim_key)
+/// accepts either form.
+fn claim_key(demand: &Demand) -> String {
+    let disc = demand
+        .claim_discriminator
+        .clone()
+        .unwrap_or_else(|| demand.logical_ts.to_rfc3339());
     format!(
-        "{pipeline}\u{1f}{}\u{1f}{}",
-        source.as_str(),
-        logical_ts.to_rfc3339()
+        "{}\u{1f}{}\u{1f}{}",
+        demand.pipeline,
+        demand.source.as_str(),
+        disc
     )
 }
 
@@ -756,7 +955,7 @@ async fn execute_demand(
     opts: &TickOptions,
     lock: Option<&TickLock>,
 ) -> Result<ExecOutcome, TickError> {
-    let key = claim_key(&demand.pipeline, demand.source, demand.logical_ts);
+    let key = claim_key(demand);
     let mut iterations = 0;
     loop {
         iterations += 1;
@@ -843,6 +1042,7 @@ async fn execute_claimed(
             submission_id: submission_id.clone(),
             traceparent: opts.traceparent.clone(),
             timeout: schedule.timeout.map(to_std_timeout),
+            trigger: RunTriggerKind::for_source(demand.source),
         };
         // Release the store — both locks — for the child's whole window: the
         // child `rocky run` opens the SAME state file, and the redb + advisory
@@ -1392,7 +1592,12 @@ cron = "also invalid"
         submission_id: &str,
         transitioned_at: DateTime<Utc>,
     ) -> String {
-        let key = claim_key(pipeline, source, logical_ts);
+        let key = claim_key(&Demand {
+            pipeline: pipeline.to_string(),
+            source,
+            logical_ts,
+            claim_discriminator: None,
+        });
         let claim = ClaimRecord::new_submitted(submission_id.to_string(), transitioned_at);
         let cas = store
             .schedule_claim_cas(&key, None, &claim, pipeline, &ScheduleStateMutation::None)
@@ -2378,5 +2583,448 @@ freshness = true
                 "the sweep leaves consecutive_failures untouched"
             );
         });
+    }
+
+    // --- webhook ingress (at-most-once spool consumption) --------------------
+
+    /// A no-schedule pipeline a webhook can target (plus a second one for the
+    /// two-pipelines dedup case).
+    const WEBHOOK_TARGETS: &str = r#"
+[adapter.db]
+type = "duckdb"
+
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+
+[pipeline.other]
+type = "transformation"
+[pipeline.other.target]
+adapter = "db"
+"#;
+
+    fn webhook_now() -> DateTime<Utc> {
+        at(2026, 5, 2, 3, 0)
+    }
+
+    /// The `demand_uid` minted by an accept, read back off the single pending
+    /// file so a test can seed a matching claim.
+    fn accept_and_read_uid(
+        rocky_dir: &std::path::Path,
+        pipeline: &str,
+        kind: crate::schedule::spool::WebhookKind,
+        token: &str,
+    ) -> String {
+        let outcome = crate::schedule::spool::accept(
+            rocky_dir,
+            pipeline,
+            kind,
+            token,
+            "bodyhash",
+            webhook_now(),
+        )
+        .unwrap();
+        match outcome {
+            crate::schedule::spool::AcceptOutcome::Created(uid) => uid,
+            crate::schedule::spool::AcceptOutcome::Duplicate => panic!("expected a fresh accept"),
+        }
+    }
+
+    /// A spooled webhook demand fires its pipeline exactly once and disposes the
+    /// file to a `.done` tombstone (id kind) — this is also the 202-durability
+    /// case: the file is present, the server "crashed", the next tick executes.
+    #[test]
+    fn webhook_id_demand_fires_once_and_tombstones() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-1");
+
+        let spawner = CapturingSpawner::new(0);
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                webhook_now(),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            spawner.run_count(),
+            1,
+            "the spooled webhook demand runs once"
+        );
+        let runs = spawner.runs_for("raw");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].request.trigger, RunTriggerKind::Webhook);
+        assert_eq!(report.executed.len(), 1);
+        assert_eq!(report.executed[0].source, DemandKind::Webhook);
+
+        // Consumed: no pending file remains, a `.done` tombstone was left.
+        assert!(
+            spool::list_pending_files(&opts.rocky_dir)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Re-tick at the same instant: the tombstone dedups, nothing re-fires.
+        let report2 = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                webhook_now(),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+        assert_eq!(spawner.run_count(), 1, "an id demand never runs twice");
+        assert!(report2.executed.is_empty());
+    }
+
+    /// A failed webhook child (exit 1) is consumed with NO requeue — at-most-once
+    /// means one attempt, and the failure is visible in the report/history.
+    #[test]
+    fn webhook_failed_child_is_consumed_without_requeue() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-1");
+
+        let spawner = CapturingSpawner::new(0);
+        spawner.script("raw", [1]); // the child exits 1 (failure)
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                webhook_now(),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            spawner.run_count(),
+            1,
+            "one attempt, no retry (retry_max=0)"
+        );
+        assert_eq!(report.executed.len(), 1);
+        assert_eq!(report.executed[0].outcome, TerminalOutcome::Failure);
+        assert!(
+            spool::list_pending_files(&opts.rocky_dir)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Re-tick: the claim is completed{failure}, so it never re-runs.
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.run_count(), 1, "a failed webhook is not requeued");
+    }
+
+    /// Crash between the claim CAS and disposal: the claim is `submitted` and the
+    /// child already recorded a terminal run, but the spool file is still present.
+    /// The next tick idempotently completes disposal with EXACTLY ONE run and no
+    /// new spawn.
+    #[test]
+    fn webhook_crash_after_claim_self_heals_to_exactly_one_run() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        let uid = accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-1");
+
+        // Simulate the crash: a submitted claim for this demand's key + a terminal
+        // run the (now-dead) child recorded, both present, plus the spool file.
+        let key = claim_key(&Demand {
+            pipeline: "raw".to_string(),
+            source: DemandKind::Webhook,
+            logical_ts: webhook_now(),
+            claim_discriminator: Some(uid.clone()),
+        });
+        with_store(&state_path, |store| {
+            let claim = ClaimRecord::new_submitted("sub-crash".to_string(), webhook_now());
+            store
+                .schedule_claim_cas(&key, None, &claim, "raw", &ScheduleStateMutation::None)
+                .unwrap();
+            seed_run(
+                store,
+                "raw",
+                Some("sub-crash"),
+                RunStatus::Success,
+                webhook_now(),
+                webhook_now(),
+            );
+        });
+
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+
+        // No NEW spawn — the recorded run is joined and the claim finalized.
+        assert_eq!(
+            spawner.run_count(),
+            0,
+            "the recorded run is honored, not re-run"
+        );
+        with_store(&state_path, |store| {
+            let claim = store.get_schedule_claim(&key).unwrap().unwrap();
+            assert!(claim.is_completed(), "the crashed claim was finalized");
+        });
+        // Disposed — no pending file lingers.
+        assert!(
+            spool::list_pending_files(&opts.rocky_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The reconciler is the id-dedup authority: a pending file whose key already
+    /// has a `.done` tombstone (a redelivery landing after consumption) is dropped
+    /// WITHOUT running, closing the accept-side race.
+    #[test]
+    fn webhook_pending_with_existing_tombstone_is_dropped_not_run() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        // First delivery: accept + consume → a `.done` tombstone.
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-1");
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.run_count(), 1);
+
+        // Simulate the accept-side race: a fresh pending file at the SAME key
+        // (a different uid) materializes after the tombstone exists. Derive the
+        // key path from the tombstone (strip `.done`) — the on-disk key is a
+        // hash, so a test must not hand-encode it.
+        let spool_path = spool::spool_dir(&opts.rocky_dir);
+        let tombstone = std::fs::read_dir(&spool_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().ends_with(".done"))
+            .expect("the first consume left a .done tombstone")
+            .path();
+        let racing = tombstone.with_extension(""); // `<hex>.done` -> `<hex>`
+        let record = serde_json::json!({
+            "demand_uid": "racing-uid",
+            "pipeline": "raw",
+            "kind": "id",
+            "token": "evt-1",
+            "received_at": webhook_now().to_rfc3339(),
+            "body_hash": "h",
+        });
+        std::fs::write(&racing, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(
+            spawner.run_count(),
+            1,
+            "the tombstoned duplicate must not run"
+        );
+        assert!(
+            spool::list_pending_files(&opts.rocky_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A body-keyed demand leaves no tombstone, so an identical body delivered
+    /// again after consumption is a NEW demand that fires again.
+    #[test]
+    fn webhook_body_demand_fires_again_after_consumption() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        let spawner = CapturingSpawner::new(0);
+
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Body, "bodyhash");
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.run_count(), 1);
+        assert!(
+            spool::list_pending_files(&opts.rocky_dir)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Same body again, after consumption → fires again.
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Body, "bodyhash");
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(
+            spawner.run_count(),
+            2,
+            "a body demand re-fires post-consumption"
+        );
+    }
+
+    /// The same body delivered to two different pipelines is two demands; both
+    /// fire.
+    #[test]
+    fn webhook_same_body_two_pipelines_both_fire() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Body, "bh");
+        accept_and_read_uid(&opts.rocky_dir, "other", spool::WebhookKind::Body, "bh");
+
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.run_count(), 2);
+        assert_eq!(spawner.runs_for("raw").len(), 1);
+        assert_eq!(spawner.runs_for("other").len(), 1);
+    }
+
+    /// A demand for a pipeline removed from config is finalized (never run) and
+    /// disposed loudly — never left pending forever.
+    #[test]
+    fn webhook_demand_for_unknown_pipeline_is_finalized_not_run() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        // "ghost" is not in the config.
+        accept_and_read_uid(&opts.rocky_dir, "ghost", spool::WebhookKind::Id, "evt-1");
+
+        let spawner = CapturingSpawner::new(0);
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                webhook_now(),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+        assert_eq!(
+            spawner.run_count(),
+            0,
+            "an unknown-pipeline demand never runs"
+        );
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|s| s.reason == TickSkipReason::ConfigError),
+            "the removed-pipeline demand is reported as a config_error skip"
+        );
+        assert!(
+            spool::list_pending_files(&opts.rocky_dir)
+                .unwrap()
+                .is_empty(),
+            "the orphaned demand is disposed, never left pending"
+        );
+    }
+
+    /// A corrupt spool file is quarantined (never silently deleted) and the tick
+    /// continues.
+    #[test]
+    fn webhook_corrupt_file_is_quarantined_and_tick_continues() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        let spool_path = spool::spool_dir(&opts.rocky_dir);
+        std::fs::create_dir_all(&spool_path).unwrap();
+        std::fs::write(spool_path.join("raw__id__bad"), b"not json").unwrap();
+        // A good demand alongside the corrupt one still runs.
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "good");
+
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(spawner.run_count(), 1, "the good demand still runs");
+        assert!(
+            spool::count_corrupt(&opts.rocky_dir).unwrap() >= 1,
+            "the corrupt file was quarantined, not deleted"
+        );
+        assert!(
+            spool::list_pending_files(&opts.rocky_dir)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A delivery id shaped like a reserved control affix (`x.corrupt-9`) is
+    /// spooled, consumed, and RUN — not hidden from the scan or miscounted as
+    /// corrupt (red-team F2, consume side).
+    #[test]
+    fn webhook_affix_shaped_delivery_id_runs() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(
+            &opts.rocky_dir,
+            "raw",
+            spool::WebhookKind::Id,
+            "x.corrupt-9",
+        );
+
+        let spawner = CapturingSpawner::new(0);
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            webhook_now(),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        assert_eq!(
+            spawner.run_count(),
+            1,
+            "an affix-shaped delivery id still runs"
+        );
+        assert_eq!(
+            spool::count_corrupt(&opts.rocky_dir).unwrap(),
+            0,
+            "an affix-shaped id must not raise a false corrupt alarm"
+        );
+        assert!(
+            spool::list_pending_files(&opts.rocky_dir)
+                .unwrap()
+                .is_empty(),
+            "the affix-shaped demand was consumed"
+        );
     }
 }

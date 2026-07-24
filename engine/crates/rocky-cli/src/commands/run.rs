@@ -579,6 +579,7 @@ fn run_trigger_from_env() -> rocky_core::state::RunTrigger {
     use rocky_core::state::RunTrigger;
     match std::env::var("ROCKY_RUN_TRIGGER").ok().as_deref() {
         Some("schedule") => RunTrigger::Schedule,
+        Some("webhook") => RunTrigger::Webhook,
         Some("sensor") => RunTrigger::Sensor,
         Some("ci") => RunTrigger::Ci,
         _ => RunTrigger::Manual,
@@ -10704,6 +10705,8 @@ mod tests {
             assert!(matches!(run_trigger_from_env(), RunTrigger::Manual));
             std::env::set_var("ROCKY_RUN_TRIGGER", "schedule");
             assert!(matches!(run_trigger_from_env(), RunTrigger::Schedule));
+            std::env::set_var("ROCKY_RUN_TRIGGER", "webhook");
+            assert!(matches!(run_trigger_from_env(), RunTrigger::Webhook));
             std::env::set_var("ROCKY_RUN_TRIGGER", "sensor");
             assert!(matches!(run_trigger_from_env(), RunTrigger::Sensor));
             std::env::set_var("ROCKY_RUN_TRIGGER", "ci");

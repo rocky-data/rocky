@@ -29,3 +29,4 @@ pub mod lsp;
 pub(crate) mod schema_cache_throttle;
 pub mod state;
 pub mod watch;
+pub mod webhook_ingress;

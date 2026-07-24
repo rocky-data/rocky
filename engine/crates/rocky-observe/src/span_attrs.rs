@@ -180,6 +180,7 @@ pub const SCHEDULER_SKIP_REASONS: &[&str] = &[
     "failure_backoff",
     "partial_backoff",
     "dedup",
+    "config_error",
     "history_unavailable",
     "state_busy",
 ];

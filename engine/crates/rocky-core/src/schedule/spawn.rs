@@ -97,6 +97,40 @@ pub struct SpawnRequest {
     /// Scheduler-level timeout, when configured. On elapse the child is
     /// terminated gracefully, then forcibly.
     pub timeout: Option<Duration>,
+    /// The `ROCKY_RUN_TRIGGER` value stamped on the child's run record —
+    /// `"schedule"` for a cron/`after`/freshness demand, `"webhook"` for a
+    /// webhook-ingress demand.
+    pub trigger: RunTriggerKind,
+}
+
+/// The trigger a spawned run records — the child maps this to its
+/// `RunTrigger` via `ROCKY_RUN_TRIGGER`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RunTriggerKind {
+    /// A cron / `after` / freshness demand (`ROCKY_RUN_TRIGGER=schedule`).
+    #[default]
+    Schedule,
+    /// A webhook-ingress demand (`ROCKY_RUN_TRIGGER=webhook`).
+    Webhook,
+}
+
+impl RunTriggerKind {
+    /// The `ROCKY_RUN_TRIGGER` env value.
+    fn as_env(self) -> &'static str {
+        match self {
+            RunTriggerKind::Schedule => "schedule",
+            RunTriggerKind::Webhook => "webhook",
+        }
+    }
+
+    /// The trigger kind for a demand source: a webhook demand records
+    /// `Webhook`, every coordinate-derived demand records `Schedule`.
+    pub fn for_source(source: crate::schedule::claim::DemandKind) -> Self {
+        match source {
+            crate::schedule::claim::DemandKind::Webhook => RunTriggerKind::Webhook,
+            _ => RunTriggerKind::Schedule,
+        }
+    }
 }
 
 /// The result of running a child to completion (or termination).
@@ -122,9 +156,9 @@ pub trait Spawner: Send + Sync {
 const KILL_GRACE: Duration = Duration::from_secs(60);
 
 /// The real spawner: launches `current_exe -c <config> run --pipeline <name>
-/// --output json` with the tick's `TRACEPARENT`, `ROCKY_RUN_TRIGGER=schedule`,
-/// and `ROCKY_SUBMISSION_ID`, honoring the scheduler-level timeout with a
-/// graceful-then-forced termination.
+/// --output json` with the tick's `TRACEPARENT`, the request's
+/// `ROCKY_RUN_TRIGGER` (`schedule` or `webhook`), and `ROCKY_SUBMISSION_ID`,
+/// honoring the scheduler-level timeout with a graceful-then-forced termination.
 #[derive(Debug, Default)]
 pub struct SubprocessSpawner {
     /// The drain signal. Default (the CLI `rocky tick` path) is never raised, so
@@ -174,7 +208,7 @@ impl SubprocessSpawner {
             .arg(&request.pipeline)
             .arg("--output")
             .arg("json")
-            .env("ROCKY_RUN_TRIGGER", "schedule")
+            .env("ROCKY_RUN_TRIGGER", request.trigger.as_env())
             .env("ROCKY_SUBMISSION_ID", &request.submission_id);
         if let Some(tp) = &request.traceparent {
             cmd.env("TRACEPARENT", tp);
@@ -432,6 +466,7 @@ mod tests {
             submission_id: "sub-1".to_string(),
             traceparent: None,
             timeout: None,
+            trigger: RunTriggerKind::Schedule,
         };
 
         let outcome = spawner.run(&request).await;
@@ -456,6 +491,7 @@ mod tests {
             submission_id: "sub-1".to_string(),
             traceparent: None,
             timeout: None,
+            trigger: RunTriggerKind::Schedule,
         };
         let cmd = SubprocessSpawner::build_command(&request);
         let args: Vec<String> = cmd
@@ -484,6 +520,36 @@ mod tests {
             "--state-path value must follow the flag: {args:?}"
         );
         assert!(pipe_pos > run_pos, "--pipeline must follow `run`: {args:?}");
+    }
+
+    #[test]
+    fn build_command_sets_run_trigger_from_the_request() {
+        for (kind, expected) in [
+            (RunTriggerKind::Schedule, "schedule"),
+            (RunTriggerKind::Webhook, "webhook"),
+        ] {
+            let request = SpawnRequest {
+                pipeline: "raw".to_string(),
+                config_path: PathBuf::from("/proj/rocky.toml"),
+                state_path: PathBuf::from("/proj/models/.rocky-state.redb"),
+                submission_id: "sub-1".to_string(),
+                traceparent: None,
+                timeout: None,
+                trigger: kind,
+            };
+            let cmd = SubprocessSpawner::build_command(&request);
+            let trigger = cmd
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new("ROCKY_RUN_TRIGGER"))
+                .and_then(|(_, v)| v)
+                .map(|v| v.to_string_lossy().into_owned());
+            assert_eq!(
+                trigger.as_deref(),
+                Some(expected),
+                "ROCKY_RUN_TRIGGER for {kind:?}"
+            );
+        }
     }
 
     #[test]

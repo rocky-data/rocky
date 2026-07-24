@@ -1487,6 +1487,9 @@ pub enum RunTrigger {
     Sensor,
     Schedule,
     Ci,
+    /// An HTTP webhook delivery consumed by the resident scheduler's webhook
+    /// ingress (`POST /api/v1/hooks/trigger/{pipeline}`).
+    Webhook,
 }
 
 /// Where the `rocky` invocation originated — the calling surface that

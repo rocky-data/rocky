@@ -47,6 +47,11 @@ pub struct ServerState {
     /// and child run history — agrees on one file instead of silently splitting
     /// across two.
     pub state_path: Option<PathBuf>,
+    /// Webhook-ingress configuration, present only when `serve --scheduler` is
+    /// active. `None` means the ingress route (`POST /api/v1/hooks/trigger/…`)
+    /// answers `404` — a webhook can only be consumed by a resident reconciler,
+    /// so ingress without one is disabled.
+    pub webhook: Option<crate::webhook_ingress::WebhookIngress>,
     /// Per-session throttle for the "N sources hit" info log so it
     /// emits once per server start, not once per recompile. Keyed on
     /// `models_dir`, which stays constant.
@@ -86,11 +91,38 @@ impl ServerState {
         allowed_origins: Vec<String>,
         state_path: Option<PathBuf>,
     ) -> Arc<Self> {
+        Self::with_auth_and_webhook(
+            models_dir,
+            contracts_dir,
+            config_path,
+            auth_token,
+            allowed_origins,
+            state_path,
+            None,
+        )
+    }
+
+    /// [`ServerState::with_auth`] plus webhook-ingress configuration.
+    ///
+    /// `webhook` is `Some` only when `serve --scheduler` is active; without a
+    /// resident reconciler there is nothing to consume a spooled demand, so the
+    /// ingress route stays disabled (`404`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_auth_and_webhook(
+        models_dir: PathBuf,
+        contracts_dir: Option<PathBuf>,
+        config_path: Option<PathBuf>,
+        auth_token: Option<String>,
+        allowed_origins: Vec<String>,
+        state_path: Option<PathBuf>,
+        webhook: Option<crate::webhook_ingress::WebhookIngress>,
+    ) -> Arc<Self> {
         let state = Arc::new(Self {
             models_dir,
             contracts_dir,
             config_path,
             state_path,
+            webhook,
             compile_result: RwLock::new(None),
             dag_status: DagStatusStore::new(),
             mutation_permit: crate::jobs::MutationPermit::new(),

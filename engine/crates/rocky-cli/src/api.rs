@@ -139,6 +139,12 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/api/v1/jobs/apply", post(submit_apply))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/schedule", get(schedule_status))
+        // Webhook ingress. Registered BEFORE the auth layer like every route, but
+        // the middleware PREFIX-exempts `/api/v1/hooks/trigger/{pipeline}` from
+        // the Bearer token (see `rocky_server::auth`): the handler authenticates
+        // with its own `X-Rocky-Signature` HMAC instead. The exemption is scoped
+        // to a single segment so it can never widen to another route.
+        .route("/api/v1/hooks/trigger/{pipeline}", post(webhook_trigger))
         // Envelope fallbacks (see the module doc's error contract). Both are
         // registered BEFORE the auth layer so they are auth-wrapped like every
         // route: with a token configured, an unauthenticated probe of an
@@ -229,7 +235,7 @@ pub async fn serve(
 /// Accepts the textual forms we actually emit / accept on the CLI:
 /// `127.0.0.1`, `::1`, `localhost`. Anything else (including `0.0.0.0`
 /// and external addresses) is treated as non-loopback.
-fn is_loopback(host: &str) -> bool {
+pub(crate) fn is_loopback(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
@@ -408,6 +414,49 @@ impl ApiError {
             None,
         )
     }
+
+    /// `404` — webhook ingress is not available: either `serve` is running
+    /// without `--scheduler` (nothing would consume a demand), or no
+    /// `ROCKY_WEBHOOK_SECRET` is configured on a non-loopback bind (fail-closed).
+    /// A distinct code from `route_not_found` so the route-registration probe
+    /// still recognizes the route as served, and so callers do not treat it as a
+    /// generic missing route.
+    fn webhook_disabled() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "webhook_disabled",
+            "webhook ingress is not enabled on this server",
+            Some(
+                "run `rocky serve --scheduler` and set ROCKY_WEBHOOK_SECRET \
+                 (required unless bound to loopback)",
+            ),
+        )
+    }
+
+    /// `401` — the `X-Rocky-Signature` HMAC did not verify (missing, malformed,
+    /// or wrong). Distinct code from the Bearer middleware's `unauthorized` so a
+    /// caller — and the auth-wrapping probe — can tell the webhook's own HMAC
+    /// rejection from a Bearer-token rejection.
+    fn webhook_bad_signature() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "the X-Rocky-Signature HMAC did not verify",
+            Some("sign the raw request body: HMAC-SHA256 hex, header `X-Rocky-Signature`"),
+        )
+    }
+
+    /// `404` — the target pipeline is not defined in the resolved config.
+    /// Returned only after the HMAC verifies, so an unauthenticated caller
+    /// cannot use it to enumerate pipeline names.
+    fn pipeline_not_found(name: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "pipeline_not_found",
+            format!("pipeline '{name}' is not defined in the project config"),
+            Some("check the pipeline name against the project's rocky.toml"),
+        )
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -555,6 +604,7 @@ pub(crate) fn api_v1_routes() -> Vec<String> {
         "POST /api/v1/jobs/apply",
         "GET /api/v1/jobs/{id}",
         "GET /api/v1/schedule",
+        "POST /api/v1/hooks/trigger/{pipeline}",
     ]
     .into_iter()
     .map(String::from)
@@ -576,6 +626,7 @@ fn capabilities() -> Vec<String> {
         "error_envelope",
         "jobs",
         "schedule",
+        "webhooks",
     ]
     .into_iter()
     .map(String::from)
@@ -879,11 +930,7 @@ async fn schedule_status(
     // Anchor `.rocky` to the config's directory (the project root), not the
     // process cwd — the same derivation the reconciler uses, so a `serve
     // --scheduler` and a cron `rocky tick` are reported against one tick lock.
-    let rocky_dir = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join(".rocky");
+    let rocky_dir = crate::commands::scheduler::rocky_dir_for_config(&config_path);
     let running_job_id = state.mutation_permit.running_job();
 
     let output = tokio::task::spawn_blocking(move || {
@@ -893,6 +940,147 @@ async fn schedule_status(
     .map_err(|e| map_join_err(&e))?
     .map_err(|e| map_schedule_err(e, running_job_id))?;
     Ok(PrettyJson(output))
+}
+
+// --- Webhook ingress (POST /api/v1/hooks/trigger/{pipeline}) ---
+
+/// The hex HMAC-SHA256 of the raw body, keyed on `ROCKY_WEBHOOK_SECRET`.
+const WEBHOOK_SIGNATURE_HEADER: &str = "x-rocky-signature";
+/// An optional caller-supplied delivery id. When present the demand deduplicates
+/// on the id (with a 24h consumed-tombstone); when absent it deduplicates on the
+/// body hash (no tombstone — an identical body after consumption fires again).
+const WEBHOOK_DELIVERY_HEADER: &str = "x-rocky-delivery";
+
+/// The result of the blocking pipeline-validate + spool-accept.
+enum WebhookAccept {
+    Accepted(String),
+    Duplicate,
+    PipelineNotFound,
+    Failed(String),
+}
+
+/// `POST /api/v1/hooks/trigger/{pipeline}` — accept a webhook demand.
+///
+/// This route is **prefix-exempt** from the Bearer middleware and authenticates
+/// with its own `X-Rocky-Signature` HMAC over the raw body. The demand is
+/// written durably (`fsync`'d) before the `202`, so an accepted webhook is never
+/// lost across a crash; the resident reconciler consumes it *at most once* on a
+/// later tick. Fail-closed: the route is dark when `--scheduler` is off or when
+/// no secret is set on a non-loopback bind.
+async fn webhook_trigger(
+    State(state): State<Arc<ServerState>>,
+    Path(pipeline): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let Some(ingress) = state.webhook.as_ref() else {
+        // `serve` without `--scheduler`: no reconciler to consume a demand.
+        return Err(ApiError::webhook_disabled());
+    };
+    // Fail-closed: a non-loopback bind with no secret must not accept unsigned
+    // webhooks. Loopback with no secret is the dev convenience path (no HMAC).
+    if ingress.secret.is_none() && !ingress.bind_is_loopback {
+        return Err(ApiError::webhook_disabled());
+    }
+
+    // 1. HMAC FIRST — before revealing anything about the target — so an
+    //    unauthenticated caller can neither enumerate pipelines nor exhaust the
+    //    rate limiter for legitimate senders.
+    if let Some(secret) = ingress.secret.as_deref() {
+        let provided = headers
+            .get(WEBHOOK_SIGNATURE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !rocky_core::hooks::webhook::verify_signature(secret, &body, provided) {
+            return Err(ApiError::webhook_bad_signature());
+        }
+    }
+
+    // 2. Rate limit — a flood guard on authenticated traffic, BEFORE any spool
+    //    write so an over-limit request never yields a `202` without a file.
+    if let rocky_server::webhook_ingress::RateDecision::Limited { retry_after } =
+        ingress.rate_limiter.check(std::time::Instant::now())
+    {
+        return Ok(too_many_requests_response(retry_after));
+    }
+
+    // 3. Determine dedup kind + token from the delivery header, and hash the body.
+    let body_hash = blake3::hash(&body).to_hex().to_string();
+    let (kind, token) = match headers
+        .get(WEBHOOK_DELIVERY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+    {
+        Some(delivery) => (rocky_core::schedule::WebhookKind::Id, delivery.to_string()),
+        None => (rocky_core::schedule::WebhookKind::Body, body_hash.clone()),
+    };
+
+    // 4. Validate the pipeline + durably spool — both are blocking FS/parse work.
+    let config_path = state.config_path.clone();
+    let rocky_dir = ingress.rocky_dir.clone();
+    let pipeline_for_task = pipeline.clone();
+    let now = chrono::Utc::now();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let Some(config_path) = config_path.as_deref() else {
+            return WebhookAccept::Failed("no project config is bound to this server".to_string());
+        };
+        let config = match rocky_core::config::load_rocky_config(config_path) {
+            Ok(c) => c,
+            Err(e) => return WebhookAccept::Failed(format!("config load failed: {e}")),
+        };
+        if !config.pipelines.contains_key(&pipeline_for_task) {
+            return WebhookAccept::PipelineNotFound;
+        }
+        match rocky_core::schedule::accept(
+            &rocky_dir,
+            &pipeline_for_task,
+            kind,
+            &token,
+            &body_hash,
+            now,
+        ) {
+            Ok(rocky_core::schedule::AcceptOutcome::Created(uid)) => WebhookAccept::Accepted(uid),
+            Ok(rocky_core::schedule::AcceptOutcome::Duplicate) => WebhookAccept::Duplicate,
+            Err(e) => WebhookAccept::Failed(format!("spooling the demand failed: {e}")),
+        }
+    })
+    .await
+    .map_err(|e| map_join_err(&e))?;
+
+    match outcome {
+        WebhookAccept::Accepted(uid) => {
+            tracing::info!(pipeline = %pipeline, demand_uid = %uid, "webhook demand accepted");
+            Ok((
+                StatusCode::ACCEPTED,
+                PrettyJson(serde_json::json!({ "demand": "accepted", "demand_uid": uid })),
+            )
+                .into_response())
+        }
+        WebhookAccept::Duplicate => Ok((
+            StatusCode::ACCEPTED,
+            PrettyJson(serde_json::json!({ "demand": "duplicate" })),
+        )
+            .into_response()),
+        WebhookAccept::PipelineNotFound => Err(ApiError::pipeline_not_found(&pipeline)),
+        WebhookAccept::Failed(message) => Err(ApiError::internal(message)),
+    }
+}
+
+/// Build a `429` with the `Retry-After` header and the standard error envelope.
+fn too_many_requests_response(retry_after: std::time::Duration) -> Response {
+    let secs = retry_after.as_secs().max(1);
+    let envelope = ErrorEnvelope {
+        code: "rate_limited".to_string(),
+        message: "too many webhook requests; retry after the indicated delay".to_string(),
+        remediation_hint: Some("respect the Retry-After header".to_string()),
+        running_job_id: None,
+    };
+    let mut resp = (StatusCode::TOO_MANY_REQUESTS, PrettyJson(envelope)).into_response();
+    if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, value);
+    }
+    resp
 }
 
 // --- Job model (POST /api/v1/jobs/{run|plan|apply}, GET /api/v1/jobs/{id}) ---
@@ -2308,7 +2496,8 @@ mod tests {
         let path = path
             .replace("{name}", "probe_model")
             .replace("{column}", "probe_column")
-            .replace("{id}", "probe_job");
+            .replace("{id}", "probe_job")
+            .replace("{pipeline}", "probe_pipeline");
         format!("{base}{path}")
     }
 
@@ -2370,13 +2559,23 @@ mod tests {
         assert_eq!(body.code, "route_not_found");
     }
 
-    /// With a token configured, every declared route except the auth-exempt
-    /// `GET /api/v1/health` must reject a token-less request with a `401` —
-    /// this pins the requirement that routes are registered BEFORE the
-    /// `.layer(require_bearer_token)` call in `router()` (a route appended
-    /// after it would silently dodge auth). The fallback is wrapped too: an
-    /// unknown path without a token is a `401`, never a route-existence
-    /// oracle.
+    /// With a token configured, every declared route must reject a token-less
+    /// request with a `401` from the Bearer middleware — EXCEPT the two known
+    /// exemption classes, which carry their own auth (or none):
+    ///
+    /// - `GET /api/v1/health` — always exempt (liveness probes need no token).
+    /// - `POST /api/v1/hooks/trigger/{pipeline}` — prefix-exempt because it
+    ///   authenticates with an `X-Rocky-Signature` HMAC instead of the Bearer
+    ///   token. A token-less probe must therefore NOT get the Bearer `401`; it
+    ///   must reach the handler, which on this webhook-disabled test state
+    ///   answers `404 webhook_disabled` — proving it bypassed the Bearer layer.
+    ///
+    /// This pins that routes are registered BEFORE the
+    /// `.layer(require_bearer_token)` call (a route appended after it would
+    /// silently dodge auth) and that the webhook exemption did not accidentally
+    /// widen: every OTHER declared route still hard-`401`s. The fallback is
+    /// wrapped too: an unknown path without a token is a `401`, never a
+    /// route-existence oracle.
     #[tokio::test]
     async fn every_declared_route_is_auth_wrapped_except_health() {
         let base = spawn_router(test_state_with_token("s3cret")).await;
@@ -2392,6 +2591,20 @@ mod tests {
                 .unwrap();
             if entry == "GET /api/v1/health" {
                 assert_eq!(resp.status(), 200, "{entry}: health is auth-exempt");
+            } else if entry == "POST /api/v1/hooks/trigger/{pipeline}" {
+                // HMAC-authed, so the Bearer layer must NOT reject it. On this
+                // webhook-disabled state it reaches the handler → 404
+                // webhook_disabled, never the Bearer 401.
+                assert_eq!(
+                    resp.status(),
+                    404,
+                    "{entry}: HMAC-exempt route must reach its handler, not the Bearer 401"
+                );
+                let body: ErrorEnvelope = resp.json().await.unwrap();
+                assert_eq!(
+                    body.code, "webhook_disabled",
+                    "{entry}: exempt route reached the handler (not a Bearer or fallback answer)"
+                );
             } else {
                 assert_eq!(
                     resp.status(),
@@ -2405,6 +2618,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 401, "the 404 fallback sits behind auth too");
+
+        // The exemption must not widen: a traversal under the webhook prefix is
+        // NOT exempt (the post-prefix remainder has a `/`), so a token-less
+        // request still hits the Bearer `401`, never the webhook handler.
+        let resp = client
+            .post(format!("{base}/api/v1/hooks/trigger/../jobs/run"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "a traversal under the webhook prefix must stay behind Bearer auth"
+        );
     }
 
     // --- Envelope fallbacks (unknown path / wrong method / bad path param) ---
@@ -2458,5 +2685,254 @@ mod tests {
         assert_eq!(resp.status(), 400);
         let body: ErrorEnvelope = resp.json().await.unwrap();
         assert_eq!(body.code, "bad_request");
+    }
+
+    // --- Webhook ingress (POST /api/v1/hooks/trigger/{pipeline}) -------------
+
+    const WEBHOOK_TEST_CONFIG: &str = r#"
+[adapter.db]
+type = "duckdb"
+
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+"#;
+
+    /// A `ServerState` with webhook ingress configured. Returns the state and the
+    /// temp dir whose `.rocky/pending-demands` the spool lands in (kept alive by
+    /// the caller so it can inspect the spool).
+    fn webhook_state(
+        secret: Option<&str>,
+        loopback: bool,
+        rps: f64,
+    ) -> (Arc<ServerState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, WEBHOOK_TEST_CONFIG).unwrap();
+        let ingress = rocky_server::webhook_ingress::WebhookIngress {
+            secret: secret.map(String::from),
+            bind_is_loopback: loopback,
+            rocky_dir: dir.path().join(".rocky"),
+            rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(rps),
+        };
+        let state = ServerState::with_auth_and_webhook(
+            simple_project_models(),
+            None,
+            Some(config_path),
+            None,
+            Vec::new(),
+            None,
+            Some(ingress),
+        );
+        (state, dir)
+    }
+
+    fn sign(secret: &str, body: &[u8]) -> String {
+        rocky_core::hooks::webhook::compute_signature_bytes(secret, body)
+    }
+
+    fn spool_file_count(dir: &tempfile::TempDir) -> usize {
+        rocky_core::schedule::spool::list_pending_files(&dir.path().join(".rocky"))
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn webhook_404_without_scheduler() {
+        // `test_state` has `webhook: None` — ingress disabled.
+        let base = spawn_router(test_state()).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/hooks/trigger/raw"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "webhook_disabled");
+    }
+
+    #[tokio::test]
+    async fn webhook_404_without_secret_on_non_loopback() {
+        let (state, _dir) = webhook_state(None, false, 100.0);
+        let base = spawn_router(state).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/hooks/trigger/raw"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "webhook_disabled");
+    }
+
+    #[tokio::test]
+    async fn webhook_loopback_without_secret_accepts_unsigned() {
+        let (state, dir) = webhook_state(None, true, 100.0);
+        let base = spawn_router(state).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/hooks/trigger/raw"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["demand"], "accepted");
+        assert_eq!(spool_file_count(&dir), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_valid_hmac_accepts_without_bearer() {
+        let (state, dir) = webhook_state(Some("s3cret"), false, 100.0);
+        let base = spawn_router(state).await;
+        let body = br#"{"event":"sync.done"}"#;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/hooks/trigger/raw"))
+            .header("X-Rocky-Signature", sign("s3cret", body))
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            202,
+            "a valid HMAC is accepted with no Bearer token"
+        );
+        assert_eq!(spool_file_count(&dir), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_invalid_and_missing_hmac_are_401_and_write_nothing() {
+        let (state, dir) = webhook_state(Some("s3cret"), false, 100.0);
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+
+        // Wrong signature.
+        let resp = client
+            .post(format!("{base}/api/v1/hooks/trigger/raw"))
+            .header("X-Rocky-Signature", "deadbeef")
+            .body("payload")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let env: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(env.code, "invalid_signature");
+
+        // Missing signature header entirely.
+        let resp = client
+            .post(format!("{base}/api/v1/hooks/trigger/raw"))
+            .body("payload")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+
+        assert_eq!(
+            spool_file_count(&dir),
+            0,
+            "a rejected webhook spools nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_unknown_pipeline_is_404_only_after_auth() {
+        let (state, dir) = webhook_state(Some("s3cret"), false, 100.0);
+        let base = spawn_router(state).await;
+        let body = b"x";
+        // A VALID signature but an unknown pipeline → 404 pipeline_not_found.
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/hooks/trigger/ghost"))
+            .header("X-Rocky-Signature", sign("s3cret", body))
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let env: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(env.code, "pipeline_not_found");
+        assert_eq!(spool_file_count(&dir), 0);
+
+        // An UNAUTHENTICATED request to the same unknown pipeline gets 401, NOT
+        // 404 — so the endpoint is not a pipeline-name enumeration oracle.
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/v1/hooks/trigger/ghost"))
+            .header("X-Rocky-Signature", "bad")
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            401,
+            "auth is checked before pipeline existence"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_same_delivery_id_twice_is_duplicate() {
+        let (state, dir) = webhook_state(Some("s3cret"), false, 100.0);
+        let base = spawn_router(state).await;
+        let body = b"x";
+        let client = reqwest::Client::new();
+        let send = || {
+            client
+                .post(format!("{base}/api/v1/hooks/trigger/raw"))
+                .header("X-Rocky-Signature", sign("s3cret", body))
+                .header("X-Rocky-Delivery", "evt-42")
+                .body(body.to_vec())
+                .send()
+        };
+        let first: serde_json::Value = send().await.unwrap().json().await.unwrap();
+        assert_eq!(first["demand"], "accepted");
+        let second: serde_json::Value = send().await.unwrap().json().await.unwrap();
+        assert_eq!(second["demand"], "duplicate");
+        assert_eq!(
+            spool_file_count(&dir),
+            1,
+            "a redelivered id is a single file"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_over_rate_limit_is_429_with_retry_after_and_no_spool() {
+        // Capacity 1: the first request is allowed, the second is limited.
+        let (state, dir) = webhook_state(Some("s3cret"), false, 1.0);
+        let base = spawn_router(state).await;
+        let body = b"x";
+        let client = reqwest::Client::new();
+
+        let ok = client
+            .post(format!("{base}/api/v1/hooks/trigger/raw"))
+            .header("X-Rocky-Signature", sign("s3cret", body))
+            .header("X-Rocky-Delivery", "evt-a")
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), 202);
+        assert_eq!(spool_file_count(&dir), 1);
+
+        let limited = client
+            .post(format!("{base}/api/v1/hooks/trigger/raw"))
+            .header("X-Rocky-Signature", sign("s3cret", body))
+            .header("X-Rocky-Delivery", "evt-b")
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), 429);
+        assert!(
+            limited.headers().contains_key("retry-after"),
+            "a 429 must carry Retry-After"
+        );
+        assert_eq!(
+            spool_file_count(&dir),
+            1,
+            "an over-limit request writes no spool file"
+        );
     }
 }

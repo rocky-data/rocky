@@ -430,6 +430,7 @@ fn map_tick_skip_reason(
         TickSkipReason::FailureBackoff { resume_at } => ("failure_backoff", Some(*resume_at), None),
         TickSkipReason::PartialBackoff { resume_at } => ("partial_backoff", Some(*resume_at), None),
         TickSkipReason::Dedup => ("dedup", None, None),
+        TickSkipReason::ConfigError => ("config_error", None, None),
         TickSkipReason::HistoryUnavailable => ("history_unavailable", None, None),
         TickSkipReason::StateBusy => ("state_busy", None, None),
     }
@@ -555,6 +556,7 @@ cron = "0 3 * * *"
                         pipeline: "raw".to_string(),
                         source: DemandKind::Cron,
                         logical_ts: ts("2026-05-02T03:00:00Z"),
+                        claim_discriminator: None,
                     }),
                     anchor_init: None,
                     catchup_advance: None,

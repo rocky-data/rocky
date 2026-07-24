@@ -718,6 +718,47 @@ fn route_table() -> Vec<Route> {
             ],
             auth_exempt: false,
         },
+        Route {
+            method: "post",
+            path: "/api/v1/hooks/trigger/{pipeline}",
+            operation_id: "triggerWebhook",
+            tag: "webhooks",
+            summary: "Trigger a pipeline by webhook",
+            description: "Accept a webhook that queues a durable, at-most-once run demand for \
+                 the named pipeline, consumed by the resident scheduler (`serve --scheduler`). \
+                 Authenticated by an `X-Rocky-Signature` HMAC-SHA256 (hex) over the raw body \
+                 keyed on `ROCKY_WEBHOOK_SECRET`, NOT the Bearer token. The demand is fsync'd \
+                 before the 202. Fail-closed: 404 without `--scheduler`, or without a secret on \
+                 a non-loopback bind.",
+            path_params: &["pipeline"],
+            header_params: &["X-Rocky-Signature", "X-Rocky-Delivery"],
+            request_body: None,
+            responses: &[
+                Resp {
+                    status: "202",
+                    description: "Demand accepted (or a duplicate delivery idempotently acked).",
+                    body: Body::OutOfContract,
+                },
+                Resp {
+                    status: "401",
+                    description: "The X-Rocky-Signature HMAC did not verify.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "404",
+                    description: "Ingress is disabled, or the pipeline is not in config.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+                Resp {
+                    status: "429",
+                    description: "Over the fixed webhook rate limit; see `Retry-After`.",
+                    body: Body::Component("ErrorEnvelope"),
+                },
+            ],
+            // HMAC-authenticated, not Bearer — `security: []` like health, but for
+            // a different reason (its own signature check).
+            auth_exempt: true,
+        },
     ]
 }
 

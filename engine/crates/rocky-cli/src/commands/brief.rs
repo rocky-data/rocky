@@ -893,6 +893,7 @@ fn run_trigger_str(trigger: &RunTrigger) -> &'static str {
         RunTrigger::Sensor => "sensor",
         RunTrigger::Schedule => "schedule",
         RunTrigger::Ci => "ci",
+        RunTrigger::Webhook => "webhook",
     }
 }
 

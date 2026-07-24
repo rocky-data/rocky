@@ -38,7 +38,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
 
-**87 of 99 POCs run with no external credentials.** See each POC's README for prerequisites.
+**88 of 100 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -137,7 +137,7 @@ Unity Catalog grants, schema patterns, workspace isolation, tagging, classificat
 | [10-recipe-provenance](pocs/04-governance/10-recipe-provenance) | Every materialization records a recipe-identity triple (`recipe_hash`, `input_hash`, `env_hash`); `rocky history --recipe <hash>` returns every execution of that exact program — the "what produced this?" audit one-liner, honest about `heuristic` vs `strong` input proof | none |
 | [11-agent-policy](pocs/04-governance/11-agent-policy) | `[policy]` block enforced at apply time under an agent principal — a denied change is refused before it touches the warehouse, and every decision lands in a ledger queryable via `rocky audit` | none |
 
-### 05 — Orchestration (11 POCs · DuckDB / docker)
+### 05 — Orchestration (12 POCs · DuckDB / docker)
 
 Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode, circuit breaker, idempotency.
 

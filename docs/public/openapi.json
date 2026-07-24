@@ -19585,6 +19585,90 @@
         ]
       }
     },
+    "/api/v1/hooks/trigger/{pipeline}": {
+      "post": {
+        "description": "Accept a webhook that queues a durable, at-most-once run demand for the named pipeline, consumed by the resident scheduler (`serve --scheduler`). Authenticated by an `X-Rocky-Signature` HMAC-SHA256 (hex) over the raw body keyed on `ROCKY_WEBHOOK_SECRET`, NOT the Bearer token. The demand is fsync'd before the 202. Fail-closed: 404 without `--scheduler`, or without a secret on a non-loopback bind.",
+        "operationId": "triggerWebhook",
+        "parameters": [
+          {
+            "description": "Path parameter `pipeline`.",
+            "in": "path",
+            "name": "pipeline",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Signature",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Advisory principal recorded for audit only. Spoofable under shared-secret auth; never an authorization input.",
+            "in": "header",
+            "name": "X-Rocky-Delivery",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "description": "Ad-hoc body outside the `/api/v1` value contract; shape is not pinned and may change without a version bump.",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Demand accepted (or a duplicate delivery idempotently acked)."
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "The X-Rocky-Signature HMAC did not verify."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Ingress is disabled, or the pipeline is not in config."
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            },
+            "description": "Over the fixed webhook rate limit; see `Retry-After`."
+          }
+        },
+        "security": [],
+        "summary": "Trigger a pipeline by webhook",
+        "tags": [
+          "webhooks"
+        ]
+      }
+    },
     "/api/v1/jobs/apply": {
       "post": {
         "description": "Submit a mutating `apply` job. Takes the single-mutating-job permit; a second run/apply while one is held returns 409.",

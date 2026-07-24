@@ -405,6 +405,46 @@ WantedBy=multi-user.target
 
 Pick one form or the other, not both against the same project: a `rocky tick` timer *and* a `rocky serve --scheduler` on the same state file are two reconcilers (see below).
 
+### Event-driven triggers: webhook ingress (experimental)
+
+The resident scheduler can also accept an HTTP webhook that queues a run demand for a named pipeline, so an external event (a Fivetran sync completing, an upstream job finishing, a manual "run now" button) fires a pipeline without waiting for the next cron slot:
+
+```
+POST /api/v1/hooks/trigger/{pipeline}
+```
+
+The route is live only under `--scheduler` (nothing else would consume the demand) and is authenticated by its own HMAC, not the `--token` Bearer token used by the rest of the API. Set a shared secret and sign the raw request body with HMAC-SHA256, hex-encoded, in the `X-Rocky-Signature` header:
+
+```bash
+export ROCKY_WEBHOOK_SECRET='a-long-random-secret'
+rocky serve --scheduler   # in another shell
+
+# Sign an (empty) body and trigger the `orders` pipeline.
+BODY=''
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$ROCKY_WEBHOOK_SECRET" | awk '{print $2}')
+curl -sS -X POST http://127.0.0.1:8080/api/v1/hooks/trigger/orders \
+  -H "X-Rocky-Signature: $SIG" \
+  -H 'X-Rocky-Delivery: evt-2026-05-02-0001' \
+  --data-binary "$BODY"
+# → 202 {"demand":"accepted","demand_uid":"…"}
+```
+
+`X-Rocky-Delivery` is an optional idempotency key, and it changes the guarantee you get. Every *accepted* demand is at-most-once regardless. But whether the same *event* runs at most once depends on the header:
+
+- **With `X-Rocky-Delivery`:** a redelivery of the same id is deduplicated (idempotently `202 {"demand":"duplicate"}`) for 24 hours after the demand is consumed, so a sender that retries the same event does not double-fire the pipeline. This is the mode to use if your sender retries.
+- **Without it (body-hash fallback):** the demand deduplicates on the body hash only while it is still queued; an identical body delivered again *after* consumption is a new demand and fires again. So for a delivery-id-less sender the guarantee is **at-least-once** across retries — pair it with a `freshness` schedule (below) so a re-fire is at worst a redundant refresh, not a correctness problem.
+
+**Fail-closed.** With no `ROCKY_WEBHOOK_SECRET` set, the route answers `404` unless the server is bound to loopback (the local-dev convenience, where it accepts without a signature). Running `serve` without `--scheduler` also answers `404`. An over-rate flood is shed with `429` and a `Retry-After` header before anything is written. An unsigned or wrongly-signed request is `401`, and a request for a pipeline not in your config is `404` — but only after the signature verifies, so an unauthenticated caller cannot use the endpoint to enumerate pipeline names.
+
+**At-most-once delivery — read this before you depend on it.** An accepted webhook is written to a durable, `fsync`'d spool file *before* the `202`, so a crash between the `202` and the next tick never loses it. The reconciler then consumes each spooled demand **at most once**: it is attempted exactly one time and never retried. The one loss window is narrow but real — if the reconciler crashes *after* it has claimed the demand **and** the child run also dies before recording its outcome, that demand is finalized as a failure and not re-run. (A child that outlives a dead reconciler still records its run and is honored; a sender's own retries cover everything before the `202`.) Because a webhook is not retried on the delivery side, **a webhook-only pipeline should also carry a `freshness` schedule as a backstop**, so that if a delivery is ever dropped the freshness trigger still brings the pipeline current within its budget:
+
+```toml
+[pipelines.orders.schedule]
+freshness = true        # backstop: re-runs if it goes stale, even if a webhook is lost
+```
+
+A webhook-triggered run records `trigger: "webhook"` in its history (`rocky history`), distinct from a cron/`after`/freshness `schedule` run, and shows up under `GET /api/v1/schedule`'s in-flight claims while it runs. A demand whose pipeline was removed from config since it was accepted is finalized (never run) and logged loudly rather than left pending forever.
+
 ### One scheduler instance per project
 
 Run exactly one reconciler per project, meaning per state file — one `rocky tick` timer, or one `rocky serve --scheduler`, not both and not several. All of a reconciler's mutual exclusion is local to one machine: the `.rocky/tick.lock` flock and the state store's own writer lock both live on that host's filesystem and cannot see a second host. Scheduler state (the cursor and claim tables) is deliberately local-only as well — a remote `[state]` backend (S3, GCS, Valkey, tiered) never uploads it and a download never overwrites it — so two hosts ticking the same project each keep an independent cursor and would both fire the same occurrence. Remote state is last-writer-wins today (there is no cross-host compare-and-swap yet), so there is no fence to lean on across machines. If you need timers on several hosts, give each host its own project and state file, or keep a single timer and let the other hosts invoke `rocky run` directly.
