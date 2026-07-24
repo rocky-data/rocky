@@ -1037,6 +1037,38 @@ mod tests {
         assert_eq!(&*diags[0].code, "G001");
     }
 
+    #[test]
+    fn declared_key_grain_drives_detection() {
+        // Deliverable #3 end-to-end: the upstream grain comes from a DECLARED
+        // merge/snapshot `unique_key` via `grain_of` — not a pre-baked
+        // `Grain::known`, and not structurally inferable (the upstream is a
+        // plain SELECT). A snapshot keyed on (customer_id, address_type) joined
+        // on customer_id alone still fans out.
+        let upstream_sql = "SELECT customer_id, address_type, city FROM raw_addresses";
+        assert_eq!(
+            infer_grain(upstream_sql),
+            Grain::Unknown,
+            "plain SELECT is not inferable"
+        );
+        let grain = grain_of(upstream_sql, &["customer_id", "address_type"]);
+        assert_eq!(grain, Grain::known(["customer_id", "address_type"]));
+
+        let sql = "SELECT o.id, a.city FROM orders o \
+                   JOIN customer_addresses a ON o.customer_id = a.customer_id";
+        let diags = check_fanout(
+            "orders_enriched",
+            sql,
+            &grains(&[("customer_addresses", grain)]),
+        );
+        assert_eq!(
+            diags.len(),
+            1,
+            "a declared-key grain must drive detection, got: {diags:?}"
+        );
+        assert_eq!(&*diags[0].code, "G001");
+        assert!(diags[0].message.contains("address_type"));
+    }
+
     // ======================================================================
     // PR-2 re-measurement harness (the spike's actual deliverable).
     //
