@@ -44,6 +44,22 @@ Nothing an agent produces reaches your warehouse without clearing three independ
 
 **The human.** `propose` writes an AI-authored plan, and `rocky apply` refuses to run one until a human has approved it. A bare `rocky apply` on an unapproved AI-authored plan is rejected by the engine, not by convention.
 
+## Why a warehouse grant is not enough
+
+An AI agent that operates your warehouse holds warehouse credentials, and in most setups those credentials are broad. An agent that can build a model can usually also drop a table, rewrite a column, or alter a contract's shape, because the permission system underneath speaks in tables and roles. It grants "this role may `ALTER` this schema" or it does not. It has no vocabulary for the thing you actually want to say.
+
+Consider the sentence *an agent may not drop a column that is classified as PII and sits under a cross-team contract.* No `GRANT` can express it. The classification lives in Rocky's model sidecar, not in the warehouse's permission catalog. Whether a change is a breaking drop or an additive column is a fact about two compiled schemas, not about a role. The contract boundary is a Rocky artifact. A grant sees a table and a verb; it cannot see meaning.
+
+Rocky's policy plane can, because it sits where the meaning is. It evaluates a proposed change with the compiler's knowledge in hand: the breaking-versus-additive verdict from diffing the typed output, the column classifications carried on the model, the contract boundary, and the transitive blast radius. A `[policy]` rule can therefore say the sentence a grant cannot, and the seam that enforces it is the same `rocky apply` an agent already runs. The refusal happens before any DDL is issued, it names the rule that decided, and it is written to an audit ledger you can query after the fact.
+
+<!-- TODO(hugo): optional named-incident hook here -->
+
+<!-- TODO(hugo): optional — name the specific platform features here (the major warehouses' agent access gateways / agent-identity controls) if you want the caveat to cite them by product. -->
+
+This is a different layer from the runtime-access controls the warehouses ship. The major cloud warehouses now offer agent-governance features, runtime access gateways and agent-identity controls, that answer a runtime question: which tables and rows may this agent read, and through what masking. That is real and worth using, and it is orthogonal to what Rocky governs. An agent authoring a transformation is not reading data through a gateway. It is proposing a change to the pipeline that produces the data. Governing that authored change — deny this drop, review that widening, allow this net-new bronze model — is the boundary the runtime controls do not cover, and the one Rocky's policy plane is built for. Use both: their controls for what an agent may read, Rocky's policy plane for what an agent may change.
+
+The concrete proof is the agent-policy example in the playground (`examples/playground/pocs/04-governance/11-agent-policy`). An agent tries to drop a PII-classified column from a contracted gold model. `rocky apply` denies it at the policy seam and names the rule; `rocky audit` prints who tried, what they tried, on which target, and why it was refused; and the same plan, applied by a human, goes through, because humans own the boundary. It runs on DuckDB with no credentials.
+
 ## Structured errors
 
 Every failing tool call returns a stable envelope rather than a prose blob:
