@@ -29,9 +29,11 @@
 //!    that binds join keys) pin a grain column to a single value, so at most one
 //!    row matches on it. Those columns count as satisfied, killing the
 //!    constant-pinned false-positive class.
-//! 3. **Declared-key grain source.** [`grain_of`] reads a declared merge/snapshot
+//! 3. **Declared-key grain source.** [`grain_of`] reads a declared merge/upsert
 //!    `unique_key` as an authoritative grain, falling back to structural
-//!    inference when none is declared.
+//!    inference when none is declared. A snapshot (SCD2) entity key is *not* a
+//!    row grain — SCD2 keeps multiple versions per entity — so it is never
+//!    trusted as one (see [`DeclaredKeyKind`]).
 //!
 //! ## What still stays `Unknown` (⇒ silent) — honest residual gaps
 //!
@@ -96,8 +98,10 @@ impl Grain {
         )
     }
 
-    /// A declared grain from a model's `unique_key`. An empty `unique_key`
-    /// means "not declared", not "grain is the empty set".
+    /// A declared grain from a true row key (a merge/upsert `unique_key`). An
+    /// empty key means "not declared", not "grain is the empty set". A snapshot
+    /// entity key is *not* a row grain — route those through [`grain_of`] with
+    /// [`DeclaredKeyKind::SnapshotEntityKey`], never here.
     pub fn from_unique_key(unique_key: &[impl AsRef<str>]) -> Self {
         if unique_key.is_empty() {
             Grain::Unknown
@@ -107,17 +111,49 @@ impl Grain {
     }
 }
 
+/// How a declared `unique_key` relates to the model's output-row grain.
+///
+/// The distinction is load-bearing: a merge/upsert key and a snapshot entity
+/// key are spelled the same way but say different things about row counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredKeyKind {
+    /// A merge/upsert key. The materialization keeps exactly one row per key,
+    /// so the key *is* the output-row grain.
+    MergeRowKey,
+    /// A snapshot (SCD2) entity key. The table keeps one row per entity *per
+    /// version interval*, so the entity key is only part of the row grain
+    /// (`entity_key ∪ {version columns}`). It must not be used to prove a join
+    /// covers the grain — doing so would falsely clear an entity-key join that
+    /// actually fans out across versions.
+    SnapshotEntityKey,
+}
+
 /// Resolves a model's grain from its declared `unique_key` first, falling back
 /// to structural inference over its own SQL.
 ///
-/// A declared merge/snapshot `unique_key` is authoritative: it is the grain the
-/// materialization enforces. Only when nothing is declared does structural
-/// inference (`GROUP BY` / `DISTINCT`) carry the weight.
+/// Only a [`DeclaredKeyKind::MergeRowKey`] is authoritative — a merge upsert
+/// keeps one row per key, so the key is the grain. A
+/// [`DeclaredKeyKind::SnapshotEntityKey`] is *not* the row grain (SCD2 keeps
+/// multiple versions per entity); without the version columns we cannot form a
+/// sound grain, so it yields [`Grain::Unknown`] (silent) rather than a false
+/// proof of coverage. Firing on an unfiltered SCD2 entity-key join is a
+/// follow-up that needs the snapshot's version columns and point-in-time-filter
+/// detection.
 #[must_use]
-pub fn grain_of(sql: &str, declared_unique_key: &[impl AsRef<str>]) -> Grain {
-    match Grain::from_unique_key(declared_unique_key) {
-        Grain::Known(g) => Grain::Known(g),
-        Grain::Unknown => infer_grain(sql),
+pub fn grain_of(
+    sql: &str,
+    declared_unique_key: &[impl AsRef<str>],
+    kind: DeclaredKeyKind,
+) -> Grain {
+    match kind {
+        DeclaredKeyKind::MergeRowKey => match Grain::from_unique_key(declared_unique_key) {
+            Grain::Known(g) => Grain::Known(g),
+            Grain::Unknown => infer_grain(sql),
+        },
+        // An SCD2 entity key is only part of the row grain, so it is never a
+        // sound grain source. We also do not infer from the snapshot's defining
+        // SQL: the SCD2 materialization changes the grain away from that source.
+        DeclaredKeyKind::SnapshotEntityKey => Grain::Unknown,
     }
 }
 
@@ -694,7 +730,11 @@ mod tests {
         // A declared unique_key is authoritative even when the SQL is a plain
         // SELECT that would otherwise infer Unknown.
         assert_eq!(
-            grain_of("SELECT id, amount FROM orders", &["id"]),
+            grain_of(
+                "SELECT id, amount FROM orders",
+                &["id"],
+                DeclaredKeyKind::MergeRowKey
+            ),
             Grain::known(["id"])
         );
         // With no declaration, fall back to structural inference.
@@ -702,9 +742,56 @@ mod tests {
         assert_eq!(
             grain_of(
                 "SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id",
-                no_decl
+                no_decl,
+                DeclaredKeyKind::MergeRowKey
             ),
             Grain::known(["customer_id"])
+        );
+    }
+
+    #[test]
+    fn snapshot_entity_key_is_not_a_row_grain() {
+        // An SCD2 snapshot keyed on `customer_id` keeps *multiple* rows per
+        // customer (one per version interval), so its output-row grain is NOT
+        // {customer_id}. Treating the entity key as the grain would let a
+        // downstream join on customer_id be *falsely proven* fan-out-free —
+        // the dangerous direction. Until the version columns are threaded in, a
+        // snapshot entity key yields Unknown (silent): an honest miss, never a
+        // fabricated all-clear.
+        let snap_sql = "SELECT customer_id, city FROM raw_customers";
+        assert_eq!(
+            grain_of(
+                snap_sql,
+                &["customer_id"],
+                DeclaredKeyKind::SnapshotEntityKey
+            ),
+            Grain::Unknown,
+            "a snapshot entity key must not be treated as the output-row grain"
+        );
+        // Contrast: the identical key on a MERGE upsert *is* the row grain,
+        // because a merge keeps exactly one row per key.
+        assert_eq!(
+            grain_of(snap_sql, &["customer_id"], DeclaredKeyKind::MergeRowKey),
+            Grain::known(["customer_id"]),
+        );
+        // End-to-end: a join to the snapshot on the entity key is not cleared
+        // by its declared key — the snapshot contributes Unknown, so the join
+        // stays silent (an honest miss) instead of a false proof of safety.
+        let sql = "SELECT o.id, s.city FROM orders o \
+                   JOIN cust_snapshot s ON o.customer_id = s.customer_id";
+        let snap_grain = grain_of(
+            snap_sql,
+            &["customer_id"],
+            DeclaredKeyKind::SnapshotEntityKey,
+        );
+        let diags = check_fanout(
+            "orders_enriched",
+            sql,
+            &grains(&[("cust_snapshot", snap_grain)]),
+        );
+        assert!(
+            diags.is_empty(),
+            "an Unknown snapshot grain stays silent — never a fabricated all-clear, got: {diags:?}"
         );
     }
 
@@ -1040,17 +1127,22 @@ mod tests {
     #[test]
     fn declared_key_grain_drives_detection() {
         // Deliverable #3 end-to-end: the upstream grain comes from a DECLARED
-        // merge/snapshot `unique_key` via `grain_of` — not a pre-baked
-        // `Grain::known`, and not structurally inferable (the upstream is a
-        // plain SELECT). A snapshot keyed on (customer_id, address_type) joined
-        // on customer_id alone still fans out.
+        // merge `unique_key` via `grain_of` — not a pre-baked `Grain::known`,
+        // and not structurally inferable (the upstream is a plain SELECT). A
+        // merge target keyed on (customer_id, address_type) joined on
+        // customer_id alone still fans out. (Snapshot entity keys are handled
+        // separately — see `snapshot_entity_key_is_not_a_row_grain`.)
         let upstream_sql = "SELECT customer_id, address_type, city FROM raw_addresses";
         assert_eq!(
             infer_grain(upstream_sql),
             Grain::Unknown,
             "plain SELECT is not inferable"
         );
-        let grain = grain_of(upstream_sql, &["customer_id", "address_type"]);
+        let grain = grain_of(
+            upstream_sql,
+            &["customer_id", "address_type"],
+            DeclaredKeyKind::MergeRowKey,
+        );
         assert_eq!(grain, Grain::known(["customer_id", "address_type"]));
 
         let sql = "SELECT o.id, a.city FROM orders o \

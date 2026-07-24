@@ -23,8 +23,10 @@ Nothing here is hand-counted, and the corpus deliberately includes shapes that s
 2. **Literal-predicate handling** — one AND-only walker (`collect_predicates`) emits both
    `a.x = b.y` join keys and `a.x = <literal>` pins, from `ON` and `WHERE`. A pinned grain column
    counts as satisfied. It stops at `OR`, so a pin under an `OR` does **not** falsely satisfy grain.
-3. **Declared-key grain source** — `grain_of(sql, unique_key)` prefers a declared merge/snapshot
-   `unique_key`, falling back to structural inference.
+3. **Declared-key grain source** — `grain_of(sql, unique_key, kind)` prefers a declared
+   merge/upsert `unique_key` (`DeclaredKeyKind::MergeRowKey`), falling back to structural
+   inference. A snapshot (SCD2) entity key (`DeclaredKeyKind::SnapshotEntityKey`) is **not** a row
+   grain and yields `Unknown` — see the SCD2 seam under "For a red-teamer to attack".
 
 ### The two pinned limitation tests were flipped from "pins the bug" to "proves the fix"
 
@@ -193,3 +195,13 @@ unearned: the real-project coverage is unproven, and the cross-model plumbing is
   *right* input per left grain). This is inherited from the flat prototype, not a PR-2 regression —
   the plan only explicitly cleared `LEFT` — but it should be modelled (or right joins made silent)
   before wiring.
+- **SCD2 snapshot entity key ≠ row grain (found by stop-time review, fixed).** The declared-key
+  path originally treated *any* `unique_key` as the row grain. That is true for a merge upsert (one
+  row per key) but false for an SCD2 snapshot, which keeps one row per entity *per version interval*
+  — its row grain is `entity_key ∪ {version columns}`. Trusting the entity key would *falsely clear*
+  a downstream `JOIN snapshot ON entity_key` that actually fans out across versions (the dangerous
+  direction — a false proof of safety, not a missed warning). Fixed: `grain_of` now takes a
+  `DeclaredKeyKind`; a `SnapshotEntityKey` yields `Unknown` (silent — an honest miss) rather than a
+  fabricated all-clear, pinned by `snapshot_entity_key_is_not_a_row_grain`. Firing on an *unfiltered*
+  SCD2 entity-key join (higher value, but unsound without point-in-time-filter detection) is a
+  documented follow-up, not attempted here.
