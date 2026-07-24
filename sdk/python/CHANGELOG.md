@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-07-24
+
+### Added
+
+- Generated Pydantic model `ScheduleStatusOutput` for the engine-v1.67.0 `GET /api/v1/schedule` endpoint — a read-only snapshot of every scheduled pipeline's configuration, last/next fire, active backoff, in-flight claims, and tick-lock state. Additive — existing models and every `RockyClient` method are unchanged.
+
+### Changed
+
+- Regenerated bindings for the engine-v1.67.0 `rocky gc` / `rocky restore` output surface, tracking the corrected `physical_reclaimed` / `derivable` field semantics (documentation-level; the wire shape is unchanged).
+
 ## [0.9.1] — 2026-07-19
 
 ### Changed
