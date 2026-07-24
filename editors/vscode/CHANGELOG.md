@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.37.0] — 2026-07-24
+
+### Added
+
+- Generated TypeScript types for the engine-v1.67.0 `GET /api/v1/schedule` endpoint (`schedule_status`) — the read-only scheduler snapshot surfaced by `rocky serve --scheduler`. Also regenerated the `rocky gc` / `rocky restore` and project-schema types for the corrected `physical_reclaimed` / `derivable` field descriptions. Additive; the LSP client and existing commands are unchanged.
+
 ## [1.36.0] — 2026-07-19
 
 ### Added
