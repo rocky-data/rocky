@@ -178,6 +178,18 @@ unearned: the real-project coverage is unproven, and the cross-model plumbing is
 
 ## For a red-teamer to attack
 
+**Soundness posture (both directions), stated plainly — three stop-time reviews each found a hole in
+this area, so treat the list as illustrative, not closed.** No grain source here is a *proof*.
+Structural inference (`GROUP BY`/`DISTINCT`) is the strongest signal and is conservative against
+false *all-clears* in the common shapes, but it is not sound: it can raise `G001` on a non-fan-out
+(alias/output-name divergence, non-minimal grouping) and, in exotic shapes (a set-returning
+projection after `GROUP BY`), can miss a real fan-out. Declared keys are weaker still — a merge key
+is an unverified assertion, and a snapshot entity key is not a row grain at all (now `Unknown`). The
+join-side rule has two known seams (`own_side_keys`, outer-join direction). **Before any wiring**,
+this argues for: warning-or-info severity behind the PR-4 acknowledgment pragma, a grain-provenance
+distinction (inferred vs asserted) in the returned `Grain`, and reconciling inferred grain to output
+column names. The bullets below enumerate the specific holes.
+
 - **Does the code truly resolve CTE→CTE inferred grain?** Answered by the ablation above and by
   `cte_joins_to_earlier_cte_with_inferred_grain` supplying empty `upstream_grains`. Attack: check
   that removing the `scope.insert` loop drops precisely those detections (it does).
@@ -192,10 +204,12 @@ unearned: the real-project coverage is unproven, and the cross-model plumbing is
   relation. So an intra-relation predicate `a.x = a.y` would count `a.x` (and `a.y`) as satisfied
   join keys, producing an unsound false negative on a contrived self-referential `ON`. Not exercised
   by any real shape here, but a real soundness seam if this is ever wired.
-- **`RIGHT`/`RIGHT OUTER` fan-out direction (pre-existing).** `join_constraint` routes right joins
-  through the same `grain(R) ⊆ K_R` rule, but a right join's fan-out is inverted (it duplicates the
-  *right* input per left grain). This is inherited from the flat prototype, not a PR-2 regression —
-  the plan only explicitly cleared `LEFT` — but it should be modelled (or right joins made silent)
+- **`RIGHT` / `RIGHT OUTER` / `FULL OUTER` fan-out direction (pre-existing).** `join_constraint`
+  routes these through the same left-oriented `grain(R) ⊆ K_R` rule, but a right join's fan-out is
+  inverted (it duplicates the *right* input per left grain) and a full outer join fans out on both
+  sides. Only `LEFT`/`INNER` are cleared by that rule. This is inherited from the flat prototype, not
+  a PR-2 regression — the plan only explicitly cleared `LEFT` — but it should be modelled (or these
+  joins made silent)
   before wiring.
 - **SCD2 snapshot entity key ≠ row grain (found by stop-time review, fixed).** The declared-key
   path originally treated *any* `unique_key` as the row grain. That is defensible for a merge
