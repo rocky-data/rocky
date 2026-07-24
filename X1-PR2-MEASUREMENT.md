@@ -25,9 +25,10 @@ Nothing here is hand-counted, and the corpus deliberately includes shapes that s
    counts as satisfied. It stops at `OR`, so a pin under an `OR` does **not** falsely satisfy grain.
 3. **Declared-key grain source** — `grain_of(sql, unique_key, kind)` prefers a declared
    merge/upsert `unique_key` (`DeclaredKeyKind::MergeRowKey`) — an *unverified assertion* trusted by
-   convention, not an engine-proven grain — falling back to structural inference (the only *sound*
-   source). A snapshot (SCD2) entity key (`DeclaredKeyKind::SnapshotEntityKey`) is **not** a row
-   grain and yields `Unknown`. Both caveats are detailed under "For a red-teamer to attack".
+   convention, not an engine-proven grain — falling back to structural inference (the strongest
+   signal, but not itself *sound* — see the GROUP BY note below). A snapshot (SCD2) entity key
+   (`DeclaredKeyKind::SnapshotEntityKey`) is **not** a row grain and yields `Unknown`. All three
+   caveats are detailed under "For a red-teamer to attack".
 
 ### The two pinned limitation tests were flipped from "pins the bug" to "proves the fix"
 
@@ -217,6 +218,19 @@ unearned: the real-project coverage is unproven, and the cross-model plumbing is
   now documented as an unverified assertion trusted by convention (the posture every analytics tool
   takes for a declared grain, paired with a uniqueness test). **Open design decision for wiring
   (feeds D1):** should an unverified declared key justify *silence*, or only drive *firing* — or be
-  paired with a required uniqueness check? Only structural inference (`GROUP BY`/`DISTINCT`) is
-  compile-time *sound*; declared keys are trust, and the spike does not yet distinguish the two
-  provenances in the returned `Grain`.
+  paired with a required uniqueness check? No source here is a proof: even structural inference is
+  only best-effort (next bullet); declared keys are weaker still, and the spike does not yet
+  distinguish grain provenance in the returned `Grain`.
+- **"Structural inference is sound" is an overstatement (found by stop-time review; claim corrected,
+  limitation pinned).** Two holes in the implemented path. (1) The `GROUP BY` branch emits the
+  *grouping* column's source name, while the `DISTINCT` branch emits the projected *output/alias*
+  name — inconsistent, and `check_one_join` matches join keys by output name. So `GROUP BY
+  customer_id` projected `AS cust_key` infers grain `{customer_id}`, a name absent from the output; a
+  downstream join on `cust_key` then raises `G001` though nothing fans out — a false positive, pinned
+  by `group_by_grain_uses_source_names_not_output_names`. It also never checks the grouping columns
+  are projected, and a non-minimal grouping (a functionally-dependent grouping column) over-states the
+  grain the same way. (2) A set-returning projection after `GROUP BY` (`SELECT id, UNNEST(tags) … GROUP
+  BY id`) multiplies rows the grain does not reflect — an exotic *false all-clear*. Net: inference is
+  the strongest compile-time signal and is conservative in the common cases, but it is neither
+  false-positive-free nor guaranteed complete; "sound" was wrong. Follow-ups before wiring: reconcile
+  `GROUP BY` grain to the projection's output names, and verify projection membership.

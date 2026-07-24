@@ -32,10 +32,12 @@
 //! 3. **Declared-key grain source.** [`grain_of`] reads a declared merge/upsert
 //!    `unique_key` as the model's *asserted* grain (unverified — Rocky enforces
 //!    no unique constraint), falling back to structural inference when none is
-//!    declared. Only structural inference is *sound*; a declared key is trusted
-//!    by convention. A snapshot (SCD2) entity key is *not* a row grain — SCD2
-//!    keeps multiple versions per entity — so it is never trusted as one (see
-//!    [`DeclaredKeyKind`]).
+//!    declared. Even structural inference is only best-effort — it matches by
+//!    column name and can misfire when `GROUP BY`/projection aliases diverge
+//!    from the output names — but it is the strongest signal; a declared key is
+//!    a weaker, unverified assertion. A snapshot (SCD2) entity key is *not* a
+//!    row grain — SCD2 keeps multiple versions per entity — so it is never
+//!    trusted as one (see [`DeclaredKeyKind`]).
 //!
 //! ## What still stays `Unknown` (⇒ silent) — honest residual gaps
 //!
@@ -139,22 +141,27 @@ pub enum DeclaredKeyKind {
 /// Resolves a model's grain from its declared `unique_key` first, falling back
 /// to structural inference over its own SQL.
 ///
-/// The two grain sources differ in how far they can be trusted. This spike does
-/// not yet reflect that difference in the returned [`Grain`] — whether an
-/// unverified declared key should justify *silence* is a wiring-step decision
-/// (see the trust-boundary note in `X1-PR2-MEASUREMENT.md`):
+/// The grain sources differ in how far they can be trusted — and none is a
+/// proof. This spike does not yet reflect the difference in the returned
+/// [`Grain`]; whether a given source should justify *silence* is a wiring-step
+/// decision (see the trust-boundary note in `X1-PR2-MEASUREMENT.md`):
 ///
-/// - **Structural inference** (`GROUP BY` / `DISTINCT`) is *sound* — the SQL
-///   guarantees the grain at compile time.
+/// - **Structural inference** (`GROUP BY` / `DISTINCT` over bare columns) is the
+///   strongest compile-time signal, but it is *not* sound: it matches columns by
+///   name without reconciling `GROUP BY`/projection aliases against the output
+///   column names (so it can raise `G001` on a join that does not fan out — a
+///   false positive; see `group_by_grain_uses_source_names_not_output_names`),
+///   and a set-returning projection after `GROUP BY` would let it miss a real
+///   fan-out. Best-effort, not a guarantee.
 /// - A [`DeclaredKeyKind::MergeRowKey`] is an *unverified assertion* — Rocky
 ///   merges on it but enforces no unique constraint, so an under-declaration
 ///   yields wrong diagnostics. Used by convention, like a declared grain in any
 ///   analytics tool.
 /// - A [`DeclaredKeyKind::SnapshotEntityKey`] is *not* the row grain at all
 ///   (SCD2 keeps multiple versions per entity); without the version columns we
-///   cannot form a sound grain, so it yields [`Grain::Unknown`] (silent) rather
-///   than a false proof of coverage. Firing on an unfiltered SCD2 entity-key
-///   join needs version columns + point-in-time-filter detection — a follow-up.
+///   cannot form a reliable grain, so it yields [`Grain::Unknown`] (silent)
+///   rather than a false proof of coverage. Firing on an unfiltered SCD2
+///   entity-key join needs version columns + point-in-time-filter detection.
 #[must_use]
 pub fn grain_of(
     sql: &str,
@@ -710,6 +717,36 @@ mod tests {
         assert_eq!(
             infer_grain("SELECT DISTINCT customer_id FROM orders"),
             Grain::known(["customer_id"])
+        );
+    }
+
+    #[test]
+    fn group_by_grain_uses_source_names_not_output_names() {
+        // Pins why "structural inference is sound" is an overstatement. The
+        // `GROUP BY` branch emits the *grouping* column's source name, while the
+        // `DISTINCT` branch emits the projected *output* name — inconsistent, and
+        // `check_one_join` matches join keys by output name. Here the grouping
+        // column `customer_id` is re-aliased to `cust_key` in the output, so the
+        // inferred grain names a column the output does not expose.
+        assert_eq!(
+            infer_grain(
+                "SELECT customer_id AS cust_key, SUM(x) AS total FROM orders \
+                 GROUP BY customer_id"
+            ),
+            Grain::known(["customer_id"]),
+            "GROUP BY inference emits the source name, not the output alias"
+        );
+        // Consequence: a downstream that joins on the real output name `cust_key`
+        // sees grain {customer_id} ⊄ {cust_key} and raises G001 though the join
+        // cannot fan out (one row per cust_key). A false positive — inference is
+        // conservative against false *all-clears*, but it is not sound. Fixing it
+        // means reconciling GROUP BY grain to the projection's output names.
+        let sql = "SELECT f.k, r.total FROM facts f JOIN agg r ON f.k = r.cust_key";
+        let diags = check_fanout("m", sql, &grains(&[("agg", Grain::known(["customer_id"]))]));
+        assert_eq!(
+            diags.len(),
+            1,
+            "documents the alias-divergence false positive, got: {diags:?}"
         );
     }
 
