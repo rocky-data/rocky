@@ -2,6 +2,17 @@
 
 Single repository for the Rocky data platform — a typed-program layer above the warehouse — and its first-party integrations.
 
+## Always ask when analyzing or planning
+
+Whenever analyzing a problem or planning a change, confront these two questions explicitly, in the output — never just consider them silently:
+
+- What are you least confident about right now?
+- What's the most important thing I'm missing about this situation?
+
+A real answer names the weakest assumption, the stale justification, or the hidden prerequisite — and what would settle it. "Nothing" is acceptable only after an actual search, never as a reflex.
+
+These questions are also red-team bait, deliberately. Give every substantive analysis or plan, plus these two answers, to an independent red team — a genuinely different model, never the authoring model or a same-model agent — because an independent model is better placed than the author to see what's missing. Substantive means it can change behavior, a decision, or standing policy; a small or docs-only diff never exempts a change, only mechanical, behavior-neutral corrections are exempt. Name the reviewer and address or rebut its findings on the record; that disposition closes the loop (the red-team pass itself doesn't recurse). If no independent red team is available, say so in the output rather than skipping silently. Code changes additionally follow the [`AGENT_REVIEW.md`](AGENT_REVIEW.md) adversarial-review profile.
+
 ## Subprojects
 
 | Path | Language | What it is |

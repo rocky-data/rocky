@@ -1,8 +1,12 @@
 # Rocky monorepo
 
-Canonical agent guidance lives in [`AGENTS.md`](AGENTS.md) (shared across agent tools). Claude Code loads it via the import below; the rest of this file is the Claude Code skills router.
+Canonical agent guidance lives in [`AGENTS.md`](AGENTS.md) (shared across agent tools). Claude Code loads it via the import below; the rest of this file is Claude Code-specific: the red-team mapping and the skills router.
 
 @AGENTS.md
+
+## Red team in Claude Code
+
+The independent red team that [`AGENTS.md`](AGENTS.md) requires for substantive analyses and plans is the **Codex plugin** here (the `codex:codex-rescue` agent). `/code-review` is same-model Claude: strong for code diffs, but it does not satisfy the independence requirement.
 
 ## Claude Code skills
 
