@@ -280,6 +280,15 @@ fn validate_contract_with_policy(
 /// of [`type_name_matches`], or a declaration that arm accepts could fall
 /// outside the unverifiable report.
 ///
+/// # The two gates scope differently, and that is inherent
+///
+/// The load gate reports when *either* raw type string names a decimal — it has
+/// two warehouse type strings to look at. This gate has only one: the contract's
+/// declared type. The column side is a `RockyType` that is, by construction at
+/// this point, `Unknown` — there is no raw string carrying a name that could be
+/// inspected. So the load gate's second disjunct has no analogue here, and the
+/// asymmetry is a property of the available evidence, not an oversight.
+///
 /// # This accepts parameters it does not enforce
 ///
 /// `Decimal(10,0)` is recognized here — so an *unresolved* column against it is
