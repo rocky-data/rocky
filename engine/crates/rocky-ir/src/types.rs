@@ -587,13 +587,24 @@ pub enum UnverifiablePolicy {
 ///   type check"*.
 /// - the `CHANGELOG` entry that announced the warning.
 ///
-/// # Two known gaps that should be closed before, or with, the flip
+/// # Three known gaps that should be closed before, or with, the flip
 ///
-/// Both are pre-existing and neither is a *new* fail-open, but the flip is the
+/// All three are pre-existing and none is a *new* fail-open, but the flip is the
 /// natural moment to settle them, because after it the gates reject and a gap
 /// that merely under-warns today starts to look like an arbitrary exemption:
 ///
-/// - `rocky_compiler::contracts::declares_rocky_decimal` accepts a declared
+/// - **Every project that compiles without source schemas fails its contracts
+///   at the flip.** With `[cache.schemas]` disabled or a cold cache the
+///   compiler's `source_schemas` is empty, so no column in any model resolves;
+///   `rocky_compiler::contracts` reports that as one collapsed diagnostic per
+///   contracted model, which becomes one **error** per contracted model here.
+///   Measured: every POC in this repository is in that state, every column. That
+///   is the correct fail-closed reading — a contract cannot be checked against
+///   evidence that was never produced — and it is a much larger migration than a
+///   per-column warning suggests. Closing it means making a schema cache
+///   reliably available to `rocky compile`, or offering an explicit opt-out that
+///   is itself recorded.
+/// - `rocky_compiler::contracts::type_name_matches` accepts a declared
 ///   `Decimal(p,s)` but the compile-time check never enforces `p`/`s` — any
 ///   decimal satisfies any `Decimal(…)` declaration there. Closing it turns
 ///   currently-clean contracts into `E011` errors.

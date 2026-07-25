@@ -705,9 +705,126 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
     }
 }
 
+/// [`default_type_mapper`] exactly as it stood before the decimal rewrite,
+/// frozen as ground truth for the transition oracle in
+/// [`crate::contracts`]'s tests. Sibling of
+/// `rocky_ir::types::tests::is_assignable_frozen_old` and of
+/// `rocky_core::contracts::tests::warehouse_type_to_rocky_frozen_old`.
+///
+/// The rewrite's verdict change does not live in `is_assignable` — old and new
+/// agree that `Decimal(38,0)` does not fit `Decimal(10,2)`. It lives here, in
+/// which type a warehouse type *string* resolves to, and nothing compared this
+/// function's old and new output until the oracle did.
+///
+/// Two behaviours are reproduced verbatim: the `starts_with` family test, and
+/// the `Decimal(38,0)` fallthrough for anything it could not parse into exactly
+/// two in-range parameters.
+#[cfg(test)]
+pub(crate) fn default_type_mapper_frozen_old(warehouse_type: &str) -> RockyType {
+    let upper = warehouse_type.trim().to_uppercase();
+    match upper.as_str() {
+        "BOOLEAN" | "BOOL" => RockyType::Boolean,
+        "TINYINT" | "BYTE" | "SMALLINT" | "SHORT" | "INT" | "INTEGER" => RockyType::Int32,
+        "BIGINT" | "LONG" => RockyType::Int64,
+        "FLOAT" | "REAL" => RockyType::Float32,
+        "DOUBLE" | "DOUBLE PRECISION" => RockyType::Float64,
+        "STRING" | "VARCHAR" | "TEXT" => RockyType::String,
+        "BINARY" => RockyType::Binary,
+        "DATE" => RockyType::Date,
+        "TIMESTAMP" => RockyType::Timestamp,
+        "TIMESTAMP_NTZ" => RockyType::TimestampNtz,
+        "VARIANT" => RockyType::Variant,
+        _ if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") => {
+            if let Some(params) = upper
+                .strip_prefix("DECIMAL(")
+                .or_else(|| upper.strip_prefix("NUMERIC("))
+                .and_then(|s| s.strip_suffix(')'))
+            {
+                let parts: Vec<&str> = params.split(',').collect();
+                if parts.len() == 2
+                    && let (Ok(p), Ok(s)) = (parts[0].trim().parse(), parts[1].trim().parse())
+                {
+                    return RockyType::Decimal {
+                        precision: p,
+                        scale: s,
+                    };
+                }
+            }
+            RockyType::Decimal {
+                precision: 38,
+                scale: 0,
+            }
+        }
+        _ => RockyType::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mapper-level half of the transition oracle: every string in the grid
+    /// whose resolved type moved, and nothing else.
+    ///
+    /// The gate-level half — what each of these does to a contract verdict — is
+    /// `contracts::tests::test_compiler_gate_transition_oracle`.
+    #[test]
+    fn test_default_type_mapper_transition_oracle() {
+        let dec = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
+
+        // (type string, old, new). Exhaustive over the grid: any string not
+        // listed must map identically old and new.
+        let intended: &[(&str, RockyType, RockyType)] = &[
+            // An unparameterised decimal names a different type on every
+            // adapter, so `Decimal(38,0)` was a fabrication, not a default.
+            ("DECIMAL", dec(38, 0), RockyType::Unknown),
+            ("decimal", dec(38, 0), RockyType::Unknown),
+            ("NUMERIC", dec(38, 0), RockyType::Unknown),
+            // `DECIMAL(p)` is `DECIMAL(p,0)` — ANSI, and what DuckDB executes.
+            ("DECIMAL(10)", dec(38, 0), dec(10, 0)),
+            // Parameters that name no type on any adapter used to fall through
+            // to the same fabrication.
+            ("DECIMAL(300,2)", dec(38, 0), RockyType::Unknown),
+            ("DECIMAL(10,-2)", dec(38, 0), RockyType::Unknown),
+            // Both parameters fit `u8`, so the old mapper accepted them
+            // verbatim and produced a decimal with more fractional digits than
+            // digits — a type nothing can hold.
+            ("DECIMAL(5,10)", dec(5, 10), RockyType::Unknown),
+            ("DECIMAL(x)", dec(38, 0), RockyType::Unknown),
+            ("DECIMAL(1,2,3)", dec(38, 0), RockyType::Unknown),
+            // A near-miss name is no longer routed through the decimal branch
+            // by a prefix test.
+            ("NUMERICAL", dec(38, 0), RockyType::Unknown),
+            ("DECIMALISH", dec(38, 0), RockyType::Unknown),
+            // A spaced parameter list is the same type as an unspaced one.
+            ("DECIMAL (10,2)", dec(38, 0), dec(10, 2)),
+        ];
+
+        for (type_str, old, new) in intended {
+            assert_eq!(
+                default_type_mapper_frozen_old(type_str),
+                *old,
+                "frozen old mapper drifted for {type_str}"
+            );
+            assert_eq!(
+                default_type_mapper(type_str),
+                *new,
+                "new mapper drifted for {type_str}"
+            );
+        }
+
+        for type_str in crate::contracts::TRANSITION_TYPE_STRINGS {
+            let old = default_type_mapper_frozen_old(type_str);
+            let new = default_type_mapper(type_str);
+            let listed = intended.iter().any(|(t, _, _)| t == type_str);
+            assert_eq!(
+                old != new,
+                listed,
+                "{type_str}: old={old:?} new={new:?} — every change must be listed \
+                 above, and every listing must still be a change"
+            );
+        }
+    }
 
     #[test]
     fn test_default_type_mapper() {

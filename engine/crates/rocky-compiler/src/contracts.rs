@@ -131,6 +131,24 @@ fn validate_contract_with_policy(
     let mut diagnostics = Vec::new();
     let col_names: Vec<&str> = inferred_schema.iter().map(|c| c.name.as_str()).collect();
 
+    // Whether *nothing* in this model resolved. Measured, not assumed: with
+    // `[cache.schemas]` disabled or a cold cache the compiler is handed an empty
+    // `source_schemas`, every leaf column types as `Unknown`, and so does
+    // everything downstream of it — both of this repository's fixture POCs are
+    // in exactly that state, every column, and so is any project compiled
+    // without a live warehouse schema.
+    //
+    // That is a *project-configuration* fact, not a fact about any one column,
+    // and it is the only thing this flag is used for: the per-column reports
+    // below collapse into one model-level report naming the same columns. It is
+    // **not** a suppression — see `collapsed_unverifiable`.
+    let every_column_unresolved = inferred_schema
+        .iter()
+        .all(|c| c.data_type == RockyType::Unknown);
+    // Columns whose declared type could not be checked, when the cause is
+    // project-wide. Collected here and reported once, after the loop.
+    let mut collapsed_unverifiable: Vec<&str> = Vec::new();
+
     // Check required columns exist
     for required in &contract.rules.required {
         if !col_names.contains(&required.as_str()) {
@@ -164,21 +182,30 @@ fn validate_contract_with_policy(
                 if let Some(ref expected_type) = contract_col.type_name {
                     if col.data_type == RockyType::Unknown {
                         // The `Unverifiable` verdict, expressed against a
-                        // string-declared type. Scoped to declared decimals for
-                        // this release — see `declares_rocky_decimal`.
-                        if declares_rocky_decimal(expected_type) {
+                        // string-declared type. It fires for **every** declared
+                        // type, not just a declared decimal.
+                        //
+                        // Scoping it to declared decimals is what round 2
+                        // shipped, and it was a fail-open: `default_type_mapper`
+                        // now resolves a bare `decimal` (what Databricks
+                        // `information_schema` returns for every decimal source
+                        // column) to `Unknown`, so a contract declaring `Int64`
+                        // / `String` / `Timestamp` for such a column produced
+                        // `E011` before this branch existed and produced
+                        // *nothing at all* after it. A check that used to run
+                        // must not stop running.
+                        if every_column_unresolved {
+                            // Deferred, not dropped — reported once per model
+                            // below.
+                            collapsed_unverifiable.push(&contract_col.name);
+                        } else {
                             let message = format!(
                                 "column '{}' has no inferred type, so the contract's expected \
                                  type '{expected_type}' could not be verified — unresolved \
                                  evidence does not satisfy a contract",
                                 contract_col.name
                             );
-                            let suggestion = format!(
-                                "give `{}` a concrete type — an explicit CAST with declared \
-                                 precision and scale, e.g. CAST({0} AS DECIMAL(38,2)) — or \
-                                 compile with source schemas available so the type resolves",
-                                contract_col.name
-                            );
+                            let suggestion = unresolved_remedy(&contract_col.name);
                             diagnostics.push(match policy {
                                 UnverifiablePolicy::Warn => Diagnostic::warning(
                                     W032,
@@ -252,6 +279,54 @@ fn validate_contract_with_policy(
         }
     }
 
+    // The collapsed form of the same verdict: one report per model instead of
+    // one per contracted column, emitted when *no* column in the model
+    // resolved.
+    //
+    // # Why collapse rather than suppress
+    //
+    // Suppressing here was measured and rejected: both of this repository's
+    // fixture POCs, and every project compiled without source schemas, have no
+    // resolved column at all, so suppression would make this gate report
+    // nothing in any of them — trading one silence for another. The verdict is
+    // the same verdict; only its granularity changes, and the columns it stands
+    // in for are named so it stays actionable.
+    //
+    // # What this becomes at the flip
+    //
+    // Under [`UnverifiablePolicy::Reject`] this is one **error** per contracted
+    // model, and every project that compiles without source schemas — every POC
+    // in this repository included — fails its contracts. That is the correct
+    // fail-closed reading (a contract cannot be checked against evidence that
+    // was never produced), and it is a far larger migration than a per-column
+    // warning suggests. It is named on [`crate::types::UNVERIFIABLE_POLICY`] as
+    // flip-time work.
+    if !collapsed_unverifiable.is_empty() {
+        let names = collapsed_unverifiable
+            .iter()
+            .map(|n| format!("'{n}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let count = collapsed_unverifiable.len();
+        let message = format!(
+            "{count} contracted column(s) ({names}) could not be type-checked: no column in \
+             this model has an inferred type, so no expected type could be verified — \
+             unresolved evidence does not satisfy a contract"
+        );
+        let suggestion = unresolved_remedy_project();
+        diagnostics.push(match policy {
+            UnverifiablePolicy::Warn => Diagnostic::warning(
+                W032,
+                model_name,
+                format!("{message}. Warning in this release; error in the next"),
+            )
+            .with_suggestion(suggestion),
+            UnverifiablePolicy::Reject => {
+                Diagnostic::error(E037, model_name, message).with_suggestion(suggestion)
+            }
+        });
+    }
+
     // Check protected columns
     for protected in &contract.rules.protected {
         if !col_names.contains(&protected.as_str()) {
@@ -271,49 +346,43 @@ fn validate_contract_with_policy(
     diagnostics
 }
 
-/// Whether a contract's declared type *name* is in the fixed-point decimal
-/// family, in Rocky's vocabulary (`Decimal`, `Decimal(38,2)`).
+/// The remedy for one unresolved contracted column, **in the order that
+/// actually works**.
 ///
-/// The load gate's counterpart reads *warehouse* vocabulary (`DECIMAL`,
-/// `NUMBER`, …) and is `rocky_core::contracts::looks_like_decimal`; the two look
-/// alike and are not interchangeable. This one must agree with the `Decimal` arm
-/// of [`type_name_matches`], or a declaration that arm accepts could fall
-/// outside the unverifiable report.
+/// The order is measured, not stylistic. `enhanced_inference` applies a cast's
+/// target type only when the value being cast already has a known type (the
+/// `input_is_known` gate in `typecheck.rs`), so a `CAST` does *not* repair a
+/// column whose source type never resolved. Probed on this branch, with the
+/// model `SELECT CAST(amount AS DECIMAL(10,2)) AS amount, id FROM src.raw.t`:
 ///
-/// # The two gates scope differently, and that is inherent
+/// ```text
+/// source `amount` described as "decimal"       -> model `amount` = Unknown
+/// source `amount` described as "DECIMAL(38,0)" -> model `amount` = Decimal(10,2)
+/// SELECT CAST(1 AS DECIMAL(10,2)) AS lit       -> `lit` = Unknown
+/// ```
 ///
-/// The load gate reports when *either* raw type string names a decimal — it has
-/// two warehouse type strings to look at. This gate has only one: the contract's
-/// declared type. The column side is a `RockyType` that is, by construction at
-/// this point, `Unknown` — there is no raw string carrying a name that could be
-/// inspected. So the load gate's second disjunct has no analogue here, and the
-/// asymmetry is a property of the available evidence, not an oversight.
-///
-/// # This accepts parameters it does not enforce
-///
-/// `Decimal(10,0)` is recognized here — so an *unresolved* column against it is
-/// reported — but a **resolved** `Decimal(38,0)` against it is not: the
-/// `Decimal` arm of [`type_name_matches`] matches any decimal against any
-/// `Decimal(…)` declaration, so the compile-time gate cannot detect a
-/// precision/scale mismatch at all. That is pre-existing (it predates the
-/// unverifiable verdict entirely) and it is **not** closed by this change.
-///
-/// The `rocky load` gate *does* enforce decimal containment — but it is not a
-/// backstop for this one, and saying so would be wrong: the two gates read
-/// different configuration. This gate reads a `<model>.contract.toml`
-/// ([`CompilerContract`]); the load gate reads `rocky.toml`'s
-/// `[…contract] required_columns` (`rocky_core::contracts::ContractConfig`).
-/// A project that declares `Decimal(10,0)` only in the compile-time contract has
-/// no second check anywhere.
-///
-/// Closing it means parsing the declared parameters and routing through
-/// [`rocky_ir::contract_verdict`], which turns a class of contracts that compile
-/// clean today into `E011` errors. That is a hard-rejection change, and it does
-/// not belong in the release whose whole point is that the new verdict is
-/// warning-only. It is named on [`rocky_ir::UNVERIFIABLE_POLICY`] as flip-time
-/// work.
-fn declares_rocky_decimal(type_name: &str) -> bool {
-    type_name == "Decimal" || type_name.starts_with("Decimal(")
+/// The previous wording led with the cast, which is false for exactly the
+/// population that receives this diagnostic.
+fn unresolved_remedy(column: &str) -> String {
+    format!(
+        "resolve the source type first — run `rocky discover --with-schemas` (or any `rocky \
+         run`) to warm the schema cache this compile reads. A common cause is a source that \
+         reports a bare `DECIMAL` with no precision or scale, which names a different type on \
+         every warehouse and so resolves to none. An explicit `CAST({column} AS …)` only takes \
+         effect once the value being cast already has a known type, so on its own it does not \
+         repair a column whose source type never resolved."
+    )
+}
+
+/// [`unresolved_remedy`] for the collapsed, model-level report — same ordering,
+/// no single column to name.
+fn unresolved_remedy_project() -> String {
+    "no column in this model resolved, which is what compiling with no source schemas looks \
+     like: run `rocky discover --with-schemas` (or any `rocky run`) to warm the schema cache \
+     this compile reads, and check `[cache.schemas] enabled` is not `false`. An explicit `CAST` \
+     only takes effect once the value being cast already has a known type, so on its own it \
+     does not repair this."
+        .to_string()
 }
 
 /// Check if a RockyType matches a type name string from a contract.
@@ -345,6 +414,47 @@ fn type_name_matches(rocky_type: &RockyType, type_name: &str) -> bool {
         RockyType::Unknown => false,
     }
 }
+
+/// Warehouse type strings a source adapter can really hand the compiler, plus
+/// the malformed spellings the decimal rewrite re-routed.
+///
+/// Shared by the two halves of the transition oracle — the mapper-level half in
+/// [`crate::compile`] and the gate-level half below — so neither can drift onto
+/// a narrower grid than the other. `decimal` in lower case is in the grid
+/// because that is literally what Databricks `information_schema.columns
+/// .data_type` returns for every decimal source column.
+#[cfg(test)]
+pub(crate) const TRANSITION_TYPE_STRINGS: &[&str] = &[
+    "BIGINT",
+    "INT",
+    "SMALLINT",
+    "STRING",
+    "VARCHAR",
+    "DOUBLE",
+    "FLOAT",
+    "BOOLEAN",
+    "DATE",
+    "TIMESTAMP",
+    "TIMESTAMP_NTZ",
+    "BINARY",
+    "VARIANT",
+    "DECIMAL",
+    "decimal",
+    "NUMERIC",
+    "DECIMAL(10,2)",
+    "DECIMAL (10,2)",
+    "DECIMAL(38,0)",
+    "DECIMAL(10)",
+    "DECIMAL(300,2)",
+    "DECIMAL(10,-2)",
+    "DECIMAL(5,10)",
+    "DECIMAL(x)",
+    "DECIMAL(1,2,3)",
+    "NUMERICAL",
+    "DECIMALISH",
+    "HUGEINT",
+    "GEOMETRY",
+];
 
 #[cfg(test)]
 mod tests {
@@ -490,7 +600,12 @@ mod tests {
     /// and `E037` under `Reject`.
     #[test]
     fn test_unknown_type_is_reported_not_permitted() {
-        let schema = vec![typed_col("total_revenue", RockyType::Unknown, false)];
+        // A model with *something* resolved: the per-column report. The
+        // all-unresolved model is the collapsed report and has its own test.
+        let schema = vec![
+            typed_col("total_revenue", RockyType::Unknown, false),
+            typed_col("order_id", RockyType::Int64, false),
+        ];
 
         let contract = CompilerContract {
             columns: vec![ContractColumn {
@@ -539,15 +654,34 @@ mod tests {
         assert!(shipped.iter().all(|d| &*d.code != E037));
     }
 
-    /// The scope of the compiler gate's unverifiable report: only a contract
-    /// that declares a *decimal* type. A cold schema cache makes every
-    /// contracted column `Unknown`, so a general rule would emit one diagnostic
-    /// per contracted column on every cold compile — and the flip would then
-    /// break every such build. The hole this leaves is real and asserted here
-    /// rather than only described.
+    /// **The inversion of the round-2 scoping**, and the regression test for the
+    /// silence it caused.
+    ///
+    /// This test previously asserted that a contract declaring `Int64` /
+    /// `String` / `Timestamp` over an unresolved column produced *nothing* under
+    /// both policies, and called that "out of scope for this release". It was a
+    /// fail-open, and it pinned one: `default_type_mapper` resolves the bare
+    /// `decimal` that Databricks `information_schema` returns to `Unknown`, so
+    /// those three declarations produced `E011` before the unverifiable branch
+    /// existed and produced nothing after it. Measured on this branch, with the
+    /// column typed from a bare `"decimal"`:
+    ///
+    /// ```text
+    ///   contract declares Int64      pre-PR=[E011]  round-2=[]  <- the silence
+    ///   contract declares String     pre-PR=[E011]  round-2=[]
+    ///   contract declares Timestamp  pre-PR=[E011]  round-2=[]
+    /// ```
+    ///
+    /// The declared type name is now irrelevant to *whether* the verdict is
+    /// reported.
     #[test]
-    fn test_unverifiable_report_is_scoped_to_declared_decimals() {
-        let schema = vec![typed_col("id", RockyType::Unknown, false)];
+    fn test_unverifiable_report_covers_every_declared_type() {
+        // One resolved column, so this is a per-column gap rather than a
+        // project-wide one.
+        let schema = vec![
+            typed_col("id", RockyType::Unknown, false),
+            typed_col("resolved", RockyType::Int64, false),
+        ];
         let contract = |type_name: &str| CompilerContract {
             columns: vec![ContractColumn {
                 name: "id".to_string(),
@@ -558,18 +692,37 @@ mod tests {
             rules: ContractRules::default(),
         };
 
-        for declared in ["Decimal", "Decimal(38,2)"] {
-            let diags = validate_contract("m", &schema, &contract(declared));
-            assert!(
-                diags.iter().any(|d| &*d.code == W032),
-                "{declared} must be reported"
-            );
-        }
-
-        // Out of scope for this release — still permitted, and still silent,
-        // under both policies.
-        for declared in ["Int64", "String", "Timestamp"] {
+        for declared in [
+            "Decimal",
+            "Decimal(38,2)",
+            "Int64",
+            "String",
+            "Timestamp",
+            "Boolean",
+            "Array<String>",
+        ] {
             let warned = validate_contract("m", &schema, &contract(declared));
+            let w032 = warned
+                .iter()
+                .find(|d| &*d.code == W032)
+                .unwrap_or_else(|| panic!("{declared} must be reported, got {warned:?}"));
+            assert!(
+                w032.message.contains(declared),
+                "the report must name the declared type: {w032:?}"
+            );
+            // The remedy must lead with resolving the *source* type, because a
+            // `CAST` provably does not repair an unresolved one — see
+            // `unresolved_remedy`.
+            let suggestion = w032.suggestion.as_deref().unwrap_or_default();
+            assert!(
+                suggestion.contains("rocky discover --with-schemas"),
+                "the remedy must name the action that works: {w032:?}"
+            );
+            assert!(
+                suggestion.find("resolve the source type") < suggestion.find("An explicit `CAST"),
+                "the remedy must put the source type before the CAST: {w032:?}"
+            );
+
             let rejected = validate_contract_with_policy(
                 "m",
                 &schema,
@@ -577,10 +730,80 @@ mod tests {
                 UnverifiablePolicy::Reject,
             );
             assert!(
-                warned.is_empty() && rejected.is_empty(),
-                "{declared}: scoped out of this release, but got {warned:?} / {rejected:?}"
+                rejected.iter().any(|d| &*d.code == E037),
+                "{declared} must reject at the flip, got {rejected:?}"
             );
         }
+    }
+
+    /// The collapsed form: when *no* column in the model resolved, the same
+    /// verdict is reported once for the model rather than once per column.
+    ///
+    /// Not a suppression — suppressing here was measured and rejected. Both of
+    /// this repository's fixture POCs have no resolved column at all (every
+    /// column of every model), so a suppression would have made this gate report
+    /// nothing in any in-repo project, trading one silence for another.
+    #[test]
+    fn test_unverifiable_report_collapses_when_nothing_resolved() {
+        let schema = vec![
+            typed_col("id", RockyType::Unknown, false),
+            typed_col("amount", RockyType::Unknown, true),
+        ];
+        let contract = CompilerContract {
+            columns: vec![
+                ContractColumn {
+                    name: "id".to_string(),
+                    type_name: Some("Int64".to_string()),
+                    nullable: None,
+                    description: None,
+                },
+                ContractColumn {
+                    name: "amount".to_string(),
+                    type_name: Some("Decimal".to_string()),
+                    nullable: None,
+                    description: None,
+                },
+            ],
+            rules: ContractRules::default(),
+        };
+
+        let warned = validate_contract("m", &schema, &contract);
+        let reports: Vec<_> = warned.iter().filter(|d| &*d.code == W032).collect();
+        assert_eq!(
+            reports.len(),
+            1,
+            "one report for the model, not one per column: {warned:?}"
+        );
+        // It stands in for both columns, so it must name both.
+        assert!(reports[0].message.contains("'id'"), "{:?}", reports[0]);
+        assert!(reports[0].message.contains("'amount'"), "{:?}", reports[0]);
+        assert!(reports[0].message.contains('2'), "{:?}", reports[0]);
+        assert!(reports[0].suggestion.is_some());
+
+        // The flip turns the collapsed report into a single error per model.
+        let rejected =
+            validate_contract_with_policy("m", &schema, &contract, UnverifiablePolicy::Reject);
+        let errors: Vec<_> = rejected.iter().filter(|d| &*d.code == E037).collect();
+        assert_eq!(errors.len(), 1, "{rejected:?}");
+    }
+
+    /// A contract column with no declared type is not a type check, so it is
+    /// neither reported nor collapsed. Guards the collapse from counting
+    /// columns that were never going to be checked.
+    #[test]
+    fn test_untyped_contract_column_is_not_collapsed() {
+        let schema = vec![typed_col("id", RockyType::Unknown, false)];
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "id".to_string(),
+                type_name: None,
+                nullable: Some(true),
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        let diags = validate_contract("m", &schema, &contract);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     /// G6 — `Unknown` must not match a declared type name either. Once the
@@ -629,5 +852,162 @@ no_new_nullable = true
         assert_eq!(contract.rules.required.len(), 2);
         assert_eq!(contract.rules.protected.len(), 1);
         assert!(contract.rules.no_new_nullable);
+    }
+
+    // ======================================================================
+    // Transition oracle, gate-level half.
+    //
+    // The mapper-level half lives in `compile.rs` and pins *which type* each
+    // string resolves to, old vs new. This half pins what that does to a
+    // contract verdict, which is the thing a user actually sees.
+    // ======================================================================
+
+    /// `type_name_matches` exactly as it stood before the split, frozen.
+    ///
+    /// The only difference is the `Unknown` arm, which returned `true` —
+    /// "Unknown matches anything". That arm is the entire pre-rewrite reason a
+    /// column with no inferred type passed every contract silently.
+    fn type_name_matches_frozen_old(rocky_type: &RockyType, type_name: &str) -> bool {
+        match rocky_type {
+            RockyType::Unknown => true,
+            other => type_name_matches(other, type_name),
+        }
+    }
+
+    /// The pre-rewrite compile-gate verdict for one (source type string,
+    /// declared type name) pair: `Some(E011)` or `None`.
+    fn frozen_old_gate_code(source_type: &str, declared: &str) -> Option<&'static str> {
+        let ty = crate::compile::default_type_mapper_frozen_old(source_type);
+        (!type_name_matches_frozen_old(&ty, declared)).then_some(E011)
+    }
+
+    /// Contract type names a user can write in a `.contract.toml`.
+    const DECLARED_NAMES: &[&str] = &[
+        "Int64",
+        "Int32",
+        "String",
+        "Boolean",
+        "Float64",
+        "Date",
+        "Timestamp",
+        "Binary",
+        "Decimal",
+        "Decimal(10,2)",
+        "Decimal(38,0)",
+    ];
+
+    fn new_gate_codes(source_type: &str, declared: &str) -> Vec<String> {
+        // A resolved sibling column, so this exercises the per-column report
+        // rather than the collapsed one. The collapsed path has its own test.
+        let schema = vec![
+            typed_col("c", crate::compile::default_type_mapper(source_type), true),
+            typed_col("_resolved", RockyType::Int64, false),
+        ];
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "c".to_string(),
+                type_name: Some(declared.to_string()),
+                nullable: None,
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+        validate_contract("m", &schema, &contract)
+            .iter()
+            .map(|d| d.code.to_string())
+            .collect()
+    }
+
+    /// **The invariant F1 restored, as a property over the whole grid:** a
+    /// contract type check that used to run must not stop running.
+    ///
+    /// Stated executably: there is no (source type, declared type) pair for
+    /// which the pre-rewrite gate produced `E011` and this gate produces
+    /// nothing. Round 2 had 3 such pairs for *every* decimal source string —
+    /// measured, with the column typed from Databricks' bare `decimal`:
+    ///
+    /// ```text
+    ///   declares Int64      pre-rewrite=[E011]  round-2=[]   <- silent
+    ///   declares String     pre-rewrite=[E011]  round-2=[]
+    ///   declares Timestamp  pre-rewrite=[E011]  round-2=[]
+    /// ```
+    ///
+    /// A property, not a list, because the list would have to be re-derived
+    /// every time the grid grows — and because the failure mode being guarded
+    /// is precisely "a case nobody thought to enumerate went quiet".
+    #[test]
+    fn test_compiler_gate_never_goes_silent_where_it_used_to_speak() {
+        let mut regressions = Vec::new();
+        for source_type in TRANSITION_TYPE_STRINGS {
+            for declared in DECLARED_NAMES {
+                let old = frozen_old_gate_code(source_type, declared);
+                let new = new_gate_codes(source_type, declared);
+                if old.is_some() && new.is_empty() {
+                    regressions.push((*source_type, *declared));
+                }
+            }
+        }
+        assert!(
+            regressions.is_empty(),
+            "the pre-rewrite gate reported these and this one is silent: {regressions:?}"
+        );
+    }
+
+    /// The gate-level transition table: every pair whose diagnostic changed,
+    /// classified, with the whole grid asserted against the classification.
+    ///
+    /// Three transition classes are legitimate and each is checked by a rule
+    /// rather than by an enumerated pair list, because the grid is 29 × 11:
+    ///
+    /// - `E011` → `W032`: the type stopped resolving, so a *mismatch* verdict
+    ///   became an *unverifiable* one. The check still runs; it reports at
+    ///   warning severity this release and rejects at the flip.
+    /// - `∅` → `W032`: same cause, for a declaration the old concrete type
+    ///   happened to satisfy. A new report, never a new permit.
+    /// - `∅` → `E011` / `E011` → `∅` at *resolved* types: only `DECIMAL(10)`
+    ///   and `DECIMAL (10,2)`, which now resolve to what they name.
+    ///
+    /// What must never appear is a fourth class: a pair that reported before and
+    /// reports nothing now. That is asserted separately, as a property, by
+    /// `test_compiler_gate_never_goes_silent_where_it_used_to_speak`.
+    #[test]
+    fn test_compiler_gate_transition_oracle() {
+        let mut changed = Vec::new();
+        for source_type in TRANSITION_TYPE_STRINGS {
+            for declared in DECLARED_NAMES {
+                let old = frozen_old_gate_code(source_type, declared);
+                let new = new_gate_codes(source_type, declared);
+                let old_v: Vec<String> = old.iter().map(|c| (*c).to_string()).collect();
+                if old_v == new {
+                    continue;
+                }
+                changed.push((*source_type, *declared, old_v.clone(), new.clone()));
+
+                let resolves_now =
+                    crate::compile::default_type_mapper(source_type) != RockyType::Unknown;
+                if new == vec![W032.to_string()] {
+                    assert!(
+                        !resolves_now,
+                        "{source_type}/{declared}: W032 is only for a type that does not resolve"
+                    );
+                } else {
+                    assert!(
+                        resolves_now,
+                        "{source_type}/{declared}: an unresolved type can only produce W032, \
+                         got {new:?}"
+                    );
+                    assert!(
+                        matches!(source_type, &"DECIMAL(10)" | &"DECIMAL (10,2)"),
+                        "{source_type}/{declared}: the only strings that changed *resolved* \
+                         verdict are the two whose parameters are now read correctly, got \
+                         {old_v:?} -> {new:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            !changed.is_empty(),
+            "the oracle must observe the change it exists to bound"
+        );
     }
 }

@@ -179,14 +179,20 @@ pub fn validate_contract(
 ///   and the pair is decided by [`contract_verdict`]. A narrower landed type
 ///   (`INT32`) satisfies a wider contract (`BIGINT`), but not the reverse.
 /// - **Unverifiable types** (the gate's third outcome): when either side
-///   normalizes to [`RockyType::Unknown`] the containment question cannot be
-///   answered. That is **not** a permit —
+///   normalizes to [`RockyType::Unknown`] the containment question usually
+///   cannot be answered. That is **not** a permit —
 ///   [`is_assignable`][rocky_ir::is_assignable] would say it is, which is the
-///   fail-open this gate no longer has. What happens instead is
-///   [`UNVERIFIABLE_POLICY`]: `Warn` reports `W032` and permits (the migration
-///   window), `Reject` reports a `required_column_type_unverifiable` violation.
+///   fail-open this gate no longer has. Two things can happen:
 ///
-///   The report is scoped to the *decimal* family in this release — see
+///   1. The *family* the unresolved side names decides it anyway — no
+///      `DECIMAL`, whatever its parameters, holds a `VARCHAR`. That is a
+///      violation under both policies, now, and restores a rejection the
+///      decimal rewrite dropped. See [`family_rules_out`].
+///   2. Otherwise it is genuinely undecidable and [`UNVERIFIABLE_POLICY`]
+///      applies: `Warn` reports `W032` and permits (the migration window),
+///      `Reject` reports a `required_column_type_unverifiable` violation.
+///
+///   The *report* in (2) is scoped to the decimal family in this release — see
 ///   [`unverifiable_is_reportable`] for the conditions and for the residual
 ///   fail-open that scoping deliberately leaves open.
 ///
@@ -267,6 +273,25 @@ fn validate_contract_typed_with_policy(
                     column: req.name.clone(),
                     message: format!(
                         "column '{}' has type '{}' ({landed_ty}), expected '{}' ({expected_ty})",
+                        req.name, col.data_type, req.data_type
+                    ),
+                });
+            }
+            // Unverifiable, but the *family* decides it anyway. Checked before
+            // the reporting arm below, because this is a violation under both
+            // policies — it is not waiting for the flip.
+            ContractVerdict::Unverifiable
+                if family_rules_out(&col.data_type, &landed_ty, &req.data_type, &expected_ty) =>
+            {
+                violations.push(ContractViolation {
+                    // Deliberately the same rule the pre-split gate used for
+                    // these pairs, because that is what this arm restores.
+                    rule: "required_column_type".to_string(),
+                    column: req.name.clone(),
+                    message: format!(
+                        "column '{}' has type '{}' ({landed_ty}), expected '{}' ({expected_ty}) — \
+                         the unparameterised side names the fixed-point decimal family, and no \
+                         decimal, whatever its precision and scale, satisfies this pair",
                         req.name, col.data_type, req.data_type
                     ),
                 });
@@ -423,6 +448,77 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
     }
 }
 
+/// Whether an [`ContractVerdict::Unverifiable`] pair is nonetheless **decided**
+/// — `Violated` — by the type *family* the unresolved side names.
+///
+/// # Why "cannot decide" is sometimes false
+///
+/// `Unverifiable` says the containment question cannot be answered. For an
+/// unresolved *decimal* that is only true of its parameters. The family is still
+/// named, and the family alone answers the question whenever the answer is the
+/// same for **every** member of it:
+///
+/// | pair | decided? |
+/// |---|---|
+/// | landed `VARCHAR`, declared `DECIMAL` | yes — no `Decimal(p,s)` admits a `String` |
+/// | landed `DOUBLE`, declared `DECIMAL` | yes — no `Decimal(p,s)` admits a `Float64` |
+/// | landed `DECIMAL`, declared `BIGINT` | yes — no `Decimal(p,s)` is assignable to an integer |
+/// | landed `DECIMAL`, declared `DECIMAL(10,2)` | **no** — `Decimal(10,2)` fits, `Decimal(38,0)` does not |
+///
+/// Row 4 is the residual and it is genuinely undecidable: it stays
+/// `Unverifiable`, is reported, and permits until the flip. It is live on
+/// Databricks, whose Unity Catalog table-info responses fall back to a bare
+/// `"DECIMAL"` when they omit `type_text`.
+///
+/// So the rule is an existential over the family, in whichever direction the
+/// unresolved side sits:
+/// - unresolved **declared** side: violated unless the landed type is
+///   exact-numeric (the only types any decimal can hold).
+/// - unresolved **landed** side: violated unless the declared type is a decimal
+///   (the only target any decimal is assignable to — [`rocky_ir::is_assignable`]
+///   has no `Decimal → Int` arm, so `Decimal(5,0) → BIGINT` is not a permit
+///   there either, and this must not invent one).
+///
+/// # Why the narrow name set, when [`looks_like_decimal`] is wider
+///
+/// Two different jobs. *Reporting* an unverifiable pair is safe to over-include
+/// — it only adds a warning — so it uses the wide set (`DEC`, `BIGDECIMAL` too).
+/// *Deciding* one is a rejection under the shipping policy, so it is restricted
+/// to the four spellings [`warehouse_type_to_rocky`] actually normalizes. That
+/// restriction buys a property worth more than the extra coverage:
+///
+/// > **every pair this arm rejects was already rejected before the decimal
+/// > rewrite.** Each of those four names resolved to a concrete `Decimal(38,0)`
+/// > pre-rewrite, and `is_assignable` said false for exactly the pairs above.
+///
+/// So this arm cannot invent a rejection; it restores ones the rewrite dropped.
+/// `test_family_refinement_only_restores_pre_rewrite_rejections` proves it over
+/// the transition grid rather than asserting it here. The cost is a residual:
+/// a landed `DEC` against a `VARCHAR` contract is reported but still permitted,
+/// because `DEC` resolved to `Unknown` before the rewrite too — that permit is
+/// pre-existing, not opened here, and the flip closes it.
+fn family_rules_out(
+    landed_raw: &str,
+    landed_ty: &RockyType,
+    declared_raw: &str,
+    declared_ty: &RockyType,
+) -> bool {
+    // Both sides unresolved: nothing to compare a family against.
+    if *landed_ty == RockyType::Unknown && *declared_ty == RockyType::Unknown {
+        return false;
+    }
+    if *declared_ty == RockyType::Unknown
+        && normalizes_as_decimal(&declared_raw.trim().to_uppercase())
+    {
+        return !(landed_ty.is_integer() || landed_ty.is_decimal());
+    }
+    if *landed_ty == RockyType::Unknown && normalizes_as_decimal(&landed_raw.trim().to_uppercase())
+    {
+        return !declared_ty.is_decimal();
+    }
+    false
+}
+
 /// Whether a [`ContractVerdict::Unverifiable`] verdict is reported at this gate.
 ///
 /// Two conditions, and both are load-bearing.
@@ -462,15 +558,22 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 ///
 /// This is still a *narrow* scope, and it leaves a fail-open open: a contracted
 /// `String` or `Timestamp` column whose landed type does not normalize passes
-/// this gate silently, because no decimal is named anywhere.
+/// this gate silently, because no decimal is named anywhere. Note that
+/// [`family_rules_out`] does not reach it either — that arm needs a decimal name
+/// on the unresolved side, by construction.
 ///
-/// The scoping is not timidity, it is a measurement. With `[cache.schemas]
-/// disabled` or a cold cache, `rocky-compiler`'s source schemas are empty and
-/// *every* contracted column types as `Unknown`; a general "report all
-/// unverifiable" rule would emit one diagnostic per contracted column on every
-/// cold compile, and the flip to `Reject` would then break every such build.
-/// Closing the general case needs either a reliably-populated schema cache or an
-/// opt-in strict mode, and is a separate change with its own migration.
+/// The scoping is not timidity, and the reason is **local to this gate** — the
+/// cold-schema-cache argument that scopes the *compiler* gate does not apply
+/// here, because neither of this gate's inputs comes from the schema cache:
+/// `landed_columns` is a live `DESCRIBE` and the declared type is written in
+/// `rocky.toml`. The reason here is that [`warehouse_type_to_rocky`] matches
+/// non-decimal names by exact string, so every *parameterised* non-decimal name
+/// a warehouse emits already resolves to `Unknown` — Snowflake alone returns
+/// `VARCHAR(16777216)` and `TIMESTAMP_NTZ(9)` from `DESCRIBE`. A general "report
+/// every unverifiable pair" rule would fire on those today and, at the flip,
+/// fail loads that work now. Closing the general case means widening the
+/// normalizer to parse parameterised non-decimal names, which is a verdict
+/// change with its own migration, not a reporting change.
 fn unverifiable_is_reportable(landed_raw: &str, declared_raw: &str) -> bool {
     if landed_raw.trim().eq_ignore_ascii_case(declared_raw.trim())
         && !elides_decimal_parameters(landed_raw)
@@ -889,9 +992,16 @@ mod tests {
         assert_eq!(result.violations[0].rule, "required_column_type");
     }
 
+    /// An un-normalizable landed type that names **no** family Rocky can reason
+    /// about does not produce a type violation.
+    ///
+    /// The old name for this test was `test_typed_unknown_type_never_fails`, and
+    /// that claim is no longer true in general: an unresolved type whose *name*
+    /// is in the decimal family now fails against a contract no decimal can
+    /// satisfy (see `test_unverifiable_outcomes_violated_reported_silent`).
+    /// `GEOMETRY` carries no such name, so nothing about it is decidable.
     #[test]
-    fn test_typed_unknown_type_never_fails() {
-        // An un-normalizable landed type must not produce a type violation.
+    fn test_typed_unnamed_unknown_type_does_not_fail() {
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "geo".into(),
@@ -1240,19 +1350,32 @@ mod tests {
         assert!(reject_passes);
     }
 
-    /// The scoping rule, stated as a table: an unverifiable comparison is
-    /// reported exactly when the decimal family is named on either side.
+    /// What the gate does with an unverifiable pair, as a table. Three
+    /// outcomes, and which one you get depends on how much the *family* of the
+    /// unresolved side settles.
     ///
-    /// The narrower "only when the *unresolved* side names a decimal" variant
-    /// was written and reverted; the row that killed it is `DECIMAL(10,2)` vs
-    /// `HUGEINT`, which the narrow rule passed silently under **both** policies.
-    /// `HUGEINT` is DuckDB's 128-bit *integer*, so `0.01` does not fit it — a
-    /// false permit, and the WP-03 rule ranks a false permit far worse than a
-    /// false `Unknown`. Rejecting it at the flip is not a false reject: Rocky
-    /// cannot verify a decimal against a type it does not model, which is what
-    /// the verdict says.
+    /// - **Violated** — the family decides it: no member of it satisfies the
+    ///   pair. Rejected under both policies. See [`family_rules_out`].
+    /// - **Reported** — genuinely undecidable, and the decimal family is named
+    ///   on either side, so `W032` now / reject at the flip.
+    /// - **Silent** — genuinely undecidable and no decimal is named anywhere:
+    ///   the documented residual hole.
+    ///
+    /// The `Reported` scope's narrower "only when the *unresolved* side names a
+    /// decimal" variant was written and reverted; the row that killed it is
+    /// `DECIMAL(10,2)` vs `HUGEINT`, which the narrow rule passed silently under
+    /// **both** policies. `HUGEINT` is DuckDB's 128-bit *integer*, so `0.01`
+    /// does not fit it — a false permit, and the WP-03 rule ranks a false permit
+    /// far worse than a false `Unknown`.
     #[test]
-    fn test_unverifiable_scope_is_the_decimal_family_on_either_side() {
+    fn test_unverifiable_outcomes_violated_reported_silent() {
+        #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+        enum Outcome {
+            Violated,
+            Reported,
+            Silent,
+        }
+
         let check = |landed: &str, declared: &str| {
             let contract = ContractConfig {
                 required_columns: vec![RequiredColumn {
@@ -1269,38 +1392,53 @@ mod tests {
                 &landed_cols,
                 UnverifiablePolicy::Reject,
             );
-            (
-                warned.warnings.iter().any(|w| w.starts_with("W032:")),
-                rejected.passed,
-            )
+            let outcome = if !warned.passed {
+                Outcome::Violated
+            } else if warned.warnings.iter().any(|w| w.starts_with("W032:")) {
+                Outcome::Reported
+            } else {
+                Outcome::Silent
+            };
+            (outcome, rejected.passed)
         };
 
-        // (landed, declared, reported)
-        let cases: &[(&str, &str, bool)] = &[
-            // Resolved decimal against a type Rocky does not model. Reported —
-            // this is the row that reverted the narrow rule.
-            ("DECIMAL(10,2)", "HUGEINT", true),
-            ("DECIMAL(10,2)", "SUPER", true),
-            // Unresolved decimal against a non-decimal contract: the landed type
-            // could be a NUMBER(38,10) that does not fit a BIGINT.
-            ("NUMBER", "BIGINT", true),
-            // Declared decimal that cannot be verified — the same class the
-            // compiler-side gate reports.
-            ("GEOMETRY", "DECIMAL(38,2)", true),
+        let cases: &[(&str, &str, Outcome)] = &[
+            // The unresolved side names a decimal and the other side is outside
+            // what any decimal satisfies. Decided, not deferred.
+            ("VARCHAR", "DECIMAL", Outcome::Violated),
+            ("DOUBLE", "DECIMAL", Outcome::Violated),
+            ("NUMBER", "BIGINT", Outcome::Violated),
+            ("NUMBER", "VARCHAR", Outcome::Violated),
+            // Same family on both sides: the parameters are what is unknown, and
+            // they genuinely decide it either way. This is the residual, and it
+            // is live on Databricks.
+            ("DECIMAL", "DECIMAL(10,2)", Outcome::Reported),
+            ("DECIMAL(10,2)", "DECIMAL", Outcome::Reported),
+            // Resolved decimal against a type Rocky does not model. The family
+            // rule cannot reach it — `HUGEINT` is not a decimal name — so it
+            // stays deferred. This is the row that reverted the narrow rule.
+            ("DECIMAL(10,2)", "HUGEINT", Outcome::Reported),
+            ("DECIMAL(10,2)", "SUPER", Outcome::Reported),
+            // Declared decimal that cannot be verified against an unresolved
+            // landed type: both sides unresolved, nothing to compare.
+            ("GEOMETRY", "DECIMAL(38,2)", Outcome::Reported),
             // No decimal named anywhere: the documented residual hole.
-            ("VARCHAR", "HUGEINT", false),
-            ("GEOMETRY", "BIGINT", false),
+            ("VARCHAR", "HUGEINT", Outcome::Silent),
+            ("GEOMETRY", "BIGINT", Outcome::Silent),
+            // `DEC` is in the *reported* set but not the *decided* set, on
+            // purpose — it resolved to `Unknown` before the rewrite too, so
+            // deciding it here would invent a rejection rather than restore one.
+            ("DEC", "VARCHAR", Outcome::Reported),
         ];
 
-        for (landed, declared, reported) in cases {
-            let (warned, reject_passes) = check(landed, declared);
+        for (landed, declared, expected) in cases {
+            let (outcome, reject_passes) = check(landed, declared);
+            assert_eq!(outcome, *expected, "{landed} vs {declared}");
+            let expected_reject_passes = *expected == Outcome::Silent;
             assert_eq!(
-                warned, *reported,
-                "{landed} vs {declared}: wrong W032 verdict"
-            );
-            assert_eq!(
-                reject_passes, !*reported,
-                "{landed} vs {declared}: Reject must be gated by the same predicate as Warn"
+                reject_passes, expected_reject_passes,
+                "{landed} vs {declared}: the flip must reject everything that is \
+                 violated or reported"
             );
         }
     }
@@ -1501,5 +1639,423 @@ mod tests {
         assert_eq!(deserialized.required_columns.len(), 1);
         assert_eq!(deserialized.protected_columns.len(), 1);
         assert_eq!(deserialized.allowed_type_changes.len(), 1);
+    }
+
+    // ======================================================================
+    // Transition oracle: the pre-rewrite gate vs this one, over a type grid.
+    //
+    // The decimal rewrite's verdict change does **not** live in
+    // `is_assignable` — old and new agree that `Decimal(38,0)` does not fit
+    // `Decimal(10,2)`. It lives in *which type each side resolves to*. Nothing
+    // in the change compared the mappers' old and new output, so a verdict
+    // could move without any test noticing. These frozen copies plus the grid
+    // below are that comparison.
+    // ======================================================================
+
+    /// `warehouse_type_to_rocky` exactly as it stood before the decimal
+    /// rewrite, frozen as ground truth. Sibling of
+    /// `rocky_ir::types::tests::is_assignable_frozen_old`.
+    ///
+    /// Two behaviours matter and both are reproduced verbatim: the
+    /// `starts_with` family test (so `NUMBERED` was a decimal), and the
+    /// `Decimal(38,0)` fallthrough for anything it could not parse into exactly
+    /// two `u8` parameters.
+    fn warehouse_type_to_rocky_frozen_old(warehouse_type: &str) -> RockyType {
+        let upper = warehouse_type.trim().to_uppercase();
+        match upper.as_str() {
+            "BOOLEAN" | "BOOL" => RockyType::Boolean,
+            "TINYINT" | "BYTE" | "SMALLINT" | "SHORT" | "INT" | "INTEGER" => RockyType::Int32,
+            "BIGINT" | "LONG" | "INT64" => RockyType::Int64,
+            "FLOAT" | "REAL" => RockyType::Float32,
+            "DOUBLE" | "DOUBLE PRECISION" | "FLOAT64" => RockyType::Float64,
+            "STRING" | "VARCHAR" | "TEXT" => RockyType::String,
+            "BINARY" | "BYTES" => RockyType::Binary,
+            "DATE" => RockyType::Date,
+            "TIMESTAMP" => RockyType::Timestamp,
+            "TIMESTAMP_NTZ" | "DATETIME" => RockyType::TimestampNtz,
+            "VARIANT" => RockyType::Variant,
+            _ if upper.starts_with("DECIMAL")
+                || upper.starts_with("BIGNUMERIC")
+                || upper.starts_with("NUMERIC")
+                || upper.starts_with("NUMBER") =>
+            {
+                if let Some(params) = upper
+                    .strip_prefix("DECIMAL(")
+                    .or_else(|| upper.strip_prefix("BIGNUMERIC("))
+                    .or_else(|| upper.strip_prefix("NUMERIC("))
+                    .or_else(|| upper.strip_prefix("NUMBER("))
+                    .and_then(|s| s.strip_suffix(')'))
+                {
+                    let parts: Vec<&str> = params.split(',').collect();
+                    if parts.len() == 2
+                        && let (Ok(p), Ok(s)) = (parts[0].trim().parse(), parts[1].trim().parse())
+                    {
+                        return RockyType::Decimal {
+                            precision: p,
+                            scale: s,
+                        };
+                    }
+                }
+                RockyType::Decimal {
+                    precision: 38,
+                    scale: 0,
+                }
+            }
+            _ => RockyType::Unknown,
+        }
+    }
+
+    /// The pre-rewrite `is_assignable`, frozen. Copied from
+    /// `rocky_ir::types::tests::is_assignable_frozen_old`, which cannot be
+    /// imported across the crate boundary.
+    fn is_assignable_frozen_old(from: &RockyType, to: &RockyType) -> bool {
+        fn common_supertype_frozen_old(a: &RockyType, b: &RockyType) -> Option<RockyType> {
+            if a == b {
+                return Some(a.clone());
+            }
+            if *a == RockyType::Unknown {
+                return Some(b.clone());
+            }
+            if *b == RockyType::Unknown {
+                return Some(a.clone());
+            }
+            match (a, b) {
+                (RockyType::Int32, RockyType::Int64) | (RockyType::Int64, RockyType::Int32) => {
+                    Some(RockyType::Int64)
+                }
+                (RockyType::Float32, RockyType::Float64)
+                | (RockyType::Float64, RockyType::Float32) => Some(RockyType::Float64),
+                (i, RockyType::Float64) | (RockyType::Float64, i) if i.is_integer() => {
+                    Some(RockyType::Float64)
+                }
+                (i, RockyType::Float32) | (RockyType::Float32, i) if i.is_integer() => {
+                    Some(RockyType::Float64)
+                }
+                (RockyType::Int32, RockyType::Decimal { precision, scale })
+                | (RockyType::Decimal { precision, scale }, RockyType::Int32) => {
+                    Some(RockyType::Decimal {
+                        precision: (*precision).max(10),
+                        scale: *scale,
+                    })
+                }
+                (RockyType::Int64, RockyType::Decimal { precision, scale })
+                | (RockyType::Decimal { precision, scale }, RockyType::Int64) => {
+                    Some(RockyType::Decimal {
+                        precision: (*precision).max(19),
+                        scale: *scale,
+                    })
+                }
+                (
+                    RockyType::Decimal {
+                        precision: p1,
+                        scale: s1,
+                    },
+                    RockyType::Decimal {
+                        precision: p2,
+                        scale: s2,
+                    },
+                ) => Some(RockyType::Decimal {
+                    precision: (*p1).max(*p2),
+                    scale: (*s1).max(*s2),
+                }),
+                (RockyType::Timestamp, RockyType::TimestampNtz)
+                | (RockyType::TimestampNtz, RockyType::Timestamp) => Some(RockyType::Timestamp),
+                _ => None,
+            }
+        }
+
+        if from == to || *from == RockyType::Unknown || *to == RockyType::Unknown {
+            return true;
+        }
+        common_supertype_frozen_old(from, to).is_some_and(|sup| sup == *to)
+    }
+
+    /// The pre-rewrite gate verdict for one (landed, declared) pair: two
+    /// outcomes, decided by the frozen mapper feeding the frozen predicate.
+    fn frozen_old_gate_passes(landed: &str, declared: &str) -> bool {
+        is_assignable_frozen_old(
+            &warehouse_type_to_rocky_frozen_old(landed),
+            &warehouse_type_to_rocky_frozen_old(declared),
+        )
+    }
+
+    /// Raw warehouse type strings a supported warehouse can actually emit from
+    /// `DESCRIBE`, or a user can actually write in `rocky.toml`, plus the
+    /// malformed spellings the rewrite re-routed.
+    ///
+    /// Snowflake's `VARCHAR(16777216)` and `TIMESTAMP_NTZ(9)` are in the grid
+    /// because they are what `DESCRIBE` really returns there, and they resolve
+    /// to `Unknown` on **both** sides of the rewrite — they are the population
+    /// the residual silent hole is about.
+    const TRANSITION_GRID: &[&str] = &[
+        "VARCHAR",
+        "VARCHAR(16777216)",
+        "STRING",
+        "TEXT",
+        "BIGINT",
+        "INT",
+        "SMALLINT",
+        "DOUBLE",
+        "FLOAT",
+        "BOOLEAN",
+        "DATE",
+        "TIMESTAMP",
+        "TIMESTAMP_NTZ",
+        "TIMESTAMP_NTZ(9)",
+        "BINARY",
+        "VARIANT",
+        "DECIMAL",
+        "NUMBER",
+        "NUMERIC",
+        "DECIMAL(10,2)",
+        "DECIMAL(38,0)",
+        "NUMBER(38,0)",
+        "NUMBER (38,0)",
+        "DECIMAL(10)",
+        "DECIMAL(300,2)",
+        "DECIMAL(10,-2)",
+        "DECIMAL(x)",
+        "DECIMAL(1,2,3)",
+        "BIGNUMERIC(76,38)",
+        "DEC",
+        "HUGEINT",
+        "GEOMETRY",
+    ];
+
+    fn new_gate_passes(landed: &str, declared: &str, policy: UnverifiablePolicy) -> bool {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "c".into(),
+                data_type: declared.into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        validate_contract_typed_with_policy(&contract, &[col_n("c", landed, true)], policy).passed
+    }
+
+    /// **The oracle.** Every ordered pair over [`TRANSITION_GRID`], old verdict
+    /// against new verdict, with both transition directions enumerated
+    /// explicitly. An unintended permit fails here rather than shipping.
+    ///
+    /// Read the two lists as the whole behavioural delta of the decimal rewrite
+    /// at this gate.
+    #[test]
+    fn test_load_gate_transition_oracle() {
+        // reject -> pass. Every entry is a *deliberate* new permit.
+        //
+        // All of them have a decimal-family head on both sides, and all of them
+        // are the same shape: a pair the pre-rewrite mapper decided using a
+        // `Decimal(38,0)` it invented, where the truth is that the parameters
+        // are unknown. They are reported (`W032`) and reject at the flip; the
+        // property assertion below states the "decimal on both sides" invariant
+        // independently of this list, so a future widening on a *non*-decimal
+        // name fails even if someone extends the list.
+        let intended_new_permits: &[(&str, &str)] = &[
+            // Unparameterised or malformed declared type: the landed decimal
+            // might or might not fit, and the pre-rewrite answer was decided by
+            // a fabricated `Decimal(38,0)`.
+            ("DECIMAL(10,2)", "DECIMAL"),
+            ("DECIMAL(10,2)", "NUMBER"),
+            ("DECIMAL(10,2)", "NUMERIC"),
+            ("DECIMAL(10,2)", "DECIMAL(300,2)"),
+            ("DECIMAL(10,2)", "DECIMAL(10,-2)"),
+            ("DECIMAL(10,2)", "DECIMAL(x)"),
+            ("DECIMAL(10,2)", "DECIMAL(1,2,3)"),
+            ("BIGNUMERIC(76,38)", "DECIMAL"),
+            ("BIGNUMERIC(76,38)", "NUMBER"),
+            ("BIGNUMERIC(76,38)", "NUMERIC"),
+            ("BIGNUMERIC(76,38)", "DECIMAL(300,2)"),
+            ("BIGNUMERIC(76,38)", "DECIMAL(10,-2)"),
+            ("BIGNUMERIC(76,38)", "DECIMAL(x)"),
+            ("BIGNUMERIC(76,38)", "DECIMAL(1,2,3)"),
+            ("NUMERIC", "DECIMAL(10,2)"),
+            ("DECIMAL", "DECIMAL(10,2)"),
+            ("NUMBER", "DECIMAL(10,2)"),
+            ("DECIMAL(300,2)", "DECIMAL(10,2)"),
+            ("DECIMAL(10,-2)", "DECIMAL(10,2)"),
+            ("DECIMAL(x)", "DECIMAL(10,2)"),
+            ("DECIMAL(1,2,3)", "DECIMAL(10,2)"),
+        ];
+
+        // pass -> reject. Every entry is a *deliberate* closed false permit.
+        let intended_new_rejections: &[(&str, &str)] = &[
+            // `DECIMAL(p)` is `DECIMAL(p,0)`, not unparameterised. A contract
+            // written `DECIMAL(10)` used to admit 28 more integer digits than
+            // it declared.
+            ("BIGINT", "DECIMAL(10)"),
+            ("DECIMAL(38,0)", "DECIMAL(10)"),
+            ("NUMBER(38,0)", "DECIMAL(10)"),
+            ("NUMBER (38,0)", "DECIMAL(10)"),
+            // `is_assignable` no longer proxies through `common_supertype`, so
+            // an integer's digits must fit the declared *integer* digits.
+            ("INT", "DECIMAL(10,2)"),
+            ("SMALLINT", "DECIMAL(10,2)"),
+        ];
+
+        let mut unexpected_permits = Vec::new();
+        let mut unexpected_rejections = Vec::new();
+        for landed in TRANSITION_GRID {
+            for declared in TRANSITION_GRID {
+                let old = frozen_old_gate_passes(landed, declared);
+                let new = new_gate_passes(landed, declared, UnverifiablePolicy::Warn);
+                if !old && new && !intended_new_permits.contains(&(landed, declared)) {
+                    unexpected_permits.push((*landed, *declared));
+                }
+                if old && !new && !intended_new_rejections.contains(&(landed, declared)) {
+                    unexpected_rejections.push((*landed, *declared));
+                }
+            }
+        }
+        assert!(
+            unexpected_permits.is_empty(),
+            "unintended reject -> pass transitions: {unexpected_permits:?}"
+        );
+        assert!(
+            unexpected_rejections.is_empty(),
+            "unintended pass -> reject transitions: {unexpected_rejections:?}"
+        );
+
+        // Both lists must stay live: an entry that no longer transitions is
+        // stale documentation, and stale documentation of a false permit is
+        // exactly what this oracle exists to prevent.
+        for (landed, declared) in intended_new_permits {
+            assert!(
+                !frozen_old_gate_passes(landed, declared)
+                    && new_gate_passes(landed, declared, UnverifiablePolicy::Warn),
+                "{landed} vs {declared} is listed as a new permit but no longer transitions"
+            );
+            // The property, stated independently of the list.
+            assert!(
+                looks_like_decimal(landed) && looks_like_decimal(declared),
+                "{landed} vs {declared}: a new permit must have a decimal head on \
+                 both sides — a non-decimal name transitioning is out of scope for \
+                 this change"
+            );
+            // Every one of them is reported, and closes at the flip.
+            assert!(
+                !new_gate_passes(landed, declared, UnverifiablePolicy::Reject),
+                "{landed} vs {declared}: a migration-window permit must close at the flip"
+            );
+        }
+        for (landed, declared) in intended_new_rejections {
+            assert!(
+                frozen_old_gate_passes(landed, declared)
+                    && !new_gate_passes(landed, declared, UnverifiablePolicy::Warn),
+                "{landed} vs {declared} is listed as a closed false permit but no \
+                 longer transitions"
+            );
+        }
+
+        // The split the CHANGELOG quotes, pinned so the numbers stay true. Of
+        // the pairs the pre-rewrite gate rejected and the new *mappers* alone
+        // would have let through, the family arm decides most and defers the
+        // rest.
+        let mut would_open = 0usize;
+        let mut restored_by_family = 0usize;
+        for landed in TRANSITION_GRID {
+            for declared in TRANSITION_GRID {
+                if frozen_old_gate_passes(landed, declared) {
+                    continue;
+                }
+                let decided = family_rules_out(
+                    landed,
+                    &warehouse_type_to_rocky(landed),
+                    declared,
+                    &warehouse_type_to_rocky(declared),
+                );
+                if decided {
+                    would_open += 1;
+                    restored_by_family += 1;
+                } else if new_gate_passes(landed, declared, UnverifiablePolicy::Warn) {
+                    would_open += 1;
+                }
+            }
+        }
+        assert_eq!(would_open, 196, "grid size or mapper coverage changed");
+        assert_eq!(restored_by_family, 175);
+        assert_eq!(
+            would_open - restored_by_family,
+            intended_new_permits.len(),
+            "the residual must be exactly the enumerated migration-window permits"
+        );
+    }
+
+    /// The containment property [`family_rules_out`] is scoped for: **it never
+    /// invents a rejection.**
+    ///
+    /// Restricting the family decision to the four names
+    /// [`warehouse_type_to_rocky`] normalizes is what buys this. Every pair the
+    /// arm rejects was rejected before the rewrite too, so the arm restores
+    /// verdicts rather than adding them — which is what makes it safe to ship in
+    /// a release whose new verdict is otherwise warning-only.
+    #[test]
+    fn test_family_refinement_only_restores_pre_rewrite_rejections() {
+        let mut decided = 0usize;
+        for landed in TRANSITION_GRID {
+            for declared in TRANSITION_GRID {
+                let landed_ty = warehouse_type_to_rocky(landed);
+                let declared_ty = warehouse_type_to_rocky(declared);
+                if !family_rules_out(landed, &landed_ty, declared, &declared_ty) {
+                    continue;
+                }
+                decided += 1;
+                assert!(
+                    !frozen_old_gate_passes(landed, declared),
+                    "{landed} vs {declared}: the family arm invented a rejection the \
+                     pre-rewrite gate did not make"
+                );
+                assert!(
+                    !new_gate_passes(landed, declared, UnverifiablePolicy::Warn),
+                    "{landed} vs {declared}: decided by family, so it must not pass"
+                );
+            }
+        }
+        assert!(
+            decided > 0,
+            "the family arm must actually fire on this grid, or the property is vacuous"
+        );
+    }
+
+    /// The residual F2 leaves open, asserted rather than only described.
+    ///
+    /// Same-family pairs are genuinely undecidable without the parameters, so
+    /// they stay reported-and-permitted until the flip. The first row is live on
+    /// Databricks: Unity Catalog table-info responses fall back to the bare
+    /// `type_name` `"DECIMAL"` when they omit `type_text`.
+    #[test]
+    fn test_same_family_decimal_pairs_remain_permitted_until_the_flip() {
+        for (landed, declared) in [("DECIMAL", "DECIMAL(10,2)"), ("DECIMAL(10,2)", "DECIMAL")] {
+            assert!(
+                !frozen_old_gate_passes(landed, declared),
+                "premise: the pre-rewrite gate rejected {landed} vs {declared}"
+            );
+            assert!(
+                new_gate_passes(landed, declared, UnverifiablePolicy::Warn),
+                "{landed} vs {declared}: still permitted in the migration window"
+            );
+            assert!(
+                !new_gate_passes(landed, declared, UnverifiablePolicy::Reject),
+                "{landed} vs {declared}: and closed by the flip"
+            );
+        }
+
+        // The same undecidability in the other direction: the pre-rewrite gate
+        // *passed* `NUMBER` against `DECIMAL(38,0)`, but only because it
+        // fabricated `Decimal(38,0)` for the bare name — the landed column could
+        // as easily have been `NUMBER(38,10)`, which does not fit. So this pair
+        // is permitted now for an honest reason where it was permitted then for
+        // a dishonest one, and the flip will newly reject it.
+        assert!(frozen_old_gate_passes("NUMBER", "DECIMAL(38,0)"));
+        assert!(new_gate_passes(
+            "NUMBER",
+            "DECIMAL(38,0)",
+            UnverifiablePolicy::Warn
+        ));
+        assert!(!new_gate_passes(
+            "NUMBER",
+            "DECIMAL(38,0)",
+            UnverifiablePolicy::Reject
+        ));
     }
 }

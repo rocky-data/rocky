@@ -260,10 +260,10 @@ pub const W031: &str = "W031";
 ///
 /// The `Warn` half of the unverifiable-type gate; [`E037`] is the same condition
 /// under `Reject`, and [`rocky_ir::UNVERIFIABLE_POLICY`] is the one line that
-/// picks between them. Emitted when [`rocky_ir::contract_verdict`] returns
-/// `Unverifiable` — either the landed/inferred type or the contract's declared
-/// type normalized to `RockyType::Unknown` — for a comparison in the *decimal*
-/// family whose two raw type strings differ.
+/// picks between them. The underlying condition is
+/// [`rocky_ir::contract_verdict`] returning `Unverifiable` — either the
+/// landed/inferred type or the contract's declared type normalized to
+/// `RockyType::Unknown`.
 ///
 /// **Emitted by both contract gates.** `rocky compile`'s gate
 /// (`crate::contracts::validate_contract`) emits it as a `Diagnostic`; the
@@ -285,13 +285,34 @@ pub const W031: &str = "W031";
 /// new one and two codes would double-fire on the same `DECIMAL(300,2)`
 /// contract. `W032` has never shipped in a release.
 ///
-/// # Scope, and the hole it leaves
+/// # The two gates scope it differently, because they hold different evidence
 ///
-/// Restricted to the decimal family. With a cold schema cache *every* contracted
-/// column types as `Unknown`, so a general rule would emit one diagnostic per
-/// contracted column per compile, and the flip to `Reject` would break every
-/// such build. A contracted non-decimal column whose type does not resolve
-/// therefore still passes both gates silently. That fail-open is open.
+/// **`rocky compile`** reports it for **every** declared type, not only a
+/// declared decimal. Restricting it to decimals was a fail-open: a bare
+/// `decimal` from source discovery no longer resolves, so a contract declaring
+/// `Int64` for such a column raised [`E011`] before the unverifiable verdict
+/// existed and raised nothing after it. When *no* column in a model resolves —
+/// what compiling without a warmed schema cache looks like — the per-column
+/// reports collapse into a single model-level `W032` naming the columns it
+/// stands in for, so the noise is one per contracted model rather than one per
+/// contracted column. It is a collapse, not a suppression: this gate is never
+/// silent about a declared type it could not check.
+///
+/// **`rocky load`** reports it only for a comparison naming the *decimal* family
+/// on either side, and only when the two raw type strings differ (or elide their
+/// parameters). Its inputs are a live `DESCRIBE` and `rocky.toml`, so the
+/// compile gate's cold-cache reasoning does not apply; the reason here is that
+/// `warehouse_type_to_rocky` matches non-decimal names by exact string, so every
+/// parameterised non-decimal name a warehouse emits (Snowflake's
+/// `VARCHAR(16777216)`, `TIMESTAMP_NTZ(9)`) is already `Unknown`. A general rule
+/// would fire on all of those today and reject them at the flip.
+///
+/// **The hole that leaves:** at the load gate a contracted `String` or
+/// `Timestamp` column whose landed type does not normalize still passes
+/// silently, because no decimal is named anywhere. That fail-open is open. Note
+/// it is *not* the fail-open where the family settles the question — a landed
+/// `VARCHAR` against an unparameterised `DECIMAL` contract is a violation now,
+/// not a `W032`, because no decimal holds a string whatever its parameters.
 pub const W032: &str = "W032";
 
 /// A `CAST` target names a decimal with no precision or scale, so the column has
