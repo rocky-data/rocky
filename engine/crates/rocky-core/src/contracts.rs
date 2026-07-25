@@ -2095,8 +2095,14 @@ mod tests {
             }
         }
 
-        println!("MEASURE(b) grid size                     = {}", TRANSITION_GRID.len());
-        println!("MEASURE(b) ordered pairs                 = {}", TRANSITION_GRID.len().pow(2));
+        println!(
+            "MEASURE(b) grid size                     = {}",
+            TRANSITION_GRID.len()
+        );
+        println!(
+            "MEASURE(b) ordered pairs                 = {}",
+            TRANSITION_GRID.len().pow(2)
+        );
         println!("MEASURE(b) would_open (total)            = {opened_total}");
         println!(
             "MEASURE(b)   restored by family rule     = {}",
@@ -2106,7 +2112,10 @@ mod tests {
             "MEASURE(b)   residual (still permitted)  = {}",
             opened_residual.len()
         );
-        println!("MEASURE(b) newly CLOSED (old pass -> new reject) = {}", closed.len());
+        println!(
+            "MEASURE(b) newly CLOSED (old pass -> new reject) = {}",
+            closed.len()
+        );
         println!("MEASURE(b) --- residual opened pairs (landed vs declared) ---");
         for (landed, declared) in &opened_residual {
             println!("MEASURE(b)   OPEN  {landed:<18} -> {declared}");
@@ -2148,9 +2157,27 @@ mod tests {
         // What a bare landed decimal ACTUALLY is, per adapter (executed values
         // recorded in this branch's own doc comments).
         let truths = [
-            ("Databricks", RockyType::Decimal { precision: 10, scale: 0 }),
-            ("DuckDB", RockyType::Decimal { precision: 18, scale: 3 }),
-            ("Snowflake", RockyType::Decimal { precision: 38, scale: 0 }),
+            (
+                "Databricks",
+                RockyType::Decimal {
+                    precision: 10,
+                    scale: 0,
+                },
+            ),
+            (
+                "DuckDB",
+                RockyType::Decimal {
+                    precision: 18,
+                    scale: 3,
+                },
+            ),
+            (
+                "Snowflake",
+                RockyType::Decimal {
+                    precision: 38,
+                    scale: 0,
+                },
+            ),
         ];
 
         for landed in ["DECIMAL", "NUMBER", "NUMERIC"] {

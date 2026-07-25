@@ -1314,8 +1314,14 @@ mod tests {
 
         let base_ir = project_ir_from_compile(&base_compile);
         let head_ir = project_ir_from_compile(&head_compile);
-        println!("MEASURE(a) base typed_columns = {:?}", base_ir.models[0].typed_columns);
-        println!("MEASURE(a) head typed_columns = {:?}", head_ir.models[0].typed_columns);
+        println!(
+            "MEASURE(a) base typed_columns = {:?}",
+            base_ir.models[0].typed_columns
+        );
+        println!(
+            "MEASURE(a) head typed_columns = {:?}",
+            head_ir.models[0].typed_columns
+        );
 
         let findings = rocky_core::breaking_change::diff_project_ir(&base_ir, &head_ir);
         println!("MEASURE(a) total findings = {}", findings.len());
@@ -1367,8 +1373,14 @@ mod tests {
 
         let base_ir = project_ir_from_compile(&base_compile);
         let head_ir = project_ir_from_compile(&head_compile);
-        println!("MEASURE(a-base) base typed_columns = {:?}", base_ir.models[0].typed_columns);
-        println!("MEASURE(a-base) head typed_columns = {:?}", head_ir.models[0].typed_columns);
+        println!(
+            "MEASURE(a-base) base typed_columns = {:?}",
+            base_ir.models[0].typed_columns
+        );
+        println!(
+            "MEASURE(a-base) head typed_columns = {:?}",
+            head_ir.models[0].typed_columns
+        );
 
         let findings = rocky_core::breaking_change::diff_project_ir(&base_ir, &head_ir);
         println!("MEASURE(a-base) total findings = {}", findings.len());

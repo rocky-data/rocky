@@ -1957,10 +1957,7 @@ mod tests {
         let mut swept_opened = 0usize;
         for from in &universe {
             for to in &universe {
-                match (
-                    is_assignable_frozen_old(from, to),
-                    is_assignable(from, to),
-                ) {
+                match (is_assignable_frozen_old(from, to), is_assignable(from, to)) {
                     (true, false) => swept_closed += 1,
                     (false, true) => swept_opened += 1,
                     _ => {}
