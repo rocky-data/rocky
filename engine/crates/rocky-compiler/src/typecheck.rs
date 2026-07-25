@@ -3401,6 +3401,67 @@ mod tests {
         }
     }
 
+    /// SPLIT-FEASIBILITY MEASUREMENT. `test_cast_decimal_parameter_validation`
+    /// panics on its first mismatching row, which hides whether the rows after
+    /// it still hold. This runs every row independently and prints the verdict,
+    /// so "the revert broke the algebra" can be answered by measurement rather
+    /// than by the ordering of a `for` loop.
+    #[test]
+    fn measure_split_feasibility_cast_validation_rows() {
+        let scope = TypeScope::new();
+        let dec = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
+
+        let cases: &[(&str, &str, RockyType)] = &[
+            ("T5.1", "CAST(1 AS DECIMAL(10,2))", dec(10, 2)),
+            ("T5.2", "CAST(1 AS DECIMAL(76,38))", dec(76, 38)),
+            ("T5.2b", "CAST(1 AS NUMERIC(38,9))", dec(38, 9)),
+            ("precision only", "CAST(1 AS DECIMAL(10))", dec(10, 0)),
+            ("T5.3", "CAST(1 AS DECIMAL(256,2))", RockyType::Unknown),
+            ("T5.4", "CAST(1 AS DECIMAL(300,2))", RockyType::Unknown),
+            ("T5.5", "CAST(1 AS DECIMAL(10,1000))", RockyType::Unknown),
+            ("T5.6", "CAST(1 AS DECIMAL(10,-2))", RockyType::Unknown),
+            ("T5.7", "CAST(1 AS DECIMAL(5,10))", RockyType::Unknown),
+            ("T5.8", "CAST(1 AS DECIMAL(0,0))", RockyType::Unknown),
+            ("T5.9 (bare)", "CAST(1 AS DECIMAL)", RockyType::Unknown),
+            ("DEC valid", "CAST(1 AS DEC(10,2))", dec(10, 2)),
+            (
+                "BIGNUMERIC valid",
+                "CAST(1 AS BIGNUMERIC(76,38))",
+                dec(76, 38),
+            ),
+            (
+                "BIGDECIMAL valid",
+                "CAST(1 AS BIGDECIMAL(20,4))",
+                dec(20, 4),
+            ),
+            ("DEC invalid", "CAST(1 AS DEC(300,2))", RockyType::Unknown),
+            (
+                "BIGNUMERIC invalid",
+                "CAST(1 AS BIGNUMERIC(77,0))",
+                RockyType::Unknown,
+            ),
+        ];
+
+        let mut failed = 0usize;
+        for (label, sql, expected) in cases {
+            let got = infer_expr_type(&parse_expr(sql), &scope).0;
+            let ok = &got == expected;
+            if !ok {
+                failed += 1;
+            }
+            println!(
+                "MEASURE(rows) {:<20} {:<32} want={expected:<14} got={got:<14} {}",
+                label,
+                sql,
+                if ok { "OK" } else { "MISMATCH" }
+            );
+        }
+        println!(
+            "MEASURE(rows) mismatching rows = {failed} of {}",
+            cases.len()
+        );
+    }
+
     /// T5.11 — an out-of-range declaration is an E036 **error**, so the
     /// resulting `Unknown` can never silently skip the E011 contract check
     /// (`crate::contracts` guards that check with `!= RockyType::Unknown`).
