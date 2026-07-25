@@ -462,7 +462,15 @@ async fn collect_health_checks(
         }
     }
 
-    // 7. Auth — construct adapters and ping each warehouse
+    // 7. Lost-update exposure of the configured remote state backend.
+    //    Silent on `local` — the check simply isn't emitted.
+    if should_run("state_concurrency", check_filter)
+        && let Some(check) = state_concurrency_check(config_path, verbose, &mut suggestions)
+    {
+        checks.push(check);
+    }
+
+    // 8. Auth — construct adapters and ping each warehouse
     if should_run("auth", check_filter) {
         let start = Instant::now();
         match rocky_core::config::load_rocky_config(config_path) {
@@ -608,6 +616,203 @@ async fn collect_health_checks(
     }
 
     (checks, suggestions)
+}
+
+/// Lost-update exposure of the configured `[state]` backend: can two runs
+/// sharing this state silently overwrite each other's committed watermarks?
+///
+/// Returns `None` (silent) for [`StateBackend::Local`] — a local state file has
+/// a single writer by construction, so `concurrency_control = "off"` is correct
+/// there and warning about it would be noise.
+///
+/// Offline: config only, no warehouse and no state-backend I/O.
+///
+/// Capability is **derived**, never re-listed here: the check asks
+/// [`cas_supported_on`][rocky_core::state_sync::cas_supported_on], the same
+/// predicate `RemoteStateSession` gates its write path on. A backend that gains
+/// compare-and-swap support therefore changes the runtime and this diagnostic in
+/// one commit — hardcoding the backend list is how a check ends up warning that
+/// a protected deployment is unprotected, which pushes an operator off a correct
+/// configuration.
+///
+/// A remote backend never reports Healthy today — see *No remote deployment is
+/// fully protected yet* below. The three Warnings are worded apart so an
+/// operator can tell them apart from the message alone:
+///
+/// - `concurrency_control = "off"` on a backend that **would** honour `cas` —
+///   you have not enabled it. Names the setting as the fix.
+/// - `concurrency_control = "cas"` on a backend that **cannot** honour it — you
+///   enabled it and the engine silently downgrades to an unconditional upload,
+///   so the config claims a protection the deployment does not have.
+/// - `concurrency_control = "cas"` on a backend that **does** honour it — runs
+///   are compare-and-swap protected, but the ledger-seam writers still are not.
+///
+/// # No remote deployment is fully protected yet
+///
+/// `docs/adr/ADR-CONCURRENCY.md` is normative: compare-and-swap applies to
+/// *every* remote state write, split by writer class. Only the run half is
+/// implemented. The ledger-seam writers — `rocky gc`, `rocky policy`, and
+/// `rocky apply`, which commit through
+/// `RemoteStateSession::upload_only_fail_closed` — still call the
+/// unconditional [`upload_state`][rocky_core::state_sync::upload_state] on
+/// **every** backend, so a concurrent maintenance or governance command can
+/// silently erase a run's just-committed state.
+///
+/// That exposure is backend-independent, which is why `cas` on a
+/// conditional-write backend earns a Warning rather than a Healthy: a green
+/// verdict there would overclaim exactly as much as it would anywhere else.
+/// Issue #1228 tracks closing the seam half; when it lands, this arm is the one
+/// that becomes Healthy.
+fn state_concurrency_check(
+    config_path: &Path,
+    verbose: bool,
+    suggestions: &mut Vec<String>,
+) -> Option<HealthCheck> {
+    use rocky_core::config::{ConcurrencyControl, StateBackend};
+
+    let start = Instant::now();
+    // A config we cannot READ is not the same as a project on `local`.
+    // Swallowing the error here would emit no check at all, so `rocky doctor
+    // --check state_concurrency` on a broken `rocky.toml` would report
+    // `overall: healthy` with exit 0 over a deployment whose protection nobody
+    // could confirm. Fail loudly, as the other config-dependent checks do.
+    let config = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(config) => config,
+        Err(e) => {
+            return Some(config_load_failed(
+                "state_concurrency",
+                &e,
+                start,
+                suggestions,
+            ));
+        }
+    };
+
+    let backend = config.state.backend;
+    // Exhaustive by design: a backend added later must decide explicitly
+    // whether it is the single-writer local store (this check stays silent) or
+    // a shared location the check has to speak about.
+    let single_writer_local = match backend {
+        StateBackend::Local => true,
+        StateBackend::S3 | StateBackend::Gcs | StateBackend::Valkey | StateBackend::Tiered => false,
+    };
+    if single_writer_local {
+        return None;
+    }
+
+    // DERIVED, never re-listed here: `cas_supported_on` is the engine's own
+    // capability predicate, the one `RemoteStateSession` gates its write path
+    // on. A backend that gains conditional writes flips this check in the same
+    // commit, so the diagnostic can neither vouch for absent protection nor
+    // warn about a deployment that is in fact protected.
+    let cas_supported = rocky_core::state_sync::cas_supported_on(backend);
+
+    let (status, message) = match (config.state.concurrency_control, cas_supported) {
+        // The best configuration available today, and still not Healthy: the
+        // ledger-seam writers bypass CAS on every backend, so a green here
+        // would certify a protection no deployment currently has. This is the
+        // arm that flips to Healthy once the seam half lands.
+        (ConcurrencyControl::Cas, true) => {
+            suggestions.push(
+                "state_concurrency: end-of-run uploads are compare-and-swap protected, but \
+                 `rocky gc`, `rocky policy`, and `rocky apply` still write state \
+                 unconditionally — until issue #1228 lands, do not run maintenance or \
+                 governance commands concurrently with a pipeline run"
+                    .into(),
+            );
+            (
+                HealthStatus::Warning,
+                format!(
+                    "[state] concurrency_control = \"cas\" protects this writer's end-of-run \
+                     upload on the '{backend}' backend, but ledger-seam writers (`rocky gc`, \
+                     `rocky policy`, `rocky apply`) still upload state unconditionally on every \
+                     backend — a concurrent maintenance or governance command can silently \
+                     overwrite a run's committed state. Avoid running them alongside a pipeline \
+                     run; tracked in issue #1228"
+                ),
+            )
+        }
+        // Requested but unsupported. Distinct from the `off` cases on purpose:
+        // the operator has already made the right decision and the engine is
+        // silently not honouring it, so the wording must not read as "you
+        // forgot to turn it on".
+        (ConcurrencyControl::Cas, false) => {
+            suggestions.push(format!(
+                "state_concurrency: concurrency_control = \"cas\" cannot take effect on the \
+                 '{backend}' backend — move [state] to a backend that performs compare-and-swap \
+                 writes, or serialize runs so only one writes this state at a time"
+            ));
+            (
+                HealthStatus::Warning,
+                format!(
+                    "[state] concurrency_control = \"cas\" is a no-op on the '{backend}' backend: \
+                     Rocky performs no compare-and-swap state write there, so each run falls back \
+                     to an unconditional upload. This deployment has asked for lost-update \
+                     protection and is not getting it — concurrent runs sharing this state can \
+                     still silently overwrite each other's committed state"
+                ),
+            )
+        }
+        // Simply not enabled, on a backend that would honour it.
+        (ConcurrencyControl::Off, true) => {
+            suggestions.push(
+                "state_concurrency: set [state] concurrency_control = \"cas\" so a run that loses a \
+                 write race fails instead of overwriting the winner's committed state"
+                    .into(),
+            );
+            (
+                HealthStatus::Warning,
+                format!(
+                    "[state] backend = \"{backend}\" runs with concurrency_control = \"off\": the \
+                     end-of-run upload is unconditional, so concurrent runs sharing this state can \
+                     silently overwrite each other's committed state (last writer wins). This \
+                     backend performs compare-and-swap writes — set concurrency_control = \"cas\""
+                ),
+            )
+        }
+        // Not enabled, and enabling it would not help on this backend either.
+        (ConcurrencyControl::Off, false) => {
+            suggestions.push(format!(
+                "state_concurrency: no concurrency_control setting protects the '{backend}' \
+                 backend — move [state] to a backend that performs compare-and-swap writes, or \
+                 serialize runs so only one writes this state at a time"
+            ));
+            (
+                HealthStatus::Warning,
+                format!(
+                    "[state] backend = \"{backend}\" runs with concurrency_control = \"off\", and \
+                     Rocky performs no compare-and-swap state write on it, so setting \"cas\" would \
+                     not help either: concurrent runs sharing this state can silently overwrite \
+                     each other's committed state (last writer wins)"
+                ),
+            )
+        }
+    };
+
+    let details = if verbose {
+        vec![
+            ("backend".into(), backend.to_string()),
+            (
+                "concurrency_control".into(),
+                config.state.concurrency_control.to_string(),
+            ),
+            ("cas_supported".into(), cas_supported.to_string()),
+            (
+                "cas_effective".into(),
+                rocky_core::state_sync::cas_effective(&config.state).to_string(),
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
+
+    Some(HealthCheck {
+        name: "state_concurrency".into(),
+        status,
+        message,
+        duration_ms: start.elapsed().as_millis() as u64,
+        details,
+    })
 }
 
 /// Health of native orchestration: is a reconciler wedged, and is the timer
@@ -923,6 +1128,296 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c.status, HealthStatus::Critical)),
             "doctor must report at least one Critical so it exits non-zero"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // state_concurrency — lost-update exposure of the remote state backend
+    // -----------------------------------------------------------------------
+
+    /// Write a `rocky.toml` with the given `[state]` body and collect the
+    /// `state_concurrency` check for it.
+    async fn state_concurrency_checks(state_block: &str) -> Vec<HealthCheck> {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter.db]\ntype = \"duckdb\"\n\
+                 [pipeline.raw]\ntype = \"transformation\"\n\
+                 [pipeline.raw.target]\nadapter = \"db\"\n\
+                 [state]\n{state_block}"
+            ),
+        )
+        .unwrap();
+        let state_path = dir.path().join("state.redb");
+        collect_health_checks(&config_path, &state_path, Some("state_concurrency"), false)
+            .await
+            .0
+    }
+
+    /// A local state file has one writer by construction, so `off` is correct
+    /// and warning about it would be noise.
+    #[tokio::test]
+    async fn state_concurrency_is_silent_on_the_local_backend() {
+        let checks = state_concurrency_checks("backend = \"local\"\n").await;
+        assert!(
+            !checks.iter().any(|c| c.name == "state_concurrency"),
+            "local ⇒ the check stays silent, got {checks:?}",
+        );
+    }
+
+    /// The dangerous direction the engine never surfaced: a remote backend
+    /// running last-writer-wins.
+    #[tokio::test]
+    async fn remote_backend_without_concurrency_control_warns() {
+        let checks = state_concurrency_checks("backend = \"s3\"\ns3_bucket = \"example\"\n").await;
+        let check = checks
+            .iter()
+            .find(|c| c.name == "state_concurrency")
+            .expect("a remote backend must emit the check");
+        assert!(
+            matches!(check.status, HealthStatus::Warning),
+            "remote + off is a lost-update exposure, got {:?}",
+            check.status,
+        );
+        assert!(
+            check.message.contains("concurrency_control = \"cas\""),
+            "the warning must name the fix: {}",
+            check.message,
+        );
+    }
+
+    /// The sharper case: the operator asked for protection on a backend that
+    /// cannot provide it, so the request silently downgrades. The message must
+    /// say CAS is *unavailable*, not merely unconfigured.
+    ///
+    /// Deliberately pinned to a backend the engine reports as unsupported via
+    /// `cas_supported_on` rather than a hardcoded name — see
+    /// `cas_verdict_tracks_the_engine_capability_predicate`, which covers every
+    /// backend so this stays honest when one gains support.
+    #[tokio::test]
+    async fn cas_on_a_backend_without_conditional_writes_warns() {
+        assert!(
+            !rocky_core::state_sync::cas_supported_on(rocky_core::config::StateBackend::Valkey),
+            "fixture assumes valkey performs no compare-and-swap write",
+        );
+        let checks = state_concurrency_checks(
+            "backend = \"valkey\"\nconcurrency_control = \"cas\"\nvalkey_url = \"redis://example\"\n",
+        )
+        .await;
+        let check = checks
+            .iter()
+            .find(|c| c.name == "state_concurrency")
+            .expect("a remote backend must emit the check");
+        assert!(
+            matches!(check.status, HealthStatus::Warning),
+            "cas that cannot take effect is not healthy, got {:?}",
+            check.status,
+        );
+        assert!(
+            check.message.contains("no-op") && check.message.contains("unconditional upload"),
+            "the message must say the setting cannot take effect: {}",
+            check.message,
+        );
+    }
+
+    /// `cas` on a conditional-write backend is the best configuration available
+    /// today and still must not report Healthy: the ledger-seam writers bypass
+    /// compare-and-swap on every backend, so a green here would certify a
+    /// protection no deployment currently has.
+    #[tokio::test]
+    async fn cas_on_an_object_store_backend_warns_about_the_seam_writers() {
+        let checks = state_concurrency_checks(
+            "backend = \"s3\"\nconcurrency_control = \"cas\"\ns3_bucket = \"example\"\n",
+        )
+        .await;
+        let check = checks
+            .iter()
+            .find(|c| c.name == "state_concurrency")
+            .expect("a remote backend must emit the check");
+        assert!(
+            matches!(check.status, HealthStatus::Warning),
+            "seam writers bypass CAS, so this must not be Healthy, got {:?}",
+            check.status,
+        );
+        assert!(
+            check.message.contains("end-of-run"),
+            "the message must say what IS protected: {}",
+            check.message,
+        );
+        assert!(
+            check.message.contains("rocky gc") && check.message.contains("unconditionally"),
+            "the message must name the seam writers that bypass CAS: {}",
+            check.message,
+        );
+        assert!(
+            check.message.contains("#1228"),
+            "the message must point at the tracking issue: {}",
+            check.message,
+        );
+    }
+
+    /// Every remote combination is a Warning today, and each of the four is
+    /// distinguishable from its message alone — an operator has to be able to
+    /// tell "not enabled" from "cannot be honoured" from "runs protected, seams
+    /// are not" without reading the source.
+    #[tokio::test]
+    async fn every_remote_warning_is_distinguishable_from_its_message() {
+        let cases = [
+            // (state block, a phrase unique to this case)
+            (
+                "backend = \"s3\"\ns3_bucket = \"example\"\n",
+                "set concurrency_control = \"cas\"",
+            ),
+            (
+                "backend = \"valkey\"\nvalkey_url = \"redis://example\"\n",
+                "would not help either",
+            ),
+            (
+                "backend = \"valkey\"\nvalkey_url = \"redis://example\"\nconcurrency_control = \"cas\"\n",
+                "is a no-op",
+            ),
+            (
+                "backend = \"s3\"\ns3_bucket = \"example\"\nconcurrency_control = \"cas\"\n",
+                "#1228",
+            ),
+        ];
+
+        let mut seen: Vec<String> = Vec::new();
+        for (block, marker) in cases {
+            let checks = state_concurrency_checks(block).await;
+            let check = checks
+                .iter()
+                .find(|c| c.name == "state_concurrency")
+                .expect("a remote backend must emit the check");
+            assert!(
+                matches!(check.status, HealthStatus::Warning),
+                "no remote configuration is fully protected yet, got {:?} for {block}",
+                check.status,
+            );
+            assert!(
+                check.message.contains(marker),
+                "message for {block} must contain {marker:?}: {}",
+                check.message,
+            );
+            assert!(
+                !seen.contains(&check.message),
+                "two cases produced the identical message, so an operator cannot tell them \
+                 apart: {}",
+                check.message,
+            );
+            seen.push(check.message.clone());
+        }
+    }
+
+    /// The verdict must be *derived* from the engine's capability predicate,
+    /// never from a backend list copied into the check. Asserted across every
+    /// remote backend and both settings: the check reports `cas` as taking
+    /// effect exactly when `cas_effective` says compare-and-swap really happens.
+    ///
+    /// Status alone can no longer carry this property — every remote case is a
+    /// Warning until the seam writers stop bypassing CAS — so the assertion is
+    /// on which *message class* is emitted. This is what keeps the check correct
+    /// when a backend gains compare-and-swap support: a stale hardcoded list
+    /// would tell an operator their `cas` setting is a no-op when it is in fact
+    /// working, pushing them off a correct configuration.
+    #[tokio::test]
+    async fn cas_verdict_tracks_the_engine_capability_predicate() {
+        use rocky_core::config::{ConcurrencyControl, StateBackend, StateConfig};
+
+        let remote = [
+            (
+                StateBackend::S3,
+                "backend = \"s3\"\ns3_bucket = \"example\"\n",
+            ),
+            (
+                StateBackend::Gcs,
+                "backend = \"gcs\"\ngcs_bucket = \"example\"\n",
+            ),
+            (
+                StateBackend::Valkey,
+                "backend = \"valkey\"\nvalkey_url = \"redis://example\"\n",
+            ),
+            (
+                StateBackend::Tiered,
+                "backend = \"tiered\"\ns3_bucket = \"example\"\nvalkey_url = \"redis://example\"\n",
+            ),
+        ];
+
+        for (backend, base) in remote {
+            for control in [ConcurrencyControl::Off, ConcurrencyControl::Cas] {
+                let block = match control {
+                    ConcurrencyControl::Off => base.to_string(),
+                    ConcurrencyControl::Cas => {
+                        format!("{base}concurrency_control = \"cas\"\n")
+                    }
+                };
+                let checks = state_concurrency_checks(&block).await;
+                let check = checks
+                    .iter()
+                    .find(|c| c.name == "state_concurrency")
+                    .unwrap_or_else(|| panic!("{backend} must emit the check"));
+
+                // Nothing is fully protected until the seam writers stop
+                // bypassing compare-and-swap.
+                assert!(
+                    matches!(check.status, HealthStatus::Warning),
+                    "{backend} + {control}: every remote case warns today, got {:?}",
+                    check.status,
+                );
+
+                let effective = rocky_core::state_sync::cas_effective(&StateConfig {
+                    backend,
+                    concurrency_control: control,
+                    ..StateConfig::default()
+                });
+                // "is a no-op" is the phrase reserved for a `cas` request the
+                // backend cannot honour. It must appear exactly when the engine
+                // says compare-and-swap does NOT take effect — that equivalence
+                // is what proves the check reads the engine's predicate rather
+                // than a copied backend list.
+                let says_no_op = check.message.contains("is a no-op");
+                assert_eq!(
+                    says_no_op,
+                    control == ConcurrencyControl::Cas && !effective,
+                    "{backend} + {control}: the no-op wording must track cas_effective \
+                     (effective={effective}) — {}",
+                    check.message,
+                );
+                if effective {
+                    assert!(
+                        check.message.contains("#1228"),
+                        "{backend} + {control}: an effective-CAS writer must be told what is \
+                         still unprotected — {}",
+                        check.message,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Fail-closed: a config we cannot read is not evidence of a `local`
+    /// backend, and must not let `--check state_concurrency` exit 0 green.
+    #[tokio::test]
+    async fn state_concurrency_fails_loudly_on_unreadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(&config_path, "this is not valid toml : : :").unwrap();
+        let state_path = dir.path().join("state.redb");
+
+        let (checks, _) =
+            collect_health_checks(&config_path, &state_path, Some("state_concurrency"), false)
+                .await;
+
+        let check = checks
+            .iter()
+            .find(|c| c.name == "state_concurrency")
+            .expect("an unreadable config must still emit the check");
+        assert!(
+            matches!(check.status, HealthStatus::Critical),
+            "a config we cannot read must not report healthy, got {:?}",
+            check.status,
         );
     }
 

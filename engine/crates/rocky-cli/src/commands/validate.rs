@@ -59,11 +59,18 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
         }
     };
 
-    // Emit a structured diagnostic for every adapter-kind / pipeline-role
-    // issue. V032 covers `[adapter.*]` `kind` invariants; V033 covers
-    // `source.adapter` / `source.discovery.adapter` role mismatches.
-    for err in rocky_core::config::validate_adapter_kinds(&cfg) {
-        out.push(kind_diagnostic(&err, config_path));
+    // Emit a structured diagnostic for every issue the shared post-parse
+    // validation chain finds — the same chain `load_rocky_config` runs, so
+    // `rocky validate` and the executing paths agree on what is loadable.
+    // Validating only adapter kinds here let a config that every `rocky run`
+    // rejects (e.g. `[state] freeze_marker_writes` on a backend with no
+    // durable object tier) report "valid" with exit 0.
+    //
+    // V032 covers `[adapter.*]` `kind` invariants, V033 the
+    // `source.adapter` / `source.discovery.adapter` role mismatches, and
+    // V046 the rest of the chain.
+    for err in rocky_core::config::collect_loaded_config_errors(&cfg) {
+        out.push(config_error_diagnostic(&err, config_path));
     }
 
     // Validate adapters
@@ -252,12 +259,23 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     Ok(out)
 }
 
-/// Converts a `kind`-validation error into a `ValidateMessage` with a
-/// structured V-code and a `field` path that points an IDE at the
-/// offending key in `rocky.toml`.
-fn kind_diagnostic(err: &rocky_core::config::ConfigError, config_path: &Path) -> ValidateMessage {
+/// Converts one error from the shared post-parse validation chain into a
+/// `ValidateMessage` with a structured V-code and a `field` path that points
+/// an IDE at the offending key in `rocky.toml`.
+///
+/// Codes are a public contract, so the two pre-existing ones keep their exact
+/// meaning — V032 for `[adapter.*]` `kind` invariants, V033 for pipeline
+/// adapter-role mismatches — and everything else the chain rejects lands on
+/// V046 rather than the V001 parse code, which already carries both the "Config
+/// syntax valid" ok message and the "Failed to parse config" error.
+fn config_error_diagnostic(
+    err: &rocky_core::config::ConfigError,
+    config_path: &Path,
+) -> ValidateMessage {
     use rocky_core::config::ConfigError;
 
+    // `ConfigError` carries every read/parse/env variant too; only the ones
+    // the validation chain can actually produce are worth a `field` path.
     let (code, field) = match err {
         ConfigError::AdapterMissingDiscoveryKind { name, .. }
         | ConfigError::AdapterKindUnsupported { name, .. } => {
@@ -270,7 +288,47 @@ fn kind_diagnostic(err: &rocky_core::config::ConfigError, config_path: &Path) ->
             "V033",
             Some(format!("pipeline.{pipeline}.source.discovery.adapter")),
         ),
-        _ => ("V001", None),
+        ConfigError::ReplicationMergeMissingKeys { pipeline } => {
+            ("V046", Some(format!("pipeline.{pipeline}.merge_keys")))
+        }
+        ConfigError::TableOverrideEmptyMatch { pipeline, .. }
+        | ConfigError::TableOverrideDuplicate { pipeline, .. }
+        | ConfigError::TableOverrideInvalidGlob { pipeline, .. }
+        | ConfigError::TableOverrideMergeMissingKeys { pipeline, .. } => {
+            ("V046", Some(format!("pipeline.{pipeline}.table_overrides")))
+        }
+        ConfigError::SchemaPatternReservedComponent { pipeline, .. } => (
+            "V046",
+            Some(format!(
+                "pipeline.{pipeline}.source.schema_pattern.components"
+            )),
+        ),
+        ConfigError::FivetranCacheMissingField { adapter, .. } => {
+            ("V046", Some(format!("adapter.{adapter}.cache")))
+        }
+        ConfigError::FivetranRatelimitMissingField { adapter, .. } => {
+            ("V046", Some(format!("adapter.{adapter}.ratelimit")))
+        }
+        ConfigError::FivetranStampedeMissingField { adapter, .. } => {
+            ("V046", Some(format!("adapter.{adapter}.stampede")))
+        }
+        ConfigError::FivetranCircuitBreakerMissingField { adapter, .. } => {
+            ("V046", Some(format!("adapter.{adapter}.circuit_breaker")))
+        }
+        ConfigError::PolicyUnsupportedVersion { .. } => ("V046", Some("policy.version".into())),
+        ConfigError::PolicyScopeAnyConflict { rule_index }
+        | ConfigError::PolicyScopeEmpty { rule_index } => {
+            ("V046", Some(format!("policy.rules[{rule_index}].scope")))
+        }
+        ConfigError::PolicyBudgetInvalidWindow { rule_index, .. }
+        | ConfigError::PolicyBudgetZeroFailures { rule_index, .. } => (
+            "V046",
+            Some(format!("policy.rules[{rule_index}].autonomy_budget")),
+        ),
+        ConfigError::StateFreezeMarkerWritesUnsupportedBackend { .. } => {
+            ("V046", Some("state.freeze_marker_writes".into()))
+        }
+        _ => ("V046", None),
     };
 
     ValidateMessage {
@@ -1320,6 +1378,130 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(toml_str.as_bytes()).unwrap();
         validate_inner(f.path()).unwrap()
+    }
+
+    /// Write a config, then return both what `rocky validate` reports and
+    /// whether the executing paths (`load_rocky_config`) accept it.
+    ///
+    /// The pair is the point: `validate` must not green-light a config that
+    /// cannot run, and must not reject one that can.
+    fn validate_and_load(toml_str: &str) -> (ValidateOutput, bool) {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let out = validate_inner(f.path()).unwrap();
+        let loadable = rocky_core::config::load_rocky_config(f.path()).is_ok();
+        (out, loadable)
+    }
+
+    /// `rocky validate` ran only the adapter-kind validator, so a config the
+    /// shared validation chain rejects — here `[state] freeze_marker_writes`
+    /// on a backend with no durable object tier — reported "Config syntax
+    /// valid" and exit 0 while every `rocky run` hard-errored on it.
+    #[test]
+    fn freeze_marker_writes_on_local_backend_is_rejected_v046() {
+        let (out, loadable) = validate_and_load(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[state]
+backend = "local"
+freeze_marker_writes = true
+"#,
+        );
+
+        assert!(
+            !out.valid,
+            "a config no run can load must not validate: {:?}",
+            out.messages
+        );
+        let v046: Vec<_> = out
+            .messages
+            .iter()
+            .filter(|m| m.code == "V046" && m.severity == "error")
+            .collect();
+        assert_eq!(v046.len(), 1, "expected one V046: {:?}", out.messages);
+        assert_eq!(
+            v046[0].field.as_deref(),
+            Some("state.freeze_marker_writes"),
+            "the diagnostic must point at the offending key",
+        );
+        assert!(
+            !loadable,
+            "the config validate now rejects must be one load_rocky_config already rejected — \
+             otherwise this is a new rule, not a bug fix",
+        );
+    }
+
+    /// A config carrying both an adapter-kind issue and a later-chain issue
+    /// surfaces both. The kind diagnostic keeps its V032 code and is emitted
+    /// exactly once — the chain now includes the kind validator, so a
+    /// leftover separate pass over it would double-report.
+    #[test]
+    fn kind_and_state_errors_both_surface_exactly_once() {
+        let out = validate_toml(
+            r#"
+[adapter.db]
+type = "duckdb"
+[adapter.ft]
+type = "fivetran"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[state]
+backend = "local"
+freeze_marker_writes = true
+"#,
+        );
+
+        let v032: Vec<_> = out.messages.iter().filter(|m| m.code == "V032").collect();
+        assert_eq!(
+            v032.len(),
+            1,
+            "the kind diagnostic must be emitted exactly once: {:?}",
+            out.messages
+        );
+        assert_eq!(v032[0].field.as_deref(), Some("adapter.ft.kind"));
+        assert!(
+            out.messages.iter().any(|m| m.code == "V046"),
+            "the later-chain error must surface alongside the kind error: {:?}",
+            out.messages
+        );
+        assert!(!out.valid);
+    }
+
+    /// The chain must not fire on a config the executing paths accept.
+    #[test]
+    fn a_loadable_config_emits_no_chain_errors() {
+        let (out, loadable) = validate_and_load(
+            r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+[state]
+backend = "s3"
+freeze_marker_writes = true
+"#,
+        );
+
+        assert!(
+            loadable,
+            "fixture must be loadable for this test to mean anything"
+        );
+        assert!(
+            !out.messages
+                .iter()
+                .any(|m| ["V032", "V033", "V046"].contains(&m.code.as_str())),
+            "no chain diagnostic may fire on a loadable config: {:?}",
+            out.messages
+        );
     }
 
     #[test]

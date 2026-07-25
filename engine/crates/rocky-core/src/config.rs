@@ -509,7 +509,7 @@ fn default_table_retries() -> u32 {
 }
 
 /// State storage backend variants.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum StateBackend {
     /// State stored on local disk (default). No sync needed.
@@ -539,10 +539,24 @@ impl std::fmt::Display for StateBackend {
 
 /// Concurrency control for remote `[state]` object writes.
 ///
-/// Guards the cross-pod lost update where two runs sharing one `[state]` prefix
-/// race: one downloads the state, the other commits, and the first's end-of-run
+/// Guards the cross-process lost update where two writers sharing one `[state]`
+/// location race: one reads the state, the other commits, and the first's
 /// upload silently overwrites the second (last-writer-wins). See
 /// [`StateConfig::concurrency_control`].
+///
+/// **Scope:** `docs/adr/ADR-CONCURRENCY.md` governs — compare-and-swap applies
+/// to *every* remote state write, split by writer class (runs refuse on
+/// conflict; single-record ledger seams retry). Only the run half is
+/// implemented today: the ledger-seam writers reached through
+/// `RemoteStateSession::upload_only_fail_closed` (`rocky gc`, `rocky policy`,
+/// `rocky apply`) still upload unconditionally on every backend, so `cas` does
+/// not yet make a deployment fully safe against lost updates. Issue #1228
+/// tracks closing that half; `rocky doctor --check state_concurrency` reports
+/// the residual exposure in the meantime.
+//
+// Kept free of rustdoc intra-doc links on purpose: `schemars` exports this
+// comment verbatim as the JSON Schema `description`, which surfaces in editor
+// tooltips and the OpenAPI document, where `[text][path]` renders as noise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ConcurrencyControl {
@@ -5820,48 +5834,79 @@ fn apply_single_adapter_discovery_default(config: &mut RockyConfig) {
 /// deprecation warnings programmatically (e.g., `rocky doctor`, `rocky
 /// validate`) can use [`check_config_deprecations`] on the raw TOML string.
 ///
-/// Also validates adapter `kind` fields and pipeline adapter references —
-/// see [`validate_adapter_kinds`]. Fails fast on the first such issue;
-/// `rocky validate` uses [`parse_rocky_config`] + [`validate_adapter_kinds`]
-/// directly so it can emit every issue as its own diagnostic.
+/// Also runs the whole [`CONFIG_VALIDATORS`] chain — adapter `kind` fields,
+/// pipeline adapter references, replication strategies and overrides,
+/// Fivetran cache/resilience blocks, `[policy]`, and `[state]` marker
+/// writes. Fails fast on the first issue; `rocky validate` uses
+/// [`parse_rocky_config`] + [`collect_loaded_config_errors`] over the same
+/// chain so it can emit every issue as its own diagnostic.
 pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     let config = parse_rocky_config(path)?;
     validate_loaded_config(&config)?;
     Ok(config)
 }
 
+/// A validator in the [`CONFIG_VALIDATORS`] chain: pure, panic-free, and
+/// independent of every other validator's outcome.
+type ConfigValidator = fn(&RockyConfig) -> Vec<ConfigError>;
+
+/// The ordered post-parse validation chain, in one place so the fail-fast
+/// consumer ([`validate_loaded_config`], behind `rocky run` and every other
+/// executing path) and the collect-all consumer
+/// ([`collect_loaded_config_errors`], behind `rocky validate`) can never
+/// disagree about which rules a config has to satisfy.
+///
+/// Sharing the list is the point: `rocky validate` used to run only
+/// [`validate_adapter_kinds`], so a config rejected by a later validator —
+/// e.g. `[state] freeze_marker_writes` on a backend with no durable object
+/// tier — reported "valid" and exit 0 while every `rocky run` hard-errored.
+///
+/// Every entry must stay pure and panic-free: the collect-all consumer runs
+/// each one even when an earlier validator already found problems, so a
+/// validator that assumed a predecessor had passed would fault on input the
+/// fail-fast consumer never reaches.
+const CONFIG_VALIDATORS: &[ConfigValidator] = &[
+    validate_adapter_kinds,
+    validate_replication_strategies,
+    validate_schema_pattern_reserved_components,
+    validate_replication_overrides,
+    validate_fivetran_cache,
+    validate_fivetran_resilience,
+    validate_policy,
+    validate_freeze_marker_writes,
+];
+
 /// The fail-fast validation chain shared by [`load_rocky_config`] and
 /// [`load_rocky_config_fingerprinted`]. Returns the first issue, matching
-/// `load_rocky_config`'s historical behavior.
+/// `load_rocky_config`'s historical behavior: validators run in
+/// [`CONFIG_VALIDATORS`] order and the chain stops at the first one that
+/// reports anything.
 fn validate_loaded_config(config: &RockyConfig) -> Result<(), ConfigError> {
-    if let Some(first) = validate_adapter_kinds(config).into_iter().next() {
-        return Err(first);
-    }
-    if let Some(first) = validate_replication_strategies(config).into_iter().next() {
-        return Err(first);
-    }
-    if let Some(first) = validate_schema_pattern_reserved_components(config)
-        .into_iter()
-        .next()
-    {
-        return Err(first);
-    }
-    if let Some(first) = validate_replication_overrides(config).into_iter().next() {
-        return Err(first);
-    }
-    if let Some(first) = validate_fivetran_cache(config).into_iter().next() {
-        return Err(first);
-    }
-    if let Some(first) = validate_fivetran_resilience(config).into_iter().next() {
-        return Err(first);
-    }
-    if let Some(first) = validate_policy(config).into_iter().next() {
-        return Err(first);
-    }
-    if let Some(first) = validate_freeze_marker_writes(config).into_iter().next() {
-        return Err(first);
+    for validate in CONFIG_VALIDATORS {
+        if let Some(first) = validate(config).into_iter().next() {
+            return Err(first);
+        }
     }
     Ok(())
+}
+
+/// Runs the whole [`CONFIG_VALIDATORS`] chain and returns **every** issue,
+/// in chain order, instead of stopping at the first.
+///
+/// The diagnostic counterpart to [`validate_loaded_config`]: `rocky validate`
+/// reports all of a config's problems in one pass rather than making the
+/// author fix them one run at a time. A parsed config that yields an empty
+/// `Vec` here is exactly a config [`load_rocky_config`] accepts, so `rocky
+/// validate` and the executing paths agree on what is loadable.
+///
+/// Callers that need to *load* a config should use [`load_rocky_config`] —
+/// this function neither reads nor parses, and returning `Vec` rather than
+/// `Result` makes it unusable as a gate by accident.
+pub fn collect_loaded_config_errors(config: &RockyConfig) -> Vec<ConfigError> {
+    CONFIG_VALIDATORS
+        .iter()
+        .flat_map(|validate| validate(config))
+        .collect()
 }
 
 /// A parsed [`RockyConfig`] paired with the fingerprint of the exact raw

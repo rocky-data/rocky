@@ -700,7 +700,7 @@
       ]
     },
     "ConcurrencyControl": {
-      "description": "Concurrency control for remote `[state]` object writes.\n\nGuards the cross-pod lost update where two runs sharing one `[state]` prefix race: one downloads the state, the other commits, and the first's end-of-run upload silently overwrites the second (last-writer-wins). See [`StateConfig::concurrency_control`].",
+      "description": "Concurrency control for remote `[state]` object writes.\n\nGuards the cross-process lost update where two writers sharing one `[state]` location race: one reads the state, the other commits, and the first's upload silently overwrites the second (last-writer-wins). See [`StateConfig::concurrency_control`].\n\n**Scope:** `docs/adr/ADR-CONCURRENCY.md` governs — compare-and-swap applies to *every* remote state write, split by writer class (runs refuse on conflict; single-record ledger seams retry). Only the run half is implemented today: the ledger-seam writers reached through `RemoteStateSession::upload_only_fail_closed` (`rocky gc`, `rocky policy`, `rocky apply`) still upload unconditionally on every backend, so `cas` does not yet make a deployment fully safe against lost updates. Issue #1228 tracks closing that half; `rocky doctor --check state_concurrency` reports the residual exposure in the meantime.",
       "oneOf": [
         {
           "description": "Unconditional last-writer-wins upload (default) — byte-identical to the pre-CAS behaviour. Correct for single-writer-per-prefix deployments (one run at a time, orchestrator-serialized).",

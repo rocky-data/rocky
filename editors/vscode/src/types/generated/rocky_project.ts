@@ -349,7 +349,9 @@ export type StateBackend = "local" | "s3" | "gcs" | "valkey" | "tiered";
 /**
  * Concurrency control for remote `[state]` object writes.
  *
- * Guards the cross-pod lost update where two runs sharing one `[state]` prefix race: one downloads the state, the other commits, and the first's end-of-run upload silently overwrites the second (last-writer-wins). See [`StateConfig::concurrency_control`].
+ * Guards the cross-process lost update where two writers sharing one `[state]` location race: one reads the state, the other commits, and the first's upload silently overwrites the second (last-writer-wins). See [`StateConfig::concurrency_control`].
+ *
+ * **Scope:** `docs/adr/ADR-CONCURRENCY.md` governs — compare-and-swap applies to *every* remote state write, split by writer class (runs refuse on conflict; single-record ledger seams retry). Only the run half is implemented today: the ledger-seam writers reached through `RemoteStateSession::upload_only_fail_closed` (`rocky gc`, `rocky policy`, `rocky apply`) still upload unconditionally on every backend, so `cas` does not yet make a deployment fully safe against lost updates. Issue #1228 tracks closing that half; `rocky doctor --check state_concurrency` reports the residual exposure in the meantime.
  */
 export type ConcurrencyControl = "off" | "cas";
 /**

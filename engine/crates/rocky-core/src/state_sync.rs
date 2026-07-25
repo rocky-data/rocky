@@ -554,6 +554,44 @@ pub struct RemoteStateSession {
     base: Option<Generation>,
 }
 
+/// Whether Rocky performs compare-and-swap state writes on `backend` at all.
+///
+/// The single source of truth for CAS backend capability. The runtime write
+/// path gates on it through [`cas_effective`], and `rocky doctor`'s
+/// `state_concurrency` check derives its verdict from the same call, so a
+/// backend that gains or loses conditional-write support changes both together.
+/// Re-deriving this list anywhere else is how a diagnostic ends up vouching for
+/// protection that is not there — or, just as harmful, warning about a
+/// deployment that is in fact protected.
+///
+/// `local` is `false` because it performs no remote write to condition; callers
+/// that care about the single-writer-local case handle it before asking.
+#[must_use]
+pub fn cas_supported_on(backend: StateBackend) -> bool {
+    match backend {
+        // A conditional-write object tier the upload can compare against.
+        StateBackend::S3 | StateBackend::Gcs => true,
+        // No generation to condition on: `cas` falls back to an unconditional
+        // upload (and warns once at `acquire`).
+        StateBackend::Valkey | StateBackend::Tiered => false,
+        // No remote write at all — the on-disk file IS the state.
+        StateBackend::Local => false,
+    }
+}
+
+/// Whether this `[state]` configuration *actually* performs compare-and-swap
+/// state writes: `concurrency_control = "cas"` requested AND
+/// [`cas_supported_on`] the configured backend.
+///
+/// "Effective" rather than "configured" is the distinction that matters — a
+/// `cas` request on a backend without conditional writes silently downgrades to
+/// an unconditional upload, so the request alone proves nothing about whether
+/// the deployment is protected.
+#[must_use]
+pub fn cas_effective(cfg: &StateConfig) -> bool {
+    cfg.concurrency_control == ConcurrencyControl::Cas && cas_supported_on(cfg.backend)
+}
+
 impl RemoteStateSession {
     /// Build a session over an owned snapshot of `cfg` for the ledger at
     /// `state_path`. Performs no I/O; call [`acquire`][Self::acquire] before
@@ -574,13 +612,11 @@ impl RemoteStateSession {
         }
     }
 
-    /// Whether this session performs compare-and-swap state writes: configured
-    /// `concurrency_control = "cas"` AND a backend with a conditional-write
-    /// object tier (`s3` / `gcs`). On other backends `cas` auto-downgrades to
-    /// an unconditional upload.
+    /// Whether this session performs compare-and-swap state writes — see
+    /// [`cas_effective`], which this delegates to so the write path and the
+    /// `rocky doctor` diagnostic cannot disagree.
     fn cas_enabled(&self) -> bool {
-        self.cfg.concurrency_control == ConcurrencyControl::Cas
-            && matches!(self.cfg.backend, StateBackend::S3 | StateBackend::Gcs)
+        cas_effective(&self.cfg)
     }
 
     /// Download-before-read: resolve, record, and return the ledger's
