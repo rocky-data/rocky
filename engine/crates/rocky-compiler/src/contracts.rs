@@ -1010,4 +1010,63 @@ no_new_nullable = true
             "the oracle must observe the change it exists to bound"
         );
     }
+
+    /// SPLIT-FEASIBILITY MEASUREMENT. The *second* contract gate — the
+    /// compile-side `validate_contract` (E011/W032/E037) — probed with the
+    /// landed type a bare Databricks `decimal` now resolves to.
+    ///
+    /// Measured rather than assumed: the load-gate entanglement is driven by
+    /// `is_assignable` containment, and this gate does not use containment at
+    /// all (it string-matches type *names*), so the two gates can move in
+    /// opposite directions.
+    #[test]
+    fn measure_split_feasibility_compile_side_contract_gate() {
+        // What `default_type_mapper("decimal")` returns on this scratch branch
+        // vs on the 16-commit branch.
+        let probes = [
+            (
+                "scratch (bare -> Decimal(38,0))",
+                RockyType::Decimal {
+                    precision: 38,
+                    scale: 0,
+                },
+            ),
+            ("16-commit (bare -> Unknown)", RockyType::Unknown),
+        ];
+
+        for declared in ["Decimal", "Decimal(38,2)", "Decimal(10,2)", "Int64"] {
+            for (label, landed) in &probes {
+                let schema = vec![
+                    typed_col("amount", landed.clone(), true),
+                    // A second resolved column, so the per-column report path
+                    // runs rather than the collapsed all-unresolved one.
+                    typed_col("id", RockyType::Int64, false),
+                ];
+                let contract = CompilerContract {
+                    columns: vec![ContractColumn {
+                        name: "amount".to_string(),
+                        type_name: Some(declared.to_string()),
+                        nullable: None,
+                        description: None,
+                    }],
+                    rules: ContractRules::default(),
+                };
+                let diags = validate_contract_with_policy(
+                    "m",
+                    &schema,
+                    &contract,
+                    UnverifiablePolicy::Warn,
+                );
+                let codes: Vec<&str> = diags.iter().map(|d| &*d.code).collect();
+                println!(
+                    "MEASURE(compile-gate) declared={declared:<14} {label:<32} -> {}",
+                    if codes.is_empty() {
+                        "(silent)".to_string()
+                    } else {
+                        format!("{codes:?}")
+                    }
+                );
+            }
+        }
+    }
 }
