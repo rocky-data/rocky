@@ -2117,6 +2117,78 @@ mod tests {
         }
     }
 
+    /// SPLIT-FEASIBILITY MEASUREMENT (the entanglement). Pairs the scratch
+    /// branch **hard-rejects** that origin/main permitted, where a landed bare
+    /// decimal is compared against a parameterised declared decimal.
+    ///
+    /// origin/main permitted these only because its `is_assignable` was *also*
+    /// wrong: `common_supertype(Dec(38,0), Dec(38,2)) == Dec(38,2)`, so the
+    /// fabricated width was silently absorbed. Restoring the fabrication on top
+    /// of the corrected containment rule removes that compensation, so the
+    /// fabricated 38 integer digits are now checked literally.
+    ///
+    /// A landed bare `decimal` is what Databricks' `information_schema` really
+    /// returns, and there it means `DECIMAL(10,0)` — so every reject below that
+    /// a `DECIMAL(10,0)` source would have satisfied is a NEW false reject at
+    /// `rocky load`, present on neither origin/main nor the 16-commit branch.
+    #[test]
+    fn measure_split_feasibility_new_false_rejects_from_the_fabrication() {
+        // Every declared decimal a contract plausibly writes.
+        let declared_grid: Vec<String> = {
+            let mut v = Vec::new();
+            for p in [10u8, 12, 18, 20, 38] {
+                for s in [0u8, 2, 4, 6] {
+                    if s <= p {
+                        v.push(format!("DECIMAL({p},{s})"));
+                    }
+                }
+            }
+            v
+        };
+        // What a bare landed decimal ACTUALLY is, per adapter (executed values
+        // recorded in this branch's own doc comments).
+        let truths = [
+            ("Databricks", RockyType::Decimal { precision: 10, scale: 0 }),
+            ("DuckDB", RockyType::Decimal { precision: 18, scale: 3 }),
+            ("Snowflake", RockyType::Decimal { precision: 38, scale: 0 }),
+        ];
+
+        for landed in ["DECIMAL", "NUMBER", "NUMERIC"] {
+            let mut rejects: Vec<&str> = Vec::new();
+            for declared in &declared_grid {
+                let old = frozen_old_gate_passes(landed, declared);
+                let new = new_gate_passes(landed, declared, UnverifiablePolicy::Warn);
+                if old && !new {
+                    rejects.push(declared);
+                }
+            }
+            println!(
+                "MEASURE(entangle) landed '{landed}': {} of {} declared decimals newly HARD-REJECT \
+                 (origin/main permitted all of them)",
+                rejects.len(),
+                declared_grid.len()
+            );
+            for declared in &rejects {
+                // Would the adapter's real type have satisfied this contract?
+                let declared_ty = warehouse_type_to_rocky(declared);
+                let satisfied_by: Vec<&str> = truths
+                    .iter()
+                    .filter(|(_, truth)| rocky_ir::types::is_assignable(truth, &declared_ty))
+                    .map(|(name, _)| *name)
+                    .collect();
+                println!(
+                    "MEASURE(entangle)   REJECT {landed:<8} -> {declared:<14} \
+                     but really fits on: {}",
+                    if satisfied_by.is_empty() {
+                        "(none — reject is sound)".to_string()
+                    } else {
+                        format!("{satisfied_by:?}  <-- FALSE REJECT there")
+                    }
+                );
+            }
+        }
+    }
+
     /// SPLIT-FEASIBILITY MEASUREMENT. Which grid strings still resolve
     /// differently from origin/main after the bare-tail revert — the honest
     /// answer to "did the blast radius collapse".
