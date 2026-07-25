@@ -279,6 +279,24 @@ fn validate_contract_with_policy(
 /// alike and are not interchangeable. This one must agree with the `Decimal` arm
 /// of [`type_name_matches`], or a declaration that arm accepts could fall
 /// outside the unverifiable report.
+///
+/// # This accepts parameters it does not enforce
+///
+/// `Decimal(10,0)` is recognized here — so an *unresolved* column against it is
+/// reported — but a **resolved** `Decimal(38,0)` against it is not: the
+/// `Decimal` arm of [`type_name_matches`] matches any decimal against any
+/// `Decimal(…)` declaration, so the compile-time gate cannot detect a
+/// precision/scale mismatch at all. That is pre-existing (it predates the
+/// unverifiable verdict entirely) and it is **not** closed by this change; the
+/// `rocky load` gate does enforce containment, so the mismatch is caught there
+/// and not at compile time.
+///
+/// Closing it means parsing the declared parameters and routing through
+/// [`rocky_ir::contract_verdict`], which turns a class of contracts that compile
+/// clean today into `E011` errors. That is a hard-rejection change, and it does
+/// not belong in the release whose whole point is that the new verdict is
+/// warning-only. It is named on [`rocky_ir::UNVERIFIABLE_POLICY`] as flip-time
+/// work.
 fn declares_rocky_decimal(type_name: &str) -> bool {
     type_name == "Decimal" || type_name.starts_with("Decimal(")
 }

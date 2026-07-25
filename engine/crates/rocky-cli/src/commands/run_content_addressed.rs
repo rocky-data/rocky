@@ -533,10 +533,13 @@ pub(crate) fn query_result_to_record_batch(
             // W033) and from any expression the typechecker does not model.
             RockyType::Unknown => {
                 return Err(anyhow!(
-                    "column {:?} has no inferred type; the model's column type could not be \
-                     inferred, so the content-addressed writer cannot pick a physical type. \
-                     Declare it with an explicit CAST that names precision and scale, \
-                     e.g. CAST({0} AS DECIMAL(38,2))",
+                    "column {:?} has no inferred type, so the content-addressed writer cannot \
+                     pick a physical type. If the column is computed, declare it with an \
+                     explicit CAST naming precision and scale, e.g. \
+                     CAST({0} AS DECIMAL(38,2)); if the column reads straight from a source \
+                     whose own type did not resolve, the cast will NOT help — the source \
+                     schema is what has to name a complete type (an unparameterised \
+                     'DECIMAL' names a different type on every adapter)",
                     tc.name
                 ));
             }

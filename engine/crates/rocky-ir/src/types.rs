@@ -586,6 +586,22 @@ pub enum UnverifiablePolicy {
 ///   normalizer doesn't recognize is treated as unknown and never fails the
 ///   type check"*.
 /// - the `CHANGELOG` entry that announced the warning.
+///
+/// # Two known gaps that should be closed before, or with, the flip
+///
+/// Both are pre-existing and neither is a *new* fail-open, but the flip is the
+/// natural moment to settle them, because after it the gates reject and a gap
+/// that merely under-warns today starts to look like an arbitrary exemption:
+///
+/// - `rocky_compiler::contracts::declares_rocky_decimal` accepts a declared
+///   `Decimal(p,s)` but the compile-time check never enforces `p`/`s` — any
+///   decimal satisfies any `Decimal(…)` declaration there. Closing it turns
+///   currently-clean contracts into `E011` errors.
+/// - The Databricks source-discovery producers hand Rocky a bare `decimal`
+///   (`information_schema.columns.data_type` is the simple type name;
+///   `full_data_type` carries the parameters), so Databricks decimal source
+///   columns resolve to `Unknown` and will be *rejected* at the flip. Fixing the
+///   producer is the right repair; it needs a live Databricks to verify.
 pub const UNVERIFIABLE_POLICY: UnverifiablePolicy = UnverifiablePolicy::Warn;
 
 /// Decide whether a landed/inferred type satisfies a declared contract type.
@@ -656,13 +672,21 @@ pub fn contract_verdict(landed: &RockyType, declared: &RockyType) -> ContractVer
 ///
 /// # `Unknown` passes here, and that is why this must not be used at a gate
 ///
-/// [`RockyType::Unknown`] on either side is assignable. That is correct for
-/// *inference* — an unresolved type is a missing constraint, not a violated one
-/// — and it is a **false permit** at a *validation* gate, where unresolved
-/// evidence would read as evidence of safety. Governance call sites must use
-/// [`contract_verdict`], which reports [`ContractVerdict::Unverifiable`] for the
-/// same inputs. This function keeps its own contract unchanged so inference and
-/// unification behave exactly as before.
+/// [`RockyType::Unknown`] on either side is assignable, which is a **false
+/// permit** at a validation gate: unresolved evidence would read as evidence of
+/// safety. Governance call sites must use [`contract_verdict`], which reports
+/// [`ContractVerdict::Unverifiable`] for the same inputs.
+///
+/// Stated precisely, because a grep will otherwise contradict a looser claim:
+/// after the gate split this function has **no callers outside this module** —
+/// `contract_verdict` and the tests are the only consumers, and the two agree
+/// everywhere except the `Unknown` axis. The permissive behaviour is retained
+/// because it is this predicate's own long-standing contract and because
+/// freezing it keeps the change to one flip surface
+/// (`test_is_assignable_verdicts_preserved_for_non_decimals`), **not** because
+/// some inference call site depends on it — there is no such call site today.
+/// A future inference consumer is exactly who this contract is for; a future
+/// governance consumer must not use it.
 pub fn is_assignable(from: &RockyType, to: &RockyType) -> bool {
     if from == to || *from == RockyType::Unknown || *to == RockyType::Unknown {
         return true;

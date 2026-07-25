@@ -272,7 +272,7 @@ fn validate_contract_typed_with_policy(
                 });
             }
             ContractVerdict::Unverifiable
-                if unverifiable_is_reportable(&col.data_type, &req.data_type) =>
+                if unverifiable_is_reportable(&col.data_type, &landed_ty, &req.data_type) =>
             {
                 let detail = format!(
                     "column '{}' — contract type check not verified: landed type '{}' resolved \
@@ -428,17 +428,40 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 ///
 /// Two conditions, and both are load-bearing.
 ///
-/// **1. The raw type strings must differ** (case-insensitively, trimmed).
-/// Identical warehouse type strings on both sides means the landed type *is* the
-/// declared type, and every type contains itself — so the check is genuinely
-/// *verified*, not skipped. Without this, a `GEOMETRY` column against a
-/// `GEOMETRY` contract would be reported, and under `Reject` would fail a load
-/// that is obviously fine.
+/// **1. The raw type strings must differ, and the shortcut applies only to
+/// COMPLETE type names.** Identical warehouse type strings usually means the
+/// landed type *is* the declared type, and every type contains itself — so the
+/// check is genuinely *verified*, not skipped. Without it, a `GEOMETRY` column
+/// against a `GEOMETRY` contract would be reported, and under `Reject` would
+/// fail a load that is obviously fine.
 ///
-/// **2. One side must name a decimal.** This is the deliberate and *narrow*
-/// scope of this release, and it leaves a fail-open open: a contracted `String`
-/// or `Timestamp` column whose landed type does not normalize still passes this
-/// gate silently.
+/// That reasoning fails for the decimal family, because `DECIMAL` is an
+/// *incomplete* type name: it elides the parameters. Two columns both described
+/// as `DECIMAL` can be `DECIMAL(10,0)` and `DECIMAL(38,10)`, and one does not
+/// contain the other — the string is a lossy projection, not a type. (Reachable:
+/// Databricks Unity falls back to `type_name`, a bare `"DECIMAL"`, when a
+/// table-info response omits `type_text`.) So the shortcut is withheld from any
+/// name [`looks_like_decimal`] matches, which is exactly the family whose
+/// parameters can be elided.
+///
+/// **2. A decimal must be implicated, on a side where it can matter.** Not
+/// simply "either raw string names a decimal": that would report — and, after
+/// the flip, *reject* — a landed `DECIMAL(10,2)` against a contract declaring
+/// some type this mapper does not know (`HUGEINT`, `SUPER`, `GEOGRAPHY`), where
+/// the decimal is on the side that resolved perfectly well and contributes
+/// nothing to the failure. The two disjuncts below are the two ways a decimal
+/// actually participates in an unresolved comparison:
+///
+/// - **the contract declares a decimal** — the class RD-010 is about, and the
+///   same trigger the compiler-side gate uses (`declares_rocky_decimal`), so the
+///   two gates report the same class rather than two overlapping ones; or
+/// - **the landed side is the unresolved one and names a decimal** — an
+///   unparameterised `NUMBER` landing against a `BIGINT` contract, say, where
+///   the landed type could well be a `NUMBER(38,10)` that does not fit.
+///
+/// This is the deliberate and *narrow* scope of this release, and it leaves a
+/// fail-open open: a contracted `String` or `Timestamp` column whose landed type
+/// does not normalize still passes this gate silently.
 ///
 /// The scoping is not timidity, it is a measurement. With `[cache.schemas]
 /// disabled` or a cold cache, `rocky-compiler`'s source schemas are empty and
@@ -447,11 +470,18 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 /// cold compile, and the flip to `Reject` would then break every such build.
 /// Closing the general case needs either a reliably-populated schema cache or an
 /// opt-in strict mode, and is a separate change with its own migration.
-fn unverifiable_is_reportable(landed_raw: &str, declared_raw: &str) -> bool {
-    if landed_raw.trim().eq_ignore_ascii_case(declared_raw.trim()) {
+fn unverifiable_is_reportable(landed_raw: &str, landed_ty: &RockyType, declared_raw: &str) -> bool {
+    if landed_raw.trim().eq_ignore_ascii_case(declared_raw.trim())
+        && !looks_like_decimal(landed_raw)
+    {
         return false;
     }
-    looks_like_decimal(landed_raw) || looks_like_decimal(declared_raw)
+    // `looks_like_decimal` covers the declared side whether or not it resolved:
+    // `warehouse_type_to_rocky` only ever produces a `Decimal` from one of the
+    // four spellings it tests, so a declared type that *resolved* to a decimal
+    // necessarily satisfies it too.
+    looks_like_decimal(declared_raw)
+        || (*landed_ty == RockyType::Unknown && looks_like_decimal(landed_raw))
 }
 
 /// Whether a raw warehouse type string names a fixed-point decimal family.
@@ -1019,10 +1049,16 @@ mod tests {
         assert!(result.warnings.iter().all(|w| !w.starts_with("W032:")));
     }
 
-    /// G5 — identical raw type strings are *verified*, not skipped: the landed
-    /// type is the declared type, and every type contains itself. Without this
-    /// guard the scoping predicate would report every unrecognized-but-matching
-    /// type pair, and under `Reject` would fail a load that is obviously fine.
+    /// G5 — identical raw type strings are *verified*, not skipped, **when the
+    /// type name is complete**: the landed type is the declared type, and every
+    /// type contains itself. Without this guard the scoping predicate would
+    /// report every unrecognized-but-matching type pair, and under `Reject`
+    /// would fail a load that is obviously fine.
+    ///
+    /// The decimal family is excluded from the shortcut and is asserted in
+    /// `test_identical_bare_decimal_strings_are_not_a_verification` — `DECIMAL`
+    /// elides its parameters, so two columns that print the same string are not
+    /// necessarily the same type.
     ///
     /// This is the discriminator against the naive "report every Unverifiable"
     /// implementation.
@@ -1051,8 +1087,7 @@ mod tests {
         for (landed, declared) in [
             ("GEOMETRY", "GEOMETRY"),
             ("geometry", "GEOMETRY"),
-            ("DECIMAL", "DECIMAL"),
-            ("NUMBER", "number"),
+            ("VARIANT_X", "variant_x"),
         ] {
             let (warned, rejected) = check(landed, declared);
             assert!(warned.passed, "{landed} vs {declared}: must pass");
@@ -1080,6 +1115,130 @@ mod tests {
             rejected.passed,
             "scoped out of this release: non-decimal unverifiable types still pass"
         );
+    }
+
+    /// Two columns both described as `DECIMAL` are **not** thereby the same
+    /// type: the string elides the parameters, so it is a lossy projection, and
+    /// `DECIMAL(10,0)` versus `DECIMAL(38,10)` prints identically. Asserting
+    /// "identical strings, therefore verified" here would be the round-1 failure
+    /// mode again — a test certifying a fail-open.
+    ///
+    /// Reachable in production: Databricks Unity falls back to `type_name`
+    /// (`"DECIMAL"`) when a table-info response omits `type_text`, and Databricks
+    /// `information_schema.columns.data_type` is the simple type name, so a
+    /// landed side can genuinely arrive bare.
+    #[test]
+    fn test_identical_bare_decimal_strings_are_not_a_verification() {
+        let check = |landed: &str, declared: &str| {
+            let contract = ContractConfig {
+                required_columns: vec![RequiredColumn {
+                    name: "c".into(),
+                    data_type: declared.into(),
+                    nullable: true,
+                }],
+                ..Default::default()
+            };
+            let landed_cols = vec![col_n("c", landed, true)];
+            let warned = validate_contract_typed(&contract, &landed_cols);
+            let rejected = validate_contract_typed_with_policy(
+                &contract,
+                &landed_cols,
+                UnverifiablePolicy::Reject,
+            );
+            (
+                warned.warnings.iter().any(|w| w.starts_with("W032:")),
+                rejected.passed,
+            )
+        };
+
+        for (landed, declared) in [
+            ("DECIMAL", "DECIMAL"),
+            ("NUMBER", "number"),
+            ("decimal", "DECIMAL"),
+        ] {
+            let (warned, reject_passes) = check(landed, declared);
+            assert!(
+                warned,
+                "{landed} vs {declared}: identical bare decimal strings are not a verification"
+            );
+            assert!(
+                !reject_passes,
+                "{landed} vs {declared}: the flip must reject an unverified decimal pair"
+            );
+        }
+
+        // A fully parameterised decimal on both sides IS verified — it resolves,
+        // so it never reaches the unverifiable arm at all.
+        let (warned, reject_passes) = check("DECIMAL(10,2)", "DECIMAL(10,2)");
+        assert!(!warned);
+        assert!(reject_passes);
+    }
+
+    /// The scoping predicate must implicate a decimal *where it can matter*, not
+    /// merely find one somewhere in the pair.
+    ///
+    /// A landed `DECIMAL(10,2)` resolves perfectly well; if the *contract*
+    /// declares a type this mapper does not know, the decimal contributes
+    /// nothing to why the comparison failed. Reporting it would be noise now and
+    /// a false reject after the flip — a class the design's scoping rule never
+    /// enumerated. The mirror case (an unresolved landed decimal against a
+    /// non-decimal contract) *is* reported, because there the unresolved type
+    /// could be one that does not fit.
+    #[test]
+    fn test_unverifiable_scope_needs_the_decimal_where_it_matters() {
+        let check = |landed: &str, declared: &str| {
+            let contract = ContractConfig {
+                required_columns: vec![RequiredColumn {
+                    name: "c".into(),
+                    data_type: declared.into(),
+                    nullable: true,
+                }],
+                ..Default::default()
+            };
+            let landed_cols = vec![col_n("c", landed, true)];
+            let warned = validate_contract_typed(&contract, &landed_cols);
+            let rejected = validate_contract_typed_with_policy(
+                &contract,
+                &landed_cols,
+                UnverifiablePolicy::Reject,
+            );
+            (
+                warned.warnings.iter().any(|w| w.starts_with("W032:")),
+                rejected.passed,
+            )
+        };
+
+        // Resolved decimal on the landed side, unknown non-decimal declared:
+        // NOT reported, and the flip must not reject it.
+        for declared in ["HUGEINT", "SUPER", "GEOGRAPHY"] {
+            let (warned, reject_passes) = check("DECIMAL(10,2)", declared);
+            assert!(!warned, "DECIMAL(10,2) vs {declared} must not warn");
+            assert!(
+                reject_passes,
+                "DECIMAL(10,2) vs {declared} must not be rejected at the flip"
+            );
+        }
+
+        // Unresolved decimal on the landed side against a non-decimal contract:
+        // reported, because the landed type could be a NUMBER(38,10) that does
+        // not fit a BIGINT.
+        let (warned, reject_passes) = check("NUMBER", "BIGINT");
+        assert!(warned, "an unresolved landed decimal must be reported");
+        assert!(!reject_passes);
+
+        // Contract declares a decimal, landed type unknown and not a decimal:
+        // reported — the same class the compiler-side gate reports.
+        let (warned, reject_passes) = check("GEOMETRY", "DECIMAL(38,2)");
+        assert!(
+            warned,
+            "a declared decimal that cannot be verified must be reported"
+        );
+        assert!(!reject_passes);
+
+        // Neither side implicates a decimal: the documented residual hole.
+        let (warned, reject_passes) = check("VARCHAR", "HUGEINT");
+        assert!(!warned);
+        assert!(reject_passes);
     }
 
     /// T5.14 — the six landed/declared pairs measured against the pre-fix gate,

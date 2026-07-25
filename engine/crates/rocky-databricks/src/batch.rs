@@ -114,6 +114,27 @@ pub struct ColumnDescribeResult {
 ///
 /// Unlike `generate_batch_columns_sql` (which only returns column names),
 /// this includes `data_type` so the result can be used for drift detection.
+///
+/// # Known gap: `data_type` drops decimal parameters
+///
+/// Databricks' `information_schema.columns` follows the ANSI convention where
+/// `data_type` is the *simple* type name and the parameters live in sibling
+/// columns — `full_data_type` carries `decimal(10,2)`, `data_type` carries
+/// `decimal`. So every decimal source column reaches Rocky unparameterised, and
+/// `rocky_compiler::compile::default_type_mapper` resolves an unparameterised
+/// decimal to `RockyType::Unknown` (it names `DECIMAL(10,0)` on Databricks,
+/// `DECIMAL(18,3)` on DuckDB and `NUMBER(38,0)` on Snowflake — there is no sound
+/// single answer). Consequences today: such a column is reported by the contract
+/// gates as unverifiable rather than checked, and it cannot be materialized on
+/// the content-addressed path.
+///
+/// The repair is to select `full_data_type` here (and to keep `data_type` only
+/// where the simple name is what is wanted). It is not made in this change
+/// because the column name has to be verified against a live Databricks
+/// workspace first — a wrong column name breaks discovery outright, which is
+/// worse than the gap it closes.
+//
+// TODO(decimal-precision): select `full_data_type` once verified live.
 pub fn generate_batch_describe_sql(catalog: &str, schema: &str) -> Result<String, BatchError> {
     validation::validate_identifier(catalog)?;
     validation::validate_identifier(schema)?;

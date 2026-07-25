@@ -1887,7 +1887,18 @@ fn check_decimal_declarations(model_name: &str, sql: &str) -> Vec<Diagnostic> {
                      Snowflake NUMBER(38,0) — so this column has no inferred type"
                 ),
             )
-            .with_suggestion("declare the precision and scale, e.g. CAST(x AS DECIMAL(38,2))")
+            // Deliberately not "add an explicit CAST" without the caveat:
+            // measured, `enhanced_inference` only applies a cast's target type
+            // when the cast's INPUT column already resolves, so a cast over a
+            // column whose own source type is unresolved still yields
+            // `Unknown`. Naming a remedy that does not work in that case would
+            // be worse than naming none.
+            .with_suggestion(
+                "declare the precision and scale, e.g. CAST(x AS DECIMAL(38,2)) — and note \
+                 the cast only resolves the column when the value being cast already has a \
+                 known type, so an unresolved *source* column has to be fixed at the source \
+                 schema",
+            )
         } else {
             Diagnostic::error(
                 E036,
