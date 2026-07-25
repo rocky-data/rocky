@@ -1972,12 +1972,18 @@ mod tests {
                 }
             }
         }
+        // These two literals are the guard, not the subtraction below them: a
+        // grid string that opens a genuinely new permit moves `would_open` even
+        // if someone dutifully adds the pair to `intended_new_permits`.
         assert_eq!(would_open, 196, "grid size or mapper coverage changed");
         assert_eq!(restored_by_family, 175);
+        // Weaker, and says only what it pins: the enumerated list is complete,
+        // with no listed pair that the family arm actually decides.
         assert_eq!(
             would_open - restored_by_family,
             intended_new_permits.len(),
-            "the residual must be exactly the enumerated migration-window permits"
+            "every deferred permit must be enumerated, and every enumerated one \
+             must still be deferred rather than decided"
         );
     }
 
