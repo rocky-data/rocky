@@ -6,7 +6,16 @@
   "models_compiled": 3,
   "tests_passed": 3,
   "tests_failed": 0,
-  "exit_code": 0,
-  "diagnostics": [],
+  "exit_code": 4,
+  "diagnostics": [
+    {
+      "severity": "Warning",
+      "code": "W032",
+      "message": "column 'total_revenue' has no inferred type, so the contract's expected type 'Decimal' could not be verified \u2014 unresolved evidence does not satisfy a contract. Warning in this release; error in the next",
+      "span": null,
+      "model": "revenue_summary",
+      "suggestion": "give `total_revenue` a concrete type \u2014 an explicit CAST with declared precision and scale, e.g. CAST(total_revenue AS DECIMAL(38,2)) \u2014 or compile with source schemas available so the type resolves"
+    }
+  ],
   "failures": []
 }

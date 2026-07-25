@@ -21,12 +21,28 @@
       "suggestion": "filter out NULLs (e.g. `WHERE order_id IS NOT NULL`) or COALESCE `order_id` to a default, or relax `nullable = true` in the contract"
     },
     {
+      "severity": "Warning",
+      "code": "W032",
+      "message": "column 'amount' has no inferred type, so the contract's expected type 'Decimal' could not be verified \u2014 unresolved evidence does not satisfy a contract. Warning in this release; error in the next",
+      "span": null,
+      "model": "broken_metrics",
+      "suggestion": "give `amount` a concrete type \u2014 an explicit CAST with declared precision and scale, e.g. CAST(amount AS DECIMAL(38,2)) \u2014 or compile with source schemas available so the type resolves"
+    },
+    {
       "severity": "Error",
       "code": "E013",
       "message": "protected column 'customer_id' has been removed",
       "span": null,
       "model": "broken_metrics",
       "suggestion": "restore `customer_id` in the SELECT, or remove it from `[rules] protected`"
+    },
+    {
+      "severity": "Warning",
+      "code": "W032",
+      "message": "column 'amount' has no inferred type, so the contract's expected type 'Decimal' could not be verified \u2014 unresolved evidence does not satisfy a contract. Warning in this release; error in the next",
+      "span": null,
+      "model": "good_metrics",
+      "suggestion": "give `amount` a concrete type \u2014 an explicit CAST with declared precision and scale, e.g. CAST(amount AS DECIMAL(38,2)) \u2014 or compile with source schemas available so the type resolves"
     }
   ],
   "has_errors": true,
