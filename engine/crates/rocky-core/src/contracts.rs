@@ -2055,4 +2055,83 @@ mod tests {
             UnverifiablePolicy::Reject
         ));
     }
+
+    /// SPLIT-FEASIBILITY MEASUREMENT (b). Prints, rather than asserts, the
+    /// load-gate transition counts against the frozen origin/main oracle, so
+    /// the number is read off real output instead of a failing assertion.
+    #[test]
+    fn measure_split_feasibility_load_gate_openings() {
+        let mut opened_total = 0usize;
+        let mut opened_family_restored: Vec<(&str, &str)> = Vec::new();
+        let mut opened_residual: Vec<(&str, &str)> = Vec::new();
+        let mut closed: Vec<(&str, &str)> = Vec::new();
+
+        for landed in TRANSITION_GRID {
+            for declared in TRANSITION_GRID {
+                let old = frozen_old_gate_passes(landed, declared);
+                let new = new_gate_passes(landed, declared, UnverifiablePolicy::Warn);
+                if old && !new {
+                    closed.push((landed, declared));
+                }
+                if old {
+                    continue;
+                }
+                // Same accounting the shipped oracle uses: a pair the new
+                // *mappers* alone would have let through counts as opened,
+                // whether or not the family arm then restores the rejection.
+                let decided = family_rules_out(
+                    landed,
+                    &warehouse_type_to_rocky(landed),
+                    declared,
+                    &warehouse_type_to_rocky(declared),
+                );
+                if decided {
+                    opened_total += 1;
+                    opened_family_restored.push((landed, declared));
+                } else if new {
+                    opened_total += 1;
+                    opened_residual.push((landed, declared));
+                }
+            }
+        }
+
+        println!("MEASURE(b) grid size                     = {}", TRANSITION_GRID.len());
+        println!("MEASURE(b) ordered pairs                 = {}", TRANSITION_GRID.len().pow(2));
+        println!("MEASURE(b) would_open (total)            = {opened_total}");
+        println!(
+            "MEASURE(b)   restored by family rule     = {}",
+            opened_family_restored.len()
+        );
+        println!(
+            "MEASURE(b)   residual (still permitted)  = {}",
+            opened_residual.len()
+        );
+        println!("MEASURE(b) newly CLOSED (old pass -> new reject) = {}", closed.len());
+        println!("MEASURE(b) --- residual opened pairs (landed vs declared) ---");
+        for (landed, declared) in &opened_residual {
+            println!("MEASURE(b)   OPEN  {landed:<18} -> {declared}");
+        }
+        println!("MEASURE(b) --- newly closed pairs (landed vs declared) ---");
+        for (landed, declared) in &closed {
+            println!("MEASURE(b)   CLOSE {landed:<18} -> {declared}");
+        }
+    }
+
+    /// SPLIT-FEASIBILITY MEASUREMENT. Which grid strings still resolve
+    /// differently from origin/main after the bare-tail revert — the honest
+    /// answer to "did the blast radius collapse".
+    #[test]
+    fn measure_split_feasibility_mapper_deltas() {
+        println!("MEASURE(mapper) --- warehouse_type_to_rocky: strings whose type still moved ---");
+        let mut moved = 0usize;
+        for s in TRANSITION_GRID {
+            let old = warehouse_type_to_rocky_frozen_old(s);
+            let new = warehouse_type_to_rocky(s);
+            if old != new {
+                moved += 1;
+                println!("MEASURE(mapper)   {s:<20} old={old:<16} new={new}");
+            }
+        }
+        println!("MEASURE(mapper) strings still moving     = {moved}");
+    }
 }

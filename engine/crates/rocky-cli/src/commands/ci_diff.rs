@@ -1276,4 +1276,119 @@ mod tests {
         // omit the field from JSON output in this case.
         assert!(semantic_findings(None, None).is_empty());
     }
+
+    /// SPLIT-FEASIBILITY MEASUREMENT (a). The breaking-change gate, driven
+    /// end-to-end through the real path `rocky plan promote` uses:
+    ///
+    ///   Databricks `information_schema.columns.data_type` == "decimal"
+    ///     -> `default_type_mapper`      (schema_cache.rs:106)
+    ///     -> `CompilerConfig.source_schemas`
+    ///     -> `compile_head`             (the real compiler)
+    ///     -> `project_ir_from_compile`  (ci_diff.rs:614)
+    ///     -> `diff_project_ir`          (rocky_core::breaking_change)
+    ///     -> `.filter(|f| f.is_breaking())`  (plan.rs:2099)
+    ///
+    /// Prints the findings rather than asserting a verdict.
+    #[test]
+    fn measure_split_feasibility_breaking_change_gate() {
+        use rocky_compiler::compile::default_type_mapper;
+
+        // Exactly what the Databricks source schema cache holds: the ANSI
+        // simple type name, parameters dropped.
+        let landed = default_type_mapper("decimal");
+        println!("MEASURE(a) default_type_mapper(\"decimal\") = {landed}");
+
+        let sources = source_schema("raw.t", &[("amount", landed.clone())]);
+
+        let base_dir = TempDir::new().unwrap();
+        write_model(base_dir.path(), "m", "SELECT amount FROM raw.t");
+        let head_dir = TempDir::new().unwrap();
+        write_model(
+            head_dir.path(),
+            "m",
+            "SELECT CAST(amount AS DECIMAL(10,2)) AS amount FROM raw.t",
+        );
+
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+
+        let base_ir = project_ir_from_compile(&base_compile);
+        let head_ir = project_ir_from_compile(&head_compile);
+        println!("MEASURE(a) base typed_columns = {:?}", base_ir.models[0].typed_columns);
+        println!("MEASURE(a) head typed_columns = {:?}", head_ir.models[0].typed_columns);
+
+        let findings = rocky_core::breaking_change::diff_project_ir(&base_ir, &head_ir);
+        println!("MEASURE(a) total findings = {}", findings.len());
+        for f in &findings {
+            println!(
+                "MEASURE(a)   finding: {:?} severity={:?} is_breaking={}",
+                f.change,
+                f.severity,
+                f.is_breaking()
+            );
+        }
+        // The plan.rs:2099 filter, verbatim.
+        let breaking: Vec<_> = findings.iter().filter(|f| f.is_breaking()).collect();
+        println!("MEASURE(a) BREAKING findings = {}", breaking.len());
+        println!(
+            "MEASURE(a) VERDICT: `rocky plan promote` would {}",
+            if breaking.is_empty() {
+                "NOT block (gate silent)"
+            } else {
+                "BLOCK (gate fires)"
+            }
+        );
+    }
+
+    /// SPLIT-FEASIBILITY MEASUREMENT (a), the 16-commit-branch baseline.
+    ///
+    /// Identical pipeline to the test above; the only difference is the landed
+    /// type, forced to the `RockyType::Unknown` that `default_type_mapper`
+    /// returns for a bare `"decimal"` on `feat/wp03-pr1-decimal-inference`.
+    /// This is what makes the comparison a measurement rather than an argument.
+    #[test]
+    fn measure_split_feasibility_breaking_change_gate_16commit_baseline() {
+        let landed = rocky_ir::RockyType::Unknown;
+        println!("MEASURE(a-base) landed type (16-commit mapper output) = {landed}");
+
+        let sources = source_schema("raw.t", &[("amount", landed)]);
+
+        let base_dir = TempDir::new().unwrap();
+        write_model(base_dir.path(), "m", "SELECT amount FROM raw.t");
+        let head_dir = TempDir::new().unwrap();
+        write_model(
+            head_dir.path(),
+            "m",
+            "SELECT CAST(amount AS DECIMAL(10,2)) AS amount FROM raw.t",
+        );
+
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+
+        let base_ir = project_ir_from_compile(&base_compile);
+        let head_ir = project_ir_from_compile(&head_compile);
+        println!("MEASURE(a-base) base typed_columns = {:?}", base_ir.models[0].typed_columns);
+        println!("MEASURE(a-base) head typed_columns = {:?}", head_ir.models[0].typed_columns);
+
+        let findings = rocky_core::breaking_change::diff_project_ir(&base_ir, &head_ir);
+        println!("MEASURE(a-base) total findings = {}", findings.len());
+        for f in &findings {
+            println!(
+                "MEASURE(a-base)   finding: {:?} severity={:?} is_breaking={}",
+                f.change,
+                f.severity,
+                f.is_breaking()
+            );
+        }
+        let breaking: Vec<_> = findings.iter().filter(|f| f.is_breaking()).collect();
+        println!("MEASURE(a-base) BREAKING findings = {}", breaking.len());
+        println!(
+            "MEASURE(a-base) VERDICT: `rocky plan promote` would {}",
+            if breaking.is_empty() {
+                "NOT block (gate silent)"
+            } else {
+                "BLOCK (gate fires)"
+            }
+        );
+    }
 }

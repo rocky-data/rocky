@@ -1903,4 +1903,73 @@ mod tests {
             Some(RockyType::Timestamp)
         );
     }
+
+    /// SPLIT-FEASIBILITY MEASUREMENT (c). Derives — does not assert — every
+    /// `is_assignable` verdict that flipped `true -> false` against the frozen
+    /// origin/main rule, over the T3.1 containment matrix plus a swept decimal
+    /// space. These are the fail-closed closures the split must not lose.
+    #[test]
+    fn measure_split_feasibility_fail_closed_closures() {
+        let named: &[(&str, RockyType, RockyType)] = &[
+            ("int32 -> dec(10,2)", RockyType::Int32, dec(10, 2)),
+            ("int64 -> dec(19,2)", RockyType::Int64, dec(19, 2)),
+            ("int64 -> dec(21,2)", RockyType::Int64, dec(21, 2)),
+            ("dec(10,0) -> dec(10,10)", dec(10, 0), dec(10, 10)),
+            ("dec(12,2) -> dec(12,4)", dec(12, 2), dec(12, 4)),
+            ("dec(38,0) -> dec(38,2)", dec(38, 0), dec(38, 2)),
+            ("dec(10,2) -> dec(12,4)", dec(10, 2), dec(12, 4)),
+            ("dec(10,2) -> dec(10,2)", dec(10, 2), dec(10, 2)),
+            ("int32 -> dec(12,2)", RockyType::Int32, dec(12, 2)),
+            ("int32 -> dec(10,0)", RockyType::Int32, dec(10, 0)),
+            ("dec(10,2) -> float64", dec(10, 2), RockyType::Float64),
+            ("float64 -> dec(10,2)", RockyType::Float64, dec(10, 2)),
+            ("dec(5,10) -> dec(38,10)", dec(5, 10), dec(38, 10)),
+            ("dec(10,2) -> dec(5,10)", dec(10, 2), dec(5, 10)),
+        ];
+
+        println!("MEASURE(c) --- T3.1 matrix: old verdict vs verdict on this branch ---");
+        let mut closures = 0usize;
+        for (label, from, to) in named {
+            let old = is_assignable_frozen_old(from, to);
+            let new = is_assignable(from, to);
+            let tag = match (old, new) {
+                (true, false) => {
+                    closures += 1;
+                    "CLOSED  (was permit, now reject)"
+                }
+                (false, true) => "OPENED  (was reject, now permit)",
+                _ => "same",
+            };
+            println!("MEASURE(c)   {label:<26} old={old:<5} new={new:<5} {tag}");
+        }
+        println!("MEASURE(c) named closures in the T3.1 matrix = {closures}");
+
+        // Independent sweep: the closures are a property of the rule, not of
+        // the hand-written matrix. Count every decimal/int pair in a swept
+        // space whose verdict closed.
+        let mut universe: Vec<RockyType> = vec![RockyType::Int32, RockyType::Int64];
+        for p in [5u8, 10, 12, 19, 21, 38] {
+            for s in [0u8, 2, 4, 10] {
+                universe.push(dec(p, s));
+            }
+        }
+        let mut swept_closed = 0usize;
+        let mut swept_opened = 0usize;
+        for from in &universe {
+            for to in &universe {
+                match (
+                    is_assignable_frozen_old(from, to),
+                    is_assignable(from, to),
+                ) {
+                    (true, false) => swept_closed += 1,
+                    (false, true) => swept_opened += 1,
+                    _ => {}
+                }
+            }
+        }
+        println!(
+            "MEASURE(c) swept space ({} types): closed={swept_closed} opened={swept_opened}",
+            universe.len()
+        );
+    }
 }
