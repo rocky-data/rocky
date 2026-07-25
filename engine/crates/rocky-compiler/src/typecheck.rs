@@ -3702,6 +3702,26 @@ mod tests {
             ("DECIMAL(77)", E::Precision(77), RockyType::Unknown),
         ];
 
+        // Whitespace inside the parameter list is the same type. The two
+        // string parsers must agree on that too, or they drift again — the AST
+        // parser cannot see whitespace at all, so only these two can disagree.
+        for (spaced, expect) in [
+            ("DECIMAL (10,2)", dec(10, 2)),
+            ("DECIMAL ( 10 , 2 )", dec(10, 2)),
+            ("DECIMAL ( 10 )", dec(10, 0)),
+        ] {
+            assert_eq!(
+                crate::compile::default_type_mapper(spaced),
+                expect,
+                "default_type_mapper: {spaced}"
+            );
+            assert_eq!(
+                rocky_core::contracts::warehouse_type_to_rocky(spaced),
+                expect,
+                "warehouse_type_to_rocky: {spaced}"
+            );
+        }
+
         for (text, info, expect) in cases {
             assert_eq!(
                 sql_type_to_rocky(&ast::DataType::Decimal(*info)),

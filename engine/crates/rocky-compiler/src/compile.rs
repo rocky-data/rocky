@@ -596,13 +596,24 @@ pub fn compile_incremental(
     })
 }
 
+/// Validate every model's contract, in a deterministic order.
+///
+/// `contract_map` is a `HashMap`, so iterating it directly emits diagnostics in
+/// a per-process-random model order. That was invisible while at most one model
+/// per project produced a contract diagnostic; the unverifiable-type warning
+/// made a second model produce one, and the captured `rocky compile` fixtures
+/// started drifting between otherwise identical runs. Diagnostics are ordered
+/// output — sort by model name so a compile is reproducible.
 fn validate_all_contracts(
     contract_map: &HashMap<String, CompilerContract>,
     typed_models: &IndexMap<String, Vec<TypedColumn>>,
 ) -> Vec<Diagnostic> {
     let mut all_diags = Vec::new();
 
-    for (model_name, contract) in contract_map {
+    let mut by_model: Vec<(&String, &CompilerContract)> = contract_map.iter().collect();
+    by_model.sort_by_key(|(name, _)| *name);
+
+    for (model_name, contract) in by_model {
         if let Some(schema) = typed_models.get(model_name) {
             let diags = contracts::validate_contract(model_name, schema, contract);
             all_diags.extend(diags);
@@ -633,13 +644,22 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
         "TIMESTAMP" => RockyType::Timestamp,
         "TIMESTAMP_NTZ" => RockyType::TimestampNtz,
         "VARIANT" => RockyType::Variant,
-        _ if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") => {
+        // The type-name head, exactly — a prefix test routes a custom
+        // `NUMERICAL` type through the decimal branch.
+        _ if matches!(
+            upper.split('(').next().unwrap_or(&upper).trim_end(),
+            "DECIMAL" | "NUMERIC"
+        ) =>
+        {
             // Parse into the widest form first, then validate — never narrow an
             // unvalidated value into the `u8` precision/scale fields.
+            // Split on the first `(` rather than stripping a fixed prefix, so
+            // `DECIMAL (10,2)` parses like `DECIMAL(10,2)` — and so this mapper
+            // agrees with `rocky_core::contracts::warehouse_type_to_rocky`,
+            // which does the same.
             if let Some(params) = upper
-                .strip_prefix("DECIMAL(")
-                .or_else(|| upper.strip_prefix("NUMERIC("))
-                .and_then(|s| s.strip_suffix(')'))
+                .split_once('(')
+                .and_then(|(_, rest)| rest.trim_end().strip_suffix(')'))
             {
                 let parts: Vec<&str> = params.split(',').collect();
                 match parts.len() {

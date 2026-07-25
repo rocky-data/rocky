@@ -356,13 +356,14 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
         // contract written `DECIMAL(38,0)` for the contract to port.
         // The type-name head, exactly — not a prefix of the whole string, which
         // would route a custom `NUMBERED` type through the decimal branch.
-        _ if is_decimal_family_head(&upper) => {
+        _ if normalizes_as_decimal(&upper) => {
+            // Split on the first `(` rather than stripping a fixed prefix:
+            // `NUMBER (38,0)` is the same type as `NUMBER(38,0)`, and reading
+            // the spaced form as unparameterised made an identical pair
+            // unverifiable — and, after the flip, rejected.
             if let Some(params) = upper
-                .strip_prefix("DECIMAL(")
-                .or_else(|| upper.strip_prefix("BIGNUMERIC("))
-                .or_else(|| upper.strip_prefix("NUMERIC("))
-                .or_else(|| upper.strip_prefix("NUMBER("))
-                .and_then(|s| s.strip_suffix(')'))
+                .split_once('(')
+                .and_then(|(_, rest)| rest.trim_end().strip_suffix(')'))
             {
                 // Parse into the widest form first, then validate — never
                 // narrow an unvalidated value into the `u8` precision/scale
@@ -433,14 +434,15 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 /// against a `GEOMETRY` contract would be reported, and under `Reject` would
 /// fail a load that is obviously fine.
 ///
-/// That reasoning fails for the decimal family, because `DECIMAL` is an
-/// *incomplete* type name: it elides the parameters. Two columns both described
-/// as `DECIMAL` can be `DECIMAL(10,0)` and `DECIMAL(38,10)`, and one does not
-/// contain the other — the string is a lossy projection, not a type. (Reachable:
-/// Databricks Unity falls back to `type_name`, a bare `"DECIMAL"`, when a
-/// table-info response omits `type_text`.) So the shortcut is withheld from any
-/// name [`looks_like_decimal`] matches, which is exactly the family whose
-/// parameters can be elided.
+/// That reasoning fails for a type name that *elides its parameters*. Two
+/// columns both described as `DECIMAL` can be `DECIMAL(10,0)` and
+/// `DECIMAL(38,10)`, and one does not contain the other — the string is a lossy
+/// projection, not a type. (Reachable: Databricks Unity falls back to
+/// `type_name`, a bare `"DECIMAL"`, when a table-info response omits
+/// `type_text`.) So the shortcut is withheld from exactly those names, via
+/// [`elides_decimal_parameters`] — **not** from every decimal-family name.
+/// `DECIMAL(10,2)` against `DECIMAL(10,2)` names one complete type twice, and
+/// withholding the shortcut there would be a false reject at the flip.
 ///
 /// **2. Either side must name a decimal.** The rule is exactly that, stated
 /// plainly: *this release reports an unverifiable comparison whenever the
@@ -471,7 +473,7 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 /// opt-in strict mode, and is a separate change with its own migration.
 fn unverifiable_is_reportable(landed_raw: &str, declared_raw: &str) -> bool {
     if landed_raw.trim().eq_ignore_ascii_case(declared_raw.trim())
-        && !looks_like_decimal(landed_raw)
+        && !elides_decimal_parameters(landed_raw)
     {
         return false;
     }
@@ -492,17 +494,62 @@ fn unverifiable_is_reportable(landed_raw: &str, declared_raw: &str) -> bool {
 /// recognizes, and that mapper matches the same head, so a name it claims to
 /// handle can never fall outside the report and vice versa.
 fn looks_like_decimal(warehouse_type: &str) -> bool {
-    is_decimal_family_head(warehouse_type)
+    decimal_family_head(warehouse_type).is_some()
 }
 
-/// The head of a warehouse type name (before any parameter list), matched
-/// against the exact set of fixed-point decimal spellings Rocky normalizes.
+/// Whether a raw type string names the decimal family **without naming its
+/// parameters** — `DECIMAL`, `NUMBER`, `DEC`, but not `DECIMAL(10,2)`.
 ///
-/// Shared by [`warehouse_type_to_rocky`] and [`looks_like_decimal`] so the set
-/// cannot drift between "what normalizes" and "what is reported".
-fn is_decimal_family_head(warehouse_type: &str) -> bool {
+/// This is the property that makes raw-string equality unsafe: an
+/// unparameterised name is a projection of a type, not a type, so two columns
+/// that print the same string need not be the same type. A *parameterised* name
+/// is a complete type and equality means what it looks like it means.
+fn elides_decimal_parameters(warehouse_type: &str) -> bool {
+    decimal_family_head(warehouse_type).is_some() && !warehouse_type.contains('(')
+}
+
+/// The head of a warehouse type name (everything before a parameter list),
+/// matched against the fixed-point decimal spellings — returned uppercased when
+/// it is one, `None` when it is not.
+///
+/// # The reported set is deliberately wider than the normalized set
+///
+/// [`warehouse_type_to_rocky`] normalizes four spellings (`DECIMAL`,
+/// `NUMERIC`, `NUMBER`, `BIGNUMERIC`); this matcher also admits `DEC` and
+/// `BIGDECIMAL`. The asymmetry is intentional and is the safe direction: a name
+/// Rocky does *not* normalize resolves to `Unknown`, and if it is a decimal
+/// spelling that `Unknown` is exactly what must be reported rather than waved
+/// through by raw-string equality. Widening what `warehouse_type_to_rocky`
+/// *normalizes* is a separate change — it would make previously-unverifiable
+/// contracts resolve, which is a verdict change, not a reporting change.
+///
+/// `sql_type_to_rocky` (the compiler's AST-driven parser) does type all six,
+/// because sqlparser gives each its own `DataType` variant;
+/// `test_three_decimal_parsers_agree` pins each parser's claimed set so the
+/// asymmetry cannot widen unnoticed.
+fn decimal_family_head(warehouse_type: &str) -> Option<String> {
     let upper = warehouse_type.trim().to_uppercase();
-    let head = upper.split('(').next().unwrap_or(&upper).trim_end();
+    let head = upper
+        .split('(')
+        .next()
+        .unwrap_or(&upper)
+        .trim_end()
+        .to_string();
+    matches!(
+        head.as_str(),
+        "DECIMAL" | "BIGNUMERIC" | "NUMERIC" | "NUMBER" | "DEC" | "BIGDECIMAL"
+    )
+    .then_some(head)
+}
+
+/// Whether the head names one of the four spellings [`warehouse_type_to_rocky`]
+/// normalizes. Narrower than [`decimal_family_head`] on purpose — see there.
+fn normalizes_as_decimal(upper_type: &str) -> bool {
+    let head = upper_type
+        .split('(')
+        .next()
+        .unwrap_or(upper_type)
+        .trim_end();
     matches!(head, "DECIMAL" | "BIGNUMERIC" | "NUMERIC" | "NUMBER")
 }
 
@@ -1163,6 +1210,11 @@ mod tests {
             ("DECIMAL", "DECIMAL"),
             ("NUMBER", "number"),
             ("decimal", "DECIMAL"),
+            // `DEC` is a decimal spelling this mapper does not normalize; that
+            // makes the pair MORE unresolved, not less, so it must not take the
+            // identity shortcut either.
+            ("DEC", "DEC"),
+            ("BIGDECIMAL", "bigdecimal"),
         ] {
             let (warned, reject_passes) = check(landed, declared);
             assert!(
@@ -1179,6 +1231,12 @@ mod tests {
         // so it never reaches the unverifiable arm at all.
         let (warned, reject_passes) = check("DECIMAL(10,2)", "DECIMAL(10,2)");
         assert!(!warned);
+        assert!(reject_passes);
+        // And a parameterised spelling Rocky does NOT normalize still names one
+        // complete type on both sides, so raw-string identity is a genuine
+        // verification there and must survive the flip.
+        let (warned, reject_passes) = check("DEC(10,2)", "DEC(10,2)");
+        assert!(!warned, "identical complete type names are verified");
         assert!(reject_passes);
     }
 
@@ -1261,11 +1319,39 @@ mod tests {
         assert!(looks_like_decimal("decimal(10,2)"));
         assert!(looks_like_decimal(" NUMBER (38,0) "));
         assert!(looks_like_decimal("BIGNUMERIC(76,38)"));
+        // Reported but not normalized — the deliberate asymmetry.
+        assert!(looks_like_decimal("DEC"));
+        assert!(looks_like_decimal("BIGDECIMAL(10,2)"));
+
+        // The identity shortcut keys on *parameter elision*, not on family
+        // membership: a parameterised name is a complete type, so two equal
+        // ones are the same type and must keep passing at the flip.
+        assert!(elides_decimal_parameters("DECIMAL"));
+        assert!(elides_decimal_parameters("dec"));
+        assert!(!elides_decimal_parameters("DECIMAL(10,2)"));
+        assert!(!elides_decimal_parameters("NUMBER (38,0)"));
+        assert!(!elides_decimal_parameters("GEOMETRY"));
 
         // And the mapper agrees: a near-miss name is simply unrecognized, not
         // routed through the decimal branch.
         assert_eq!(warehouse_type_to_rocky("NUMBERED"), RockyType::Unknown);
         assert_eq!(warehouse_type_to_rocky("NUMERICAL"), RockyType::Unknown);
+        // A spaced parameter list is the same type as an unspaced one; reading
+        // it as unparameterised made an identical pair unverifiable.
+        assert_eq!(
+            warehouse_type_to_rocky("NUMBER (38,0)"),
+            RockyType::Decimal {
+                precision: 38,
+                scale: 0
+            }
+        );
+        assert_eq!(
+            crate::contracts::warehouse_type_to_rocky("DECIMAL ( 10 , 2 )"),
+            RockyType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
 
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
