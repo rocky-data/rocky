@@ -662,6 +662,7 @@ Global state persistence: where Rocky stores watermarks, run history, and checkp
 | `transfer_timeout_seconds` | int | `300` | Wall-clock budget for each transfer (upload *or* download). Retries share this budget rather than extending it; raise for large state or slow networks. |
 | `on_upload_failure` | string | `"skip"` | What to do when upload exhausts retries + circuit-breaker. `"skip"` logs a warning and continues (state goes stale, next run re-derives); `"fail"` propagates the error. |
 | `namespacing` | string | `"none"` | State-file namespacing policy. `"none"` (default) keeps one global state file — byte-identical to a project that omits this key. `"pipeline"` gives each pipeline its own state file (see [State namespacing](#state-namespacing) below). |
+| `concurrency_control` | string | `"off"` | `"off"` (default) uploads unconditionally — last writer wins. `"cas"` makes the end-of-run upload conditional on the remote object still carrying the generation this run downloaded, so a run that lost a cross-pod race fails closed instead of erasing the winner. See [Concurrent writers](#concurrent-writers) below. |
 
 **Local (default):**
 
@@ -697,6 +698,31 @@ s3_bucket = "${ROCKY_STATE_BUCKET}"
 ```
 
 Tiered downloads from Valkey first (fast), falls back to S3 (durable). Uploads to both.
+
+### Concurrent writers
+
+By default every remote state upload is an unconditional overwrite. When two runs share one `[state]` prefix, both download the ledger, both mutate it, and the second upload silently erases the first — lost watermarks, run records, and policy rows, with no error.
+
+Set `concurrency_control = "cas"` to close that:
+
+```toml
+[state]
+backend = "s3"
+s3_bucket = "${ROCKY_STATE_BUCKET}"
+concurrency_control = "cas"
+```
+
+The end-of-run upload becomes conditional on the remote object still carrying the generation the run downloaded. A run that lost the race exits non-zero with a compare-and-swap conflict instead of overwriting the winner.
+
+What it does not do is reconcile the two runs. The loser has to be re-run, and the warehouse writes it already made are not rolled back, so a non-merge strategy can duplicate rows on that re-run. Prefer merge-style strategies for pipelines you expect to contend.
+
+It requires a backend with a durable object tier: `s3`, `gcs`, or `tiered`. On `local` and `valkey` it auto-downgrades to `off` with a warning, since neither offers a conditional write. Enabling it also turns off the mid-run periodic state uploader on every backend, so a crashed run leaves the remote ledger at its last committed generation rather than at a partial mid-run snapshot.
+
+**What `cas` does not yet cover.** It protects the end-of-run state upload. The single-record ledger seams — the state writes made by `rocky policy freeze`, `gc apply`, and `apply` — still upload unconditionally on every backend, so a concurrent `gc apply` can overwrite a run's committed state without raising a conflict and still exit zero. This is tracked as [issue #1228](https://github.com/rocky-data/rocky/issues/1228) and applies equally to `s3`, `gcs`, and `tiered`. Until it is closed, keep the orchestrator-level rule of one writer per `[state]` prefix for the seam commands.
+
+**On `tiered`,** `cas` additionally makes the Valkey tier coherent with the durable object. The compare-and-swap runs against S3 first; only after it commits is the Valkey copy written, stored together with the generation it was committed at. A read may use the cached copy only after confirming that generation is still the durable object's — otherwise it reads S3. So a Valkey write that fails, a process that dies between the two, or a cache entry left over from an earlier run can no longer shadow durable state. Cached copies are held under a separate key from the `off` path's, so a fleet can move pods from `off` to `cas` one at a time.
+
+With `concurrency_control = "off"` the tiered backend keeps its historical behaviour, including the stale-cache window: an `off` write carries no generation, so there is nothing for a read to validate a cached copy against.
 
 ### `[state.retry]`
 

@@ -24,6 +24,7 @@ use futures::StreamExt;
 use object_store::{
     ClientOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, path::Path as ObjectPath,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
 
@@ -96,7 +97,13 @@ pub enum PutIfNotExistsOutcome {
 /// if another writer committed in between. S3/Azure key on `e_tag` (`If-Match`),
 /// GCS on `version` (`x-goog-if-generation-match`) — both are carried so the
 /// primitive stays backend-agnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are load-bearing, not incidental: the tiered state
+/// cache frames the generation *inside* the cached value so a reader can check
+/// the entry's freshness against the durable object without downloading it. It
+/// is a freshness check, not an authentication one — see the trust boundary in
+/// [`crate::state_sync`]'s tiered-coherence header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Generation {
     /// Entity tag (S3 / Azure).
     pub e_tag: Option<String>,
@@ -118,6 +125,25 @@ impl Generation {
             version: result.version.clone(),
         }
     }
+}
+
+/// What a metadata-only read found at a key
+/// ([`remote_generation`](ObjectStoreProvider::remote_generation)).
+///
+/// Three states, not two. "Present, but the backend surfaced no version
+/// metadata" must not collapse into either neighbour: a caller that needs a
+/// compare token — validating a cached copy against the durable object — has
+/// to fall back to the durable read in that case rather than trust a copy it
+/// cannot check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteVersion {
+    /// No object exists at the key.
+    Absent,
+    /// The object exists and carries a version identity.
+    Present(Generation),
+    /// The object exists but the backend reported neither an ETag nor a
+    /// version, so no compare token can be derived from it.
+    PresentUnversioned,
 }
 
 /// Outcome of a compare-and-swap write
@@ -515,6 +541,36 @@ impl ObjectStoreProvider {
         Ok(())
     }
 
+    /// Read an object's current [`Generation`] without fetching its body.
+    ///
+    /// A `HEAD`, so it is cheap enough to run ahead of a cache read — which is
+    /// exactly what the tiered state backend does: a cached copy may only be
+    /// trusted when the generation it was stored with still matches the
+    /// durable object's.
+    ///
+    /// # Errors
+    ///
+    /// Backend / transport failures propagate. A missing object is
+    /// [`RemoteVersion::Absent`], never an error.
+    pub async fn remote_generation(&self, relative_path: &str) -> ObjectStoreResult<RemoteVersion> {
+        let path = self.absolute_path(relative_path);
+        debug!(path = %path, "object_store remote_generation");
+        match self.store.head(&path).await {
+            Ok(meta) => {
+                if meta.e_tag.is_some() || meta.version.is_some() {
+                    Ok(RemoteVersion::Present(Generation {
+                        e_tag: meta.e_tag,
+                        version: meta.version,
+                    }))
+                } else {
+                    Ok(RemoteVersion::PresentUnversioned)
+                }
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(RemoteVersion::Absent),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Returns `true` if the object exists.
     pub async fn exists(&self, relative_path: &str) -> ObjectStoreResult<bool> {
         let path = self.absolute_path(relative_path);
@@ -670,6 +726,47 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(committed, PutIfMatchOutcome::Committed(_)));
+    }
+
+    /// The generation a metadata-only read reports must be the SAME compare
+    /// token the write returned — that identity is what lets a cached copy be
+    /// validated against the durable object without downloading it. Absent
+    /// keys report `Absent`, never an error.
+    #[tokio::test]
+    async fn remote_generation_matches_the_committed_generation() {
+        let provider = ObjectStoreProvider::in_memory();
+        assert_eq!(
+            provider.remote_generation("state").await.unwrap(),
+            RemoteVersion::Absent,
+            "a missing object is Absent, not an error"
+        );
+
+        let PutIfMatchOutcome::Committed(committed) = provider
+            .put_if_match("state", Bytes::from_static(b"v0"), None)
+            .await
+            .unwrap()
+        else {
+            panic!("bootstrap write should commit");
+        };
+        assert_eq!(
+            provider.remote_generation("state").await.unwrap(),
+            RemoteVersion::Present(committed.clone()),
+            "HEAD must report the generation the PUT committed"
+        );
+
+        // A second commit advances it, and HEAD tracks the advance.
+        let PutIfMatchOutcome::Committed(next) = provider
+            .put_if_match("state", Bytes::from_static(b"v1"), Some(&committed))
+            .await
+            .unwrap()
+        else {
+            panic!("matching-base write should commit");
+        };
+        assert_eq!(
+            provider.remote_generation("state").await.unwrap(),
+            RemoteVersion::Present(next),
+            "HEAD must track the new generation"
+        );
     }
 
     #[tokio::test]

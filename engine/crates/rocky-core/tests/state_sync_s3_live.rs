@@ -30,7 +30,9 @@ use rocky_core::freeze_marker::{
     FreezeMarker, FreezeMarkerError, UnfreezeMarker, load_active_marker_freezes,
     write_freeze_marker, write_unfreeze_marker,
 };
-use rocky_core::object_store::{ObjectStoreProvider, PutIfMatchOutcome, PutIfNotExistsOutcome};
+use rocky_core::object_store::{
+    ObjectStoreProvider, PutIfMatchOutcome, PutIfNotExistsOutcome, RemoteVersion,
+};
 use rocky_core::state::StateStore;
 use rocky_core::state_sync::{download_state, upload_state};
 use rocky_ir::WatermarkState;
@@ -362,4 +364,74 @@ async fn live_put_if_match_cas_roundtrip() {
 
     let _ = provider.delete(&key).await;
     println!("OK: S3 CAS roundtrip (bootstrap + match + stale-conflict + download-base) verified");
+}
+
+/// The assumption the tiered cache-coherence path (ADR-CONCURRENCY D5) rests
+/// on, and the one InMemory cannot test: **one object's `Generation` is the
+/// same value however it is observed** — returned by the `PUT`, reported by a
+/// metadata-only `HEAD`, and carried on the `GET`.
+///
+/// InMemory hands out a monotonic counter, so it satisfies this trivially. S3
+/// hands out ETag strings, where per-verb quoting or weak-tag normalization
+/// could differ. If they ever disagree on the wire, the tiered read would
+/// reject every cache entry — fail-SAFE (the durable tier is always read), but
+/// it would silently delete the entire reason the tiered backend exists, and
+/// no in-memory test could see it. Hence a live receipt.
+#[tokio::test]
+#[ignore]
+async fn live_generation_is_identical_across_put_head_and_get() {
+    let _serial = live_serial();
+    let Some(live) = live_s3_from_env() else {
+        eprintln!(
+            "SKIP live_generation_is_identical_across_put_head_and_get: ROCKY_TEST_S3_* env not set"
+        );
+        return;
+    };
+    let provider = ObjectStoreProvider::from_uri(&format!("s3://{}/{}", live.bucket, live.prefix))
+        .expect("live provider");
+    let key = format!("generation-identity-{}", unique_suffix());
+
+    let PutIfMatchOutcome::Committed(from_put) = provider
+        .put_if_match(&key, Bytes::from_static(b"coherence-probe"), None)
+        .await
+        .expect("bootstrap put")
+    else {
+        panic!("first CAS write must commit against an absent key");
+    };
+
+    let from_head = provider
+        .remote_generation(&key)
+        .await
+        .expect("head for generation");
+    assert_eq!(
+        from_head,
+        RemoteVersion::Present(from_put.clone()),
+        "HEAD must report the same generation the PUT committed — a mismatch makes every \
+         tiered cache validation fail"
+    );
+
+    let out = tempfile::tempdir().unwrap();
+    let out_path = out.path().join("dl");
+    let from_get = provider
+        .download_file_capturing_version(&key, &out_path)
+        .await
+        .expect("download capturing version")
+        .expect("S3 surfaces an ETag");
+    assert_eq!(
+        from_get, from_put,
+        "the generation captured on the GET must equal the PUT's — a mismatch would make a \
+         freshly-populated cache entry unreadable on the very next read"
+    );
+
+    // And an absent key reports Absent rather than erroring.
+    let _ = provider.delete(&key).await;
+    assert_eq!(
+        provider
+            .remote_generation(&key)
+            .await
+            .expect("head on a deleted key"),
+        RemoteVersion::Absent,
+        "a missing object must be Absent, not an error"
+    );
+    println!("OK: S3 generation identity across PUT / HEAD / GET verified");
 }

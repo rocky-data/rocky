@@ -114,7 +114,7 @@ async fn upload_file_if_match(local, rel, expected: Option<&Generation>) -> CasO
 - CAS runs against **durable S3 FIRST.**
 - Populate Valkey **only with the committed generation on success**; **invalidate on conflict/failure.**
 - Tiered reads **validate the cached generation against S3** before trusting the cache.
-- **Tiered CAS is disabled** (`concurrency_control` forced `off` on tiered) until this coherence lands. (Freeze markers already read the durable tier per D3, so the kill-switch is coherent on tiered from PR-F.)
+- **Tiered CAS is disabled** (`concurrency_control` forced `off` on tiered) until this coherence lands. (Freeze markers already read the durable tier per D3, so the kill-switch is coherent on tiered from PR-F.) **Landed (D5 only — this does NOT satisfy D1 on tiered):** the coherence is implemented and `concurrency_control = "cas"` is now accepted on `tiered`, covering the **end-of-run upload**. The cached copy is stored together with the generation the durable CAS committed at, in one value — a two-key sidecar could pair a stale blob with a current generation and produce an entry that validates and is wrong. Because the generation travels inside the value, a failed invalidation is hygiene rather than a correctness dependency: a surviving entry carries a superseded generation and is rejected on read. The generation check proves **freshness, not provenance** — it is not authenticated, and Rocky trusts the configured state tiers as infrastructure exactly as it already trusts the durable object. Coherence engages under `cas` only; `off` on tiered keeps the documented stale-cache window, since an `off` write carries no generation to validate against. **The D1 ledger seams still write unconditionally on every backend (#1228)**, so tiered reaches parity with `s3`/`gcs` rather than closing D1's writer-class contract.
 
 ### D6 — Rollout flag
 
@@ -165,7 +165,7 @@ Invariants:
 | **Azure** (`az`/`abfs*`) | Native ETag / If-Match | Flag-gated after conformance | As GCS. |
 | **LocalFS** (`file`) | `PutMode::Update` = `NotImplemented` | **Advisory-flock-only (documented)** | Single-host; the existing `state.rs` `flock` is the guard. `concurrency_control` auto-`off` + warn. |
 | **Valkey** | Lua-CAS (compare-and-set script) | **Deferred** | First cut writes unconditionally; tiered coherence (D5) keeps durable S3 authoritative in the meantime. |
-| **Tiered** | CAS on the durable S3 leg | **CAS disabled until D5 coherence** | Freeze markers already read durable tier, so the kill-switch is coherent on tiered from PR-F. |
+| **Tiered** | CAS on the durable S3 leg | **End-of-run upload only** — D5 coherence landed; D1's writer-class contract is NOT satisfied | The Valkey tier caches the committed bytes tagged with the committed generation and is only usable on an exact match, so the cache can no longer shadow durable state. But the ledger seams still write unconditionally (**#1228**), exactly as on `s3`/`gcs` — enabling `cas` here reaches parity with those backends, it does not close D1. Freeze markers already read the durable tier, so the kill-switch is coherent on tiered from PR-F. |
 
 ---
 

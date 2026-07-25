@@ -2219,7 +2219,7 @@ export interface StateConfig {
    */
   backend?: StateBackend & string;
   /**
-   * Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `"cas"` on live multi-pod object-store deployments so a run that lost a cross-pod race fail-closes instead of silently overwriting the winner's committed state. Auto-downgrades to `off` (with a warn) on backends without a conditional-write object tier.
+   * Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `"cas"` on live multi-pod deployments with a durable object tier (`s3`, `gcs`, `tiered`) so a run that lost a cross-pod race fail-closes instead of silently overwriting the winner's committed state. On `tiered` it additionally makes the Valkey tier coherent with the durable object. Auto-downgrades to `off` (with a warn) on `local` and `valkey`.
    */
   concurrency_control?: ConcurrencyControl & string;
   /**

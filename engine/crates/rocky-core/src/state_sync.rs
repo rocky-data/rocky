@@ -19,7 +19,9 @@ use crate::circuit_breaker::TransitionOutcome;
 use crate::config::{
     ConcurrencyControl, RetryConfig, StateBackend, StateConfig, StateUploadFailureMode,
 };
-use crate::object_store::{Generation, ObjectStoreError, ObjectStoreProvider, PutIfMatchOutcome};
+use crate::object_store::{
+    Generation, ObjectStoreError, ObjectStoreProvider, PutIfMatchOutcome, RemoteVersion,
+};
 use crate::redacted::RedactedString;
 use crate::retry::compute_backoff;
 use crate::retry_budget::RetryBudget;
@@ -227,6 +229,7 @@ pub fn durable_tier_provider(
 mod test_support {
     use super::ObjectStoreProvider;
     use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
     thread_local! {
@@ -234,8 +237,18 @@ mod test_support {
             const { RefCell::new(None) };
         /// One-shot fault: make the next object-store existence probe error.
         static OBJECT_STORE_EXISTS_FAULT: Cell<bool> = const { Cell::new(false) };
+        /// One-shot fault: make the next object-store generation probe error.
+        static OBJECT_STORE_HEAD_FAULT: Cell<bool> = const { Cell::new(false) };
         /// One-shot fault: make the next Valkey download report a MISS.
         static VALKEY_MISS_FAULT: Cell<bool> = const { Cell::new(false) };
+        /// In-process stand-in for a Valkey peer, so the tiered coherent-cache
+        /// paths (GET / SET / DEL) can be driven without a live server.
+        static VALKEY_FAKE: RefCell<Option<HashMap<String, Vec<u8>>>> =
+            const { RefCell::new(None) };
+        /// One-shot fault: make the next coherent-cache SET fail.
+        static VALKEY_SET_FAULT: Cell<bool> = const { Cell::new(false) };
+        /// One-shot fault: make the next coherent-cache DEL fail.
+        static VALKEY_DEL_FAULT: Cell<bool> = const { Cell::new(false) };
     }
 
     /// Arm a one-shot fault so the next `probe_exists` returns `Err`. Consumed
@@ -250,6 +263,20 @@ mod test_support {
         OBJECT_STORE_EXISTS_FAULT.with(|c| c.replace(false))
     }
 
+    /// Arm a one-shot fault so the next `probe_generation` returns `Err`. Kept
+    /// distinct from the existence fault: the tiered coherent read probes the
+    /// generation and then may still delegate to the durable leg's existence
+    /// probe, and a test must be able to fault exactly one of them.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn arm_object_store_head_fault() {
+        OBJECT_STORE_HEAD_FAULT.with(|c| c.set(true));
+    }
+
+    /// Read-and-clear the object-store generation-probe fault.
+    pub(super) fn take_object_store_head_fault() -> bool {
+        OBJECT_STORE_HEAD_FAULT.with(|c| c.replace(false))
+    }
+
     /// Arm a one-shot fault so the next `download_from_valkey` reports a MISS
     /// (`Absent`) without touching a live Valkey peer.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -260,6 +287,66 @@ mod test_support {
     /// Read-and-clear the Valkey-miss fault.
     pub(super) fn take_valkey_miss_fault() -> bool {
         VALKEY_MISS_FAULT.with(|c| c.replace(false))
+    }
+
+    /// Install an empty in-process Valkey stand-in on this thread. While it is
+    /// installed the coherent-cache GET / SET / DEL helpers resolve against it
+    /// instead of a live peer (and never resolve `state.valkey_url`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn install_fake_valkey() {
+        VALKEY_FAKE.with(|cell| *cell.borrow_mut() = Some(HashMap::new()));
+    }
+
+    /// Whether the in-process Valkey stand-in is installed on this thread.
+    pub(super) fn fake_valkey_installed() -> bool {
+        VALKEY_FAKE.with(|cell| cell.borrow().is_some())
+    }
+
+    /// Read a key from the stand-in (`None` = cache miss).
+    pub(super) fn fake_valkey_get(key: &str) -> Option<Vec<u8>> {
+        VALKEY_FAKE.with(|cell| cell.borrow().as_ref()?.get(key).cloned())
+    }
+
+    /// Write a key to the stand-in. `Err(())` when the one-shot SET fault is
+    /// armed — the caller maps it to the same error shape a live peer would
+    /// produce, and (critically) the key is left UNWRITTEN.
+    pub(super) fn fake_valkey_set(key: &str, value: Vec<u8>) -> Result<(), ()> {
+        if VALKEY_SET_FAULT.with(|c| c.replace(false)) {
+            return Err(());
+        }
+        VALKEY_FAKE.with(|cell| {
+            if let Some(map) = cell.borrow_mut().as_mut() {
+                map.insert(key.to_string(), value);
+            }
+        });
+        Ok(())
+    }
+
+    /// Delete a key from the stand-in. `Err(())` when the one-shot DEL fault is
+    /// armed, leaving the entry in place — the state a test needs to prove that
+    /// a *surviving* stale entry is still rejected on read.
+    pub(super) fn fake_valkey_del(key: &str) -> Result<(), ()> {
+        if VALKEY_DEL_FAULT.with(|c| c.replace(false)) {
+            return Err(());
+        }
+        VALKEY_FAKE.with(|cell| {
+            if let Some(map) = cell.borrow_mut().as_mut() {
+                map.remove(key);
+            }
+        });
+        Ok(())
+    }
+
+    /// Arm a one-shot coherent-cache SET failure.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn arm_valkey_set_fault() {
+        VALKEY_SET_FAULT.with(|c| c.set(true));
+    }
+
+    /// Arm a one-shot coherent-cache DEL failure.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn arm_valkey_del_fault() {
+        VALKEY_DEL_FAULT.with(|c| c.set(true));
     }
 
     /// Install `provider` as the next provider [`super::cloud_provider`] hands
@@ -287,7 +374,11 @@ mod test_support {
     pub(super) fn clear() {
         PROVIDER_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
         OBJECT_STORE_EXISTS_FAULT.with(|c| c.set(false));
+        OBJECT_STORE_HEAD_FAULT.with(|c| c.set(false));
         VALKEY_MISS_FAULT.with(|c| c.set(false));
+        VALKEY_FAKE.with(|cell| *cell.borrow_mut() = None);
+        VALKEY_SET_FAULT.with(|c| c.set(false));
+        VALKEY_DEL_FAULT.with(|c| c.set(false));
     }
 
     /// Process-global provider override, consulted by
@@ -504,11 +595,14 @@ pub enum FinalizeDurability {
 /// # Held only under CAS
 ///
 /// - **A `base` generation** is captured at [`acquire`][Self::acquire] and held
-///   ONLY under `concurrency_control = "cas"` on an object-store backend: it is
-///   the remote object's generation at download time, which
+///   ONLY under `concurrency_control = "cas"` on a backend with a durable
+///   object tier: it is the durable object's generation at download time, which
 ///   [`finalize`][Self::finalize] CAS-commits against so a run that lost a
-///   cross-pod race fail-closes instead of erasing the winner. `None` on the
-///   default `off` path (an unconditional upload, byte-identical to pre-CAS).
+///   cross-pod race fail-closes instead of erasing the winner. On `tiered` the
+///   base always comes from the durable tier, never from the Valkey cache —
+///   the cache only ever answers a read after proving it holds that same
+///   generation. `None` on the default `off` path (an unconditional upload,
+///   byte-identical to pre-CAS).
 ///
 /// # Drop tripwire
 ///
@@ -547,10 +641,11 @@ pub struct RemoteStateSession {
     /// detach the blocking closure, leaking the scratch it recreates and holding
     /// the upgrade past the run tail's `Arc::try_unwrap`.
     periodic_shutdown: Option<Arc<tokio::sync::Notify>>,
-    /// The remote object's generation captured at `acquire`, held ONLY under
-    /// `concurrency_control = "cas"` on an object-store backend. `finalize`
-    /// CAS-commits against it. `None` on the `off` path, on non-object-store
-    /// backends, or when the object was absent (bootstrap → create-if-absent).
+    /// The durable object's generation captured at `acquire`, held ONLY under
+    /// `concurrency_control = "cas"` on a backend with a durable object tier.
+    /// `finalize` CAS-commits against it. `None` on the `off` path, on the
+    /// tier-less backends, or when the object was absent (bootstrap →
+    /// create-if-absent).
     base: Option<Generation>,
 }
 
@@ -571,9 +666,14 @@ pub fn cas_supported_on(backend: StateBackend) -> bool {
     match backend {
         // A conditional-write object tier the upload can compare against.
         StateBackend::S3 | StateBackend::Gcs => true,
+        // The durable S3 leg carries the generation, and the Valkey tier is
+        // kept coherent with it (see [`tiered_cas_download`] and
+        // [`dispatch_upload_cas`]) — a cached copy is only usable once its
+        // stored generation is confirmed to still be the durable object's.
+        StateBackend::Tiered => true,
         // No generation to condition on: `cas` falls back to an unconditional
         // upload (and warns once at `acquire`).
-        StateBackend::Valkey | StateBackend::Tiered => false,
+        StateBackend::Valkey => false,
         // No remote write at all — the on-disk file IS the state.
         StateBackend::Local => false,
     }
@@ -655,10 +755,10 @@ impl RemoteStateSession {
             return Ok(self.authority);
         }
 
-        // Under CAS on an object-store backend, capture the downloaded object's
-        // generation as this run's base so `finalize` can conditionally commit
-        // against it. Other backends fall back to the plain download (and warn
-        // once if `cas` was configured but unsupported here).
+        // Under CAS on a backend with a durable object tier, capture the durable
+        // object's generation as this run's base so `finalize` can conditionally
+        // commit against it. Tier-less backends fall back to the plain download
+        // (and warn once if `cas` was configured but unsupported here).
         let result = if self.cas_enabled() {
             download_state_with_generation(&self.cfg, &self.state_path)
                 .await
@@ -670,8 +770,9 @@ impl RemoteStateSession {
             if self.cfg.concurrency_control == ConcurrencyControl::Cas {
                 warn!(
                     backend = %self.cfg.backend,
-                    "concurrency_control = cas is not supported on this backend; using an \
-                     unconditional state upload (auto-downgraded to off)"
+                    "concurrency_control = cas needs a durable object tier (s3, gcs, or \
+                     tiered) and this backend has none; using an unconditional state upload \
+                     (auto-downgraded to off)"
                 );
             }
             download_state(&self.cfg, &self.state_path).await
@@ -1450,18 +1551,24 @@ async fn download_state_inner(
             .await
         }
         StateBackend::Valkey => download_from_valkey(config, dest_path, remote_key).await,
+        // Under `cas` the tiered read is generation-validated against the
+        // durable tier — the Valkey copy may only short-circuit when it proves
+        // it holds the object's CURRENT generation.
+        StateBackend::Tiered if config.concurrency_control == ConcurrencyControl::Cas => {
+            tiered_cas_download(config, dest_path, remote_key, gen_sink).await
+        }
         StateBackend::Tiered => {
             // Try Valkey first (fast), fall back to S3 (durable).
             //
-            // KNOWN LIMITATION — tiered cache coherence (finding 3): on the READ
-            // side a genuine Valkey HIT short-circuits the durable S3 tier below.
-            // If a freeze/decision was written to S3 but Valkey holds a STALE
-            // cached snapshot (or one written before the freeze), a policy gate
-            // reading through this path can see the stale Valkey copy and MISS
-            // the freeze. This is NOT fixed here; a correct fix needs
-            // cache-invalidation-on-write (bust/refresh the Valkey key when a
-            // governance ledger is written) or reading the durable tier directly
-            // for policy gates. Tracked as follow-up.
+            // KNOWN LIMITATION — this is the `concurrency_control = off` tiered
+            // read, where a genuine Valkey HIT short-circuits the durable S3
+            // tier below. `off` writes carry no generation, so there is nothing
+            // to validate a cached copy against: if state was written to S3
+            // while Valkey holds a stale snapshot, a read through this path can
+            // see the stale copy. Set `concurrency_control = "cas"` for the
+            // coherent tiered read (the arm above) — that is the fix, and it is
+            // opt-in precisely so `off` stays byte-identical to pre-CAS
+            // releases.
             info!("State backend: tiered (Valkey → S3 fallback)");
             let valkey_config = StateConfig {
                 backend: StateBackend::Valkey,
@@ -1478,10 +1585,11 @@ async fn download_state_inner(
             // stale local file left by a previous run must NOT be mistaken for a
             // fresh Valkey hit (which would skip the S3 fallback and resume from
             // stale state).
-            // CAS generation capture is deferred on tiered (D5 cache-coherence
-            // is a follow-up), so the recursive legs pass `None`; a tiered
-            // backend under `concurrency_control = cas` auto-downgrades to an
-            // unconditional upload at finalize.
+            //
+            // `gen_sink` is deliberately dropped on both legs: an `off` tiered
+            // read captures no base, so nothing can later mistake `None` for
+            // "the object was absent" — `cas_enabled()` never routes a base
+            // capture through this arm.
             match Box::pin(download_state_inner(
                 &valkey_config,
                 dest_path,
@@ -1511,6 +1619,455 @@ async fn download_state_inner(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tiered cache coherence (ADR-CONCURRENCY D5)
+// ---------------------------------------------------------------------------
+//
+// The tiered backend caches the state blob in Valkey in front of a durable S3
+// object. Under `concurrency_control = "cas"` the durable object decides what
+// committed for THIS write path, and the cache is a read accelerator that must
+// never be able to answer with something the durable tier disagrees with.
+//
+// Scope, stated up front: this covers the end-of-run upload
+// (`RemoteStateSession::finalize`). The single-record ledger seams
+// (`upload_only_fail_closed` — `policy freeze`, `gc apply`, `apply`) still
+// write unconditionally on every backend, so they can overwrite a
+// CAS-committed object without raising a conflict. That is ADR-CONCURRENCY
+// D1's writer-class contract, which is not implemented here and is tracked as
+// issue #1228; the behaviour is identical on `s3`/`gcs`, so enabling `cas` on
+// `tiered` brings it to parity rather than closing D1.
+//
+// The mechanism is a FRESHNESS-CHECKED cache entry: the generation the durable
+// CAS committed at is framed into the cached value itself, in one atomic
+// Valkey `SET`. A reader reads the durable object's current generation (a
+// cheap `HEAD`) and accepts the cached blob only on an exact match.
+//
+// # Trust boundary (a named assumption, not a verified property)
+//
+// The framed generation is NOT authenticated. The check proves **freshness,
+// not provenance**: it establishes that the entry corresponds to the durable
+// object's current generation, not that Rocky wrote it. Anyone who can write
+// the cache key can pair the current generation with an arbitrary body and be
+// believed.
+//
+// Rocky trusts the configured state tiers as infrastructure, and that
+// assumption is not new or specific to the cache: nothing authenticates the
+// durable object either, so whoever can write the S3 object owns the state
+// outright. Under `off` the cached blob is served with no check at all, so
+// `cas` strictly tightens this trust rather than introducing it. Authenticating
+// the payload would need a body digest committed to durable storage — a
+// separate design, not something the generation header can be made to do.
+//
+// Two consequences worth stating explicitly, because they are what make the
+// protocol robust rather than merely careful:
+//
+// - **Invalidation is hygiene, not a correctness dependency.** A `DEL` that
+//   fails (or a process that dies before issuing one) leaves an entry whose
+//   framed generation is, by construction, older than the durable object's —
+//   so the next read rejects it anyway. Every crash point between the durable
+//   commit and the cache populate lands on "cache holds an older generation",
+//   which is the safe direction.
+// - **A single key, not a sidecar.** Storing the generation in a second key
+//   would let two writers interleave blob and generation writes and leave a
+//   STALE blob paired with the CURRENT generation — an entry that validates
+//   and is wrong. One value, one `SET`, no pairing hazard.
+
+/// Magic + framing version for a coherent tiered cache entry.
+///
+/// Bumping the trailing digit retires every previously written entry for free:
+/// an unrecognised magic reads as a cache miss, so the framing can evolve
+/// without a migration step.
+const COHERENT_CACHE_MAGIC: &[u8; 8] = b"RKYSGEN1";
+
+/// Valkey key for the generation-validated tiered cache entry.
+///
+/// Deliberately DISJOINT from [`valkey_state_key`]'s raw-blob key. The coherent
+/// entry carries a framed header, and a pod still on `concurrency_control =
+/// "off"` reads the raw key and would interpret a frame as redb bytes. Separate
+/// keys let a fleet roll `off → cas` one pod at a time without either side
+/// mis-reading the other's value.
+///
+/// The `cas:` discriminator sits BEFORE the schema-version segment, which is
+/// what makes the two namespaces provably disjoint: `valkey_state_key` yields
+/// `<prefix>v9:<key>` and this yields `<prefix>cas:v9:<key>`, so a collision
+/// would require the version segment to be the literal `cas` — impossible, it
+/// is always `v` followed by digits. Placing the discriminator *after* the
+/// segment would not be safe: a namespaced state file whose name began `cas:`
+/// would then collide with another namespace's coherent key.
+fn valkey_coherent_key(prefix: &str, remote_key: &str) -> String {
+    format!("{prefix}cas:{}:{remote_key}", schema_version_segment())
+}
+
+/// Frame `blob` together with the durable generation it was committed at.
+///
+/// Layout: `MAGIC(8) || u32-le header length || header JSON || state bytes`.
+///
+/// # Errors
+///
+/// Only for an un-encodable generation or a header beyond `u32` — both
+/// impossible in practice; they are surfaced rather than panicked on.
+fn frame_coherent_cache_entry(
+    generation: &Generation,
+    blob: &[u8],
+) -> Result<Vec<u8>, StateSyncError> {
+    let header = serde_json::to_vec(generation).map_err(|e| {
+        StateSyncError::Valkey(format!("failed to encode tiered cache generation: {e}"))
+    })?;
+    let header_len = u32::try_from(header.len())
+        .map_err(|_| StateSyncError::Valkey("tiered cache generation header exceeds u32".into()))?;
+    let mut framed = Vec::with_capacity(
+        COHERENT_CACHE_MAGIC.len() + size_of::<u32>() + header.len() + blob.len(),
+    );
+    framed.extend_from_slice(COHERENT_CACHE_MAGIC);
+    framed.extend_from_slice(&header_len.to_le_bytes());
+    framed.extend_from_slice(&header);
+    framed.extend_from_slice(blob);
+    Ok(framed)
+}
+
+/// Parse a framed cache entry into `(generation, state bytes)`.
+///
+/// TOTAL and panic-free over arbitrary input. The value is externally supplied
+/// — another pod, an older binary, an operator poking at Valkey — so every
+/// malformed shape (wrong magic, truncated length, over-long header, invalid
+/// JSON) reads as `None`, i.e. a plain cache miss. It is never a panic and
+/// never an error that could fail a run: the durable tier is right there.
+fn parse_coherent_cache_entry(value: &[u8]) -> Option<(Generation, &[u8])> {
+    let rest = value.strip_prefix(COHERENT_CACHE_MAGIC.as_slice())?;
+    let (len_bytes, rest) = rest.split_at_checked(size_of::<u32>())?;
+    let header_len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
+    let (header, blob) = rest.split_at_checked(header_len)?;
+    let generation = serde_json::from_slice::<Generation>(header).ok()?;
+    Some((generation, blob))
+}
+
+/// The Valkey peer URL from `[state] valkey_url`.
+fn valkey_url(config: &StateConfig) -> Result<String, StateSyncError> {
+    Ok(config
+        .valkey_url
+        .as_ref()
+        .map(RedactedString::expose)
+        .ok_or_else(|| StateSyncError::MissingConfig("valkey".into(), "state.valkey_url".into()))?
+        .to_string())
+}
+
+/// The configured Valkey key prefix (or the default).
+fn valkey_key_prefix(config: &StateConfig) -> &str {
+    config
+        .valkey_prefix
+        .as_deref()
+        .unwrap_or(DEFAULT_VALKEY_PREFIX)
+}
+
+/// Run one blocking Valkey command under the shared transfer-timeout budget.
+///
+/// The `redis` crate's sync client blocks its thread, so — exactly as
+/// [`download_from_valkey`] does — the work is offloaded to the blocking pool
+/// and capped by `transfer_timeout_seconds` so a dead peer cannot stall a run.
+async fn valkey_exec<T, F>(config: &StateConfig, op: F) -> Result<T, StateSyncError>
+where
+    F: FnOnce(&mut redis::Connection) -> Result<T, StateSyncError> + Send + 'static,
+    T: Send + 'static,
+{
+    let url = valkey_url(config)?;
+    with_transfer_timeout(transfer_timeout(config), async move {
+        let join = tokio::task::spawn_blocking(move || {
+            let client =
+                redis::Client::open(url).map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+            let mut conn = client
+                .get_connection()
+                .map_err(|e| StateSyncError::Valkey(e.to_string()))?;
+            op(&mut conn)
+        })
+        .await;
+        match join {
+            Ok(inner) => inner,
+            Err(e) => Err(StateSyncError::Valkey(format!(
+                "valkey worker task failed: {e}"
+            ))),
+        }
+    })
+    .await
+}
+
+/// `GET` the coherent cache entry (`None` = miss).
+async fn coherent_cache_get(
+    config: &StateConfig,
+    key: String,
+) -> Result<Option<Vec<u8>>, StateSyncError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if test_support::fake_valkey_installed() {
+        return Ok(test_support::fake_valkey_get(&key));
+    }
+    valkey_exec(config, move |conn| {
+        redis::cmd("GET")
+            .arg(&key)
+            .query::<Option<Vec<u8>>>(conn)
+            .map_err(|e| StateSyncError::Valkey(e.to_string()))
+    })
+    .await
+}
+
+/// `SET` the coherent cache entry.
+async fn coherent_cache_set(
+    config: &StateConfig,
+    key: String,
+    value: Vec<u8>,
+) -> Result<(), StateSyncError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if test_support::fake_valkey_installed() {
+        return test_support::fake_valkey_set(&key, value)
+            .map_err(|()| StateSyncError::Valkey("injected cache SET failure (test seam)".into()));
+    }
+    valkey_exec(config, move |conn| {
+        redis::cmd("SET")
+            .arg(&key)
+            .arg(value)
+            .query::<()>(conn)
+            .map_err(|e| StateSyncError::Valkey(e.to_string()))
+    })
+    .await
+}
+
+/// `DEL` the coherent cache entry.
+async fn coherent_cache_del(config: &StateConfig, key: String) -> Result<(), StateSyncError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if test_support::fake_valkey_installed() {
+        return test_support::fake_valkey_del(&key)
+            .map_err(|()| StateSyncError::Valkey("injected cache DEL failure (test seam)".into()));
+    }
+    valkey_exec(config, move |conn| {
+        redis::cmd("DEL")
+            .arg(&key)
+            .query::<()>(conn)
+            .map_err(|e| StateSyncError::Valkey(e.to_string()))
+    })
+    .await
+}
+
+/// Drop the coherent cache entry. **Best-effort by design** — see the module
+/// note above: a surviving entry carries a superseded generation and is
+/// rejected on read, so a failed `DEL` costs a wasted round-trip, never
+/// correctness.
+async fn invalidate_coherent_cache(config: &StateConfig, remote_key: &str) {
+    let key = valkey_coherent_key(valkey_key_prefix(config), remote_key);
+    match coherent_cache_del(config, key.clone()).await {
+        Ok(()) => debug!(key = %key, "tiered cache entry invalidated"),
+        Err(e) => warn!(
+            error = %e,
+            key = %key,
+            outcome = "invalidate_failed",
+            "could not invalidate the tiered state cache entry; it carries a superseded \
+             generation and will be rejected on read"
+        ),
+    }
+}
+
+/// Publish the just-committed state as the tiered cache entry, tagged with the
+/// generation the durable compare-and-swap returned.
+///
+/// Best-effort on failure, deliberately: the durable write has ALREADY
+/// committed, so failing the run over a cache miss would report failure for
+/// state that is safely persisted. What it must not do is leave a half-known
+/// entry hittable, so any failure invalidates.
+async fn populate_coherent_cache(
+    config: &StateConfig,
+    remote_key: &str,
+    committed: &Generation,
+    blob: &[u8],
+) {
+    let key = valkey_coherent_key(valkey_key_prefix(config), remote_key);
+    let framed = match frame_coherent_cache_entry(committed, blob) {
+        Ok(framed) => framed,
+        Err(e) => {
+            warn!(error = %e, "could not frame the tiered state cache entry");
+            invalidate_coherent_cache(config, remote_key).await;
+            return;
+        }
+    };
+    match coherent_cache_set(config, key.clone(), framed).await {
+        Ok(()) => debug!(key = %key, "tiered cache populated with the committed generation"),
+        Err(e) => {
+            warn!(
+                error = %e,
+                key = %key,
+                outcome = "cache_populate_failed",
+                "tiered state cache populate failed after a durable commit; invalidating so \
+                 no stale entry can be served (the run's state IS committed)"
+            );
+            invalidate_coherent_cache(config, remote_key).await;
+        }
+    }
+}
+
+/// The durable tier's CURRENT generation for `remote_key` — the only thing a
+/// cached entry may be validated against.
+async fn durable_generation(
+    config: &StateConfig,
+    remote_key: &str,
+) -> Result<RemoteVersion, StateSyncError> {
+    let bucket = config
+        .s3_bucket
+        .as_deref()
+        .ok_or_else(|| StateSyncError::MissingConfig("tiered".into(), "state.s3_bucket".into()))?;
+    let prefix = config.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX);
+    let provider = cloud_provider("s3", bucket, prefix)?;
+    let key = object_store_state_key(remote_key);
+    with_transfer_timeout(transfer_timeout(config), probe_generation(&provider, &key)).await
+}
+
+/// Generation probe for the durable tier, isolated behind a test seam (mirrors
+/// [`probe_exists`]). Production behaviour is exactly
+/// `provider.remote_generation(key)`.
+async fn probe_generation(
+    provider: &ObjectStoreProvider,
+    key: &str,
+) -> Result<RemoteVersion, StateSyncError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if test_support::take_object_store_head_fault() {
+        return Err(StateSyncError::S3Download(
+            "injected generation-probe failure (test seam)".into(),
+        ));
+    }
+    provider
+        .remote_generation(key)
+        .await
+        .map_err(StateSyncError::from)
+}
+
+/// Read the coherent cache entry and write it to `dest_path` **only** if its
+/// framed generation equals `durable`.
+///
+/// Returns `Ok(true)` when the cache served the read. Every other outcome —
+/// miss, unparseable value, generation mismatch — is `Ok(false)`, which the
+/// caller resolves by reading the durable tier. A definitively-stale entry is
+/// invalidated on the way out (hygiene; the mismatch check already made it
+/// unusable).
+///
+/// # Errors
+///
+/// Transport failures reaching the cache propagate so the caller can log them;
+/// the caller treats them exactly like a miss.
+async fn read_coherent_cache(
+    config: &StateConfig,
+    remote_key: &str,
+    durable: &Generation,
+    dest_path: &Path,
+) -> Result<bool, StateSyncError> {
+    let key = valkey_coherent_key(valkey_key_prefix(config), remote_key);
+    let Some(value) = coherent_cache_get(config, key.clone()).await? else {
+        debug!(key = %key, "tiered cache miss; reading the durable tier");
+        return Ok(false);
+    };
+    let Some((cached, blob)) = parse_coherent_cache_entry(&value) else {
+        warn!(
+            key = %key,
+            outcome = "cache_unparseable",
+            "tiered cache entry is not a coherent frame; ignoring it and reading the durable tier"
+        );
+        invalidate_coherent_cache(config, remote_key).await;
+        return Ok(false);
+    };
+    if &cached != durable {
+        debug!(
+            key = %key,
+            outcome = "cache_stale",
+            "tiered cache entry carries a superseded generation; reading the durable tier"
+        );
+        invalidate_coherent_cache(config, remote_key).await;
+        return Ok(false);
+    }
+    tokio::fs::write(dest_path, blob).await?;
+    info!(
+        size = blob.len(),
+        outcome = "ok",
+        "state restored from the tiered cache (generation validated against the durable tier)"
+    );
+    Ok(true)
+}
+
+/// The `concurrency_control = "cas"` tiered read (ADR-CONCURRENCY D5).
+///
+/// ```text
+/// HEAD durable object ──► Present(G) ──► cache GET ──► frame.generation == G ──► serve from cache
+///        │                    │              │                  │
+///        │                    │              │                  └─ mismatch ─┐
+///        │                    │              └─ miss / unparseable ──────────┤
+///        │                    ├─ Absent / PresentUnversioned ────────────────┤
+///        └─ Err ──────────────────────────────────────────────────────────────┤
+///                                                                            ▼
+///                                                          read the DURABLE S3 tier
+/// ```
+///
+/// One invariant carries the whole design: **the cache short-circuits only on a
+/// proven generation match; every other path reads the durable tier.** So the
+/// worst case is the cost of the plain `s3` backend, and no interleaving of
+/// *conforming* writers — writers that publish through
+/// [`populate_coherent_cache`], which only ever pairs a generation with the
+/// bytes committed at it — leaves a reader observing a cache entry newer-looking
+/// than durable truth. It is a freshness check, not an authentication one: a
+/// hand-crafted entry pairing the current generation with a different body would
+/// be believed (see the trust boundary in this module's header).
+///
+/// The base generation this run CAS-commits against comes from the durable
+/// tier either way: from the validated `HEAD` on a cache hit, or from the same
+/// `GET` that fetched the bytes on a fall-through. It is never derived from the
+/// cache.
+///
+/// Cost: one metadata `HEAD` on every tiered read, and a second one on the
+/// fall-through (the durable leg runs its own existence probe). A `HEAD` is
+/// bytes; the ledger it avoids downloading is megabytes, which is the trade the
+/// cache exists to make.
+async fn tiered_cas_download(
+    config: &StateConfig,
+    dest_path: &Path,
+    remote_key: &str,
+    mut gen_sink: Option<&mut Option<Generation>>,
+) -> Result<DownloadOutcome, StateSyncError> {
+    info!("State backend: tiered (generation-validated cache → S3)");
+
+    match durable_generation(config, remote_key).await {
+        Ok(RemoteVersion::Present(durable)) => {
+            match read_coherent_cache(config, remote_key, &durable, dest_path).await {
+                Ok(true) => {
+                    if let Some(sink) = gen_sink.as_deref_mut() {
+                        *sink = Some(durable);
+                    }
+                    return Ok(DownloadOutcome::Restored);
+                }
+                Ok(false) => {}
+                Err(e) => warn!(
+                    error = %e,
+                    "tiered cache read failed; reading the durable tier"
+                ),
+            }
+        }
+        // Nothing durable exists, so nothing can validate a cached entry —
+        // the cache is skipped entirely rather than trusted unchecked.
+        Ok(RemoteVersion::Absent) => {
+            debug!("durable tier has no state object; the tiered cache cannot be validated")
+        }
+        Ok(RemoteVersion::PresentUnversioned) => warn!(
+            outcome = "unversioned",
+            "durable state object carries no ETag/version; the tiered cache cannot be \
+             validated, reading the durable tier"
+        ),
+        Err(e) => warn!(
+            error = %e,
+            "durable generation probe failed; reading the durable tier"
+        ),
+    }
+
+    let s3_config = StateConfig {
+        backend: StateBackend::S3,
+        ..config.clone()
+    };
+    Box::pin(download_state_inner(
+        &s3_config, dest_path, remote_key, gen_sink,
+    ))
+    .await
 }
 
 /// Uploads state from a local file to remote storage after a run.
@@ -1828,16 +2385,16 @@ async fn dispatch_upload(
             // as a whole. The same `remote_key` flows to both legs so a
             // namespaced upload lands at `<ns>.redb` on Valkey and S3 alike.
             //
-            // KNOWN LIMITATION — tiered cache coherence (finding 3): a Valkey
-            // upload failure here is SWALLOWED (only the durable S3 leg below is
-            // required), even under `on_upload_failure = Fail`. Combined with the
-            // read-side short-circuit (a Valkey HIT skips S3 — see
-            // `download_state_inner`'s Tiered arm), this means a freeze can be
-            // durably written to S3 while a STALE Valkey cache entry survives and
-            // shadows it on the next policy-gate read. This is NOT fixed here; a
-            // correct fix needs cache-invalidation-on-write (bust/refresh the
-            // Valkey key when a governance ledger is written) or reading the
-            // durable tier directly for policy gates. Tracked as follow-up.
+            // KNOWN LIMITATION — this is the `concurrency_control = off` tiered
+            // upload, where a Valkey failure here is SWALLOWED (only the durable
+            // S3 leg below is required) even under `on_upload_failure = Fail`.
+            // Combined with the `off` read-side short-circuit (a Valkey HIT skips
+            // S3), a stale cache entry can survive and shadow durably-written
+            // state on the next read. `off` writes carry no generation, so there
+            // is nothing an invalidation could be made reliable against. Set
+            // `concurrency_control = "cas"` for the coherent tiered write
+            // (`dispatch_upload_cas`), which commits to S3 first and then
+            // populates-or-invalidates a generation-tagged cache entry.
             if let Err(e) = Box::pin(dispatch_upload(&valkey_config, local_path, remote_key)).await
             {
                 warn!(error = %e, "Valkey upload failed (non-fatal, S3 is durable)");
@@ -1849,12 +2406,14 @@ async fn dispatch_upload(
     }
 }
 
-/// End-of-run compare-and-swap upload for `concurrency_control = "cas"` on an
-/// object-store backend (`s3` / `gcs`).
+/// End-of-run compare-and-swap upload for `concurrency_control = "cas"` on a
+/// backend with a durable object tier (`s3` / `gcs` / `tiered`).
 ///
 /// Strips local-only tables exactly as [`upload_state`] does, then conditionally
 /// uploads against `base` (the generation captured at
-/// [`download_state_with_generation`]):
+/// [`download_state_with_generation`]). On `tiered` the conditional upload goes
+/// to the durable S3 leg and [`dispatch_upload_cas`] keeps the Valkey tier
+/// coherent with its outcome:
 /// - `Committed` → `Ok(())`.
 /// - `Conflict` → [`StateSyncError::CasConflict`] — another writer committed
 ///   since this run's download; fail-closed, and NEVER swallowed by
@@ -1910,9 +2469,15 @@ async fn upload_state_cas(
     }
 }
 
-/// CAS upload dispatch for the object-store backends. A non-object-store backend
-/// never reaches here — the session downgrades `cas` to an unconditional
-/// [`upload_state`] on `local` / `valkey` / `tiered`.
+/// CAS upload dispatch for the backends with a durable object tier. `local` and
+/// `valkey` never reach here — the session downgrades `cas` to an unconditional
+/// [`upload_state`] on those.
+///
+/// On `tiered` this is the D5 write half: **the durable S3 leg is the commit**,
+/// and the Valkey tier is populated with the committed generation only after
+/// that commit succeeds — or invalidated on conflict, on a transport error, or
+/// on a cache write that fails. The Valkey leg is never load-bearing for
+/// durability, so it cannot turn a committed run into a failed one.
 async fn dispatch_upload_cas(
     config: &StateConfig,
     local_path: &Path,
@@ -1920,6 +2485,40 @@ async fn dispatch_upload_cas(
     base: Option<&Generation>,
 ) -> Result<PutIfMatchOutcome, StateSyncError> {
     match config.backend {
+        StateBackend::Tiered => {
+            let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
+                StateSyncError::MissingConfig("tiered".into(), "state.s3_bucket".into())
+            })?;
+            let prefix = config.s3_prefix.as_deref().unwrap_or(DEFAULT_S3_PREFIX);
+            // Read the payload ONCE and commit exactly those bytes, so the
+            // durable object and the cache entry that claims its generation are
+            // provably the same content — re-reading the file for the cache
+            // would open a window for them to diverge.
+            let data = Bytes::from(tokio::fs::read(local_path).await?);
+            let outcome = upload_bytes_to_object_store_cas(
+                "s3",
+                bucket,
+                prefix,
+                data.clone(),
+                remote_key,
+                transfer_timeout(config),
+                base,
+            )
+            .await;
+            match &outcome {
+                Ok(PutIfMatchOutcome::Committed(committed)) => {
+                    populate_coherent_cache(config, remote_key, committed, &data).await;
+                }
+                // Conflict: we are not the winner, so anything this pod cached
+                // is not what committed. Transport error: the durable outcome is
+                // UNKNOWN, so no generation can be claimed. Both invalidate and
+                // populate nothing.
+                Ok(PutIfMatchOutcome::Conflict) | Err(_) => {
+                    invalidate_coherent_cache(config, remote_key).await;
+                }
+            }
+            outcome
+        }
         StateBackend::S3 => {
             let bucket = config.s3_bucket.as_deref().ok_or_else(|| {
                 StateSyncError::MissingConfig("s3".into(), "state.s3_bucket".into())
@@ -1953,10 +2552,12 @@ async fn dispatch_upload_cas(
             .await
         }
         // Unreachable in practice — the session downgrades `cas` to an
-        // unconditional upload on non-object-store backends. Defensive only.
-        _ => Err(StateSyncError::MissingConfig(
+        // unconditional upload on the tier-less backends. Listed explicitly
+        // rather than behind a `_ =>` so a future backend variant has to be
+        // classified here instead of silently landing on "refuse".
+        StateBackend::Local | StateBackend::Valkey => Err(StateSyncError::MissingConfig(
             config.backend.to_string(),
-            "an object-store backend (s3/gcs) for concurrency_control = cas".into(),
+            "a durable object tier (s3/gcs/tiered) for concurrency_control = cas".into(),
         )),
     }
 }
@@ -2031,6 +2632,12 @@ async fn download_from_object_store(
     // from the SAME GET that fetched the bytes (never a separate HEAD — that
     // would open a TOCTOU between the version read and the bytes the writer
     // mutates). `None` (every non-CAS caller) uses the plain download.
+    //
+    // The sink is AUTHORITATIVE over its prior contents: an absent object
+    // clears it rather than leaving whatever was there. Callers seed it with
+    // `None` today, so this is observably identical — but it means a base can
+    // never survive a leg that proved the object is gone, which would let a
+    // `PutMode::Update` fire against a key that should take `Create`.
     gen_sink: Option<&mut Option<Generation>>,
 ) -> Result<DownloadOutcome, StateSyncError> {
     let provider = cloud_provider(scheme, bucket, prefix)?;
@@ -2072,6 +2679,13 @@ async fn download_from_object_store(
                     Ok(DownloadOutcome::Restored)
                 }
                 Ok(false) => {
+                    // Clear the sink: there is no object, so there is no base.
+                    // Leaving a stale one would send `finalize` down
+                    // `PutMode::Update` for a key whose only correct write is
+                    // `Create`.
+                    if let Some(sink) = gen_sink {
+                        *sink = None;
+                    }
                     info!(outcome = "absent", "No existing state in object store — starting fresh");
                     Ok(DownloadOutcome::Absent)
                 }
@@ -2181,6 +2795,59 @@ async fn upload_to_object_store_cas(
         let outcome = with_transfer_timeout(timeout, async {
             provider
                 .upload_file_if_match(local_path, &key, base)
+                .await
+                .map_err(StateSyncError::from)
+        })
+        .await?;
+        info!(
+            bytes = size_bytes,
+            committed = matches!(outcome, PutIfMatchOutcome::Committed(_)),
+            outcome = "ok",
+            "CAS state upload complete"
+        );
+        Ok(outcome)
+    }
+    .instrument(span)
+    .await
+}
+
+/// Byte-payload compare-and-swap upload — the tiered path's durable commit.
+///
+/// Separate from [`upload_to_object_store_cas`] (which uploads from a path) on
+/// purpose: the tiered write needs the EXACT bytes it committed in hand
+/// afterwards, to publish them as the cache entry tagged with the generation
+/// this commit returned. Reading the file twice would let the durable object
+/// and the cache entry claiming its generation drift apart.
+///
+/// A `Conflict` is `Ok(Conflict)`, never an `Err` — the caller maps it to a
+/// fail-closed refusal, and a backend error stays an error.
+async fn upload_bytes_to_object_store_cas(
+    scheme: &str,
+    bucket: &str,
+    prefix: &str,
+    data: Bytes,
+    key: &str,
+    timeout: Duration,
+    base: Option<&Generation>,
+) -> Result<PutIfMatchOutcome, StateSyncError> {
+    let provider = cloud_provider(scheme, bucket, prefix)?;
+    let key = object_store_state_key(key);
+    let size_bytes = data.len() as u64;
+    let span = info_span!(
+        "state.upload.cas",
+        backend = %provider.scheme(),
+        bucket = %provider.bucket(),
+        size_bytes,
+    );
+    async {
+        info!(
+            uri = format!("{scheme}://{bucket}/{prefix}{key}"),
+            conditional = base.is_some(),
+            "CAS-uploading state to the durable tier"
+        );
+        let outcome = with_transfer_timeout(timeout, async {
+            provider
+                .put_if_match(&key, data, base)
                 .await
                 .map_err(StateSyncError::from)
         })
@@ -4522,6 +5189,596 @@ mod tests {
                 .await
                 .expect("off finalize is an unconditional put (no conflict)");
         }
+        test_support::clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // Tiered cache coherence (ADR-CONCURRENCY D5)
+    // -----------------------------------------------------------------------
+
+    /// A `tiered` + `cas` config wired to the in-memory durable tier. No
+    /// `valkey_url`: the in-process cache stand-in short-circuits ahead of URL
+    /// resolution, so a coherent-cache test never needs a live peer.
+    fn tiered_cas_config() -> StateConfig {
+        StateConfig {
+            backend: StateBackend::Tiered,
+            s3_bucket: Some("bucket".into()),
+            concurrency_control: ConcurrencyControl::Cas,
+            retry: RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Install both tiers a coherent-cache test needs: the fault-counting
+    /// in-memory durable store and the in-process Valkey stand-in.
+    fn install_tiered_backends() -> (crate::fault_store::FaultHandle, ObjectStoreProvider) {
+        let faults = install_counting_provider();
+        test_support::install_fake_valkey();
+        let provider = test_support::current_override().expect("provider override installed");
+        (faults, provider)
+    }
+
+    /// Seed the durable tier with `bytes` and return its generation.
+    async fn seed_durable(
+        provider: &ObjectStoreProvider,
+        object_key: &str,
+        bytes: &[u8],
+    ) -> Generation {
+        provider
+            .put(object_key, Bytes::copy_from_slice(bytes))
+            .await
+            .unwrap();
+        match provider.remote_generation(object_key).await.unwrap() {
+            RemoteVersion::Present(generation) => generation,
+            other => panic!("the in-memory tier must surface a generation, got {other:?}"),
+        }
+    }
+
+    fn bogus_generation() -> Generation {
+        Generation {
+            e_tag: Some("\"superseded\"".into()),
+            version: None,
+        }
+    }
+
+    #[test]
+    fn coherent_cache_frame_round_trips() {
+        let generation = Generation {
+            e_tag: Some("\"abc123\"".into()),
+            version: Some("42".into()),
+        };
+        let framed = frame_coherent_cache_entry(&generation, b"redb-bytes").unwrap();
+        let (parsed, blob) = parse_coherent_cache_entry(&framed).expect("frame round-trips");
+        assert_eq!(parsed, generation);
+        assert_eq!(blob, b"redb-bytes");
+
+        // An empty payload is a legitimate frame, not a parse failure.
+        let empty = frame_coherent_cache_entry(&generation, b"").unwrap();
+        let (_, blob) = parse_coherent_cache_entry(&empty).expect("empty payload round-trips");
+        assert!(blob.is_empty());
+    }
+
+    /// The cached value is externally supplied, so the parser must be TOTAL:
+    /// every malformed shape reads as a plain miss — never a panic, never an
+    /// error that could fail a run. A legacy raw-redb value (no magic) is one
+    /// of those shapes.
+    #[test]
+    fn coherent_cache_parse_is_total_over_malformed_input() {
+        let malformed: [&[u8]; 8] = [
+            b"",
+            b"RKY",
+            b"NOTMAGIC-and-more",
+            // A legacy raw blob written by an `off` pod.
+            b"redb\x00\x00\x00\x00garbage",
+            // Magic only — no length word.
+            b"RKYSGEN1",
+            // Truncated length word.
+            b"RKYSGEN1\x01\x00",
+            // Header length far beyond the value.
+            b"RKYSGEN1\xff\xff\xff\xff",
+            // Well-formed length, invalid JSON header.
+            b"RKYSGEN1\x03\x00\x00\x00{{{",
+        ];
+        for value in malformed {
+            assert!(
+                parse_coherent_cache_entry(value).is_none(),
+                "a malformed cache value must read as a miss, got a parse for {value:?}"
+            );
+        }
+    }
+
+    /// The fast path still works: a cache entry whose framed generation matches
+    /// the durable object's is served from the cache, and the durable object is
+    /// never GET. The base still comes from the durable tier's generation.
+    #[tokio::test]
+    async fn tiered_cas_validated_cache_hit_serves_without_a_durable_get() {
+        test_support::clear();
+        let (faults, provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let object_key = object_store_state_key(&remote_key);
+        let durable = seed_durable(&provider, &object_key, b"DURABLE").await;
+
+        // Distinguishable cache payload, framed with the CURRENT generation, so
+        // "the cache served this read" is unambiguous.
+        let cfg = tiered_cas_config();
+        let cache_key = valkey_coherent_key(valkey_key_prefix(&cfg), &remote_key);
+        test_support::fake_valkey_set(
+            &cache_key,
+            frame_coherent_cache_entry(&durable, b"FROM-CACHE").unwrap(),
+        )
+        .unwrap();
+
+        let gets_before = faults.count(crate::fault_store::FaultOp::Get);
+        let mut base = None;
+        let outcome = download_state_inner(&cfg, &local, &remote_key, Some(&mut base))
+            .await
+            .unwrap();
+        test_support::clear();
+
+        assert_eq!(outcome, DownloadOutcome::Restored);
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            b"FROM-CACHE",
+            "a generation-validated cache entry must serve the read"
+        );
+        assert_eq!(
+            base,
+            Some(durable),
+            "the CAS base must be the durable tier's generation, never a cache-local value"
+        );
+        assert_eq!(
+            faults.count(crate::fault_store::FaultOp::Get),
+            gets_before,
+            "a validated hit must not download the durable object — that is why tiered exists"
+        );
+    }
+
+    /// When the durable generation cannot be READ, there is nothing to validate
+    /// against — so the cache is not consulted at all, even though the entry
+    /// present here would have matched. "Cannot check" resolves to "read the
+    /// durable tier", never to "trust it".
+    #[tokio::test]
+    async fn tiered_cas_generation_probe_failure_never_serves_the_cache() {
+        test_support::clear();
+        let (_faults, provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let object_key = object_store_state_key(&remote_key);
+        let durable = seed_durable(&provider, &object_key, b"DURABLE").await;
+
+        let cfg = tiered_cas_config();
+        let cache_key = valkey_coherent_key(valkey_key_prefix(&cfg), &remote_key);
+        // A cache entry that WOULD validate — the probe failure is the only
+        // reason it must not be used.
+        test_support::fake_valkey_set(
+            &cache_key,
+            frame_coherent_cache_entry(&durable, b"FROM-CACHE").unwrap(),
+        )
+        .unwrap();
+        // One-shot, and distinct from the existence-probe fault, so the durable
+        // leg's own probe still succeeds and the fall-through is observable.
+        test_support::arm_object_store_head_fault();
+
+        let mut base = None;
+        let outcome = download_state_inner(&cfg, &local, &remote_key, Some(&mut base))
+            .await
+            .unwrap();
+        test_support::clear();
+
+        assert_eq!(outcome, DownloadOutcome::Restored);
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            b"DURABLE",
+            "an unvalidatable cache entry must not be served, however well it would have matched"
+        );
+        assert_eq!(
+            base,
+            Some(durable),
+            "the fall-through still captures the durable generation as the base"
+        );
+    }
+
+    /// A cache entry whose framed generation no longer matches the durable
+    /// object is rejected: the durable bytes win, and the stale entry is
+    /// invalidated on the way out.
+    #[tokio::test]
+    async fn tiered_cas_stale_cache_generation_is_rejected() {
+        test_support::clear();
+        let (_faults, provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+        let object_key = object_store_state_key(&remote_key);
+        let durable = seed_durable(&provider, &object_key, b"DURABLE").await;
+
+        let cfg = tiered_cas_config();
+        let cache_key = valkey_coherent_key(valkey_key_prefix(&cfg), &remote_key);
+        test_support::fake_valkey_set(
+            &cache_key,
+            frame_coherent_cache_entry(&bogus_generation(), b"STALE").unwrap(),
+        )
+        .unwrap();
+
+        let mut base = None;
+        let outcome = download_state_inner(&cfg, &local, &remote_key, Some(&mut base))
+            .await
+            .unwrap();
+        let survived = test_support::fake_valkey_get(&cache_key);
+        test_support::clear();
+
+        assert_eq!(outcome, DownloadOutcome::Restored);
+        assert_eq!(
+            std::fs::read(&local).unwrap(),
+            b"DURABLE",
+            "a superseded cache generation must lose to durable truth"
+        );
+        assert_eq!(base, Some(durable));
+        assert!(
+            survived.is_none(),
+            "a definitively-stale entry should be invalidated once observed"
+        );
+    }
+
+    /// A cache entry with NO durable object behind it cannot be validated
+    /// against anything, so it is skipped entirely — the read resolves to a
+    /// genuine fresh start with a `None` base, which maps to create-if-absent.
+    #[tokio::test]
+    async fn tiered_cas_cache_entry_without_a_durable_object_is_rejected() {
+        test_support::clear();
+        let (_faults, _provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        let remote_key = remote_state_key(&local);
+
+        let cfg = tiered_cas_config();
+        let cache_key = valkey_coherent_key(valkey_key_prefix(&cfg), &remote_key);
+        test_support::fake_valkey_set(
+            &cache_key,
+            frame_coherent_cache_entry(&bogus_generation(), b"ORPHANED").unwrap(),
+        )
+        .unwrap();
+
+        let mut base = Some(bogus_generation());
+        let outcome = download_state_inner(&cfg, &local, &remote_key, Some(&mut base))
+            .await
+            .unwrap();
+        test_support::clear();
+
+        assert_eq!(
+            outcome,
+            DownloadOutcome::Absent,
+            "no durable object ⇒ a real fresh start, not an unvalidatable cache hit"
+        );
+        assert!(
+            !local.exists(),
+            "the orphaned cache entry must not be written locally"
+        );
+        assert_eq!(
+            base, None,
+            "an absent durable object leaves no base ⇒ PutMode::Create"
+        );
+    }
+
+    /// A cache write that fails after a durable commit must INVALIDATE, so the
+    /// next read falls through to the durable tier instead of hitting a stale
+    /// entry. This is the pre-fix silent-staleness path, closed.
+    #[tokio::test]
+    async fn tiered_cas_cache_write_failure_invalidates_the_stale_entry() {
+        test_support::clear();
+        let (_faults, _provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let cfg = tiered_cas_config();
+        let remote_key = remote_state_key(&local);
+        let cache_key = valkey_coherent_key(valkey_key_prefix(&cfg), &remote_key);
+
+        // A stale entry left over from an earlier write — the bait the pre-fix
+        // read path would have served.
+        test_support::fake_valkey_set(
+            &cache_key,
+            frame_coherent_cache_entry(&bogus_generation(), b"STALE").unwrap(),
+        )
+        .unwrap();
+
+        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable);
+        let _ = session.acquire().await.unwrap();
+        test_support::arm_valkey_set_fault();
+        session
+            .finalize()
+            .await
+            .expect("a cache-populate failure must NOT fail an already-durable commit");
+
+        let survived = test_support::fake_valkey_get(&cache_key);
+        let mut base = None;
+        let outcome = download_state_inner(&cfg, &local, &remote_key, Some(&mut base))
+            .await
+            .unwrap();
+        test_support::clear();
+
+        assert!(
+            survived.is_none(),
+            "a failed cache populate must invalidate, leaving nothing hittable"
+        );
+        assert_eq!(outcome, DownloadOutcome::Restored);
+        assert!(
+            base.is_some(),
+            "the fall-through read must capture the durable generation as the base"
+        );
+    }
+
+    /// The harder case: the cache populate AND the invalidation both fail, so a
+    /// stale entry genuinely SURVIVES. It is still rejected, because the entry
+    /// carries its own generation — invalidation is hygiene, not the mechanism.
+    #[tokio::test]
+    async fn tiered_cas_surviving_stale_entry_is_still_rejected() {
+        test_support::clear();
+        let (_faults, provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let cfg = tiered_cas_config();
+        let remote_key = remote_state_key(&local);
+        let object_key = object_store_state_key(&remote_key);
+        let cache_key = valkey_coherent_key(valkey_key_prefix(&cfg), &remote_key);
+
+        test_support::fake_valkey_set(
+            &cache_key,
+            frame_coherent_cache_entry(&bogus_generation(), b"STALE").unwrap(),
+        )
+        .unwrap();
+
+        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable);
+        let _ = session.acquire().await.unwrap();
+        test_support::arm_valkey_set_fault();
+        test_support::arm_valkey_del_fault();
+        session.finalize().await.expect("the durable commit stands");
+
+        assert!(
+            test_support::fake_valkey_get(&cache_key).is_some(),
+            "this test is only meaningful while the stale entry survives an armed DEL failure"
+        );
+
+        // Read into a scratch path so the assertion is on what the tiered read
+        // produced, not on the pre-existing local ledger.
+        let restored = dir.path().join("restored.redb");
+        let mut base = None;
+        let outcome = download_state_inner(&cfg, &restored, &remote_key, Some(&mut base))
+            .await
+            .unwrap();
+        let durable_bytes = provider.get(&object_key).await.unwrap();
+        test_support::clear();
+
+        assert_eq!(outcome, DownloadOutcome::Restored);
+        let served = std::fs::read(&restored).unwrap();
+        assert_ne!(
+            served, b"STALE",
+            "a surviving stale entry must never be served — the frame carries its own \
+             generation, so invalidation is hygiene rather than the mechanism"
+        );
+        assert_eq!(
+            served,
+            durable_bytes.as_ref(),
+            "the read must resolve to durable truth"
+        );
+        assert!(
+            base.is_some(),
+            "the fall-through read captures the durable generation as the base"
+        );
+    }
+
+    /// Two writers from a shared base: exactly one commits, the loser gets a
+    /// fail-closed `CasConflict`, the durable generation does not advance past
+    /// the winner, and the loser leaves nothing cached.
+    #[tokio::test]
+    async fn tiered_cas_loser_fail_closes_without_overwriting_the_winner() {
+        test_support::clear();
+        let (_faults, provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let cfg = tiered_cas_config();
+        let remote_key = remote_state_key(&local);
+        let object_key = object_store_state_key(&remote_key);
+        let cache_key = valkey_coherent_key(valkey_key_prefix(&cfg), &remote_key);
+
+        // Bootstrap so both racers share a non-None base.
+        let mut first = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let _ = first.acquire().await.unwrap();
+        first.finalize().await.expect("bootstrap commit");
+
+        let mut loser = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let _ = loser.acquire().await.unwrap();
+        let mut winner = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let _ = winner.acquire().await.unwrap();
+        winner.finalize().await.expect("the winner commits");
+
+        let after_winner = provider.remote_generation(&object_key).await.unwrap();
+        let err = loser
+            .finalize()
+            .await
+            .expect_err("the loser must fail closed, not overwrite the winner");
+        let after_loser = provider.remote_generation(&object_key).await.unwrap();
+        let cached = test_support::fake_valkey_get(&cache_key);
+        test_support::clear();
+
+        assert!(
+            matches!(err, StateSyncError::CasConflict { .. }),
+            "expected CasConflict, got: {err:?}"
+        );
+        assert_eq!(
+            after_winner, after_loser,
+            "the durable generation must not advance — the loser wrote nothing"
+        );
+        assert!(
+            cached.is_none(),
+            "a conflicted writer must invalidate, never leave its own view cached"
+        );
+    }
+
+    /// Bootstrap race: two first-ever writers both carry `base = None`. One
+    /// creates, the other CONFLICTS — `None` never degrades to an
+    /// unconditional put.
+    #[tokio::test]
+    async fn tiered_cas_bootstrap_race_conflicts_rather_than_overwriting() {
+        test_support::clear();
+        let (_faults, provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let cfg = tiered_cas_config();
+        let object_key = object_store_state_key(&remote_state_key(&local));
+
+        let mut first = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        let mut second = RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+        assert_eq!(
+            first.acquire().await.unwrap(),
+            StateAuthority::FreshStart,
+            "both bootstrap writers see an absent durable object"
+        );
+        assert_eq!(second.acquire().await.unwrap(), StateAuthority::FreshStart);
+
+        first.finalize().await.expect("the first Create commits");
+        let after_first = provider.remote_generation(&object_key).await.unwrap();
+        let err = second
+            .finalize()
+            .await
+            .expect_err("the second bootstrap writer must conflict");
+        let after_second = provider.remote_generation(&object_key).await.unwrap();
+        test_support::clear();
+
+        assert!(
+            matches!(err, StateSyncError::CasConflict { .. }),
+            "expected CasConflict on the bootstrap race, got: {err:?}"
+        );
+        assert_eq!(
+            after_first, after_second,
+            "the losing bootstrap writer must not have written"
+        );
+    }
+
+    /// A backend/transport error is an `Err`, never a `Conflict` — and it
+    /// invalidates, because the durable outcome is unknown and no generation
+    /// can be claimed for a cache entry.
+    #[tokio::test]
+    async fn tiered_cas_backend_error_is_err_not_conflict() {
+        test_support::clear();
+        let (faults, _provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let cfg = tiered_cas_config();
+        let remote_key = remote_state_key(&local);
+        let cache_key = valkey_coherent_key(valkey_key_prefix(&cfg), &remote_key);
+        test_support::fake_valkey_set(
+            &cache_key,
+            frame_coherent_cache_entry(&bogus_generation(), b"STALE").unwrap(),
+        )
+        .unwrap();
+
+        let mut session = RemoteStateSession::new(&cfg, &local, FinalizeDurability::Durable);
+        let _ = session.acquire().await.unwrap();
+        faults.arm(
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultMode::FailAll,
+        );
+        let err = session
+            .finalize()
+            .await
+            .expect_err("a Durable finalize must propagate the transport failure");
+        let survived = test_support::fake_valkey_get(&cache_key);
+        test_support::clear();
+
+        assert!(
+            !matches!(err, StateSyncError::CasConflict { .. }),
+            "a transport error must NOT be reported as a CAS conflict; got: {err:?}"
+        );
+        assert!(
+            survived.is_none(),
+            "an unknown durable outcome must leave nothing cached"
+        );
+    }
+
+    /// `off` on `tiered` is untouched: the coherent cache key is never written,
+    /// and the durable write stays the unconditional put it has always been.
+    #[tokio::test]
+    async fn tiered_off_never_touches_the_coherent_cache_key() {
+        test_support::clear();
+        let (_faults, provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+        let cfg = StateConfig {
+            concurrency_control: ConcurrencyControl::Off,
+            ..tiered_cas_config()
+        };
+        let remote_key = remote_state_key(&local);
+        let object_key = object_store_state_key(&remote_key);
+        let cache_key = valkey_coherent_key(valkey_key_prefix(&cfg), &remote_key);
+
+        for _ in 0..2 {
+            let mut session =
+                RemoteStateSession::new(&cfg, &local, FinalizeDurability::ConfigDefault);
+            let _ = session.acquire().await.unwrap();
+            session
+                .finalize()
+                .await
+                .expect("off on tiered is an unconditional put — never a conflict");
+        }
+        let cached = test_support::fake_valkey_get(&cache_key);
+        let durable = provider.exists(&object_key).await.unwrap();
+        test_support::clear();
+
+        assert!(
+            cached.is_none(),
+            "the `off` path must not write the coherent cache key (mixed-fleet safety)"
+        );
+        assert!(durable, "the `off` durable write is unchanged");
+    }
+
+    /// Enabling `cas` on `tiered` also disables the mid-run periodic uploader,
+    /// exactly as it does on `s3`: finalize-only CAS is correct precisely
+    /// because no mid-run upload bumps the durable generation.
+    #[tokio::test]
+    async fn tiered_cas_disables_the_periodic_uploader() {
+        test_support::clear();
+        let (_faults, _provider) = install_tiered_backends();
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".rocky-state.redb");
+        seed_state_file(&local);
+
+        let mut cas = RemoteStateSession::new(
+            &tiered_cas_config(),
+            &local,
+            FinalizeDurability::ConfigDefault,
+        );
+        let _ = cas.acquire().await.unwrap();
+        cas.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
+        assert!(
+            cas.periodic.is_none(),
+            "cas on tiered must not start the mid-run uploader"
+        );
+        cas.finalize().await.expect("terminal CAS commit");
+
+        let off_cfg = StateConfig {
+            concurrency_control: ConcurrencyControl::Off,
+            ..tiered_cas_config()
+        };
+        let mut off = RemoteStateSession::new(&off_cfg, &local, FinalizeDurability::ConfigDefault);
+        let _ = off.acquire().await.unwrap();
+        off.start_periodic_uploader(Weak::<StateStore>::new(), Duration::from_secs(3600));
+        assert!(
+            off.periodic.is_some(),
+            "off on tiered keeps the mid-run uploader"
+        );
+        off.stop_periodic().await;
+        off.abandon("test").await;
         test_support::clear();
     }
 

@@ -568,8 +568,17 @@ pub enum ConcurrencyControl {
     /// Compare-and-swap: the end-of-run upload is conditional on the remote
     /// object still carrying the generation the run downloaded. A run that lost
     /// a cross-pod race fail-closes (nonzero exit) instead of erasing the
-    /// winner. Requires a backend with a conditional-write object tier (`s3` /
-    /// `gcs`); auto-downgrades to `off` (with a warn) on other backends.
+    /// winner. Requires a backend with a durable conditional-write object tier
+    /// (`s3`, `gcs`, or `tiered`); auto-downgrades to `off` (with a warn) on
+    /// `local` and `valkey`, which have no such tier.
+    ///
+    /// On `tiered` the compare-and-swap runs against the durable S3 leg and the
+    /// Valkey tier is kept coherent with it: a cached copy is stored together
+    /// with the generation it was committed at, and a read may only use it
+    /// after that generation is confirmed to still be the durable object's.
+    /// Enabling `cas` also disables the mid-run periodic state uploader, on
+    /// every backend. It protects the end-of-run upload only — see the
+    /// type-level note on the ledger-seam writers that still bypass it.
     Cas,
 }
 
@@ -764,10 +773,12 @@ pub struct StateConfig {
 
     /// Concurrency control for remote state writes. Default
     /// [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte-
-    /// identical to pre-CAS). Set to `"cas"` on live multi-pod object-store
-    /// deployments so a run that lost a cross-pod race fail-closes instead of
-    /// silently overwriting the winner's committed state. Auto-downgrades to
-    /// `off` (with a warn) on backends without a conditional-write object tier.
+    /// identical to pre-CAS). Set to `"cas"` on live multi-pod deployments with
+    /// a durable object tier (`s3`, `gcs`, `tiered`) so a run that lost a
+    /// cross-pod race fail-closes instead of silently overwriting the winner's
+    /// committed state. On `tiered` it additionally makes the Valkey tier
+    /// coherent with the durable object. Auto-downgrades to `off` (with a warn)
+    /// on `local` and `valkey`.
     #[serde(default)]
     pub concurrency_control: ConcurrencyControl,
 }
