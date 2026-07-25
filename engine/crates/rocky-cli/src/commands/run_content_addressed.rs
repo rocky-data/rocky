@@ -205,6 +205,10 @@ pub(crate) async fn removal_proof_given_store(
 /// Supported column types (Phase 1 + 2 of the writer): `Int64`, `Int32`,
 /// `String`, `Timestamp`, `TimestampNtz`. Any other `RockyType` returns an
 /// error pointing at the limitation; widening lands in a follow-up PR.
+///
+/// [`RockyType::Unknown`] gets its own error, because it is not a gap in this
+/// writer — it is the model failing to say what the column is, and no amount of
+/// widening here fixes it.
 pub(crate) fn query_result_to_record_batch(
     typed_columns: &[TypedColumn],
     result: &rocky_core::traits::QueryResult,
@@ -521,6 +525,20 @@ pub(crate) fn query_result_to_record_batch(
                     ),
                     Arc::new(arr) as ArrayRef,
                 )
+            }
+            // An unresolved type is a different failure from an unsupported
+            // one, and the remedy is different too: nothing about the writer
+            // needs to widen, the model needs to say what the column is.
+            // Reachable from a bare `CAST(x AS DECIMAL)` (which compiles with a
+            // W033) and from any expression the typechecker does not model.
+            RockyType::Unknown => {
+                return Err(anyhow!(
+                    "column {:?} has no inferred type; the model's column type could not be \
+                     inferred, so the content-addressed writer cannot pick a physical type. \
+                     Declare it with an explicit CAST that names precision and scale, \
+                     e.g. CAST({0} AS DECIMAL(38,2))",
+                    tc.name
+                ));
             }
             other => {
                 return Err(anyhow!(
@@ -1499,6 +1517,32 @@ mod tests {
         };
         let err = query_result_to_record_batch(&typed_cols, &result).unwrap_err();
         assert!(format!("{err}").contains("Int32 / Int64"));
+    }
+
+    /// T6.5 — an unresolved column type fails here, and the message says what
+    /// to do about it.
+    ///
+    /// This is a pre-existing limitation (`Unknown` columns have always reached
+    /// this arm — any expression the typechecker does not model produces one),
+    /// widened by one expression: `CAST(x AS DECIMAL)` used to infer
+    /// `DECIMAL(38,0)` and now infers nothing, because no concrete answer is
+    /// sound across the adapters. The compile-time `W033` names the cast before
+    /// the run; this is the run-time half, and it must not read as "the writer
+    /// needs a new type" — nothing about the writer would fix it.
+    #[test]
+    fn convert_errors_on_unresolved_type_with_a_remedy() {
+        let typed_cols = vec![col("amount", RockyType::Unknown, true)];
+        let result = QueryResult {
+            columns: vec!["amount".into()],
+            rows: vec![vec![serde_json::json!("1.00")]],
+        };
+        let err = format!(
+            "{}",
+            query_result_to_record_batch(&typed_cols, &result).unwrap_err()
+        );
+        assert!(err.contains("no inferred type"), "{err}");
+        assert!(err.contains("CAST"), "{err}");
+        assert!(err.contains("DECIMAL(38,2)"), "{err}");
     }
 
     fn make_partitioned_batch_3rows() -> RecordBatch {
