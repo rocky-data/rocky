@@ -90,11 +90,18 @@ impl Drop for PermitGuard {
 
 /// How many records [`JobRegistry::new`] retains before it evicts.
 ///
-/// Sized against a measured ~9 KB per cached record (a [`PersistedJob`] plus map
-/// overhead), so a full cache costs on the order of 5 MB. That is roughly eight
-/// hours of history for a one-minute schedule and comfortably more submissions
-/// than an embedder polls at once, while keeping the ceiling in the tens of
-/// megabytes even when jobs embed a large `result` payload.
+/// Sized against the scheduler path that motivated the bound, where a record
+/// measured ~9 KB (a [`PersistedJob`] plus map overhead) and carries no embedded
+/// result — so a full cache costs on the order of 5 MB, holds roughly eight hours
+/// of history for a one-minute schedule, and covers far more submissions than an
+/// embedder polls at once.
+///
+/// This bounds the record **count**, and the count is the only thing it bounds.
+/// A record's size is not capped: `PersistedJob::result` embeds the submitted
+/// job's entire canonical output verbatim, which Rocky does not limit, so an API
+/// workload whose jobs return large results has a proportionally larger ceiling
+/// (512 × the largest result). Bounding bytes rather than records would need a
+/// size cap on the embedded result, which is a separate contract.
 pub const DEFAULT_JOB_CACHE_CAPACITY: usize = 512;
 
 /// Bounded in-memory cache of job records fronting the durable `jobs` state
@@ -103,9 +110,16 @@ pub const DEFAULT_JOB_CACHE_CAPACITY: usize = 512;
 /// `rocky serve --scheduler` runs indefinitely and submits a job per scheduled
 /// fire, so retaining every record would grow the process without limit. The
 /// cache therefore holds at most [`DEFAULT_JOB_CACHE_CAPACITY`] records and
-/// evicts the least recently finished beyond that — a **count** bound rather
-/// than an age window, because an age window still grows without limit whenever
-/// the job rate rises.
+/// evicts in finish order beyond that — a **count** bound rather than an age
+/// window, because an age window still grows without limit whenever the job rate
+/// rises.
+///
+/// The cap is on retained *history*. Records still in flight are exempt (below),
+/// so the true ceiling is the cap plus however many jobs are running at once —
+/// and since `plan` submissions take no mutation permit, that second term is set
+/// by how many jobs the server is asked to run concurrently, not by uptime. That
+/// is the deliberate trade: history is what grew without bound, and concurrency
+/// is bounded by the work actually in flight.
 ///
 /// Two properties make eviction safe:
 ///
@@ -114,7 +128,10 @@ pub const DEFAULT_JOB_CACHE_CAPACITY: usize = 512;
 ///   [in flight](PersistedJob::is_in_flight), and both the state transition and
 ///   the eviction it enables happen under a single write lock in
 ///   [`upsert`](Self::upsert) — there is no separate eviction pass for a
-///   transition to race.
+///   transition to race. The corollary is that nothing may cache an in-flight
+///   record it cannot expect to finish: the durable-fallback read in the job
+///   handler deliberately declines to warm one, since a stale `running` would
+///   hold a slot for the life of the process.
 /// - **A miss costs a redb read, never an answer.** `GET /api/v1/jobs/{id}`
 ///   falls through to the durable `jobs` table on a miss and builds its response
 ///   from the same record type, so an evicted job answers exactly as a cached
@@ -148,12 +165,20 @@ impl Default for JobRegistry {
 struct Cache {
     /// The cached records, keyed by `job_id`.
     records: HashMap<String, PersistedJob>,
-    /// Ids eligible for eviction, least recently finished first.
+    /// Ids eligible for eviction, in the order they became evictable.
     ///
     /// An id is enqueued when its record stops being in flight; an in-flight
     /// record is never enqueued at all. That is what makes "never evict a
     /// running job" structural rather than a check that could go stale between
     /// the decision and the removal.
+    ///
+    /// Finish order, not strict recency: an id that is rewritten while already
+    /// queued keeps its original position rather than moving to the back, so a
+    /// record that goes back in flight and finishes again can be evicted ahead
+    /// of one that finished before it did. Ordering only decides which record
+    /// costs a durable read next, never whether an answer is correct, so the
+    /// approximation buys an uncontended read path — promoting on rewrite would
+    /// mean scanning or indexing positions on the hot path.
     evictable: VecDeque<String>,
     /// Membership index for [`Cache::evictable`], holding exactly the ids that
     /// queue contains.
@@ -316,10 +341,12 @@ mod tests {
         assert_eq!(reg.get("j").await.unwrap().state, "succeeded");
     }
 
-    /// The bound itself: past capacity the map stops growing, and it is the
-    /// least recently finished records that go.
+    /// The bound itself: past capacity the map stops growing, and for ids that
+    /// each finish once it is the earliest-finished records that go. (The
+    /// rewrite exception to that ordering is pinned separately by
+    /// `a_requeued_id_keeps_its_original_position`.)
     #[tokio::test]
-    async fn capacity_bound_holds_and_evicts_least_recently_finished() {
+    async fn capacity_bound_holds_and_evicts_in_finish_order() {
         let reg = JobRegistry::with_capacity(4);
         for i in 0..10 {
             reg.upsert(job(&format!("j{i}"), "succeeded")).await;
@@ -499,6 +526,33 @@ mod tests {
             reg.upsert(job(&format!("done{i}"), "succeeded")).await;
         }
         assert!(reg.get("j").await.is_none());
+    }
+
+    /// The documented limit of the ordering: an id rewritten while still queued
+    /// keeps its original position instead of moving to the back, so it can be
+    /// evicted ahead of a record that finished earlier than its latest finish.
+    /// Pinned because it is a deliberate trade — promoting on rewrite would cost
+    /// a scan or a position index on the write path, and eviction order only
+    /// decides which record costs a durable read, never which answer is correct.
+    #[tokio::test]
+    async fn a_requeued_id_keeps_its_original_position() {
+        let reg = JobRegistry::with_capacity(2);
+        reg.upsert(job("a", "succeeded")).await;
+        reg.upsert(job("b", "succeeded")).await;
+        // `a` returns to flight and finishes again. It is now the most recently
+        // finished of the two, but it never left the queue, so it keeps the
+        // front slot that `b` would otherwise have aged into.
+        reg.upsert(job("a", "running")).await;
+        reg.upsert(job("a", "succeeded")).await;
+
+        reg.upsert(job("c", "succeeded")).await;
+
+        assert!(
+            reg.get("a").await.is_none(),
+            "a is evicted from its original queue position despite finishing last"
+        );
+        assert!(reg.get("b").await.is_some());
+        assert!(reg.get("c").await.is_some());
     }
 
     /// A state string this build does not recognize — which a newer sidecar may

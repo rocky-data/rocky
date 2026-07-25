@@ -1463,8 +1463,25 @@ async fn get_job(
 
     match record {
         Some(record) => {
-            // Warm the cache so subsequent reads are hot.
-            state.jobs.upsert(record.clone()).await;
+            // Warm the cache so subsequent reads are hot — but only for a
+            // finished record.
+            //
+            // Reaching here with a record that still reads as in flight means it
+            // is not one this process is running: every job launched here is
+            // cached from submission until it finishes, so a live job's read is
+            // a cache hit and never falls through. Whatever else it is — most
+            // likely a terminal write that lost to lock contention, since
+            // persistence is best-effort — this process will never observe it
+            // transition. That is the decisive part, and it holds whether the
+            // record is stale or genuinely live somewhere else: the job cache
+            // never evicts an in-flight record, so caching one whose completion
+            // we will never see parks a slot for the life of the process, and
+            // repeating that rebuilds the unbounded growth the capacity bound
+            // exists to stop. Re-reading instead also lets the answer improve if
+            // a later write settles, rather than pinning `running` in memory.
+            if !record.is_in_flight() {
+                state.jobs.upsert(record.clone()).await;
+            }
             Ok(PrettyJson(job_status_from(record)))
         }
         None => Err(ApiError::job_not_found(&id)),
@@ -2549,6 +2566,47 @@ mod tests {
             cold.text().await.unwrap(),
             hot,
             "a cache miss must return exactly what the hit returned"
+        );
+    }
+
+    /// A durable record that still reads as in flight must be served but NOT
+    /// cached. Persisting is best-effort, so a job whose terminal write lost to
+    /// lock contention leaves `running` behind durably; caching that on a miss
+    /// would park a record the cache is never allowed to evict, and repeating it
+    /// would rebuild the very unbounded growth the capacity bound exists to stop.
+    #[tokio::test]
+    async fn a_stale_in_flight_durable_record_is_served_but_not_cached() {
+        use rocky_core::state::StateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = pinned_state_path(&models_dir);
+
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .record_job(&persisted_job("job_zombie", "running"))
+                .unwrap();
+        }
+
+        let state = pinned_server(models_dir, None, &state_path);
+        let base = spawn_router(state.clone()).await;
+
+        let resp = get_retrying_on_busy(&format!("{base}/api/v1/jobs/job_zombie")).await;
+        assert_eq!(resp.status(), 200);
+        let body: JobStatus = resp.json().await.unwrap();
+        assert!(
+            matches!(body.state, JobState::Running),
+            "the durable record is still reported honestly, got {:?}",
+            body.state
+        );
+
+        assert!(
+            state.jobs.get("job_zombie").await.is_none(),
+            "an in-flight record read from the durable table must not be cached: \
+             the cache never evicts in-flight records, so caching it would strand \
+             a slot for the life of the process"
         );
     }
 
