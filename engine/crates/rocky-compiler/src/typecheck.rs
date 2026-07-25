@@ -1784,15 +1784,19 @@ fn infer_case_type(
 /// type a cast produces and the declaration the compiler rejects can never
 /// disagree.
 ///
-/// `ExactNumberInfo::None` (a bare `CAST(x AS DECIMAL)`) yields `Unknown`
-/// rather than the old `Decimal(38,0)`: the engines disagree on the default
-/// (Spark `(10,0)`, DuckDB `(18,3)`, Snowflake `(38,0)`) and `Decimal(38,0)` is
-/// not a safe over-approximation of `Decimal(18,3)` because it has zero scale.
+/// SPLIT-FEASIBILITY REVERT (site 3/3): `ExactNumberInfo::None` (a bare
+/// `CAST(x AS DECIMAL)`) resolves to the known-wrong-but-decisive
+/// `Decimal(38,0)` that origin/main fabricates. Restored verbatim to measure
+/// whether the type algebra is separable from the Unknown-mapper change.
+///
+/// Note the coupling this re-introduces: because this function is also
+/// `check_decimal_declarations`'s "is this typeable?" gate, a resolving bare
+/// decimal makes the `W033` arm of that check unreachable.
 fn decimal_from_exact_number_info(info: &ast::ExactNumberInfo) -> RockyType {
     let params = match info {
         ast::ExactNumberInfo::PrecisionAndScale(p, s) => validate_decimal_params(*p, *s),
         ast::ExactNumberInfo::Precision(p) => validate_decimal_params(*p, 0),
-        ast::ExactNumberInfo::None => None,
+        ast::ExactNumberInfo::None => Some((38, 0)),
     };
     params.map_or(RockyType::Unknown, |(precision, scale)| {
         RockyType::Decimal { precision, scale }

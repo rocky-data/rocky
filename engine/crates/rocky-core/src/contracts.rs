@@ -425,24 +425,15 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
                     _ => return RockyType::Unknown,
                 }
             }
-            // Unparameterised (`NUMBER`, `DECIMAL`).
-            //
-            // This used to fabricate `Decimal(38,0)` on the stated ground that
-            // "wide is the fail-closed direction for a landed type". It is not,
-            // and measurement says so: of six probed landed/declared pairs the
-            // fabrication produced three false *rejects* and one false permit,
-            // and only one of its two passes was honest. `DECIMAL(10)` landed
-            // against a `DECIMAL(10,0)` contract was rejected, when DuckDB
-            // executes that cast to exactly `DECIMAL(10,0)`.
-            //
-            // An unparameterised decimal also names a different type on every
-            // adapter — Databricks `DECIMAL(10,0)`, DuckDB `DECIMAL(18,3)`
-            // (executed), Snowflake `NUMBER(38,0)` — so there is nothing to
-            // normalize to, and `Decimal(38,0)` is not even an upper bound on
-            // `Decimal(18,3)` (scale 0 < 3). `Unknown` says that, and
-            // `contract_verdict` turns it into a reported non-permit rather
-            // than the silent pass it would have been under `is_assignable`.
-            RockyType::Unknown
+            // SPLIT-FEASIBILITY REVERT (site 2/3): unparameterised (`NUMBER`,
+            // `DECIMAL`) resolves to the known-wrong-but-decisive
+            // `Decimal(38,0)` that origin/main fabricates. Restored verbatim to
+            // measure whether the type algebra is separable from the
+            // Unknown-mapper change.
+            RockyType::Decimal {
+                precision: 38,
+                scale: 0,
+            }
         }
         _ => RockyType::Unknown,
     }

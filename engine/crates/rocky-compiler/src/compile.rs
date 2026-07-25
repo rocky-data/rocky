@@ -691,15 +691,15 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
                     _ => return RockyType::Unknown,
                 }
             }
-            // Unparameterised (`DECIMAL`, `NUMERIC`). The wide `Decimal(38,0)`
-            // default that used to live here was a fabrication: an
-            // unparameterised decimal names `DECIMAL(10,0)` on Databricks,
-            // `DECIMAL(18,3)` on DuckDB (executed) and `NUMBER(38,0)` on
-            // Snowflake, and `Decimal(38,0)` is not an upper bound on
-            // `Decimal(18,3)` — its scale is smaller. All three of Rocky's
-            // decimal parsers now agree on `Unknown` here
-            // (`test_three_decimal_parsers_agree`).
-            RockyType::Unknown
+            // SPLIT-FEASIBILITY REVERT (site 1/3): unparameterised (`DECIMAL`,
+            // `NUMERIC`) resolves to the known-wrong-but-decisive
+            // `Decimal(38,0)` that origin/main fabricates. Restored verbatim to
+            // measure whether the type algebra is separable from the
+            // Unknown-mapper change.
+            RockyType::Decimal {
+                precision: 38,
+                scale: 0,
+            }
         }
         _ => RockyType::Unknown,
     }
