@@ -287,9 +287,15 @@ fn validate_contract_with_policy(
 /// `Decimal` arm of [`type_name_matches`] matches any decimal against any
 /// `Decimal(…)` declaration, so the compile-time gate cannot detect a
 /// precision/scale mismatch at all. That is pre-existing (it predates the
-/// unverifiable verdict entirely) and it is **not** closed by this change; the
-/// `rocky load` gate does enforce containment, so the mismatch is caught there
-/// and not at compile time.
+/// unverifiable verdict entirely) and it is **not** closed by this change.
+///
+/// The `rocky load` gate *does* enforce decimal containment — but it is not a
+/// backstop for this one, and saying so would be wrong: the two gates read
+/// different configuration. This gate reads a `<model>.contract.toml`
+/// ([`CompilerContract`]); the load gate reads `rocky.toml`'s
+/// `[…contract] required_columns` (`rocky_core::contracts::ContractConfig`).
+/// A project that declares `Decimal(10,0)` only in the compile-time contract has
+/// no second check anywhere.
 ///
 /// Closing it means parsing the declared parameters and routing through
 /// [`rocky_ir::contract_verdict`], which turns a class of contracts that compile

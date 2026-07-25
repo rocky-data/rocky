@@ -272,7 +272,7 @@ fn validate_contract_typed_with_policy(
                 });
             }
             ContractVerdict::Unverifiable
-                if unverifiable_is_reportable(&col.data_type, &landed_ty, &req.data_type) =>
+                if unverifiable_is_reportable(&col.data_type, &req.data_type) =>
             {
                 let detail = format!(
                     "column '{}' — contract type check not verified: landed type '{}' resolved \
@@ -354,11 +354,9 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
         // (Snowflake's fixed-point name). Snowflake's `DESCRIBE` returns
         // `NUMBER(38,0)`, so it must normalize to the same RockyType as a
         // contract written `DECIMAL(38,0)` for the contract to port.
-        _ if upper.starts_with("DECIMAL")
-            || upper.starts_with("BIGNUMERIC")
-            || upper.starts_with("NUMERIC")
-            || upper.starts_with("NUMBER") =>
-        {
+        // The type-name head, exactly — not a prefix of the whole string, which
+        // would route a custom `NUMBERED` type through the decimal branch.
+        _ if is_decimal_family_head(&upper) => {
             if let Some(params) = upper
                 .strip_prefix("DECIMAL(")
                 .or_else(|| upper.strip_prefix("BIGNUMERIC("))
@@ -444,24 +442,25 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 /// name [`looks_like_decimal`] matches, which is exactly the family whose
 /// parameters can be elided.
 ///
-/// **2. A decimal must be implicated, on a side where it can matter.** Not
-/// simply "either raw string names a decimal": that would report — and, after
-/// the flip, *reject* — a landed `DECIMAL(10,2)` against a contract declaring
-/// some type this mapper does not know (`HUGEINT`, `SUPER`, `GEOGRAPHY`), where
-/// the decimal is on the side that resolved perfectly well and contributes
-/// nothing to the failure. The two disjuncts below are the two ways a decimal
-/// actually participates in an unresolved comparison:
+/// **2. Either side must name a decimal.** The rule is exactly that, stated
+/// plainly: *this release reports an unverifiable comparison whenever the
+/// decimal family is named on either side.* It does not try to decide which
+/// side "caused" the failure.
 ///
-/// - **the contract declares a decimal** — the class RD-010 is about, and the
-///   same trigger the compiler-side gate uses (`declares_rocky_decimal`), so the
-///   two gates report the same class rather than two overlapping ones; or
-/// - **the landed side is the unresolved one and names a decimal** — an
-///   unparameterised `NUMBER` landing against a `BIGINT` contract, say, where
-///   the landed type could well be a `NUMBER(38,10)` that does not fit.
+/// The narrower alternative — report only when the *unresolved* side names a
+/// decimal — was written and then reverted, because it makes a landed
+/// `DECIMAL(10,2)` against a contract declaring a type this mapper does not know
+/// pass silently under **both** policies. `HUGEINT` is such a type and it is an
+/// integer, so `0.01` does not fit it: that is a false permit, and the WP-03
+/// rule is explicit that a false permit is far worse than a false `Unknown`.
+/// Under the wide rule the same pair is reported now and rejected at the flip,
+/// and that rejection is not a false one — Rocky genuinely cannot verify a
+/// decimal against a type it does not model, and "cannot verify" is precisely
+/// what the verdict says.
 ///
-/// This is the deliberate and *narrow* scope of this release, and it leaves a
-/// fail-open open: a contracted `String` or `Timestamp` column whose landed type
-/// does not normalize still passes this gate silently.
+/// This is still a *narrow* scope, and it leaves a fail-open open: a contracted
+/// `String` or `Timestamp` column whose landed type does not normalize passes
+/// this gate silently, because no decimal is named anywhere.
 ///
 /// The scoping is not timidity, it is a measurement. With `[cache.schemas]
 /// disabled` or a cold cache, `rocky-compiler`'s source schemas are empty and
@@ -470,32 +469,41 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 /// cold compile, and the flip to `Reject` would then break every such build.
 /// Closing the general case needs either a reliably-populated schema cache or an
 /// opt-in strict mode, and is a separate change with its own migration.
-fn unverifiable_is_reportable(landed_raw: &str, landed_ty: &RockyType, declared_raw: &str) -> bool {
+fn unverifiable_is_reportable(landed_raw: &str, declared_raw: &str) -> bool {
     if landed_raw.trim().eq_ignore_ascii_case(declared_raw.trim())
         && !looks_like_decimal(landed_raw)
     {
         return false;
     }
-    // `looks_like_decimal` covers the declared side whether or not it resolved:
-    // `warehouse_type_to_rocky` only ever produces a `Decimal` from one of the
-    // four spellings it tests, so a declared type that *resolved* to a decimal
-    // necessarily satisfies it too.
-    looks_like_decimal(declared_raw)
-        || (*landed_ty == RockyType::Unknown && looks_like_decimal(landed_raw))
+    looks_like_decimal(landed_raw) || looks_like_decimal(declared_raw)
 }
 
 /// Whether a raw warehouse type string names a fixed-point decimal family.
 ///
-/// Used only to scope which unverifiable type comparisons are reported (see
-/// [`unverifiable_is_reportable`]). Deliberately the same four spellings
-/// [`warehouse_type_to_rocky`] recognizes, so a name that mapper claims to
-/// handle can never fall outside the report.
+/// Matches the type-name **head** — everything before the first `(` — against an
+/// exact set, rather than testing a prefix of the whole string. A prefix test
+/// classifies `NUMBERED` and `NUMERICAL` as decimals, and since the identity
+/// shortcut in [`unverifiable_is_reportable`] is withheld from decimal-family
+/// names, a custom `NUMBERED` column against a `NUMBERED` contract would be
+/// reported now and *rejected* at the flip — a false reject on two identical,
+/// complete type names.
+///
+/// The set is deliberately the same four spellings [`warehouse_type_to_rocky`]
+/// recognizes, and that mapper matches the same head, so a name it claims to
+/// handle can never fall outside the report and vice versa.
 fn looks_like_decimal(warehouse_type: &str) -> bool {
+    is_decimal_family_head(warehouse_type)
+}
+
+/// The head of a warehouse type name (before any parameter list), matched
+/// against the exact set of fixed-point decimal spellings Rocky normalizes.
+///
+/// Shared by [`warehouse_type_to_rocky`] and [`looks_like_decimal`] so the set
+/// cannot drift between "what normalizes" and "what is reported".
+fn is_decimal_family_head(warehouse_type: &str) -> bool {
     let upper = warehouse_type.trim().to_uppercase();
-    upper.starts_with("DECIMAL")
-        || upper.starts_with("BIGNUMERIC")
-        || upper.starts_with("NUMERIC")
-        || upper.starts_with("NUMBER")
+    let head = upper.split('(').next().unwrap_or(&upper).trim_end();
+    matches!(head, "DECIMAL" | "BIGNUMERIC" | "NUMERIC" | "NUMBER")
 }
 
 /// Whether a normalized type participates in the exact-numeric containment rule
@@ -1174,18 +1182,19 @@ mod tests {
         assert!(reject_passes);
     }
 
-    /// The scoping predicate must implicate a decimal *where it can matter*, not
-    /// merely find one somewhere in the pair.
+    /// The scoping rule, stated as a table: an unverifiable comparison is
+    /// reported exactly when the decimal family is named on either side.
     ///
-    /// A landed `DECIMAL(10,2)` resolves perfectly well; if the *contract*
-    /// declares a type this mapper does not know, the decimal contributes
-    /// nothing to why the comparison failed. Reporting it would be noise now and
-    /// a false reject after the flip — a class the design's scoping rule never
-    /// enumerated. The mirror case (an unresolved landed decimal against a
-    /// non-decimal contract) *is* reported, because there the unresolved type
-    /// could be one that does not fit.
+    /// The narrower "only when the *unresolved* side names a decimal" variant
+    /// was written and reverted; the row that killed it is `DECIMAL(10,2)` vs
+    /// `HUGEINT`, which the narrow rule passed silently under **both** policies.
+    /// `HUGEINT` is DuckDB's 128-bit *integer*, so `0.01` does not fit it — a
+    /// false permit, and the WP-03 rule ranks a false permit far worse than a
+    /// false `Unknown`. Rejecting it at the flip is not a false reject: Rocky
+    /// cannot verify a decimal against a type it does not model, which is what
+    /// the verdict says.
     #[test]
-    fn test_unverifiable_scope_needs_the_decimal_where_it_matters() {
+    fn test_unverifiable_scope_is_the_decimal_family_on_either_side() {
         let check = |landed: &str, declared: &str| {
             let contract = ContractConfig {
                 required_columns: vec![RequiredColumn {
@@ -1208,37 +1217,73 @@ mod tests {
             )
         };
 
-        // Resolved decimal on the landed side, unknown non-decimal declared:
-        // NOT reported, and the flip must not reject it.
-        for declared in ["HUGEINT", "SUPER", "GEOGRAPHY"] {
-            let (warned, reject_passes) = check("DECIMAL(10,2)", declared);
-            assert!(!warned, "DECIMAL(10,2) vs {declared} must not warn");
-            assert!(
-                reject_passes,
-                "DECIMAL(10,2) vs {declared} must not be rejected at the flip"
+        // (landed, declared, reported)
+        let cases: &[(&str, &str, bool)] = &[
+            // Resolved decimal against a type Rocky does not model. Reported —
+            // this is the row that reverted the narrow rule.
+            ("DECIMAL(10,2)", "HUGEINT", true),
+            ("DECIMAL(10,2)", "SUPER", true),
+            // Unresolved decimal against a non-decimal contract: the landed type
+            // could be a NUMBER(38,10) that does not fit a BIGINT.
+            ("NUMBER", "BIGINT", true),
+            // Declared decimal that cannot be verified — the same class the
+            // compiler-side gate reports.
+            ("GEOMETRY", "DECIMAL(38,2)", true),
+            // No decimal named anywhere: the documented residual hole.
+            ("VARCHAR", "HUGEINT", false),
+            ("GEOMETRY", "BIGINT", false),
+        ];
+
+        for (landed, declared, reported) in cases {
+            let (warned, reject_passes) = check(landed, declared);
+            assert_eq!(
+                warned, *reported,
+                "{landed} vs {declared}: wrong W032 verdict"
+            );
+            assert_eq!(
+                reject_passes, !*reported,
+                "{landed} vs {declared}: Reject must be gated by the same predicate as Warn"
             );
         }
+    }
 
-        // Unresolved decimal on the landed side against a non-decimal contract:
-        // reported, because the landed type could be a NUMBER(38,10) that does
-        // not fit a BIGINT.
-        let (warned, reject_passes) = check("NUMBER", "BIGINT");
-        assert!(warned, "an unresolved landed decimal must be reported");
-        assert!(!reject_passes);
+    /// A *complete* type name whose text merely starts with a decimal spelling
+    /// is not in the family. `NUMBERED` vs `NUMBERED` must stay silent and must
+    /// keep passing at the flip: two identical complete type names are the same
+    /// type, and a prefix test would have made that a false reject once the
+    /// identity shortcut started excluding decimal-family names.
+    #[test]
+    fn test_decimal_family_is_matched_on_the_name_head() {
+        assert!(!looks_like_decimal("NUMBERED"));
+        assert!(!looks_like_decimal("NUMERICAL"));
+        assert!(!looks_like_decimal("DECIMALISH"));
+        assert!(looks_like_decimal("DECIMAL"));
+        assert!(looks_like_decimal("decimal(10,2)"));
+        assert!(looks_like_decimal(" NUMBER (38,0) "));
+        assert!(looks_like_decimal("BIGNUMERIC(76,38)"));
 
-        // Contract declares a decimal, landed type unknown and not a decimal:
-        // reported — the same class the compiler-side gate reports.
-        let (warned, reject_passes) = check("GEOMETRY", "DECIMAL(38,2)");
+        // And the mapper agrees: a near-miss name is simply unrecognized, not
+        // routed through the decimal branch.
+        assert_eq!(warehouse_type_to_rocky("NUMBERED"), RockyType::Unknown);
+        assert_eq!(warehouse_type_to_rocky("NUMERICAL"), RockyType::Unknown);
+
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "c".into(),
+                data_type: "NUMBERED".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("c", "NUMBERED", true)];
+        let warned = validate_contract_typed(&contract, &landed);
+        assert!(warned.warnings.iter().all(|w| !w.starts_with("W032:")));
+        let rejected =
+            validate_contract_typed_with_policy(&contract, &landed, UnverifiablePolicy::Reject);
         assert!(
-            warned,
-            "a declared decimal that cannot be verified must be reported"
+            rejected.passed,
+            "identical complete type names must not be rejected at the flip"
         );
-        assert!(!reject_passes);
-
-        // Neither side implicates a decimal: the documented residual hole.
-        let (warned, reject_passes) = check("VARCHAR", "HUGEINT");
-        assert!(!warned);
-        assert!(reject_passes);
     }
 
     /// T5.14 — the six landed/declared pairs measured against the pre-fix gate,

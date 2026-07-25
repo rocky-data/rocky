@@ -3606,10 +3606,21 @@ mod tests {
             let diags = check_decimal_declarations("m", &sql);
             assert_eq!(diags.len(), 1, "expected exactly one diagnostic for: {sql}");
             assert_eq!(&*diags[0].code, W033, "wrong code for: {sql}");
+            let suggestion = diags[0]
+                .suggestion
+                .as_deref()
+                .unwrap_or_else(|| panic!("W033 must say what to write instead: {:?}", diags[0]));
             assert!(
-                diags[0].suggestion.is_some(),
-                "W033 must say what to write instead: {:?}",
-                diags[0]
+                suggestion.contains("DECIMAL(38,2)"),
+                "W033 must name a concrete replacement: {suggestion}"
+            );
+            // The caveat is load-bearing, not decoration: measured, a cast only
+            // resolves the column when the value being cast already has a known
+            // type, so telling a user to "add a CAST" when their *source* type
+            // is the unresolved one names a remedy that does not work.
+            assert!(
+                suggestion.contains("already has a known type"),
+                "W033 must say when the cast does not help: {suggestion}"
             );
         }
         // `::DECIMAL` shorthand and TRY_CAST parse to the same `Expr::Cast`.

@@ -534,12 +534,15 @@ pub(crate) fn query_result_to_record_batch(
             RockyType::Unknown => {
                 return Err(anyhow!(
                     "column {:?} has no inferred type, so the content-addressed writer cannot \
-                     pick a physical type. If the column is computed, declare it with an \
-                     explicit CAST naming precision and scale, e.g. \
-                     CAST({0} AS DECIMAL(38,2)); if the column reads straight from a source \
-                     whose own type did not resolve, the cast will NOT help — the source \
-                     schema is what has to name a complete type (an unparameterised \
-                     'DECIMAL' names a different type on every adapter)",
+                     pick a physical type. An explicit CAST naming precision and scale \
+                     (e.g. CAST({0} AS DECIMAL(38,2))) resolves the column only when the \
+                     value being cast is a single column whose own type is already known — \
+                     the compiler applies a cast target through column lineage. It does NOT \
+                     help when the source column's type is itself unresolved (an \
+                     unparameterised 'DECIMAL' names a different type on every adapter, so \
+                     it resolves to nothing), nor for a multi-column expression such as \
+                     CAST(a + b AS DECIMAL(38,2)), which has no single producing column. \
+                     In those cases the source schema is what has to name a complete type.",
                     tc.name
                 ));
             }
@@ -1546,6 +1549,16 @@ mod tests {
         assert!(err.contains("no inferred type"), "{err}");
         assert!(err.contains("CAST"), "{err}");
         assert!(err.contains("DECIMAL(38,2)"), "{err}");
+        // The prerequisite and the two cases where the cast does NOT help are
+        // the point of the message; asserting only that the word CAST appears
+        // would pass against the message that named a remedy which measurement
+        // showed does not work.
+        assert!(err.contains("already known"), "{err}");
+        assert!(
+            err.contains("source column's type is itself unresolved"),
+            "{err}"
+        );
+        assert!(err.contains("CAST(a + b AS DECIMAL(38,2))"), "{err}");
     }
 
     fn make_partitioned_batch_3rows() -> RecordBatch {
