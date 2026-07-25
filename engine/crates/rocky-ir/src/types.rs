@@ -576,6 +576,16 @@ pub enum UnverifiablePolicy {
 /// permit with extra text. If v1.69.0 ships with this still on `Warn`, that is
 /// a decision someone has to make on the record, not a default that holds by
 /// nobody remembering.
+///
+/// The flip is one line here, plus two documentation surfaces that become
+/// *false* rather than merely incomplete when it lands, and are therefore
+/// deliberately left alone until then (both are `schemars` descriptions, so
+/// editing them requires a `just codegen` cascade that does not belong in the
+/// change that only adds the warning):
+/// - `rocky_core::contracts::RequiredColumn::data_type` — *"A type the
+///   normalizer doesn't recognize is treated as unknown and never fails the
+///   type check"*.
+/// - the `CHANGELOG` entry that announced the warning.
 pub const UNVERIFIABLE_POLICY: UnverifiablePolicy = UnverifiablePolicy::Warn;
 
 /// Decide whether a landed/inferred type satisfies a declared contract type.

@@ -2,7 +2,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::column_map;
-use rocky_ir::{ColumnInfo, RockyType, is_assignable, validate_decimal_params};
+use rocky_ir::{
+    ColumnInfo, ContractVerdict, RockyType, UNVERIFIABLE_POLICY, UnverifiablePolicy,
+    contract_verdict, validate_decimal_params,
+};
 
 /// Data contract configuration — enforced at copy/load time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -172,12 +175,20 @@ pub fn validate_contract(
 /// - **Nullability** (fully portable): a required column declared
 ///   `nullable = false` whose landed column is nullable is a violation.
 /// - **Type match** (best-effort, widening-aware): both the landed raw type
-///   and the contract's expected type string are normalized to [`RockyType`];
-///   a violation is emitted only when both normalize to a *known* type and the
-///   landed type is not assignable to (does not fit within) the expected type.
-///   So a narrower landed type (`INT32`) satisfies a wider contract (`BIGINT`),
-///   but not the reverse. If either side normalizes to [`RockyType::Unknown`],
-///   the match is skipped (never a false failure).
+///   and the contract's expected type string are normalized to [`RockyType`],
+///   and the pair is decided by [`contract_verdict`]. A narrower landed type
+///   (`INT32`) satisfies a wider contract (`BIGINT`), but not the reverse.
+/// - **Unverifiable types** (the gate's third outcome): when either side
+///   normalizes to [`RockyType::Unknown`] the containment question cannot be
+///   answered. That is **not** a permit —
+///   [`is_assignable`][rocky_ir::is_assignable] would say it is, which is the
+///   fail-open this gate no longer has. What happens instead is
+///   [`UNVERIFIABLE_POLICY`]: `Warn` reports `W032` and permits (the migration
+///   window), `Reject` reports a `required_column_type_unverifiable` violation.
+///
+///   The report is scoped to the *decimal* family in this release — see
+///   [`unverifiable_is_reportable`] for the conditions and for the residual
+///   fail-open that scoping deliberately leaves open.
 ///
 /// `protected_columns` and `allowed_type_changes` describe source-vs-target
 /// *evolution*, which a single-table load can't meaningfully evaluate (there
@@ -186,6 +197,22 @@ pub fn validate_contract(
 pub fn validate_contract_typed(
     contract: &ContractConfig,
     landed_columns: &[ColumnInfo],
+) -> ContractResult {
+    validate_contract_typed_with_policy(contract, landed_columns, UNVERIFIABLE_POLICY)
+}
+
+/// [`validate_contract_typed`] with the unverifiable-type policy as an
+/// argument.
+///
+/// Private on purpose: the shipping policy is the [`UNVERIFIABLE_POLICY`]
+/// constant, and a per-call knob that disables a governance gate is the
+/// false-permit-by-configuration this whole change exists to remove. The
+/// argument exists so the *rejecting* arm is exercised by tests before it
+/// ships, rather than being a code path nobody has ever run.
+fn validate_contract_typed_with_policy(
+    contract: &ContractConfig,
+    landed_columns: &[ColumnInfo],
+    policy: UnverifiablePolicy,
 ) -> ContractResult {
     let mut violations = Vec::new();
     let mut warnings = Vec::new();
@@ -219,40 +246,58 @@ pub fn validate_contract_typed(
         let landed_ty = warehouse_type_to_rocky(&col.data_type);
         let expected_ty = warehouse_type_to_rocky(&req.data_type);
 
-        // W032 — the contract's own declared type could not be normalized. The
-        // comparison below then passes on the `Unknown`, which is deliberate
-        // ("never a false failure"), so warn rather than let it be silent.
-        if expected_ty == RockyType::Unknown && looks_like_decimal(&req.data_type) {
-            warnings.push(format!(
-                "W032: contract column '{}' declares type '{}', whose decimal \
-                 parameters are out of range (precision must be 1..=76 and scale \
-                 0..=precision) — the type check for this column was skipped",
-                req.name, req.data_type
-            ));
-        }
-
-        if !landed_type_conforms(&landed_ty, &expected_ty) {
-            // Distinguish a precision/scale containment failure from an
-            // unrelated type mismatch, so the class of contracts affected by the
-            // decimal containment rule is greppable. `is_assignable` returns a
-            // bool by design and must not grow a reason channel, so the
-            // discrimination happens here.
-            let precision_failure = is_exact_numeric(&landed_ty)
-                && is_exact_numeric(&expected_ty)
-                && (landed_ty.is_decimal() || expected_ty.is_decimal());
-            let rule = if precision_failure {
-                "required_column_type_precision"
-            } else {
-                "required_column_type"
-            };
-            violations.push(ContractViolation {
-                rule: rule.to_string(),
-                column: req.name.clone(),
-                message: format!(
-                    "column '{}' has type '{}' ({landed_ty}), expected '{}' ({expected_ty})",
+        match contract_verdict(&landed_ty, &expected_ty) {
+            ContractVerdict::Satisfied => {}
+            ContractVerdict::Violated => {
+                // Distinguish a precision/scale containment failure from an
+                // unrelated type mismatch, so the class of contracts affected by
+                // the decimal containment rule is greppable. `contract_verdict`
+                // returns a verdict by design and must not grow a reason
+                // channel, so the discrimination happens here.
+                let precision_failure = is_exact_numeric(&landed_ty)
+                    && is_exact_numeric(&expected_ty)
+                    && (landed_ty.is_decimal() || expected_ty.is_decimal());
+                let rule = if precision_failure {
+                    "required_column_type_precision"
+                } else {
+                    "required_column_type"
+                };
+                violations.push(ContractViolation {
+                    rule: rule.to_string(),
+                    column: req.name.clone(),
+                    message: format!(
+                        "column '{}' has type '{}' ({landed_ty}), expected '{}' ({expected_ty})",
+                        req.name, col.data_type, req.data_type
+                    ),
+                });
+            }
+            ContractVerdict::Unverifiable
+                if unverifiable_is_reportable(&col.data_type, &req.data_type) =>
+            {
+                let detail = format!(
+                    "column '{}' — contract type check not verified: landed type '{}' resolved \
+                     to {landed_ty}, contract type '{}' resolved to {expected_ty}. Unresolved \
+                     evidence does not satisfy a contract.",
                     req.name, col.data_type, req.data_type
-                ),
-            });
+                );
+                let remedy = "Declare the decimal precision and scale on both sides \
+                              (e.g. 'NUMBER(38,0)').";
+                match policy {
+                    UnverifiablePolicy::Warn => warnings.push(format!(
+                        "W032: {detail} This is a warning in this release and becomes a \
+                         violation in the next. {remedy}"
+                    )),
+                    UnverifiablePolicy::Reject => violations.push(ContractViolation {
+                        rule: "required_column_type_unverifiable".to_string(),
+                        column: req.name.clone(),
+                        message: format!("{detail} {remedy}"),
+                    }),
+                }
+            }
+            // Unverifiable and out of the reported scope: permitted silently.
+            // This is the residual fail-open, and it is not closed by this
+            // change — see `unverifiable_is_reportable`.
+            ContractVerdict::Unverifiable => {}
         }
     }
 
@@ -321,64 +366,100 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
                 .or_else(|| upper.strip_prefix("NUMBER("))
                 .and_then(|s| s.strip_suffix(')'))
             {
+                // Parse into the widest form first, then validate — never
+                // narrow an unvalidated value into the `u8` precision/scale
+                // fields, where `DECIMAL(300,2)` would wrap to `DECIMAL(44,2)`
+                // and change what the contract means.
                 let parts: Vec<&str> = params.split(',').collect();
-                if parts.len() == 2 {
-                    // Parse into the widest form first, then validate — never
-                    // narrow an unvalidated value into the `u8` precision/scale
-                    // fields, where `DECIMAL(300,2)` would wrap to
-                    // `DECIMAL(44,2)` and change what the contract means.
-                    //
-                    // Note the deliberate split from the unparameterised case
-                    // below: parameters *present but out of range* name no type
-                    // on any adapter, so they degrade to `Unknown`, whereas a
-                    // bare `NUMBER` keeps the wide `Decimal(38,0)` default.
-                    let parsed = parts[0]
-                        .trim()
-                        .parse::<u64>()
-                        .ok()
-                        .zip(parts[1].trim().parse::<i64>().ok());
-                    return parsed
-                        .and_then(|(p, s)| validate_decimal_params(p, s))
-                        .map_or(RockyType::Unknown, |(precision, scale)| {
-                            RockyType::Decimal { precision, scale }
-                        });
+                match parts.len() {
+                    // `DECIMAL(p)` is `DECIMAL(p, 0)` — ANSI, and DuckDB
+                    // executed: `CAST(1 AS DECIMAL(10))` -> `DECIMAL(10,0)`.
+                    // Treating it as unparameterised is what let a contract
+                    // written `DECIMAL(10)` admit a `NUMBER(38,0)` column with
+                    // 28 more integer digits than declared.
+                    1 => {
+                        return parts[0]
+                            .trim()
+                            .parse::<u64>()
+                            .ok()
+                            .and_then(|precision| validate_decimal_params(precision, 0))
+                            .map_or(RockyType::Unknown, |(precision, scale)| {
+                                RockyType::Decimal { precision, scale }
+                            });
+                    }
+                    2 => {
+                        return parts[0]
+                            .trim()
+                            .parse::<u64>()
+                            .ok()
+                            .zip(parts[1].trim().parse::<i64>().ok())
+                            .and_then(|(p, s)| validate_decimal_params(p, s))
+                            .map_or(RockyType::Unknown, |(precision, scale)| {
+                                RockyType::Decimal { precision, scale }
+                            });
+                    }
+                    _ => return RockyType::Unknown,
                 }
             }
-            // Unparameterised (`NUMBER`, `DECIMAL`) — or a parameter list this
-            // mapper doesn't split, such as `DECIMAL(10)`. Kept at the wide
-            // `Decimal(38,0)`, which matches Snowflake's actual default and is
-            // the fail-closed reading of a *landed* type. This function feeds
-            // both sides of the contract comparison and `Unknown` passes on
-            // either side, so degrading here would make the gate strictly more
-            // permissive.
-            RockyType::Decimal {
-                precision: 38,
-                scale: 0,
-            }
+            // Unparameterised (`NUMBER`, `DECIMAL`).
+            //
+            // This used to fabricate `Decimal(38,0)` on the stated ground that
+            // "wide is the fail-closed direction for a landed type". It is not,
+            // and measurement says so: of six probed landed/declared pairs the
+            // fabrication produced three false *rejects* and one false permit,
+            // and only one of its two passes was honest. `DECIMAL(10)` landed
+            // against a `DECIMAL(10,0)` contract was rejected, when DuckDB
+            // executes that cast to exactly `DECIMAL(10,0)`.
+            //
+            // An unparameterised decimal also names a different type on every
+            // adapter — Databricks `DECIMAL(10,0)`, DuckDB `DECIMAL(18,3)`
+            // (executed), Snowflake `NUMBER(38,0)` — so there is nothing to
+            // normalize to, and `Decimal(38,0)` is not even an upper bound on
+            // `Decimal(18,3)` (scale 0 < 3). `Unknown` says that, and
+            // `contract_verdict` turns it into a reported non-permit rather
+            // than the silent pass it would have been under `is_assignable`.
+            RockyType::Unknown
         }
         _ => RockyType::Unknown,
     }
 }
 
-/// Compare two normalized [`RockyType`]s for contract purposes.
+/// Whether a [`ContractVerdict::Unverifiable`] verdict is reported at this gate.
 ///
-/// Returns `true` (a match, so no violation) when either side is
-/// [`RockyType::Unknown`] — an un-normalizable type is never a false
-/// failure. Otherwise compares by equality.
-/// Whether a landed column type conforms to a contract's expected type: the
-/// landed type must be *assignable to* (fit within) the expected type, so a
-/// narrower landed type (e.g. `INT32`) satisfies a wider contract (`BIGINT`),
-/// but a wider landed type does not satisfy a narrower contract. `Unknown` on
-/// either side passes (never a false failure) — `is_assignable` handles both.
-fn landed_type_conforms(landed: &RockyType, expected: &RockyType) -> bool {
-    is_assignable(landed, expected)
+/// Two conditions, and both are load-bearing.
+///
+/// **1. The raw type strings must differ** (case-insensitively, trimmed).
+/// Identical warehouse type strings on both sides means the landed type *is* the
+/// declared type, and every type contains itself — so the check is genuinely
+/// *verified*, not skipped. Without this, a `GEOMETRY` column against a
+/// `GEOMETRY` contract would be reported, and under `Reject` would fail a load
+/// that is obviously fine.
+///
+/// **2. One side must name a decimal.** This is the deliberate and *narrow*
+/// scope of this release, and it leaves a fail-open open: a contracted `String`
+/// or `Timestamp` column whose landed type does not normalize still passes this
+/// gate silently.
+///
+/// The scoping is not timidity, it is a measurement. With `[cache.schemas]
+/// disabled` or a cold cache, `rocky-compiler`'s source schemas are empty and
+/// *every* contracted column types as `Unknown`; a general "report all
+/// unverifiable" rule would emit one diagnostic per contracted column on every
+/// cold compile, and the flip to `Reject` would then break every such build.
+/// Closing the general case needs either a reliably-populated schema cache or an
+/// opt-in strict mode, and is a separate change with its own migration.
+fn unverifiable_is_reportable(landed_raw: &str, declared_raw: &str) -> bool {
+    if landed_raw.trim().eq_ignore_ascii_case(declared_raw.trim()) {
+        return false;
+    }
+    looks_like_decimal(landed_raw) || looks_like_decimal(declared_raw)
 }
 
 /// Whether a raw warehouse type string names a fixed-point decimal family.
 ///
-/// Used only to decide whether a `RockyType::Unknown` normalization is worth
-/// warning about (W032): an unrecognized type name is routine, but a *decimal*
-/// name that fails to normalize means the declared parameters were rejected.
+/// Used only to scope which unverifiable type comparisons are reported (see
+/// [`unverifiable_is_reportable`]). Deliberately the same four spellings
+/// [`warehouse_type_to_rocky`] recognizes, so a name that mapper claims to
+/// handle can never fall outside the report.
 fn looks_like_decimal(warehouse_type: &str) -> bool {
     let upper = warehouse_type.trim().to_uppercase();
     upper.starts_with("DECIMAL")
@@ -742,8 +823,13 @@ mod tests {
     /// T5 for the load-gate parser — the third of Rocky's three decimal
     /// parsers. Out-of-range parameters used to wrap silently through `as u8`
     /// (`NUMBER(300,2)` became `DECIMAL(44,2)`), which changed what the
-    /// contract meant. They now degrade to `Unknown`, which passes the type
-    /// check by the pre-existing "never a false failure" policy — hence W032.
+    /// contract meant. They degrade to `Unknown`, which is now a reported
+    /// non-permit (`W032` under the migration policy) rather than a silent pass.
+    ///
+    /// The unparameterised and one-parameter rows below are *inverted* from what
+    /// this test asserted a round ago; the rationale for the inversion is on
+    /// [`warehouse_type_to_rocky`] itself, at the site the fabricated default
+    /// used to live.
     #[test]
     fn test_warehouse_type_to_rocky_decimal_parameters() {
         let dec = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
@@ -768,16 +854,25 @@ mod tests {
             );
         }
 
-        // Unparameterised keeps the wide `Decimal(38,0)` default — it matches
-        // Snowflake's actual default and is the fail-closed reading of a landed
-        // type. Deliberately split from the malformed case above.
-        assert_eq!(warehouse_type_to_rocky("NUMBER"), dec(38, 0));
-        assert_eq!(warehouse_type_to_rocky("DECIMAL"), dec(38, 0));
-        // A one-part parameter list this mapper doesn't split also keeps the
-        // wide default, unchanged from before. Deliberately inconsistent with
-        // the compiler's `DECIMAL(10)` -> `Decimal(10,0)`: this function feeds
-        // both sides of the comparison, so wide is the safe direction here.
-        assert_eq!(warehouse_type_to_rocky("DECIMAL(10)"), dec(38, 0));
+        // Unparameterised names a different type on Databricks (10,0), DuckDB
+        // (18,3) and Snowflake (38,0), so there is no concrete answer to give.
+        // `Decimal(38,0)` is not even an upper bound on `Decimal(18,3)`.
+        assert_eq!(warehouse_type_to_rocky("NUMBER"), RockyType::Unknown);
+        assert_eq!(warehouse_type_to_rocky("DECIMAL"), RockyType::Unknown);
+        // `DECIMAL(p)` is `DECIMAL(p, 0)` — ANSI, and DuckDB executed:
+        // `CAST(1 AS DECIMAL(10))` -> `DECIMAL(10,0)`. This now agrees with the
+        // compiler's two decimal parsers instead of contradicting them; the
+        // disagreement admitted a `NUMBER(38,0)` column into a `DECIMAL(10)`
+        // contract.
+        assert_eq!(warehouse_type_to_rocky("DECIMAL(10)"), dec(10, 0));
+        assert_eq!(warehouse_type_to_rocky("NUMBER(1)"), dec(1, 0));
+        assert_eq!(warehouse_type_to_rocky("DECIMAL(77)"), RockyType::Unknown);
+        assert_eq!(warehouse_type_to_rocky("DECIMAL(0)"), RockyType::Unknown);
+        assert_eq!(warehouse_type_to_rocky("DECIMAL(x)"), RockyType::Unknown);
+        assert_eq!(
+            warehouse_type_to_rocky("DECIMAL(1,2,3)"),
+            RockyType::Unknown
+        );
     }
 
     /// T3.5 — the load-gate flip class. A Snowflake integer column
@@ -848,12 +943,19 @@ mod tests {
         assert!(check("INT", "DECIMAL(10,0)"));
     }
 
-    /// W032 — a contract whose own declared type has out-of-range decimal
-    /// parameters normalizes to `Unknown`, which passes the type check by the
-    /// deliberate "never a false failure" policy. The warning is what stops
-    /// that from being silent.
+    /// G3 — **the inversion.** This test previously asserted
+    /// `result.passed` with the comment *"an un-normalizable expected type must
+    /// not fail the gate"*, which states the fail-open as the intended
+    /// behaviour. It is not: `Unknown` at a validation gate is unresolved
+    /// evidence, and unresolved evidence must not read as safe.
+    ///
+    /// Under the shipping [`UNVERIFIABLE_POLICY`] (`Warn`) the gate still
+    /// permits, and that is the migration concession, not a verification — the
+    /// verdict for the same pair is [`ContractVerdict::Unverifiable`], asserted
+    /// here so the two cannot be confused. Under `Reject` — one line away, and
+    /// exercised now rather than after the flip — it is a violation.
     #[test]
-    fn test_typed_invalid_contract_decimal_warns_w032() {
+    fn test_typed_unverifiable_decimal_contract_is_not_a_permit() {
         let contract = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "amount".into(),
@@ -863,18 +965,48 @@ mod tests {
             ..Default::default()
         };
         let landed = vec![col_n("amount", "DECIMAL(10,2)", true)];
-        let result = validate_contract_typed(&contract, &landed);
-        assert!(
-            result.passed,
-            "an un-normalizable expected type must not fail the gate"
-        );
-        assert!(
-            result.warnings.iter().any(|w| w.starts_with("W032:")),
-            "expected a W032 warning, got {:?}",
-            result.warnings
+
+        // The verdict itself — this is what the gate now decides on, and it is
+        // not "compatible".
+        assert_eq!(
+            contract_verdict(
+                &warehouse_type_to_rocky("DECIMAL(10,2)"),
+                &warehouse_type_to_rocky("DECIMAL(300,2)")
+            ),
+            ContractVerdict::Unverifiable
         );
 
-        // A well-formed decimal contract produces no W032.
+        let warned =
+            validate_contract_typed_with_policy(&contract, &landed, UnverifiablePolicy::Warn);
+        assert!(
+            warned.passed,
+            "the migration window permits — see UNVERIFIABLE_POLICY: {:?}",
+            warned.violations
+        );
+        assert!(
+            warned.warnings.iter().any(|w| w.starts_with("W032:")),
+            "the permit must never be silent, got {:?}",
+            warned.warnings
+        );
+
+        let rejected =
+            validate_contract_typed_with_policy(&contract, &landed, UnverifiablePolicy::Reject);
+        assert!(
+            !rejected.passed,
+            "unresolved evidence must not satisfy a contract"
+        );
+        assert_eq!(
+            rejected.violations[0].rule,
+            "required_column_type_unverifiable"
+        );
+
+        // The shipping default is the `Warn` arm.
+        assert_eq!(UNVERIFIABLE_POLICY, UnverifiablePolicy::Warn);
+        let shipped = validate_contract_typed(&contract, &landed);
+        assert_eq!(shipped.passed, warned.passed);
+
+        // A well-formed decimal contract produces no W032 — both sides resolve,
+        // so the check is genuinely performed.
         let ok = ContractConfig {
             required_columns: vec![RequiredColumn {
                 name: "amount".into(),
@@ -885,19 +1017,133 @@ mod tests {
         };
         let result = validate_contract_typed(&ok, &[col_n("amount", "DECIMAL(10,2)", true)]);
         assert!(result.warnings.iter().all(|w| !w.starts_with("W032:")));
+    }
 
-        // Neither does an unrecognized non-decimal type name — that path has
-        // always been routine and must stay quiet.
-        let geo = ContractConfig {
-            required_columns: vec![RequiredColumn {
-                name: "g".into(),
-                data_type: "GEOMETRY".into(),
-                nullable: true,
-            }],
-            ..Default::default()
+    /// G5 — identical raw type strings are *verified*, not skipped: the landed
+    /// type is the declared type, and every type contains itself. Without this
+    /// guard the scoping predicate would report every unrecognized-but-matching
+    /// type pair, and under `Reject` would fail a load that is obviously fine.
+    ///
+    /// This is the discriminator against the naive "report every Unverifiable"
+    /// implementation.
+    #[test]
+    fn test_identical_raw_type_strings_are_verified_not_warned() {
+        let check = |landed: &str, declared: &str| {
+            let contract = ContractConfig {
+                required_columns: vec![RequiredColumn {
+                    name: "c".into(),
+                    data_type: declared.into(),
+                    nullable: true,
+                }],
+                ..Default::default()
+            };
+            let landed_cols = vec![col_n("c", landed, true)];
+            (
+                validate_contract_typed(&contract, &landed_cols),
+                validate_contract_typed_with_policy(
+                    &contract,
+                    &landed_cols,
+                    UnverifiablePolicy::Reject,
+                ),
+            )
         };
-        let result = validate_contract_typed(&geo, &[col_n("g", "GEOMETRY", true)]);
-        assert!(result.warnings.iter().all(|w| !w.starts_with("W032:")));
+
+        for (landed, declared) in [
+            ("GEOMETRY", "GEOMETRY"),
+            ("geometry", "GEOMETRY"),
+            ("DECIMAL", "DECIMAL"),
+            ("NUMBER", "number"),
+        ] {
+            let (warned, rejected) = check(landed, declared);
+            assert!(warned.passed, "{landed} vs {declared}: must pass");
+            assert!(
+                warned.warnings.iter().all(|w| !w.starts_with("W032:")),
+                "{landed} vs {declared}: must not warn, got {:?}",
+                warned.warnings
+            );
+            // And the flip must not turn it into a failure either — the
+            // rejecting arm is gated on the same predicate as the warning.
+            assert!(
+                rejected.passed,
+                "{landed} vs {declared}: the flip must not reject a verified pair, got {:?}",
+                rejected.violations
+            );
+        }
+
+        // A non-decimal type that does *not* match is the residual fail-open:
+        // still permitted, still silent, under both policies. Named here so the
+        // hole is visible in the test suite rather than only in prose.
+        let (warned, rejected) = check("GEOMETRY", "BIGINT");
+        assert!(warned.passed);
+        assert!(warned.warnings.iter().all(|w| !w.starts_with("W032:")));
+        assert!(
+            rejected.passed,
+            "scoped out of this release: non-decimal unverifiable types still pass"
+        );
+    }
+
+    /// T5.14 — the six landed/declared pairs measured against the pre-fix gate,
+    /// each asserting the post-fix verdict. Five of the eight rows here return
+    /// the opposite result on the previous implementation.
+    #[test]
+    fn test_load_gate_decimal_pairs() {
+        let gate = |landed: &str, declared: &str, policy: UnverifiablePolicy| {
+            let contract = ContractConfig {
+                required_columns: vec![RequiredColumn {
+                    name: "c".into(),
+                    data_type: declared.into(),
+                    nullable: true,
+                }],
+                ..Default::default()
+            };
+            validate_contract_typed_with_policy(&contract, &[col_n("c", landed, true)], policy)
+        };
+
+        // (landed, declared, passes under Warn, warns W032 under Warn, passes
+        // under Reject)
+        let cases: &[(&str, &str, bool, bool, bool)] = &[
+            // Migration window: a violation today, a reported permit for one
+            // release, a violation again at the flip.
+            ("NUMBER", "DECIMAL(38,2)", true, true, false),
+            // Was a false reject (landed DECIMAL(10,2) genuinely fits nothing
+            // the bare contract names, because the bare contract names nothing).
+            ("DECIMAL(10,2)", "DECIMAL", true, true, false),
+            // Passed before only by mutual fabrication — both sides invented
+            // `Decimal(38,0)`. Now reported.
+            ("NUMBER(38,0)", "DECIMAL", true, true, false),
+            // B2, landed side: a false REJECT removed immediately, not deferred
+            // to the flip. DuckDB executes `CAST(1 AS DECIMAL(10))` to exactly
+            // `DECIMAL(10,0)`.
+            ("DECIMAL(10)", "DECIMAL(10,0)", true, false, true),
+            // B2, declared side: a false PERMIT removed immediately. 38 integer
+            // digits do not fit a contract declaring 10.
+            ("NUMBER(38,0)", "DECIMAL(10)", false, false, false),
+            // Unchanged, both directions — the containment rule is untouched.
+            ("DECIMAL(10,2)", "DECIMAL(12,4)", true, false, true),
+            ("NUMBER(38,0)", "DECIMAL(38,2)", false, false, false),
+            ("INT", "DECIMAL(12,2)", true, false, true),
+        ];
+
+        for (landed, declared, warn_passes, warns, reject_passes) in cases {
+            let warned = gate(landed, declared, UnverifiablePolicy::Warn);
+            assert_eq!(
+                warned.passed, *warn_passes,
+                "Warn: landed={landed} declared={declared} violations={:?}",
+                warned.violations
+            );
+            assert_eq!(
+                warned.warnings.iter().any(|w| w.starts_with("W032:")),
+                *warns,
+                "Warn: landed={landed} declared={declared} warnings={:?}",
+                warned.warnings
+            );
+            let rejected = gate(landed, declared, UnverifiablePolicy::Reject);
+            assert_eq!(
+                rejected.passed, *reject_passes,
+                "Reject: landed={landed} declared={declared} violations={:?}",
+                rejected.violations
+            );
+        }
     }
 
     #[test]
