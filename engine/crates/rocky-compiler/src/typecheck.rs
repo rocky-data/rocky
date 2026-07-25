@@ -1845,7 +1845,17 @@ fn check_decimal_declarations(model_name: &str, sql: &str) -> Vec<Diagnostic> {
         let Expr::Cast { data_type, .. } = expr else {
             return ControlFlow::Continue(());
         };
-        let (ast::DataType::Decimal(info) | ast::DataType::Numeric(info)) = data_type else {
+        // Must cover every exact-numeric variant `sql_type_to_rocky` degrades to
+        // `Unknown`, or an out-of-range declaration in a spelling this check
+        // misses becomes an `Unknown` column with NO diagnostic — which is the
+        // fail-open through `contracts.rs`'s E011 guard that E036 exists to
+        // prevent.
+        let (ast::DataType::Decimal(info)
+        | ast::DataType::Numeric(info)
+        | ast::DataType::Dec(info)
+        | ast::DataType::BigNumeric(info)
+        | ast::DataType::BigDecimal(info)) = data_type
+        else {
             return ControlFlow::Continue(());
         };
         // A bare `DECIMAL` is unparameterised, not invalid — it types as
@@ -1996,9 +2006,16 @@ fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
         // degrades to `Unknown` here and is rejected with E036 by
         // `check_decimal_declarations`, so the `Unknown` cannot silently skip
         // the E011 contract check.
-        ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => {
-            decimal_from_exact_number_info(info)
-        }
+        // All five of sqlparser's exact-numeric spellings, not just the two
+        // Rocky used to handle. `DEC`, `BIGNUMERIC` and `BIGDECIMAL` are
+        // separate `DataType` variants, and they previously fell through to the
+        // string mapper — which does not recognize those prefixes — so even a
+        // well-formed `CAST(x AS DEC(10,2))` silently lost its type.
+        ast::DataType::Decimal(info)
+        | ast::DataType::Numeric(info)
+        | ast::DataType::Dec(info)
+        | ast::DataType::BigNumeric(info)
+        | ast::DataType::BigDecimal(info) => decimal_from_exact_number_info(info),
         ast::DataType::Varchar(_)
         | ast::DataType::Char(_)
         | ast::DataType::Text
@@ -3319,6 +3336,27 @@ mod tests {
             // the default and Decimal(38,0) is not a safe over-approximation of
             // DuckDB's Decimal(18,3), so it degrades.
             ("T5.9", "CAST(1 AS DECIMAL)", RockyType::Unknown),
+            // sqlparser has five exact-numeric DataType variants, not two.
+            // `DEC`, `BIGNUMERIC` and `BIGDECIMAL` used to fall through to the
+            // string mapper, which does not recognize those prefixes, so even
+            // these well-formed declarations silently lost their type.
+            ("DEC valid", "CAST(1 AS DEC(10,2))", dec(10, 2)),
+            (
+                "BIGNUMERIC valid",
+                "CAST(1 AS BIGNUMERIC(76,38))",
+                dec(76, 38),
+            ),
+            (
+                "BIGDECIMAL valid",
+                "CAST(1 AS BIGDECIMAL(20,4))",
+                dec(20, 4),
+            ),
+            ("DEC invalid", "CAST(1 AS DEC(300,2))", RockyType::Unknown),
+            (
+                "BIGNUMERIC invalid",
+                "CAST(1 AS BIGNUMERIC(77,0))",
+                RockyType::Unknown,
+            ),
         ];
 
         for (label, sql, expected) in cases {
@@ -3342,6 +3380,12 @@ mod tests {
             "SELECT CAST(amount AS DECIMAL(5,10)) AS a FROM source.raw.t",
             "SELECT amount::DECIMAL(256,2) AS a FROM source.raw.t",
             "SELECT TRY_CAST(amount AS NUMERIC(0,0)) AS a FROM source.raw.t",
+            // The three spellings sqlparser models as their own DataType
+            // variants. Missing any of them is a fail-open: the column types as
+            // `Unknown` and `crate::contracts` then SKIPS its E011 check.
+            "SELECT CAST(amount AS DEC(300,2)) AS a FROM source.raw.t",
+            "SELECT CAST(amount AS BIGNUMERIC(77,0)) AS a FROM source.raw.t",
+            "SELECT CAST(amount AS BIGDECIMAL(10,-2)) AS a FROM source.raw.t",
         ] {
             let diags = check_decimal_declarations("m", sql);
             assert_eq!(diags.len(), 1, "expected exactly one E036 for: {sql}");
@@ -3359,6 +3403,8 @@ mod tests {
             "SELECT CAST(amount AS DECIMAL(10)) AS a FROM source.raw.t",
             "SELECT CAST(amount AS DECIMAL) AS a FROM source.raw.t",
             "SELECT CAST(amount AS BIGINT) AS a FROM source.raw.t",
+            "SELECT CAST(amount AS DEC(10,2)) AS a FROM source.raw.t",
+            "SELECT CAST(amount AS BIGNUMERIC(76,38)) AS a FROM source.raw.t",
             "SELECT amount FROM source.raw.t",
         ] {
             assert!(
