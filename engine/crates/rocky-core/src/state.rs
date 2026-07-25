@@ -2101,6 +2101,39 @@ pub struct PersistedJob {
     pub result: Option<serde_json::Value>,
 }
 
+impl PersistedJob {
+    /// Whether the job is still in flight — `"running"` or `"queued"`.
+    ///
+    /// Errs toward *finished*: an unrecognized `state` — which the deliberate
+    /// string encoding lets a newer sidecar introduce — reads as **not** in
+    /// flight. Callers use this to decide what must not be disturbed (the
+    /// `rocky serve` job cache never evicts an in-flight record), so the
+    /// protected set stays exactly the known-live one and an unknown state can
+    /// never make a record permanently unevictable.
+    ///
+    /// This is **not** the negation of [`is_terminal`](Self::is_terminal). The
+    /// two agree on the four states `rocky-cli`'s `JobState` defines and
+    /// deliberately err in opposite directions on anything else, so each caller
+    /// gets the conservative answer for what it is deciding. A new `JobState`
+    /// variant must therefore be classified in both — this crate cannot see
+    /// that enum, so this pair stands in for the compiler's exhaustiveness
+    /// check across the crate boundary.
+    pub fn is_in_flight(&self) -> bool {
+        matches!(self.state.as_str(), "running" | "queued")
+    }
+
+    /// Whether the job reached a terminal state — `"succeeded"` or `"failed"`.
+    ///
+    /// Errs toward *unfinished*: an unrecognized `state` reads as **not**
+    /// terminal, so the restart sweep reconciles it rather than leaving an
+    /// embedder polling a record nothing will ever finish. See
+    /// [`is_in_flight`](Self::is_in_flight) for why the two predicates are not
+    /// complements.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.state.as_str(), "succeeded" | "failed")
+    }
+}
+
 impl StateStore {
     /// Insert or replace a job record (keyed by `job_id`).
     ///

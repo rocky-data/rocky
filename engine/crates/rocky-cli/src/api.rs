@@ -1195,7 +1195,7 @@ pub(crate) fn sweep_interrupted_jobs(state_path: &std::path::Path) -> anyhow::Re
     let store = rocky_core::state::StateStore::open(state_path)?;
     let mut swept = 0;
     for job in store.list_jobs()? {
-        if matches!(job.state.as_str(), "succeeded" | "failed") {
+        if job.is_terminal() {
             continue;
         }
         let mut done = job;
@@ -2307,6 +2307,11 @@ mod tests {
 
         // A brand-new server (empty in-memory registry) reads the durable record.
         let state = pinned_server(models_dir, None, &state_path);
+        assert!(
+            state.jobs.get("job_inflight").await.is_none(),
+            "the sweep is registry-independent: it reconciles the durable table, \
+             and a restarted server starts with a cold cache"
+        );
         let base = spawn_router(state).await;
 
         // This GET misses the in-memory registry and falls through to a durable
@@ -2486,6 +2491,65 @@ mod tests {
             body.state
         );
         assert!(body.error.is_none());
+    }
+
+    /// The correctness leg of the job cache's capacity bound: a record the
+    /// cache has evicted is still served, byte for byte, from the durable
+    /// `jobs` table. Bounding the cache may cost a redb read — it must never
+    /// cost an answer, and a miss must not answer differently from a hit.
+    #[tokio::test]
+    async fn evicted_job_is_served_identically_from_the_durable_table() {
+        use rocky_core::state::StateStore;
+        use rocky_server::jobs::DEFAULT_JOB_CACHE_CAPACITY;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = pinned_state_path(&models_dir);
+
+        // A finished job recorded the way the job paths do it: durable record
+        // first, then the in-memory cache.
+        let mut record = persisted_job("job_evicted", "succeeded");
+        record.finished_at = Some("2026-07-07T00:00:10Z".to_string());
+        record.result = Some(serde_json::json!({ "status": "success" }));
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store.record_job(&record).unwrap();
+        }
+
+        let state = pinned_server(models_dir, None, &state_path);
+        state.jobs.upsert(record).await;
+        let base = spawn_router(state.clone()).await;
+
+        // The hot answer, straight from the cache.
+        let hot = reqwest::get(format!("{base}/api/v1/jobs/job_evicted"))
+            .await
+            .unwrap();
+        assert_eq!(hot.status(), 200);
+        let hot = hot.text().await.unwrap();
+
+        // Exactly one capacity's worth of newer finished jobs displaces it.
+        for i in 0..DEFAULT_JOB_CACHE_CAPACITY {
+            state
+                .jobs
+                .upsert(persisted_job(&format!("filler{i}"), "succeeded"))
+                .await;
+        }
+        assert!(
+            state.jobs.get("job_evicted").await.is_none(),
+            "the record under test must actually have been evicted"
+        );
+
+        // The cold answer, through the durable fallback. This read opens the
+        // store and so races the server's spawned `recompile()` — the same
+        // contention `job_interrupted_by_restart_is_swept_to_failed` documents.
+        let cold = get_retrying_on_busy(&format!("{base}/api/v1/jobs/job_evicted")).await;
+        assert_eq!(cold.status(), 200);
+        assert_eq!(
+            cold.text().await.unwrap(),
+            hot,
+            "a cache miss must return exactly what the hit returned"
+        );
     }
 
     // --- Route-table ↔ router anti-drift probes (FIX for silent drift) ---
