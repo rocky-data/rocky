@@ -23,10 +23,10 @@
     {
       "severity": "Warning",
       "code": "W032",
-      "message": "column 'amount' has no inferred type, so the contract's expected type 'Decimal' could not be verified \u2014 unresolved evidence does not satisfy a contract. Warning in this release; error in the next",
+      "message": "2 contracted column(s) ('order_id', 'amount') could not be type-checked: no column in this model has an inferred type, so no expected type could be verified \u2014 unresolved evidence does not satisfy a contract. Warning in this release; error in the next",
       "span": null,
       "model": "broken_metrics",
-      "suggestion": "give `amount` a concrete type \u2014 an explicit CAST with declared precision and scale, e.g. CAST(amount AS DECIMAL(38,2)) \u2014 or compile with source schemas available so the type resolves"
+      "suggestion": "no column in this model resolved, which is what compiling with no source schemas looks like: run `rocky discover --with-schemas` (or any `rocky run`) to warm the schema cache this compile reads, and check `[cache.schemas] enabled` is not `false`. An explicit `CAST` only takes effect once the value being cast already has a known type, so on its own it does not repair this."
     },
     {
       "severity": "Error",
@@ -39,10 +39,10 @@
     {
       "severity": "Warning",
       "code": "W032",
-      "message": "column 'amount' has no inferred type, so the contract's expected type 'Decimal' could not be verified \u2014 unresolved evidence does not satisfy a contract. Warning in this release; error in the next",
+      "message": "3 contracted column(s) ('order_id', 'customer_id', 'amount') could not be type-checked: no column in this model has an inferred type, so no expected type could be verified \u2014 unresolved evidence does not satisfy a contract. Warning in this release; error in the next",
       "span": null,
       "model": "good_metrics",
-      "suggestion": "give `amount` a concrete type \u2014 an explicit CAST with declared precision and scale, e.g. CAST(amount AS DECIMAL(38,2)) \u2014 or compile with source schemas available so the type resolves"
+      "suggestion": "no column in this model resolved, which is what compiling with no source schemas looks like: run `rocky discover --with-schemas` (or any `rocky run`) to warm the schema cache this compile reads, and check `[cache.schemas] enabled` is not `false`. An explicit `CAST` only takes effect once the value being cast already has a known type, so on its own it does not repair this."
     }
   ],
   "has_errors": true,
