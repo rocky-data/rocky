@@ -109,17 +109,19 @@ pub const DEFAULT_JOB_CACHE_CAPACITY: usize = 512;
 ///
 /// `rocky serve --scheduler` runs indefinitely and submits a job per scheduled
 /// fire, so retaining every record would grow the process without limit. The
-/// cache therefore holds at most [`DEFAULT_JOB_CACHE_CAPACITY`] records and
-/// evicts in finish order beyond that — a **count** bound rather than an age
-/// window, because an age window still grows without limit whenever the job rate
-/// rises.
+/// cache therefore retains at most [`DEFAULT_JOB_CACHE_CAPACITY`] *finished*
+/// records, evicting in the order records became evictable — a **count** bound
+/// rather than an age window, because an age window still grows without limit
+/// whenever the job rate rises.
 ///
-/// The cap is on retained *history*. Records still in flight are exempt (below),
-/// so the true ceiling is the cap plus however many jobs are running at once —
-/// and since `plan` submissions take no mutation permit, that second term is set
-/// by how many jobs the server is asked to run concurrently, not by uptime. That
-/// is the deliberate trade: history is what grew without bound, and concurrency
-/// is bounded by the work actually in flight.
+/// Read that bound precisely: it caps retained **history**, which is the term
+/// that grew with uptime. Records still in flight are exempt (below), so the
+/// cache's actual size is the cap plus however many jobs are in flight, and
+/// since `plan` submissions take no mutation permit, that second term is set by
+/// how many jobs the server is asked to run at once. It is bounded by work
+/// actually running — each in-flight record owns a live subprocess — but it is
+/// not bounded by this constant, and admission control on job submission is a
+/// separate concern this cache cannot supply.
 ///
 /// Two properties make eviction safe:
 ///
@@ -189,22 +191,26 @@ struct Cache {
     /// finished more than once, and duplicates are only reclaimed while the map
     /// is over capacity — so a workload that recycles a job id without
     /// introducing new ones would grow the queue forever. With it, an id is
-    /// queued at most once, ids leave the queue only when they leave
-    /// [`Cache::records`] or go back in flight, and so the queue can never index
-    /// more than the (capped) map holds.
+    /// queued at most once, an id is removed from both together whenever the
+    /// queue is popped, and nothing is queued that is not also in
+    /// [`Cache::records`] — so the queue can never index more than the map
+    /// holds.
     queued: HashSet<String>,
     /// The maximum number of records to retain, at least one.
     capacity: usize,
 }
 
 impl Cache {
-    /// Evict finished records, least recently finished first, until the map is
-    /// within capacity.
+    /// Evict finished records, in the order they became evictable, until the map
+    /// is within capacity.
     ///
     /// Stops early when nothing is evictable — every remaining record is in
-    /// flight, and not disturbing live work outranks the bound. That overflow is
-    /// bounded by how many jobs run concurrently rather than by uptime, so it
-    /// cannot grow with time the way unbounded history did.
+    /// flight, and not disturbing live work outranks the bound. What is left
+    /// over is then one record per job actually running, which is a different
+    /// quantity from the retained history this bound exists to cap: it rises and
+    /// falls with concurrent work instead of accumulating with uptime. It is not
+    /// itself capped here, and cannot be — refusing to cache a job the server
+    /// agreed to run would be the wrong layer to say no at.
     fn evict_to_capacity(&mut self) {
         while self.records.len() > self.capacity {
             let Some(job_id) = self.evictable.pop_front() else {
@@ -279,6 +285,16 @@ impl JobRegistry {
     /// how embedders poll — submit, poll until terminal, stop.
     pub async fn get(&self, job_id: &str) -> Option<PersistedJob> {
         self.inner.read().await.records.get(job_id).cloned()
+    }
+
+    /// How many records are currently cached.
+    ///
+    /// The capacity bound is only worth as much as it is checkable, and the
+    /// interesting assertions live outside this crate — that abandoning a
+    /// submission caches nothing, and that a workload cannot push the cache past
+    /// its bound. Both need the count rather than a per-id lookup.
+    pub async fn entry_count(&self) -> usize {
+        self.inner.read().await.records.len()
     }
 }
 
