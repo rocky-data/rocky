@@ -40,6 +40,6 @@ pub use reconcile::{
 pub use record::{ScheduleStateMutation, ScheduleStateRecord, Throttle};
 pub use spawn::{
     CapturingSpawner, DEFAULT_DRAIN_TIMEOUT, Drain, RunOutcome, RunTriggerKind, SpawnRequest,
-    Spawner, SubprocessSpawner,
+    Spawner, SubprocessSpawner, TraceContext,
 };
 pub use spool::{AcceptOutcome, PendingDemand, WebhookKind, accept, spool_dir};

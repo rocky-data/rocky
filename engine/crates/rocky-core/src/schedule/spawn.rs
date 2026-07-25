@@ -91,9 +91,9 @@ pub struct SpawnRequest {
     /// The submission id passed as `ROCKY_SUBMISSION_ID`, stamped by the child
     /// into its run record.
     pub submission_id: String,
-    /// The W3C `traceparent` for the child's `TRACEPARENT`, connecting the tick
-    /// span to the run's trace. `None` when tracing is not active.
-    pub traceparent: Option<String>,
+    /// The W3C trace context stamped on the child, connecting the tick span to
+    /// the run's trace. `None` when tracing is not active.
+    pub trace_context: Option<TraceContext>,
     /// Scheduler-level timeout, when configured. On elapse the child is
     /// terminated gracefully, then forcibly.
     pub timeout: Option<Duration>,
@@ -101,6 +101,24 @@ pub struct SpawnRequest {
     /// `"schedule"` for a cron/`after`/freshness demand, `"webhook"` for a
     /// webhook-ingress demand.
     pub trigger: RunTriggerKind,
+}
+
+/// The W3C trace context handed to a spawned child.
+///
+/// The two values travel together because `tracestate` is scoped to the trace
+/// `traceparent` names: stamping one while the child inherits an unrelated
+/// other is a spec violation that can carry a foreign vendor sampling key into
+/// this trace. Keeping them in one optional field makes that state
+/// unrepresentable rather than merely discouraged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceContext {
+    /// The `traceparent` value for the child's `TRACEPARENT`.
+    pub traceparent: String,
+    /// The `tracestate` value for the child's `TRACESTATE`, when the described
+    /// span carries vendor state. `None` clears whatever this process
+    /// inherited, rather than leaving it paired with the `traceparent` above —
+    /// see how [`SubprocessSpawner`] builds the child's environment.
+    pub tracestate: Option<String>,
 }
 
 /// The trigger a spawned run records — the child maps this to its
@@ -156,7 +174,7 @@ pub trait Spawner: Send + Sync {
 const KILL_GRACE: Duration = Duration::from_secs(60);
 
 /// The real spawner: launches `current_exe -c <config> run --pipeline <name>
-/// --output json` with the tick's `TRACEPARENT`, the request's
+/// --output json` with the tick's trace context, the request's
 /// `ROCKY_RUN_TRIGGER` (`schedule` or `webhook`), and `ROCKY_SUBMISSION_ID`,
 /// honoring the scheduler-level timeout with a graceful-then-forced termination.
 #[derive(Debug, Default)]
@@ -210,8 +228,19 @@ impl SubprocessSpawner {
             .arg("json")
             .env("ROCKY_RUN_TRIGGER", request.trigger.as_env())
             .env("ROCKY_SUBMISSION_ID", &request.submission_id);
-        if let Some(tp) = &request.traceparent {
-            cmd.env("TRACEPARENT", tp);
+        if let Some(cx) = &request.trace_context {
+            cmd.env("TRACEPARENT", &cx.traceparent);
+            // Stamp the whole pair. A `TRACESTATE` this process inherited
+            // belongs to the trace ITS `TRACEPARENT` named, not the one just
+            // stamped, and the child reads both — so when the context we
+            // describe carries no vendor state, the inherited value is removed
+            // rather than left mispaired. When there is nothing to stamp at all
+            // (the one-shot `rocky tick`), neither variable is touched, so an
+            // ambient pair reaches the child intact and consistent.
+            match &cx.tracestate {
+                Some(ts) => cmd.env("TRACESTATE", ts),
+                None => cmd.env_remove("TRACESTATE"),
+            };
         }
         cmd
     }
@@ -464,7 +493,7 @@ mod tests {
             config_path: PathBuf::from("/proj/rocky.toml"),
             state_path: PathBuf::from("/proj/models/.rocky-state.redb"),
             submission_id: "sub-1".to_string(),
-            traceparent: None,
+            trace_context: None,
             timeout: None,
             trigger: RunTriggerKind::Schedule,
         };
@@ -489,7 +518,7 @@ mod tests {
             config_path: PathBuf::from("/proj/rocky.toml"),
             state_path: PathBuf::from("/proj/models/.rocky-state.redb"),
             submission_id: "sub-1".to_string(),
-            traceparent: None,
+            trace_context: None,
             timeout: None,
             trigger: RunTriggerKind::Schedule,
         };
@@ -533,7 +562,7 @@ mod tests {
                 config_path: PathBuf::from("/proj/rocky.toml"),
                 state_path: PathBuf::from("/proj/models/.rocky-state.redb"),
                 submission_id: "sub-1".to_string(),
-                traceparent: None,
+                trace_context: None,
                 timeout: None,
                 trigger: kind,
             };
@@ -550,6 +579,70 @@ mod tests {
                 "ROCKY_RUN_TRIGGER for {kind:?}"
             );
         }
+    }
+
+    /// The child's `TRACEPARENT`/`TRACESTATE` must always describe ONE trace.
+    /// The three cases that can arise, each checked at the env boundary:
+    /// a context without vendor state clears whatever this process inherited
+    /// (mispairing it would carry a foreign sampling key into our trace, which
+    /// W3C forbids); a context WITH vendor state stamps the pair; and nothing
+    /// to stamp leaves an ambient pair untouched.
+    #[test]
+    fn the_child_never_receives_a_mismatched_trace_context() {
+        fn env_of(cmd: &tokio::process::Command, key: &str) -> Option<Option<String>> {
+            cmd.as_std()
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(key))
+                .map(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+        }
+
+        const TP: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let base = SpawnRequest {
+            pipeline: "raw".to_string(),
+            config_path: PathBuf::from("/proj/rocky.toml"),
+            state_path: PathBuf::from("/proj/models/.rocky-state.redb"),
+            submission_id: "sub-1".to_string(),
+            trace_context: None,
+            timeout: None,
+            trigger: RunTriggerKind::Schedule,
+        };
+
+        // 1. Our context carries no vendor state ⇒ an inherited one is removed.
+        let no_vendor_state = SpawnRequest {
+            trace_context: Some(TraceContext {
+                traceparent: TP.to_string(),
+                tracestate: None,
+            }),
+            ..base.clone()
+        };
+        let cmd = SubprocessSpawner::build_command(&no_vendor_state);
+        assert_eq!(env_of(&cmd, "TRACEPARENT"), Some(Some(TP.to_string())));
+        assert_eq!(
+            env_of(&cmd, "TRACESTATE"),
+            Some(None),
+            "TRACESTATE must be explicitly removed, not left inherited"
+        );
+
+        // 2. Our context carries vendor state ⇒ the pair travels together.
+        let with_vendor_state = SpawnRequest {
+            trace_context: Some(TraceContext {
+                traceparent: TP.to_string(),
+                tracestate: Some("vendor=abc,other=1".to_string()),
+            }),
+            ..base.clone()
+        };
+        let cmd = SubprocessSpawner::build_command(&with_vendor_state);
+        assert_eq!(env_of(&cmd, "TRACEPARENT"), Some(Some(TP.to_string())));
+        assert_eq!(
+            env_of(&cmd, "TRACESTATE"),
+            Some(Some("vendor=abc,other=1".to_string())),
+            "our own vendor state must reach the child, not be dropped"
+        );
+
+        // 3. Nothing to stamp ⇒ an ambient pair reaches the child intact.
+        let cmd = SubprocessSpawner::build_command(&base);
+        assert_eq!(env_of(&cmd, "TRACEPARENT"), None);
+        assert_eq!(env_of(&cmd, "TRACESTATE"), None);
     }
 
     #[test]

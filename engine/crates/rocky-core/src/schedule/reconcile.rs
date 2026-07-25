@@ -85,9 +85,9 @@ pub struct TickOptions {
     pub config_path: PathBuf,
     /// The `.rocky` directory that holds the tick lock and its heartbeat.
     pub rocky_dir: PathBuf,
-    /// The tick span's `traceparent`, propagated to each child so the run's own
-    /// trace connects to the tick. `None` when tracing is inactive.
-    pub traceparent: Option<String>,
+    /// The tick span's W3C trace context, propagated to each child so the run's
+    /// own trace connects to the tick. `None` when tracing is inactive.
+    pub trace_context: Option<crate::schedule::TraceContext>,
     /// Per-pipeline member-model freshness budgets, in seconds. Each entry
     /// holds the `max_lag_seconds` of a pipeline's member models that declare
     /// one; freshness resolution takes the MIN (the tightest budget wins),
@@ -1040,7 +1040,7 @@ async fn execute_claimed(
             config_path: opts.config_path.clone(),
             state_path: opts.state_path.clone(),
             submission_id: submission_id.clone(),
-            traceparent: opts.traceparent.clone(),
+            trace_context: opts.trace_context.clone(),
             timeout: schedule.timeout.map(to_std_timeout),
             trigger: RunTriggerKind::for_source(demand.source),
         };
@@ -1514,7 +1514,7 @@ cron = "also invalid"
             pipeline_filter: None,
             config_path: dir.path().join("rocky.toml"),
             rocky_dir: dir.path().join(".rocky"),
-            traceparent: None,
+            trace_context: None,
             member_budgets: BTreeMap::new(),
             state_path: state_path.clone(),
             drain: Drain::default(),

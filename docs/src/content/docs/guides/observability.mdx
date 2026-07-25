@@ -26,6 +26,7 @@ Spans are created around the phases of a run, so a trace reads as the shape of t
 
 | Span | Emitted by | What it covers |
 |---|---|---|
+| `run` | `rocky run` | the whole run, carrying the `run_id` — the root of a run's trace unless an upstream context was supplied |
 | `discover_sources` | source discovery | resolving configured sources before planning (an entered span — it parents the discovery work) |
 | `materialize.table` | model execution | building one model; one span per model, carrying `rocky.model.fqn` and `rocky.model.kind` |
 | `statement.execute` | warehouse adapter | one SQL statement sent to the warehouse |
@@ -37,9 +38,27 @@ When Rocky drives a warehouse, the `statement.execute` spans nest under the `mat
 A few honest limits worth knowing:
 
 - **`statement.execute` spans come from the warehouse adapters.** The Databricks, Snowflake, BigQuery, and Trino adapters emit them. The embedded DuckDB engine runs statements in-process and does not, so local DuckDB runs show model-level spans but no per-statement spans. The `rocky.adapter.name`, `rocky.statement.kind`, and `rocky.warehouse.name` attributes are carried by the Databricks, Snowflake, and BigQuery spans; Trino emits a simpler `statement.execute` span (and a separate `statement.execute_arrow` span on its Arrow path).
-- **`scheduler.tick` comes from the resident scheduler, not a run.** It is emitted once per poll interval by `rocky serve --scheduler` (experimental), so it is its own trace root rather than a child of a `run` span. Each pass records its outcome and counts even when nothing ran, so an idle loop and a wedged one stay distinguishable in the trace.
+- **`scheduler.tick` comes from the resident scheduler, not a run.** It is emitted once per poll interval by `rocky serve --scheduler` (experimental), so it is its own trace root rather than a child of a `run` span — the runs it launches hang off it, not the other way around. Each pass records its outcome and counts even when nothing ran, so an idle loop and a wedged one stay distinguishable in the trace.
 - **`rocky.query_duration_ms` is populated by the Databricks adapter today.** Other adapters record their statement spans without feeding that metric yet.
 - **`governance_setup` and `batched_checks` are marker spans.** They are declared to delimit the governance and quality-check phases, but they do not currently parent the events emitted during those phases (those events stay at the root of the trace). Treat them as phase markers, not as subtrees.
+
+### Connected traces
+
+Rocky speaks the W3C trace context convention in both directions, through the `TRACEPARENT` environment variable.
+
+**Inbound.** When `TRACEPARENT` is set in a Rocky process's environment, the root spans that process opens become children of the span it names, so the run appears inside the caller's trace rather than starting a new one. That is what connects `rocky serve --scheduler` (experimental) to what it runs: each `scheduler.tick` describes itself, hands the value to the `rocky run` child it launches, and the child's `run` span lands under that tick. One trace then answers both "what did this run do?" and "what decided to run it?".
+
+**Outbound.** The same variable is how anything else hands Rocky a trace to join. A CI job, a shell wrapper, or an orchestrator that exports `TRACEPARENT` before invoking Rocky gets its spans nested under its own — Rocky exports observability rather than owning it, so it joins whatever trace it is given.
+
+Worth knowing before you turn it on:
+
+- **Any invocation is affected, not just scheduler children.** If `TRACEPARENT` is exported in an environment, every Rocky command launched there roots its trace under it — `run`, `compile`, `plan`, and the rest. Unset it (or unset it for a specific invocation) when you want an independent trace. A command that keeps working after it starts (`rocky run --watch`) holds the parent it was launched with, so every one of its iterations lands in that same trace.
+- **In-process background work opens its own trace.** Spans a command emits from a spawned task do not join: the resident scheduler's own loop, the periodic state uploader, and the replication path's per-table spans (which already root themselves today, independent of the `run` span). So a connected trace shows the run, not necessarily every span the process emits. Subprocesses are the opposite case — they inherit the environment, so they adopt the same context: a job submitted to `rocky serve` does its work in a child `rocky run`, which means **every job a server runs joins the trace that server was launched with**. Start a long-lived `rocky serve` with `TRACEPARENT` exported and every job it ever runs reports under that one launch-time span; unset the variable for the server process if you want each job to trace independently.
+- **An upstream sampling decision now applies to the spans that inherit it.** Rocky samples with `ParentBased(AlwaysOn)`, so a `TRACEPARENT` whose flags say "not sampled" (ending in `-00`) drops the `run` span and everything nested under it. The self-rooting spans in the bullet above are sampled on their own and still export, so a not-sampled upstream quietens a run's trace rather than guaranteeing silence — on a replication run you will still see the per-table spans. The run itself is unaffected either way: it executes normally, only what gets exported changes.
+- **A malformed value is ignored.** A truncated or corrupted `TRACEPARENT` never fails a command; the process simply roots its own trace, exactly as if the variable were unset.
+- **The Dagster integration does not set `TRACEPARENT` today.** A Dagster-launched Rocky run joins Dagster's trace only if something upstream of the process (the run launcher's environment, for instance) exports it.
+
+Inbound context needs OTLP export configured to be visible: without `OTEL_EXPORTER_OTLP_ENDPOINT` there is no exporter, so there is nothing to connect and nothing is emitted.
 
 ### Metrics
 

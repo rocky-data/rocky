@@ -116,13 +116,16 @@ pub async fn run_tick(
         pipeline_filter: pipeline,
         config_path: config_path.to_path_buf(),
         rocky_dir,
-        // Connected orchestrator→engine tracing is still blocked on the CHILD
-        // side: `extract_remote_context` has no call site at the `rocky run`
-        // entry point, so a `TRACEPARENT` handed to the child is not read and
-        // its run trace stands alone. (`serve --scheduler` does emit a
-        // `scheduler.tick` span; `rocky tick` is one-shot and has no loop to
-        // anchor one to.)
-        traceparent: None,
+        // Deliberately `None`, unlike `serve --scheduler`. A one-shot tick has
+        // no span of its own to attribute a child to (there is no resident
+        // loop to anchor one to), so there is nothing here to describe. It
+        // costs nothing: with no context to stamp, the spawner leaves the
+        // child's trace-context environment untouched, so an ambient
+        // `TRACEPARENT`/`TRACESTATE` pair — exported by the cron wrapper, CI
+        // job, or orchestrator that invoked `rocky tick` — is inherited intact
+        // by the child and adopted there. Stamping a value here would only
+        // overwrite that inherited context with a less specific one.
+        trace_context: None,
         member_budgets,
         state_path: state_path.clone(),
         // `rocky tick` is one-shot: there is no resident loop to drain, so the

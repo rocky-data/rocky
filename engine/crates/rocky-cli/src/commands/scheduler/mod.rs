@@ -290,12 +290,13 @@ async fn run_one_tick(
         pipeline_filter: None,
         config_path: config_path.to_path_buf(),
         rocky_dir: rocky_dir.to_path_buf(),
-        // The `scheduler.tick` span above exists, but the child does NOT
-        // consume `TRACEPARENT`: `extract_remote_context` has no call site at
-        // the `rocky run` entry point, so a populated value would be an env
-        // var nothing reads. This stays `None` until the child side lands —
-        // setting it earlier would make propagation look wired when it is not.
-        traceparent: None,
+        // Describe the `scheduler.tick` span above so each child `rocky run`
+        // adopts it as its parent (the child reads `TRACEPARENT` at startup),
+        // and one trace covers the tick and everything it ran. `None` when
+        // there is no span context to propagate — no OTLP endpoint configured,
+        // or a build without the `otel` feature — in which case the child is
+        // handed nothing and self-roots, exactly as before.
+        trace_context: tick_trace_context(),
         member_budgets,
         state_path: state_path.to_path_buf(),
         // The shutdown signal doubles as the tick's drain: raised mid-tick, the
@@ -319,6 +320,21 @@ async fn run_one_tick(
             false
         }
     }
+}
+
+/// The trace context describing the enclosing `scheduler.tick` span, in the
+/// shape the reconciler hands to a child process.
+///
+/// The one place the observability layer's view of "the span I am in" is
+/// adapted to the scheduler's transport — `rocky-core` carries the values and
+/// never links OTel, `rocky-observe` knows the span and never knows about
+/// spawning, and this CLI crate depends on both.
+fn tick_trace_context() -> Option<rocky_core::schedule::TraceContext> {
+    let cx = rocky_observe::tracing_setup::current_trace_context()?;
+    Some(rocky_core::schedule::TraceContext {
+        traceparent: cx.traceparent,
+        tracestate: cx.tracestate,
+    })
 }
 
 /// Why a tick ended.
@@ -797,6 +813,143 @@ cron = "* * * * *"
         assert!(
             !spans[0].contains_key(span_attrs::SCHEDULER_DUE),
             "counts must be absent when the tick never reconciled",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Connected trace: `scheduler.tick` → the child `rocky run`
+    // ---------------------------------------------------------------------
+
+    use rocky_observe::tracing_setup::testing::{CapturedSpan, TraceHarness};
+
+    /// Drive `ticks` inline reconciliation passes with an in-memory OTel
+    /// tracer installed, returning the spans it exported and every spawn
+    /// request the reconciler issued.
+    ///
+    /// Inline rather than through `run_scheduler` for the same reason as
+    /// [`capture_one_tick`]: the loop spawns, and both the subscriber and the
+    /// adopted trace context are thread-local.
+    async fn drive_ticks_with_tracing(
+        config: &str,
+        ticks: usize,
+        harness: &TraceHarness,
+    ) -> Vec<SpawnRequest> {
+        let (dir, config_path) = temp_project(config);
+        let state = test_state(dir.path());
+        let spawner = Arc::new(CapturingSpawner::new(0));
+        let shutdown = Drain::new();
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+        let state_path = dir.path().join(".rocky-state.redb");
+        let rocky_dir = dir.path().join(".rocky");
+
+        let _subscriber = tracing::subscriber::set_default(harness.subscriber());
+        for i in 0..ticks {
+            if i > 0 {
+                clock.advance(60);
+            }
+            run_one_tick(
+                &state,
+                &config_path,
+                &state_path,
+                &rocky_dir,
+                clock.as_ref(),
+                &shutdown,
+                spawner.as_ref(),
+                &SchedulerMetrics::disabled(),
+            )
+            .await;
+        }
+        drop(_subscriber);
+
+        spawner.captured().into_iter().map(|c| c.request).collect()
+    }
+
+    /// A tick that runs a pipeline hands the child a `TRACEPARENT` describing
+    /// the `scheduler.tick` span that decided to run it. Without it the child's
+    /// trace stands alone and "what ran this?" is unanswerable from the trace.
+    #[tokio::test]
+    async fn a_spawned_run_carries_the_tick_span_traceparent() {
+        let harness = TraceHarness::new();
+        // Tick 1 anchors the every-minute cron; tick 2 (clock +60s) fires it.
+        let requests = drive_ticks_with_tracing(CRON_EVERY_MINUTE, 2, &harness).await;
+
+        let request = requests.first().expect("the second tick fires one run");
+        let cx = request
+            .trace_context
+            .as_ref()
+            .expect("a spawned run must carry the tick's trace context");
+        let traceparent = cx.traceparent.as_str();
+        assert_eq!(
+            cx.tracestate, None,
+            "the tick carries no vendor state, so none is stamped"
+        );
+
+        let parts: Vec<&str> = traceparent.split('-').collect();
+        assert_eq!(
+            parts.len(),
+            4,
+            "W3C traceparent has 4 fields: {traceparent}"
+        );
+        assert_eq!(parts[0], "00", "version must be 00: {traceparent}");
+        assert_eq!(parts[1].len(), 32, "trace id is 32 hex: {traceparent}");
+        assert_eq!(parts[2].len(), 16, "span id is 16 hex: {traceparent}");
+        assert_eq!(
+            parts[3], "01",
+            "the tick is sampled, so the child must be told so: {traceparent}"
+        );
+
+        let spans = harness.spans();
+        let named: &CapturedSpan = spans
+            .iter()
+            .find(|s| s.name == "scheduler.tick" && s.span_id == parts[2])
+            .expect("the traceparent must name a `scheduler.tick` span of this process");
+        assert_eq!(
+            parts[1], named.trace_id,
+            "the child is pointed at the tick's own trace"
+        );
+    }
+
+    /// With no OTel layer registered — the default, since export only turns on
+    /// with `OTEL_EXPORTER_OTLP_ENDPOINT` — there is no span context to
+    /// propagate, so the child is handed nothing rather than a fabricated
+    /// (all-zero, W3C-invalid) parent.
+    #[tokio::test]
+    async fn without_otel_the_child_is_handed_no_traceparent() {
+        let (dir, config_path) = temp_project(CRON_EVERY_MINUTE);
+        let state = test_state(dir.path());
+        let spawner = Arc::new(CapturingSpawner::new(0));
+        let shutdown = Drain::new();
+        let clock = FakeClock::new(at(2026, 5, 2, 3, 0));
+        let state_path = dir.path().join(".rocky-state.redb");
+        let rocky_dir = dir.path().join(".rocky");
+
+        let _subscriber = tracing::subscriber::set_default(tracing_subscriber::registry());
+        for i in 0..2 {
+            if i > 0 {
+                clock.advance(60);
+            }
+            run_one_tick(
+                &state,
+                &config_path,
+                &state_path,
+                &rocky_dir,
+                clock.as_ref(),
+                &shutdown,
+                spawner.as_ref(),
+                &SchedulerMetrics::disabled(),
+            )
+            .await;
+        }
+        drop(_subscriber);
+
+        let captured = spawner.captured();
+        let request = &captured
+            .first()
+            .expect("the second tick fires one run")
+            .request;
+        assert_eq!(
+            request.trace_context, None,
+            "no tracer ⇒ no trace context, not a fabricated one"
         );
     }
 

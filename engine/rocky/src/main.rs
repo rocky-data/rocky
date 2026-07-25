@@ -2866,6 +2866,17 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
     // `run_async`; dropping it earlier loses the final batch on exit.
     let _tracing_guard = rocky_observe::tracing_setup::init_tracing(json);
 
+    // Adopt an upstream `TRACEPARENT`, when one was handed to this process, as
+    // the parent of the root spans opened below — so a `rocky run` spawned by
+    // `rocky serve --scheduler` reports inside the `scheduler.tick` trace
+    // rather than as an unrelated one, and so does any invocation an
+    // orchestrator or CI job launches with the variable exported. Must be
+    // bound (not discarded): the context stays installed only while the guard
+    // lives, and the root spans are opened by the dispatch below. Inert
+    // without `TRACEPARENT`, on a malformed value, and in a build without the
+    // `otel` feature — never a failure, always a self-rooted trace.
+    let _remote_parent = rocky_observe::tracing_setup::adopt_remote_parent();
+
     let config_path = cli.config.clone();
 
     // Resolve `--state-path` once so every command below sees the same

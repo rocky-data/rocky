@@ -10627,8 +10627,10 @@ mod tests {
     use super::*;
     use rocky_core::plan_partition::PartitionSelection;
 
-    // Serializes the process-global env-var mutations in the trigger-threading
-    // tests below (env is shared across the test binary's threads).
+    // Serializes the process-global env-var mutations in this module's tests —
+    // the trigger-threading ones below and the `TRACEPARENT` adoption ones
+    // further down (env is shared across the test binary's threads, so one
+    // lock has to cover every variable, not one lock per variable).
     static TRIGGER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A fault-injecting `WarehouseAdapter` that wraps a real in-memory DuckDB
@@ -11766,6 +11768,158 @@ adapter = "default"
              Succeeded, not leave the InFlight claim for the TTL sweep to reap \
              (FR-004 F2 regression guard)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Connected trace: `run`'s root span adopts an upstream `TRACEPARENT`.
+    //
+    // This is the consumer half of the `scheduler.tick → run` trace. The
+    // producer (`commands::scheduler`) stamps the tick's traceparent on the
+    // child's environment; here the child adopts it, so both halves are
+    // asserted against the real `run` span rather than a stand-in.
+    // -----------------------------------------------------------------------
+
+    /// The smallest config that drives `run()` to completion without
+    /// credentials: a transformation pipeline over a models directory that
+    /// does not exist warns and succeeds.
+    const TRACE_TEST_CONFIG: &str = r#"
+[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[state]
+backend = "local"
+
+[pipeline.t]
+type = "transformation"
+models = "models_nonexistent/**"
+
+[pipeline.t.target]
+adapter = "default"
+"#;
+
+    /// Drive `run()` to completion with `TRACEPARENT` set to `traceparent`
+    /// (or unset when `None`), returning the run's exported root span.
+    ///
+    /// Synchronous, driving its own runtime: the env lock has to be held for
+    /// the whole run (the variable is process-global), and the run span has to
+    /// be created on the thread holding the adopted context — the same
+    /// relationship `main`'s `block_on` has with the CLI's root spans.
+    fn run_with_traceparent(
+        traceparent: Option<&str>,
+    ) -> rocky_observe::tracing_setup::testing::CapturedSpan {
+        use rocky_observe::tracing_setup::testing::TraceHarness;
+
+        let _env = TRIGGER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior = std::env::var_os("TRACEPARENT");
+        // SAFETY: serialized by TRIGGER_ENV_LOCK, this module's env lock.
+        unsafe {
+            match traceparent {
+                Some(tp) => std::env::set_var("TRACEPARENT", tp),
+                None => std::env::remove_var("TRACEPARENT"),
+            }
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(&config_path, TRACE_TEST_CONFIG).expect("write rocky.toml");
+        let state_path = tmp.path().join("state.redb");
+
+        let harness = TraceHarness::new();
+        {
+            let _subscriber = tracing::subscriber::set_default(harness.subscriber());
+            // Exactly what `main` does, and the only thing that re-parents the
+            // `run` span below.
+            let _remote_parent = rocky_observe::tracing_setup::adopt_remote_parent();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            rt.block_on(super::run(
+                &config_path,
+                std::sync::Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+                ),
+                None,
+                None,
+                &state_path,
+                None,
+                false,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                None,
+                None,
+                false,
+            ))
+            .expect("the run must succeed regardless of the trace context");
+        }
+
+        // SAFETY: still under TRIGGER_ENV_LOCK.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TRACEPARENT", v),
+                None => std::env::remove_var("TRACEPARENT"),
+            }
+        }
+        harness
+            .only_span("run")
+            .expect("the run exports exactly one root `run` span")
+    }
+
+    /// With an upstream `TRACEPARENT` set — what `serve --scheduler` puts in a
+    /// spawned child's environment — the run's root span joins that trace as a
+    /// child of the upstream span, instead of opening one of its own.
+    #[test]
+    fn a_run_adopts_an_upstream_traceparent() {
+        let run = run_with_traceparent(Some(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        ));
+        assert_eq!(
+            run.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736",
+            "the run must land in the upstream trace"
+        );
+        assert_eq!(
+            run.parent_span_id, "00f067aa0ba902b7",
+            "the run must hang off the upstream span"
+        );
+    }
+
+    /// No `TRACEPARENT`: unchanged behaviour — the run opens its own trace.
+    #[test]
+    fn a_run_without_a_traceparent_self_roots() {
+        assert_eq!(
+            run_with_traceparent(None).parent_span_id,
+            "0000000000000000",
+            "an un-parented run must root its own trace"
+        );
+    }
+
+    /// A garbage `TRACEPARENT` — a truncated value, a hostile one, an
+    /// orchestrator bug — must never fail the run. It is ignored and the run
+    /// self-roots exactly as if the variable were unset.
+    #[test]
+    fn a_run_ignores_a_malformed_traceparent() {
+        for garbage in ["not-a-traceparent", "00-deadbeef-01", "00-"] {
+            assert_eq!(
+                run_with_traceparent(Some(garbage)).parent_span_id,
+                "0000000000000000",
+                "a malformed traceparent ({garbage:?}) must leave the run self-rooted"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
