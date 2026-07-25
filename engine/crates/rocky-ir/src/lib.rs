@@ -52,7 +52,8 @@ pub use lineage::{LineageEdge, QualifiedColumn};
 pub use mask::MaskStrategy;
 pub use time_grain::TimeGrain;
 pub use types::{
-    DecimalOp, MAX_DECLARED_PRECISION, MAX_INFERRED_PRECISION, RockyType, StructField, TypedColumn,
-    arithmetic_result_type, common_supertype, decimal_from_parts, decimal_parts_of, is_assignable,
-    validate_decimal_params,
+    ContractVerdict, DecimalOp, MAX_DECLARED_PRECISION, MAX_INFERRED_PRECISION, RockyType,
+    StructField, TypedColumn, UNVERIFIABLE_POLICY, UnverifiablePolicy, arithmetic_result_type,
+    common_supertype, common_supertype_of, contract_verdict, decimal_from_parts, decimal_parts_of,
+    is_assignable, validate_decimal_params,
 };

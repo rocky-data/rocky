@@ -446,6 +446,161 @@ pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<RockyType> {
     }
 }
 
+/// Unify a **set** of branch types — `COALESCE`, `CASE`, `GREATEST`, `LEAST`.
+///
+/// Order-independent by construction: every step is a function of the multiset
+/// (`all` / `any` / `max`), never of an accumulator, so permuting the branches
+/// cannot change the result. Pairwise reduction cannot achieve that once
+/// [`common_supertype`] has a cap: an intermediate that exceeds
+/// [`MAX_INFERRED_PRECISION`] is `Unknown`, and `Unknown` is the *bottom*
+/// element, so the next branch replaces it instead of absorbing it. Measured on
+/// the pairwise fold this replaces:
+///
+/// ```text
+/// COALESCE(DEC(30,0), DEC(30,30), DEC(5,2))  =>  DECIMAL(5,2)
+/// COALESCE(DEC(5,2),  DEC(30,0), DEC(30,30)) =>  ?
+/// ```
+///
+/// Three integer digits where the first branch alone needs thirty, and a
+/// different answer per argument order.
+///
+/// # What it guarantees, and what it does not
+///
+/// For a branch set that is entirely exact-numeric, the result contains **every**
+/// branch (`max_i ≥ i_k` and `max_s ≥ s_k` for all k) or is
+/// [`RockyType::Unknown`], which claims nothing. Order-independence holds for
+/// **every** input; containment holds for **exact-numeric sets only**. When any
+/// branch is a float the result is `Float64`, which cannot hold a
+/// `DECIMAL(30,30)` exactly — the pre-existing deliberate lossy arm that
+/// [`common_supertype`] already had, and every engine's answer for that
+/// expression. It is not a containment claim, and
+/// [`contract_verdict`]`(Decimal, Float64)` is [`ContractVerdict::Violated`], so
+/// it cannot become a false permit at a gate.
+///
+/// `Unknown` branches are dropped before unifying: an unresolved branch carries
+/// no constraint, and dropping it is what makes its *position* irrelevant. A set
+/// with no known branch is `Unknown`.
+pub fn common_supertype_of(branches: &[RockyType]) -> RockyType {
+    let known: Vec<&RockyType> = branches
+        .iter()
+        .filter(|t| **t != RockyType::Unknown)
+        .collect();
+    let Some(first) = known.first() else {
+        return RockyType::Unknown;
+    };
+    if known.iter().all(|t| *t == *first) {
+        // Set-wide form of `common_supertype`'s `a == b` short circuit: the
+        // unification of one repeated type is that type, whatever it is.
+        return (*first).clone();
+    }
+    if known.iter().all(|t| t.is_numeric()) {
+        if known.iter().any(|t| t.is_float()) {
+            // Matches every pairwise float arm: Float32 ⊔ Float64, Int ⊔ Float,
+            // and Float ⊔ Decimal all resolve to Float64.
+            return RockyType::Float64;
+        }
+        if known.iter().all(|t| t.is_integer()) {
+            // Not all equal, so this is Int32 ⊔ Int64.
+            return RockyType::Int64;
+        }
+        let (mut max_int_digits, mut max_scale) = (0u32, 0u32);
+        for ty in &known {
+            let Some((int_digits, scale)) = decimal_parts_of(ty) else {
+                // A malformed decimal cannot be reasoned about, and unlike the
+                // pairwise fold there is no accumulator for the next branch to
+                // overwrite it in.
+                return RockyType::Unknown;
+            };
+            max_int_digits = max_int_digits.max(int_digits);
+            max_scale = max_scale.max(scale);
+        }
+        // `Unknown` exactly when no representable common decimal exists.
+        return decimal_from_parts(max_int_digits, max_scale);
+    }
+    // Outside the numeric families the only cross-type unification
+    // `common_supertype` performs is the timestamp pair; every other mix is
+    // incompatible, which the pairwise fold also reported as `Unknown` (via
+    // `try_fold`'s `None` short circuit).
+    if known
+        .iter()
+        .all(|t| matches!(t, RockyType::Timestamp | RockyType::TimestampNtz))
+    {
+        return RockyType::Timestamp;
+    }
+    RockyType::Unknown
+}
+
+/// The verdict of a **governance** type check — a contract gate, not inference.
+///
+/// Three outcomes, not two, because "unresolved" is not "compatible".
+/// [`RockyType::Unknown`] is a valid conservative *inference* result, but at a
+/// validation gate an unresolved type is unresolved *evidence*, and evidence
+/// that has not been produced must not read as evidence of safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractVerdict {
+    /// Every value of the landed type is representable in the declared type.
+    Satisfied,
+    /// Some value of the landed type is not representable in the declared type.
+    Violated,
+    /// At least one side is [`RockyType::Unknown`], so containment cannot be
+    /// decided. **Not a permit.** How a gate acts on it is [`UnverifiablePolicy`].
+    Unverifiable,
+}
+
+/// How a governance gate acts on [`ContractVerdict::Unverifiable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnverifiablePolicy {
+    /// Report the diagnostic and permit. The migration phase.
+    Warn,
+    /// Report the diagnostic and reject.
+    Reject,
+}
+
+/// **THE MIGRATION SWITCH. Changing this one line is the entire flip.**
+///
+/// `Warn` → `Reject` makes an unresolved type at a contract gate fail closed.
+/// Nothing else changes: both gates already compute the
+/// [`ContractVerdict::Unverifiable`] verdict, already thread this policy, and
+/// already emit their diagnostic under both arms. Flipping it turns `W032` into
+/// `E037` at the compiler contract gate, and into a `ContractViolation` with
+/// rule `required_column_type_unverifiable` at the `rocky load` gate. Both arms
+/// are exercised by tests today (each gate's `*_with_policy` entry point takes
+/// the policy as an argument), so the rejecting behaviour is covered before it
+/// ships.
+///
+/// # When it flips
+///
+/// **Targeted for engine v1.69.0** — one minor release after the v1.68.0 that
+/// introduces it. This date is the forcing function: a warning that never
+/// becomes an error trains people to ignore it, at which point the gate is a
+/// permit with extra text. If v1.69.0 ships with this still on `Warn`, that is
+/// a decision someone has to make on the record, not a default that holds by
+/// nobody remembering.
+pub const UNVERIFIABLE_POLICY: UnverifiablePolicy = UnverifiablePolicy::Warn;
+
+/// Decide whether a landed/inferred type satisfies a declared contract type.
+///
+/// This is the **gate** predicate. [`is_assignable`] is the *inference-side*
+/// containment predicate and keeps `Unknown`-passes-everything, which is correct
+/// there and a false permit here: degrading a type to [`RockyType::Unknown`] at a
+/// validation gate is a fail-*open*, because `Unknown` satisfies
+/// [`is_assignable`] unconditionally in both directions.
+///
+/// Off the `Unknown` axis the two agree exactly —
+/// `contract_verdict(a, b) == Satisfied ⟺ is_assignable(a, b)` for every pair of
+/// known types (`test_contract_verdict_agrees_with_is_assignable_off_unknown`),
+/// so this splits one axis and freezes every other verdict.
+pub fn contract_verdict(landed: &RockyType, declared: &RockyType) -> ContractVerdict {
+    if *landed == RockyType::Unknown || *declared == RockyType::Unknown {
+        return ContractVerdict::Unverifiable;
+    }
+    if is_assignable(landed, declared) {
+        ContractVerdict::Satisfied
+    } else {
+        ContractVerdict::Violated
+    }
+}
+
 /// Check if a value of type `from` can be assigned to a column of type `to`.
 ///
 /// This is a **containment** predicate — *can every value of `from` be
@@ -489,8 +644,15 @@ pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<RockyType> {
 /// pinned against a frozen copy of the old rule over the full cross-product of
 /// non-decimal types.
 ///
-/// [`RockyType::Unknown`] on either side is assignable: an un-normalizable type
-/// is never a false failure (see `rocky_core::contracts`).
+/// # `Unknown` passes here, and that is why this must not be used at a gate
+///
+/// [`RockyType::Unknown`] on either side is assignable. That is correct for
+/// *inference* — an unresolved type is a missing constraint, not a violated one
+/// — and it is a **false permit** at a *validation* gate, where unresolved
+/// evidence would read as evidence of safety. Governance call sites must use
+/// [`contract_verdict`], which reports [`ContractVerdict::Unverifiable`] for the
+/// same inputs. This function keeps its own contract unchanged so inference and
+/// unification behave exactly as before.
 pub fn is_assignable(from: &RockyType, to: &RockyType) -> bool {
     if from == to || *from == RockyType::Unknown || *to == RockyType::Unknown {
         return true;
@@ -1010,6 +1172,265 @@ mod tests {
             common_supertype(&RockyType::String, &RockyType::Unknown),
             Some(RockyType::String)
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // T2.11–T2.15 — `common_supertype_of`, the set-wide fold
+    // ---------------------------------------------------------------------
+
+    /// The pairwise fold the four `typecheck.rs` sites used before
+    /// `common_supertype_of`, kept verbatim so the tests below can state what
+    /// changed rather than assert it.
+    fn pairwise_fold_frozen_old(branches: &[RockyType]) -> RockyType {
+        branches
+            .iter()
+            .try_fold(RockyType::Unknown, |acc, t| common_supertype(&acc, t))
+            .unwrap_or(RockyType::Unknown)
+    }
+
+    fn permutations(branches: &[RockyType]) -> Vec<Vec<RockyType>> {
+        if branches.len() <= 1 {
+            return vec![branches.to_vec()];
+        }
+        let mut out = Vec::new();
+        for i in 0..branches.len() {
+            let mut rest = branches.to_vec();
+            let head = rest.remove(i);
+            for mut permutation in permutations(&rest) {
+                permutation.insert(0, head.clone());
+                out.push(permutation);
+            }
+        }
+        out
+    }
+
+    /// The branch sets every fold test runs over. Each is a `COALESCE` /
+    /// `CASE` / `GREATEST` argument list that is legal SQL.
+    fn fold_corpus() -> Vec<(&'static str, Vec<RockyType>)> {
+        vec![
+            // The measured regression: pairwise gives DECIMAL(5,2) in one order
+            // and `?` in another, and DECIMAL(5,2) has three integer digits
+            // where the first branch alone needs thirty.
+            (
+                "dec30_dec30x30_dec5",
+                vec![dec(30, 0), dec(30, 30), dec(5, 2)],
+            ),
+            // Worse: pairwise gives three different answers, one of them Int64.
+            (
+                "dec30_dec30x30_int64",
+                vec![dec(30, 0), dec(30, 30), RockyType::Int64],
+            ),
+            // The second B4 trigger — `decimal_parts_of` failing on a malformed
+            // decimal, which the pairwise fold absorbs into the accumulator.
+            ("malformed_dec", vec![dec(5, 10), dec(10, 2)]),
+            // The named float exception (T2.13).
+            (
+                "float_and_wide_decimals",
+                vec![RockyType::Float64, dec(30, 0), dec(30, 30)],
+            ),
+            // Cap overflow with only two branches.
+            ("cap_overflow_pair", vec![dec(20, 0), dec(20, 20)]),
+            // Ordinary sets that must keep their existing answers.
+            ("widening_decimals", vec![dec(10, 2), dec(12, 4)]),
+            (
+                "mixed_ints_and_float",
+                vec![RockyType::Int32, RockyType::Int64, RockyType::Float32],
+            ),
+            ("int_and_decimal", vec![RockyType::Int64, dec(10, 2)]),
+            ("incompatible", vec![RockyType::String, RockyType::Int64]),
+            (
+                "timestamps",
+                vec![RockyType::Timestamp, RockyType::TimestampNtz],
+            ),
+            ("unknown_and_known", vec![RockyType::Unknown, dec(10, 2)]),
+            ("all_equal", vec![dec(10, 2), dec(10, 2), dec(10, 2)]),
+        ]
+    }
+
+    /// T2.11 — the fold is a function of the branch *multiset*.
+    ///
+    /// Measured on the pairwise fold this replaces, over the same corpus:
+    /// `{DEC(30,0), DEC(30,30), DEC(5,2)}` yields two distinct results
+    /// depending on argument order, and `{DEC(30,0), DEC(30,30), INT64}`
+    /// yields three. Same expression, reordered arguments, different type.
+    #[test]
+    fn test_fold_is_order_independent() {
+        for (label, branches) in fold_corpus() {
+            let mut results: Vec<RockyType> = permutations(&branches)
+                .iter()
+                .map(|permutation| common_supertype_of(permutation))
+                .collect();
+            results.dedup();
+            assert_eq!(
+                results.len(),
+                1,
+                "{label}: fold is order-dependent, results = {}",
+                results
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            );
+        }
+    }
+
+    /// T2.12 — for an exact-numeric branch set the result contains every
+    /// branch, or is `Unknown` (which claims nothing).
+    ///
+    /// The pairwise fold fails this: `COALESCE(DEC(30,0), DEC(30,30), DEC(5,2))`
+    /// typed as `DECIMAL(5,2)`, and `is_assignable(DEC(30,0), DEC(5,2))` is
+    /// false — a *confidently wrong* narrower type, the one outcome the WP-03
+    /// brief rules out.
+    #[test]
+    fn test_fold_never_narrows_exact_numerics() {
+        for (label, branches) in fold_corpus() {
+            let exact_numeric = branches
+                .iter()
+                .all(|t| t.is_integer() || t.is_decimal() || *t == RockyType::Unknown);
+            if !exact_numeric {
+                continue;
+            }
+            let result = common_supertype_of(&branches);
+            if result == RockyType::Unknown {
+                continue;
+            }
+            for branch in &branches {
+                assert!(
+                    is_assignable(branch, &result),
+                    "{label}: fold = {result} does not contain branch {branch}"
+                );
+            }
+        }
+    }
+
+    /// T2.13 — the float exception, stated executably so it cannot be mistaken
+    /// for an oversight: a float branch makes the result `Float64`, which does
+    /// **not** contain a high-scale decimal. What stops that being a false
+    /// permit is the gate — `contract_verdict` reports `Violated` for exactly
+    /// that pair, because `is_assignable(Decimal, Float64)` is false.
+    #[test]
+    fn test_fold_float_exception_is_named() {
+        let result = common_supertype_of(&[RockyType::Float64, dec(30, 30)]);
+        assert_eq!(result, RockyType::Float64);
+        assert!(!is_assignable(&dec(30, 30), &RockyType::Float64));
+        assert_eq!(
+            contract_verdict(&dec(30, 30), &RockyType::Float64),
+            ContractVerdict::Violated
+        );
+    }
+
+    /// The blast radius of the fold change, stated as a test rather than as a
+    /// claim: outside the cap-overflow and malformed-decimal classes,
+    /// `common_supertype_of` returns exactly what the pairwise fold returned.
+    #[test]
+    fn test_fold_matches_pairwise_outside_the_bug_class() {
+        let unchanged = [
+            "widening_decimals",
+            "mixed_ints_and_float",
+            "int_and_decimal",
+            "incompatible",
+            "timestamps",
+            "unknown_and_known",
+            "all_equal",
+            "float_and_wide_decimals",
+            "malformed_dec",
+        ];
+        for (label, branches) in fold_corpus() {
+            if !unchanged.contains(&label) {
+                continue;
+            }
+            for permutation in permutations(&branches) {
+                assert_eq!(
+                    common_supertype_of(&permutation),
+                    pairwise_fold_frozen_old(&permutation),
+                    "{label}: fold changed a result outside the bug class"
+                );
+            }
+        }
+        // The empty set: no branches, nothing to unify.
+        assert_eq!(common_supertype_of(&[]), RockyType::Unknown);
+        assert_eq!(
+            common_supertype_of(&[RockyType::Unknown, RockyType::Unknown]),
+            RockyType::Unknown
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // G1/G2 — `contract_verdict`, the gate predicate
+    // ---------------------------------------------------------------------
+
+    /// G1 — an unresolved type at a gate is `Unverifiable`, in both directions.
+    ///
+    /// Measured on `is_assignable`, the predicate the `rocky load` gate used
+    /// for these same three inputs: `true`, `true`, `true`. That is the
+    /// fail-open — degrading a type to `Unknown` at a validation gate made the
+    /// gate *more* permissive, not more conservative.
+    #[test]
+    fn test_contract_verdict_unknown_is_unverifiable() {
+        assert_eq!(
+            contract_verdict(&RockyType::Unknown, &dec(10, 2)),
+            ContractVerdict::Unverifiable
+        );
+        assert_eq!(
+            contract_verdict(&dec(38, 0), &RockyType::Unknown),
+            ContractVerdict::Unverifiable
+        );
+        assert_eq!(
+            contract_verdict(&RockyType::Unknown, &RockyType::Unknown),
+            ContractVerdict::Unverifiable
+        );
+        // `is_assignable` keeps its own contract — this is a split, not a
+        // change to the inference-side predicate.
+        assert!(is_assignable(&RockyType::Unknown, &dec(10, 2)));
+        assert!(is_assignable(&dec(38, 0), &RockyType::Unknown));
+    }
+
+    /// G2 — off the `Unknown` axis the gate predicate and the inference
+    /// predicate agree exactly, over the full cross-product of the scalar
+    /// variants plus a decimal grid. The split touches one axis and freezes
+    /// every other verdict.
+    #[test]
+    fn test_contract_verdict_agrees_with_is_assignable_off_unknown() {
+        let mut universe = vec![
+            RockyType::Boolean,
+            RockyType::Int32,
+            RockyType::Int64,
+            RockyType::Float32,
+            RockyType::Float64,
+            RockyType::String,
+            RockyType::Date,
+            RockyType::Timestamp,
+            RockyType::TimestampNtz,
+            RockyType::Binary,
+            RockyType::Variant,
+            RockyType::Array(Box::new(RockyType::Int64)),
+        ];
+        for precision in [1u8, 5, 10, 19, 38, 76] {
+            for scale in [0u8, 2, 10, 38] {
+                if scale <= precision {
+                    universe.push(dec(precision, scale));
+                }
+            }
+        }
+        // A malformed decimal on either side must also agree.
+        universe.push(dec(5, 10));
+
+        for from in &universe {
+            for to in &universe {
+                let verdict = contract_verdict(from, to);
+                assert_ne!(
+                    verdict,
+                    ContractVerdict::Unverifiable,
+                    "no known pair may be Unverifiable: ({from}, {to})"
+                );
+                assert_eq!(
+                    verdict == ContractVerdict::Satisfied,
+                    is_assignable(from, to),
+                    "gate predicate diverged from is_assignable off the Unknown axis: \
+                     ({from}, {to})"
+                );
+            }
+        }
     }
 
     #[test]
