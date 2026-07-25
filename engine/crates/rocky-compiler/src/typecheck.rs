@@ -6,6 +6,7 @@
 //! incompatibilities, and provides diagnostics with suggestions.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,11 +19,14 @@ use sqlparser::parser::Parser;
 
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
-    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, I001, I002, SourceSpan, W001,
-    W002, W003, W004, W005, W006,
+    Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E036, I001, I002, SourceSpan,
+    W001, W002, W003, W004, W005, W006,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
-use crate::types::{RockyType, TypedColumn};
+use crate::types::{
+    DecimalOp, MAX_DECLARED_PRECISION, RockyType, TypedColumn, arithmetic_result_type,
+    decimal_from_parts, validate_decimal_params,
+};
 use rocky_core::column_map::{CiKey, CiStr};
 use rocky_ir::dag::{self, DagNode};
 
@@ -438,6 +442,9 @@ fn compute_model_typecheck(
 
     // Extract references from this model's SQL if available.
     let ref_map = if let Some(model) = model_by_name.get(model_name) {
+        // E036 — reject out-of-range declared decimal parameters before the
+        // resulting `Unknown` can reach a contract check.
+        diagnostics.extend(check_decimal_declarations(model_name, &model.sql));
         collect_references(&model.sql, &model.file_path, model_names)
     } else {
         ReferenceMap::default()
@@ -1500,13 +1507,17 @@ fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, bool) {
 
         // Literals
         Expr::Value(val) => match &val.value {
-            ast::Value::Number(_, _) => (RockyType::Int64, false),
+            ast::Value::Number(text, _) => (numeric_literal_type(text), false),
             ast::Value::SingleQuotedString(_) | ast::Value::DoubleQuotedString(_) => {
                 (RockyType::String, false)
             }
             ast::Value::Boolean(_) => (RockyType::Boolean, false),
             ast::Value::Null => (RockyType::Unknown, true),
-            _ => (RockyType::Unknown, false),
+            // Every other literal form — placeholders included. Claiming
+            // non-nullable for a value Rocky has not modelled is a confident
+            // assertion over unresolved evidence; nullable is the conservative
+            // read and never a false permit.
+            _ => (RockyType::Unknown, true),
         },
 
         // CAST(expr AS type)
@@ -1586,16 +1597,31 @@ fn infer_binary_op_type(
         // Boolean logic
         ast::BinaryOperator::And | ast::BinaryOperator::Or => (RockyType::Boolean, nullable),
 
-        // Arithmetic → numeric promotion
-        ast::BinaryOperator::Plus
-        | ast::BinaryOperator::Minus
-        | ast::BinaryOperator::Multiply
-        | ast::BinaryOperator::Divide
-        | ast::BinaryOperator::Modulo => {
-            let result_type = crate::types::common_supertype(&left_type, &right_type)
-                .unwrap_or(RockyType::Unknown);
-            (result_type, nullable)
-        }
+        // Arithmetic. Each operator gets its own decimal precision/scale
+        // calculus — they are genuinely different (`+` grows one integer digit,
+        // `*` adds both the integer digits and the scales), so they cannot share
+        // one generic supertype branch. Non-decimal operand pairs fall back to
+        // the unchanged unification behaviour inside `arithmetic_result_type`.
+        ast::BinaryOperator::Plus => (
+            arithmetic_result_type(DecimalOp::Add, &left_type, &right_type),
+            nullable,
+        ),
+        ast::BinaryOperator::Minus => (
+            arithmetic_result_type(DecimalOp::Subtract, &left_type, &right_type),
+            nullable,
+        ),
+        ast::BinaryOperator::Multiply => (
+            arithmetic_result_type(DecimalOp::Multiply, &left_type, &right_type),
+            nullable,
+        ),
+        ast::BinaryOperator::Divide => (
+            arithmetic_result_type(DecimalOp::Divide, &left_type, &right_type),
+            nullable,
+        ),
+        ast::BinaryOperator::Modulo => (
+            arithmetic_result_type(DecimalOp::Modulo, &left_type, &right_type),
+            nullable,
+        ),
 
         // String concatenation
         ast::BinaryOperator::StringConcat => (RockyType::String, nullable),
@@ -1759,6 +1785,198 @@ fn infer_case_type(
     (result_type, nullable)
 }
 
+/// Resolve a declared `DECIMAL`/`NUMERIC` parameter list to a `RockyType`.
+///
+/// Shared by [`sql_type_to_rocky`] and [`check_decimal_declarations`] so the
+/// type a cast produces and the declaration the compiler rejects can never
+/// disagree.
+///
+/// `ExactNumberInfo::None` (a bare `CAST(x AS DECIMAL)`) yields `Unknown`
+/// rather than the old `Decimal(38,0)`: the engines disagree on the default
+/// (Spark `(10,0)`, DuckDB `(18,3)`, Snowflake `(38,0)`) and `Decimal(38,0)` is
+/// not a safe over-approximation of `Decimal(18,3)` because it has zero scale.
+fn decimal_from_exact_number_info(info: &ast::ExactNumberInfo) -> RockyType {
+    let params = match info {
+        ast::ExactNumberInfo::PrecisionAndScale(p, s) => validate_decimal_params(*p, *s),
+        ast::ExactNumberInfo::Precision(p) => validate_decimal_params(*p, 0),
+        ast::ExactNumberInfo::None => None,
+    };
+    params.map_or(RockyType::Unknown, |(precision, scale)| {
+        RockyType::Decimal { precision, scale }
+    })
+}
+
+/// Reject `CAST` targets whose decimal precision/scale parameters are out of
+/// range (E036).
+///
+/// This is a standalone pass rather than a diagnostic emitted from
+/// [`sql_type_to_rocky`], because expression inference returns
+/// `(RockyType, bool)` with no diagnostic channel and threading one through a
+/// recursive inference function would be a large refactor for one check. The
+/// two are decoupled but share [`decimal_from_exact_number_info`], so a
+/// declaration that types as `Unknown` is exactly the set this rejects.
+///
+/// # Why this must be an error
+///
+/// `rocky_compiler::contracts` skips the E011 required-column-type check for any
+/// column whose type is `Unknown`. Degrading an invalid declaration to `Unknown`
+/// without failing the compile would therefore *create* a new way to bypass
+/// contract validation. Failing here means the `Unknown` never reaches a
+/// governance decision unchallenged.
+///
+/// # Scope
+///
+/// Walks every expression in the parsed statement, so it covers `CAST(… AS …)`,
+/// `TRY_CAST`, and the `::` shorthand (all of which parse to `Expr::Cast`). A
+/// `DataType` in a non-expression position — a DDL column definition, say — is
+/// not reached; model SQL is a `SELECT`, so casts are the surface that matters.
+/// SQL that does not parse produces no diagnostics here; the parse failure is
+/// reported by the caller's own path.
+fn check_decimal_declarations(model_name: &str, sql: &str) -> Vec<Diagnostic> {
+    let dialect = rocky_sql::dialect::DatabricksDialect;
+    let Ok(stmts) = Parser::parse_sql(&dialect, sql) else {
+        return Vec::new();
+    };
+
+    let mut diagnostics = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    let _: ControlFlow<()> = ast::visit_expressions(&stmts, |expr| {
+        let Expr::Cast { data_type, .. } = expr else {
+            return ControlFlow::Continue(());
+        };
+        let (ast::DataType::Decimal(info) | ast::DataType::Numeric(info)) = data_type else {
+            return ControlFlow::Continue(());
+        };
+        // A bare `DECIMAL` is unparameterised, not invalid — it types as
+        // `Unknown` but names nothing out of range, so it is not an error.
+        if matches!(info, ast::ExactNumberInfo::None) {
+            return ControlFlow::Continue(());
+        }
+        if decimal_from_exact_number_info(info) != RockyType::Unknown {
+            return ControlFlow::Continue(());
+        }
+
+        let rendered = format!("{data_type}");
+        if !seen.insert(rendered.clone()) {
+            return ControlFlow::Continue(());
+        }
+        diagnostics.push(
+            Diagnostic::error(
+                E036,
+                model_name,
+                format!(
+                    "cast target '{rendered}' declares out-of-range decimal parameters — \
+                     precision must be 1..={MAX_DECLARED_PRECISION} and scale must be \
+                     0..=precision"
+                ),
+            )
+            .with_suggestion(
+                "pick a precision and scale the target warehouse supports, \
+                 e.g. DECIMAL(38,2)",
+            ),
+        );
+        ControlFlow::Continue(())
+    });
+
+    diagnostics
+}
+
+/// Infer the type of a numeric literal from its **lexical form**.
+///
+/// sqlparser hands back the literal's source text (`Value::Number(String, bool)`
+/// — Rocky does not enable the `bigdecimal` feature). That text was previously
+/// discarded and every numeric literal was typed `Int64`, including fractional
+/// forms, exponent forms, and integers beyond `i64`'s range.
+///
+/// | form | test | result |
+/// |---|---|---|
+/// | exponent | contains `e`/`E` | `Float64` |
+/// | fractional | contains `.` | `Decimal(int_digits + frac_digits, frac_digits)` |
+/// | integer within `i64` | `parse::<i64>()` succeeds | `Int64` |
+/// | integer beyond `i64` | all ASCII digits | `Decimal(digit_count, 0)` |
+/// | anything else | — | `Unknown` |
+///
+/// Exponent is tested first because `1.5e-3` also contains a `.`.
+///
+/// The fractional form yields `Decimal`, not `Float64`: four of the five
+/// supported engines agree, and more decisively `Decimal` is the *exact*
+/// representation — typing `0.1` as `Float64` would assert a value binary
+/// floating point cannot hold exactly, which is an unsound narrowing in exactly
+/// the direction this change removes. Integer digits are counted with leading
+/// zeros stripped, so `0.5` is `Decimal(1,1)` (zero integer digits — correct,
+/// since `|0.5| < 10^0`).
+///
+/// Sign is not part of the text: sqlparser represents `-1.5` as a unary minus
+/// over `Number("1.5")`, and magnitude is unaffected by sign either way.
+///
+/// Small integers stay `Int64` rather than narrowing to `Int32` — `Int64` is a
+/// sound widening of DuckDB's `INTEGER` and narrowing would be churn with no
+/// soundness gain.
+fn numeric_literal_type(text: &str) -> RockyType {
+    // A sign does not change the magnitude, so it does not change the type.
+    // sqlparser represents `-1.5` as a unary minus over `Number("1.5")` and so
+    // never puts a sign in the text, but handling it keeps every form
+    // consistent rather than resolving `-42` and degrading `-1.5`.
+    let text = text.strip_prefix(['+', '-']).unwrap_or(text);
+
+    // Exponent form, tested first because `1.5e-3` also contains a `.`. Both
+    // halves are validated: matching on a bare "contains an `e`" would type any
+    // text containing the letter as a float.
+    if let Some((mantissa, exponent)) = text.split_once(['e', 'E']) {
+        let exponent_digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        let well_formed = unsigned_decimal_digit_counts(mantissa).is_some()
+            && !exponent_digits.is_empty()
+            && exponent_digits.bytes().all(|b| b.is_ascii_digit());
+        return if well_formed {
+            RockyType::Float64
+        } else {
+            RockyType::Unknown
+        };
+    }
+
+    // No exponent marker, so the remaining text must be a plain unsigned
+    // decimal. Validating the shape *before* reaching for `parse::<i64>()`
+    // matters: Rust's integer parser accepts its own leading sign, which would
+    // let text this classifier has already rejected slip back in.
+    let Some((int_digits, scale)) = unsigned_decimal_digit_counts(text) else {
+        return RockyType::Unknown;
+    };
+
+    // Fractional form.
+    if scale > 0 {
+        return decimal_from_parts(int_digits, scale);
+    }
+
+    // Integer that fits i64.
+    if text.parse::<i64>().is_ok() {
+        return RockyType::Int64;
+    }
+
+    // Integer beyond i64's range — sized as a decimal so the magnitude is not
+    // silently claimed to fit an Int64.
+    decimal_from_parts(int_digits, 0)
+}
+
+/// Count `(integer_digits, fractional_digits)` in an unsigned decimal literal.
+///
+/// Accepts `123`, `1.5`, `.5` and `5.`; rejects anything with a non-digit
+/// character, more than one decimal point, or no digits at all. Leading zeros
+/// are not integer digits — `0.5` has none, which is correct: `|0.5| < 10^0`.
+fn unsigned_decimal_digit_counts(text: &str) -> Option<(u32, u32)> {
+    let (int_part, frac_part) = text.split_once('.').unwrap_or((text, ""));
+    let is_digits = |s: &str| s.bytes().all(|b| b.is_ascii_digit());
+    if !is_digits(int_part) || !is_digits(frac_part) {
+        return None;
+    }
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    let int_digits = u32::try_from(int_part.trim_start_matches('0').len()).ok()?;
+    let scale = u32::try_from(frac_part.len()).ok()?;
+    Some((int_digits, scale))
+}
+
 /// Convert an sqlparser DataType to RockyType.
 fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
     match dt {
@@ -1771,20 +1989,16 @@ fn sql_type_to_rocky(dt: &ast::DataType) -> RockyType {
         ast::DataType::BigInt(_) => RockyType::Int64,
         ast::DataType::Float(_) | ast::DataType::Real => RockyType::Float32,
         ast::DataType::Double(_) | ast::DataType::DoublePrecision => RockyType::Float64,
-        ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => match info {
-            ast::ExactNumberInfo::PrecisionAndScale(p, s) => RockyType::Decimal {
-                precision: *p as u8,
-                scale: *s as u8,
-            },
-            ast::ExactNumberInfo::Precision(p) => RockyType::Decimal {
-                precision: *p as u8,
-                scale: 0,
-            },
-            ast::ExactNumberInfo::None => RockyType::Decimal {
-                precision: 38,
-                scale: 0,
-            },
-        },
+        // Declared decimal parameters are validated before they are narrowed to
+        // the `u8` fields of `RockyType::Decimal`; the previous `as u8` casts
+        // wrapped out-of-range values into a different, meaningless type
+        // (`DECIMAL(300,2)` became `DECIMAL(44,2)`). An invalid declaration
+        // degrades to `Unknown` here and is rejected with E036 by
+        // `check_decimal_declarations`, so the `Unknown` cannot silently skip
+        // the E011 contract check.
+        ast::DataType::Decimal(info) | ast::DataType::Numeric(info) => {
+            decimal_from_exact_number_info(info)
+        }
         ast::DataType::Varchar(_)
         | ast::DataType::Char(_)
         | ast::DataType::Text
@@ -2832,11 +3046,452 @@ mod tests {
 
     // --- New expression-level inference tests ---
 
+    /// T4.1 — small integers still type as `Int64`.
     #[test]
     fn test_infer_expr_literal_int() {
         let scope = TypeScope::new();
         let expr = parse_expr("42");
         assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Int64);
+    }
+
+    // -----------------------------------------------------------------
+    // T4 — numeric literals, by lexical form
+    //
+    // These assert against `infer_expr_type` directly, not against a
+    // compiled model's `typed_columns`. That is deliberate: lineage
+    // extraction has no `BinaryOp` arm and `enhanced_inference` only writes
+    // columns whose producing edge `is_cast()`, so a literal or arithmetic
+    // column lands `Unknown` in `typed_columns` both before and after this
+    // change (see `test_arithmetic_column_still_unknown_end_to_end`). An
+    // end-to-end assertion here would pass without the fix.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_numeric_literal_forms() {
+        let scope = TypeScope::new();
+        let dec = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
+
+        let cases: &[(&str, &str, RockyType)] = &[
+            // T4.1 — integer within i64.
+            ("T4.1", "42", RockyType::Int64),
+            ("T4.1b", "0", RockyType::Int64),
+            ("T4.1c", "9223372036854775807", RockyType::Int64),
+            // T4.2/T4.3/T4.4 — fractional forms size from the text. Leading
+            // zeros are not integer digits, so `0.5` has none.
+            ("T4.2", "1.5", dec(2, 1)),
+            ("T4.3", "0.5", dec(1, 1)),
+            ("T4.4", "12.578", dec(5, 3)),
+            ("T4.4b", "1.50", dec(3, 2)),
+            ("T4.4c", "0.001", dec(3, 3)),
+            // T4.5 — exponent forms are floats, tested before the '.' rule.
+            ("T4.5a", "1e10", RockyType::Float64),
+            ("T4.5b", "1E10", RockyType::Float64),
+            ("T4.5c", "1.5e-3", RockyType::Float64),
+            // T4.6 — an integer beyond i64 is sized as a decimal rather than
+            // claimed to fit an Int64.
+            ("T4.6", "99999999999999999999", dec(20, 0)),
+            ("T4.6b", "9223372036854775808", dec(19, 0)),
+            // T4.7/T4.8 — past the inference cap, degrade to Unknown.
+            (
+                "T4.7",
+                "1111111111111111111111111111111111111111",
+                RockyType::Unknown,
+            ),
+            (
+                "T4.8",
+                "0.111111111111111111111111111111111111111",
+                RockyType::Unknown,
+            ),
+        ];
+
+        for (label, text, expected) in cases {
+            let expr = parse_expr(text);
+            assert_eq!(
+                &infer_expr_type(&expr, &scope).0,
+                expected,
+                "{label}: literal {text}"
+            );
+        }
+    }
+
+    /// T4.9 — a negative literal parses as unary minus over the magnitude, and
+    /// sign does not change the magnitude's type.
+    #[test]
+    fn test_numeric_literal_negative() {
+        let scope = TypeScope::new();
+        let expr = parse_expr("-1.5");
+        assert_eq!(
+            infer_expr_type(&expr, &scope).0,
+            RockyType::Decimal {
+                precision: 2,
+                scale: 1
+            }
+        );
+        let expr = parse_expr("-42");
+        assert_eq!(infer_expr_type(&expr, &scope).0, RockyType::Int64);
+    }
+
+    /// T4.10 — every literal form except NULL is non-nullable.
+    #[test]
+    fn test_numeric_literal_nullability() {
+        let scope = TypeScope::new();
+        for text in ["42", "1.5", "1e10", "99999999999999999999"] {
+            let expr = parse_expr(text);
+            assert!(
+                !infer_expr_type(&expr, &scope).1,
+                "literal {text} should be non-nullable"
+            );
+        }
+        let expr = parse_expr("NULL");
+        assert!(infer_expr_type(&expr, &scope).1);
+    }
+
+    /// Malformed literal text degrades rather than fabricating a type.
+    ///
+    /// The `e`/`E` cases matter specifically: a bare "contains an `e`" test
+    /// would type any text containing the letter as `Float64`.
+    #[test]
+    fn test_malformed_numeric_literal_text_degrades() {
+        for text in [
+            "",
+            ".",
+            "1.2.3",
+            "not a number",
+            "1e",
+            "1e+",
+            "e10",
+            "1ex",
+            "1.5e2.5",
+            "0x1f",
+            "1_000",
+            " 42",
+            "++42",
+            "42-",
+        ] {
+            assert_eq!(
+                numeric_literal_type(text),
+                RockyType::Unknown,
+                "text {text:?} should not resolve to a concrete type"
+            );
+        }
+    }
+
+    /// Well-formed edge cases the tokenizer can produce.
+    #[test]
+    fn test_numeric_literal_edge_forms() {
+        assert_eq!(
+            numeric_literal_type(".5"),
+            RockyType::Decimal {
+                precision: 1,
+                scale: 1
+            }
+        );
+        assert_eq!(
+            numeric_literal_type("5."),
+            RockyType::Decimal {
+                precision: 1,
+                scale: 0
+            }
+        );
+        assert_eq!(numeric_literal_type("000"), RockyType::Int64);
+        assert_eq!(numeric_literal_type("1E+10"), RockyType::Float64);
+        assert_eq!(numeric_literal_type("1E-10"), RockyType::Float64);
+        // A sign in the text does not change the magnitude's type. sqlparser
+        // never produces these (it emits a unary minus), but the classifier is
+        // consistent across forms rather than resolving some and degrading
+        // others.
+        assert_eq!(numeric_literal_type("-42"), RockyType::Int64);
+        assert_eq!(numeric_literal_type("+42"), RockyType::Int64);
+        assert_eq!(
+            numeric_literal_type("-1.5"),
+            RockyType::Decimal {
+                precision: 2,
+                scale: 1
+            }
+        );
+        assert_eq!(numeric_literal_type("-1e10"), RockyType::Float64);
+    }
+
+    // -----------------------------------------------------------------
+    // Operator-specific arithmetic, through `infer_binary_op_type`
+    // -----------------------------------------------------------------
+
+    /// The five arithmetic operators no longer share one generic
+    /// common-supertype branch. Asserted at the expression level for the same
+    /// reason as T4.
+    #[test]
+    fn test_infer_binary_op_decimal_calculus() {
+        let dec = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
+        let mut scope = TypeScope::new();
+        scope
+            .columns
+            .insert(CiKey::owned("a".to_string()), (dec(10, 2), false));
+        scope
+            .columns
+            .insert(CiKey::owned("b".to_string()), (dec(10, 2), false));
+        scope
+            .columns
+            .insert(CiKey::owned("c".to_string()), (dec(10, 0), false));
+        scope
+            .columns
+            .insert(CiKey::owned("d".to_string()), (dec(10, 10), false));
+        scope
+            .columns
+            .insert(CiKey::owned("big".to_string()), (dec(30, 2), false));
+        scope
+            .columns
+            .insert(CiKey::owned("i".to_string()), (RockyType::Int64, false));
+
+        let cases: &[(&str, RockyType)] = &[
+            ("a + b", dec(11, 2)),
+            ("a - b", dec(11, 2)),
+            ("a * b", dec(20, 4)),
+            ("a % b", dec(10, 2)),
+            // Divide over exact numerics has no sound bound.
+            ("a / b", RockyType::Unknown),
+            // Integer digits survive a scale increase.
+            ("c + d", dec(21, 10)),
+            // Int64 promotes to nineteen integer digits.
+            ("i + a", dec(22, 2)),
+            ("i * a", dec(29, 2)),
+            // Past the cap, degrade rather than truncate.
+            ("big * big", RockyType::Unknown),
+            // Non-decimal pairs are untouched by this change.
+            ("i + i", RockyType::Int64),
+            ("i / i", RockyType::Int64),
+        ];
+
+        for (expr_text, expected) in cases {
+            let expr = parse_expr(expr_text);
+            assert_eq!(&infer_expr_type(&expr, &scope).0, expected, "{expr_text}");
+        }
+    }
+
+    /// Arithmetic nullability still propagates per SQL 3VL: any nullable
+    /// operand makes the result nullable.
+    #[test]
+    fn test_infer_binary_op_nullability_unchanged() {
+        let dec = RockyType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        let mut scope = TypeScope::new();
+        scope
+            .columns
+            .insert(CiKey::owned("a".to_string()), (dec.clone(), false));
+        scope
+            .columns
+            .insert(CiKey::owned("n".to_string()), (dec, true));
+
+        assert!(!infer_expr_type(&parse_expr("a + a"), &scope).1);
+        assert!(infer_expr_type(&parse_expr("a + n"), &scope).1);
+        assert!(infer_expr_type(&parse_expr("n * a"), &scope).1);
+    }
+
+    // -----------------------------------------------------------------
+    // T5 — declared precision/scale (defect D)
+    // -----------------------------------------------------------------
+
+    /// Every one of these used to wrap silently through `as u8` into a
+    /// different, meaningless type.
+    #[test]
+    fn test_cast_decimal_parameter_validation() {
+        let scope = TypeScope::new();
+        let dec = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
+
+        let cases: &[(&str, &str, RockyType)] = &[
+            ("T5.1", "CAST(1 AS DECIMAL(10,2))", dec(10, 2)),
+            // T5.2 — BigQuery BIGNUMERIC's maximum is legal and must not be
+            // rejected, even though it exceeds the *inference* cap.
+            ("T5.2", "CAST(1 AS DECIMAL(76,38))", dec(76, 38)),
+            ("T5.2b", "CAST(1 AS NUMERIC(38,9))", dec(38, 9)),
+            // A one-parameter declaration is honoured.
+            ("precision only", "CAST(1 AS DECIMAL(10))", dec(10, 0)),
+            // T5.3–T5.8 — invalid, previously wrapped to the value in the
+            // comment.
+            ("T5.3", "CAST(1 AS DECIMAL(256,2))", RockyType::Unknown), // was Decimal(0,2)
+            ("T5.4", "CAST(1 AS DECIMAL(300,2))", RockyType::Unknown), // was Decimal(44,2)
+            ("T5.5", "CAST(1 AS DECIMAL(10,1000))", RockyType::Unknown), // was Decimal(10,232)
+            ("T5.6", "CAST(1 AS DECIMAL(10,-2))", RockyType::Unknown), // was Decimal(10,254)
+            ("T5.7", "CAST(1 AS DECIMAL(5,10))", RockyType::Unknown),  // scale > precision
+            ("T5.8", "CAST(1 AS DECIMAL(0,0))", RockyType::Unknown),
+            // T5.9 — a bare DECIMAL is unparameterised; the engines disagree on
+            // the default and Decimal(38,0) is not a safe over-approximation of
+            // DuckDB's Decimal(18,3), so it degrades.
+            ("T5.9", "CAST(1 AS DECIMAL)", RockyType::Unknown),
+        ];
+
+        for (label, sql, expected) in cases {
+            let expr = parse_expr(sql);
+            assert_eq!(
+                &infer_expr_type(&expr, &scope).0,
+                expected,
+                "{label}: {sql}"
+            );
+        }
+    }
+
+    /// T5.11 — an out-of-range declaration is an E036 **error**, so the
+    /// resulting `Unknown` can never silently skip the E011 contract check
+    /// (`crate::contracts` guards that check with `!= RockyType::Unknown`).
+    #[test]
+    fn test_out_of_range_decimal_cast_is_e036() {
+        for sql in [
+            "SELECT CAST(amount AS DECIMAL(300,2)) AS a FROM source.raw.t",
+            "SELECT CAST(amount AS DECIMAL(10,-2)) AS a FROM source.raw.t",
+            "SELECT CAST(amount AS DECIMAL(5,10)) AS a FROM source.raw.t",
+            "SELECT amount::DECIMAL(256,2) AS a FROM source.raw.t",
+            "SELECT TRY_CAST(amount AS NUMERIC(0,0)) AS a FROM source.raw.t",
+        ] {
+            let diags = check_decimal_declarations("m", sql);
+            assert_eq!(diags.len(), 1, "expected exactly one E036 for: {sql}");
+            assert_eq!(&*diags[0].code, E036, "wrong code for: {sql}");
+        }
+    }
+
+    /// Valid declarations — including a bare `DECIMAL`, which is
+    /// unparameterised rather than out of range — produce no E036.
+    #[test]
+    fn test_valid_decimal_cast_is_not_e036() {
+        for sql in [
+            "SELECT CAST(amount AS DECIMAL(10,2)) AS a FROM source.raw.t",
+            "SELECT CAST(amount AS DECIMAL(76,38)) AS a FROM source.raw.t",
+            "SELECT CAST(amount AS DECIMAL(10)) AS a FROM source.raw.t",
+            "SELECT CAST(amount AS DECIMAL) AS a FROM source.raw.t",
+            "SELECT CAST(amount AS BIGINT) AS a FROM source.raw.t",
+            "SELECT amount FROM source.raw.t",
+        ] {
+            assert!(
+                check_decimal_declarations("m", sql).is_empty(),
+                "unexpected diagnostic for: {sql}"
+            );
+        }
+    }
+
+    /// Unparseable SQL yields no E036 — the parse failure is reported by the
+    /// caller's own path, and this check must not double-report it or panic.
+    #[test]
+    fn test_decimal_declaration_check_tolerates_unparseable_sql() {
+        assert!(check_decimal_declarations("m", "NOT SQL AT ALL {{{").is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // T6 — end-to-end, the only cases observable in `typed_columns` today
+    // -----------------------------------------------------------------
+
+    /// T6.1 — the single typed-column value this change alters. A cast with
+    /// out-of-range decimal parameters used to land `DECIMAL(44,2)` in
+    /// `ModelIr.typed_columns`; it is now `Unknown` **and** the model fails to
+    /// compile with E036.
+    #[test]
+    fn test_out_of_range_cast_end_to_end() {
+        let models = vec![make_model(
+            "m",
+            "SELECT CAST(amount AS DECIMAL(300,2)) AS cast_300 FROM source.raw.src",
+        )];
+        let project = Project::from_models(models).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.src".to_string(),
+            vec![rocky_ir::ColumnInfo {
+                name: "amount".to_string(),
+                data_type: "DECIMAL(10,2)".to_string(),
+                nullable: true,
+            }],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+
+        let mut sources = HashMap::new();
+        sources.insert(
+            "source.raw.src".to_string(),
+            source_schema(&[(
+                "amount",
+                RockyType::Decimal {
+                    precision: 10,
+                    scale: 2,
+                },
+                true,
+            )]),
+        );
+
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let col = &result.typed_models["m"][0];
+        assert_eq!(col.name, "cast_300");
+        assert_eq!(
+            col.data_type,
+            RockyType::Unknown,
+            "out-of-range cast must not fabricate a wrapped type"
+        );
+        assert!(
+            result.diagnostics.iter().any(|d| &*d.code == E036),
+            "out-of-range cast must fail the compile so the Unknown cannot \
+             silently skip contract validation"
+        );
+    }
+
+    /// T6.2 — asserted **deliberately**: arithmetic columns still land
+    /// `Unknown` in `typed_columns`, because `rocky_sql::lineage` has no
+    /// `BinaryOp` arm and `enhanced_inference` only writes cast-produced
+    /// columns. This documents that the operator and literal fixes are latent
+    /// today, and fails loudly if someone widens that gate without revisiting
+    /// the decimal design (arithmetic cap overflow degrades to `Unknown`
+    /// silently, with no diagnostic — see the module docs on
+    /// `arithmetic_result_type`).
+    #[test]
+    fn test_arithmetic_column_still_unknown_end_to_end() {
+        let models = vec![make_model(
+            "m",
+            "SELECT a * b AS mul, a + b AS add, 1.5 AS lit_frac, a AS passthru \
+             FROM source.raw.src",
+        )];
+        let project = Project::from_models(models).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.src".to_string(),
+            vec![
+                rocky_ir::ColumnInfo {
+                    name: "a".to_string(),
+                    data_type: "DECIMAL(10,2)".to_string(),
+                    nullable: true,
+                },
+                rocky_ir::ColumnInfo {
+                    name: "b".to_string(),
+                    data_type: "DECIMAL(10,2)".to_string(),
+                    nullable: true,
+                },
+            ],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+
+        let dec = RockyType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        let mut sources = HashMap::new();
+        sources.insert(
+            "source.raw.src".to_string(),
+            source_schema(&[("a", dec.clone(), true), ("b", dec.clone(), true)]),
+        );
+
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let by_name: HashMap<&str, &TypedColumn> = result.typed_models["m"]
+            .iter()
+            .map(|c| (c.name.as_str(), c))
+            .collect();
+
+        for name in ["mul", "add", "lit_frac"] {
+            assert_eq!(
+                by_name[name].data_type,
+                RockyType::Unknown,
+                "{name}: arithmetic/literal columns are still Unknown end-to-end — \
+                 if this now resolves, revisit the arithmetic-overflow degradation \
+                 before shipping"
+            );
+        }
+        // A direct passthrough still carries its source type.
+        assert_eq!(by_name["passthru"].data_type, dec);
     }
 
     #[test]

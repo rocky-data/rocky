@@ -19,7 +19,7 @@ use crate::diagnostic::{Diagnostic, W011};
 use crate::project::{Project, ProjectError};
 use crate::semantic::{self, SemanticGraph};
 use crate::typecheck::{self, TypeCheckResult};
-use crate::types::{RockyType, TypedColumn};
+use crate::types::{RockyType, TypedColumn, validate_decimal_params};
 
 /// Wall-clock duration of each compile phase.
 ///
@@ -634,22 +634,32 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
         "TIMESTAMP_NTZ" => RockyType::TimestampNtz,
         "VARIANT" => RockyType::Variant,
         _ if upper.starts_with("DECIMAL") || upper.starts_with("NUMERIC") => {
-            // Try to parse precision and scale
+            // Parse into the widest form first, then validate — never narrow an
+            // unvalidated value into the `u8` precision/scale fields.
             if let Some(params) = upper
                 .strip_prefix("DECIMAL(")
                 .or_else(|| upper.strip_prefix("NUMERIC("))
                 .and_then(|s| s.strip_suffix(')'))
             {
                 let parts: Vec<&str> = params.split(',').collect();
-                if parts.len() == 2
-                    && let (Ok(p), Ok(s)) = (parts[0].trim().parse(), parts[1].trim().parse())
-                {
-                    return RockyType::Decimal {
-                        precision: p,
-                        scale: s,
-                    };
+                if parts.len() == 2 {
+                    let parsed = parts[0]
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .zip(parts[1].trim().parse::<i64>().ok());
+                    // Parameters present but out of range name no type on any
+                    // adapter, so this degrades to `Unknown` rather than
+                    // fabricating the unparameterised default.
+                    return parsed
+                        .and_then(|(p, s)| validate_decimal_params(p, s))
+                        .map_or(RockyType::Unknown, |(precision, scale)| {
+                            RockyType::Decimal { precision, scale }
+                        });
                 }
             }
+            // Unparameterised (`DECIMAL`, `NUMERIC`) or a shape this mapper
+            // doesn't parse: keep the pre-existing wide default.
             RockyType::Decimal {
                 precision: 38,
                 scale: 0,
@@ -676,5 +686,45 @@ mod tests {
             }
         );
         assert_eq!(default_type_mapper("unknown_type"), RockyType::Unknown);
+    }
+
+    /// T5 for the string-based mapper — the second of Rocky's three decimal
+    /// parsers. Out-of-range parameters used to fall through to the
+    /// unparameterised `Decimal(38,0)` default (this mapper parsed straight
+    /// into `u8`, so it never wrapped, but it did fabricate a wide type from a
+    /// declaration that names none). They now degrade to `Unknown`.
+    #[test]
+    fn test_default_type_mapper_decimal_parameters() {
+        let dec = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
+
+        // Valid.
+        assert_eq!(default_type_mapper("DECIMAL(10,2)"), dec(10, 2));
+        assert_eq!(default_type_mapper("NUMERIC(38,9)"), dec(38, 9));
+        // BigQuery BIGNUMERIC's maximum is a legal declaration.
+        assert_eq!(default_type_mapper("DECIMAL(76,38)"), dec(76, 38));
+
+        // Out of range — no adapter has such a type.
+        for invalid in [
+            "DECIMAL(256,2)",
+            "DECIMAL(300,2)",
+            "DECIMAL(10,1000)",
+            "DECIMAL(10,-2)",
+            "DECIMAL(5,10)",
+            "DECIMAL(0,0)",
+            "DECIMAL(77,0)",
+        ] {
+            assert_eq!(
+                default_type_mapper(invalid),
+                RockyType::Unknown,
+                "{invalid} should not resolve to a concrete type"
+            );
+        }
+
+        // T5.9 — unparameterised keeps the pre-existing wide default.
+        assert_eq!(default_type_mapper("DECIMAL"), dec(38, 0));
+        assert_eq!(default_type_mapper("NUMERIC"), dec(38, 0));
+        // A shape this mapper doesn't split also keeps the wide default,
+        // unchanged from before.
+        assert_eq!(default_type_mapper("DECIMAL(10)"), dec(38, 0));
     }
 }

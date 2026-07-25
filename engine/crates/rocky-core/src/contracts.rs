@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::column_map;
-use rocky_ir::{ColumnInfo, RockyType, is_assignable};
+use rocky_ir::{ColumnInfo, RockyType, is_assignable, validate_decimal_params};
 
 /// Data contract configuration — enforced at copy/load time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -218,9 +218,35 @@ pub fn validate_contract_typed(
         // Type match — best-effort in Rocky's type vocabulary.
         let landed_ty = warehouse_type_to_rocky(&col.data_type);
         let expected_ty = warehouse_type_to_rocky(&req.data_type);
+
+        // W032 — the contract's own declared type could not be normalized. The
+        // comparison below then passes on the `Unknown`, which is deliberate
+        // ("never a false failure"), so warn rather than let it be silent.
+        if expected_ty == RockyType::Unknown && looks_like_decimal(&req.data_type) {
+            warnings.push(format!(
+                "W032: contract column '{}' declares type '{}', whose decimal \
+                 parameters are out of range (precision must be 1..=76 and scale \
+                 0..=precision) — the type check for this column was skipped",
+                req.name, req.data_type
+            ));
+        }
+
         if !landed_type_conforms(&landed_ty, &expected_ty) {
+            // Distinguish a precision/scale containment failure from an
+            // unrelated type mismatch, so the class of contracts affected by the
+            // decimal containment rule is greppable. `is_assignable` returns a
+            // bool by design and must not grow a reason channel, so the
+            // discrimination happens here.
+            let precision_failure = is_exact_numeric(&landed_ty)
+                && is_exact_numeric(&expected_ty)
+                && (landed_ty.is_decimal() || expected_ty.is_decimal());
+            let rule = if precision_failure {
+                "required_column_type_precision"
+            } else {
+                "required_column_type"
+            };
             violations.push(ContractViolation {
-                rule: "required_column_type".to_string(),
+                rule: rule.to_string(),
                 column: req.name.clone(),
                 message: format!(
                     "column '{}' has type '{}' ({landed_ty}), expected '{}' ({expected_ty})",
@@ -296,15 +322,35 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
                 .and_then(|s| s.strip_suffix(')'))
             {
                 let parts: Vec<&str> = params.split(',').collect();
-                if parts.len() == 2
-                    && let (Ok(p), Ok(s)) = (parts[0].trim().parse(), parts[1].trim().parse())
-                {
-                    return RockyType::Decimal {
-                        precision: p,
-                        scale: s,
-                    };
+                if parts.len() == 2 {
+                    // Parse into the widest form first, then validate — never
+                    // narrow an unvalidated value into the `u8` precision/scale
+                    // fields, where `DECIMAL(300,2)` would wrap to
+                    // `DECIMAL(44,2)` and change what the contract means.
+                    //
+                    // Note the deliberate split from the unparameterised case
+                    // below: parameters *present but out of range* name no type
+                    // on any adapter, so they degrade to `Unknown`, whereas a
+                    // bare `NUMBER` keeps the wide `Decimal(38,0)` default.
+                    let parsed = parts[0]
+                        .trim()
+                        .parse::<u64>()
+                        .ok()
+                        .zip(parts[1].trim().parse::<i64>().ok());
+                    return parsed
+                        .and_then(|(p, s)| validate_decimal_params(p, s))
+                        .map_or(RockyType::Unknown, |(precision, scale)| {
+                            RockyType::Decimal { precision, scale }
+                        });
                 }
             }
+            // Unparameterised (`NUMBER`, `DECIMAL`) — or a parameter list this
+            // mapper doesn't split, such as `DECIMAL(10)`. Kept at the wide
+            // `Decimal(38,0)`, which matches Snowflake's actual default and is
+            // the fail-closed reading of a *landed* type. This function feeds
+            // both sides of the contract comparison and `Unknown` passes on
+            // either side, so degrading here would make the gate strictly more
+            // permissive.
             RockyType::Decimal {
                 precision: 38,
                 scale: 0,
@@ -326,6 +372,25 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
 /// either side passes (never a false failure) — `is_assignable` handles both.
 fn landed_type_conforms(landed: &RockyType, expected: &RockyType) -> bool {
     is_assignable(landed, expected)
+}
+
+/// Whether a raw warehouse type string names a fixed-point decimal family.
+///
+/// Used only to decide whether a `RockyType::Unknown` normalization is worth
+/// warning about (W032): an unrecognized type name is routine, but a *decimal*
+/// name that fails to normalize means the declared parameters were rejected.
+fn looks_like_decimal(warehouse_type: &str) -> bool {
+    let upper = warehouse_type.trim().to_uppercase();
+    upper.starts_with("DECIMAL")
+        || upper.starts_with("BIGNUMERIC")
+        || upper.starts_with("NUMERIC")
+        || upper.starts_with("NUMBER")
+}
+
+/// Whether a normalized type participates in the exact-numeric containment rule
+/// (integers and decimals — the types with a well-defined digit count).
+fn is_exact_numeric(ty: &RockyType) -> bool {
+    ty.is_integer() || ty.is_decimal()
 }
 
 #[cfg(test)]
@@ -672,6 +737,167 @@ mod tests {
         let landed = vec![col_n("geo", "GEOMETRY", true)];
         let result = validate_contract_typed(&contract, &landed);
         assert!(result.passed, "violations: {:?}", result.violations);
+    }
+
+    /// T5 for the load-gate parser — the third of Rocky's three decimal
+    /// parsers. Out-of-range parameters used to wrap silently through `as u8`
+    /// (`NUMBER(300,2)` became `DECIMAL(44,2)`), which changed what the
+    /// contract meant. They now degrade to `Unknown`, which passes the type
+    /// check by the pre-existing "never a false failure" policy — hence W032.
+    #[test]
+    fn test_warehouse_type_to_rocky_decimal_parameters() {
+        let dec = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
+
+        assert_eq!(warehouse_type_to_rocky("DECIMAL(10,2)"), dec(10, 2));
+        assert_eq!(warehouse_type_to_rocky("NUMBER(38,0)"), dec(38, 0));
+        assert_eq!(warehouse_type_to_rocky("BIGNUMERIC(76,38)"), dec(76, 38));
+
+        for invalid in [
+            "DECIMAL(256,2)",
+            "NUMBER(300,2)",
+            "DECIMAL(10,1000)",
+            "DECIMAL(10,-2)",
+            "NUMERIC(5,10)",
+            "DECIMAL(0,0)",
+            "BIGNUMERIC(77,0)",
+        ] {
+            assert_eq!(
+                warehouse_type_to_rocky(invalid),
+                RockyType::Unknown,
+                "{invalid} should not normalize to a concrete type"
+            );
+        }
+
+        // Unparameterised keeps the wide `Decimal(38,0)` default — it matches
+        // Snowflake's actual default and is the fail-closed reading of a landed
+        // type. Deliberately split from the malformed case above.
+        assert_eq!(warehouse_type_to_rocky("NUMBER"), dec(38, 0));
+        assert_eq!(warehouse_type_to_rocky("DECIMAL"), dec(38, 0));
+        // A one-part parameter list this mapper doesn't split also keeps the
+        // wide default, unchanged from before. Deliberately inconsistent with
+        // the compiler's `DECIMAL(10)` -> `Decimal(10,0)`: this function feeds
+        // both sides of the comparison, so wide is the safe direction here.
+        assert_eq!(warehouse_type_to_rocky("DECIMAL(10)"), dec(38, 0));
+    }
+
+    /// T3.5 — the load-gate flip class. A Snowflake integer column
+    /// (`DESCRIBE` returns `NUMBER(38,0)` for every one of them) does NOT
+    /// satisfy a contract declaring a nonzero decimal scale: 38 integer digits
+    /// cannot fit into a `DECIMAL(38,2)`'s 36. This passed before the
+    /// containment fix, and there is no contract writable on Snowflake that
+    /// makes it pass (`DECIMAL(40,2)` exceeds Snowflake's own max precision) —
+    /// the escape is an explicit CAST in the model or a `DECIMAL(38,0)`
+    /// contract. The rule string names precision so the class is greppable.
+    #[test]
+    fn test_typed_decimal_precision_flip_is_a_violation() {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "amount".into(),
+                data_type: "DECIMAL(38,2)".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("amount", "NUMBER(38,0)", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(!result.passed);
+        assert_eq!(
+            result.violations[0].rule, "required_column_type_precision",
+            "the precision failure class must be distinguishable from an \
+             unrelated type mismatch"
+        );
+        assert!(result.violations[0].message.contains("DECIMAL(38,0)"));
+    }
+
+    /// The rest of the containment matrix at the gate, in both directions.
+    #[test]
+    fn test_typed_decimal_containment_matrix() {
+        let check = |landed: &str, expected: &str| {
+            let contract = ContractConfig {
+                required_columns: vec![RequiredColumn {
+                    name: "c".into(),
+                    data_type: expected.into(),
+                    nullable: true,
+                }],
+                ..Default::default()
+            };
+            validate_contract_typed(&contract, &[col_n("c", landed, true)]).passed
+        };
+
+        // Flipped from pass to violation — each is a case where the old
+        // max-precision/max-scale rule fabricated a type that cannot hold the
+        // landed values.
+        assert!(!check("INT", "DECIMAL(10,2)"), "10 int digits into 8");
+        assert!(!check("BIGINT", "DECIMAL(19,2)"), "19 int digits into 17");
+        assert!(
+            !check("DECIMAL(10,0)", "DECIMAL(10,10)"),
+            "10 int digits to 0"
+        );
+        assert!(
+            !check("DECIMAL(12,2)", "DECIMAL(12,4)"),
+            "10 int digits into 8"
+        );
+
+        // Still passing — genuine widening.
+        assert!(check("DECIMAL(10,2)", "DECIMAL(12,4)"));
+        assert!(check("DECIMAL(10,2)", "DECIMAL(10,2)"));
+        assert!(check("BIGINT", "DECIMAL(21,2)"));
+        assert!(check("INT", "DECIMAL(12,2)"));
+        // Newly passing — the old rule rejected this while permitting the
+        // strictly wider BIGINT -> DECIMAL(19,2) above.
+        assert!(check("INT", "DECIMAL(10,0)"));
+    }
+
+    /// W032 — a contract whose own declared type has out-of-range decimal
+    /// parameters normalizes to `Unknown`, which passes the type check by the
+    /// deliberate "never a false failure" policy. The warning is what stops
+    /// that from being silent.
+    #[test]
+    fn test_typed_invalid_contract_decimal_warns_w032() {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "amount".into(),
+                data_type: "DECIMAL(300,2)".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let landed = vec![col_n("amount", "DECIMAL(10,2)", true)];
+        let result = validate_contract_typed(&contract, &landed);
+        assert!(
+            result.passed,
+            "an un-normalizable expected type must not fail the gate"
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.starts_with("W032:")),
+            "expected a W032 warning, got {:?}",
+            result.warnings
+        );
+
+        // A well-formed decimal contract produces no W032.
+        let ok = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "amount".into(),
+                data_type: "DECIMAL(38,2)".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let result = validate_contract_typed(&ok, &[col_n("amount", "DECIMAL(10,2)", true)]);
+        assert!(result.warnings.iter().all(|w| !w.starts_with("W032:")));
+
+        // Neither does an unrecognized non-decimal type name — that path has
+        // always been routine and must stay quiet.
+        let geo = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "g".into(),
+                data_type: "GEOMETRY".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let result = validate_contract_typed(&geo, &[col_n("g", "GEOMETRY", true)]);
+        assert!(result.warnings.iter().all(|w| !w.starts_with("W032:")));
     }
 
     #[test]

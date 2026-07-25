@@ -134,6 +134,29 @@ pub const E034: &str = "E034";
 /// can never drift. (FR-044)
 pub const E035: &str = "E035";
 
+/// A `CAST`/`::` declares decimal precision/scale parameters that are out of
+/// range, so the declaration does not name a type on any adapter.
+///
+/// Emitted by `rocky compile` for a `DECIMAL(p, s)` / `NUMERIC(p, s)` cast
+/// target that violates `1 ≤ p ≤ 76 ∧ 0 ≤ s ≤ p` — `DECIMAL(300,2)`,
+/// `DECIMAL(10,-2)`, `DECIMAL(5,10)`, `DECIMAL(0,0)`. sqlparser accepts all of
+/// them (its scale is a signed integer), and Rocky used to cast the parameters
+/// straight to the `u8` fields of `RockyType::Decimal`, where they wrapped
+/// silently into a *different* type: `DECIMAL(300,2)` became `DECIMAL(44,2)`,
+/// `DECIMAL(10,-2)` became `DECIMAL(10,254)`. The parameters are now validated
+/// before conversion and the column's type degrades to `RockyType::Unknown`.
+///
+/// # Why an error and not a warning
+///
+/// This is what stops the `Unknown` degradation from being fail-open.
+/// `rocky_compiler::contracts` skips the E011 required-column-type check for
+/// any column whose type is `Unknown`, so degrading silently would let a
+/// meaningless declaration bypass contract validation entirely. Failing the
+/// compile means the `Unknown` never reaches a governance decision
+/// unchallenged. The declaration is meaningless on every supported adapter, so
+/// there is no valid program this rejects.
+pub const E036: &str = "E036";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";
@@ -218,6 +241,24 @@ pub const W030: &str = "W030";
 /// reads keep working — but the consumer's own declared output type may now
 /// be too small, hence a warning rather than silence.
 pub const W031: &str = "W031";
+
+/// A data contract declares a column type whose decimal precision/scale
+/// parameters are out of range, so the contract's expected type cannot be
+/// normalized.
+///
+/// **Emitted by the `rocky load` contract gate, not by `rocky compile`** — it is
+/// the one code in this registry that does not come from the compiler.
+/// `rocky_core::contracts::validate_contract_typed` surfaces it as a
+/// `ContractResult` warning string (rocky-core cannot depend on this crate), so
+/// the code is reserved here to keep the registry the single place a code is
+/// allocated. Grep for `"W032"` in `rocky-core/src/contracts.rs` for the
+/// emission site.
+///
+/// A warning rather than a violation because the type comparison degrades to
+/// `RockyType::Unknown`, which passes: an un-normalizable type has always been
+/// "never a false failure" on this path. The warning is what keeps that
+/// degradation from being silent.
+pub const W032: &str = "W032";
 
 // Info
 /// Model dependency inferred from SQL.

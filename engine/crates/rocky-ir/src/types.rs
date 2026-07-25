@@ -307,10 +307,20 @@ pub fn validate_decimal_params(precision: u64, scale: i64) -> Option<(u8, u8)> {
 /// The operator-specific calculus applies **only** when at least one operand is
 /// [`RockyType::Decimal`] and both reduce via [`decimal_parts_of`]. Every other
 /// operand pair — integer/integer, float on either side, string, `Unknown` —
-/// keeps the pre-existing [`common_supertype`] behaviour, which for a float
-/// operand is also the sound answer (all five engines return a float, division
-/// included). `Int64 / Int64` therefore still yields `Int64`; that is wrong on
-/// four of five engines but is a separate finding with no live defect behind it.
+/// keeps the pre-existing [`common_supertype`] behaviour.
+///
+/// For a float operand that is also the sound answer: all five engines return a
+/// float, division included. **For integer/integer it is not.** `Int32 + Int32`
+/// yields `Int32`, which overflows; `Int64 * Int64` likewise; and `Int64 /
+/// Int64` yields `Int64`, where the exact quotient of `1 / 2` is not an integer
+/// at all. Those are genuine under-bounds, unchanged by this function and
+/// deliberately out of its scope: they are not part of the decimal finding, no
+/// live defect depends on them (arithmetic types do not reach
+/// `ModelIr::typed_columns` — lineage extraction has no `BinaryOp` arm), and
+/// widening them flips a second class of results. Whoever closes them should
+/// extend the exact-numeric rules above to integer pairs rather than special-case
+/// them. `test_arithmetic_result_is_an_upper_bound` states the same boundary
+/// executably by excluding integer/integer pairs.
 ///
 /// An `Unknown` operand paired with a `Decimal` yields `Unknown`: an unbounded
 /// operand cannot be bounded. (That differs from [`common_supertype`], where
@@ -451,14 +461,33 @@ pub fn common_supertype(a: &RockyType, b: &RockyType) -> Option<RockyType> {
 ///
 /// For an exact-numeric source and a `Decimal` target, containment is checked in
 /// `(integer_digits, scale)` space: the source's integer digits must fit the
-/// target's, *and* the source's scale must fit the target's. A malformed
-/// decimal on either side is not assignable (fail-closed on a governance
-/// predicate).
+/// target's, *and* the source's scale must fit the target's. A malformed decimal
+/// (scale > precision, or zero precision) on either side is not assignable —
+/// fail-closed on a governance predicate.
 ///
-/// Every non-decimal pair reproduces the previous verdict exactly, including the
-/// intentionally lossy integer/float widenings — see `test_is_assignable_verdicts_preserved`,
-/// which pins that against a frozen copy of the old rule over the full
-/// cross-product of non-decimal types.
+/// # Exactly where the containment claim holds, and where it does not
+///
+/// The claim above is **not** true of this function in general. Two arms are
+/// deliberately retained exceptions, both pre-existing and both outside the
+/// decimal finding this rewrite closes. They are named here rather than left for
+/// a reader to discover:
+///
+/// - **`Int64`/`Int32`/`Float32` → `Float64` is a genuine false permit.**
+///   `9007199254740993` (`2^53 + 1`) is an `i64` that binary64 cannot represent
+///   exactly, so `Int64 → Float64` claims an assignment that loses information.
+///   The arm is kept because this rewrite freezes every non-decimal verdict (see
+///   `test_is_assignable_verdicts_preserved_for_non_decimals`) so the change has
+///   one flip surface rather than two; removing it flips a second, unrelated
+///   class of contracts. `test_is_assignable_known_float_widening_exception`
+///   pins it with the counterexample so it cannot be mistaken for an oversight.
+/// - **Identical types short-circuit before validity is checked**, so a
+///   malformed `Decimal(5,10)` is assignable to itself. That is trivially sound
+///   — assigning a type to itself loses nothing whatever the type — but it does
+///   mean "malformed is never assignable" holds only for *distinct* types.
+///
+/// Every other non-decimal pair also reproduces the previous verdict exactly,
+/// pinned against a frozen copy of the old rule over the full cross-product of
+/// non-decimal types.
 ///
 /// [`RockyType::Unknown`] on either side is assignable: an un-normalizable type
 /// is never a false failure (see `rocky_core::contracts`).
@@ -479,7 +508,9 @@ pub fn is_assignable(from: &RockyType, to: &RockyType) -> bool {
         }
         // Int32 widens to Int64.
         (RockyType::Int32, RockyType::Int64) => true,
-        // Pre-existing intentional lossy widening into Float64.
+        // Pre-existing lossy widening into Float64. NOT exact containment:
+        // 2^53 + 1 is an i64 binary64 cannot hold. Retained deliberately so this
+        // change has one flip surface; see the doc comment above.
         (RockyType::Int32 | RockyType::Int64 | RockyType::Float32, RockyType::Float64) => true,
         // A timezone-naive timestamp is assignable to a zoned one.
         (RockyType::TimestampNtz, RockyType::Timestamp) => true,
@@ -1039,6 +1070,59 @@ mod tests {
                 "{label}: is_assignable({from}, {to})"
             );
         }
+    }
+
+    /// The `Int → Float64` arm is a **known, deliberately retained false
+    /// permit**, not an oversight.
+    ///
+    /// `2^53 + 1` is an `i64` that binary64 cannot represent exactly, so
+    /// `is_assignable(Int64, Float64) == true` claims an assignment that loses
+    /// information. It is kept because this change freezes every non-decimal
+    /// verdict so it has one flip surface rather than two — removing the arm
+    /// flips a second, unrelated class of load contracts (a landed `BIGINT`
+    /// against a `DOUBLE` contract). Fixing it is a separate change.
+    ///
+    /// This test exists so the exception is pinned and greppable. If it starts
+    /// failing, someone tightened the arm — that is a *behaviour* change to a
+    /// governance predicate and needs its own review, not a test update.
+    #[test]
+    fn test_is_assignable_known_float_widening_exception() {
+        let not_exactly_representable: i64 = 9_007_199_254_740_993; // 2^53 + 1
+        assert_ne!(
+            not_exactly_representable as f64 as i64, not_exactly_representable,
+            "premise of this test: the value survives neither round trip"
+        );
+
+        assert!(
+            is_assignable(&RockyType::Int64, &RockyType::Float64),
+            "known retained false permit — see the doc comment on is_assignable"
+        );
+        assert!(is_assignable(&RockyType::Int32, &RockyType::Float64));
+        assert!(is_assignable(&RockyType::Float32, &RockyType::Float64));
+        // The decimal directions are NOT permitted, in either orientation.
+        assert!(!is_assignable(&dec(10, 2), &RockyType::Float64));
+        assert!(!is_assignable(&RockyType::Float64, &dec(10, 2)));
+    }
+
+    /// Identical types short-circuit before decimal validity is checked, so a
+    /// malformed decimal is assignable to itself. That is trivially sound —
+    /// assigning a type to itself loses nothing — but it bounds the
+    /// "malformed is never assignable" rule to *distinct* types, so it is pinned
+    /// explicitly rather than left implicit.
+    #[test]
+    fn test_is_assignable_identity_short_circuit() {
+        assert!(is_assignable(&dec(5, 10), &dec(5, 10)));
+        assert!(is_assignable(&dec(0, 0), &dec(0, 0)));
+        // Distinct malformed pairs are rejected in both directions.
+        assert!(!is_assignable(&dec(5, 10), &dec(6, 10)));
+        assert!(!is_assignable(&dec(10, 2), &dec(5, 10)));
+        assert!(!is_assignable(&dec(5, 10), &dec(10, 2)));
+        // Same for unification: `a ⊔ a` is `a` by definition, whatever `a` is.
+        assert_eq!(common_supertype(&dec(5, 10), &dec(5, 10)), Some(dec(5, 10)));
+        assert_eq!(
+            common_supertype(&dec(5, 10), &dec(10, 2)),
+            Some(RockyType::Unknown)
+        );
     }
 
     /// The old `is_assignable`, frozen verbatim as ground truth for T3.2.
