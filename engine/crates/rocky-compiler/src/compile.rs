@@ -642,28 +642,44 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
                 .and_then(|s| s.strip_suffix(')'))
             {
                 let parts: Vec<&str> = params.split(',').collect();
-                if parts.len() == 2 {
-                    let parsed = parts[0]
-                        .trim()
-                        .parse::<u64>()
-                        .ok()
-                        .zip(parts[1].trim().parse::<i64>().ok());
+                match parts.len() {
+                    // `DECIMAL(p)` is `DECIMAL(p, 0)` — ANSI, and DuckDB
+                    // executed: `CAST(1 AS DECIMAL(10))` -> `DECIMAL(10,0)`.
+                    1 => {
+                        return parts[0]
+                            .trim()
+                            .parse::<u64>()
+                            .ok()
+                            .and_then(|precision| validate_decimal_params(precision, 0))
+                            .map_or(RockyType::Unknown, |(precision, scale)| {
+                                RockyType::Decimal { precision, scale }
+                            });
+                    }
                     // Parameters present but out of range name no type on any
-                    // adapter, so this degrades to `Unknown` rather than
-                    // fabricating the unparameterised default.
-                    return parsed
-                        .and_then(|(p, s)| validate_decimal_params(p, s))
-                        .map_or(RockyType::Unknown, |(precision, scale)| {
-                            RockyType::Decimal { precision, scale }
-                        });
+                    // adapter, so this degrades to `Unknown`.
+                    2 => {
+                        return parts[0]
+                            .trim()
+                            .parse::<u64>()
+                            .ok()
+                            .zip(parts[1].trim().parse::<i64>().ok())
+                            .and_then(|(p, s)| validate_decimal_params(p, s))
+                            .map_or(RockyType::Unknown, |(precision, scale)| {
+                                RockyType::Decimal { precision, scale }
+                            });
+                    }
+                    _ => return RockyType::Unknown,
                 }
             }
-            // Unparameterised (`DECIMAL`, `NUMERIC`) or a shape this mapper
-            // doesn't parse: keep the pre-existing wide default.
-            RockyType::Decimal {
-                precision: 38,
-                scale: 0,
-            }
+            // Unparameterised (`DECIMAL`, `NUMERIC`). The wide `Decimal(38,0)`
+            // default that used to live here was a fabrication: an
+            // unparameterised decimal names `DECIMAL(10,0)` on Databricks,
+            // `DECIMAL(18,3)` on DuckDB (executed) and `NUMBER(38,0)` on
+            // Snowflake, and `Decimal(38,0)` is not an upper bound on
+            // `Decimal(18,3)` — its scale is smaller. All three of Rocky's
+            // decimal parsers now agree on `Unknown` here
+            // (`test_three_decimal_parsers_agree`).
+            RockyType::Unknown
         }
         _ => RockyType::Unknown,
     }
@@ -720,11 +736,19 @@ mod tests {
             );
         }
 
-        // T5.9 — unparameterised keeps the pre-existing wide default.
-        assert_eq!(default_type_mapper("DECIMAL"), dec(38, 0));
-        assert_eq!(default_type_mapper("NUMERIC"), dec(38, 0));
-        // A shape this mapper doesn't split also keeps the wide default,
-        // unchanged from before.
-        assert_eq!(default_type_mapper("DECIMAL(10)"), dec(38, 0));
+        // T5.9, inverted — unparameterised no longer fabricates a wide default.
+        // It names a different type on every adapter (Databricks 10,0, DuckDB
+        // 18,3, Snowflake 38,0) and `Decimal(38,0)` is not an upper bound on
+        // `Decimal(18,3)`.
+        assert_eq!(default_type_mapper("DECIMAL"), RockyType::Unknown);
+        assert_eq!(default_type_mapper("NUMERIC"), RockyType::Unknown);
+        // One parameter is `DECIMAL(p, 0)`, which this mapper used to read as
+        // unparameterised — the disagreement with the other two parsers that
+        // let a `DECIMAL(10)` contract admit a 38-integer-digit column.
+        assert_eq!(default_type_mapper("DECIMAL(10)"), dec(10, 0));
+        assert_eq!(default_type_mapper("NUMERIC(1)"), dec(1, 0));
+        assert_eq!(default_type_mapper("DECIMAL(0)"), RockyType::Unknown);
+        assert_eq!(default_type_mapper("DECIMAL(77)"), RockyType::Unknown);
+        assert_eq!(default_type_mapper("DECIMAL(1,2,3)"), RockyType::Unknown);
     }
 }

@@ -11,8 +11,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::diagnostic::{Diagnostic, E010, E011, E012, E013, W010};
-use crate::types::{RockyType, TypedColumn};
+use crate::diagnostic::{Diagnostic, E010, E011, E012, E013, E037, W010, W032};
+use crate::types::{RockyType, TypedColumn, UNVERIFIABLE_POLICY, UnverifiablePolicy};
 
 /// A compile-time contract for a model's output schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +113,21 @@ pub fn validate_contract(
     inferred_schema: &[TypedColumn],
     contract: &CompilerContract,
 ) -> Vec<Diagnostic> {
+    validate_contract_with_policy(model_name, inferred_schema, contract, UNVERIFIABLE_POLICY)
+}
+
+/// [`validate_contract`] with the unverifiable-type policy as an argument.
+///
+/// Private on purpose — see the same arrangement in
+/// `rocky_core::contracts::validate_contract_typed_with_policy`. The argument
+/// exists so the `Reject` arm is exercised by tests before the flip, not so a
+/// caller can pick how strict a governance gate is.
+fn validate_contract_with_policy(
+    model_name: &str,
+    inferred_schema: &[TypedColumn],
+    contract: &CompilerContract,
+    policy: UnverifiablePolicy,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let col_names: Vec<&str> = inferred_schema.iter().map(|c| c.name.as_str()).collect();
 
@@ -138,10 +153,48 @@ pub fn validate_contract(
 
         match inferred {
             Some(col) => {
-                // Type check
+                // Type check.
+                //
+                // Three outcomes, not two. The contract's expected type is a
+                // *string* here, not a `RockyType`, so `contract_verdict` does
+                // not slot in — but the same rule applies: an unresolved type
+                // is unresolved evidence, and "could not check" must not be
+                // recorded the same way as "checked and found nothing wrong".
+                // It used to be recorded by emitting nothing at all.
                 if let Some(ref expected_type) = contract_col.type_name {
-                    let matches = type_name_matches(&col.data_type, expected_type);
-                    if !matches && col.data_type != RockyType::Unknown {
+                    if col.data_type == RockyType::Unknown {
+                        // The `Unverifiable` verdict, expressed against a
+                        // string-declared type. Scoped to declared decimals for
+                        // this release — see `declares_rocky_decimal`.
+                        if declares_rocky_decimal(expected_type) {
+                            let message = format!(
+                                "column '{}' has no inferred type, so the contract's expected \
+                                 type '{expected_type}' could not be verified — unresolved \
+                                 evidence does not satisfy a contract",
+                                contract_col.name
+                            );
+                            let suggestion = format!(
+                                "give `{}` a concrete type — an explicit CAST with declared \
+                                 precision and scale, e.g. CAST({0} AS DECIMAL(38,2)) — or \
+                                 compile with source schemas available so the type resolves",
+                                contract_col.name
+                            );
+                            diagnostics.push(match policy {
+                                UnverifiablePolicy::Warn => Diagnostic::warning(
+                                    W032,
+                                    model_name,
+                                    format!(
+                                        "{message}. Warning in this release; error in the next"
+                                    ),
+                                )
+                                .with_suggestion(suggestion),
+                                UnverifiablePolicy::Reject => {
+                                    Diagnostic::error(E037, model_name, message)
+                                        .with_suggestion(suggestion)
+                                }
+                            });
+                        }
+                    } else if !type_name_matches(&col.data_type, expected_type) {
                         diagnostics.push(
                             Diagnostic::error(
                                 E011,
@@ -218,7 +271,25 @@ pub fn validate_contract(
     diagnostics
 }
 
+/// Whether a contract's declared type *name* is in the fixed-point decimal
+/// family, in Rocky's vocabulary (`Decimal`, `Decimal(38,2)`).
+///
+/// The load gate's counterpart reads *warehouse* vocabulary (`DECIMAL`,
+/// `NUMBER`, …) and is `rocky_core::contracts::looks_like_decimal`; the two look
+/// alike and are not interchangeable. This one must agree with the `Decimal` arm
+/// of [`type_name_matches`], or a declaration that arm accepts could fall
+/// outside the unverifiable report.
+fn declares_rocky_decimal(type_name: &str) -> bool {
+    type_name == "Decimal" || type_name.starts_with("Decimal(")
+}
+
 /// Check if a RockyType matches a type name string from a contract.
+///
+/// **`Unknown` matches nothing.** Callers must decide the unresolved case before
+/// asking this question — `validate_contract_with_policy` does, which makes the
+/// `Unknown` arm below unreachable. That is exactly why it must not be left
+/// returning `true`: an unreachable fail-open is still a fail-open, waiting for
+/// the next caller.
 fn type_name_matches(rocky_type: &RockyType, type_name: &str) -> bool {
     match rocky_type {
         RockyType::Boolean => type_name == "Boolean",
@@ -236,7 +307,9 @@ fn type_name_matches(rocky_type: &RockyType, type_name: &str) -> bool {
         RockyType::Map(_, _) => type_name == "Map" || type_name.starts_with("Map<"),
         RockyType::Struct(_) => type_name == "Struct",
         RockyType::Variant => type_name == "Variant",
-        RockyType::Unknown => true, // Unknown matches anything
+        // Not "matches anything" — nothing is known about it. Unreachable from
+        // `validate_contract_with_policy`, which is total on `Unknown`.
+        RockyType::Unknown => false,
     }
 }
 
@@ -372,23 +445,130 @@ mod tests {
         );
     }
 
+    /// G4 — **the inversion.** This test was named `test_unknown_type_passes`
+    /// and commented *"Unknown type should not produce an error (we can't
+    /// check)"*. The first half is still true and the second half is the
+    /// fail-open: not being able to check is not the same as checking and
+    /// finding nothing wrong, and the gate used to record the two identically —
+    /// by emitting nothing at all.
+    ///
+    /// The column still produces no `E011` (that code means *mismatch*, which
+    /// is not what happened). It now produces `W032` under the shipping policy
+    /// and `E037` under `Reject`.
     #[test]
-    fn test_unknown_type_passes() {
-        let schema = vec![typed_col("id", RockyType::Unknown, false)];
+    fn test_unknown_type_is_reported_not_permitted() {
+        let schema = vec![typed_col("total_revenue", RockyType::Unknown, false)];
 
         let contract = CompilerContract {
             columns: vec![ContractColumn {
-                name: "id".to_string(),
-                type_name: Some("Int64".to_string()),
+                name: "total_revenue".to_string(),
+                type_name: Some("Decimal".to_string()),
                 nullable: None,
                 description: None,
             }],
             rules: ContractRules::default(),
         };
 
-        let diags = validate_contract("test_model", &schema, &contract);
-        // Unknown type should not produce an error (we can't check)
-        assert!(diags.iter().all(|d| &*d.code != "E011"));
+        let warned = validate_contract_with_policy(
+            "test_model",
+            &schema,
+            &contract,
+            UnverifiablePolicy::Warn,
+        );
+        assert!(
+            warned.iter().all(|d| &*d.code != E011),
+            "an unresolved type is not a mismatch: {warned:?}"
+        );
+        let w032 = warned
+            .iter()
+            .find(|d| &*d.code == W032)
+            .expect("an unverifiable contract type must be reported");
+        assert!(
+            w032.suggestion.is_some(),
+            "W032 must carry an actionable suggestion: {w032:?}"
+        );
+
+        let rejected = validate_contract_with_policy(
+            "test_model",
+            &schema,
+            &contract,
+            UnverifiablePolicy::Reject,
+        );
+        assert!(
+            rejected.iter().any(|d| &*d.code == E037),
+            "the flip must reject, got {rejected:?}"
+        );
+        assert!(rejected.iter().all(|d| &*d.code != W032));
+
+        // The shipping default is the warning.
+        let shipped = validate_contract("test_model", &schema, &contract);
+        assert!(shipped.iter().any(|d| &*d.code == W032));
+        assert!(shipped.iter().all(|d| &*d.code != E037));
+    }
+
+    /// The scope of the compiler gate's unverifiable report: only a contract
+    /// that declares a *decimal* type. A cold schema cache makes every
+    /// contracted column `Unknown`, so a general rule would emit one diagnostic
+    /// per contracted column on every cold compile — and the flip would then
+    /// break every such build. The hole this leaves is real and asserted here
+    /// rather than only described.
+    #[test]
+    fn test_unverifiable_report_is_scoped_to_declared_decimals() {
+        let schema = vec![typed_col("id", RockyType::Unknown, false)];
+        let contract = |type_name: &str| CompilerContract {
+            columns: vec![ContractColumn {
+                name: "id".to_string(),
+                type_name: Some(type_name.to_string()),
+                nullable: None,
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+
+        for declared in ["Decimal", "Decimal(38,2)"] {
+            let diags = validate_contract("m", &schema, &contract(declared));
+            assert!(
+                diags.iter().any(|d| &*d.code == W032),
+                "{declared} must be reported"
+            );
+        }
+
+        // Out of scope for this release — still permitted, and still silent,
+        // under both policies.
+        for declared in ["Int64", "String", "Timestamp"] {
+            let warned = validate_contract("m", &schema, &contract(declared));
+            let rejected = validate_contract_with_policy(
+                "m",
+                &schema,
+                &contract(declared),
+                UnverifiablePolicy::Reject,
+            );
+            assert!(
+                warned.is_empty() && rejected.is_empty(),
+                "{declared}: scoped out of this release, but got {warned:?} / {rejected:?}"
+            );
+        }
+    }
+
+    /// G6 — `Unknown` must not match a declared type name either. Once the
+    /// caller decides `Unknown` first this arm is unreachable, which is exactly
+    /// why it must not be left returning `true`: it is a fail-open sitting in
+    /// wait for the next caller.
+    #[test]
+    fn test_type_name_matches_rejects_unknown() {
+        assert!(!type_name_matches(&RockyType::Unknown, "Int64"));
+        assert!(!type_name_matches(&RockyType::Unknown, "Decimal"));
+        assert!(!type_name_matches(&RockyType::Unknown, "Unknown"));
+        // Known types are unaffected.
+        assert!(type_name_matches(&RockyType::Int64, "Int64"));
+        assert!(type_name_matches(
+            &RockyType::Decimal {
+                precision: 10,
+                scale: 2
+            },
+            "Decimal(10,2)"
+        ));
+        assert!(!type_name_matches(&RockyType::Int64, "String"));
     }
 
     #[test]

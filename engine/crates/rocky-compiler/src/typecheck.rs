@@ -20,7 +20,7 @@ use sqlparser::parser::Parser;
 use crate::compile::default_type_mapper;
 use crate::diagnostic::{
     Diagnostic, E001, E020, E021, E022, E023, E024, E025, E026, E035, E036, I001, I002, SourceSpan,
-    W001, W002, W003, W004, W005, W006,
+    W001, W002, W003, W004, W005, W006, W033,
 };
 use crate::semantic::{ModelSchema, SemanticGraph};
 use crate::types::{
@@ -1663,13 +1663,8 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         }
         "COALESCE" => {
             let arg_types = all_arg_types(func, scope);
-            let result_type = arg_types
-                .iter()
-                .map(|(t, _)| t)
-                .try_fold(RockyType::Unknown, |acc, t| {
-                    crate::types::common_supertype(&acc, t)
-                })
-                .unwrap_or(RockyType::Unknown);
+            let branches: Vec<RockyType> = arg_types.iter().map(|(t, _)| t.clone()).collect();
+            let result_type = crate::types::common_supertype_of(&branches);
             let all_nullable = arg_types.iter().all(|(_, n)| *n);
             (result_type, all_nullable)
         }
@@ -1740,14 +1735,8 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
         }
         "GREATEST" | "LEAST" => {
             let arg_types = all_arg_types(func, scope);
-            let result_type = arg_types
-                .iter()
-                .map(|(t, _)| t)
-                .try_fold(RockyType::Unknown, |acc, t| {
-                    crate::types::common_supertype(&acc, t)
-                })
-                .unwrap_or(RockyType::Unknown);
-            (result_type, true)
+            let branches: Vec<RockyType> = arg_types.iter().map(|(t, _)| t.clone()).collect();
+            (crate::types::common_supertype_of(&branches), true)
         }
 
         "CAST" => (RockyType::Unknown, true), // handled by Expr::Cast above
@@ -1757,32 +1746,36 @@ fn infer_function_type(func: &ast::Function, scope: &TypeScope) -> (RockyType, b
 
 /// Infer the result type of a CASE WHEN expression.
 ///
-/// Folds the common supertype across all THEN branches and the optional
-/// ELSE branch. The result is nullable when any branch is nullable or
-/// when no ELSE clause is present.
+/// Unifies all THEN branches and the optional ELSE branch as a *set*
+/// ([`crate::types::common_supertype_of`]), so the inferred type does not depend
+/// on the order the branches are written in. Folding them pairwise did: a
+/// branch pair that overflows the precision cap unifies to `Unknown`, and
+/// `Unknown` is the bottom element, so the next branch replaced it.
+///
+/// The result is nullable when any branch is nullable or when no ELSE clause is
+/// present — unchanged, and deliberately kept as its own accumulation, because
+/// nullability is an `any`, not a unification.
 fn infer_case_type(
     conditions: &[ast::CaseWhen],
     else_result: &Option<Box<Expr>>,
     scope: &TypeScope,
 ) -> (RockyType, bool) {
-    let mut result_type = RockyType::Unknown;
+    let mut branches = Vec::with_capacity(conditions.len() + 1);
     let mut nullable = else_result.is_none(); // No ELSE → nullable
 
     for case_when in conditions {
         let (t, n) = infer_expr_type(&case_when.result, scope);
-        result_type =
-            crate::types::common_supertype(&result_type, &t).unwrap_or(RockyType::Unknown);
+        branches.push(t);
         nullable = nullable || n;
     }
 
     if let Some(else_expr) = else_result {
         let (t, n) = infer_expr_type(else_expr, scope);
-        result_type =
-            crate::types::common_supertype(&result_type, &t).unwrap_or(RockyType::Unknown);
+        branches.push(t);
         nullable = nullable || n;
     }
 
-    (result_type, nullable)
+    (crate::types::common_supertype_of(&branches), nullable)
 }
 
 /// Resolve a declared `DECIMAL`/`NUMERIC` parameter list to a `RockyType`.
@@ -1806,23 +1799,37 @@ fn decimal_from_exact_number_info(info: &ast::ExactNumberInfo) -> RockyType {
     })
 }
 
-/// Reject `CAST` targets whose decimal precision/scale parameters are out of
-/// range (E036).
+/// Diagnose `CAST` targets that name a decimal Rocky cannot type.
 ///
 /// This is a standalone pass rather than a diagnostic emitted from
 /// [`sql_type_to_rocky`], because expression inference returns
 /// `(RockyType, bool)` with no diagnostic channel and threading one through a
 /// recursive inference function would be a large refactor for one check. The
-/// two are decoupled but share [`decimal_from_exact_number_info`], so a
-/// declaration that types as `Unknown` is exactly the set this rejects.
+/// two are decoupled but share [`decimal_from_exact_number_info`].
 ///
-/// # Why this must be an error
+/// # The invariant, stated as it actually holds
 ///
-/// `rocky_compiler::contracts` skips the E011 required-column-type check for any
-/// column whose type is `Unknown`. Degrading an invalid declaration to `Unknown`
-/// without failing the compile would therefore *create* a new way to bypass
-/// contract validation. Failing here means the `Unknown` never reaches a
-/// governance decision unchallenged.
+/// Every declaration that types as `Unknown` is **diagnosed** here — `E036` when
+/// the parameters are present but name no type on any adapter, `W033` when the
+/// parameters are absent and the default is dialect-dependent. (An earlier
+/// version of this comment claimed the `Unknown` set was *exactly* what the pass
+/// rejects, which was false: the unparameterised case typed as `Unknown` and was
+/// explicitly exempted from the check, so it produced neither a type nor a
+/// diagnostic. `test_three_decimal_parsers_agree` and
+/// `test_bare_decimal_cast_warns_w033` pin the invariant in its true form.)
+///
+/// # Why one is an error and the other a warning
+///
+/// Out-of-range parameters (`DECIMAL(300,2)`) are meaningless on every supported
+/// adapter, so `E036` rejects no valid program. A bare `DECIMAL` is legal SQL
+/// everywhere — it is not wrong, it is *ambiguous*, naming `DECIMAL(10,0)` on
+/// Databricks, `DECIMAL(18,3)` on DuckDB and `NUMBER(38,0)` on Snowflake. So it
+/// warns.
+///
+/// Either way the resulting `Unknown` no longer reaches a governance decision
+/// unchallenged: `crate::contracts` reports an unresolved type against a
+/// declared decimal instead of skipping the check, and the `rocky load` gate
+/// treats it as [`rocky_ir::ContractVerdict::Unverifiable`] rather than a pass.
 ///
 /// # Scope
 ///
@@ -1858,11 +1865,6 @@ fn check_decimal_declarations(model_name: &str, sql: &str) -> Vec<Diagnostic> {
         else {
             return ControlFlow::Continue(());
         };
-        // A bare `DECIMAL` is unparameterised, not invalid — it types as
-        // `Unknown` but names nothing out of range, so it is not an error.
-        if matches!(info, ast::ExactNumberInfo::None) {
-            return ControlFlow::Continue(());
-        }
         if decimal_from_exact_number_info(info) != RockyType::Unknown {
             return ControlFlow::Continue(());
         }
@@ -1871,7 +1873,22 @@ fn check_decimal_declarations(model_name: &str, sql: &str) -> Vec<Diagnostic> {
         if !seen.insert(rendered.clone()) {
             return ControlFlow::Continue(());
         }
-        diagnostics.push(
+        // A bare `DECIMAL` is unparameterised, not invalid: legal SQL on every
+        // adapter, so it is not the "names no type anywhere" class E036 exists
+        // for. It is still untyped, and it used to be exempted from this check
+        // entirely — no type and no diagnostic.
+        diagnostics.push(if matches!(info, ast::ExactNumberInfo::None) {
+            Diagnostic::warning(
+                W033,
+                model_name,
+                format!(
+                    "cast target '{rendered}' declares no precision or scale, and the default \
+                     is dialect-dependent — Databricks DECIMAL(10,0), DuckDB DECIMAL(18,3), \
+                     Snowflake NUMBER(38,0) — so this column has no inferred type"
+                ),
+            )
+            .with_suggestion("declare the precision and scale, e.g. CAST(x AS DECIMAL(38,2))")
+        } else {
             Diagnostic::error(
                 E036,
                 model_name,
@@ -1884,8 +1901,8 @@ fn check_decimal_declarations(model_name: &str, sql: &str) -> Vec<Diagnostic> {
             .with_suggestion(
                 "pick a precision and scale the target warehouse supports, \
                  e.g. DECIMAL(38,2)",
-            ),
-        );
+            )
+        });
         ControlFlow::Continue(())
     });
 
@@ -3393,15 +3410,19 @@ mod tests {
         }
     }
 
-    /// Valid declarations — including a bare `DECIMAL`, which is
-    /// unparameterised rather than out of range — produce no E036.
+    /// Declarations that name a type produce no diagnostic at all.
+    ///
+    /// The bare `DECIMAL` row moved out of this list — see
+    /// `test_bare_decimal_cast_warns_w033`. It was here because it is not an
+    /// *error*, which is true and was the wrong conclusion: it types as
+    /// `Unknown`, and an `Unknown` with no diagnostic is the silence B1 is
+    /// about.
     #[test]
     fn test_valid_decimal_cast_is_not_e036() {
         for sql in [
             "SELECT CAST(amount AS DECIMAL(10,2)) AS a FROM source.raw.t",
             "SELECT CAST(amount AS DECIMAL(76,38)) AS a FROM source.raw.t",
             "SELECT CAST(amount AS DECIMAL(10)) AS a FROM source.raw.t",
-            "SELECT CAST(amount AS DECIMAL) AS a FROM source.raw.t",
             "SELECT CAST(amount AS BIGINT) AS a FROM source.raw.t",
             "SELECT CAST(amount AS DEC(10,2)) AS a FROM source.raw.t",
             "SELECT CAST(amount AS BIGNUMERIC(76,38)) AS a FROM source.raw.t",
@@ -3412,6 +3433,328 @@ mod tests {
                 "unexpected diagnostic for: {sql}"
             );
         }
+    }
+
+    /// T2.14 — the branch-set expressions are order-independent end to end.
+    ///
+    /// Measured before the fix, over columns `a: DECIMAL(30,0)`,
+    /// `b: DECIMAL(30,30)`, `c: DECIMAL(5,2)`:
+    ///
+    /// ```text
+    /// CASE … THEN a … THEN b ELSE c END  =>  DECIMAL(5,2)
+    /// CASE … THEN c … THEN b ELSE a END  =>  ?
+    /// COALESCE(a, b, c)                  =>  DECIMAL(5,2)
+    /// COALESCE(c, b, a)                  =>  ?
+    /// ```
+    ///
+    /// `DECIMAL(5,2)` holds three integer digits; branch `a` alone needs thirty.
+    #[test]
+    fn test_case_expression_is_order_independent() {
+        let dec = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
+        let mut scope = HashMap::new();
+        scope.insert(
+            "t".to_string(),
+            source_schema(&[
+                ("a", dec(30, 0), true),
+                ("b", dec(30, 30), true),
+                ("c", dec(5, 2), true),
+                ("i", RockyType::Int64, true),
+            ]),
+        );
+
+        let infer = |expr: &str| {
+            infer_select_types(&format!("SELECT {expr} AS x FROM t"), &scope, "m").unwrap()[0]
+                .data_type
+                .clone()
+        };
+
+        for (forward, reverse) in [
+            (
+                "CASE WHEN 1=1 THEN a WHEN 2=2 THEN b ELSE c END",
+                "CASE WHEN 1=1 THEN c WHEN 2=2 THEN b ELSE a END",
+            ),
+            ("COALESCE(a, b, c)", "COALESCE(c, b, a)"),
+            ("COALESCE(a, b, i)", "COALESCE(i, b, a)"),
+            ("GREATEST(a, b, c)", "GREATEST(c, b, a)"),
+            ("LEAST(a, b, c)", "LEAST(b, c, a)"),
+        ] {
+            let f = infer(forward);
+            let r = infer(reverse);
+            assert_eq!(f, r, "order-dependent: {forward} => {f}, {reverse} => {r}");
+            assert_eq!(
+                f,
+                RockyType::Unknown,
+                "{forward}: no decimal under the cap holds 30 integer digits and 30 \
+                 fractional digits, so the honest answer is no answer"
+            );
+        }
+
+        // And a set that *does* have a common type still resolves to it, in
+        // either order.
+        assert_eq!(infer("COALESCE(c, c)"), dec(5, 2));
+        // Int64 contributes 19 integer digits, DECIMAL(5,2) contributes 2
+        // fractional digits: DECIMAL(21,2) holds both.
+        assert_eq!(infer("COALESCE(c, i)"), dec(21, 2));
+        assert_eq!(infer("COALESCE(i, c)"), dec(21, 2));
+    }
+
+    /// T2.15 — the trap the review named, pinned against the *fix* rather than
+    /// the bug: making the fold sound must not turn a cap-overflowing join key
+    /// into a hard `E001`.
+    ///
+    /// It does not, and the reason is structural rather than incidental:
+    /// `common_supertype` keeps its `Option` signature and its `Some(Unknown)`
+    /// on cap overflow, and the fold sites moved to a different function
+    /// entirely. `emit_join_key_diagnostic` reads only `.is_some()`, so
+    /// `Some(Unknown)` and `Some(concrete)` are indistinguishable there.
+    ///
+    /// This test passes before the change as well as after — it exists so that
+    /// a future "simplification" of `common_supertype` to return `None` on
+    /// overflow fails loudly.
+    #[test]
+    fn test_join_key_cap_overflow_is_w001_not_e001() {
+        let models = vec![
+            make_model("wide", "SELECT k FROM source.raw.wide_src"),
+            make_model("high_scale", "SELECT k FROM source.raw.high_scale_src"),
+            make_model(
+                "joined",
+                "SELECT w.k AS k FROM wide w JOIN high_scale h ON w.k = h.k",
+            ),
+        ];
+        let project = Project::from_models(models).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.wide_src".to_string(),
+            vec![rocky_ir::ColumnInfo {
+                name: "k".to_string(),
+                data_type: "DECIMAL(30,0)".to_string(),
+                nullable: true,
+            }],
+        );
+        external.insert(
+            "source.raw.high_scale_src".to_string(),
+            vec![rocky_ir::ColumnInfo {
+                name: "k".to_string(),
+                data_type: "DECIMAL(30,30)".to_string(),
+                nullable: true,
+            }],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+
+        let mut sources = HashMap::new();
+        sources.insert(
+            "source.raw.wide_src".to_string(),
+            source_schema(&[(
+                "k",
+                RockyType::Decimal {
+                    precision: 30,
+                    scale: 0,
+                },
+                true,
+            )]),
+        );
+        sources.insert(
+            "source.raw.high_scale_src".to_string(),
+            source_schema(&[(
+                "k",
+                RockyType::Decimal {
+                    precision: 30,
+                    scale: 30,
+                },
+                true,
+            )]),
+        );
+
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        assert!(
+            result.diagnostics.iter().all(|d| &*d.code != E001),
+            "a cap-overflowing join key must not become a hard incompatibility: {:?}",
+            result
+                .diagnostics
+                .iter()
+                .map(|d| (d.code.to_string(), d.message.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// T5.12 — a bare decimal cast warns (`W033`) instead of being exempted.
+    ///
+    /// It used to hit an explicit early-continue in `check_decimal_declarations`
+    /// commented *"unparameterised, not invalid"*, so the column typed as
+    /// `Unknown` with no diagnostic whatsoever: it silently skipped the
+    /// contract check and, on the content-addressed path, failed at write time
+    /// with nothing at compile time pointing at the cause.
+    ///
+    /// A warning and not an error because the declaration is legal SQL on every
+    /// adapter — it is ambiguous, not meaningless.
+    #[test]
+    fn test_bare_decimal_cast_warns_w033() {
+        for spelling in ["DECIMAL", "NUMERIC", "DEC", "BIGNUMERIC", "BIGDECIMAL"] {
+            let sql = format!("SELECT CAST(amount AS {spelling}) AS a FROM source.raw.t");
+            let diags = check_decimal_declarations("m", &sql);
+            assert_eq!(diags.len(), 1, "expected exactly one diagnostic for: {sql}");
+            assert_eq!(&*diags[0].code, W033, "wrong code for: {sql}");
+            assert!(
+                diags[0].suggestion.is_some(),
+                "W033 must say what to write instead: {:?}",
+                diags[0]
+            );
+        }
+        // `::DECIMAL` shorthand and TRY_CAST parse to the same `Expr::Cast`.
+        assert_eq!(
+            &*check_decimal_declarations("m", "SELECT amount::DECIMAL AS a FROM source.raw.t")[0]
+                .code,
+            W033
+        );
+        assert_eq!(
+            &*check_decimal_declarations(
+                "m",
+                "SELECT TRY_CAST(amount AS NUMERIC) AS a FROM source.raw.t"
+            )[0]
+            .code,
+            W033
+        );
+        // Out-of-range parameters stay an error — the two classes are distinct.
+        assert_eq!(
+            &*check_decimal_declarations(
+                "m",
+                "SELECT CAST(amount AS DECIMAL(300,2)) AS a FROM source.raw.t"
+            )[0]
+            .code,
+            E036
+        );
+    }
+
+    /// T5.13 — **the three decimal parsers must agree on every input.**
+    ///
+    /// This test lives here because it is the only module that can see all
+    /// three: `sql_type_to_rocky` is private to this module,
+    /// `compile::default_type_mapper` is `pub` in a sibling module, and
+    /// `rocky_core::contracts::warehouse_type_to_rocky` is in another crate.
+    /// Anywhere else pins two of three and lets the third drift — which is
+    /// exactly how the `DECIMAL(10)` false permit shipped.
+    ///
+    /// The corpus is `(text, ExactNumberInfo, expected)` triples rather than
+    /// strings because one parser is AST-driven and two are string-driven; a
+    /// string-only table would look complete while driving two of the three.
+    #[test]
+    fn test_three_decimal_parsers_agree() {
+        use ast::ExactNumberInfo as E;
+
+        let dec = |precision: u8, scale: u8| RockyType::Decimal { precision, scale };
+        let cases: &[(&str, E, RockyType)] = &[
+            ("DECIMAL(10,2)", E::PrecisionAndScale(10, 2), dec(10, 2)),
+            ("DECIMAL(76,38)", E::PrecisionAndScale(76, 38), dec(76, 38)),
+            // B2 — one parameter is `(p, 0)`, not "unparameterised".
+            ("DECIMAL(10)", E::Precision(10), dec(10, 0)),
+            ("DECIMAL(1)", E::Precision(1), dec(1, 0)),
+            // B2 — unparameterised names no single type across the adapters.
+            ("DECIMAL", E::None, RockyType::Unknown),
+            (
+                "DECIMAL(300,2)",
+                E::PrecisionAndScale(300, 2),
+                RockyType::Unknown,
+            ),
+            (
+                "DECIMAL(10,-2)",
+                E::PrecisionAndScale(10, -2),
+                RockyType::Unknown,
+            ),
+            (
+                "DECIMAL(5,10)",
+                E::PrecisionAndScale(5, 10),
+                RockyType::Unknown,
+            ),
+            (
+                "DECIMAL(0,0)",
+                E::PrecisionAndScale(0, 0),
+                RockyType::Unknown,
+            ),
+            (
+                "DECIMAL(77,0)",
+                E::PrecisionAndScale(77, 0),
+                RockyType::Unknown,
+            ),
+            ("DECIMAL(0)", E::Precision(0), RockyType::Unknown),
+            ("DECIMAL(77)", E::Precision(77), RockyType::Unknown),
+        ];
+
+        for (text, info, expect) in cases {
+            assert_eq!(
+                sql_type_to_rocky(&ast::DataType::Decimal(*info)),
+                *expect,
+                "sql_type_to_rocky: {text}"
+            );
+            assert_eq!(
+                crate::compile::default_type_mapper(text),
+                *expect,
+                "default_type_mapper: {text}"
+            );
+            assert_eq!(
+                rocky_core::contracts::warehouse_type_to_rocky(text),
+                *expect,
+                "warehouse_type_to_rocky: {text}"
+            );
+
+            // Spellings must not diverge either — but only over the
+            // intersection each parser claims to support, which is not the same
+            // set. Widening one parser's alias list without the others must
+            // fail the assertion below, not slip through this loop.
+            for alias in ["NUMERIC", "NUMBER", "DEC", "BIGNUMERIC", "BIGDECIMAL"] {
+                let aliased = text.replacen("DECIMAL", alias, 1);
+                if default_type_mapper_claims(alias) {
+                    assert_eq!(
+                        crate::compile::default_type_mapper(&aliased),
+                        *expect,
+                        "default_type_mapper: {aliased}"
+                    );
+                }
+                if warehouse_mapper_claims(alias) {
+                    assert_eq!(
+                        rocky_core::contracts::warehouse_type_to_rocky(&aliased),
+                        *expect,
+                        "warehouse_type_to_rocky: {aliased}"
+                    );
+                }
+            }
+        }
+
+        // The claimed alias sets themselves, pinned. `sql_type_to_rocky` covers
+        // all five because sqlparser gives each its own `DataType` variant;
+        // the two string parsers cover strictly less, and that asymmetry is a
+        // known gap, not an accident — widening it is a separate change with
+        // its own contract-verdict blast radius.
+        assert!(default_type_mapper_claims("NUMERIC"));
+        for alias in ["NUMBER", "DEC", "BIGDECIMAL"] {
+            assert!(!default_type_mapper_claims(alias), "{alias}");
+        }
+        for alias in ["NUMERIC", "NUMBER", "BIGNUMERIC"] {
+            assert!(warehouse_mapper_claims(alias), "{alias}");
+        }
+        for alias in ["DEC", "BIGDECIMAL"] {
+            assert!(!warehouse_mapper_claims(alias), "{alias}");
+        }
+    }
+
+    /// Whether `compile::default_type_mapper` claims to recognize a decimal
+    /// spelling. Probed rather than duplicated so it cannot go stale.
+    fn default_type_mapper_claims(alias: &str) -> bool {
+        crate::compile::default_type_mapper(&format!("{alias}(10,2)"))
+            == RockyType::Decimal {
+                precision: 10,
+                scale: 2,
+            }
+    }
+
+    /// Whether `rocky_core::contracts::warehouse_type_to_rocky` claims to
+    /// recognize a decimal spelling.
+    fn warehouse_mapper_claims(alias: &str) -> bool {
+        rocky_core::contracts::warehouse_type_to_rocky(&format!("{alias}(10,2)"))
+            == RockyType::Decimal {
+                precision: 10,
+                scale: 2,
+            }
     }
 
     /// Unparseable SQL yields no E036 — the parse failure is reported by the
@@ -3538,6 +3881,64 @@ mod tests {
         }
         // A direct passthrough still carries its source type.
         assert_eq!(by_name["passthru"].data_type, dec);
+    }
+
+    /// T6.4 — the bare decimal cast end to end. The column types as `Unknown`
+    /// (no sound concrete answer exists) **and** the compile now says so.
+    ///
+    /// Before this change the same model produced an `Unknown` column and a
+    /// single `I002` "1 column(s) have unknown types" info — nothing that named
+    /// the cast, and nothing a contract gate could act on.
+    #[test]
+    fn test_bare_decimal_cast_end_to_end() {
+        let models = vec![make_model(
+            "m",
+            "SELECT CAST(amount AS DECIMAL) AS bare, amount AS passthru FROM source.raw.src",
+        )];
+        let project = Project::from_models(models).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert(
+            "source.raw.src".to_string(),
+            vec![rocky_ir::ColumnInfo {
+                name: "amount".to_string(),
+                data_type: "DECIMAL(30,0)".to_string(),
+                nullable: true,
+            }],
+        );
+        let graph = build_semantic_graph(&project, &external).unwrap();
+
+        let dec = RockyType::Decimal {
+            precision: 30,
+            scale: 0,
+        };
+        let mut sources = HashMap::new();
+        sources.insert(
+            "source.raw.src".to_string(),
+            source_schema(&[("amount", dec.clone(), true)]),
+        );
+
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let by_name: HashMap<&str, &TypedColumn> = result.typed_models["m"]
+            .iter()
+            .map(|c| (c.name.as_str(), c))
+            .collect();
+
+        assert_eq!(
+            by_name["bare"].data_type,
+            RockyType::Unknown,
+            "no concrete type is sound: Databricks (10,0), DuckDB (18,3), Snowflake (38,0)"
+        );
+        assert_eq!(by_name["passthru"].data_type, dec);
+        let w033 = result
+            .diagnostics
+            .iter()
+            .find(|d| &*d.code == W033)
+            .expect("the untyped cast must be named by a diagnostic");
+        assert!(
+            w033.message.contains("DECIMAL"),
+            "W033 must name the cast target: {w033:?}"
+        );
     }
 
     #[test]

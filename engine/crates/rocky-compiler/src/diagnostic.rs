@@ -157,6 +157,20 @@ pub const E035: &str = "E035";
 /// there is no valid program this rejects.
 pub const E036: &str = "E036";
 
+/// A contract's expected type could not be verified, because the column's
+/// inferred type did not resolve.
+///
+/// The `Reject` half of the unverifiable-type gate — see
+/// [`rocky_ir::UNVERIFIABLE_POLICY`], which is the one line that decides whether
+/// this or [`W032`] fires. `RockyType::Unknown` is a valid conservative
+/// *inference* result, but at a contract gate it is unresolved *evidence*, and
+/// evidence that has not been produced must not read as evidence of safety.
+///
+/// Not emitted under the shipping policy (`Warn`), which reports [`W032`]
+/// instead and permits for one release. The arm is exercised by tests today so
+/// the flip is a switch, not a new code path.
+pub const E037: &str = "E037";
+
 // Warnings
 /// Unused model (no downstream consumers).
 pub const W001: &str = "W001";
@@ -242,23 +256,62 @@ pub const W030: &str = "W030";
 /// be too small, hence a warning rather than silence.
 pub const W031: &str = "W031";
 
-/// A data contract declares a column type whose decimal precision/scale
-/// parameters are out of range, so the contract's expected type cannot be
-/// normalized.
+/// A contract type check could not be verified, because a type did not resolve.
 ///
-/// **Emitted by the `rocky load` contract gate, not by `rocky compile`** — it is
-/// the one code in this registry that does not come from the compiler.
-/// `rocky_core::contracts::validate_contract_typed` surfaces it as a
-/// `ContractResult` warning string (rocky-core cannot depend on this crate), so
-/// the code is reserved here to keep the registry the single place a code is
-/// allocated. Grep for `"W032"` in `rocky-core/src/contracts.rs` for the
-/// emission site.
+/// The `Warn` half of the unverifiable-type gate; [`E037`] is the same condition
+/// under `Reject`, and [`rocky_ir::UNVERIFIABLE_POLICY`] is the one line that
+/// picks between them. Emitted when [`rocky_ir::contract_verdict`] returns
+/// `Unverifiable` — either the landed/inferred type or the contract's declared
+/// type normalized to `RockyType::Unknown` — for a comparison in the *decimal*
+/// family whose two raw type strings differ.
 ///
-/// A warning rather than a violation because the type comparison degrades to
-/// `RockyType::Unknown`, which passes: an un-normalizable type has always been
-/// "never a false failure" on this path. The warning is what keeps that
-/// degradation from being silent.
+/// **Emitted by both contract gates.** `rocky compile`'s gate
+/// (`crate::contracts::validate_contract`) emits it as a `Diagnostic`; the
+/// `rocky load` gate (`rocky_core::contracts::validate_contract_typed`)
+/// surfaces it as a `ContractResult` warning string prefixed `"W032: "`, because
+/// rocky-core cannot depend on this crate. The code is reserved here so the
+/// registry stays the single place a code is allocated. Grep for `"W032"` in
+/// `rocky-core/src/contracts.rs` for that emission site.
+///
+/// # Why the condition changed
+///
+/// This code was allocated one round earlier, for the strictly narrower
+/// condition "the contract's *own* declared decimal parameters are out of
+/// range, so the check was skipped", with the rationale that *an un-normalizable
+/// type has always been "never a false failure" on this path*. That rationale is
+/// what the split predicate overturns: at a validation gate, an unresolved type
+/// is a false **permit**, not a false failure. The condition is widened rather
+/// than a second code allocated, because the old condition is a subset of the
+/// new one and two codes would double-fire on the same `DECIMAL(300,2)`
+/// contract. `W032` has never shipped in a release.
+///
+/// # Scope, and the hole it leaves
+///
+/// Restricted to the decimal family. With a cold schema cache *every* contracted
+/// column types as `Unknown`, so a general rule would emit one diagnostic per
+/// contracted column per compile, and the flip to `Reject` would break every
+/// such build. A contracted non-decimal column whose type does not resolve
+/// therefore still passes both gates silently. That fail-open is open.
 pub const W032: &str = "W032";
+
+/// A `CAST` target names a decimal with no precision or scale, so the column has
+/// no inferred type.
+///
+/// Emitted by `rocky compile` for `CAST(x AS DECIMAL)` (and `NUMERIC` / `DEC` /
+/// `BIGNUMERIC` / `BIGDECIMAL` with no parameters). The declaration is legal SQL
+/// on every adapter, which is why this is a warning and not [`E036`] — but the
+/// *default* it names differs per engine: Databricks `DECIMAL(10,0)`, DuckDB
+/// `DECIMAL(18,3)` (executed), Snowflake `NUMBER(38,0)`. There is no sound
+/// concrete answer — `Decimal(38,0)` is not an upper bound on `Decimal(18,3)`,
+/// its scale is smaller — so the column types as `RockyType::Unknown`.
+///
+/// # Why it must not be silent
+///
+/// An `Unknown` column is unresolved evidence at every downstream gate, and on
+/// the content-addressed materialization path it is a hard write failure
+/// (`run_content_addressed.rs` has no `Unknown` arm). Before this code the
+/// declaration produced neither a type nor a diagnostic.
+pub const W033: &str = "W033";
 
 // Info
 /// Model dependency inferred from SQL.
