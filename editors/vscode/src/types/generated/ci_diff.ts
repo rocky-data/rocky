@@ -186,7 +186,9 @@ export interface BreakingFinding {
   [k: string]: unknown;
 }
 /**
- * Diff result for a single model between two pipeline states.
+ * Diff result for a single warehouse object between two pipeline states.
+ *
+ * A row identifies a **target**, not a logical model. A model whose target moves is therefore reported twice — removed at its old target, added at its new one — because that is what happens in the warehouse: nothing drops the abandoned table. [`Self::model_name`] alone cannot distinguish those two rows, so [`Self::resolved_target`] carries the identity they differ on.
  */
 export interface DiffResult {
   /**
@@ -194,9 +196,17 @@ export interface DiffResult {
    */
   column_changes?: ColumnDiff[];
   /**
-   * Fully-qualified model name (e.g. `catalog.schema.table`).
+   * Logical model name — the sidecar `name`, or the filename stem when the classifier could not resolve a compiled model.
+   *
+   * Not unique across a result set: two rows share it when a model's target moved. Key on [`Self::resolved_target`] instead when one is present.
    */
   model_name: string;
+  /**
+   * The warehouse object this row describes, as `catalog.schema.table`.
+   *
+   * `None` when the classifier fell back to filename matching because a ref did not compile, and for callers that build results without a resolved project (e.g. the row-level comparison in `compare`).
+   */
+  resolved_target?: string | null;
   /**
    * Row count on the incoming (PR) side. `None` for removed models.
    */

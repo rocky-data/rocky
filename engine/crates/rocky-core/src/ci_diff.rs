@@ -87,13 +87,30 @@ pub struct ColumnDiff {
 // Per-model diff result
 // ---------------------------------------------------------------------------
 
-/// Diff result for a single model between two pipeline states.
+/// Diff result for a single warehouse object between two pipeline states.
+///
+/// A row identifies a **target**, not a logical model. A model whose target
+/// moves is therefore reported twice — removed at its old target, added at its
+/// new one — because that is what happens in the warehouse: nothing drops the
+/// abandoned table. [`Self::model_name`] alone cannot distinguish those two
+/// rows, so [`Self::resolved_target`] carries the identity they differ on.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DiffResult {
-    /// Fully-qualified model name (e.g. `catalog.schema.table`).
+    /// Logical model name — the sidecar `name`, or the filename stem when the
+    /// classifier could not resolve a compiled model.
+    ///
+    /// Not unique across a result set: two rows share it when a model's target
+    /// moved. Key on [`Self::resolved_target`] instead when one is present.
     pub model_name: String,
     /// High-level status.
     pub status: ModelDiffStatus,
+    /// The warehouse object this row describes, as `catalog.schema.table`.
+    ///
+    /// `None` when the classifier fell back to filename matching because a ref
+    /// did not compile, and for callers that build results without a resolved
+    /// project (e.g. the row-level comparison in `compare`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_target: Option<String>,
     /// Row count on the base (target branch) side. `None` for added models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_count_before: Option<u64>,
@@ -180,9 +197,17 @@ pub fn format_diff_markdown(results: &[DiffResult]) -> String {
         summary.unchanged,
     ));
 
-    // Summary table — only non-unchanged models
-    out.push_str("| Model | Status | Rows (before) | Rows (after) | Delta |\n");
-    out.push_str("|-------|--------|--------------|-------------|-------|\n");
+    // Summary table — only non-unchanged models. The target column earns its
+    // width only when a row actually carries one; the fallback classifier and
+    // the row-level comparison paths leave it unset.
+    let show_target = results.iter().any(|r| r.resolved_target.is_some());
+    if show_target {
+        out.push_str("| Model | Target | Status | Rows (before) | Rows (after) | Delta |\n");
+        out.push_str("|-------|--------|--------|--------------|-------------|-------|\n");
+    } else {
+        out.push_str("| Model | Status | Rows (before) | Rows (after) | Delta |\n");
+        out.push_str("|-------|--------|--------------|-------------|-------|\n");
+    }
 
     for r in results {
         if r.status == ModelDiffStatus::Unchanged {
@@ -201,10 +226,22 @@ pub fn format_diff_markdown(results: &[DiffResult]) -> String {
             ModelDiffStatus::Removed => "removed",
             ModelDiffStatus::Unchanged => unreachable!(),
         };
-        out.push_str(&format!(
-            "| `{}` | {} | {} | {} | {} |\n",
-            r.model_name, status_badge, before, after, delta
-        ));
+        if show_target {
+            out.push_str(&format!(
+                "| `{}` | `{}` | {} | {} | {} | {} |\n",
+                r.model_name,
+                r.resolved_target.as_deref().unwrap_or("-"),
+                status_badge,
+                before,
+                after,
+                delta
+            ));
+        } else {
+            out.push_str(&format!(
+                "| `{}` | {} | {} | {} | {} |\n",
+                r.model_name, status_badge, before, after, delta
+            ));
+        }
     }
     out.push('\n');
 
@@ -213,9 +250,13 @@ pub fn format_diff_markdown(results: &[DiffResult]) -> String {
         if r.column_changes.is_empty() {
             continue;
         }
+        // Disambiguate the <summary> too — two rows can share a model name.
+        let heading = match &r.resolved_target {
+            Some(target) => format!("{} — {}", r.model_name, target),
+            None => r.model_name.clone(),
+        };
         out.push_str(&format!(
-            "<details>\n<summary><b>{}</b> — column changes</summary>\n\n",
-            r.model_name
+            "<details>\n<summary><b>{heading}</b> — column changes</summary>\n\n"
         ));
         out.push_str("| Column | Change | Old Type | New Type |\n");
         out.push_str("|--------|--------|----------|----------|\n");
@@ -269,14 +310,23 @@ pub fn format_diff_table(results: &[DiffResult]) -> String {
         .max(5);
     let status_width = 8; // "modified" is the longest status string
     let num_width = 12;
+    // Two rows can share a model name once a target moves, so show the target
+    // when any row resolved one.
+    let target_width = changed
+        .iter()
+        .filter_map(|r| r.resolved_target.as_deref().map(str::len))
+        .max()
+        .map(|w| w.max(6));
 
     // Table header
+    let header_target = target_width.map_or(String::new(), |w| format!("  {:<w$}", "TARGET"));
+    let rule_target = target_width.map_or(String::new(), |w| format!("  {}", "-".repeat(w)));
     out.push_str(&format!(
-        "  {:<model_width$}  {:<status_width$}  {:>num_width$}  {:>num_width$}  {:>num_width$}\n",
+        "  {:<model_width$}{header_target}  {:<status_width$}  {:>num_width$}  {:>num_width$}  {:>num_width$}\n",
         "MODEL", "STATUS", "BEFORE", "AFTER", "DELTA",
     ));
     out.push_str(&format!(
-        "  {:<model_width$}  {:<status_width$}  {:>num_width$}  {:>num_width$}  {:>num_width$}\n",
+        "  {:<model_width$}{rule_target}  {:<status_width$}  {:>num_width$}  {:>num_width$}  {:>num_width$}\n",
         "-".repeat(model_width),
         "-".repeat(status_width),
         "-".repeat(num_width),
@@ -292,9 +342,12 @@ pub fn format_diff_table(results: &[DiffResult]) -> String {
             .row_count_after
             .map_or(String::from("-"), |n| n.to_string());
         let delta = format_row_delta(r.row_count_before, r.row_count_after);
+        let target_cell = target_width.map_or(String::new(), |w| {
+            format!("  {:<w$}", r.resolved_target.as_deref().unwrap_or("-"))
+        });
 
         out.push_str(&format!(
-            "  {:<model_width$}  {:<status_width$}  {:>num_width$}  {:>num_width$}  {:>num_width$}\n",
+            "  {:<model_width$}{target_cell}  {:<status_width$}  {:>num_width$}  {:>num_width$}  {:>num_width$}\n",
             r.model_name,
             r.status.to_string(),
             before,
@@ -372,6 +425,7 @@ mod tests {
         DiffResult {
             model_name: name.to_string(),
             status: ModelDiffStatus::Unchanged,
+            resolved_target: None,
             row_count_before: Some(rows),
             row_count_after: Some(rows),
             column_changes: vec![],
@@ -388,6 +442,7 @@ mod tests {
         DiffResult {
             model_name: name.to_string(),
             status: ModelDiffStatus::Modified,
+            resolved_target: None,
             row_count_before: Some(before),
             row_count_after: Some(after),
             column_changes,
@@ -399,6 +454,7 @@ mod tests {
         DiffResult {
             model_name: name.to_string(),
             status: ModelDiffStatus::Added,
+            resolved_target: None,
             row_count_before: None,
             row_count_after: Some(rows),
             column_changes: vec![],
@@ -410,6 +466,7 @@ mod tests {
         DiffResult {
             model_name: name.to_string(),
             status: ModelDiffStatus::Removed,
+            resolved_target: None,
             row_count_before: Some(rows),
             row_count_after: None,
             column_changes: vec![],

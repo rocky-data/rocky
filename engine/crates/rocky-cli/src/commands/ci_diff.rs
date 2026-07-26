@@ -47,6 +47,11 @@ struct ModelChange {
     base_schema_name: Option<String>,
     /// Schema-map key on HEAD.
     head_schema_name: Option<String>,
+    /// Resolved `catalog.schema.table` this change refers to, when both refs
+    /// compiled. The map key can carry a name qualifier to disambiguate two
+    /// models sharing a target; this is the bare warehouse identity, which is
+    /// what the report publishes.
+    resolved_target: Option<String>,
 }
 
 impl ModelChange {
@@ -193,6 +198,31 @@ fn model_file_name<'a>(path: &'a str, models_rel: Option<&str>) -> Option<&'a st
 /// "any descendant", though — a `models/README.md` or a stray CSV cannot change
 /// a compile, and running two compiles for one is pure cost. Used to decide
 /// whether a compile is worth running, never to classify a model.
+/// Whether `path` is shared model configuration — config the compiler reads for
+/// *many* models rather than one.
+///
+/// These files own no model, so the path-matching classifier can never key on
+/// them, yet `groups/*.toml` supplies `schema_template` and `_defaults.toml`
+/// supplies `target.catalog` / `target.schema` — either can move every model
+/// that reads it.
+fn is_shared_model_config(path: &str, models_rel: Option<&str>) -> bool {
+    let Some(root) = models_rel else {
+        return false;
+    };
+    let Ok(relative) = Path::new(path).strip_prefix(root) else {
+        return false;
+    };
+    if relative.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+        return false;
+    }
+    let components: Vec<_> = relative.iter().filter_map(|c| c.to_str()).collect();
+    match components.as_slice() {
+        [file] => matches!(*file, "_defaults.toml" | "test_definitions.toml"),
+        ["groups", _] => true,
+        _ => false,
+    }
+}
+
 fn compiler_input_under_models_root(path: &str, models_rel: Option<&str>) -> bool {
     models_rel.is_some_and(|root| Path::new(path).strip_prefix(root).is_ok())
         && matches!(
@@ -278,9 +308,13 @@ fn record_model_side(
     changes: &mut HashMap<String, ModelChange>,
     key: String,
     model_name: &str,
+    resolved_target: Option<&str>,
     is_base: bool,
 ) {
     let change = changes.entry(key).or_default();
+    if change.resolved_target.is_none() {
+        change.resolved_target = resolved_target.map(str::to_string);
+    }
     if is_base {
         change.base_schema_name = Some(model_name.to_string());
         if change.model_name.is_empty() {
@@ -290,6 +324,24 @@ fn record_model_side(
         change.head_schema_name = Some(model_name.to_string());
         change.model_name = model_name.to_string();
     }
+}
+
+/// Record one compiled model under its target-derived key.
+fn record_resolved_model(
+    changes: &mut HashMap<String, ModelChange>,
+    model: &Model,
+    ambiguous: &HashSet<String>,
+    is_base: bool,
+) {
+    let target = target_identity(model);
+    // A target shared by two models can't identify either of them; fall
+    // back to pairing by name so neither disappears from the report.
+    let key = if ambiguous.contains(&target) {
+        format!("{target}#{}", model.config.name)
+    } else {
+        target.clone()
+    };
+    record_model_side(changes, key, &model.config.name, Some(&target), is_base);
 }
 
 fn record_resolved_side(
@@ -304,15 +356,7 @@ fn record_resolved_side(
         .iter()
         .filter(|model| model_matches_path(model, path, models_rel))
     {
-        let target = target_identity(model);
-        // A target shared by two models can't identify either of them; fall
-        // back to pairing by name so neither disappears from the report.
-        let key = if ambiguous.contains(&target) {
-            format!("{target}#{}", model.config.name)
-        } else {
-            target
-        };
-        record_model_side(changes, key, &model.config.name, is_base);
+        record_resolved_model(changes, model, ambiguous, is_base);
     }
 }
 
@@ -348,6 +392,35 @@ fn classify_model_changes(
                 false,
             );
         }
+
+        // Shared config — `_defaults.toml`, `groups/*.toml`,
+        // `test_definitions.toml` — owns no model file, so nothing above can
+        // key on it. It can still retarget every model that reads it, and a
+        // row here identifies a *target*: N tables abandoned, N created. Pair
+        // the two compiles by logical name and record any pair whose resolved
+        // target moved. Models the shared config did not move contribute
+        // nothing, so this stays proportional to the retargeted set rather
+        // than emitting a row per model in the project.
+        if files
+            .iter()
+            .any(|file| is_shared_model_config(&file.path, models_rel))
+        {
+            let head_by_name: HashMap<&str, &Model> = head
+                .iter()
+                .map(|model| (model.config.name.as_str(), model))
+                .collect();
+            for base_model in base {
+                let Some(head_model) = head_by_name.get(base_model.config.name.as_str()) else {
+                    continue;
+                };
+                if target_identity(base_model) == target_identity(head_model) {
+                    continue;
+                }
+                record_resolved_model(&mut changes, base_model, &ambiguous, true);
+                record_resolved_model(&mut changes, head_model, &ambiguous, false);
+            }
+        }
+
         return changes;
     }
 
@@ -394,6 +467,9 @@ fn classify_model_changes(
                 model_name: name,
                 base_schema_name,
                 head_schema_name,
+                // Filename fallback: the key is a stem, not a warehouse
+                // identity. Publishing it as one would be a lie.
+                resolved_target: None,
             },
         );
     }
@@ -697,6 +773,11 @@ fn build_diff_results(
             let result = DiffResult {
                 model_name: change.model_name.clone(),
                 status,
+                // The change-map key IS the resolved target on the resolved
+                // path. On the fallback path it is a filename stem, which is
+                // not a warehouse identity — leave it unset rather than
+                // publishing a stem as though it were one.
+                resolved_target: change.resolved_target.clone(),
                 row_count_before: None,
                 row_count_after: None,
                 column_changes,
@@ -1098,6 +1179,7 @@ mod tests {
             model_name: name.to_string(),
             base_schema_name,
             head_schema_name,
+            resolved_target: None,
         }
     }
 
@@ -1860,6 +1942,7 @@ mod tests {
                         model_name: "orders".to_string(),
                         base_schema_name: Some(format!("s{i}")),
                         head_schema_name: None,
+                        resolved_target: None,
                     },
                 );
             }
@@ -2232,9 +2315,29 @@ mod tests {
 
         let data = compute_in(dir, &models_dir);
 
-        // No model file changed, so there is nothing structural to report …
-        assert!(data.results.is_empty(), "results: {:?}", data.results);
-        // … but both compiles must be available, or `--semantic` is a no-op.
+        // No model *file* changed, but a row identifies a target and the group
+        // moved this model's: the old table is abandoned, a new one appears.
+        let row = |status: ModelDiffStatus| {
+            data.results
+                .iter()
+                .find(|result| result.status == status)
+                .unwrap_or_else(|| panic!("no {status} row in {:?}", data.results))
+        };
+        assert_eq!(data.results.len(), 2, "results: {:?}", data.results);
+        assert_eq!(
+            row(ModelDiffStatus::Removed).resolved_target.as_deref(),
+            Some("poc.mart_emea.orders")
+        );
+        assert_eq!(
+            row(ModelDiffStatus::Added).resolved_target.as_deref(),
+            Some("poc.mart_emea_v2.orders")
+        );
+        // Both rows name the same model, so the target is the only thing
+        // telling them apart — the reason it is on `DiffResult` at all.
+        assert_eq!(row(ModelDiffStatus::Removed).model_name, "orders");
+        assert_eq!(row(ModelDiffStatus::Added).model_name, "orders");
+
+        // The semantic gate must still fire alongside it.
         assert!(
             data.base_compile.is_some() && data.head_compile.is_some(),
             "shared-config change must not suppress the compiles"
@@ -2245,6 +2348,44 @@ mod tests {
                 .iter()
                 .any(rocky_core::breaking_change::BreakingFinding::is_breaking),
             "retargeting a group must surface a breaking finding, got: {findings:?}"
+        );
+    }
+
+    /// A shared-config edit that moves nothing must stay quiet — the scan is
+    /// proportional to the retargeted set, not to the project.
+    #[test]
+    fn e2e_shared_config_edit_that_moves_nothing_reports_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = init_repo(
+            dir,
+            &[
+                (
+                    "_defaults.toml",
+                    "[target]\ncatalog = \"poc\"\nschema = \"marts\"\n",
+                ),
+                ("orders.sql", "SELECT 1 AS id\n"),
+                (
+                    "orders.toml",
+                    "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n",
+                ),
+            ],
+        );
+
+        // Touch the shared config without changing any resolved target.
+        fs::write(
+            models_dir.join("_defaults.toml"),
+            "# routing for the marts layer\n[target]\ncatalog = \"poc\"\nschema = \"marts\"\n",
+        )
+        .unwrap();
+        run_git(dir, &["add", "."]);
+        run_git(dir, &["commit", "-q", "-m", "comment only"]);
+
+        let data = compute_in(dir, &models_dir);
+        assert!(
+            data.results.is_empty(),
+            "a no-op shared-config edit must not emit rows: {:?}",
+            data.results
         );
     }
 

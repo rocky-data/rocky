@@ -6227,7 +6227,7 @@
         "type": "string"
       },
       "DiffResult": {
-        "description": "Diff result for a single model between two pipeline states.",
+        "description": "Diff result for a single warehouse object between two pipeline states.\n\nA row identifies a **target**, not a logical model. A model whose target moves is therefore reported twice — removed at its old target, added at its new one — because that is what happens in the warehouse: nothing drops the abandoned table. [`Self::model_name`] alone cannot distinguish those two rows, so [`Self::resolved_target`] carries the identity they differ on.",
         "properties": {
           "column_changes": {
             "description": "Column-level changes (empty for unchanged models).",
@@ -6237,8 +6237,15 @@
             "type": "array"
           },
           "model_name": {
-            "description": "Fully-qualified model name (e.g. `catalog.schema.table`).",
+            "description": "Logical model name — the sidecar `name`, or the filename stem when the classifier could not resolve a compiled model.\n\nNot unique across a result set: two rows share it when a model's target moved. Key on [`Self::resolved_target`] instead when one is present.",
             "type": "string"
+          },
+          "resolved_target": {
+            "description": "The warehouse object this row describes, as `catalog.schema.table`.\n\n`None` when the classifier fell back to filename matching because a ref did not compile, and for callers that build results without a resolved project (e.g. the row-level comparison in `compare`).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "row_count_after": {
             "description": "Row count on the incoming (PR) side. `None` for removed models.",
