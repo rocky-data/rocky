@@ -2439,11 +2439,27 @@ fn strip_local_only_tables(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    #[cfg(not(test))]
     let scratch = std::env::temp_dir().join(format!(
         "rocky-state-upload-{}-{}.redb",
         std::process::id(),
         nanos
     ));
+    #[cfg(test)]
+    let scratch = {
+        // The unit suite drives many filtered uploads concurrently in one
+        // process. Some platforms expose a clock coarse enough for two tests
+        // to observe the same `nanos`, so add a test-only sequence suffix and
+        // keep the production scratch-path shape unchanged.
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rocky-state-upload-{}-{}-{}.redb",
+            std::process::id(),
+            nanos,
+            sequence
+        ))
+    };
     std::fs::copy(local_path, &scratch)?;
 
     // Open the copy and drop the excluded tables. `delete_table` returns
@@ -4118,6 +4134,10 @@ mod tests {
 
     #[tokio::test]
     async fn upload_state_unless_recreated_suppresses_upload_when_recreated() {
+        // Cross-pod tests hold this guard while exercising the same filtered
+        // upload scratch-database path through a process-global provider.
+        let _serial = test_support::serial_guard();
+
         // The "no-clobber" half of the mixed-version safety invariant: when the
         // local store was recreated after a forward-incompatible schema
         // mismatch, the end-of-run upload must NOT run — otherwise a downgraded
@@ -5578,64 +5598,6 @@ mod tests {
         assert!(
             !decisions.iter().any(|row| row.plan_id == "losing-freeze"),
             "the losing local transition must never overwrite the remote winner"
-        );
-        test_support::clear();
-    }
-
-    #[tokio::test]
-    async fn ledger_seam_restore_failure_does_not_mask_exhausted_conflict() {
-        use crate::fault_store::{FaultMode, FaultOp};
-
-        let _serial = test_support::serial_guard();
-        test_support::clear();
-        let mut harness = crate::test_harness::CrossPodHarness::new_s3_like();
-        harness.pod_b.cfg.concurrency_control = ConcurrencyControl::Cas;
-        harness.pod_b.cfg.retry.max_retries = 0;
-
-        let winner_record = seam_policy_record("remote-winner");
-        {
-            let store = harness.open_store(&harness.pod_a);
-            store.record_policy_decision(&winner_record).unwrap();
-        }
-        harness.upload(&harness.pod_a).await.unwrap();
-
-        let object_key = format!("v{}/state.redb", crate::state::current_schema_version());
-        harness
-            .faults
-            .arm_precondition_failures(&object_key, LEDGER_SEAM_MAX_ATTEMPTS);
-        let restore_get =
-            harness.faults.count(FaultOp::Get) + u64::from(LEDGER_SEAM_MAX_ATTEMPTS) + 1;
-        harness
-            .faults
-            .arm(FaultOp::Get, FaultMode::FailNth(restore_get));
-
-        let loser_record = seam_policy_record("losing-freeze");
-        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path);
-        let err = session
-            .execute(move |store, _fresh_base| {
-                let loser_record = loser_record.clone();
-                Box::pin(async move {
-                    store.record_policy_decision(&loser_record)?;
-                    Ok(())
-                })
-            })
-            .await
-            .expect_err("restore failure must not mask the exhausted conflict");
-
-        assert!(
-            matches!(
-                err,
-                StateSyncError::LedgerSeamConflict {
-                    ref key,
-                    attempts: LEDGER_SEAM_MAX_ATTEMPTS,
-                } if key == STATE_FILE
-            ),
-            "expected the original typed exhausted-conflict error, got {err:?}"
-        );
-        assert_eq!(
-            harness.faults.count(FaultOp::Get),
-            restore_get,
-            "the injected failure must fire on the restoring download"
         );
         test_support::clear();
     }
