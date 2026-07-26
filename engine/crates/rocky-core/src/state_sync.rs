@@ -2439,27 +2439,18 @@ fn strip_local_only_tables(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    #[cfg(not(test))]
+    // A process-unique sequence disambiguates two uploads that observe the same
+    // `nanos` on a coarse clock — the scratch file is read back and uploaded, so
+    // a collision would publish another upload's bytes. The name carries no
+    // contract; it is removed after the upload.
+    static SCRATCH_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SCRATCH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scratch = std::env::temp_dir().join(format!(
-        "rocky-state-upload-{}-{}.redb",
+        "rocky-state-upload-{}-{}-{}.redb",
         std::process::id(),
-        nanos
+        nanos,
+        sequence
     ));
-    #[cfg(test)]
-    let scratch = {
-        // The unit suite drives many filtered uploads concurrently in one
-        // process. Some platforms expose a clock coarse enough for two tests
-        // to observe the same `nanos`, so add a test-only sequence suffix and
-        // keep the production scratch-path shape unchanged.
-        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "rocky-state-upload-{}-{}-{}.redb",
-            std::process::id(),
-            nanos,
-            sequence
-        ))
-    };
     std::fs::copy(local_path, &scratch)?;
 
     // Open the copy and drop the excluded tables. `delete_table` returns
