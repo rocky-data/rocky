@@ -545,9 +545,16 @@ impl std::fmt::Display for StateBackend {
 /// [`StateConfig::concurrency_control`].
 ///
 /// **Scope:** `docs/adr/ADR-CONCURRENCY.md` governs — compare-and-swap applies
-/// to *every* remote state write, split by writer class (runs refuse on
-/// conflict; single-record ledger seams retry). The run half and the
-/// `rocky policy` freeze/unfreeze seam are implemented today. The remaining
+/// to every write of the shared state object, split by writer class (runs
+/// refuse on conflict; single-record ledger seams retry). It does not extend to
+/// the sibling objects written under their own keys: freeze markers,
+/// idempotency records, and the doctor read/write probe are create-once or
+/// self-keyed, cannot lose an update, and stay outside compare-and-swap by
+/// design rather than as a gap.
+///
+/// Implemented today: the end-of-run upload, and the `rocky policy`
+/// freeze/unfreeze *ledger write* (its markers are create-once objects that
+/// must never be replayed, so they stay outside the retry). The remaining
 /// ledger-seam writers reached through
 /// `RemoteStateSession::upload_only_fail_closed` (`rocky gc`, `rocky apply`)
 /// still upload unconditionally on every backend, so `cas` does not yet make a
