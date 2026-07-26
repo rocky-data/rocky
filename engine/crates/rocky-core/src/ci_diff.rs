@@ -170,11 +170,28 @@ impl DiffSummary {
 // Markdown formatter (GitHub PR comment)
 // ---------------------------------------------------------------------------
 
+/// Escape a value going into a Markdown table cell wrapped in a code span.
+///
+/// Neither `config.name` nor a target component is validated as a SQL
+/// identifier at model load, so either can carry a `|` — which ends the cell —
+/// or a backtick, which closes the code span early.
+fn md_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('`', "'")
+}
+
+/// Escape a value interpolated into the raw HTML `<summary>` heading.
+fn html_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Produce a markdown summary suitable for a GitHub PR comment.
 ///
-/// The output includes a one-line summary, a table of changed models, and
-/// per-model details (column changes, row count deltas) for non-unchanged
-/// models. Unchanged models are mentioned only in the summary count.
+/// The output includes a one-line summary, a table of changed rows, and
+/// per-row details (column changes, row count deltas) for non-unchanged rows.
+/// A row is a warehouse target, so a retargeted model contributes two.
 pub fn format_diff_markdown(results: &[DiffResult]) -> String {
     let summary = DiffSummary::from_results(results);
     let mut out = String::new();
@@ -189,7 +206,7 @@ pub fn format_diff_markdown(results: &[DiffResult]) -> String {
     }
 
     out.push_str(&format!(
-        "**{} model(s) changed** ({} modified, {} added, {} removed, {} unchanged)\n\n",
+        "**{} row(s) changed** ({} modified, {} added, {} removed, {} unchanged)\n\n",
         summary.modified + summary.added + summary.removed,
         summary.modified,
         summary.added,
@@ -229,8 +246,8 @@ pub fn format_diff_markdown(results: &[DiffResult]) -> String {
         if show_target {
             out.push_str(&format!(
                 "| `{}` | `{}` | {} | {} | {} | {} |\n",
-                r.model_name,
-                r.resolved_target.as_deref().unwrap_or("-"),
+                md_cell(&r.model_name),
+                md_cell(r.resolved_target.as_deref().unwrap_or("-")),
                 status_badge,
                 before,
                 after,
@@ -239,7 +256,11 @@ pub fn format_diff_markdown(results: &[DiffResult]) -> String {
         } else {
             out.push_str(&format!(
                 "| `{}` | {} | {} | {} | {} |\n",
-                r.model_name, status_badge, before, after, delta
+                md_cell(&r.model_name),
+                status_badge,
+                before,
+                after,
+                delta
             ));
         }
     }
@@ -252,8 +273,8 @@ pub fn format_diff_markdown(results: &[DiffResult]) -> String {
         }
         // Disambiguate the <summary> too — two rows can share a model name.
         let heading = match &r.resolved_target {
-            Some(target) => format!("{} — {}", r.model_name, target),
-            None => r.model_name.clone(),
+            Some(target) => format!("{} — {}", html_text(&r.model_name), html_text(target)),
+            None => html_text(&r.model_name),
         };
         out.push_str(&format!(
             "<details>\n<summary><b>{heading}</b> — column changes</summary>\n\n"
@@ -265,7 +286,10 @@ pub fn format_diff_markdown(results: &[DiffResult]) -> String {
             let new = c.new_type.as_deref().unwrap_or("-");
             out.push_str(&format!(
                 "| `{}` | {} | {} | {} |\n",
-                c.column_name, c.change_type, old, new
+                md_cell(&c.column_name),
+                c.change_type,
+                md_cell(old),
+                md_cell(new)
             ));
         }
         out.push_str("\n</details>\n\n");
@@ -287,7 +311,7 @@ pub fn format_diff_table(results: &[DiffResult]) -> String {
 
     // Header line
     out.push_str(&format!(
-        "Diff: {} model(s) total — {} modified, {} added, {} removed, {} unchanged\n\n",
+        "Diff: {} row(s) total — {} modified, {} added, {} removed, {} unchanged\n\n",
         summary.total_models, summary.modified, summary.added, summary.removed, summary.unchanged,
     ));
 
@@ -412,6 +436,115 @@ fn format_row_delta(before: Option<u64>, after: Option<u64>) -> String {
 // ===========================================================================
 // Tests
 // ===========================================================================
+
+#[cfg(test)]
+mod render_escaping_tests {
+    //! `config.name` and target components are not validated as SQL
+    //! identifiers at model load, so both reach the renderers as arbitrary
+    //! text. A `|` ends a Markdown cell, a backtick closes the code span, and
+    //! the `<details>` heading is raw HTML.
+    use super::*;
+
+    fn row(model_name: &str, target: Option<&str>) -> DiffResult {
+        DiffResult {
+            model_name: model_name.to_string(),
+            status: ModelDiffStatus::Removed,
+            resolved_target: target.map(str::to_string),
+            row_count_before: None,
+            row_count_after: None,
+            column_changes: vec![ColumnDiff {
+                column_name: "a|b".to_string(),
+                change_type: ColumnChangeType::Removed,
+                old_type: Some("Int64".to_string()),
+                new_type: None,
+            }],
+            sample_changed_rows: None,
+        }
+    }
+
+    #[test]
+    fn pipes_and_backticks_do_not_split_table_rows() {
+        let md = format_diff_markdown(&[row("or|ders`x", Some("c.s.t|z"))]);
+        let summary_row = md
+            .lines()
+            .find(|l| l.contains("removed") && l.starts_with("| `"))
+            .expect("a summary row");
+        // Six cells => five " | " separators; an unescaped pipe adds more.
+        assert_eq!(
+            summary_row.matches(" | ").count(),
+            5,
+            "row split by an unescaped pipe: {summary_row}"
+        );
+        // Each of the two code spans must open and close cleanly, so the
+        // backtick in the model name has to be gone.
+        assert!(!summary_row.contains("ders`x"), "{summary_row}");
+        assert_eq!(summary_row.matches('`').count(), 4, "{summary_row}");
+
+        let column_row = md
+            .lines()
+            .find(|l| l.contains("a\\|b"))
+            .expect("column cell escaped");
+        assert_eq!(column_row.matches(" | ").count(), 3, "{column_row}");
+    }
+
+    #[test]
+    fn details_heading_is_html_escaped() {
+        let md = format_diff_markdown(&[row("<img src=x>", Some("c.s.<b>"))]);
+        let heading = md
+            .lines()
+            .find(|l| l.starts_with("<summary>"))
+            .expect("a details heading");
+        assert!(
+            !heading.contains("<img src=x>") && !heading.contains("c.s.<b>"),
+            "raw HTML reached the <summary> heading: {heading}"
+        );
+        assert!(heading.contains("&lt;img src=x&gt;"), "{heading}");
+        assert!(heading.contains("&lt;b&gt;"), "{heading}");
+    }
+
+    #[test]
+    fn target_column_appears_only_when_a_row_resolved_one() {
+        let with = format_diff_markdown(&[row("orders", Some("c.s.orders"))]);
+        assert!(with.contains("| Model | Target | Status |"), "{with}");
+
+        let without = format_diff_markdown(&[row("orders", None)]);
+        assert!(
+            without.contains("| Model | Status |") && !without.contains("Target"),
+            "fallback output must be unchanged:\n{without}"
+        );
+    }
+
+    #[test]
+    fn mixed_resolved_and_unresolved_rows_stay_aligned() {
+        let mut resolved = row("a", Some("c.s.a"));
+        resolved.status = ModelDiffStatus::Added;
+        let table = format_diff_table(&[resolved, row("b", None)]);
+        let body: Vec<&str> = table
+            .lines()
+            .filter(|l| l.starts_with("  ") && (l.contains("added") || l.contains("removed")))
+            .collect();
+        assert_eq!(body.len(), 2, "{table}");
+        // The unresolved row still gets a padded placeholder cell, so the
+        // status column starts at the same offset in both rows.
+        let offset = |l: &str| l.find("added").or_else(|| l.find("removed"));
+        assert_eq!(
+            offset(body[0]),
+            offset(body[1]),
+            "columns misaligned:\n{table}"
+        );
+    }
+
+    #[test]
+    fn summary_prose_counts_rows_not_models() {
+        // One retargeted model contributes two rows; calling that "2 models"
+        // would be wrong under the target-row contract.
+        let mut added = row("orders", Some("c.s2.orders"));
+        added.status = ModelDiffStatus::Added;
+        let md = format_diff_markdown(&[row("orders", Some("c.s.orders")), added]);
+        assert!(md.contains("**2 row(s) changed**"), "{md}");
+        assert!(!md.contains("model(s) changed"), "{md}");
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -600,7 +733,7 @@ mod tests {
         let md = format_diff_markdown(&results);
 
         // Summary line
-        assert!(md.contains("**3 model(s) changed**"));
+        assert!(md.contains("**3 row(s) changed**"), "{md}");
         assert!(md.contains("1 modified"));
         assert!(md.contains("1 added"));
         assert!(md.contains("1 removed"));

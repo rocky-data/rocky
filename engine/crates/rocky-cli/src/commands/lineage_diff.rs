@@ -145,7 +145,7 @@ fn format_lineage_diff_markdown(results: &[LineageDiffResult], summary: &DiffSum
     }
 
     out.push_str(&format!(
-        "**{} model(s) changed** ({} modified, {} added, {} removed, {} unchanged)\n\n",
+        "**{} row(s) changed** ({} modified, {} added, {} removed, {} unchanged)\n\n",
         summary.modified + summary.added + summary.removed,
         summary.modified,
         summary.added,

@@ -304,6 +304,26 @@ fn target_identity(model: &Model) -> String {
     format!("{}.{}.{}", target.catalog, target.schema, target.table)
 }
 
+/// The model's target identity, but only when every component is a real SQL
+/// identifier.
+///
+/// Target components are not validated at load — that happens later, at SQL
+/// generation, where `format_table_ref` rejects them. `resolved_target` is
+/// published as *the warehouse object this row describes*, so a string that
+/// could never name one must not go out under that contract; such a model
+/// reports `None` and is simply unidentified rather than misidentified.
+///
+/// This also keeps the disambiguating `{target}#{name}` map key injective:
+/// a validated identifier cannot contain `#`, so a qualified key can never
+/// collide with some other model's bare target.
+fn publishable_target(model: &Model) -> Option<String> {
+    let target = &model.config.target;
+    [&target.catalog, &target.schema, &target.table]
+        .iter()
+        .all(|component| rocky_sql::validation::validate_identifier(component).is_ok())
+        .then(|| target_identity(model))
+}
+
 fn record_model_side(
     changes: &mut HashMap<String, ModelChange>,
     key: String,
@@ -341,7 +361,13 @@ fn record_resolved_model(
     } else {
         target.clone()
     };
-    record_model_side(changes, key, &model.config.name, Some(&target), is_base);
+    record_model_side(
+        changes,
+        key,
+        &model.config.name,
+        publishable_target(model).as_deref(),
+        is_base,
+    );
 }
 
 fn record_resolved_side(
@@ -2348,6 +2374,86 @@ mod tests {
                 .iter()
                 .any(rocky_core::breaking_change::BreakingFinding::is_breaking),
             "retargeting a group must surface a breaking finding, got: {findings:?}"
+        );
+    }
+
+    /// `_defaults.toml` supplies `target.schema` to every model in the
+    /// directory, so editing it moves all of them. Same shape as the group
+    /// case, different shared-config file.
+    #[test]
+    fn e2e_defaults_retarget_reports_both_targets() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let models_dir = init_repo(
+            dir,
+            &[
+                (
+                    "_defaults.toml",
+                    "[target]\ncatalog = \"poc\"\nschema = \"marts\"\n",
+                ),
+                ("orders.sql", "SELECT 1 AS id\n"),
+                (
+                    "orders.toml",
+                    "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n",
+                ),
+            ],
+        );
+
+        fs::write(
+            models_dir.join("_defaults.toml"),
+            "[target]\ncatalog = \"poc\"\nschema = \"marts_v2\"\n",
+        )
+        .unwrap();
+        run_git(dir, &["add", "."]);
+        run_git(dir, &["commit", "-q", "-m", "retarget via _defaults"]);
+
+        let data = compute_in(dir, &models_dir);
+        let target = |status: ModelDiffStatus| {
+            data.results
+                .iter()
+                .find(|r| r.status == status)
+                .and_then(|r| r.resolved_target.as_deref())
+        };
+        assert_eq!(data.results.len(), 2, "results: {:?}", data.results);
+        assert_eq!(target(ModelDiffStatus::Removed), Some("poc.marts.orders"));
+        assert_eq!(target(ModelDiffStatus::Added), Some("poc.marts_v2.orders"));
+    }
+
+    /// A target that could never name a warehouse object must not be published
+    /// as one. Components are not validated at load — only at SQL generation —
+    /// so `ci-diff` has to check before it publishes.
+    #[test]
+    fn unvalidatable_target_is_not_published_as_an_identity() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let dir = TempDir::new().unwrap();
+        write_model_with_identity(
+            dir.path(),
+            "orders",
+            "orders",
+            "not a valid identifier",
+            "SELECT id FROM src_orders",
+        );
+        let compile = compile_head(dir.path(), sources).expect("compile");
+        let model = &compile.project.models[0];
+        assert!(
+            publishable_target(model).is_none(),
+            "an invalid target must not be published, got {:?}",
+            publishable_target(model)
+        );
+
+        // A well-formed one still is.
+        let ok_dir = TempDir::new().unwrap();
+        write_model_with_identity(
+            ok_dir.path(),
+            "orders",
+            "orders",
+            "orders",
+            "SELECT 1 AS id",
+        );
+        let ok = compile_head(ok_dir.path(), HashMap::new()).expect("compile");
+        assert_eq!(
+            publishable_target(&ok.project.models[0]).as_deref(),
+            Some("c.s.orders")
         );
     }
 
