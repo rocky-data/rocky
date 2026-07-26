@@ -1427,6 +1427,16 @@ max_retries = 0
             )),
             "the typed exhausted-conflict error must survive anyhow context: {err:#}"
         );
+        let local_rows = StateStore::open(&harness.pod_a.state_path)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        assert_eq!(
+            local_rows,
+            vec![winner.clone()],
+            "the local state must contain only the remote winner; the losing freeze row must \
+             not remain visible"
+        );
         assert_eq!(harness.faults.put_count(&object_key, PutKind::Update), 3);
         assert_eq!(
             harness

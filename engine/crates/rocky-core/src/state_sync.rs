@@ -830,6 +830,17 @@ impl LedgerSeamSession {
                     tokio::time::sleep(backoff).await;
                 }
                 Err(StateSyncError::CasConflict { key }) => {
+                    // Read-only consumers such as audit and brief open the local file
+                    // without downloading, so a transition that never committed must not
+                    // remain locally visible.
+                    if let Err(error) = download_state(&self.cfg, &self.state_path).await {
+                        warn!(
+                            key = %key,
+                            error = %error,
+                            "failed to restore the remote ledger winner after ledger-seam \
+                             conflict exhaustion"
+                        );
+                    }
                     return Err(StateSyncError::LedgerSeamConflict {
                         key,
                         attempts: LEDGER_SEAM_MAX_ATTEMPTS,
@@ -5567,6 +5578,64 @@ mod tests {
         assert!(
             !decisions.iter().any(|row| row.plan_id == "losing-freeze"),
             "the losing local transition must never overwrite the remote winner"
+        );
+        test_support::clear();
+    }
+
+    #[tokio::test]
+    async fn ledger_seam_restore_failure_does_not_mask_exhausted_conflict() {
+        use crate::fault_store::{FaultMode, FaultOp};
+
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let mut harness = crate::test_harness::CrossPodHarness::new_s3_like();
+        harness.pod_b.cfg.concurrency_control = ConcurrencyControl::Cas;
+        harness.pod_b.cfg.retry.max_retries = 0;
+
+        let winner_record = seam_policy_record("remote-winner");
+        {
+            let store = harness.open_store(&harness.pod_a);
+            store.record_policy_decision(&winner_record).unwrap();
+        }
+        harness.upload(&harness.pod_a).await.unwrap();
+
+        let object_key = format!("v{}/state.redb", crate::state::current_schema_version());
+        harness
+            .faults
+            .arm_precondition_failures(&object_key, LEDGER_SEAM_MAX_ATTEMPTS);
+        let restore_get =
+            harness.faults.count(FaultOp::Get) + u64::from(LEDGER_SEAM_MAX_ATTEMPTS) + 1;
+        harness
+            .faults
+            .arm(FaultOp::Get, FaultMode::FailNth(restore_get));
+
+        let loser_record = seam_policy_record("losing-freeze");
+        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path);
+        let err = session
+            .execute(move |store, _fresh_base| {
+                let loser_record = loser_record.clone();
+                Box::pin(async move {
+                    store.record_policy_decision(&loser_record)?;
+                    Ok(())
+                })
+            })
+            .await
+            .expect_err("restore failure must not mask the exhausted conflict");
+
+        assert!(
+            matches!(
+                err,
+                StateSyncError::LedgerSeamConflict {
+                    ref key,
+                    attempts: LEDGER_SEAM_MAX_ATTEMPTS,
+                } if key == STATE_FILE
+            ),
+            "expected the original typed exhausted-conflict error, got {err:?}"
+        );
+        assert_eq!(
+            harness.faults.count(FaultOp::Get),
+            restore_get,
+            "the injected failure must fire on the restoring download"
         );
         test_support::clear();
     }
