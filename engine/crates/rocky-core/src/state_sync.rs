@@ -8,6 +8,7 @@
 //! so credential resolution follows the standard AWS SDK / GCP ADC chains.
 
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +48,9 @@ pub enum StateSyncError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("state store error: {0}")]
+    State(#[from] crate::state::StateError),
+
     #[error("state backend '{0}' requires {1} to be configured")]
     MissingConfig(String, String),
 
@@ -69,6 +73,13 @@ pub enum StateSyncError {
          downloaded state; refusing to overwrite the winner (fail-closed)"
     )]
     CasConflict { key: String },
+
+    #[error(
+        "ledger-seam compare-and-swap conflict on shared state blob '{key}' after {attempts} \
+         attempts: concurrent writers kept advancing it; preserving the remote winner \
+         (fail-closed)"
+    )]
+    LedgerSeamConflict { key: String, attempts: u32 },
 }
 
 /// State file name within the configured prefix.
@@ -692,6 +703,158 @@ pub fn cas_effective(cfg: &StateConfig) -> bool {
     cfg.concurrency_control == ConcurrencyControl::Cas && cas_supported_on(cfg.backend)
 }
 
+/// Boxed full-transition attempt used by [`LedgerSeamSession`].
+///
+/// The attempt borrows the freshly downloaded [`StateStore`] and the
+/// generation captured by that same download. Borrowing (rather than owning)
+/// the store prevents a successful attempt from returning it in `T`; the
+/// session drops the store before it performs the conditional upload. The
+/// future shape lets a seam refresh external proofs inside every attempt,
+/// after the fresh shared `state.redb` blob is installed and before it mutates
+/// the ledger.
+pub type LedgerSeamAttempt<'a, T> =
+    Pin<Box<dyn std::future::Future<Output = Result<T, StateSyncError>> + Send + 'a>>;
+
+/// A generation-owning session for a replayable, single-seam ledger
+/// transition against the shared remote `state.redb` blob.
+///
+/// Unlike [`RemoteStateSession`], which owns one run's acquire/finalize base,
+/// this session retries a seam transition on a fresh winner. Under effective
+/// CAS, every attempt is ordered as:
+///
+/// 1. download the shared blob and its generation together;
+/// 2. open the freshly published store;
+/// 3. run the caller's complete transition (dynamic authorization, external
+///    proof refresh, and ledger mutation all belong inside this closure);
+/// 4. drop the store;
+/// 5. conditionally upload against that attempt's generation.
+///
+/// The return value comes from the CAS-winning attempt. A conflict discards
+/// that attempt's value; the next fresh download replaces its stale local
+/// mutation before replaying the whole transition, up to three total attempts.
+/// Exhaustion returns
+/// [`StateSyncError::LedgerSeamConflict`] and never falls back to an
+/// unconditional upload.
+///
+/// When CAS is not effective this is deliberately the legacy half-seam shape:
+/// Local performs one transition and no remote I/O; a remote backend downloads
+/// once, performs one transition, and unconditionally uploads with
+/// `on_upload_failure = "fail"`.
+#[derive(Debug, Clone)]
+pub struct LedgerSeamSession {
+    cfg: StateConfig,
+    state_path: PathBuf,
+}
+
+const LEDGER_SEAM_MAX_ATTEMPTS: u32 = 3;
+
+impl LedgerSeamSession {
+    /// Build a session from an owned state-config snapshot and local ledger
+    /// path. Performs no I/O until [`execute`][Self::execute].
+    #[must_use]
+    pub fn new(cfg: &StateConfig, state_path: &Path) -> Self {
+        Self {
+            cfg: cfg.clone(),
+            state_path: state_path.to_path_buf(),
+        }
+    }
+
+    /// Execute a full typed ledger transition and return the winning attempt's
+    /// result.
+    ///
+    /// `attempt` receives the store produced by the current attempt's download
+    /// and the generation captured by that same download. It must re-run every
+    /// dynamic authorization check and refresh every external proof that the
+    /// blob generation does not cover before applying its ledger mutation.
+    /// Create-once side effects that cannot be replayed (for example freeze
+    /// markers) stay outside this closure.
+    ///
+    /// # Errors
+    ///
+    /// Propagates download, store, transition, and upload failures. Three
+    /// consecutive CAS conflicts return
+    /// [`StateSyncError::LedgerSeamConflict`]; the remote winner is preserved
+    /// and no unconditional upload is attempted.
+    pub async fn execute<T, F>(&self, mut attempt: F) -> Result<T, StateSyncError>
+    where
+        T: Send,
+        F: for<'a> FnMut(&'a StateStore, Option<&'a Generation>) -> LedgerSeamAttempt<'a, T> + Send,
+    {
+        if matches!(self.cfg.backend, StateBackend::Local) {
+            let store = StateStore::open(&self.state_path)?;
+            let result = attempt(&store, None).await;
+            drop(store);
+            return result;
+        }
+
+        if !cas_effective(&self.cfg) {
+            let _authority = download_state(&self.cfg, &self.state_path).await?;
+            let store = StateStore::open(&self.state_path)?;
+            let result = attempt(&store, None).await;
+            drop(store);
+            let output = result?;
+            let upload_cfg = StateConfig {
+                on_upload_failure: StateUploadFailureMode::Fail,
+                ..self.cfg.clone()
+            };
+            upload_state(&upload_cfg, &self.state_path).await?;
+            return Ok(output);
+        }
+
+        let upload_cfg = StateConfig {
+            on_upload_failure: StateUploadFailureMode::Fail,
+            ..self.cfg.clone()
+        };
+        for attempt_index in 0..LEDGER_SEAM_MAX_ATTEMPTS {
+            let (_authority, base) =
+                download_state_with_generation(&self.cfg, &self.state_path).await?;
+            let store = StateStore::open(&self.state_path)?;
+            let result = attempt(&store, base.as_ref()).await;
+            drop(store);
+            let output = result?;
+
+            match upload_state_cas(&upload_cfg, &self.state_path, base.as_ref()).await {
+                Ok(()) => return Ok(output),
+                Err(StateSyncError::CasConflict { key })
+                    if attempt_index + 1 < LEDGER_SEAM_MAX_ATTEMPTS =>
+                {
+                    let backoff = ledger_seam_conflict_backoff(attempt_index);
+                    warn!(
+                        key,
+                        attempt = attempt_index + 1,
+                        max_attempts = LEDGER_SEAM_MAX_ATTEMPTS,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "shared state blob changed during ledger-seam transition; \
+                         replaying the full transition on the winner"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+                Err(StateSyncError::CasConflict { key }) => {
+                    return Err(StateSyncError::LedgerSeamConflict {
+                        key,
+                        attempts: LEDGER_SEAM_MAX_ATTEMPTS,
+                    });
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        unreachable!("ledger-seam attempt loop always returns within the for body")
+    }
+}
+
+fn ledger_seam_conflict_backoff(attempt: u32) -> Duration {
+    let cfg = RetryConfig {
+        max_retries: LEDGER_SEAM_MAX_ATTEMPTS - 1,
+        initial_backoff_ms: 20,
+        max_backoff_ms: 80,
+        backoff_multiplier: 2.0,
+        jitter: true,
+        ..RetryConfig::default()
+    };
+    Duration::from_millis(compute_backoff(&cfg, attempt))
+}
+
 impl RemoteStateSession {
     /// Build a session over an owned snapshot of `cfg` for the ledger at
     /// `state_path`. Performs no I/O; call [`acquire`][Self::acquire] before
@@ -1051,9 +1214,9 @@ impl RemoteStateSession {
     // Half-seams — download-XOR-upload lifecycle shapes (WP-01 PR-B §1)
     // -----------------------------------------------------------------------
 
-    /// Half-seam download for the single-record ledger seams (policy freeze,
-    /// gc apply, restore apply, the governed-apply pre-gate sync): pull the
-    /// authoritative remote ledger before the seam reads it.
+    /// Half-seam download for legacy single-record ledger paths (policy freeze
+    /// when CAS is inert, gc apply, restore apply, the governed-apply pre-gate
+    /// sync): pull the authoritative remote ledger before the seam reads it.
     ///
     /// A *lifecycle shape*, not a session: no `acquire`/`finalize` pairing, no
     /// Drop tripwire. [`StateBackend::Local`] is a zero-I/O
@@ -1092,6 +1255,10 @@ impl RemoteStateSession {
     ///
     /// Propagates the upload failure (never swallowed — the forced `Fail`
     /// disables the configured `skip` liveness contract for this seam).
+    ///
+    /// TODO(#1228): keep this unconditional half-seam until the remaining gc
+    /// and apply callers migrate to [`LedgerSeamSession`]; remove it only with
+    /// the last seam migration.
     pub async fn upload_only_fail_closed(
         cfg: &StateConfig,
         state_path: &Path,
@@ -1631,12 +1798,12 @@ async fn download_state_inner(
 // never be able to answer with something the durable tier disagrees with.
 //
 // Scope, stated up front: this covers the end-of-run upload
-// (`RemoteStateSession::finalize`). The single-record ledger seams
-// (`upload_only_fail_closed` — `policy freeze`, `gc apply`, `apply`) still
-// write unconditionally on every backend, so they can overwrite a
-// CAS-committed object without raising a conflict. That is ADR-CONCURRENCY
-// D1's writer-class contract, which is not implemented here and is tracked as
-// issue #1228; the behaviour is identical on `s3`/`gcs`, so enabling `cas` on
+// (`RemoteStateSession::finalize`) and policy freeze's effective-CAS
+// [`LedgerSeamSession`] path. The remaining `upload_only_fail_closed` callers
+// (`gc apply` and `apply`) still write the shared blob unconditionally on
+// every backend, so they can overwrite a CAS-committed object without raising
+// a conflict. That is the remaining ADR-CONCURRENCY D1 rollout tracked by
+// #1228; the behaviour is identical on `s3`/`gcs`, so enabling `cas` on
 // `tiered` brings it to parity rather than closing D1.
 //
 // The mechanism is a FRESHNESS-CHECKED cache entry: the generation the durable
@@ -2575,6 +2742,7 @@ fn apply_upload_failure_policy(
         // silent success that erases the winner. (The CAS path returns this
         // directly today; this guard keeps the invariant if it ever routes here.)
         Err(e @ StateSyncError::CasConflict { .. }) => Err(e),
+        Err(e @ StateSyncError::LedgerSeamConflict { .. }) => Err(e),
         Err(e) => match config.on_upload_failure {
             StateUploadFailureMode::Skip => {
                 warn!(
@@ -3328,13 +3496,15 @@ fn is_transient(err: &StateSyncError) -> bool {
             | ObjectStoreError::Io(_),
         )
         | StateSyncError::Io(_)
+        | StateSyncError::State(_)
         | StateSyncError::MissingConfig(..)
         | StateSyncError::CircuitOpen { .. }
         | StateSyncError::RetryBudgetExhausted { .. }
         // A CAS conflict is definitive (another writer won) — retrying against
         // the same stale base would just conflict again and burn the budget.
         // Fail closed immediately.
-        | StateSyncError::CasConflict { .. } => false,
+        | StateSyncError::CasConflict { .. }
+        | StateSyncError::LedgerSeamConflict { .. } => false,
     }
 }
 
@@ -5188,6 +5358,316 @@ mod tests {
             s.finalize()
                 .await
                 .expect("off finalize is an unconditional put (no conflict)");
+        }
+        test_support::clear();
+    }
+
+    // -----------------------------------------------------------------------
+    // #1228 — replayable ledger-seam CAS session
+    // -----------------------------------------------------------------------
+
+    fn seam_policy_record(plan_id: &str) -> crate::state::PolicyDecisionRecord {
+        crate::state::PolicyDecisionRecord {
+            timestamp: chrono::Utc::now(),
+            plan_id: plan_id.to_string(),
+            principal: crate::config::PolicyPrincipal::Agent,
+            capability: crate::config::PolicyCapability::Apply,
+            model: "any".to_string(),
+            effect: crate::config::PolicyEffect::Deny,
+            rule_id: None,
+            reason: plan_id.to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        }
+    }
+
+    /// A run commits after the seam's fresh download but before its upload.
+    /// The first seam attempt therefore loses; the second must re-download the
+    /// winner, replay the exact freeze record, and return its own result. A
+    /// stale-delta or stale-generation implementation loses one of the rows.
+    #[tokio::test]
+    async fn ledger_seam_retry_preserves_run_winner_and_returns_winning_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let mut harness = crate::test_harness::CrossPodHarness::new_s3_like();
+        harness.pod_a.cfg.concurrency_control = ConcurrencyControl::Cas;
+        harness.pod_b.cfg.concurrency_control = ConcurrencyControl::Cas;
+
+        seed_state_file(&harness.pod_a.state_path);
+        let mut bootstrap = RemoteStateSession::new(
+            &harness.pod_a.cfg,
+            &harness.pod_a.state_path,
+            FinalizeDurability::Durable,
+        );
+        let _authority = bootstrap.acquire().await.unwrap();
+        bootstrap.finalize().await.unwrap();
+
+        // The run captures the same base the seam's first attempt will read,
+        // then stages its winner row locally.
+        let mut run_winner = RemoteStateSession::new(
+            &harness.pod_a.cfg,
+            &harness.pod_a.state_path,
+            FinalizeDurability::Durable,
+        );
+        let _authority = run_winner.acquire().await.unwrap();
+        let winner_record = seam_policy_record("run-winner");
+        {
+            let store = harness.open_store(&harness.pod_a);
+            store.record_policy_decision(&winner_record).unwrap();
+        }
+
+        let run_winner = Arc::new(tokio::sync::Mutex::new(Some(run_winner)));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let freeze_record = seam_policy_record("freeze-record");
+        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path);
+        let winning_attempt = session
+            .execute({
+                let run_winner = Arc::clone(&run_winner);
+                let attempts = Arc::clone(&attempts);
+                let freeze_record = freeze_record.clone();
+                move |store, fresh_base| {
+                    let run_winner = Arc::clone(&run_winner);
+                    let attempts = Arc::clone(&attempts);
+                    let freeze_record = freeze_record.clone();
+                    let has_fresh_base = fresh_base.is_some();
+                    Box::pin(async move {
+                        assert!(
+                            has_fresh_base,
+                            "the blob already exists, so every attempt must own its generation"
+                        );
+                        store.record_policy_decision(&freeze_record)?;
+                        let attempt_number = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        if attempt_number == 1 {
+                            let winner = run_winner.lock().await.take().ok_or_else(|| {
+                                StateSyncError::Io(std::io::Error::other(
+                                    "run winner was already committed",
+                                ))
+                            })?;
+                            winner.finalize().await?;
+                        }
+                        Ok(attempt_number)
+                    })
+                }
+            })
+            .await
+            .expect("the replayed seam transition must win its second attempt");
+
+        assert_eq!(
+            winning_attempt, 2,
+            "the helper must return T from the CAS-winning replay"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let verify_dir = TempDir::new().unwrap();
+        let verify_path = verify_dir.path().join(".rocky-state.redb");
+        let _authority = download_state(&harness.pod_a.cfg, &verify_path)
+            .await
+            .unwrap();
+        let decisions = StateStore::open(&verify_path)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        assert!(decisions.iter().any(|row| row.plan_id == "run-winner"));
+        assert!(decisions.iter().any(|row| row.plan_id == "freeze-record"));
+        test_support::clear();
+    }
+
+    /// Three consecutive semantic conflicts exhaust the seam budget. The
+    /// typed error must escape even when the configured liveness policy says
+    /// `skip`, the pre-existing remote winner must remain byte-semantically
+    /// intact, and no unconditional state-blob put may be issued.
+    #[tokio::test]
+    async fn ledger_seam_exhaustion_preserves_winner_without_unconditional_upload() {
+        use crate::fault_store::PutKind;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let mut harness = crate::test_harness::CrossPodHarness::new_s3_like();
+        harness.pod_a.cfg.concurrency_control = ConcurrencyControl::Cas;
+        harness.pod_b.cfg.concurrency_control = ConcurrencyControl::Cas;
+        harness.pod_b.cfg.on_upload_failure = StateUploadFailureMode::Skip;
+
+        seed_state_file(&harness.pod_a.state_path);
+        let winner_record = seam_policy_record("remote-winner");
+        let mut bootstrap = RemoteStateSession::new(
+            &harness.pod_a.cfg,
+            &harness.pod_a.state_path,
+            FinalizeDurability::Durable,
+        );
+        let _authority = bootstrap.acquire().await.unwrap();
+        {
+            let store = harness.open_store(&harness.pod_a);
+            store.record_policy_decision(&winner_record).unwrap();
+        }
+        bootstrap.finalize().await.unwrap();
+
+        let object_key = format!("v{}/state.redb", crate::state::current_schema_version());
+        harness
+            .faults
+            .arm_precondition_failures(&object_key, LEDGER_SEAM_MAX_ATTEMPTS);
+        let loser_record = seam_policy_record("losing-freeze");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path);
+        let err = session
+            .execute({
+                let attempts = Arc::clone(&attempts);
+                move |store, _fresh_base| {
+                    let loser_record = loser_record.clone();
+                    let attempts = Arc::clone(&attempts);
+                    Box::pin(async move {
+                        store.record_policy_decision(&loser_record)?;
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }
+            })
+            .await
+            .expect_err("three conflicts must fail closed");
+        assert!(
+            matches!(
+                err,
+                StateSyncError::LedgerSeamConflict {
+                    attempts: LEDGER_SEAM_MAX_ATTEMPTS,
+                    ..
+                }
+            ),
+            "expected the typed exhausted-conflict error, got {err:?}"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            LEDGER_SEAM_MAX_ATTEMPTS as usize
+        );
+        assert_eq!(
+            harness.faults.put_count(&object_key, PutKind::Update),
+            u64::from(LEDGER_SEAM_MAX_ATTEMPTS),
+            "exactly three conditional attempts are allowed"
+        );
+        assert_eq!(
+            harness
+                .faults
+                .put_count(&object_key, PutKind::Unconditional),
+            0,
+            "CAS exhaustion must never fall back to an unconditional upload"
+        );
+
+        harness.faults.clear();
+        let verify_dir = TempDir::new().unwrap();
+        let verify_path = verify_dir.path().join(".rocky-state.redb");
+        let _authority = download_state(&harness.pod_a.cfg, &verify_path)
+            .await
+            .unwrap();
+        let decisions = StateStore::open(&verify_path)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        assert!(decisions.iter().any(|row| row.plan_id == "remote-winner"));
+        assert!(
+            !decisions.iter().any(|row| row.plan_id == "losing-freeze"),
+            "the losing local transition must never overwrite the remote winner"
+        );
+        test_support::clear();
+    }
+
+    /// `concurrency_control = "off"` retains the legacy half-seam: one fresh
+    /// download, one transition with no generation, and one forced-Fail
+    /// unconditional upload that preserves the downloaded winner.
+    #[tokio::test]
+    async fn ledger_seam_off_retains_legacy_unconditional_shape() {
+        use crate::fault_store::PutKind;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _serial = test_support::serial_guard();
+        test_support::clear();
+        let harness = crate::test_harness::CrossPodHarness::new_s3_like();
+        let winner_record = seam_policy_record("off-winner");
+        {
+            let store = harness.open_store(&harness.pod_a);
+            store.record_policy_decision(&winner_record).unwrap();
+        }
+        harness.upload(&harness.pod_a).await.unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seam_record = seam_policy_record("off-seam");
+        let session = LedgerSeamSession::new(&harness.pod_b.cfg, &harness.pod_b.state_path);
+        let output = session
+            .execute({
+                let calls = Arc::clone(&calls);
+                move |store, fresh_base| {
+                    assert!(
+                        fresh_base.is_none(),
+                        "the off path must not introduce generation ownership"
+                    );
+                    let calls = Arc::clone(&calls);
+                    let seam_record = seam_record.clone();
+                    Box::pin(async move {
+                        store.record_policy_decision(&seam_record)?;
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok("legacy-output")
+                    })
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(output, "legacy-output");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let object_key = format!("v{}/state.redb", crate::state::current_schema_version());
+        assert_eq!(
+            harness
+                .faults
+                .put_count(&object_key, PutKind::Unconditional),
+            2,
+            "the seed plus the seam must both use the legacy unconditional put"
+        );
+        let decisions = StateStore::open(&harness.pod_b.state_path)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        assert!(decisions.iter().any(|row| row.plan_id == "off-winner"));
+        assert!(decisions.iter().any(|row| row.plan_id == "off-seam"));
+        test_support::clear();
+    }
+
+    /// Local remains a one-transition, zero-remote-I/O path.
+    #[tokio::test]
+    async fn ledger_seam_local_is_legacy_zero_io() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        test_support::clear();
+        let faults = install_counting_provider();
+        let dir = TempDir::new().unwrap();
+        let state_path = dir.path().join(".rocky-state.redb");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let record = seam_policy_record("local-seam");
+        let session = LedgerSeamSession::new(&StateConfig::default(), &state_path);
+        let output = session
+            .execute({
+                let calls = Arc::clone(&calls);
+                move |store, fresh_base| {
+                    assert!(fresh_base.is_none());
+                    let calls = Arc::clone(&calls);
+                    let record = record.clone();
+                    Box::pin(async move {
+                        store.record_policy_decision(&record)?;
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(7_u8)
+                    })
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(output, 7);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        for op in [
+            crate::fault_store::FaultOp::Get,
+            crate::fault_store::FaultOp::Put,
+            crate::fault_store::FaultOp::Head,
+            crate::fault_store::FaultOp::List,
+        ] {
+            assert_eq!(faults.count(op), 0, "Local must not issue {op:?}");
         }
         test_support::clear();
     }

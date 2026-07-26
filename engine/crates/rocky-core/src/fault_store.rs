@@ -25,7 +25,7 @@ use futures::stream::BoxStream;
 use object_store::path::Path as ObjectPath;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 
 /// Logical object-store operation a fault can target.
@@ -47,6 +47,17 @@ pub enum FaultOp {
     Copy,
 }
 
+/// Observed write condition for a [`FaultingStore`] `put_opts` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PutKind {
+    /// Last-writer-wins overwrite.
+    Unconditional,
+    /// Atomic create-if-absent.
+    Create,
+    /// Compare-and-swap update against a generation.
+    Update,
+}
+
 /// How an armed fault fires across successive calls of its [`FaultOp`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultMode {
@@ -65,8 +76,12 @@ pub enum FaultMode {
 struct FaultState {
     /// Unconditional per-op call counters (every call counts, faulted or not).
     counts: HashMap<FaultOp, u64>,
+    /// Per-path put counts split by conditional-write kind.
+    put_counts: HashMap<(String, PutKind), u64>,
     /// Currently-armed fault per op.
     armed: HashMap<FaultOp, FaultMode>,
+    /// Deterministic conditional conflicts, targeted to an exact object path.
+    precondition_failures: HashMap<String, u32>,
 }
 
 fn lock(state: &Mutex<FaultState>) -> std::sync::MutexGuard<'_, FaultState> {
@@ -124,12 +139,33 @@ impl FaultHandle {
     /// Disarm every fault. Counters are intentionally NOT reset — counting is
     /// unconditional for the store's lifetime.
     pub fn clear(&self) {
-        lock(&self.0).armed.clear();
+        let mut guard = lock(&self.0);
+        guard.armed.clear();
+        guard.precondition_failures.clear();
     }
 
     /// Total calls observed for `op` (faulted calls included).
     pub fn count(&self, op: FaultOp) -> u64 {
         lock(&self.0).counts.get(&op).copied().unwrap_or(0)
+    }
+
+    /// Force the next `count` puts to `path` to return a conditional-write
+    /// precondition failure. Used to exercise retry semantics without
+    /// replacing the real object-store/CAS path.
+    pub fn arm_precondition_failures(&self, path: impl Into<String>, count: u32) {
+        lock(&self.0)
+            .precondition_failures
+            .insert(path.into(), count);
+    }
+
+    /// Number of `put_opts` calls observed for an exact object path and write
+    /// condition.
+    pub fn put_count(&self, path: &str, kind: PutKind) -> u64 {
+        lock(&self.0)
+            .put_counts
+            .get(&(path.to_string(), kind))
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -155,6 +191,33 @@ impl FaultingStore {
     fn check(&self, op: FaultOp) -> Result<(), object_store::Error> {
         record_and_check(&self.state, op)
     }
+
+    fn record_put(&self, location: &ObjectPath, mode: &PutMode) -> Result<(), object_store::Error> {
+        let path = location.to_string();
+        let kind = match mode {
+            PutMode::Overwrite => PutKind::Unconditional,
+            PutMode::Create => PutKind::Create,
+            PutMode::Update(_) => PutKind::Update,
+        };
+        let mut guard = lock(&self.state);
+        *guard.put_counts.entry((path.clone(), kind)).or_insert(0) += 1;
+        let conflict = kind != PutKind::Unconditional
+            && match guard.precondition_failures.get_mut(&path) {
+                Some(remaining) if *remaining > 0 => {
+                    *remaining -= 1;
+                    true
+                }
+                _ => false,
+            };
+        drop(guard);
+        if conflict {
+            return Err(object_store::Error::Precondition {
+                path,
+                source: "injected conditional-write conflict".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for FaultingStore {
@@ -172,6 +235,7 @@ impl ObjectStore for FaultingStore {
         opts: PutOptions,
     ) -> object_store::Result<PutResult> {
         self.check(FaultOp::Put)?;
+        self.record_put(location, &opts.mode)?;
         self.inner.put_opts(location, payload, opts).await
     }
 

@@ -416,22 +416,22 @@ fn marker_error_to_sync(e: FreezeMarkerError) -> StateSyncError {
 ///
 /// # Durable freeze markers — the un-erasable enforcement half
 ///
-/// The seam-scoped sync above closes only the *sequential* between-runs
-/// clobber: the remote state object is a whole-file blob published
-/// last-writer-wins, so a concurrent `rocky run` whose start-download
-/// preceded this freeze can still erase the ledger row on its own end-upload.
-/// The enforcement truth that survives that is a separate **add-wins marker
-/// set** beside the state file (see [`rocky_core::freeze_marker`]): `freeze`
-/// writes one create-once object `<prefix>/freeze/<freeze_id>.json` per
-/// principal, `unfreeze` writes `<prefix>/unfreeze/<unfreeze_id>.json` naming
-/// the exact `freeze_id`s it lifts, and enforcement projects the
-/// order-independent active set from the durable object tier — which a run's
-/// blob upload can never clobber. Marker **writes** are gated by `[state]
+/// With effective blob CAS, this command replays its exact ledger rows on a
+/// fresh shared `state.redb` blob and generation after a conflict. When CAS is
+/// off or unsupported, the legacy half-seam remains last-writer-wins. The
+/// enforcement truth that survives either mode — and the still-unconditional
+/// gc/apply blob writers during the partial #1228 rollout — is a separate
+/// **add-wins marker set** beside the state file (see
+/// [`rocky_core::freeze_marker`]): `freeze` writes one create-once object
+/// `<prefix>/freeze/<freeze_id>.json` per principal, `unfreeze` writes
+/// `<prefix>/unfreeze/<unfreeze_id>.json` naming the exact `freeze_id`s it
+/// lifts, and enforcement projects the order-independent active set from the
+/// durable object tier. Marker **writes** are gated by `[state]
 /// freeze_marker_writes` so a fleet can be upgraded to marker readers
 /// everywhere before the first marker is written; reading and enforcement are
-/// always on wherever a durable object tier exists. The ledger row stays as
-/// the audit trail and the feed for the ledger-based apply gate;
-/// compare-and-swap on the row itself is a separate follow-up.
+/// always on wherever a durable object tier exists. These marker keys never
+/// bump the shared blob generation, so blob CAS does not serialize them or
+/// close a marker-LIST-to-mutation window.
 pub fn run_policy_freeze(
     config_path: &Path,
     state_path: &Path,
@@ -505,11 +505,16 @@ pub fn run_policy_freeze(
     } else {
         None
     };
+    let seam_cas = rocky_core::state_sync::cas_effective(&state_cfg);
 
     // SEAM-SCOPED SYNC — download half. Pull the authoritative remote ledger
     // (overwriting the local file) BEFORE opening the store, so the freeze is
     // recorded on top of other pods' decisions rather than over an empty local.
-    if remote_state {
+    //
+    // Effective CAS moves this download into each LedgerSeamSession attempt so
+    // the installed bytes and generation are captured together. The legacy
+    // half-seam remains unchanged when CAS is off or unsupported.
+    if remote_state && !seam_cas {
         // WP-01 PR-B (2b): the session half-seam owns the download shape; a
         // successful download of either usable variant means the local ledger
         // now mirrors remote truth; failure still `?`-bails fail-closed
@@ -523,8 +528,17 @@ pub fn run_policy_freeze(
         })?;
     }
 
-    let store = StateStore::open(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+    // Preserve the legacy open-before-timestamp ordering when CAS is inert.
+    // Under effective CAS, LedgerSeamSession opens and drops a fresh store in
+    // every attempt.
+    let legacy_store =
+        if seam_cas {
+            None
+        } else {
+            Some(StateStore::open(state_path).with_context(|| {
+                format!("failed to open state store at {}", state_path.display())
+            })?)
+        };
 
     let now = chrono::Utc::now();
     let prefix = if lift {
@@ -534,6 +548,7 @@ pub fn run_policy_freeze(
     };
 
     let mut entries = Vec::new();
+    let mut records = Vec::new();
     let mut freeze_markers: Vec<FreezeMarker> = Vec::new();
     for p in principals.iter().copied() {
         let principal_label = serde_plain(&p);
@@ -583,9 +598,12 @@ pub fn run_policy_freeze(
             // auto-apply, so it carries no auto-apply custody.
             auto_apply: None,
         };
-        store
-            .record_policy_decision(&record)
-            .context("failed to record the freeze decision to the ledger")?;
+        if let Some(store) = &legacy_store {
+            store
+                .record_policy_decision(&record)
+                .context("failed to record the freeze decision to the ledger")?;
+        }
+        records.push(record);
         entries.push(PolicyFreezeEntry {
             principal: p,
             effect,
@@ -603,7 +621,7 @@ pub fn run_policy_freeze(
     // (default `skip`): a freeze that commits locally but never reaches the
     // remote — while the command reports success — would leave every other pod
     // unfrozen. A failed upload aborts (finding 5).
-    drop(store);
+    drop(legacy_store);
 
     // Durable freeze markers are written BEFORE the ledger upload (engage
     // early): if the blob upload then fails, the un-erasable marker is
@@ -628,7 +646,29 @@ pub fn run_policy_freeze(
         }
     }
 
-    if remote_state {
+    if seam_cas {
+        // Freeze is always allowed and has no dynamic authorization or
+        // external proof to refresh. Its complete replayable transition is the
+        // exact set of pre-constructed ledger records above. The marker is
+        // deliberately outside this closure because its create-once UUID
+        // cannot be replayed.
+        let session = rocky_core::state_sync::LedgerSeamSession::new(&state_cfg, state_path);
+        let expected_record_count = records.len();
+        let committed_record_count =
+            block_on_state_sync(session.execute(move |fresh_store, _fresh_base| {
+                let records = records.clone();
+                Box::pin(async move {
+                    for record in &records {
+                        fresh_store.record_policy_decision(record)?;
+                    }
+                    Ok(records.len())
+                })
+            }))
+            .with_context(
+                || "failed to commit the policy freeze ledger transition to shared remote state",
+            )?;
+        debug_assert_eq!(committed_record_count, expected_record_count);
+    } else if remote_state {
         // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
         // policy (previously a local `StateConfig` clone here).
         block_on_state_sync(
@@ -1250,5 +1290,255 @@ expcet = \"deny\"
         let store = StateStore::open(&state).unwrap();
         let freezes = policy::active_freezes(&store.list_policy_decisions().unwrap());
         assert_eq!(freezes.len(), 1, "the freeze must be recorded locally");
+    }
+
+    /// The real policy-freeze command writes its create-once marker outside
+    /// the CAS transition. Two injected state-blob conflicts force three full
+    /// ledger attempts; the exact marker key must still see one create call.
+    #[test]
+    fn freeze_marker_is_written_once_across_two_cas_conflicts() {
+        use rocky_core::fault_store::PutKind;
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let body = format!(
+            "{POLICY}
+[state]
+backend = \"s3\"
+s3_bucket = \"test\"
+concurrency_control = \"cas\"
+freeze_marker_writes = true
+on_upload_failure = \"skip\"
+
+[state.retry]
+max_retries = 0
+"
+        );
+        let (_dir, path) = config_with(&body);
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        harness.faults.arm_precondition_failures(&object_key, 2);
+
+        run_policy_freeze(
+            &path,
+            &harness.pod_a.state_path,
+            Some(PolicyPrincipal::Agent),
+            Some("any".to_string()),
+            Some("two-conflict freeze".to_string()),
+            false,
+            true,
+        )
+        .expect("the third full transition attempt must commit");
+
+        let provider = harness.provider.clone();
+        let marker_keys = block_on_state_sync(async move {
+            provider
+                .list(rocky_core::freeze_marker::FREEZE_MARKER_PREFIX)
+                .await
+                .map_err(StateSyncError::ObjectStore)
+        })
+        .unwrap();
+        assert_eq!(marker_keys.len(), 1, "one principal creates one marker");
+        assert_eq!(
+            harness.faults.put_count(&marker_keys[0], PutKind::Create),
+            1,
+            "the exact freeze-marker UUID must be written once, never replayed"
+        );
+        assert_eq!(
+            harness.faults.put_count(&object_key, PutKind::Create),
+            3,
+            "two conflicts must force exactly three state-blob CAS attempts"
+        );
+        assert_eq!(
+            harness
+                .faults
+                .put_count(&object_key, PutKind::Unconditional),
+            0,
+            "the CAS path must not issue an unconditional state-blob upload"
+        );
+    }
+
+    /// Exhaustion propagates the typed conflict through the CLI layer, so the
+    /// command exits nonzero even with `on_upload_failure = "skip"`. The
+    /// existing remote winner remains the only ledger row, while the
+    /// already-created freeze marker stays engaged.
+    #[test]
+    fn freeze_cas_exhaustion_is_nonzero_and_preserves_remote_winner() {
+        use rocky_core::fault_store::PutKind;
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let winner = PolicyDecisionRecord {
+            timestamp: chrono::Utc::now(),
+            plan_id: "existing-run-winner".to_string(),
+            principal: PolicyPrincipal::Agent,
+            capability: PolicyCapability::Apply,
+            model: "winner".to_string(),
+            effect: PolicyEffect::Allow,
+            rule_id: None,
+            reason: "remote winner".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+        {
+            let store = harness.open_store(&harness.pod_b);
+            store.record_policy_decision(&winner).unwrap();
+        }
+        block_on_state_sync(harness.upload(&harness.pod_b)).unwrap();
+
+        let body = format!(
+            "{POLICY}
+[state]
+backend = \"s3\"
+s3_bucket = \"test\"
+concurrency_control = \"cas\"
+freeze_marker_writes = true
+on_upload_failure = \"skip\"
+
+[state.retry]
+max_retries = 0
+"
+        );
+        let (_dir, path) = config_with(&body);
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        harness.faults.arm_precondition_failures(&object_key, 3);
+
+        let err = run_policy_freeze(
+            &path,
+            &harness.pod_a.state_path,
+            Some(PolicyPrincipal::Agent),
+            Some("any".to_string()),
+            Some("exhausted freeze".to_string()),
+            false,
+            true,
+        )
+        .expect_err("three conflicts must make the command fail nonzero");
+        assert!(
+            err.chain().any(|cause| matches!(
+                cause.downcast_ref::<StateSyncError>(),
+                Some(StateSyncError::LedgerSeamConflict { attempts: 3, .. })
+            )),
+            "the typed exhausted-conflict error must survive anyhow context: {err:#}"
+        );
+        assert_eq!(harness.faults.put_count(&object_key, PutKind::Update), 3);
+        assert_eq!(
+            harness
+                .faults
+                .put_count(&object_key, PutKind::Unconditional),
+            1,
+            "only the explicit winner seed is unconditional; exhaustion adds no fallback put"
+        );
+
+        let provider = harness.provider.clone();
+        let marker_keys = block_on_state_sync(async move {
+            provider
+                .list(rocky_core::freeze_marker::FREEZE_MARKER_PREFIX)
+                .await
+                .map_err(StateSyncError::ObjectStore)
+        })
+        .unwrap();
+        assert_eq!(
+            marker_keys.len(),
+            1,
+            "the marker remains engaged on failure"
+        );
+        assert_eq!(
+            harness.faults.put_count(&marker_keys[0], PutKind::Create),
+            1
+        );
+
+        harness.faults.clear();
+        let verify_dir = TempDir::new().unwrap();
+        let verify_path = verify_dir.path().join("verify.redb");
+        let _authority = block_on_state_sync(rocky_core::state_sync::download_state(
+            &harness.pod_b.cfg,
+            &verify_path,
+        ))
+        .unwrap();
+        let rows = StateStore::open(&verify_path)
+            .unwrap()
+            .list_policy_decisions()
+            .unwrap();
+        assert!(rows.iter().any(|row| row.plan_id == "existing-run-winner"));
+        assert!(
+            !rows.iter().any(|row| row.reason == "exhausted freeze"),
+            "the losing freeze ledger row must not overwrite the remote winner"
+        );
+    }
+
+    /// Unfreeze keeps the inverse ordering: its ledger row must win CAS before
+    /// the unfreeze marker is created. Exhausting the ledger transition leaves
+    /// the original freeze marker active and writes no lift object.
+    #[test]
+    fn unfreeze_marker_is_not_written_before_ledger_cas_wins() {
+        use rocky_core::test_harness::CrossPodHarness;
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = CrossPodHarness::new_s3_like();
+        let body = format!(
+            "{POLICY}
+[state]
+backend = \"s3\"
+s3_bucket = \"test\"
+concurrency_control = \"cas\"
+freeze_marker_writes = true
+
+[state.retry]
+max_retries = 0
+"
+        );
+        let (_dir, path) = config_with(&body);
+        run_policy_freeze(
+            &path,
+            &harness.pod_a.state_path,
+            Some(PolicyPrincipal::Agent),
+            Some("any".to_string()),
+            Some("freeze before failed lift".to_string()),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        harness.faults.arm_precondition_failures(&object_key, 3);
+        run_policy_freeze(
+            &path,
+            &harness.pod_a.state_path,
+            Some(PolicyPrincipal::Agent),
+            Some("any".to_string()),
+            Some("must not lift early".to_string()),
+            true,
+            true,
+        )
+        .expect_err("the unfreeze ledger transition must exhaust before marker creation");
+
+        let provider = harness.provider.clone();
+        let (freeze_keys, unfreeze_keys) = block_on_state_sync(async move {
+            let freezes = provider
+                .list(rocky_core::freeze_marker::FREEZE_MARKER_PREFIX)
+                .await
+                .map_err(StateSyncError::ObjectStore)?;
+            let unfreezes = provider
+                .list(rocky_core::freeze_marker::UNFREEZE_MARKER_PREFIX)
+                .await
+                .map_err(StateSyncError::ObjectStore)?;
+            Ok((freezes, unfreezes))
+        })
+        .unwrap();
+        assert_eq!(freeze_keys.len(), 1, "the original freeze stays engaged");
+        assert!(
+            unfreeze_keys.is_empty(),
+            "no unfreeze marker may land before the superseding ledger row wins CAS"
+        );
     }
 }
