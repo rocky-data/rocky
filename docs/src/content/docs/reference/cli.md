@@ -295,7 +295,7 @@ rocky doctor
 | Pipelines | `pipelines` | Validates schema patterns, templates, and governance config |
 | State Sync | `state_sync` | Inspects the configured remote state backend (type only) |
 | State RW | `state_rw` | Round-trips a marker object against the configured backend (put → get → delete). Surfaces IAM and reachability problems at cold start instead of end-of-run upload. No-op for `local`; tiered probes both legs. |
-| State Concurrency | `state_concurrency` | Reports lost-update exposure of a remote `[state]` backend. Every remote configuration warns today, with distinct messages for the three situations: `concurrency_control = "off"` (not enabled), `"cas"` on a backend that performs no compare-and-swap write (enabled but silently downgraded to an unconditional upload), and `"cas"` where it does take effect (runs protected, but `rocky gc` / `rocky policy` / `rocky apply` still write state unconditionally — see issue #1228). Silent for `local`. |
+| State Concurrency | `state_concurrency` | Reports lost-update exposure of a remote `[state]` backend. Every remote configuration warns today, with distinct messages for the three situations: `concurrency_control = "off"` (not enabled), `"cas"` on a backend that performs no compare-and-swap write (enabled but silently downgraded to an unconditional upload), and `"cas"` where it does take effect (runs and the `rocky policy` freeze/unfreeze ledger write protected, but `rocky gc` / `rocky apply` still write state unconditionally — see issue #1228). Silent for `local`. |
 | Auth | `auth`, `auth/<adapter>` | Pings each warehouse and discovery adapter to verify credentials and connectivity |
 
 **JSON output:**

@@ -3326,7 +3326,7 @@ class StateConfig(BaseModel):
     """
     concurrency_control: ConcurrencyControl1 | ConcurrencyControl2 | None = "off"
     """
-    Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `"cas"` on live multi-pod deployments with a durable object tier (`s3`, `gcs`, `tiered`) so a run that lost a cross-pod race fail-closes instead of silently overwriting the winner's committed state. On `tiered` it additionally makes the Valkey tier coherent with the durable object. Auto-downgrades to `off` (with a warn) on `local` and `valkey`.
+    Concurrency control for remote state writes. Default [`ConcurrencyControl::Off`] (unconditional last-writer-wins, byte- identical to pre-CAS). Set to `"cas"` on live multi-pod deployments with a durable object tier (`s3`, `gcs`, `tiered`) so a writer that lost a cross-pod race is reconciled by writer class instead of silently overwriting the winner: the end-of-run upload fail-closes, and the `rocky policy` freeze/unfreeze ledger write replays onto the winner. `rocky gc` and `rocky apply` still write unconditionally (issue #1228), so `cas` reduces but does not yet eliminate lost updates. On `tiered` it additionally makes the Valkey tier coherent with the durable object. Auto-downgrades to `off` (with a warn) on `local` and `valkey`.
     """
     freeze_marker_writes: bool | None = False
     """

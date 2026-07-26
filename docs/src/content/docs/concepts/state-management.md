@@ -182,7 +182,7 @@ The `tiered` backend combines Valkey (fast) with S3 (durable):
 - **Download**: try Valkey first (sub-millisecond reads); on miss or error, fall back to S3.
 - **Upload**: write to both Valkey (best-effort) and S3 (required).
 
-By default the cached copy is trusted as-is, so a Valkey write that fails while the S3 write succeeds leaves a stale copy that the next read will serve. Setting `concurrency_control = "cas"` closes that: the end-of-run upload commits to S3 first, and the cached copy is stored with the generation it was committed at so a read can check it against the durable object before using it. Ledger-seam writes (`policy freeze`, `gc apply`, `apply`) are not yet covered — see [Concurrent writers](/reference/configuration/#concurrent-writers).
+By default the cached copy is trusted as-is, so a Valkey write that fails while the S3 write succeeds leaves a stale copy that the next read will serve. Setting `concurrency_control = "cas"` closes that: the end-of-run upload commits to S3 first, and the cached copy is stored with the generation it was committed at so a read can check it against the durable object before using it. The remaining ledger-seam writes (`gc apply`, `apply`) are not yet covered — see [Concurrent writers](/reference/configuration/#concurrent-writers).
 
 ### Sync Lifecycle
 
