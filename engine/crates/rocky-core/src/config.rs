@@ -546,13 +546,14 @@ impl std::fmt::Display for StateBackend {
 ///
 /// **Scope:** `docs/adr/ADR-CONCURRENCY.md` governs — compare-and-swap applies
 /// to *every* remote state write, split by writer class (runs refuse on
-/// conflict; single-record ledger seams retry). Only the run half is
-/// implemented today: the ledger-seam writers reached through
-/// `RemoteStateSession::upload_only_fail_closed` (`rocky gc`, `rocky policy`,
-/// `rocky apply`) still upload unconditionally on every backend, so `cas` does
-/// not yet make a deployment fully safe against lost updates. Issue #1228
-/// tracks closing that half; `rocky doctor --check state_concurrency` reports
-/// the residual exposure in the meantime.
+/// conflict; single-record ledger seams retry). The run half and the
+/// `rocky policy` freeze/unfreeze seam are implemented today. The remaining
+/// ledger-seam writers reached through
+/// `RemoteStateSession::upload_only_fail_closed` (`rocky gc`, `rocky apply`)
+/// still upload unconditionally on every backend, so `cas` does not yet make a
+/// deployment fully safe against lost updates. Issue #1228 tracks closing that
+/// half; `rocky doctor --check state_concurrency` reports the residual exposure
+/// in the meantime.
 //
 // Kept free of rustdoc intra-doc links on purpose: `schemars` exports this
 // comment verbatim as the JSON Schema `description`, which surfaces in editor
