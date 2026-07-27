@@ -228,7 +228,9 @@ fn member_max_lags(tx: &TransformationPipelineConfig, config_path: &Path) -> Res
     else {
         return Ok(Vec::new());
     };
-    let models = crate::models_loader::load_project_models(&models_dir)?;
+    // Partial: a broken draft in one subdirectory must not drop every healthy
+    // member budget and silently widen this pipeline to the project default.
+    let (models, _load_errors) = crate::models_loader::load_project_models_partial(&models_dir);
     Ok(models
         .iter()
         .filter_map(|m| m.config.freshness.as_ref().map(|f| f.max_lag_seconds))

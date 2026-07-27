@@ -1003,8 +1003,7 @@ pub async fn run_preview_cost(
     // silently degrades to an empty per-model budget map. Project-level
     // budget projection still runs.
     let model_budgets: BTreeMap<String, rocky_core::config::ModelBudgetConfig> =
-        crate::models_loader::load_project_models(models_dir)
-            .ok()
+        Some(crate::models_loader::load_project_models_partial(models_dir).0)
             .map(|models| {
                 models
                     .into_iter()

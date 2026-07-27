@@ -173,9 +173,9 @@ fn load_dag_from_models(models_dir: Option<&Path>) -> Vec<DagNode> {
     };
 
     // Top-level + immediate subdirectories, including `.rocky` DSL files.
-    let Ok(all_models) = crate::models_loader::load_project_models(dir) else {
-        return vec![];
-    };
+    // Partial: this drives advisory downstream-reference counts, so one broken
+    // draft model must not silently collapse every healthy count to zero.
+    let (all_models, _load_errors) = crate::models_loader::load_project_models_partial(dir);
 
     all_models
         .iter()

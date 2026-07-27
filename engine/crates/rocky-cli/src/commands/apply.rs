@@ -2375,16 +2375,29 @@ pub(crate) fn resolve_touched_apply_targets(
     // failure just leaves the maps empty and every target falls through as-is.
     let mut fqn_to_name: BTreeMap<String, String> = BTreeMap::new();
     let mut names: BTreeSet<String> = BTreeSet::new();
-    if let Ok(models) = crate::models_loader::load_project_models(&models_dir) {
-        for m in &models {
-            names.insert(m.config.name.clone());
-            let fqn = format!(
-                "{}.{}.{}",
-                m.config.target.catalog, m.config.target.schema, m.config.target.table
-            )
-            .to_lowercase();
-            fqn_to_name.insert(fqn, m.config.name.clone());
-        }
+    // Partial, NOT `load_project_models`: this map is a policy input, so losing
+    // it wholesale because one unrelated subdirectory is malformed is a
+    // fail-open, not a degraded answer. An unresolved FQN is evaluated against
+    // DEFAULT attributes, so a rule scoped to a positive attribute
+    // (`layer = "gold"`) stops matching and the apply can fall through to a
+    // permissive default. Keep every mapping that loaded and warn about the rest
+    // — those specific targets still fall back to defaults, which is exactly the
+    // pre-existing limitation documented above.
+    let (models, load_errors) = crate::models_loader::load_project_models_partial(&models_dir);
+    for e in &load_errors {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "some models could not be loaded; policy attributes for their targets fall back to defaults"
+        );
+    }
+    for m in &models {
+        names.insert(m.config.name.clone());
+        let fqn = format!(
+            "{}.{}.{}",
+            m.config.target.catalog, m.config.target.schema, m.config.target.table
+        )
+        .to_lowercase();
+        fqn_to_name.insert(fqn, m.config.name.clone());
     }
 
     let mut touched = BTreeMap::new();
@@ -3758,6 +3771,52 @@ mod tests {
     use super::*;
     use crate::output::{ReplicationTableSnapshot, RunPlan};
     use crate::plan_store::write_plan;
+
+    /// A physical FQN must still resolve to its logical model name when an
+    /// UNRELATED model elsewhere in the tree fails to load.
+    ///
+    /// This map is a policy input: `gate_maintenance_apply` evaluates an
+    /// unresolved target against DEFAULT attributes, so an attribute-scoped rule
+    /// (`layer = "gold"`) stops matching and a destructive compact/archive can
+    /// fall through to a permissive default. Loading models strictly here would
+    /// turn one broken draft into a policy fail-open, which is why this path
+    /// deliberately uses the partial loader.
+    #[test]
+    fn touched_targets_resolve_despite_a_broken_sibling_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"p.duckdb\"\n\n\
+             [pipeline.silver]\ntype = \"transformation\"\n\n\
+             [pipeline.silver.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+
+        let models = root.join("models");
+        std::fs::create_dir_all(models.join("staging")).unwrap();
+        // The governed model, valid.
+        std::fs::write(models.join("payments.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            models.join("payments.toml"),
+            "name = \"payments\"\n[target]\ncatalog = \"wh\"\nschema = \"gold\"\ntable = \"payments\"\n",
+        )
+        .unwrap();
+        // An unrelated broken draft one directory down.
+        std::fs::write(models.join("staging").join("broken.sql"), "SELECT 1\n").unwrap();
+        std::fs::write(models.join("staging").join("broken.toml"), "name = [\n").unwrap();
+
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let touched =
+            resolve_touched_apply_targets(&cfg, &config_path, ["wh.gold.payments".to_string()]);
+
+        assert!(
+            touched.contains_key("payments"),
+            "the physical FQN must map to the logical model name so an \
+             attribute-scoped policy rule still fires; got {touched:?}"
+        );
+    }
 
     fn minimal_run_plan() -> RunPlan {
         RunPlan {
