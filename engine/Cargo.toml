@@ -181,7 +181,7 @@ md-5 = "0.11"
 # service-account keys.
 jsonwebtoken = { version = "11.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 rsa = { version = "0.9", features = ["pem"] }
-base64 = "0.22"
+base64 = "0.23"
 
 # String similarity
 strsim = "0.11"
