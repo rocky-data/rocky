@@ -179,7 +179,7 @@ md-5 = "0.11"
 # links both backends — see the `rustls` note above.)
 # `pem` keeps `EncodingKey::from_rsa_pem` available for PEM-encoded
 # service-account keys.
-jsonwebtoken = { version = "10.4", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+jsonwebtoken = { version = "11.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 rsa = { version = "0.9", features = ["pem"] }
 base64 = "0.22"
 
