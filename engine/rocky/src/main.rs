@@ -3226,6 +3226,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                      silently dropped); run without --dag/--watch, or remove --var"
                 );
             }
+            // `--models` is not threaded into the `--dag` dispatch path either.
+            // The unified DAG resolves each transformation pipeline's own
+            // `models` glob from rocky.toml, so an override passed here would be
+            // silently ignored and the DAG built from a different set of files
+            // than the caller asked for. Reject it loudly, the same way `--var`
+            // is rejected above.
+            if models_dir.is_some() && dag {
+                anyhow::bail!(
+                    "--models is not supported with --dag (it would be silently \
+                     dropped); the unified DAG resolves each transformation \
+                     pipeline's own `models` glob from rocky.toml"
+                );
+            }
             // --idempotency-key is mutually exclusive with --resume / --resume-latest:
             // a resume is an explicit override and should never be short-circuited.
             if idempotency_key.is_some() && (resume.is_some() || resume_latest) {

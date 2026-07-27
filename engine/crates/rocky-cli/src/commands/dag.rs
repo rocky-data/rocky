@@ -98,9 +98,17 @@ pub fn dag_output(
     // Load models from the models directory (including subdirectories).
     let models = load_all_models(models_dir)?;
 
-    // Load seeds if the directory exists.
+    // Load seeds if the directory exists. A discovery failure is propagated, not
+    // flattened to "no seeds": the seed nodes and the seed→model edges are built
+    // only from this list, so swallowing a malformed sidecar prints a DAG that
+    // is missing both — an answer that looks complete and is not.
+    let discover = |dir: &Path| -> Result<Vec<rocky_core::seeds::SeedFile>> {
+        rocky_core::seeds::discover_seeds(dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("failed to discover seeds in {}", dir.display()))
+    };
     let seeds = match seeds_dir {
-        Some(dir) if dir.exists() => rocky_core::seeds::discover_seeds(dir).unwrap_or_default(),
+        Some(dir) if dir.exists() => discover(dir)?,
         _ => {
             // Try default "seeds" relative to config dir.
             let default_seeds = config_path
@@ -108,7 +116,7 @@ pub fn dag_output(
                 .unwrap_or_else(|| Path::new("."))
                 .join("seeds");
             if default_seeds.is_dir() {
-                rocky_core::seeds::discover_seeds(&default_seeds).unwrap_or_default()
+                discover(&default_seeds)?
             } else {
                 vec![]
             }

@@ -16,7 +16,7 @@
 //! partial, `1` tick infrastructure error (config invalid, state unopenable).
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -224,7 +224,8 @@ pub(crate) fn build_member_budgets(
 /// block. Models without one inherit the project default, which is already the
 /// reconciler's fallback — so only own-declared budgets count as member lags.
 fn member_max_lags(tx: &TransformationPipelineConfig, config_path: &Path) -> Result<Vec<u64>> {
-    let Some(models_dir) = resolve_models_dir(&tx.models, config_path)? else {
+    let Some(models_dir) = crate::models_loader::resolve_models_dir(&tx.models, config_path)?
+    else {
         return Ok(Vec::new());
     };
     let models = crate::models_loader::load_project_models(&models_dir)?;
@@ -232,47 +233,6 @@ fn member_max_lags(tx: &TransformationPipelineConfig, config_path: &Path) -> Res
         .iter()
         .filter_map(|m| m.config.freshness.as_ref().map(|f| f.max_lag_seconds))
         .collect())
-}
-
-/// Resolve a transformation pipeline's `models` glob to its base directory,
-/// confined to the project root. Returns `None` when the directory does not
-/// exist. Mirrors `scope.rs`'s containment check: a `models = "../../etc"`
-/// escape must never read outside the project tree.
-fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Option<PathBuf>> {
-    // `Path::new("rocky.toml").parent()` is `Some("")`, not `None`, and an empty
-    // path fails to canonicalize — normalize it to the cwd so a relative default
-    // config (the common case) still resolves its models.
-    let project_root = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let models_base = models_glob
-        .split(&['*', '?', '['][..])
-        .next()
-        .unwrap_or("models");
-    let models_dir = project_root.join(models_base.trim_end_matches('/'));
-    if !models_dir.exists() {
-        return Ok(None);
-    }
-    // Confine to the project root. Both sides canonicalized so intra-project
-    // symlinks resolve before the prefix check (macOS `/tmp` is itself a
-    // symlink, so asymmetric resolution would false-reject).
-    let canonical_root = project_root.canonicalize().with_context(|| {
-        format!(
-            "project root '{}' could not be resolved",
-            project_root.display()
-        )
-    })?;
-    if let Ok(canonical_models) = models_dir.canonicalize()
-        && !canonical_models.starts_with(&canonical_root)
-    {
-        anyhow::bail!(
-            "models directory '{}' resolves outside the project root '{}'",
-            canonical_models.display(),
-            canonical_root.display(),
-        );
-    }
-    Ok(Some(models_dir))
 }
 
 /// Map the reconciler's [`TickReport`] onto the wire [`TickOutput`].

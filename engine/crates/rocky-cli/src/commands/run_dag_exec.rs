@@ -72,7 +72,13 @@ fn default_sub_runner() -> SubRunner {
          model_name: Option<String>,
          skip_opts| {
             Box::pin(async move {
-                let models_dir = models_dir_for_model_scope(&config_path, model_name.as_deref());
+                let models_dir = models_dir_for_model_scope(
+                    &config_path,
+                    &loaded.config,
+                    &pipeline_name,
+                    model_name.as_deref(),
+                )
+                .map_err(|e| format!("{e:#}"))?;
                 let partition_opts = super::PartitionRunOptions {
                     partition: None,
                     from: None,
@@ -123,16 +129,32 @@ fn default_sub_runner() -> SubRunner {
     )
 }
 
-/// Returns the conventional models directory only for a model-scoped
+/// Returns the owning pipeline's models directory, only for a model-scoped
 /// transformation sub-run. Supplying it to replication/load sub-runs makes
 /// `run()` execute every transformation model after the pipeline itself.
-fn models_dir_for_model_scope(config_path: &Path, model_name: Option<&str>) -> Option<PathBuf> {
-    model_name.map(|_| {
-        config_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join("models")
-    })
+///
+/// This must resolve the pipeline's CONFIGURED directory, not a hardcoded
+/// `models`. The DAG builds a node for every model it discovered, then hands
+/// each node's model name to a sub-run along with the directory to find it in —
+/// so a pipeline declaring `models = "transforms/**"` built a correct node whose
+/// sub-run then died with `models directory '<config>/models' not found
+/// (required for --model)`. Discovery and execution have to agree, which is why
+/// both go through [`crate::models_loader::resolve_models_dir`].
+fn models_dir_for_model_scope(
+    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
+    pipeline_name: &str,
+    model_name: Option<&str>,
+) -> Result<Option<PathBuf>> {
+    use rocky_core::config::PipelineConfig;
+
+    if model_name.is_none() {
+        return Ok(None);
+    }
+    let Some(PipelineConfig::Transformation(t)) = cfg.pipelines.get(pipeline_name) else {
+        return Ok(None);
+    };
+    crate::models_loader::resolve_models_dir(&t.models, config_path)
 }
 
 /// Execute `rocky run --dag`: run every pipeline in dependency order.
@@ -173,18 +195,26 @@ pub async fn run_with_dag(
     );
     let cfg = &loaded.config;
 
-    // Load models from the conventional `models/` directory next to the config.
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    let models_dir = config_dir.join("models");
-    let models = if models_dir.is_dir() {
-        super::dag::load_all_models(&models_dir)?
-    } else {
-        Vec::new()
-    };
+    // Load models from the model set each transformation pipeline actually
+    // declares — NOT a hardcoded `<config_dir>/models`. Hardcoding it was wrong
+    // in both directions: a pipeline with `models = "transforms/**"` loaded
+    // nothing, built zero transformation nodes, and reported success; and a
+    // project with no transformation pipeline at all was still forced to
+    // validate a `models/` directory that only transformation pipelines
+    // consume (`add_transformation_nodes`), so an unrelated broken model there
+    // failed a replication-only run that `rocky run` executes happily.
+    let models = load_transformation_models(config_path, cfg)?;
 
-    let seeds_dir = config_dir.join("seeds");
+    // Seed-discovery errors are NOT recoverable into "no seeds": seed nodes and
+    // the seed→model edges that order a model after the seed it reads are built
+    // only from this list. Swallowing a malformed seed sidecar drops the seed
+    // node, leaves the model unordered, and lets it run against whatever the
+    // previous run left in the table — a green DAG over stale data.
+    let seeds_dir = config_path.parent().unwrap_or(Path::new(".")).join("seeds");
     let seeds = if seeds_dir.is_dir() {
-        rocky_core::seeds::discover_seeds(&seeds_dir).unwrap_or_default()
+        rocky_core::seeds::discover_seeds(&seeds_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("failed to discover seeds in {}", seeds_dir.display()))?
     } else {
         Vec::new()
     };
@@ -273,6 +303,74 @@ pub async fn run_with_dag(
         anyhow::bail!("DAG execution had {} failed node(s)", result.failed);
     }
     Ok(())
+}
+
+/// Load the union of every transformation pipeline's declared model set.
+///
+/// Only transformation pipelines consume models, so a project without one loads
+/// nothing and can never fail on a `models/` directory it would not have
+/// executed. The base directory is derived from each pipeline's `models` glob
+/// exactly the way [`super::run`] derives it (the prefix up to the first `**`),
+/// so `--dag` and a plain run agree on which files are in scope.
+///
+/// A missing directory is not an error here — that matches `run`, which treats
+/// an absent models directory as a no-op rather than a failure.
+///
+/// Directories are deduplicated by canonical path, so two pipelines that write
+/// the same directory differently (`models/**` and `./models/**`) load it once
+/// instead of twice.
+///
+/// A model name reached from more than one place is an ERROR, not a silent
+/// pick-the-first. `build_unified_dag` keys a transformation node by model name
+/// alone, so two models sharing a name cannot both be built — today that
+/// surfaces from the executor as `circular dependency detected involving: []`
+/// (#1261), which names nothing. Failing here names both files instead.
+///
+/// Per-pipeline attribution is deliberately not attempted: `build_unified_dag`
+/// takes one flat model list and gives every transformation pipeline the same
+/// nodes, which is the other half of #1261.
+fn load_transformation_models(
+    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
+) -> Result<Vec<rocky_core::models::Model>> {
+    use rocky_core::config::PipelineConfig;
+
+    // (canonical key, path as configured) — the key only deduplicates, the
+    // configured path is what error messages should show.
+    let mut dirs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for pipeline in cfg.pipelines.values() {
+        let PipelineConfig::Transformation(t) = pipeline else {
+            continue;
+        };
+        let Some(dir) = crate::models_loader::resolve_models_dir(&t.models, config_path)? else {
+            continue;
+        };
+        let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if !dirs.iter().any(|(seen_key, _)| seen_key == &key) {
+            dirs.push((key, dir));
+        }
+    }
+
+    let mut models: Vec<rocky_core::models::Model> = Vec::new();
+    let mut by_name: HashMap<String, String> = HashMap::new();
+    for (_, dir) in dirs {
+        for model in super::dag::load_all_models(&dir)? {
+            if let Some(first) = by_name.get(&model.config.name) {
+                anyhow::bail!(
+                    "duplicate model name '{}': declared in both {} and {}. A \
+                     transformation node is keyed by model name alone, so two \
+                     models sharing a name cannot both be built — rename one.",
+                    model.config.name,
+                    first,
+                    model.file_path,
+                );
+            }
+            by_name.insert(model.config.name.clone(), model.file_path.clone());
+            models.push(model);
+        }
+    }
+    models.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
+    Ok(models)
 }
 
 fn status_str(s: &NodeStatus) -> &'static str {
@@ -403,7 +501,7 @@ impl NodeDispatcher for CliDispatcher {
 #[cfg(test)]
 mod skip_opts_threading_tests {
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     use rocky_core::config::LoadedConfig;
@@ -415,15 +513,106 @@ mod skip_opts_threading_tests {
 
     type RecordedSubRun = (Option<String>, SkipRunOptions);
 
+    const DEFAULT_GLOB_CONFIG: &str = r#"
+[adapter]
+type = "duckdb"
+path = "p.duckdb"
+
+[pipeline.silver]
+type = "transformation"
+
+[pipeline.silver.target]
+adapter = "default"
+"#;
+
+    const CUSTOM_GLOB_CONFIG: &str = r#"
+[adapter]
+type = "duckdb"
+path = "p.duckdb"
+
+[pipeline.ingest]
+strategy = "full_refresh"
+timestamp_column = "_updated_at"
+
+[pipeline.ingest.source.discovery]
+adapter = "default"
+
+[pipeline.ingest.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.ingest.target]
+catalog_template = "c"
+schema_template = "s"
+
+[pipeline.silver]
+type = "transformation"
+models = "transforms/**"
+
+[pipeline.silver.target]
+adapter = "default"
+"#;
+
+    /// Write a project on disk whose `rocky.toml` holds `toml_body`, creating
+    /// each named directory. `resolve_models_dir` returns `None` for a directory
+    /// that does not exist, so these have to be real paths.
+    fn project_with(toml_body: &str, dirs: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rocky.toml");
+        std::fs::write(&path, toml_body).unwrap();
+        for d in dirs {
+            std::fs::create_dir_all(tmp.path().join(d)).unwrap();
+        }
+        (tmp, path)
+    }
+
     #[test]
     fn models_dir_is_only_set_for_model_scoped_sub_runs() {
-        let config_path = Path::new("project/rocky.toml");
+        let (tmp, config_path) = project_with(DEFAULT_GLOB_CONFIG, &["models"]);
+        let loaded =
+            Arc::new(rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap());
+        let cfg = &loaded.config;
 
         assert_eq!(
-            models_dir_for_model_scope(config_path, Some("dim_orders")),
-            Some(PathBuf::from("project/models"))
+            models_dir_for_model_scope(&config_path, cfg, "silver", Some("dim_orders")).unwrap(),
+            Some(tmp.path().join("models"))
         );
-        assert_eq!(models_dir_for_model_scope(config_path, None), None);
+        // No model name means the whole pipeline runs, and `run()` must not be
+        // handed a models directory for that.
+        assert_eq!(
+            models_dir_for_model_scope(&config_path, cfg, "silver", None).unwrap(),
+            None
+        );
+    }
+
+    /// The sub-run must be pointed at the pipeline's CONFIGURED directory.
+    /// Handing it a hardcoded `models` made a correctly-discovered node die with
+    /// "models directory not found (required for --model)".
+    #[test]
+    fn models_dir_follows_the_pipelines_configured_glob() {
+        let (tmp, config_path) = project_with(CUSTOM_GLOB_CONFIG, &["transforms", "models"]);
+        let loaded =
+            Arc::new(rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap());
+        let cfg = &loaded.config;
+
+        // `transforms`, not the `models` directory that also exists beside it.
+        assert_eq!(
+            models_dir_for_model_scope(&config_path, cfg, "silver", Some("dim_orders")).unwrap(),
+            Some(tmp.path().join("transforms"))
+        );
+        // A replication pipeline owns no models, so nothing is supplied even if a
+        // model name somehow arrives — that would make `run()` execute every
+        // transformation model after the replication itself.
+        assert_eq!(
+            models_dir_for_model_scope(&config_path, cfg, "ingest", Some("dim_orders")).unwrap(),
+            None
+        );
+        // An unknown pipeline resolves to nothing rather than a guessed default.
+        assert_eq!(
+            models_dir_for_model_scope(&config_path, cfg, "nope", Some("dim_orders")).unwrap(),
+            None
+        );
     }
 
     /// A loaded snapshot for dispatcher tests, built through the real
