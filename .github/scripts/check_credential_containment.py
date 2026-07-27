@@ -26,7 +26,7 @@ PINNED_CHECKOUT_RE = re.compile(r"actions/checkout@[0-9a-f]{40}")
 PINNED_REMOTE_ACTION_RE = re.compile(
     r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.\-/]+@[0-9a-f]{40}"
 )
-CHECKOUT_SOURCE = "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
+CHECKOUT_SOURCE = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 GITHUB_SCRIPT_SOURCE = (
     "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3"
 )
