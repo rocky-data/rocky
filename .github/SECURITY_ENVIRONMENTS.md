@@ -143,6 +143,16 @@ with the intended tag but diverges is indistinguishable by eye and simply fails
 to resolve at run time. Confirm any new pin against its upstream tag before
 adding it to the allowlist.
 
+These jobs must also use the canonical block form the checker understands: block
+mapping jobs, a `steps:` list at six-space indentation, no flow-style `jobs: {...}`,
+no job image, and no reusable-workflow call. A step whose scalar spans several
+lines with a continuation beginning `uses:` is rejected as well. Recognising that
+shape needs a real YAML parser, which this checker forgoes so the same trusted
+file can run in the minimal policy job, so it fails closed and the author
+reformats. The restriction is safe in the other direction: a scalar can never
+conceal an executed step, because step splitting keys off the six-space prefix
+unconditionally.
+
 ## Updating frozen trust roots
 
 The credential-containment workflow compares the candidate copies of its

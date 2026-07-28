@@ -1822,6 +1822,44 @@ jobs:
                 f"a hostile {key} escaped the release rules",
             )
 
+    def test_release_rules_reject_multiline_scalar_steps_by_design(self) -> None:
+        """A multi-line scalar whose continuation starts with `uses:` is rejected.
+
+        This is a deliberate restriction, not an oversight. Recognising a plain or
+        quoted multi-line scalar needs a real YAML parser, which this checker
+        forgoes on purpose so the same trusted file can run in the minimal policy
+        job. The failure is closed: the continuation is counted as an action the
+        step parser missed, so a workflow using that shape is rejected and the
+        author reformats. A scalar can never hide an executed step in the other
+        direction -- `_step_blocks` splits on the six-space step prefix
+        unconditionally -- which is what makes the restriction safe to keep.
+
+        Pinned here so a future reader sees an intended boundary rather than a bug.
+        """
+
+        workflow = f"""\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: a title
+          uses: not/an-action@1111111111111111111111111111111111111111
+      - uses: {CHECKOUT_SOURCE}
+"""
+        violations = self.check_fixture("engine-release.yml", workflow)
+        self.assertTrue(
+            any("release" in item for item in violations),
+            "multi-line scalar steps must fail closed",
+        )
+
     def test_pinned_release_actions_resolve_to_their_commented_versions(self) -> None:
         """Every allow-listed release action must be pinned to a real 40-hex commit.
 
