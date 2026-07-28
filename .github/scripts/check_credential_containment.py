@@ -1333,6 +1333,12 @@ def _check_release_job_sources(job: str) -> list[str]:
     structural = _yaml_structural_text(job)
     violations: list[str] = []
     parsed: list[str] = []
+
+    # A job-level `uses:` is a reusable-workflow call: it replaces the whole job
+    # and never appears as a step, so no step-based rule can see it.
+    if _key_block(structural, "uses", indent=4) is not None:
+        violations.append("release job must not call a reusable workflow")
+
     for step in _step_blocks(structural):
         declared = STEP_USES_RE.findall(step)
         if not declared:
@@ -1354,7 +1360,13 @@ def _check_release_job_sources(job: str) -> list[str]:
     # parsed count turns every such shape into a violation instead of a silent
     # gap, which is the difference between this rule binding and merely looking
     # like it does.
-    if len(STEP_USES_RE.findall(structural)) != len(parsed):
+    # Completeness, not just per-step correctness. _step_blocks only recognises
+    # canonical six-space steps, so a step list at any other indentation would
+    # otherwise be invisible here and pass. Count within the steps block only:
+    # a `uses` key elsewhere in the job -- a matrix dimension named `uses`, say --
+    # is data, not an action, and counting it would reject a valid job.
+    steps_block = _key_block(structural, "steps", indent=4)
+    if steps_block is not None and len(STEP_USES_RE.findall(steps_block)) != len(parsed):
         violations.append("release job declares an action outside a canonical step")
 
     # A job image runs arbitrary code under the same write token as the steps,
@@ -1572,6 +1584,15 @@ def check_workflow(workflow: Workflow) -> list[str]:
         violations.append("PR-triggered jobs must use canonical block form")
     if pr_triggered and any(name.startswith("<unparsed:") for name in jobs):
         violations.append("PR-triggered job definitions must use canonical block form")
+    # The same requirement for workflows a pull request cannot reach. Without it
+    # the release rules below are trivially evaded: a flow-style `jobs: {...}`
+    # is valid to GitHub and to actionlint, but the job parser returns either
+    # nothing or an <unparsed:...> entry, so every per-job rule is skipped and
+    # the workflow passes while running an arbitrary action.
+    if not pr_triggered and ("jobs:" not in workflow.text.splitlines() or not jobs):
+        violations.append("release jobs must use canonical block form")
+    if not pr_triggered and any(name.startswith("<unparsed:") for name in jobs):
+        violations.append("release job definitions must use canonical block form")
     job_names = [
         match.group("bare") or match.group("single") or match.group("double")
         for line in workflow.text.splitlines()
@@ -1654,7 +1675,7 @@ def check_workflow(workflow: Workflow) -> list[str]:
                     allowed_checkout_maps=CANDIDATE_CHECKOUT_MAPS.get(job_identity),
                 )
             )
-        if not pr_triggered:
+        if not pr_triggered and not job_name.startswith("<unparsed:"):
             violations.extend(_check_release_job_sources(job))
         if MODEL_SECRET_RE.search(job) and (workflow.path.name, job_name) not in {
             ("ai-review.yml", "ai-review"),

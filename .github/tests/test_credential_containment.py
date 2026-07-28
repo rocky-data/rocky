@@ -1663,7 +1663,7 @@ jobs:
 """
         self.assertTrue(
             any(
-                "release job declares an action outside a canonical step" in item
+                "release job must not call a reusable workflow" in item
                 for item in self.check_fixture("engine-release.yml", reusable)
             ),
             "a reusable workflow call escaped the release allowlist",
@@ -1691,6 +1691,67 @@ jobs:
             ),
             "a non-canonical step indentation escaped the release allowlist",
         )
+
+    def test_release_workflow_must_use_canonical_block_jobs(self) -> None:
+        """Flow-style jobs would otherwise skip every per-job release rule.
+
+        `jobs: {build: {...}}` is valid to GitHub and passes actionlint, but the
+        job parser returns either nothing or an `<unparsed:...>` entry, so the
+        per-job loop never runs the release rules and the workflow passes while
+        executing an arbitrary action. The pull-request side already rejects this
+        shape; workflows a pull request cannot reach must too.
+        """
+
+        header = (
+            "name: engine-release\non:\n  push:\n    tags: [\"engine-v*\"]\n\n"
+            "permissions:\n  contents: write\n\n"
+        )
+        evil = "attacker/evil-action@1111111111111111111111111111111111111111"
+        for label, body in (
+            ("inline jobs mapping", "jobs: {build: {runs-on: ubuntu-latest, steps: [{uses: %s}]}}\n" % evil),
+            ("flow-style job body", "jobs:\n  build: {runs-on: ubuntu-latest, steps: [{uses: %s}]}\n" % evil),
+            ("inline reusable workflow", "jobs: {build: {uses: attacker/evil/.github/workflows/p.yml@main}}\n"),
+        ):
+            violations = self.check_fixture("engine-release.yml", header + body)
+            self.assertTrue(
+                any("must use canonical block form" in item for item in violations),
+                f"{label} escaped the release rules",
+            )
+
+    def test_release_completeness_ignores_non_step_uses_keys(self) -> None:
+        """A `uses` key outside the steps block is data, not an action.
+
+        A matrix dimension named `uses` sits at a deeper indentation than the
+        step parser recognises, so counting `uses:` across the whole job would
+        read it as a missed action and reject a valid workflow.
+        """
+
+        workflow = f"""\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - uses: linux
+          - uses: macos
+    steps:
+      - uses: {CHECKOUT_SOURCE}
+"""
+        violations = [
+            item
+            for item in self.check_fixture("engine-release.yml", workflow)
+            if "release" in item
+        ]
+        self.assertEqual(violations, [], "matrix data was read as an action source")
 
     def test_release_rules_read_structure_not_run_script_bodies(self) -> None:
         """A `run:` body is shell, not an action source.
