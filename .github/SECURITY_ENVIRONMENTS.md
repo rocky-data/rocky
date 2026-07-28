@@ -83,6 +83,14 @@ suite must report its own result, and GitHub must refuse the merge. Restore the
 test branch without merging it. A green policy job is advisory until these
 required-check rules are enabled.
 
+**Status: enabled.** The `main` ruleset now requires `Credential containment
+policy` and `Credential-containment regression tests` alongside the engine
+contexts, with branches required to be up to date. The rule was verified against
+a real trust-root change rather than a disposable one: #1277 turned the policy
+check red, the regression suite reported its own green result, and GitHub refused
+the merge until a maintainer applied the narrow override. Before the required
+checks were added, that same pull request reported a mergeable state.
+
 The trusted policy workflow never checks out the candidate revision. It uses a
 read-only token to fetch the exact candidate commit's `.github` Git tree as
 data, rejects truncated trees, symlinks, submodules, traversal-shaped paths,
