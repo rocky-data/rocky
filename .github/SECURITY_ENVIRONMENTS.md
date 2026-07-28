@@ -67,6 +67,16 @@ the required checks to the GitHub Actions source if the settings UI offers that
 choice. Require branches to be up to date before merging, do not grant ordinary
 bypass access, and keep any emergency override limited to named maintainers.
 
+Requiring these two checks is not optional hardening, and the repository's other
+required checks are not a substitute. Every other required context is
+path-filtered on `engine/**`, so a pull request that bundles any engine source
+edit with a hostile `.github` edit reports all of them green. If the containment
+check is merely present-and-red rather than required, GitHub returns a mergeable
+state and the change lands with no override and no administrator involvement. The
+absence of an engine change is likewise not a barrier: a `.github`-only pull
+request leaves the engine contexts pending, which is the same state that ordinary
+docs-only work produces, so it is routinely cleared rather than investigated.
+
 Verify the rule with a disposable pull request that makes a policy regression:
 the first check must fail from trusted `main` tooling, the candidate regression
 suite must report its own result, and GitHub must refuse the merge. Restore the
@@ -131,5 +141,11 @@ Use this bootstrap procedure for an intentional trust-root update:
    imports candidate code before credentials become available.
 4. Have an authorized maintainer use the narrow branch-protection override to
    merge that reviewed SHA. Do not disable the policy or broaden its allowlist.
-5. Treat the new `main` revision as the trusted checker, rerun the containment
-   workflow, and confirm it accepts the repository before any other merge.
+5. Treat the new `main` revision as the trusted checker and confirm it accepts the
+   repository before any other merge. `ci-security-policy.yml` triggers only on
+   `pull_request_target`, so there is no way to rerun it against `main` on demand:
+   the confirmation run is **the next pull request opened after the bootstrap
+   merge**. Open one that does not itself touch a trust root, and require its
+   `Credential containment policy` result to be green before merging anything
+   else. A second trust-root pull request opened immediately would report red for
+   its own bootstrap reasons and cannot confirm the previous one.
