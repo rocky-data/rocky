@@ -1692,6 +1692,45 @@ jobs:
             "a non-canonical step indentation escaped the release allowlist",
         )
 
+    def test_release_rules_read_structure_not_run_script_bodies(self) -> None:
+        """A `run:` body is shell, not an action source.
+
+        The completeness check counts `uses:` occurrences, so a heredoc that
+        writes out a workflow file - which legitimately contains `- uses:` lines -
+        would be counted as an action the step parser missed and reject a valid
+        job. `_check_unprivileged_job` already reads structural text for the same
+        reason; the release rules must too.
+        """
+
+        workflow = f"""\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # uses: attacker/evil-action@1111111111111111111111111111111111111111
+      - name: generate a workflow
+        run: |
+          cat > wf.yml <<'EOF'
+          steps:
+            - uses: someone/else@2222222222222222222222222222222222222222
+          EOF
+      - uses: {CHECKOUT_SOURCE}
+"""
+        violations = [
+            item
+            for item in self.check_fixture("engine-release.yml", workflow)
+            if "release" in item
+        ]
+        self.assertEqual(violations, [], "release rules read a run: body as an action")
+
     def test_release_job_cannot_run_a_container_image(self) -> None:
         """A job image runs arbitrary code under the same write token as a step."""
 

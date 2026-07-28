@@ -1325,9 +1325,15 @@ def _check_release_job_sources(job: str) -> list[str]:
     where an attacker would hide one.
     """
 
+    # Read structure only. A `run:` body is shell, not an action source, and a
+    # heredoc that writes out a workflow file legitimately contains `- uses:`
+    # lines; counting those would reject a valid job. _yaml_structural_text
+    # drops comments and block-scalar bodies, and it cannot hide a real step:
+    # scalar mode ends as soon as indentation returns to the step level.
+    structural = _yaml_structural_text(job)
     violations: list[str] = []
     parsed: list[str] = []
-    for step in _step_blocks(job):
+    for step in _step_blocks(structural):
         declared = STEP_USES_RE.findall(step)
         if not declared:
             continue
@@ -1348,13 +1354,13 @@ def _check_release_job_sources(job: str) -> list[str]:
     # parsed count turns every such shape into a violation instead of a silent
     # gap, which is the difference between this rule binding and merely looking
     # like it does.
-    if len(STEP_USES_RE.findall(job)) != len(parsed):
+    if len(STEP_USES_RE.findall(structural)) != len(parsed):
         violations.append("release job declares an action outside a canonical step")
 
     # A job image runs arbitrary code under the same write token as the steps,
     # so it is an action source in everything but name.
     for key in ("container", "services"):
-        if _key_block(job, key, indent=4) is not None:
+        if _key_block(structural, key, indent=4) is not None:
             violations.append(f"release job declares a {key}")
     return violations
 
