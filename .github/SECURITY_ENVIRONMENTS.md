@@ -121,6 +121,28 @@ closed only after these pass on the merged revision:
 Record the run URLs in the remediation ledger. Until these pass on `main`, the
 code is merge-ready but RD-026 stays In review.
 
+## Release and deployment action sources
+
+The containment rules above govern jobs reachable from a pull request. Release,
+publish and deployment workflows are a different trust domain: they run from a
+tag or a push, never execute candidate code, and so none of the pull-request
+rules applied to them. They do hold a write token and the publishing secrets,
+which made an unreviewed action source in one of their steps a direct path into
+the artifacts this project ships — `engine/install.sh` serves exactly those
+binaries.
+
+Every job that is not reachable from a pull request may therefore only run
+actions in `RELEASE_ACTION_SOURCES`, the pinned allowlist in the checker. Parsing
+fails closed: a step whose `uses:` cannot be read as exactly one pinned remote
+source is a violation rather than something to skip, and a repository-local
+action in such a job is rejected outright. Adding a new action to a release
+workflow is a trust-root change and follows the bootstrap procedure below.
+
+Pin provenance is not self-verifying. A pinned commit that shares a long prefix
+with the intended tag but diverges is indistinguishable by eye and simply fails
+to resolve at run time. Confirm any new pin against its upstream tag before
+adding it to the allowlist.
+
 ## Updating frozen trust roots
 
 The credential-containment workflow compares the candidate copies of its

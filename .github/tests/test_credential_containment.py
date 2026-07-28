@@ -39,7 +39,12 @@ from normalize_json import (  # noqa: E402
     extract_command_object,
     normalize_preview_json,
 )
-from check_credential_containment import FROZEN_TRUST_ROOTS, check_repository  # noqa: E402
+from check_credential_containment import (  # noqa: E402
+    FROZEN_TRUST_ROOTS,
+    RELEASE_ACTION_SOURCES,
+    WASM_PACK_SOURCE,
+    check_repository,
+)
 from preview_comment import (  # noqa: E402
     COMMENT_MARKER,
     MAX_COMMENT_BYTES,
@@ -1081,7 +1086,7 @@ jobs:
   payload:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       - run: ./payload/run.sh
@@ -1292,7 +1297,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out exact candidate policy input
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
@@ -1553,6 +1558,102 @@ jobs:
         violations = self.check_fixture("engine-evals.yml", workflow)
         self.assertTrue(any("duplicate top-level" in item for item in violations))
 
+    def test_release_workflow_cannot_run_an_unreviewed_action(self) -> None:
+        workflow = self.read(".github/workflows/engine-release.yml").replace(
+            "      - uses: actions/checkout@"
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "      - uses: attacker/evil-action@"
+            "1111111111111111111111111111111111111111 # v1",
+            1,
+        )
+        violations = self.check_fixture("engine-release.yml", workflow)
+        self.assertTrue(
+            any("release step action source is not allow-listed" in item for item in violations)
+        )
+
+    def test_every_release_workflow_rejects_an_unreviewed_action(self) -> None:
+        """The rule must bind on each credentialed non-pull-request workflow.
+
+        Covering only engine-release.yml would let a sibling release workflow
+        regress silently, which is how this gap existed in the first place.
+        """
+
+        workflows = REPOSITORY_ROOT / ".github" / "workflows"
+        covered = []
+        for path in sorted(workflows.glob("*.yml")):
+            text = path.read_text()
+            if "\n  pull_request:" in text or "\n  pull_request_target:" in text:
+                continue
+            if "\n      - uses: " not in text:
+                continue
+            covered.append(path.name)
+            hostile = text.replace(
+                "\n      - uses: ",
+                "\n      - uses: attacker/evil-action@"
+                "1111111111111111111111111111111111111111\n      - uses: ",
+                1,
+            )
+            violations = self.check_fixture(path.name, hostile)
+            self.assertTrue(
+                any(
+                    "release step action source is not allow-listed" in item
+                    for item in violations
+                ),
+                f"{path.name} did not reject an unreviewed action source",
+            )
+        self.assertIn("engine-release.yml", covered)
+        self.assertIn("engine-wasm-release.yml", covered)
+        self.assertIn("sdk-release.yml", covered)
+        self.assertIn("dagster-release.yml", covered)
+        self.assertIn("vscode-release.yml", covered)
+
+    def test_release_step_local_action_and_ambiguous_uses_fail_closed(self) -> None:
+        base = self.read(".github/workflows/engine-release.yml")
+        local = base.replace(
+            "      - uses: actions/checkout@"
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "      - uses: ./.github/actions/rocky-preview",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "release step runs a repository-local action" in item
+                for item in self.check_fixture("engine-release.yml", local)
+            )
+        )
+        ambiguous = base.replace(
+            "      - uses: actions/checkout@"
+            "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1",
+            "      - uses: actions/checkout@"
+            "3d3c42e5aac5ba805825da76410c181273ba90b1\n"
+            "        uses: attacker/evil-action@"
+            "1111111111111111111111111111111111111111",
+            1,
+        )
+        self.assertTrue(
+            any(
+                "release step declares more than one action source" in item
+                for item in self.check_fixture("engine-release.yml", ambiguous)
+            )
+        )
+
+    def test_pinned_release_actions_resolve_to_their_commented_versions(self) -> None:
+        """Every allow-listed release action must be pinned to a real 40-hex commit.
+
+        engine-wasm-release.yml shipped a wasm-pack pin that shared a 25-character
+        prefix with the real v0.4.0 commit and then diverged, so the action could
+        never resolve. A malformed pin is indistinguishable from a correct one by
+        eye, so assert the shape here and keep the allowlist the single source.
+        """
+
+        for source in RELEASE_ACTION_SOURCES:
+            owner_repo, _, sha = source.partition("@")
+            self.assertRegex(sha, r"^[0-9a-f]{40}$", f"{owner_repo} is not SHA-pinned")
+            self.assertIn("/", owner_repo)
+
+        workflows = REPOSITORY_ROOT / ".github" / "workflows"
+        wasm = (workflows / "engine-wasm-release.yml").read_text()
+        self.assertIn(WASM_PACK_SOURCE, wasm)
 
 class WorkflowPolicyTests(unittest.TestCase):
     def read(self, relative_path: str) -> str:

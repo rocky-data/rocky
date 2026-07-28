@@ -71,7 +71,7 @@ jobs:
       # Prebuilt binary — avoids ~40s of `cargo install wasm-pack --locked`
       # per run and skips a transitive compilation that occasionally trips
       # MSRV / yanked-crate failures.
-      - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e0cafa345d365d15 # v0.4.0
+      - uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
         with:
           version: 'v0.13.1'
 

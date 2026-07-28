@@ -43,6 +43,52 @@ SETUP_UV_SOURCE = "astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9"
 SETUP_NODE_SOURCE = (
     "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
 )
+DEPLOY_PAGES_SOURCE = (
+    "actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128"
+)
+UPLOAD_PAGES_ARTIFACT_SOURCE = (
+    "actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9"
+)
+SETUP_NASM_SOURCE = "ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b"
+WASM_PACK_SOURCE = (
+    "jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa"
+)
+SETUP_ZIG_SOURCE = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29"
+PYPI_PUBLISH_SOURCE = (
+    "pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247"
+)
+GH_RELEASE_SOURCE = (
+    "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
+)
+TAIKI_INSTALL_SOURCE = (
+    "taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf"
+)
+# Actions a job may run when it is not reachable from a pull request. Release,
+# publish and deployment workflows never execute candidate code, so the
+# containment rules that govern pull-request jobs do not apply to them; what they
+# do hold is a write token and the publishing secrets. That makes an unreviewed
+# action source in one of their steps a direct supply-chain path into the
+# artifacts this project ships, which nothing else in this checker examined.
+RELEASE_ACTION_SOURCES = frozenset(
+    {
+        CHECKOUT_SOURCE,
+        DEPLOY_PAGES_SOURCE,
+        GH_RELEASE_SOURCE,
+        GITHUB_SCRIPT_SOURCE,
+        PYPI_PUBLISH_SOURCE,
+        RUST_CACHE_SOURCE,
+        RUST_TOOLCHAIN_SOURCE,
+        SETUP_NASM_SOURCE,
+        SETUP_NODE_SOURCE,
+        SETUP_UV_SOURCE,
+        SETUP_ZIG_SOURCE,
+        TAIKI_INSTALL_SOURCE,
+        UPLOAD_ARTIFACT_SOURCE,
+        UPLOAD_PAGES_ARTIFACT_SOURCE,
+        WASM_PACK_SOURCE,
+    }
+)
+STEP_USES_RE = re.compile(r"(?m)^\s+(?:-\s+)?uses:\s*([^\s#]+)")
 MODEL_SECRET_RE = re.compile(r"\bANTHROPIC_API_KEY\b", re.IGNORECASE)
 CANDIDATE_JOBS = {
     ("ai-review.yml", "context"),
@@ -1270,6 +1316,31 @@ def _check_unprivileged_job(
     return violations
 
 
+def _check_release_job_sources(job: str) -> list[str]:
+    """Restrict a non-pull-request job to the pinned release action allowlist.
+
+    Parsing fails closed. A step whose `uses:` cannot be read as exactly one
+    pinned remote source is a violation rather than something to skip, because
+    the surrounding job holds credentials and an unreadable step is precisely
+    where an attacker would hide one.
+    """
+
+    violations: list[str] = []
+    for step in _step_blocks(job):
+        declared = STEP_USES_RE.findall(step)
+        if not declared:
+            continue
+        if len(declared) > 1:
+            violations.append("release step declares more than one action source")
+            continue
+        source = declared[0].strip("'\"")
+        if source.startswith("./") or source.startswith("."):
+            violations.append("release step runs a repository-local action")
+        elif source not in RELEASE_ACTION_SOURCES:
+            violations.append("release step action source is not allow-listed")
+    return violations
+
+
 def _check_live_evals(workflow: Workflow, job: str) -> list[str]:
     violations: list[str] = []
     top_level_keys = re.findall(
@@ -1559,6 +1630,8 @@ def check_workflow(workflow: Workflow) -> list[str]:
                     allowed_checkout_maps=CANDIDATE_CHECKOUT_MAPS.get(job_identity),
                 )
             )
+        if not pr_triggered:
+            violations.extend(_check_release_job_sources(job))
         if MODEL_SECRET_RE.search(job) and (workflow.path.name, job_name) not in {
             ("ai-review.yml", "ai-review"),
             ("engine-evals-live.yml", "evals"),
