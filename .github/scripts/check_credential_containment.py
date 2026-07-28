@@ -1326,18 +1326,36 @@ def _check_release_job_sources(job: str) -> list[str]:
     """
 
     violations: list[str] = []
+    parsed: list[str] = []
     for step in _step_blocks(job):
         declared = STEP_USES_RE.findall(step)
         if not declared:
             continue
+        parsed.extend(declared)
         if len(declared) > 1:
             violations.append("release step declares more than one action source")
             continue
         source = declared[0].strip("'\"")
-        if source.startswith("./") or source.startswith("."):
+        if source.startswith("."):
             violations.append("release step runs a repository-local action")
         elif source not in RELEASE_ACTION_SOURCES:
             violations.append("release step action source is not allow-listed")
+
+    # Completeness, not just per-step correctness. _step_blocks only recognises
+    # canonical six-space steps, so anything else -- a job-level `uses:` calling
+    # a reusable workflow, or a step list at a different indentation -- would
+    # otherwise be invisible here and pass. Comparing the raw count against the
+    # parsed count turns every such shape into a violation instead of a silent
+    # gap, which is the difference between this rule binding and merely looking
+    # like it does.
+    if len(STEP_USES_RE.findall(job)) != len(parsed):
+        violations.append("release job declares an action outside a canonical step")
+
+    # A job image runs arbitrary code under the same write token as the steps,
+    # so it is an action source in everything but name.
+    for key in ("container", "services"):
+        if _key_block(job, key, indent=4) is not None:
+            violations.append(f"release job declares a {key}")
     return violations
 
 

