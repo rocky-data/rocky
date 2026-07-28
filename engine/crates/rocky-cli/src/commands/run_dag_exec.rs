@@ -42,6 +42,7 @@ type SubRunner = Arc<
             String,
             Option<String>,
             SkipRunOptions,
+            Option<rocky_core::shadow::ShadowConfig>,
         ) -> Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send>>
         + Send
         + Sync,
@@ -70,7 +71,8 @@ fn default_sub_runner() -> SubRunner {
          state_path: PathBuf,
          pipeline_name: String,
          model_name: Option<String>,
-         skip_opts| {
+         skip_opts,
+         shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
             Box::pin(async move {
                 let models_dir = models_dir_for_model_scope(
                     &config_path,
@@ -100,7 +102,7 @@ fn default_sub_runner() -> SubRunner {
                     false,
                     None,
                     false,
-                    None,
+                    shadow_config.as_ref(),
                     &partition_opts,
                     model_name.as_deref(),
                     // DAG sub-runs inherit config-derived TTL.
@@ -174,6 +176,12 @@ pub async fn run_with_dag(
     // build (and `--no-reuse` disables content-addressed reuse + column-skip)
     // instead of being silently dropped at the DAG boundary.
     skip_opts: &super::run::SkipRunOptions,
+    // `--shadow` / `--branch`, threaded into every sub-run. Dropping it at the
+    // DAG boundary is what let `rocky run --dag --shadow` write production
+    // targets (#1272). Each sub-run is an ordinary `run()`, so it gets whatever
+    // isolation that pipeline kind supports — and the kinds that support none
+    // now refuse rather than write production.
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
 ) -> Result<()> {
     // Under `-o json` the orchestrator contract is that stdout is exactly one
     // JSON document (the `DagRunOutput` below). Sub-runs are dispatched with
@@ -254,6 +262,7 @@ pub async fn run_with_dag(
         seeds_dir,
         node_pipelines,
         skip_opts: *skip_opts,
+        shadow_config: shadow_config.cloned(),
         sub_runner: default_sub_runner(),
     };
     let executor = DagExecutor::new(dispatcher);
@@ -412,6 +421,10 @@ struct CliDispatcher {
     /// from the outer `run_with_dag` so each sub-run honors it. `Copy`, so the
     /// per-node closure captures a value (no borrow escaping the dispatcher).
     skip_opts: super::run::SkipRunOptions,
+    /// `--shadow` / `--branch`, threaded from the outer `run_with_dag` so each
+    /// sub-run honors it. Dropping it here is what let `rocky run --dag
+    /// --shadow` write production targets (#1272).
+    shadow_config: Option<rocky_core::shadow::ShadowConfig>,
     /// The injected sub-run driver. Production is [`default_sub_runner`]; tests
     /// substitute a recorder to observe the `skip_opts` each sub-run receives.
     sub_runner: SubRunner,
@@ -424,6 +437,7 @@ impl NodeDispatcher for CliDispatcher {
         let loaded = Arc::clone(&self.loaded);
         let state_path = self.state_path.clone();
         let skip_opts = self.skip_opts;
+        let shadow_config = self.shadow_config.clone();
         let sub_runner = self.sub_runner.clone();
         let label = label.to_string();
         match kind {
@@ -490,6 +504,7 @@ impl NodeDispatcher for CliDispatcher {
                         pipeline_name,
                         model_name,
                         skip_opts,
+                        shadow_config,
                     )
                     .await
                 }))
@@ -651,6 +666,7 @@ adapter = "default"
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
             skip_opts,
+            shadow_config: None,
             sub_runner: recorder,
         };
         (dispatcher, node_ids)
@@ -675,7 +691,7 @@ adapter = "default"
         // A recorder sub-runner: capture the skip_opts and return Ok without
         // running a real pipeline.
         let recorder: SubRunner = Arc::new(
-            move |_config, _loaded, _state, _pipeline, model_name, skip_opts| {
+            move |_config, _loaded, _state, _pipeline, model_name, skip_opts, _shadow| {
                 let sink = sink.clone();
                 Box::pin(async move {
                     sink.lock().unwrap().push((model_name, skip_opts));
@@ -729,7 +745,7 @@ adapter = "default"
         let recorded: Arc<Mutex<Vec<Arc<LoadedConfig>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = recorded.clone();
         let recorder: SubRunner =
-            Arc::new(move |_config, loaded, _state, _pipeline, _model, _skip| {
+            Arc::new(move |_config, loaded, _state, _pipeline, _model, _skip, _shadow| {
                 let sink = sink.clone();
                 Box::pin(async move {
                     sink.lock().unwrap().push(loaded);
@@ -838,6 +854,7 @@ mod tests {
             seeds_dir: root.join("seeds"),
             node_pipelines: HashMap::new(),
             skip_opts: SkipRunOptions::default(),
+            shadow_config: None,
             sub_runner: default_sub_runner(),
         };
         let id = NodeId::new("seed", "countries");
@@ -937,6 +954,7 @@ mod tests {
             &state_path,
             false,
             &crate::commands::run::SkipRunOptions::default(),
+            None,
         )
         .await
         .expect("run --dag should succeed");
@@ -1035,6 +1053,7 @@ mod tests {
             &root.join(".rocky-state.redb"),
             false,
             &crate::commands::run::SkipRunOptions::default(),
+            None,
         )
         .await
         .expect("run --dag should succeed");

@@ -651,6 +651,9 @@ async fn execute_run_plan(
             state_path,
             output_json,
             &crate::commands::run::SkipRunOptions::default(),
+            // A stored plan carries no shadow routing: `--shadow` / `--branch`
+            // are run-time isolation, never part of a persisted plan's contract.
+            None,
         )
         .await
         .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));

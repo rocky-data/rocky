@@ -2130,6 +2130,12 @@ pub async fn run(
             }
         }
         rocky_core::config::PipelineConfig::Snapshot(s) => {
+            // Snapshot execution does not route its target, so honouring the flag
+            // here is not a matter of passing the config down — the whole
+            // rewrite does not exist for this pipeline kind. Accepting it
+            // silently is what made `--shadow` write production (#1272), so
+            // refuse instead of pretending to isolate.
+            reject_unsupported_shadow(shadow_config, "snapshot")?;
             // Same remote-state session wrapping as the quality arm above: the
             // snapshot run now persists a `RunRecord`, so its terminal upload must
             // ride a session for the reconciler to observe the pipeline's success.
@@ -2197,6 +2203,9 @@ pub async fn run(
         }
         rocky_core::config::PipelineConfig::Replication(_) => {}
         rocky_core::config::PipelineConfig::Load(_) => {
+            // `run_load` writes the configured target directly; nothing rewrites
+            // it for a shadow run. See the snapshot arm above (#1272).
+            reject_unsupported_shadow(shadow_config, "load")?;
             // Delegate to the `rocky load` command, driving with the pipeline's
             // own source_dir/format/target. This lets `rocky run --pipeline X`
             // work uniformly across all pipeline types.
@@ -5744,6 +5753,30 @@ fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<O
              checking how its `format_table_ref` quotes each component"
         ),
     }
+}
+
+/// Refuse `--shadow` / `--branch` on a pipeline kind whose targets are not
+/// routed.
+///
+/// Transformation and replication rewrite their targets for a shadow run;
+/// snapshot and load do not. Accepting the flag on those kinds was not a partial
+/// isolation, it was none at all — the run wrote production exactly as if the
+/// flag had been absent, which is the failure #1272 records. Refusing is the
+/// only honest answer until the routing exists: a user who asked to keep
+/// production untouched must not be told the run succeeded after touching it.
+fn reject_unsupported_shadow(
+    shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    pipeline_kind: &str,
+) -> Result<()> {
+    if shadow_config.is_some() {
+        anyhow::bail!(
+            "--shadow / --branch is not supported for {pipeline_kind} pipelines: their targets \
+             are not rewritten, so the run would write production. Run the {pipeline_kind} \
+             pipeline without the flag, or scope the shadow run to the transformation and \
+             replication pipelines with --pipeline"
+        );
+    }
+    Ok(())
 }
 
 /// Whether this dialect treats identifier case as part of object identity.
