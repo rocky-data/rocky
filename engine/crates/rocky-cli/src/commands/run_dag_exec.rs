@@ -648,6 +648,7 @@ adapter = "default"
     fn dispatcher_with_nodes(
         loaded: Arc<LoadedConfig>,
         skip_opts: SkipRunOptions,
+        shadow_config: Option<rocky_core::shadow::ShadowConfig>,
         recorder: SubRunner,
         n: usize,
     ) -> (CliDispatcher, Vec<NodeId>) {
@@ -666,7 +667,7 @@ adapter = "default"
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
             skip_opts,
-            shadow_config: None,
+            shadow_config,
             sub_runner: recorder,
         };
         (dispatcher, node_ids)
@@ -707,7 +708,7 @@ adapter = "default"
             no_prune: false,
         };
         let (dispatcher, node_ids) =
-            dispatcher_with_nodes(test_loaded_config(), skip_opts, recorder, 1);
+            dispatcher_with_nodes(test_loaded_config(), skip_opts, None, recorder, 1);
 
         // Drive a real pipeline-node dispatch through the production path.
         let fut = dispatcher
@@ -732,6 +733,84 @@ adapter = "default"
         );
     }
 
+    /// #1272 regression: `rocky run --dag --shadow` / `--branch` must reach
+    /// EVERY sub-run. Pre-fix, `default_sub_runner` passed a hardcoded `None`
+    /// into `run()`'s `shadow_config` slot, so the flag was silently dropped at
+    /// the DAG boundary and every node wrote its PRODUCTION target — the run
+    /// reporting success the whole time.
+    ///
+    /// Non-vacuous, and deliberately mirroring
+    /// [`dispatch_passes_the_threaded_skip_opts_to_each_sub_run`], which exists
+    /// to catch a silent drop at this same boundary: a recording [`SubRunner`]
+    /// captures the EXACT `ShadowConfig` each dispatch passes. Reverting the
+    /// dispatch argument to `None` records `None` and fails the first assertion.
+    ///
+    /// The values asserted are deliberately NOT `ShadowConfig::default()` — a
+    /// revert that substituted a default-constructed config rather than `None`
+    /// would still fail on the suffix and the schema override. Three nodes,
+    /// because the drop this guards against was per-node: one node proves the
+    /// argument is wired, three prove no node is served a different value.
+    ///
+    /// (The behavioural end-to-end proof — a `--dag --shadow` run leaving
+    /// production untouched — is the transformation arm's own coverage in
+    /// `run.rs`; this test owns the boundary, which is where the defect was.)
+    #[tokio::test]
+    async fn dispatch_passes_the_threaded_shadow_config_to_each_sub_run() {
+        type RecordedShadow = (Option<String>, Option<rocky_core::shadow::ShadowConfig>);
+        let recorded: Arc<Mutex<Vec<RecordedShadow>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        let recorder: SubRunner = Arc::new(
+            move |_config, _loaded, _state, _pipeline, model_name, _skip_opts, shadow| {
+                let sink = sink.clone();
+                Box::pin(async move {
+                    sink.lock().unwrap().push((model_name, shadow));
+                    Ok(())
+                })
+            },
+        );
+
+        let shadow_config = rocky_core::shadow::ShadowConfig {
+            suffix: "_pr1272_shadow".to_string(),
+            schema_override: Some("isolated_ns".to_string()),
+            cleanup_after: false,
+        };
+        let (dispatcher, node_ids) = dispatcher_with_nodes(
+            test_loaded_config(),
+            SkipRunOptions::default(),
+            Some(shadow_config),
+            recorder,
+            3,
+        );
+
+        for (i, id) in node_ids.iter().enumerate() {
+            let fut = dispatcher
+                .dispatch(id, NodeKind::Transformation, &format!("dim_orders_{i}"))
+                .expect("a pipeline node dispatches a future");
+            fut.await.expect("recorder sub-runner returns Ok");
+        }
+
+        let got = recorded.lock().unwrap();
+        assert_eq!(got.len(), 3, "every node dispatched a sub-run");
+        for (i, (model_name, shadow)) in got.iter().enumerate() {
+            let shadow = shadow.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "node {i} ({model_name:?}) received no shadow config: `--shadow` / `--branch` \
+                     was dropped at the DAG boundary, so this sub-run would write its production \
+                     target"
+                )
+            });
+            assert_eq!(
+                shadow.suffix, "_pr1272_shadow",
+                "node {i} must receive the threaded suffix, not a default-constructed config"
+            );
+            assert_eq!(
+                shadow.schema_override.as_deref(),
+                Some("isolated_ns"),
+                "node {i} must receive the threaded schema override"
+            );
+        }
+    }
+
     /// WP-01 PR-B (#1120): every DAG sub-run receives the SAME
     /// `Arc<LoadedConfig>` instance — an `Arc::clone` of the one snapshot
     /// `run_with_dag` captured, never a per-node reload.
@@ -744,18 +823,24 @@ adapter = "default"
     async fn dispatch_passes_the_same_loaded_config_arc_to_every_sub_run() {
         let recorded: Arc<Mutex<Vec<Arc<LoadedConfig>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = recorded.clone();
-        let recorder: SubRunner =
-            Arc::new(move |_config, loaded, _state, _pipeline, _model, _skip, _shadow| {
+        let recorder: SubRunner = Arc::new(
+            move |_config, loaded, _state, _pipeline, _model, _skip, _shadow| {
                 let sink = sink.clone();
                 Box::pin(async move {
                     sink.lock().unwrap().push(loaded);
                     Ok(())
                 })
-            });
+            },
+        );
 
         let loaded = test_loaded_config();
-        let (dispatcher, node_ids) =
-            dispatcher_with_nodes(Arc::clone(&loaded), SkipRunOptions::default(), recorder, 3);
+        let (dispatcher, node_ids) = dispatcher_with_nodes(
+            Arc::clone(&loaded),
+            SkipRunOptions::default(),
+            None,
+            recorder,
+            3,
+        );
 
         for (i, id) in node_ids.iter().enumerate() {
             let fut = dispatcher
