@@ -472,18 +472,27 @@ struct CteScope {
     aliases: Vec<String>,
     /// Address of each CTE body `Query` → its index in `aliases`.
     body_addr: HashMap<usize, usize>,
-    /// `WITH RECURSIVE`: every alias is visible everywhere in the query,
-    /// including its own body. Broader than SQL, and deliberately preserved.
+    /// `WITH RECURSIVE`: a CTE body additionally sees its OWN alias, so it can
+    /// reference itself. Nothing more — later aliases stay invisible to earlier
+    /// bodies exactly as in the non-recursive case.
     recursive: bool,
     region: Region,
 }
 
 impl CteScope {
     /// The aliases visible at the walk's current position in this query.
+    ///
+    /// `RECURSIVE` adds exactly one alias to a CTE body's scope — its OWN, so it
+    /// can reference itself. It does NOT make later aliases visible to earlier
+    /// bodies, and treating it as if it did is a production read: in
+    /// `WITH RECURSIVE first AS (SELECT * FROM orders), orders AS (…)`, `first`
+    /// reads the physical `orders` (verified against DuckDB), so a rewriter that
+    /// thinks the later CTE shadows it leaves the reference pointing at
+    /// production while the model writes its shadow target.
     fn visible(&self) -> &[String] {
         match self.region {
-            _ if self.recursive => &self.aliases,
             Region::Body => &self.aliases,
+            Region::Cte(i) if self.recursive => &self.aliases[..=i],
             Region::Cte(i) => &self.aliases[..i],
         }
     }
@@ -1199,6 +1208,19 @@ mod tests {
             !out.contains("prod.up"),
             "a recursive CTE shadows its own self-reference: {out}"
         );
+
+        // 5. RECURSIVE does not expose a LATER alias to an EARLIER body.
+        let out = qualify_deferred_refs(
+            "WITH RECURSIVE first AS (SELECT * FROM up), up AS (SELECT 1 AS id) \
+             SELECT * FROM first",
+            &deferred,
+            rules,
+        )
+        .unwrap();
+        assert!(
+            out.contains("FROM prod.up"),
+            "a later recursive alias must not shadow an earlier body's read: {out}"
+        );
     }
 
     /// E2/E3 — `--defer` compares CTE aliases by resolved identity.
@@ -1784,6 +1806,25 @@ mod tests {
         assert!(
             !out.sql.contains("cat.shadow.orders"),
             "a recursive CTE shadows its own self-reference: {}",
+            out.sql
+        );
+
+        // 5. RECURSIVE does NOT make a LATER alias visible to an EARLIER body.
+        //    Verified against DuckDB: `first` here reads the physical `orders`,
+        //    so failing to redirect it reads PRODUCTION during a shadow run.
+        //    An earlier revision exposed every alias throughout a recursive
+        //    query on the theory that over-broad shadowing was harmless; it is
+        //    not, and this is the case that shows it.
+        let out = rewrite_upstream_refs(
+            "WITH RECURSIVE first AS (SELECT * FROM orders), orders AS (SELECT 1 AS id) \
+             SELECT * FROM first",
+            &renames,
+            rules,
+        )
+        .unwrap();
+        assert!(
+            out.sql.contains("FROM cat.shadow.orders"),
+            "a later recursive alias must not shadow an earlier body's upstream read: {}",
             out.sql
         );
     }
