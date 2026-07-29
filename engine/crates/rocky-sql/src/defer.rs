@@ -337,7 +337,7 @@ struct UpstreamRewriter<'a> {
     renames: &'a [(Vec<String>, &'a String, &'a DeferTarget)],
     /// Per-component case semantics for this dialect.
     case_rules: IdentifierCaseRules,
-    scopes: Vec<HashSet<String>>,
+    scopes: Vec<CteScope>,
     rewritten_keys: HashSet<String>,
     ambiguous_refs: Vec<String>,
     case_fold_only_refs: Vec<String>,
@@ -370,19 +370,49 @@ impl UpstreamRewriter<'_> {
     }
 
     fn is_shadowed(&self, name: &str) -> bool {
-        self.scopes.iter().any(|frame| frame.contains(name))
+        self.scopes
+            .iter()
+            .any(|frame| frame.in_scope.contains(name))
     }
+}
+
+/// One query's CTE scope, revealed in declaration order.
+///
+/// A non-recursive CTE is visible to the CTEs declared AFTER it and to the
+/// query body — never to the ones before it. Installing every alias up front
+/// (which this did) makes a later CTE shadow a reference in an earlier CTE's
+/// body, so an upstream read there is left unrewritten and reads PRODUCTION
+/// while the run routes that upstream to a shadow target.
+///
+/// `pending` holds the aliases not yet in scope, in declaration order.
+/// `children_done` counts direct child queries already walked: `with` is
+/// visited before `body`, so the first `pending.len()` of them are exactly the
+/// CTE bodies, and each completion promotes the next alias into `in_scope`.
+/// Later direct children (subqueries in the body) run with the full set, which
+/// is what `while children_done <= pending.len()` preserves.
+#[derive(Default)]
+struct CteScope {
+    in_scope: HashSet<String>,
+    pending: Vec<String>,
+    children_done: usize,
 }
 
 impl VisitorMut for UpstreamRewriter<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        let mut frame: HashSet<String> = HashSet::new();
+        let mut frame = CteScope::default();
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
                 let alias = &cte.alias.name;
-                frame.insert(self.lookup_form(&alias.value, alias.quote_style.is_some()));
+                let name = self.lookup_form(&alias.value, alias.quote_style.is_some());
+                // A RECURSIVE CTE may reference itself, so it is in scope for
+                // its own body; a plain one is not.
+                if with.recursive {
+                    frame.in_scope.insert(name);
+                } else {
+                    frame.pending.push(name);
+                }
             }
         }
         self.scopes.push(frame);
@@ -391,6 +421,16 @@ impl VisitorMut for UpstreamRewriter<'_> {
 
     fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
         self.scopes.pop();
+        // This query was a direct child of its parent. If it was one of the
+        // parent's CTE bodies, the alias it defines becomes visible to whatever
+        // the parent walks next.
+        if let Some(parent) = self.scopes.last_mut() {
+            parent.children_done += 1;
+            if parent.children_done <= parent.pending.len() {
+                let name = parent.pending[parent.children_done - 1].clone();
+                parent.in_scope.insert(name);
+            }
+        }
         ControlFlow::Continue(())
     }
 
@@ -1246,6 +1286,84 @@ mod tests {
         assert_eq!(
             out.sql, "WITH Orders AS (SELECT 1 AS id) SELECT * FROM cat.shadow.orders",
             "a distinct CTE name must not shadow an exactly-matching reference"
+        );
+    }
+
+    /// CTE visibility is positional: a CTE is in scope for the CTEs declared
+    /// AFTER it and for the query body, never for the ones before it.
+    ///
+    /// Installing every alias up front made a later CTE shadow a reference in an
+    /// earlier CTE's body, so an upstream read there was left unrewritten and
+    /// read PRODUCTION while the run routed that upstream to a shadow target —
+    /// an isolation break that exits 0.
+    ///
+    /// Measured before the fix, on a case-insensitive dialect:
+    ///   WITH first AS (SELECT * FROM orders), Orders AS (…) SELECT * FROM first
+    ///   -> `FROM orders` left as-is, rewritten_keys empty
+    ///
+    /// The four positions below are the whole contract. Mutation: promoting
+    /// every alias in `pre_visit_query` instead of on child completion fails
+    /// the first case; never promoting fails the second and third.
+    #[test]
+    fn cte_visibility_is_positional() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "shadow", "orders"))]);
+        let rules = IdentifierCaseRules::all_insensitive();
+
+        // 1. Earlier CTE body, later CTE of the same name: NOT shadowed, so the
+        //    upstream read is redirected.
+        let out = rewrite_upstream_refs(
+            "WITH first AS (SELECT * FROM orders), Orders AS (SELECT 1 AS id) \
+             SELECT * FROM first",
+            &renames,
+            rules,
+        )
+        .unwrap();
+        assert!(
+            out.sql.contains("FROM cat.shadow.orders"),
+            "a later CTE must not shadow an earlier body's upstream read: {}",
+            out.sql
+        );
+        assert!(out.rewritten_keys.contains("cat.raw.orders"));
+
+        // 2. Later CTE body referencing an EARLIER CTE: shadowed.
+        let out = rewrite_upstream_refs(
+            "WITH orders AS (SELECT 1 AS id), second AS (SELECT * FROM orders) \
+             SELECT * FROM second",
+            &renames,
+            rules,
+        )
+        .unwrap();
+        assert!(
+            !out.sql.contains("cat.shadow.orders"),
+            "an earlier CTE must shadow a later body's reference: {}",
+            out.sql
+        );
+
+        // 3. Query body referencing a CTE declared anywhere: shadowed.
+        let out = rewrite_upstream_refs(
+            "WITH a AS (SELECT 1 AS id), orders AS (SELECT 2 AS id) SELECT * FROM orders",
+            &renames,
+            rules,
+        )
+        .unwrap();
+        assert!(
+            !out.sql.contains("cat.shadow.orders"),
+            "the body sees every CTE: {}",
+            out.sql
+        );
+
+        // 4. RECURSIVE: a CTE is in scope for its OWN body.
+        let out = rewrite_upstream_refs(
+            "WITH RECURSIVE orders AS (SELECT 1 AS id UNION ALL SELECT id FROM orders) \
+             SELECT * FROM orders",
+            &renames,
+            rules,
+        )
+        .unwrap();
+        assert!(
+            !out.sql.contains("cat.shadow.orders"),
+            "a recursive CTE shadows its own self-reference: {}",
+            out.sql
         );
     }
 
