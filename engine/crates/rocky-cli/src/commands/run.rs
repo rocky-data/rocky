@@ -5762,7 +5762,7 @@ fn apply_defer_rewrite(
 /// Each value below is read off that dialect's `format_table_ref`, which is
 /// in-repo and checkable. This function deliberately does not reason about how
 /// any warehouse folds identifier case — that is a separate question answered by
-/// [`dialect_case_sensitive_identity`], and conflating the two is what made an
+/// [`dialect_case_rules`], and conflating the two is what made an
 /// earlier revision of this code wrong.
 ///
 /// Unknown dialects fail closed. A new adapter that quotes its targets would
@@ -5824,12 +5824,11 @@ fn reject_unsupported_shadow(
 /// only where case is part of identity can two targets differing by case be
 /// two different objects that a rewrite could confuse.
 ///
-/// This answers one narrow question: can two configured targets that differ
-/// only by case be two different objects? It is NOT a specification of how a
-/// reference should be compared per component, and must not be used as one — a
-/// warehouse may well apply different rules to the catalog than to the schema
-/// and table. Making `rewrite_upstream_refs` case-aware therefore needs
-/// per-component semantics, established per dialect, rather than this boolean.
+/// Returned per component. No supported dialect actually distinguishes its
+/// components today — each of the five is uniform — but the shape is not
+/// decoration: BigQuery's `is_case_insensitive` is a per-DATASET flag, so the
+/// divergence that exists in the wild is finer-grained than a dialect, and a
+/// boolean here would have to be widened the moment Rocky could observe it.
 ///
 /// Each entry is taken from the warehouse's own documentation, not inferred
 /// from how Rocky renders a target — rendering and identity are independent, and
@@ -5840,7 +5839,10 @@ fn reject_unsupported_shadow(
 /// Re-confirm against the vendor when adding a dialect.
 ///
 /// Unknown dialects fail closed.
-fn dialect_case_sensitive_identity(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<bool> {
+fn dialect_case_rules(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> Result<rocky_sql::defer::IdentifierCaseRules> {
+    let uniform = rocky_sql::defer::IdentifierCaseRules::uniform;
     match dialect.name() {
         // Two targets differing only by case name one object.
         //
@@ -5852,7 +5854,7 @@ fn dialect_case_sensitive_identity(dialect: &dyn rocky_core::traits::SqlDialect)
         // docs.databricks.com/aws/en/sql/language-manual/sql-ref-identifiers
         // Trino: "Identifiers are not treated as case sensitive" —
         // trino.io/docs/current/language/reserved.html
-        "duckdb" | "databricks" | "trino" => Ok(false),
+        "duckdb" | "databricks" | "trino" => Ok(uniform(false)),
         // Two targets differing only by case can name two objects.
         //
         // BigQuery: dataset and table names are case-sensitive by default, so
@@ -5865,12 +5867,12 @@ fn dialect_case_sensitive_identity(dialect: &dyn rocky_core::traits::SqlDialect)
         //
         // Both opt-outs would only ever make a rejected run acceptable, never
         // the reverse, so assuming the default is the fail-closed choice.
-        "bigquery" | "snowflake" => Ok(true),
+        "bigquery" | "snowflake" => Ok(uniform(true)),
         other => anyhow::bail!(
             "shadow/branch execution does not know whether '{other}' treats identifier case as \
              part of object identity, so it cannot tell whether two targets differing only by \
              case name one object or two. Add '{other}' to \
-             `dialect_case_sensitive_identity` after checking how it folds identifiers"
+             `dialect_case_rules` after checking how it folds identifiers"
         ),
     }
 }
@@ -5896,8 +5898,34 @@ fn apply_shadow_rewrite(
         model_name_filter.is_none_or(|selected| selected == name)
             && model_set.is_none_or(|set| set.contains(name))
     };
+    // Object identity for this dialect, per component.
+    //
+    // This was unconditionally lowercased, which is the defect the case guard
+    // below used to paper over: on a dialect where case IS identity, two models
+    // whose targets differ only by case folded to ONE key, so one model's route
+    // silently displaced the other's in `renames` and `owner_by_key` and its
+    // reads were redirected to the wrong shadow target. Folding only where the
+    // dialect actually folds keeps them distinct.
+    //
+    // Used for every keyed comparison here — production-target collisions,
+    // shadow-target ownership, and the rename keys handed to the matcher — so
+    // all of them share one notion of "the same object", and `rewritten_keys`
+    // comes back in the same key space `owner_by_key` is built in.
+    let case_rules = dialect_case_rules(dialect)?;
     let target_identity = |catalog: &str, schema: &str, table: &str| {
-        format!("{catalog}.{schema}.{table}").to_ascii_lowercase()
+        let component = |value: &str, sensitive: bool| {
+            if sensitive {
+                value.to_string()
+            } else {
+                value.to_ascii_lowercase()
+            }
+        };
+        format!(
+            "{}.{}.{}",
+            component(catalog, case_rules.catalog),
+            component(schema, case_rules.schema),
+            component(table, case_rules.table),
+        )
     };
 
     let quote_style = rewrite_quote_style(dialect)?;
@@ -6047,78 +6075,19 @@ fn apply_shadow_rewrite(
         );
     }
 
-    // Target identity is case-folded, and so is the tail match inside
-    // `rewrite_upstream_refs`. Where the dialect makes case part of object
-    // identity that is a lossy key: `"Orders"` and `"orders"` are two distinct
-    // Snowflake tables that fold to one identity, so a read of one could be
-    // redirected to the other's shadow. Keyed on that declared property rather
-    // than on whether the dialect quotes — the two are independent, and reading
-    // one off the other would go quiet on a case-sensitive dialect that renders
-    // bare identifiers.
-    //
-    // The risk exists only where a rename is actually applied. A model's own
-    // identity is excluded from its rename set, so a run that routes a single
-    // model rewrites nothing at all and cannot misdirect anything however its
-    // target is spelled — rejecting that would fail a provably safe
-    // `--model` run. Below two routed models the check is therefore skipped
-    // entirely. Above it, the trigger is a routed model, while the collision
-    // partner is drawn from every compiled model: a read of an unselected
-    // `"Orders"` still tail-matches the rename key of a selected `"orders"`.
-    if dialect_case_sensitive_identity(dialect)? && routes.len() > 1 {
-        let mut folded: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        for model in &compile_result.project.models {
-            let exact = format!(
-                "{}.{}.{}",
-                model.config.target.catalog, model.config.target.schema, model.config.target.table
-            );
-            folded
-                .entry(exact.to_ascii_lowercase())
-                .or_default()
-                .push((exact, model.config.name.clone()));
-        }
-        for model in &compile_result.project.models {
-            if !routes.contains_key(&model.config.name) {
-                continue;
-            }
-            let exact = format!(
-                "{}.{}.{}",
-                model.config.target.catalog, model.config.target.schema, model.config.target.table
-            );
-            let Some(group) = folded.get(&exact.to_ascii_lowercase()) else {
-                continue;
-            };
-            // Any other spelling of the same folded name is a different object
-            // on this dialect, and the rename matches case-insensitively, so a
-            // read of either could land on this model's shadow. Refuse.
-            //
-            // Deliberately unconditional on whether some model actually spells
-            // such a read today. Earlier revisions tried to require that
-            // evidence and it was wrong four times over — a scan of the SQL text
-            // cannot tell a table reference from a column, alias, literal or
-            // comment of the same name, and reconstructing the matcher's
-            // resolution from outside the matcher is what kept failing. The
-            // durable fix is to make `rewrite_upstream_refs` case-sensitive when
-            // the dialect quotes identifiers, after which this guard can go
-            // entirely; until then this errs toward refusing a run the operator
-            // can unblock by renaming, rather than silently reading the wrong
-            // table.
-            if let Some((other_exact, other_model)) =
-                group.iter().find(|(candidate, _)| *candidate != exact)
-            {
-                anyhow::bail!(
-                    "shadow/branch execution cannot distinguish the targets of models '{}' \
-                     ('{}') and '{}' ('{}'): they differ only by case, which this dialect \
-                     treats as two different objects, while upstream references are matched \
-                     case-insensitively. Rename one target so the two differ by more than \
-                     case, or scope the run so it routes only one of them",
-                    other_model,
-                    other_exact,
-                    model.config.name,
-                    exact,
-                );
-            }
-        }
-    }
+    // NOTE: a whole-run refusal used to sit here. On a case-sensitive dialect
+    // it rejected any run routing two models whose configured targets differed
+    // only by case, because the rename keys were folded together and the matcher
+    // compared case-insensitively — so a read of either could land on the wrong
+    // model's shadow. Both halves of that are now fixed at their source:
+    // `target_identity` above folds only where the dialect folds, so the two
+    // targets stay distinct keys, and `rewrite_upstream_refs` disambiguates a
+    // reference that folds onto several keys by its own spelling. The guard's
+    // own comment named this as the durable fix — "reconstructing the matcher's
+    // resolution from outside the matcher is what kept failing" — and with the
+    // resolution done inside the matcher, a run that is provably safe now
+    // succeeds instead of being refused, while a genuinely ambiguous REFERENCE
+    // still fails closed via `ambiguous_refs`.
 
     // Reverse index of the rename keys, so a key that `rewrite_upstream_refs`
     // reports as rewritten can be mapped back to the model that produces it.
@@ -6161,7 +6130,7 @@ fn apply_shadow_rewrite(
             .map(|(_, route)| route.clone())
             .collect();
         if !renames.is_empty() {
-            let outcome = rocky_sql::defer::rewrite_upstream_refs(&model.sql, &renames)
+            let outcome = rocky_sql::defer::rewrite_upstream_refs(&model.sql, &renames, case_rules)
                 .with_context(|| {
                     format!(
                         "shadow mode could not rewrite upstream references in model '{}'",
@@ -16998,13 +16967,15 @@ timestamp_column = "ts"
         );
     }
 
-    /// A folded name can be shared by three or more targets. Evidence for one
-    /// colliding spelling says nothing about another, so the guard has to weigh
-    /// every partner: here the first one it meets has no ambiguous read and the
-    /// second one does.
-    #[cfg(feature = "duckdb")]
+    /// Several targets fold onto one identity; routing resolves by exact case.
+    ///
+    /// This replaces a whole-run refusal. `driver` reads `main.Orders`, which is
+    /// `z_table_variant`'s target — not `lower`'s. On Snowflake those are two
+    /// objects, so the read is left alone and the run proceeds, where the old
+    /// guard rejected it outright. The misdirection it was protecting against is
+    /// now impossible: the matcher compares case per component.
     #[test]
-    fn shadow_rejects_a_later_case_collision_partner() {
+    fn shadow_routes_by_exact_case_with_several_folding_partners() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
@@ -17044,7 +17015,7 @@ timestamp_column = "ts"
             ["driver".to_string(), "lower".to_string()]
                 .into_iter()
                 .collect();
-        let err = super::apply_shadow_rewrite(
+        super::apply_shadow_rewrite(
             &mut compiled,
             None,
             Some(&selected),
@@ -17052,10 +17023,29 @@ timestamp_column = "ts"
             &rocky_snowflake::dialect::SnowflakeSqlDialect,
             false,
         )
-        .expect_err("a colliding partner beyond the first must still be rejected");
+        .expect("a read that names a different object is simply not redirected");
+
+        let model = |n: &str| {
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == n)
+                .expect("model present")
+        };
+        // The routed model's own target IS isolated.
+        assert_eq!(
+            model("lower").config.target.table,
+            "orders_rocky_shadow",
+            "the selected model is routed to its shadow"
+        );
+        // The driver's read keeps its own spelling: on Snowflake it names a
+        // different object than `lower`'s target, so redirecting it would read a
+        // table it never referenced.
+        let driver_sql = &model("driver").sql;
         assert!(
-            format!("{err:#}").contains("differ only by case"),
-            "error must explain the collision: {err:#}"
+            !driver_sql.contains("orders_rocky_shadow"),
+            "a differently-cased read must not be redirected: {driver_sql}"
         );
     }
 
@@ -17112,13 +17102,9 @@ timestamp_column = "ts"
         }
     }
 
-    /// A case collision can sit in the schema or catalog rather than the table.
-    /// `Main.orders` and `main.orders` spell the table identically, so evidence
-    /// keyed on the table alone would find nothing and let the ambiguous read
-    /// through.
-    #[cfg(feature = "duckdb")]
+    /// Same, with the divergence in the SCHEMA component rather than the table.
     #[test]
-    fn shadow_rejects_case_collision_in_the_schema_component() {
+    fn shadow_routes_by_exact_case_in_the_schema_component() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
@@ -17142,7 +17128,7 @@ timestamp_column = "ts"
             ["driver".to_string(), "lower".to_string()]
                 .into_iter()
                 .collect();
-        let err = super::apply_shadow_rewrite(
+        super::apply_shadow_rewrite(
             &mut compiled,
             None,
             Some(&selected),
@@ -17150,10 +17136,29 @@ timestamp_column = "ts"
             &rocky_snowflake::dialect::SnowflakeSqlDialect,
             false,
         )
-        .expect_err("a schema-only case collision must be rejected too");
+        .expect("a read that names a different object is simply not redirected");
+
+        let model = |n: &str| {
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == n)
+                .expect("model present")
+        };
+        // The routed model's own target IS isolated.
+        assert_eq!(
+            model("lower").config.target.table,
+            "orders_rocky_shadow",
+            "the selected model is routed to its shadow"
+        );
+        // The driver's read keeps its own spelling: on Snowflake it names a
+        // different object than `lower`'s target, so redirecting it would read a
+        // table it never referenced.
+        let driver_sql = &model("driver").sql;
         assert!(
-            format!("{err:#}").contains("differ only by case"),
-            "error must explain the collision: {err:#}"
+            !driver_sql.contains("orders_rocky_shadow"),
+            "a differently-cased read must not be redirected: {driver_sql}"
         );
     }
 
@@ -17201,15 +17206,13 @@ timestamp_column = "ts"
         assert_eq!(picked.config.target.table, "picked_rocky_shadow");
     }
 
-    /// A routed model whose target case-collides with an UNSELECTED model is the
-    /// gap the shadow-owner check cannot see: the unselected model is never
-    /// routed, so no shared shadow target exists, yet a read of its target still
-    /// folds onto the routed model's rename key and would be redirected to that
-    /// model's shadow. Needs two routed models, because a single one applies no
-    /// renames at all.
-    #[cfg(feature = "duckdb")]
+    /// A read of an UNSELECTED model's target, spelled its way, is not captured
+    /// by a selected model whose target folds onto the same identity.
+    ///
+    /// This is the misdirection the deleted guard existed to prevent, and it is
+    /// now prevented at the matcher instead of by refusing the run.
     #[test]
-    fn shadow_rejects_case_collision_between_routed_and_unselected_targets() {
+    fn shadow_does_not_redirect_a_read_of_an_unselected_case_variant() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
@@ -17236,7 +17239,7 @@ timestamp_column = "ts"
             ["driver".to_string(), "lower".to_string()]
                 .into_iter()
                 .collect();
-        let err = super::apply_shadow_rewrite(
+        super::apply_shadow_rewrite(
             &mut compiled,
             None,
             Some(&selected),
@@ -17244,10 +17247,29 @@ timestamp_column = "ts"
             &rocky_snowflake::dialect::SnowflakeSqlDialect,
             false,
         )
-        .expect_err("a routed target colliding by case with an unselected one must be rejected");
+        .expect("a read that names a different object is simply not redirected");
+
+        let model = |n: &str| {
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == n)
+                .expect("model present")
+        };
+        // The routed model's own target IS isolated.
+        assert_eq!(
+            model("lower").config.target.table,
+            "orders_rocky_shadow",
+            "the selected model is routed to its shadow"
+        );
+        // The driver's read keeps its own spelling: on Snowflake it names a
+        // different object than `lower`'s target, so redirecting it would read a
+        // table it never referenced.
+        let driver_sql = &model("driver").sql;
         assert!(
-            format!("{err:#}").contains("differ only by case"),
-            "error must explain the collision: {err:#}"
+            !driver_sql.contains("orders_rocky_shadow"),
+            "a differently-cased read must not be redirected: {driver_sql}"
         );
     }
 

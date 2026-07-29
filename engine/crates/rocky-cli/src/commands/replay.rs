@@ -1707,7 +1707,16 @@ async fn replay_execute_warehouse_node(
                 },
             );
         }
-        let outcome = match rocky_sql::defer::rewrite_upstream_refs(&cand.ir.sql, &renames) {
+        let outcome = match rocky_sql::defer::rewrite_upstream_refs(
+            &cand.ir.sql,
+            &renames,
+            // Recorded upstream keys are lowercased above, so nothing here can
+            // be separated by case; matching stays exactly as permissive as it
+            // has always been. Replay also requires EVERY key to match, so any
+            // strictness increase would refuse replayable runs rather than
+            // silently miss one.
+            rocky_sql::defer::IdentifierCaseRules::all_insensitive(),
+        ) {
             Ok(outcome) => outcome,
             Err(e) => {
                 return non_replayable_exec(

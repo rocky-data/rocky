@@ -124,6 +124,96 @@ pub fn qualify_deferred_refs(
     Ok(statement.to_string())
 }
 
+/// Whether each component of a qualified name carries case as part of object
+/// identity on the dialect a rewrite is being performed for.
+///
+/// [`rewrite_upstream_refs`] compares each component of a reference against each
+/// rename key under the rule for that component: exactly where case is part of
+/// identity, case-insensitively where it is not.
+///
+/// Comparing case-insensitively everywhere — as this matcher used to — is not
+/// merely imprecise, it redirects reads to the wrong table. On a case-sensitive
+/// dialect `raw.Orders` and `raw.orders` are two different objects, so a model
+/// reading the first must not be rewritten to the replacement registered for the
+/// second. Conversely, comparing exactly on a dialect that folds would strand
+/// references that legitimately name the renamed object.
+///
+/// Per component rather than one boolean because a warehouse may apply different
+/// rules to the catalog than to the schema and table. **No dialect Rocky
+/// supports exercises that today** — duckdb, databricks and trino are uniformly
+/// case-insensitive, bigquery and snowflake uniformly case-sensitive. The shape
+/// is kept because the one live divergence is per-object, not per-dialect:
+/// BigQuery datasets carry an `is_case_insensitive` flag that Rocky cannot
+/// observe and must assume unset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdentifierCaseRules {
+    /// Case distinguishes two catalogs.
+    pub catalog: bool,
+    /// Case distinguishes two schemas.
+    pub schema: bool,
+    /// Case distinguishes two tables.
+    pub table: bool,
+}
+
+impl IdentifierCaseRules {
+    /// Every component case-insensitive: two spellings differing only by case
+    /// name one object. Callers whose rename keys are already case-folded want
+    /// this — disambiguation can never separate keys that were folded together.
+    #[must_use]
+    pub const fn all_insensitive() -> Self {
+        Self {
+            catalog: false,
+            schema: false,
+            table: false,
+        }
+    }
+
+    /// The same rule for every component, which is what all five in-repo
+    /// dialects need.
+    #[must_use]
+    pub const fn uniform(case_sensitive: bool) -> Self {
+        Self {
+            catalog: case_sensitive,
+            schema: case_sensitive,
+            table: case_sensitive,
+        }
+    }
+
+    /// The rule for the component at `index` of a `catalog.schema.table` key.
+    const fn at(self, index: usize) -> bool {
+        match index {
+            0 => self.catalog,
+            1 => self.schema,
+            _ => self.table,
+        }
+    }
+}
+
+/// Whether `spelled` matches the tail of `key_exact`, comparing each component
+/// case-sensitively only where `rules` says case is part of identity.
+///
+/// Alignment is by tail, so a two-part reference is compared against the key's
+/// schema and table — and therefore against the *schema* and *table* rules, not
+/// the catalog's.
+fn tail_matches_with_case(
+    key_exact: &[String],
+    spelled: &[&str],
+    rules: IdentifierCaseRules,
+) -> bool {
+    if key_exact.len() < spelled.len() {
+        return false;
+    }
+    let offset = key_exact.len() - spelled.len();
+    spelled.iter().enumerate().all(|(i, part)| {
+        let key_part = &key_exact[offset + i];
+        if rules.at(offset + i) {
+            key_part.as_str() == *part
+        } else {
+            key_part.eq_ignore_ascii_case(part)
+        }
+    })
+}
+
 /// Outcome of [`rewrite_upstream_refs`].
 #[derive(Debug)]
 pub struct UpstreamRewriteOutcome {
@@ -144,9 +234,11 @@ pub struct UpstreamRewriteOutcome {
 /// Rewrite references to known upstream tables — bare, `schema.table`, or
 /// `catalog.schema.table` — to a replacement [`DeferTarget`].
 ///
-/// `renames` is keyed by the upstream's lowercase fully-qualified
-/// `catalog.schema.table` identity. A relation matches a key when every part
-/// it *does* spell agrees case-insensitively with the key's tail: a three-part
+/// `renames` is keyed by the upstream's fully-qualified `catalog.schema.table`
+/// identity, spelled as the dialect stores it — callers on a case-sensitive
+/// dialect must NOT pre-fold their keys, or two distinct objects collapse into
+/// one entry. A relation matches a key when every part it *does* spell agrees
+/// with the key's tail under `case_rules`: a three-part
 /// reference must match catalog, schema, and table; a two-part reference
 /// schema and table; a bare name just the table (subject to CTE shadowing,
 /// exactly as [`qualify_deferred_refs`] resolves it). A relation whose tail
@@ -160,20 +252,24 @@ pub struct UpstreamRewriteOutcome {
 pub fn rewrite_upstream_refs(
     sql: &str,
     renames: &HashMap<String, DeferTarget>,
+    case_rules: IdentifierCaseRules,
 ) -> Result<UpstreamRewriteOutcome, ParseError> {
     let mut statement = parse_single_statement(sql)?;
 
-    // Pre-split each rename key into (catalog, schema, table) parts once.
+    // Pre-split each rename key into its (catalog, schema, table) parts once,
+    // preserving case — the comparison below decides per component whether case
+    // matters.
     let split: Vec<(Vec<String>, &String, &DeferTarget)> = renames
         .iter()
         .map(|(key, target)| {
-            let parts: Vec<String> = key.split('.').map(str::to_ascii_lowercase).collect();
-            (parts, key, target)
+            let exact: Vec<String> = key.split('.').map(str::to_string).collect();
+            (exact, key, target)
         })
         .collect();
 
     let mut rewriter = UpstreamRewriter {
         renames: &split,
+        case_rules,
         scopes: Vec::new(),
         rewritten_keys: HashSet::new(),
         ambiguous_refs: Vec::new(),
@@ -196,8 +292,10 @@ pub fn rewrite_upstream_refs(
 /// shadowing discipline with [`DeferRewriter`]: a bare name shadowed by a CTE
 /// in scope is a reference to that CTE, never to the upstream.
 struct UpstreamRewriter<'a> {
-    /// `(key parts, original key, replacement)` triples, key parts lowercase.
+    /// `(key parts, original key, replacement)` triples, key parts as spelled.
     renames: &'a [(Vec<String>, &'a String, &'a DeferTarget)],
+    /// Per-component case semantics for this dialect.
+    case_rules: IdentifierCaseRules,
     scopes: Vec<HashSet<String>>,
     rewritten_keys: HashSet<String>,
     ambiguous_refs: Vec<String>,
@@ -245,22 +343,30 @@ impl VisitorMut for UpstreamRewriter<'_> {
         if original.len() == 1 && self.is_shadowed(original[0]) {
             return ControlFlow::Continue(());
         }
-        let spelled: Vec<String> = original.iter().map(|p| p.to_ascii_lowercase()).collect();
-        // Tail-match the spelled parts against each rename key.
-        let matches: Vec<&(Vec<String>, &String, &DeferTarget)> = self
+        // Tail-match each rename key, comparing every component under the
+        // dialect's own rule for that component. Where case is part of identity
+        // this is an exact comparison, because `raw.Orders` and `raw.orders` are
+        // then two DIFFERENT objects and redirecting a read of one to the
+        // other's replacement would silently read the wrong table. Where it is
+        // not, the comparison folds, exactly as it always has.
+        let candidates: Vec<&(Vec<String>, &String, &DeferTarget)> = self
             .renames
             .iter()
-            .filter(|(key_parts, _, _)| {
-                key_parts.len() >= spelled.len()
-                    && key_parts[key_parts.len() - spelled.len()..] == spelled[..]
+            .filter(|(key_exact, _, _)| {
+                tail_matches_with_case(key_exact, &original, self.case_rules)
             })
             .collect();
-        match matches.as_slice() {
+        match candidates.as_slice() {
             [] => {}
             [(_, key, target)] => {
                 *relation = target.to_object_name();
                 self.rewritten_keys.insert((*key).clone());
             }
+            // Several upstreams are indistinguishable from this reference under
+            // the dialect's own rules, so it genuinely names more than one of
+            // them. Refuse this REFERENCE — which is what lets the caller drop
+            // the whole-run refusal it used to need, since the ambiguity is now
+            // resolved where the resolution actually happens.
             _ => self.ambiguous_refs.push(relation.to_string()),
         }
         ControlFlow::Continue(())
@@ -609,7 +715,12 @@ mod tests {
     #[test]
     fn rewrites_fully_qualified_ref() {
         let renames = renames_map(&[("cat.raw.orders", target("cat", "replay_ns", "raw__orders"))]);
-        let out = rewrite_upstream_refs("SELECT * FROM cat.raw.orders", &renames).unwrap();
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM cat.raw.orders",
+            &renames,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert_eq!(out.sql, "SELECT * FROM cat.replay_ns.raw__orders");
         assert!(out.rewritten_keys.contains("cat.raw.orders"));
         assert!(out.ambiguous_refs.is_empty());
@@ -618,9 +729,19 @@ mod tests {
     #[test]
     fn rewrites_two_part_and_bare_tails() {
         let renames = renames_map(&[("cat.raw.orders", target("cat", "replay_ns", "raw__orders"))]);
-        let two = rewrite_upstream_refs("SELECT * FROM raw.orders", &renames).unwrap();
+        let two = rewrite_upstream_refs(
+            "SELECT * FROM raw.orders",
+            &renames,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert_eq!(two.sql, "SELECT * FROM cat.replay_ns.raw__orders");
-        let bare = rewrite_upstream_refs("SELECT * FROM orders", &renames).unwrap();
+        let bare = rewrite_upstream_refs(
+            "SELECT * FROM orders",
+            &renames,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert_eq!(bare.sql, "SELECT * FROM cat.replay_ns.raw__orders");
         assert!(bare.rewritten_keys.contains("cat.raw.orders"));
     }
@@ -628,7 +749,12 @@ mod tests {
     #[test]
     fn matches_case_insensitively() {
         let renames = renames_map(&[("cat.raw.orders", target("cat", "replay_ns", "raw__orders"))]);
-        let out = rewrite_upstream_refs("SELECT * FROM CAT.Raw.ORDERS", &renames).unwrap();
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM CAT.Raw.ORDERS",
+            &renames,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert_eq!(out.sql, "SELECT * FROM cat.replay_ns.raw__orders");
     }
 
@@ -643,12 +769,22 @@ mod tests {
                 target("cat", "replay_ns", "staging__orders"),
             ),
         ]);
-        let out = rewrite_upstream_refs("SELECT * FROM orders", &renames).unwrap();
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM orders",
+            &renames,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert_eq!(out.sql, "SELECT * FROM orders", "ambiguous ref untouched");
         assert!(out.rewritten_keys.is_empty());
         assert_eq!(out.ambiguous_refs, vec!["orders".to_string()]);
         // A fully qualified reference disambiguates.
-        let fq = rewrite_upstream_refs("SELECT * FROM cat.staging.orders", &renames).unwrap();
+        let fq = rewrite_upstream_refs(
+            "SELECT * FROM cat.staging.orders",
+            &renames,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert_eq!(fq.sql, "SELECT * FROM cat.replay_ns.staging__orders");
         assert!(fq.ambiguous_refs.is_empty());
     }
@@ -659,6 +795,7 @@ mod tests {
         let out = rewrite_upstream_refs(
             "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
             &renames,
+            IdentifierCaseRules::all_insensitive(),
         )
         .unwrap();
         assert!(
@@ -672,9 +809,188 @@ mod tests {
     #[test]
     fn unmatched_key_reported_via_rewritten_keys_absence() {
         let renames = renames_map(&[("cat.raw.orders", target("cat", "replay_ns", "raw__orders"))]);
-        let out = rewrite_upstream_refs("SELECT * FROM cat.raw.customers", &renames).unwrap();
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM cat.raw.customers",
+            &renames,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert!(out.rewritten_keys.is_empty());
         assert_eq!(out.sql, "SELECT * FROM cat.raw.customers");
+    }
+
+    // -- case-aware disambiguation ------------------------------------------
+
+    /// Case-INsensitive dialect: any spelling reaches the one upstream.
+    #[test]
+    fn a_folding_dialect_matches_every_spelling() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "shadow", "orders"))]);
+        for spelling in ["Orders", "raw.ORDERS", "CAT.Raw.Orders"] {
+            let out = rewrite_upstream_refs(
+                &format!("SELECT * FROM {spelling}"),
+                &renames,
+                IdentifierCaseRules::all_insensitive(),
+            )
+            .unwrap();
+            assert_eq!(
+                out.sql, "SELECT * FROM cat.shadow.orders",
+                "case-insensitive dialect must still match {spelling}"
+            );
+        }
+    }
+
+    /// Case-SENSITIVE dialect: a differently-cased reference names a DIFFERENT
+    /// object, so it must be left alone.
+    ///
+    /// This is the correction that the `apply_shadow_rewrite` guard tests forced.
+    /// An earlier revision of this matcher gathered candidates by folding and
+    /// only compared case when several matched — which meant a lone key
+    /// `raw.orders` captured a read of `raw.Orders`, redirecting it to a table it
+    /// never named. Matching on identity, not resemblance, is the whole point.
+    #[test]
+    fn a_case_sensitive_dialect_leaves_a_differently_cased_reference_alone() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "shadow", "orders"))]);
+        for spelling in ["cat.raw.Orders", "raw.ORDERS", "Orders"] {
+            let out = rewrite_upstream_refs(
+                &format!("SELECT * FROM {spelling}"),
+                &renames,
+                IdentifierCaseRules::uniform(true),
+            )
+            .unwrap();
+            assert_eq!(
+                out.sql,
+                format!("SELECT * FROM {spelling}"),
+                "{spelling} names a different object than cat.raw.orders"
+            );
+            assert!(out.rewritten_keys.is_empty());
+            assert!(
+                out.ambiguous_refs.is_empty(),
+                "not ambiguous — simply not a match"
+            );
+        }
+        // The exact spelling still matches.
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM cat.raw.orders",
+            &renames,
+            IdentifierCaseRules::uniform(true),
+        )
+        .unwrap();
+        assert_eq!(out.sql, "SELECT * FROM cat.shadow.orders");
+    }
+
+    /// Two upstreams differing only by case are two objects on a case-sensitive
+    /// dialect. The reference's own spelling picks one.
+    ///
+    /// This is the case that used to force `apply_shadow_rewrite` to refuse the
+    /// entire run. Resolving it here is what allows that guard to be deleted.
+    #[test]
+    fn case_separates_two_keys_that_fold_together() {
+        let renames = renames_map(&[
+            ("cat.raw.Orders", target("cat", "shadow", "upper__orders")),
+            ("cat.raw.orders", target("cat", "shadow", "lower__orders")),
+        ]);
+        let rules = IdentifierCaseRules::uniform(true);
+
+        let upper = rewrite_upstream_refs("SELECT * FROM cat.raw.Orders", &renames, rules).unwrap();
+        assert_eq!(upper.sql, "SELECT * FROM cat.shadow.upper__orders");
+        assert!(upper.rewritten_keys.contains("cat.raw.Orders"));
+        assert!(upper.ambiguous_refs.is_empty());
+
+        let lower = rewrite_upstream_refs("SELECT * FROM cat.raw.orders", &renames, rules).unwrap();
+        assert_eq!(lower.sql, "SELECT * FROM cat.shadow.lower__orders");
+        assert!(lower.rewritten_keys.contains("cat.raw.orders"));
+        assert!(lower.ambiguous_refs.is_empty());
+    }
+
+    /// A third spelling matches neither key, so it names neither object and is
+    /// left as parsed. Not ambiguous — unmatched.
+    #[test]
+    fn a_third_spelling_matches_neither_key() {
+        let renames = renames_map(&[
+            ("cat.raw.Orders", target("cat", "shadow", "upper__orders")),
+            ("cat.raw.orders", target("cat", "shadow", "lower__orders")),
+        ]);
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM cat.raw.ORDERS",
+            &renames,
+            IdentifierCaseRules::uniform(true),
+        )
+        .unwrap();
+        assert_eq!(out.sql, "SELECT * FROM cat.raw.ORDERS", "left as parsed");
+        assert!(out.rewritten_keys.is_empty());
+        assert!(out.ambiguous_refs.is_empty());
+    }
+
+    /// On a case-INsensitive dialect the same two keys name ONE object, so no
+    /// spelling can separate them and every reference is ambiguous. The caller's
+    /// duplicate-target checks are what should catch this first; the matcher
+    /// still refuses rather than guessing.
+    #[test]
+    fn folding_keys_stay_ambiguous_on_a_case_insensitive_dialect() {
+        let renames = renames_map(&[
+            ("cat.raw.Orders", target("cat", "shadow", "upper__orders")),
+            ("cat.raw.orders", target("cat", "shadow", "lower__orders")),
+        ]);
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM cat.raw.Orders",
+            &renames,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
+        assert!(out.rewritten_keys.is_empty());
+        assert_eq!(out.ambiguous_refs, vec!["cat.raw.Orders".to_string()]);
+    }
+
+    /// Disambiguation aligns by TAIL, so a two-part reference is judged by the
+    /// schema and table rules — never the catalog's. With only the catalog
+    /// case-sensitive, two keys differing in the schema's case still fold
+    /// together and stay ambiguous.
+    #[test]
+    fn per_component_rules_align_to_the_tail() {
+        let renames = renames_map(&[
+            ("cat.Raw.orders", target("cat", "shadow", "upper__raw")),
+            ("cat.raw.orders", target("cat", "shadow", "lower__raw")),
+        ]);
+        let catalog_only = IdentifierCaseRules {
+            catalog: true,
+            schema: false,
+            table: false,
+        };
+        let out =
+            rewrite_upstream_refs("SELECT * FROM Raw.orders", &renames, catalog_only).unwrap();
+        assert_eq!(
+            out.ambiguous_refs,
+            vec!["Raw.orders".to_string()],
+            "the schema rule governs a two-part ref, and it is insensitive here"
+        );
+
+        // Turning the schema rule on separates them.
+        let schema_sensitive = IdentifierCaseRules {
+            catalog: true,
+            schema: true,
+            table: false,
+        };
+        let out =
+            rewrite_upstream_refs("SELECT * FROM Raw.orders", &renames, schema_sensitive).unwrap();
+        assert_eq!(out.sql, "SELECT * FROM cat.shadow.upper__raw");
+        assert!(out.ambiguous_refs.is_empty());
+    }
+
+    /// A CTE still shadows a bare name before any of this runs.
+    #[test]
+    fn cte_shadowing_wins_over_case_disambiguation() {
+        let renames = renames_map(&[
+            ("cat.raw.Orders", target("cat", "shadow", "upper__orders")),
+            ("cat.raw.orders", target("cat", "shadow", "lower__orders")),
+        ]);
+        let out = rewrite_upstream_refs(
+            "WITH Orders AS (SELECT 1 AS id) SELECT * FROM Orders",
+            &renames,
+            IdentifierCaseRules::uniform(true),
+        )
+        .unwrap();
+        assert!(out.rewritten_keys.is_empty());
+        assert!(out.ambiguous_refs.is_empty(), "a CTE ref is not ambiguous");
     }
 
     #[test]
@@ -683,6 +999,7 @@ mod tests {
         let out = rewrite_upstream_refs(
             "SELECT o.id FROM cat.raw.orders o JOIN other.schema.customers c ON o.id = c.id",
             &renames,
+            IdentifierCaseRules::all_insensitive(),
         )
         .unwrap();
         assert!(
