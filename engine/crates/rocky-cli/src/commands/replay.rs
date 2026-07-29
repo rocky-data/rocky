@@ -13,6 +13,8 @@
 
 use std::path::Path;
 
+use std::collections::HashMap;
+
 use anyhow::{Context, Result};
 
 use rocky_core::reuse::UpstreamIdentity;
@@ -432,8 +434,6 @@ pub fn run_replay_check(
 fn deterministic_replay_state(
     typed_columns: &[rocky_ir::types::TypedColumn],
 ) -> rocky_iceberg::uniform_writer::UniformTableState {
-    use std::collections::HashMap;
-
     let mut physical = HashMap::with_capacity(typed_columns.len());
     let mut field_id = HashMap::with_capacity(typed_columns.len());
     for (i, tc) in typed_columns.iter().enumerate() {
@@ -1624,6 +1624,59 @@ async fn replay_execute_warehouse(
 /// encoding identity, then materialise the replayed output for downstream
 /// consumers and operator inspection. Only after all of that is the digest
 /// compared (`verify`) via [`build_execute_verdict`].
+/// Map each recorded in-run upstream identity to its replay-namespace target.
+///
+/// Keys are the recorded identity **verbatim**. They used to be lowercased, and
+/// that folding is what let two recorded upstreams differing only by case
+/// collapse into ONE map entry, last write wins — after which the caller's
+/// completeness check iterated the SURVIVING keys, so the lost upstream was
+/// never checked, its reference was never redirected, and the replayed recipe
+/// read the production upstream's current contents while the check reported
+/// success. Verbatim keys make that collapse impossible by construction rather
+/// than detectable by counting; two distinct identities are two distinct keys.
+///
+/// Extracted from the caller so that property is directly testable.
+///
+/// # Errors
+///
+/// Returns the operator-facing reason when a recorded key is not a
+/// `catalog.schema.table` identity or contains a part that is not a valid SQL
+/// identifier.
+fn build_replay_renames(
+    upstreams: &[String],
+    replay_schema: &str,
+) -> std::result::Result<std::collections::HashMap<String, rocky_sql::defer::DeferTarget>, String> {
+    let mut renames: std::collections::HashMap<String, rocky_sql::defer::DeferTarget> =
+        std::collections::HashMap::new();
+    for upstream in upstreams {
+        let parts: Vec<&str> = upstream.split('.').collect();
+        let [up_catalog, up_schema, up_table] = parts.as_slice() else {
+            return Err(format!(
+                "recorded upstream key {upstream:?} is not a catalog.schema.table identity"
+            ));
+        };
+        if [up_catalog, up_schema, up_table]
+            .iter()
+            .any(|p| rocky_sql::validation::validate_identifier(p).is_err())
+        {
+            return Err(format!(
+                "recorded upstream key {upstream:?} contains a part that is not a valid SQL \
+                 identifier"
+            ));
+        }
+        renames.insert(
+            upstream.clone(),
+            rocky_sql::defer::DeferTarget {
+                catalog: (*up_catalog).to_string(),
+                schema: replay_schema.to_string(),
+                table: format!("{up_schema}__{up_table}"),
+                quote_style: None,
+            },
+        );
+    }
+    Ok(renames)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn replay_execute_warehouse_node(
     store: &StateStore,
@@ -1635,9 +1688,6 @@ async fn replay_execute_warehouse_node(
     created_catalogs: &mut std::collections::HashSet<String>,
     materialized: &mut std::collections::HashSet<String>,
 ) -> ReplayExecuteModelOutput {
-    use std::collections::HashMap;
-
-    use rocky_sql::defer::DeferTarget;
     use rocky_sql::validation::validate_identifier;
 
     let catalog = &cand.ir.target.catalog;
@@ -1671,64 +1721,46 @@ async fn replay_execute_warehouse_node(
     let sql = if cand.in_run_upstreams.is_empty() {
         cand.ir.sql.clone()
     } else {
-        let mut renames: HashMap<String, DeferTarget> = HashMap::new();
-        for upstream in &cand.in_run_upstreams {
-            let parts: Vec<&str> = upstream.split('.').collect();
-            let [up_catalog, up_schema, up_table] = parts.as_slice() else {
-                return non_replayable_exec(
-                    &cand.model_name,
-                    cand.nondeterministic,
-                    vec![format!(
-                        "recorded upstream key {upstream:?} is not a catalog.schema.table \
-                         identity"
-                    )],
-                );
-            };
-            if [up_catalog, up_schema, up_table]
-                .iter()
-                .any(|p| validate_identifier(p).is_err())
-            {
-                return non_replayable_exec(
-                    &cand.model_name,
-                    cand.nondeterministic,
-                    vec![format!(
-                        "recorded upstream key {upstream:?} contains a part that is not a \
-                         valid SQL identifier"
-                    )],
-                );
+        let renames = match build_replay_renames(&cand.in_run_upstreams, replay_schema) {
+            Ok(renames) => renames,
+            Err(reason) => {
+                return non_replayable_exec(&cand.model_name, cand.nondeterministic, vec![reason]);
             }
-            renames.insert(
-                upstream.to_ascii_lowercase(),
-                DeferTarget {
-                    catalog: (*up_catalog).to_string(),
-                    schema: replay_schema.to_string(),
-                    table: format!("{up_schema}__{up_table}"),
-                    quote_style: None,
-                },
-            );
-        }
-        let outcome = match rocky_sql::defer::rewrite_upstream_refs(
-            &cand.ir.sql,
-            &renames,
-            // Recorded upstream keys are lowercased above, so nothing here can
-            // be separated by case; matching stays exactly as permissive as it
-            // has always been. Replay also requires EVERY key to match, so any
-            // strictness increase would refuse replayable runs rather than
-            // silently miss one.
-            rocky_sql::defer::IdentifierCaseRules::all_insensitive(),
-        ) {
-            Ok(outcome) => outcome,
+        };
+        // The warehouse's OWN rules, not `all_insensitive()`. That blanket was
+        // justified on the keys being folded, which was true — but the
+        // justification does not reach the REFERENCES: the matcher folds both
+        // sides, so on Snowflake or BigQuery a reference spelled `cat.s.T`
+        // matched the key `cat.s.t` and the recipe was redirected to a
+        // DIFFERENT object's replay table. On duckdb / databricks / trino these
+        // rules are field-identical to `all_insensitive()`, so those three
+        // dialects see no change at all.
+        let case_rules = match crate::commands::run::dialect_case_rules(warehouse.dialect()) {
+            Ok(rules) => rules,
             Err(e) => {
                 return non_replayable_exec(
                     &cand.model_name,
                     cand.nondeterministic,
                     vec![format!(
-                        "recorded SQL could not be parsed to redirect upstream references into \
-                         the replay namespace: {e}"
+                        "cannot redirect upstream references into the replay namespace: {e:#}"
                     )],
                 );
             }
         };
+        let outcome =
+            match rocky_sql::defer::rewrite_upstream_refs(&cand.ir.sql, &renames, case_rules) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    return non_replayable_exec(
+                        &cand.model_name,
+                        cand.nondeterministic,
+                        vec![format!(
+                            "recorded SQL could not be parsed to redirect upstream references into \
+                         the replay namespace: {e}"
+                        )],
+                    );
+                }
+            };
         if !outcome.ambiguous_refs.is_empty() {
             return non_replayable_exec(
                 &cand.model_name,
@@ -1738,6 +1770,25 @@ async fn replay_execute_warehouse_node(
                      redirection into the replay namespace is ambiguous — fail-closed rather \
                      than guess which replayed upstream to read",
                     outcome.ambiguous_refs
+                )],
+            );
+        }
+        // Reachable for the first time now that real rules are in play. Without
+        // this arm the completeness check below still refuses — fail-closed —
+        // but reports "not found among the recipe's table references", sending
+        // an operator hunting a missing reference when the actual cause is that
+        // the reference and the recorded upstream differ only by case.
+        if !outcome.case_fold_only_refs.is_empty() {
+            return non_replayable_exec(
+                &cand.model_name,
+                cand.nondeterministic,
+                vec![format!(
+                    "table reference(s) {:?} match a recorded upstream only when identifier \
+                     case is ignored, and this warehouse treats case as part of object \
+                     identity — so whether they name that upstream cannot be decided here. \
+                     Redirecting could read the wrong table and not redirecting would read \
+                     production, so neither is safe",
+                    outcome.case_fold_only_refs
                 )],
             );
         }
@@ -2391,6 +2442,46 @@ mod tests {
     }
 
     // -- warehouse replay: namespacing + isolation -------------------------
+
+    /// E6 — two recorded upstreams differing only by case stay TWO entries.
+    ///
+    /// The keys were lowercased, so such a pair collapsed to one map entry,
+    /// last write wins. The caller's completeness check then iterates
+    /// `renames.keys()` — the surviving key only — so the lost upstream was
+    /// never checked, its reference never redirected, and the replayed recipe
+    /// read the production upstream's current contents while the check PASSED.
+    ///
+    /// Mutation: restore `upstream.to_ascii_lowercase()` as the key. The map
+    /// drops to one entry and this fails.
+    #[test]
+    fn replay_renames_do_not_collapse_case_differing_upstreams() {
+        let upstreams = vec!["cat.s.T".to_string(), "cat.s.t".to_string()];
+        let renames = super::build_replay_renames(&upstreams, "replay_ns").unwrap();
+        assert_eq!(
+            renames.len(),
+            2,
+            "case-differing upstreams are distinct objects and must keep distinct keys: {:?}",
+            renames.keys().collect::<Vec<_>>()
+        );
+        for key in &upstreams {
+            assert!(
+                renames.contains_key(key),
+                "{key} must be present verbatim, not folded"
+            );
+        }
+        // Each maps to its own replay table, so neither can shadow the other.
+        assert_eq!(renames["cat.s.T"].table, "s__T");
+        assert_eq!(renames["cat.s.t"].table, "s__t");
+    }
+
+    /// The extracted helper keeps the caller's two fail-closed validations.
+    #[test]
+    fn replay_renames_reject_malformed_upstream_keys() {
+        let err = super::build_replay_renames(&["cat.s".to_string()], "ns").unwrap_err();
+        assert!(err.contains("catalog.schema.table"), "{err}");
+        let err = super::build_replay_renames(&["cat.s.bad-name".to_string()], "ns").unwrap_err();
+        assert!(err.contains("not a valid SQL identifier"), "{err}");
+    }
 
     #[test]
     fn replay_schema_name_is_a_valid_identifier() {
