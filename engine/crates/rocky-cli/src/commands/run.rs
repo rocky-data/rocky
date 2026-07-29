@@ -2201,7 +2201,37 @@ pub async fn run(
                 }
             }
         }
-        rocky_core::config::PipelineConfig::Replication(_) => {}
+        rocky_core::config::PipelineConfig::Replication(_) => {
+            // Replication honours `--shadow` in SCHEMA-OVERRIDE mode only.
+            //
+            // In suffix mode it corrupts the SOURCE instead of routing the
+            // target: `TableTask` carries ONE `table_name` for both sides, the
+            // connector loop stores the SUFFIXED name in it, and `process_table`
+            // builds `source_table` and `target_table` from that same field. So
+            // a copy of `raw.orders` reads `raw.orders_rocky_shadow` — normally
+            // absent, so the run fails with a misleading "table not found", and
+            // if some table by that name does exist, it silently copies the
+            // wrong one. Schema-override mode is unaffected: no suffix is
+            // applied and only `target_schema` moves, so source and target
+            // legitimately share the table name.
+            //
+            // Refuse rather than let either outcome stand. The real fix is to
+            // give `TableTask` separate source and target names, which is a
+            // wider change than it looks — the field also feeds asset keys,
+            // drift comparison, checks and state/watermark keys.
+            if let Some(cfg) = shadow_config
+                && cfg.schema_override.is_none()
+            {
+                anyhow::bail!(
+                    "--shadow / --branch suffix mode is not supported for replication pipelines: \
+                     the suffix is applied to the table name shared by the source read and the \
+                     target write, so the run would read '<source_schema>.<table>{}' instead of \
+                     writing a suffixed target. Use --shadow-schema <name> (or a branch, which \
+                     routes by schema) to isolate a replication run",
+                    cfg.suffix,
+                );
+            }
+        }
         rocky_core::config::PipelineConfig::Load(_) => {
             // `run_load` writes the configured target directly; nothing rewrites
             // it for a shadow run. See the snapshot arm above (#1272).
