@@ -14,10 +14,25 @@ Shadow mode writes pipeline output to shadow tables instead of (or alongside) pr
 3. A comparison engine checks row counts, schemas, and optionally sample data between shadow and production
 4. Results show pass/warn/fail with detailed diffs
 
-:::caution[Shadow isolation covers `rocky run` for transformation pipelines only]
-`rocky run --dag`, and the snapshot and load pipeline kinds, still accept
-`--shadow` and `--branch` but write **production** targets. Do not rely on those
-entrypoints for isolation.
+:::caution[Where shadow isolation applies]
+Isolation covers a plain `rocky run` over **transformation** pipelines, and
+**replication** pipelines under `--shadow-schema` (or a branch). Everywhere else
+Rocky now refuses the flag instead of running without isolation:
+
+- **`rocky run --dag`** refuses `--shadow` / `--branch` outright. The DAG runs
+  each model as its own sub-run, so a model's reads of an upstream built by the
+  same run are not redirected to that upstream's shadow target — the downstream
+  shadow table would be built from production data while the run reported
+  success. Run the shadow pipeline without `--dag`.
+- **Snapshot and load** pipelines refuse it: their targets are not rewritten.
+- **Replication in suffix mode** refuses it. The suffix would be applied to the
+  table name that the source read and the target write share, so the run would
+  read `<source_schema>.<table>_rocky_shadow`. Use `--shadow-schema` instead,
+  which moves only the target schema and leaves the source alone.
+- **Seeds** cause a `--dag` run to be refused along with the rest; `rocky seed`
+  itself has no shadow mode and always writes its configured target.
+
+A stored `rocky plan --shadow` carries its routing into `rocky apply`.
 :::
 
 Shadow and branch runs currently reject `content_addressed`, `time_interval` and
