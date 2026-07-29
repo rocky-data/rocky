@@ -5911,10 +5911,18 @@ fn apply_shadow_rewrite(
     // OPPOSITE directions. Collapsing them into one key is what made an earlier
     // revision of this function wrong in each direction in turn.
     //
-    // `target_identity` — "is this reference definitely THIS object?" Answering
-    // yes when unsure redirects a read to a table it never named, so it demands
-    // proof: it folds only where the dialect folds. This is the key space the
-    // rename map, `owner_by_key` and `rewritten_keys` all share.
+    // `target_identity` — "is this reference definitely THIS object?" It folds
+    // only where the dialect folds, so a rewrite happens only on an exact
+    // identity match. This is the key space the rename map, `owner_by_key` and
+    // `rewritten_keys` all share.
+    //
+    // Note what this does NOT do: it does not make the matcher safe on its own.
+    // An earlier revision of this comment claimed refusing to rewrite was "the
+    // safe answer" when case-identity is unknown. That is false — not rewriting
+    // a reference that DOES name a routed upstream leaves the model reading
+    // production while writing its shadow. Neither guess is safe, so the matcher
+    // reports such near-misses via `case_fold_only_refs` and the loop below
+    // refuses on them.
     //
     // `collision_identity` — "could these two be the SAME object?" Answering no
     // when unsure lets two models write one table with no error at all, so it
@@ -6171,6 +6179,25 @@ fn apply_shadow_rewrite(
                 "shadow mode cannot safely route ambiguous upstream reference(s) {:?} in model \
                  '{}'",
                 outcome.ambiguous_refs,
+                model.config.name
+            );
+            // A reference that matches a routed upstream only when case is
+            // ignored. Whether it names that upstream depends on connection
+            // state Rocky cannot see, and BOTH guesses are unsafe: rewriting it
+            // reads a table the model never named, while leaving it reads
+            // PRODUCTION while this model writes its shadow — an isolation break
+            // that exits 0 and then shows up as a clean `rocky compare`. Refuse.
+            anyhow::ensure!(
+                outcome.case_fold_only_refs.is_empty(),
+                "shadow mode cannot tell whether upstream reference(s) {:?} in model '{}' name a \
+                 model routed by this run: they match only when identifier case is ignored, and \
+                 whether case separates two objects depends on connection state Rocky cannot \
+                 observe (a Snowflake account may set QUOTED_IDENTIFIERS_IGNORE_CASE, a BigQuery \
+                 dataset may be is_case_insensitive). Redirecting could read the wrong table and \
+                 not redirecting would read production, so neither is safe. Spell the reference \
+                 exactly as the upstream's configured target, or rename one so they differ by \
+                 more than case",
+                outcome.case_fold_only_refs,
                 model.config.name
             );
             // Every reference actually redirected is now a read of a table
@@ -16846,6 +16873,66 @@ timestamp_column = "ts"
         }
     }
 
+    /// The leak trigger, at run level: a SELECTED consumer reads a SELECTED
+    /// upstream's target spelled with different case, and no other model claims
+    /// that spelling.
+    ///
+    /// If the warehouse folds case — Snowflake `QUOTED_IDENTIFIERS_IGNORE_CASE`,
+    /// a BigQuery dataset created `is_case_insensitive` — then `main.Orders` IS
+    /// `main.orders`, the consumer genuinely reads a model this run is routing,
+    /// and leaving the reference alone makes it read PRODUCTION while writing its
+    /// own shadow. The run exits 0 and `rocky compare` then reports agreement the
+    /// run never established.
+    ///
+    /// Rocky cannot observe that setting, and the opposite guess is equally
+    /// unsafe (rewriting a reference that names a genuinely different object
+    /// reads the wrong table), so it refuses.
+    ///
+    /// Deliberately distinct from the three tests above: there, a second model
+    /// claims the other spelling, so the OLD whole-run case guard also fired
+    /// here. In this shape no model has target `main.Orders`, so the old guard —
+    /// which triggered only when two compiled models folded together — did NOT
+    /// fire and the read leaked silently. This case is new coverage, not a
+    /// restatement.
+    #[test]
+    fn shadow_refuses_a_case_only_read_of_a_routed_upstream() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // No model anywhere has target `main.Orders`.
+        write_model_with_target(
+            &models_dir,
+            "consumer",
+            "SELECT id FROM main.Orders",
+            "main",
+            "consumer",
+        );
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err(
+            "unknown case semantics must not silently leave a selected-upstream production read",
+        );
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("match only when identifier case is ignored")
+                && message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+            "the refusal must explain the unobservable-connection-state reason: {message}"
+        );
+    }
+
     /// An in-run upstream read spelled as a physical `schema.table` name must
     /// be routed to that upstream's shadow target even when the sidecar
     /// declares no `depends_on`.
@@ -17111,7 +17198,7 @@ timestamp_column = "ts"
             ["driver".to_string(), "lower".to_string()]
                 .into_iter()
                 .collect();
-        super::apply_shadow_rewrite(
+        let err = super::apply_shadow_rewrite(
             &mut compiled,
             None,
             Some(&selected),
@@ -17119,29 +17206,11 @@ timestamp_column = "ts"
             &rocky_snowflake::dialect::SnowflakeSqlDialect,
             false,
         )
-        .expect("a read that names a different object is simply not redirected");
-
-        let model = |n: &str| {
-            compiled
-                .project
-                .models
-                .iter()
-                .find(|m| m.config.name == n)
-                .expect("model present")
-        };
-        // The routed model's own target IS isolated.
-        assert_eq!(
-            model("lower").config.target.table,
-            "orders_rocky_shadow",
-            "the selected model is routed to its shadow"
-        );
-        // The driver's read keeps its own spelling: on Snowflake it names a
-        // different object than `lower`'s target, so redirecting it would read a
-        // table it never referenced.
-        let driver_sql = &model("driver").sql;
+        .expect_err("a case-only near-miss on a routed upstream must refuse, not guess");
+        let message = format!("{err:#}");
         assert!(
-            !driver_sql.contains("orders_rocky_shadow"),
-            "a differently-cased read must not be redirected: {driver_sql}"
+            message.contains("match only when identifier case is ignored"),
+            "the refusal must name the case near-miss as the reason: {message}"
         );
     }
 
@@ -17224,7 +17293,7 @@ timestamp_column = "ts"
             ["driver".to_string(), "lower".to_string()]
                 .into_iter()
                 .collect();
-        super::apply_shadow_rewrite(
+        let err = super::apply_shadow_rewrite(
             &mut compiled,
             None,
             Some(&selected),
@@ -17232,29 +17301,11 @@ timestamp_column = "ts"
             &rocky_snowflake::dialect::SnowflakeSqlDialect,
             false,
         )
-        .expect("a read that names a different object is simply not redirected");
-
-        let model = |n: &str| {
-            compiled
-                .project
-                .models
-                .iter()
-                .find(|m| m.config.name == n)
-                .expect("model present")
-        };
-        // The routed model's own target IS isolated.
-        assert_eq!(
-            model("lower").config.target.table,
-            "orders_rocky_shadow",
-            "the selected model is routed to its shadow"
-        );
-        // The driver's read keeps its own spelling: on Snowflake it names a
-        // different object than `lower`'s target, so redirecting it would read a
-        // table it never referenced.
-        let driver_sql = &model("driver").sql;
+        .expect_err("a case-only near-miss on a routed upstream must refuse, not guess");
+        let message = format!("{err:#}");
         assert!(
-            !driver_sql.contains("orders_rocky_shadow"),
-            "a differently-cased read must not be redirected: {driver_sql}"
+            message.contains("match only when identifier case is ignored"),
+            "the refusal must name the case near-miss as the reason: {message}"
         );
     }
 
@@ -17335,7 +17386,7 @@ timestamp_column = "ts"
             ["driver".to_string(), "lower".to_string()]
                 .into_iter()
                 .collect();
-        super::apply_shadow_rewrite(
+        let err = super::apply_shadow_rewrite(
             &mut compiled,
             None,
             Some(&selected),
@@ -17343,29 +17394,11 @@ timestamp_column = "ts"
             &rocky_snowflake::dialect::SnowflakeSqlDialect,
             false,
         )
-        .expect("a read that names a different object is simply not redirected");
-
-        let model = |n: &str| {
-            compiled
-                .project
-                .models
-                .iter()
-                .find(|m| m.config.name == n)
-                .expect("model present")
-        };
-        // The routed model's own target IS isolated.
-        assert_eq!(
-            model("lower").config.target.table,
-            "orders_rocky_shadow",
-            "the selected model is routed to its shadow"
-        );
-        // The driver's read keeps its own spelling: on Snowflake it names a
-        // different object than `lower`'s target, so redirecting it would read a
-        // table it never referenced.
-        let driver_sql = &model("driver").sql;
+        .expect_err("a case-only near-miss on a routed upstream must refuse, not guess");
+        let message = format!("{err:#}");
         assert!(
-            !driver_sql.contains("orders_rocky_shadow"),
-            "a differently-cased read must not be redirected: {driver_sql}"
+            message.contains("match only when identifier case is ignored"),
+            "the refusal must name the case near-miss as the reason: {message}"
         );
     }
 

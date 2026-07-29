@@ -64,6 +64,11 @@ BigQuery and Snowflake they are two tables, so a reference is matched exactly:
 a model reading `raw.Orders` is **not** redirected to the shadow of a model
 whose target is `raw.orders`, because it never read that table.
 
+Where a reference matches a routed upstream **only if case is ignored**, Rocky
+refuses the run rather than guess. Redirecting it could read a table the model
+never named; leaving it would read production while the model writes its shadow.
+Spell the reference exactly as the upstream's configured target.
+
 Deciding whether two *targets* collide is the opposite question, and Rocky
 answers it conservatively on every warehouse: two selected models whose targets
 differ only by identifier case are always treated as one object, and the run is

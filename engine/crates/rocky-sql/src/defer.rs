@@ -229,6 +229,16 @@ pub struct UpstreamRewriteOutcome {
     /// upstreams). Ambiguous references are left untouched — callers must
     /// fail closed rather than guess.
     pub ambiguous_refs: Vec<String>,
+    /// Display strings of relations that match NO key under the supplied
+    /// [`IdentifierCaseRules`] but WOULD match one if case were ignored.
+    ///
+    /// Whether such a reference names the routed upstream depends on connection
+    /// state (`QUOTED_IDENTIFIERS_IGNORE_CASE`, a dataset's
+    /// `is_case_insensitive`) that Rocky cannot observe, and both guesses are
+    /// unsafe — rewriting reads the wrong table, not rewriting reads production.
+    /// Callers that require isolation must fail closed on any. Always empty when
+    /// `case_rules` is [`IdentifierCaseRules::all_insensitive`].
+    pub case_fold_only_refs: Vec<String>,
 }
 
 /// Rewrite references to known upstream tables — bare, `schema.table`, or
@@ -273,18 +283,21 @@ pub fn rewrite_upstream_refs(
         scopes: Vec::new(),
         rewritten_keys: HashSet::new(),
         ambiguous_refs: Vec::new(),
+        case_fold_only_refs: Vec::new(),
     };
     let _: ControlFlow<()> = statement.visit(&mut rewriter);
 
     let UpstreamRewriter {
         rewritten_keys,
         ambiguous_refs,
+        case_fold_only_refs,
         ..
     } = rewriter;
     Ok(UpstreamRewriteOutcome {
         sql: statement.to_string(),
         rewritten_keys,
         ambiguous_refs,
+        case_fold_only_refs,
     })
 }
 
@@ -299,6 +312,7 @@ struct UpstreamRewriter<'a> {
     scopes: Vec<HashSet<String>>,
     rewritten_keys: HashSet<String>,
     ambiguous_refs: Vec<String>,
+    case_fold_only_refs: Vec<String>,
 }
 
 impl UpstreamRewriter<'_> {
@@ -357,16 +371,41 @@ impl VisitorMut for UpstreamRewriter<'_> {
             })
             .collect();
         match candidates.as_slice() {
-            [] => {}
+            [] => {
+                // No key matches under the dialect's declared rules — but if one
+                // matches when case is IGNORED, the right answer depends on
+                // state this process cannot see.
+                //
+                // Neither guess is safe here, which is why this is reported
+                // rather than decided. Rewriting a reference that names a
+                // genuinely different object reads the wrong table; NOT
+                // rewriting one that does name the routed upstream reads
+                // PRODUCTION while the model writes its shadow — an isolation
+                // break that reports success and then shows up as a clean
+                // `rocky compare`. Case-sensitivity is connection state (a
+                // Snowflake account may set QUOTED_IDENTIFIERS_IGNORE_CASE; a
+                // BigQuery dataset may be `is_case_insensitive`), so the caller
+                // is handed the near-miss and fails closed.
+                //
+                // Inert wherever `case_rules` is already all-insensitive: folded
+                // and rule-based matching coincide, so this can never fire.
+                if self.renames.iter().any(|(key_exact, _, _)| {
+                    tail_matches_with_case(
+                        key_exact,
+                        &original,
+                        IdentifierCaseRules::all_insensitive(),
+                    )
+                }) {
+                    self.case_fold_only_refs.push(relation.to_string());
+                }
+            }
             [(_, key, target)] => {
                 *relation = target.to_object_name();
                 self.rewritten_keys.insert((*key).clone());
             }
             // Several upstreams are indistinguishable from this reference under
             // the dialect's own rules, so it genuinely names more than one of
-            // them. Refuse this REFERENCE — which is what lets the caller drop
-            // the whole-run refusal it used to need, since the ambiguity is now
-            // resolved where the resolution actually happens.
+            // them.
             _ => self.ambiguous_refs.push(relation.to_string()),
         }
         ControlFlow::Continue(())
