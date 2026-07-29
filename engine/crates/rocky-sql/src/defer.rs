@@ -344,6 +344,31 @@ struct UpstreamRewriter<'a> {
 }
 
 impl UpstreamRewriter<'_> {
+    /// The lookup form of an identifier: resolved the way the warehouse resolves
+    /// it, then folded unless case is part of identity.
+    ///
+    /// Used for BOTH the CTE frames and the reference tested against them, so
+    /// the two cannot disagree. They did: frames stored the alias verbatim and
+    /// `is_shadowed` compared exactly, while relation matching folded. On a
+    /// case-insensitive dialect `WITH Orders … FROM orders` therefore did not
+    /// register as shadowed — those are ONE CTE there — and the reference was
+    /// rewritten to a shadow table, so the query silently read something the
+    /// author never named.
+    ///
+    /// CTE names live in the table namespace, so the `table` rule governs.
+    fn lookup_form(&self, value: &str, quoted: bool) -> String {
+        let resolved = if self.case_rules.unquoted_uppercases && !quoted {
+            value.to_uppercase()
+        } else {
+            value.to_string()
+        };
+        if self.case_rules.table {
+            resolved
+        } else {
+            resolved.to_ascii_lowercase()
+        }
+    }
+
     fn is_shadowed(&self, name: &str) -> bool {
         self.scopes.iter().any(|frame| frame.contains(name))
     }
@@ -356,7 +381,8 @@ impl VisitorMut for UpstreamRewriter<'_> {
         let mut frame: HashSet<String> = HashSet::new();
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
-                frame.insert(cte.alias.name.value.clone());
+                let alias = &cte.alias.name;
+                frame.insert(self.lookup_form(&alias.value, alias.quote_style.is_some()));
             }
         }
         self.scopes.push(frame);
@@ -384,7 +410,9 @@ impl VisitorMut for UpstreamRewriter<'_> {
             return ControlFlow::Continue(());
         }
         // A bare name shadowed by a CTE in scope refers to the CTE.
-        if spelled_parts.len() == 1 && self.is_shadowed(spelled_parts[0].0) {
+        if spelled_parts.len() == 1
+            && self.is_shadowed(&self.lookup_form(spelled_parts[0].0, spelled_parts[0].1))
+        {
             return ControlFlow::Continue(());
         }
         // Resolve each part to the name the warehouse will actually look up.
@@ -1148,6 +1176,77 @@ mod tests {
         .unwrap();
         assert!(out.rewritten_keys.is_empty());
         assert!(out.ambiguous_refs.is_empty(), "a CTE ref is not ambiguous");
+    }
+
+    /// A CTE shadows a reference that resolves to the SAME name, not merely one
+    /// spelled identically.
+    ///
+    /// Live defect before this fix, on every case-insensitive dialect and on the
+    /// pre-existing matcher: frames stored the alias verbatim and `is_shadowed`
+    /// compared exactly, while relation matching folded. `WITH Orders … FROM
+    /// orders` — one CTE on DuckDB, Databricks and Trino — was therefore NOT
+    /// treated as shadowed, and the reference was rewritten to
+    /// `cat.shadow.orders`. The query silently read a table instead of its own
+    /// CTE.
+    ///
+    /// Mutation: reverting `pre_visit_query` to insert `alias.value` verbatim
+    /// makes the first case rewrite and fails this.
+    #[test]
+    fn a_cte_shadows_a_case_equivalent_reference() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "shadow", "orders"))]);
+
+        // Case-insensitive dialect: the CTE and the reference are one name.
+        for (cte, reference) in [
+            ("Orders", "orders"),
+            ("orders", "ORDERS"),
+            ("ORDERS", "Orders"),
+        ] {
+            let out = rewrite_upstream_refs(
+                &format!("WITH {cte} AS (SELECT 1 AS id) SELECT * FROM {reference}"),
+                &renames,
+                IdentifierCaseRules::all_insensitive(),
+            )
+            .unwrap();
+            assert!(
+                !out.sql.contains("cat.shadow.orders"),
+                "CTE {cte} must shadow the reference {reference}: {}",
+                out.sql
+            );
+            assert!(out.rewritten_keys.is_empty());
+            assert!(
+                out.case_fold_only_refs.is_empty(),
+                "shadowed, not a near-miss"
+            );
+        }
+
+        // Snowflake's shape: both unquoted names resolve to ORDERS, so the CTE
+        // shadows the reference there too — the case Codex flagged.
+        let upper = renames_map(&[("CAT.RAW.ORDERS", target("CAT", "SHADOW", "ORDERS"))]);
+        let out = rewrite_upstream_refs(
+            "WITH orders AS (SELECT 1 AS id) SELECT * FROM Orders",
+            &upper,
+            IdentifierCaseRules::uniform_uppercasing(true),
+        )
+        .unwrap();
+        assert!(
+            !out.sql.contains("SHADOW"),
+            "unquoted CTE `orders` and unquoted ref `Orders` both resolve to ORDERS: {}",
+            out.sql
+        );
+
+        // Control: on a case-SENSITIVE dialect that does not fold unquoted
+        // names, a differently-cased CTE genuinely does not shadow the
+        // reference, so the reference is judged on its own merits.
+        let out = rewrite_upstream_refs(
+            "WITH Orders AS (SELECT 1 AS id) SELECT * FROM orders",
+            &renames,
+            IdentifierCaseRules::uniform(true),
+        )
+        .unwrap();
+        assert_eq!(
+            out.sql, "WITH Orders AS (SELECT 1 AS id) SELECT * FROM cat.shadow.orders",
+            "a distinct CTE name must not shadow an exactly-matching reference"
+        );
     }
 
     #[test]
