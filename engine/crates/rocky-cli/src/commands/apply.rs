@@ -651,9 +651,14 @@ async fn execute_run_plan(
             state_path,
             output_json,
             &crate::commands::run::SkipRunOptions::default(),
-            // A stored plan carries no shadow routing: `--shadow` / `--branch`
-            // are run-time isolation, never part of a persisted plan's contract.
-            None,
+            // Shadow routing IS part of a persisted plan's contract: the plan
+            // captures `shadow` / `shadow_suffix` / `shadow_schema` / `branch`,
+            // and `shadow_config` above is reconstructed from them for exactly
+            // this reason. Dropping it here is the same defect as #1272 one
+            // level up — `rocky plan --dag --shadow` followed by `rocky apply`
+            // would write production while reporting success. The non-DAG path
+            // below passes the same value.
+            shadow_config.as_ref(),
         )
         .await
         .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));

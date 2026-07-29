@@ -240,6 +240,39 @@ pub async fn run_with_dag(
         .collect();
     unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name);
 
+    // A seed node is dispatched straight to `run_seed`, which DROPs, recreates
+    // and repopulates the seed's CONFIGURED target — it takes no shadow config
+    // and there is no rewrite anywhere on that path. Under `--shadow` /
+    // `--branch` that is a production write inside a run whose entire promise is
+    // that production is untouched, so refuse before the executor mutates
+    // anything rather than isolate the models and quietly destroy the seed
+    // tables beside them.
+    //
+    // Refusal, not skipping: skipping would silently change what ran, and a
+    // shadow run over a stale seed is exactly the green-DAG-over-stale-data
+    // failure the seed-discovery error handling above exists to prevent.
+    // Routing seed targets is the real fix, and it is bigger than it looks —
+    // the target rewrite would have to reach every model that reads the seed by
+    // bare name, which `apply_shadow_rewrite` does not do today because it
+    // routes only selected *models*.
+    if shadow_config.is_some() {
+        let seed_labels: Vec<&str> = dag
+            .nodes
+            .iter()
+            .filter(|n| n.kind == NodeKind::Seed)
+            .map(|n| n.label.as_str())
+            .collect();
+        if !seed_labels.is_empty() {
+            anyhow::bail!(
+                "--shadow / --branch is not supported for a DAG containing seed(s) {}: seed \
+                 targets are not rewritten, so the run would drop and repopulate the production \
+                 seed table(s). Load the seeds separately with `rocky seed` and re-run the DAG \
+                 without the flag, or remove the seeds from this project's DAG",
+                seed_labels.join(", "),
+            );
+        }
+    }
+
     info!(
         nodes = dag.node_count(),
         edges = dag.edge_count(),
