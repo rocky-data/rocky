@@ -904,17 +904,38 @@ mod tests {
             assert!(out.rewritten_keys.is_empty());
             assert!(
                 out.ambiguous_refs.is_empty(),
-                "not ambiguous — simply not a match"
+                "not ambiguous — it matches no key under these rules"
+            );
+            // But it is NOT silently fine: it matches when case is ignored, and
+            // whether that means it names the routed upstream depends on
+            // connection state, so it is reported for the caller to refuse on.
+            assert_eq!(
+                out.case_fold_only_refs,
+                vec![spelling.to_string()],
+                "a case-only near-miss must be reported, never silently skipped"
             );
         }
-        // The exact spelling still matches.
-        let out = rewrite_upstream_refs(
-            "SELECT * FROM cat.raw.orders",
-            &renames,
-            IdentifierCaseRules::uniform(true),
-        )
-        .unwrap();
-        assert_eq!(out.sql, "SELECT * FROM cat.shadow.orders");
+        // The ordinary spellings still match and report nothing. This is the
+        // usability floor for the refusal above: a model that spells its
+        // upstream the way the target is configured — including the bare-name
+        // idiom Rocky models normally use — is unaffected on a case-sensitive
+        // dialect.
+        for spelling in ["cat.raw.orders", "raw.orders", "orders"] {
+            let out = rewrite_upstream_refs(
+                &format!("SELECT * FROM {spelling}"),
+                &renames,
+                IdentifierCaseRules::uniform(true),
+            )
+            .unwrap();
+            assert_eq!(
+                out.sql, "SELECT * FROM cat.shadow.orders",
+                "matching-case spelling {spelling} must route normally"
+            );
+            assert!(
+                out.case_fold_only_refs.is_empty(),
+                "{spelling} matches exactly, so nothing is reported"
+            );
+        }
     }
 
     /// Two upstreams differing only by case are two objects on a case-sensitive
