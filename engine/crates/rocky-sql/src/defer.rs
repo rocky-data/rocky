@@ -116,6 +116,7 @@ pub fn qualify_deferred_refs(
     sql: &str,
     deferred: &HashMap<String, DeferTarget>,
     case_rules: IdentifierCaseRules,
+    recursive_visibility: RecursiveCteVisibility,
 ) -> Result<String, ParseError> {
     if deferred.is_empty() {
         return Ok(sql.to_string());
@@ -131,7 +132,7 @@ pub fn qualify_deferred_refs(
     // breaks, so the `ControlFlow` is always `Continue`.
     let mut rewriter = DeferRewriter {
         deferred,
-        scopes: CteScopeStack::new(case_rules),
+        scopes: CteScopeStack::new(case_rules, recursive_visibility),
     };
     let _: ControlFlow<()> = statement.visit(&mut rewriter);
 
@@ -389,6 +390,7 @@ pub fn rewrite_upstream_refs(
     sql: &str,
     renames: &HashMap<TargetIdentity, DeferTarget>,
     case_rules: IdentifierCaseRules,
+    recursive_visibility: RecursiveCteVisibility,
 ) -> Result<UpstreamRewriteOutcome, ParseError> {
     let mut statement = parse_single_statement(sql)?;
 
@@ -402,7 +404,7 @@ pub fn rewrite_upstream_refs(
     let mut rewriter = UpstreamRewriter {
         renames: &split,
         case_rules,
-        scopes: CteScopeStack::new(case_rules),
+        scopes: CteScopeStack::new(case_rules, recursive_visibility),
         rewritten_keys: HashSet::new(),
         ambiguous_refs: Vec::new(),
         case_fold_only_refs: Vec::new(),
@@ -435,6 +437,34 @@ struct UpstreamRewriter<'a> {
     rewritten_keys: HashSet<TargetIdentity>,
     ambiguous_refs: Vec<String>,
     case_fold_only_refs: Vec<String>,
+}
+
+/// Whether a dialect lets a CTE inside a `WITH RECURSIVE` clause reference an
+/// alias declared AFTER it.
+///
+/// A separate axis from [`IdentifierCaseRules`] — case rules say which spellings
+/// name one object, this says which names are in scope at all — and the two
+/// dialects Rocky has grounded disagree, so it cannot be inferred.
+///
+/// **The default is the conservative one, and the direction matters.** Guessing
+/// [`Forward`](Self::Forward) where the dialect does not allow it leaves a
+/// reference that actually binds to a physical table unrewritten, so a shadow
+/// run reads PRODUCTION and reports success. Guessing
+/// [`PrecedingAndSelf`](Self::PrecedingAndSelf) where the dialect does allow it
+/// rewrites a reference that binds to a CTE, so the query reads a shadow table
+/// instead of its own CTE — wrong, but isolated. The second failure is
+/// recoverable and the first is not, so unverified dialects get the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecursiveCteVisibility {
+    /// A CTE body sees the aliases before it, plus its own. Verified against
+    /// DuckDB: in `WITH RECURSIVE first AS (SELECT * FROM orders), orders AS
+    /// (SELECT 999 AS id) SELECT * FROM first`, `first` returns the PHYSICAL
+    /// orders row, not 999.
+    PrecedingAndSelf,
+    /// A CTE body additionally sees aliases declared after it. BigQuery: "A
+    /// recursive CTE can reference itself, a preceding CTE, or a subsequent
+    /// CTE." — docs.cloud.google.com/bigquery/docs/recursive-ctes
+    Forward,
 }
 
 /// Which part of a query's `WITH` structure the walk is currently inside.
@@ -489,9 +519,12 @@ impl CteScope {
     /// reads the physical `orders` (verified against DuckDB), so a rewriter that
     /// thinks the later CTE shadows it leaves the reference pointing at
     /// production while the model writes its shadow target.
-    fn visible(&self) -> &[String] {
+    fn visible(&self, policy: RecursiveCteVisibility) -> &[String] {
         match self.region {
             Region::Body => &self.aliases,
+            Region::Cte(_) if self.recursive && policy == RecursiveCteVisibility::Forward => {
+                &self.aliases
+            }
             Region::Cte(i) if self.recursive => &self.aliases[..=i],
             Region::Cte(i) => &self.aliases[..i],
         }
@@ -512,13 +545,15 @@ impl CteScope {
 struct CteScopeStack {
     frames: Vec<CteScope>,
     case_rules: IdentifierCaseRules,
+    recursive_visibility: RecursiveCteVisibility,
 }
 
 impl CteScopeStack {
-    fn new(case_rules: IdentifierCaseRules) -> Self {
+    fn new(case_rules: IdentifierCaseRules, recursive_visibility: RecursiveCteVisibility) -> Self {
         Self {
             frames: Vec::new(),
             case_rules,
+            recursive_visibility,
         }
     }
 
@@ -587,7 +622,7 @@ impl CteScopeStack {
         let name = self.lookup_form(value, quoted);
         self.frames
             .iter()
-            .any(|frame| frame.visible().contains(&name))
+            .any(|frame| frame.visible(self.recursive_visibility).contains(&name))
     }
 }
 
@@ -789,6 +824,7 @@ mod tests {
             "SELECT * FROM orders",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(out, "SELECT * FROM prod.orders");
@@ -801,6 +837,7 @@ mod tests {
             "SELECT * FROM orders",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(out, "SELECT * FROM warehouse.prod.orders");
@@ -816,6 +853,7 @@ mod tests {
             "SELECT o.id FROM orders o WHERE o.id > 0",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         // The table name is qualified; the alias `o` and the `o.col` column
@@ -837,6 +875,7 @@ mod tests {
             "SELECT o.id, c.name FROM orders o JOIN customers c ON o.cid = c.id",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(out.contains("FROM prod.orders"), "got: {out}");
@@ -853,6 +892,7 @@ mod tests {
             "SELECT * FROM (SELECT id FROM orders) sub",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -871,6 +911,7 @@ mod tests {
             "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -891,6 +932,7 @@ mod tests {
             "SELECT * FROM (WITH orders AS (SELECT 1 AS id) SELECT * FROM orders) sub",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -911,6 +953,7 @@ mod tests {
              (WITH orders AS (SELECT 1 AS id) SELECT id FROM orders)",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -930,6 +973,7 @@ mod tests {
              (WITH orders AS (SELECT 2 AS id) SELECT id FROM orders)",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -947,6 +991,7 @@ mod tests {
             "SELECT * FROM orders",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -968,6 +1013,7 @@ mod tests {
              (WITH orders AS (SELECT 1 AS id) SELECT id FROM orders)",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         // Exactly one occurrence of the qualified production ref (the outer
@@ -997,6 +1043,7 @@ mod tests {
             "SELECT * FROM orders",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(out, "SELECT * FROM `my-gcp-project-123`.`prod`.`orders`");
@@ -1011,6 +1058,7 @@ mod tests {
             "SELECT * FROM staging.orders",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(out.contains("staging.orders"), "got: {out}");
@@ -1026,6 +1074,7 @@ mod tests {
             "SELECT * FROM orders JOIN customers ON orders.cid = customers.id",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(out.contains("prod.orders"), "got: {out}");
@@ -1040,8 +1089,13 @@ mod tests {
     fn empty_deferred_map_is_a_noop() {
         let deferred: HashMap<String, DeferTarget> = HashMap::new();
         let sql = "SELECT * FROM orders";
-        let out =
-            qualify_deferred_refs(sql, &deferred, IdentifierCaseRules::all_insensitive()).unwrap();
+        let out = qualify_deferred_refs(
+            sql,
+            &deferred,
+            IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
         assert_eq!(out, sql);
     }
 
@@ -1052,6 +1106,7 @@ mod tests {
             "SELECT a.id FROM orders a JOIN orders b ON a.id = b.id",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         // Both occurrences qualified; aliases `a`/`b` preserved.
@@ -1066,6 +1121,7 @@ mod tests {
             "NOT VALID SQL ;;;",
             &deferred,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         );
         assert!(err.is_err());
     }
@@ -1168,6 +1224,7 @@ mod tests {
             "WITH first AS (SELECT * FROM up), up AS (SELECT 1 AS id) SELECT * FROM first",
             &deferred,
             rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1180,6 +1237,7 @@ mod tests {
             "WITH up AS (SELECT 1 AS id), second AS (SELECT * FROM up) SELECT * FROM second",
             &deferred,
             rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1192,6 +1250,7 @@ mod tests {
             "WITH a AS (SELECT 1 AS id), up AS (SELECT 2 AS id) SELECT * FROM up",
             &deferred,
             rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(!out.contains("prod.up"), "the body sees every CTE: {out}");
@@ -1202,6 +1261,7 @@ mod tests {
              SELECT * FROM up",
             &deferred,
             rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1215,6 +1275,7 @@ mod tests {
              SELECT * FROM first",
             &deferred,
             rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1241,6 +1302,7 @@ mod tests {
                 &format!("WITH {cte} AS (SELECT 1 AS id) SELECT * FROM {reference}"),
                 &deferred,
                 IdentifierCaseRules::all_insensitive(),
+                RecursiveCteVisibility::PrecedingAndSelf,
             )
             .unwrap();
             assert!(
@@ -1254,6 +1316,7 @@ mod tests {
             "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
             &deferred,
             IdentifierCaseRules::uniform_uppercasing(true),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1276,7 +1339,13 @@ mod tests {
             IdentifierCaseRules::all_insensitive(),
             IdentifierCaseRules::uniform(true),
         ] {
-            let out = qualify_deferred_refs("SELECT * FROM orders", &deferred, rules).unwrap();
+            let out = qualify_deferred_refs(
+                "SELECT * FROM orders",
+                &deferred,
+                rules,
+                RecursiveCteVisibility::PrecedingAndSelf,
+            )
+            .unwrap();
             assert_eq!(
                 out, "SELECT * FROM orders",
                 "a differently-cased bare name is not a ModelRef, so it is not qualified"
@@ -1311,6 +1380,7 @@ mod tests {
             "SELECT * FROM cat.raw.orders",
             &renames,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(out.sql, "SELECT * FROM cat.replay_ns.raw__orders");
@@ -1325,6 +1395,7 @@ mod tests {
             "SELECT * FROM raw.orders",
             &renames,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(two.sql, "SELECT * FROM cat.replay_ns.raw__orders");
@@ -1332,6 +1403,7 @@ mod tests {
             "SELECT * FROM orders",
             &renames,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(bare.sql, "SELECT * FROM cat.replay_ns.raw__orders");
@@ -1345,6 +1417,7 @@ mod tests {
             "SELECT * FROM CAT.Raw.ORDERS",
             &renames,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(out.sql, "SELECT * FROM cat.replay_ns.raw__orders");
@@ -1365,6 +1438,7 @@ mod tests {
             "SELECT * FROM orders",
             &renames,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(out.sql, "SELECT * FROM orders", "ambiguous ref untouched");
@@ -1375,6 +1449,7 @@ mod tests {
             "SELECT * FROM cat.staging.orders",
             &renames,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(fq.sql, "SELECT * FROM cat.replay_ns.staging__orders");
@@ -1388,6 +1463,7 @@ mod tests {
             "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
             &renames,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1405,6 +1481,7 @@ mod tests {
             "SELECT * FROM cat.raw.customers",
             &renames,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(out.rewritten_keys.is_empty());
@@ -1422,6 +1499,7 @@ mod tests {
                 &format!("SELECT * FROM {spelling}"),
                 &renames,
                 IdentifierCaseRules::all_insensitive(),
+                RecursiveCteVisibility::PrecedingAndSelf,
             )
             .unwrap();
             assert_eq!(
@@ -1447,6 +1525,7 @@ mod tests {
                 &format!("SELECT * FROM {spelling}"),
                 &renames,
                 IdentifierCaseRules::uniform(true),
+                RecursiveCteVisibility::PrecedingAndSelf,
             )
             .unwrap();
             assert_eq!(
@@ -1479,6 +1558,7 @@ mod tests {
                 &format!("SELECT * FROM {spelling}"),
                 &renames,
                 IdentifierCaseRules::uniform(true),
+                RecursiveCteVisibility::PrecedingAndSelf,
             )
             .unwrap();
             assert_eq!(
@@ -1505,12 +1585,24 @@ mod tests {
         ]);
         let rules = IdentifierCaseRules::uniform(true);
 
-        let upper = rewrite_upstream_refs("SELECT * FROM cat.raw.Orders", &renames, rules).unwrap();
+        let upper = rewrite_upstream_refs(
+            "SELECT * FROM cat.raw.Orders",
+            &renames,
+            rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
         assert_eq!(upper.sql, "SELECT * FROM cat.shadow.upper__orders");
         assert!(upper.rewritten_keys.contains(&tid("cat.raw.Orders")));
         assert!(upper.ambiguous_refs.is_empty());
 
-        let lower = rewrite_upstream_refs("SELECT * FROM cat.raw.orders", &renames, rules).unwrap();
+        let lower = rewrite_upstream_refs(
+            "SELECT * FROM cat.raw.orders",
+            &renames,
+            rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
         assert_eq!(lower.sql, "SELECT * FROM cat.shadow.lower__orders");
         assert!(lower.rewritten_keys.contains(&tid("cat.raw.orders")));
         assert!(lower.ambiguous_refs.is_empty());
@@ -1528,6 +1620,7 @@ mod tests {
             "SELECT * FROM cat.raw.ORDERS",
             &renames,
             IdentifierCaseRules::uniform(true),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(out.sql, "SELECT * FROM cat.raw.ORDERS", "left as parsed");
@@ -1549,6 +1642,7 @@ mod tests {
             "SELECT * FROM cat.raw.Orders",
             &renames,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(out.rewritten_keys.is_empty());
@@ -1571,8 +1665,13 @@ mod tests {
             table: false,
             unquoted_uppercases: false,
         };
-        let out =
-            rewrite_upstream_refs("SELECT * FROM Raw.orders", &renames, catalog_only).unwrap();
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM Raw.orders",
+            &renames,
+            catalog_only,
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
         assert_eq!(
             out.ambiguous_refs,
             vec!["Raw.orders".to_string()],
@@ -1586,8 +1685,13 @@ mod tests {
             table: false,
             unquoted_uppercases: false,
         };
-        let out =
-            rewrite_upstream_refs("SELECT * FROM Raw.orders", &renames, schema_sensitive).unwrap();
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM Raw.orders",
+            &renames,
+            schema_sensitive,
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
         assert_eq!(out.sql, "SELECT * FROM cat.shadow.upper__raw");
         assert!(out.ambiguous_refs.is_empty());
     }
@@ -1613,8 +1717,13 @@ mod tests {
         // resolve onto it, quoted ones must spell it exactly.
         let upper = renames_map(&[("CAT.RAW.ORDERS", target("CAT", "SHADOW", "ORDERS"))]);
         for spelling in ["cat.raw.orders", "CAT.RAW.ORDERS", "raw.orders", "orders"] {
-            let out =
-                rewrite_upstream_refs(&format!("SELECT * FROM {spelling}"), &upper, rules).unwrap();
+            let out = rewrite_upstream_refs(
+                &format!("SELECT * FROM {spelling}"),
+                &upper,
+                rules,
+                RecursiveCteVisibility::PrecedingAndSelf,
+            )
+            .unwrap();
             assert_eq!(
                 out.sql, "SELECT * FROM CAT.SHADOW.ORDERS",
                 "unquoted {spelling} resolves upper and routes"
@@ -1625,7 +1734,13 @@ mod tests {
         // Lower-case target: Rocky created `"orders"`, which an UNQUOTED
         // reference cannot name. Reported, not silently rewritten.
         let lower = renames_map(&[("cat.raw.orders", target("cat", "shadow", "orders"))]);
-        let out = rewrite_upstream_refs("SELECT * FROM cat.raw.orders", &lower, rules).unwrap();
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM cat.raw.orders",
+            &lower,
+            rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
         assert!(
             out.rewritten_keys.is_empty(),
             "an unquoted ref resolves to CAT.RAW.ORDERS, not cat.raw.orders: {}",
@@ -1638,8 +1753,13 @@ mod tests {
         );
 
         // Quoted, spelled exactly: that IS the object, so it routes.
-        let out = rewrite_upstream_refs("SELECT * FROM \"cat\".\"raw\".\"orders\"", &lower, rules)
-            .unwrap();
+        let out = rewrite_upstream_refs(
+            "SELECT * FROM \"cat\".\"raw\".\"orders\"",
+            &lower,
+            rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
         assert_eq!(out.sql, "SELECT * FROM cat.shadow.orders");
         assert!(out.case_fold_only_refs.is_empty());
     }
@@ -1655,10 +1775,82 @@ mod tests {
             "WITH Orders AS (SELECT 1 AS id) SELECT * FROM Orders",
             &renames,
             IdentifierCaseRules::uniform(true),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(out.rewritten_keys.is_empty());
         assert!(out.ambiguous_refs.is_empty(), "a CTE ref is not ambiguous");
+    }
+
+    /// The recursive forward-reference rule is a per-DIALECT fact, and the two
+    /// grounded dialects disagree.
+    ///
+    /// DuckDB, verified empirically: in
+    /// `WITH RECURSIVE first AS (SELECT * FROM orders), orders AS (SELECT 999
+    /// AS id) SELECT * FROM first`, `first` returns the PHYSICAL orders row —
+    /// the later alias does not shadow it, so the upstream read must be
+    /// redirected or the shadow run reads production.
+    ///
+    /// BigQuery, per vendor documentation: "A recursive CTE can reference
+    /// itself, a preceding CTE, or a subsequent CTE." There the same reference
+    /// binds to the later CTE, so redirecting it would change what the query
+    /// reads.
+    ///
+    /// One rule cannot serve both, which is why this is a parameter rather than
+    /// a constant. Unverified dialects take `PrecedingAndSelf`, because the
+    /// failure it risks (reading a shadow table instead of a CTE) is isolated
+    /// while the failure `Forward` risks (reading production) is not.
+    #[test]
+    fn recursive_forward_visibility_is_per_dialect() {
+        let renames = renames_map(&[("cat.raw.orders", target("cat", "shadow", "orders"))]);
+        let sql = "WITH RECURSIVE first AS (SELECT * FROM orders), orders AS (SELECT 1 AS id) \
+                   SELECT * FROM first";
+
+        let conservative = rewrite_upstream_refs(
+            sql,
+            &renames,
+            IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
+        assert!(
+            conservative.sql.contains("FROM cat.shadow.orders"),
+            "DuckDB binds this to the physical table, so it must be redirected: {}",
+            conservative.sql
+        );
+
+        let forward = rewrite_upstream_refs(
+            sql,
+            &renames,
+            IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::Forward,
+        )
+        .unwrap();
+        assert!(
+            !forward.sql.contains("cat.shadow.orders"),
+            "BigQuery binds this to the later CTE, so it must be left alone: {}",
+            forward.sql
+        );
+
+        // The self-reference is shadowed under BOTH policies.
+        for policy in [
+            RecursiveCteVisibility::PrecedingAndSelf,
+            RecursiveCteVisibility::Forward,
+        ] {
+            let out = rewrite_upstream_refs(
+                "WITH RECURSIVE orders AS (SELECT 1 AS id UNION ALL SELECT id FROM orders) \
+                 SELECT * FROM orders",
+                &renames,
+                IdentifierCaseRules::all_insensitive(),
+                policy,
+            )
+            .unwrap();
+            assert!(
+                !out.sql.contains("cat.shadow.orders"),
+                "a recursive CTE always shadows its own self-reference: {}",
+                out.sql
+            );
+        }
     }
 
     /// A CTE shadows a reference that resolves to the SAME name, not merely one
@@ -1688,6 +1880,7 @@ mod tests {
                 &format!("WITH {cte} AS (SELECT 1 AS id) SELECT * FROM {reference}"),
                 &renames,
                 IdentifierCaseRules::all_insensitive(),
+                RecursiveCteVisibility::PrecedingAndSelf,
             )
             .unwrap();
             assert!(
@@ -1709,6 +1902,7 @@ mod tests {
             "WITH orders AS (SELECT 1 AS id) SELECT * FROM Orders",
             &upper,
             IdentifierCaseRules::uniform_uppercasing(true),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1724,6 +1918,7 @@ mod tests {
             "WITH Orders AS (SELECT 1 AS id) SELECT * FROM orders",
             &renames,
             IdentifierCaseRules::uniform(true),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert_eq!(
@@ -1759,6 +1954,7 @@ mod tests {
              SELECT * FROM first",
             &renames,
             rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1774,6 +1970,7 @@ mod tests {
              SELECT * FROM second",
             &renames,
             rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1787,6 +1984,7 @@ mod tests {
             "WITH a AS (SELECT 1 AS id), orders AS (SELECT 2 AS id) SELECT * FROM orders",
             &renames,
             rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1801,6 +1999,7 @@ mod tests {
              SELECT * FROM orders",
             &renames,
             rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1820,6 +2019,7 @@ mod tests {
              SELECT * FROM first",
             &renames,
             rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(
@@ -1836,6 +2036,7 @@ mod tests {
             "SELECT o.id FROM cat.raw.orders o JOIN other.schema.customers c ON o.id = c.id",
             &renames,
             IdentifierCaseRules::all_insensitive(),
+            RecursiveCteVisibility::PrecedingAndSelf,
         )
         .unwrap();
         assert!(

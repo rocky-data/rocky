@@ -1758,20 +1758,24 @@ async fn replay_execute_warehouse_node(
                 return non_replayable_exec(&cand.model_name, cand.nondeterministic, vec![reason]);
             }
         };
-        let outcome =
-            match rocky_sql::defer::rewrite_upstream_refs(&cand.ir.sql, &renames, case_rules) {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    return non_replayable_exec(
-                        &cand.model_name,
-                        cand.nondeterministic,
-                        vec![format!(
-                            "recorded SQL could not be parsed to redirect upstream references into \
+        let outcome = match rocky_sql::defer::rewrite_upstream_refs(
+            &cand.ir.sql,
+            &renames,
+            case_rules,
+            crate::commands::run::dialect_recursive_cte_visibility(warehouse.dialect()),
+        ) {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                return non_replayable_exec(
+                    &cand.model_name,
+                    cand.nondeterministic,
+                    vec![format!(
+                        "recorded SQL could not be parsed to redirect upstream references into \
                          the replay namespace: {e}"
-                        )],
-                    );
-                }
-            };
+                    )],
+                );
+            }
+        };
         if !outcome.ambiguous_refs.is_empty() {
             return non_replayable_exec(
                 &cand.model_name,

@@ -5731,6 +5731,7 @@ fn apply_defer_rewrite(
     // lookup (which is by exact model name). Same dialect table the shadow path
     // uses, deliberately shared rather than copied.
     let case_rules = dialect_case_rules(dialect)?;
+    let recursive_visibility = dialect_recursive_cte_visibility(dialect);
 
     // Rewrite each selected model's SQL in place. Only the selected models
     // execute, so rewriting just those is sufficient (and avoids touching
@@ -5739,18 +5740,23 @@ fn apply_defer_rewrite(
         if !selected_set.contains(model.config.name.as_str()) {
             continue;
         }
-        let rewritten = rocky_sql::defer::qualify_deferred_refs(&model.sql, &deferred, case_rules)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "`--defer` could not rewrite the upstream references in model '{}': its SQL \
+        let rewritten = rocky_sql::defer::qualify_deferred_refs(
+            &model.sql,
+            &deferred,
+            case_rules,
+            recursive_visibility,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "`--defer` could not rewrite the upstream references in model '{}': its SQL \
                      did not parse ({e}). `--defer` parses each selected model's SQL to qualify \
                      deferred upstreams; constructs the parser does not yet support (e.g. \
                      `SELECT * EXCEPT (...)`, trailing-comma select lists, `STRUCT(...)` \
                      literals) cannot be rewritten. Build this model without `--defer`, or \
                      adjust its SQL.",
-                    model.config.name,
-                )
-            })?;
+                model.config.name,
+            )
+        })?;
         model.sql = rewritten;
     }
 
@@ -5850,6 +5856,40 @@ fn reject_unsupported_shadow(
 ///
 /// Unknown dialects fail closed. ‼️ Keep the arms in step with
 /// [`rewrite_quote_style`] — see the note there.
+/// Whether this dialect lets a CTE in a `WITH RECURSIVE` clause reference an
+/// alias declared after it.
+///
+/// A separate question from [`dialect_case_rules`] — that one says which
+/// spellings name one object, this says which names are in scope — and the two
+/// dialects that have been grounded give opposite answers, so it cannot be
+/// inferred from anything else here.
+///
+/// Unlike the case table this does NOT fail closed on an unknown dialect,
+/// because refusing would reject every recursive query rather than the
+/// ambiguous shape. It returns the conservative policy instead, and the
+/// direction is deliberate: assuming `Forward` where it is wrong leaves a
+/// reference that binds to a physical table unrewritten, so a shadow run reads
+/// PRODUCTION and exits 0, while assuming `PrecedingAndSelf` where it is wrong
+/// rewrites a reference that binds to a CTE — wrong data, but isolated.
+///
+/// ‼️ Only two entries are grounded. Snowflake, Databricks and Trino inherit the
+/// conservative default and are UNVERIFIED; the experiment that settles each is
+/// the one run for DuckDB — create a physical table, then
+/// `WITH RECURSIVE first AS (SELECT * FROM t), t AS (SELECT 999 AS id) SELECT *
+/// FROM first`, and see whether the physical row or 999 comes back.
+pub(crate) fn dialect_recursive_cte_visibility(
+    dialect: &dyn rocky_core::traits::SqlDialect,
+) -> rocky_sql::defer::RecursiveCteVisibility {
+    match dialect.name() {
+        // "A recursive CTE can reference itself, a preceding CTE, or a
+        // subsequent CTE." — docs.cloud.google.com/bigquery/docs/recursive-ctes
+        "bigquery" => rocky_sql::defer::RecursiveCteVisibility::Forward,
+        // DuckDB verified empirically: the earlier body reads the physical
+        // table, not the later CTE. Everything else inherits this conservatively.
+        _ => rocky_sql::defer::RecursiveCteVisibility::PrecedingAndSelf,
+    }
+}
+
 pub(crate) fn dialect_case_rules(
     dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> Result<rocky_sql::defer::IdentifierCaseRules> {
@@ -5974,6 +6014,7 @@ fn apply_shadow_rewrite(
     // Both rules are placeholders for a fact Rocky cannot currently obtain;
     // #1281 tracks reading the live setting, which would replace them.
     let case_rules = dialect_case_rules(dialect)?;
+    let recursive_visibility = dialect_recursive_cte_visibility(dialect);
     let collision_identity = |catalog: &str, schema: &str, table: &str| {
         rocky_sql::defer::CollisionIdentity::of(catalog, schema, table)
     };
@@ -6204,13 +6245,18 @@ fn apply_shadow_rewrite(
                 .map(|(_, route)| route.clone())
                 .collect();
         if !renames.is_empty() {
-            let outcome = rocky_sql::defer::rewrite_upstream_refs(&model.sql, &renames, case_rules)
-                .with_context(|| {
-                    format!(
-                        "shadow mode could not rewrite upstream references in model '{}'",
-                        model.config.name
-                    )
-                })?;
+            let outcome = rocky_sql::defer::rewrite_upstream_refs(
+                &model.sql,
+                &renames,
+                case_rules,
+                recursive_visibility,
+            )
+            .with_context(|| {
+                format!(
+                    "shadow mode could not rewrite upstream references in model '{}'",
+                    model.config.name
+                )
+            })?;
             anyhow::ensure!(
                 outcome.ambiguous_refs.is_empty(),
                 "shadow mode cannot safely route ambiguous upstream reference(s) {:?} in model \
@@ -16981,6 +17027,48 @@ timestamp_column = "ts"
                 && message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
             "the refusal must explain the unobservable-connection-state reason: {message}"
         );
+    }
+
+    /// The recursive-CTE visibility mapping, pinned per dialect.
+    ///
+    /// BigQuery documents that a recursive CTE may reference a SUBSEQUENT CTE
+    /// ("A recursive CTE can reference itself, a preceding CTE, or a subsequent
+    /// CTE"), so a reference matching a later alias binds to that CTE and must
+    /// not be redirected. DuckDB was verified empirically to bind the same shape
+    /// to the physical table instead. Everything else inherits the conservative
+    /// policy, because its failure mode (reading a shadow table instead of a
+    /// CTE) is isolated while `Forward`'s (reading production) is not.
+    ///
+    /// Mutation: drop the bigquery arm and this fails. Without it nothing pins
+    /// the mapping — the matcher tests only exercise the two policies directly.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn recursive_cte_visibility_is_mapped_per_dialect() {
+        use rocky_sql::defer::RecursiveCteVisibility;
+
+        assert_eq!(
+            super::dialect_recursive_cte_visibility(&rocky_bigquery::dialect::BigQueryDialect),
+            RecursiveCteVisibility::Forward,
+            "BigQuery permits forward references inside WITH RECURSIVE"
+        );
+        for (name, dialect) in [
+            (
+                "duckdb",
+                &rocky_duckdb::dialect::DuckDbSqlDialect as &dyn rocky_core::traits::SqlDialect,
+            ),
+            ("snowflake", &rocky_snowflake::dialect::SnowflakeSqlDialect),
+            ("trino", &rocky_trino::dialect::TrinoDialect),
+            (
+                "databricks",
+                &rocky_databricks::dialect::DatabricksSqlDialect,
+            ),
+        ] {
+            assert_eq!(
+                super::dialect_recursive_cte_visibility(dialect),
+                RecursiveCteVisibility::PrecedingAndSelf,
+                "{name} takes the conservative policy"
+            );
+        }
     }
 
     /// E9 — a model that is routed but has no DAG node fails the run loudly.
