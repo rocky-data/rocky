@@ -57,6 +57,15 @@ selected upstream (two models whose targets share a name in different
 catalogs, read as a bare or partially qualified name), Rocky refuses the run
 rather than guess which one to read.
 
+Matching follows the warehouse's own rule for identifier case, per component.
+On DuckDB, Databricks and Trino — where case is not part of object identity —
+`Orders` and `orders` name one table and either spelling is redirected. On
+BigQuery and Snowflake they are two tables, so a reference is matched exactly:
+a model reading `raw.Orders` is **not** redirected to the shadow of a model
+whose target is `raw.orders`, because it never read that table. Two selected
+models whose targets differ only by case are therefore routed independently on
+those warehouses, rather than the run being refused.
+
 ## Shadow target rewriting
 
 ### Suffix mode (default)
