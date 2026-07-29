@@ -6145,19 +6145,27 @@ fn apply_shadow_rewrite(
         );
     }
 
-    // NOTE: a whole-run refusal used to sit here. On a case-sensitive dialect
-    // it rejected any run routing two models whose configured targets differed
-    // only by case, because the rename keys were folded together and the matcher
-    // compared case-insensitively — so a read of either could land on the wrong
-    // model's shadow. Both halves of that are now fixed at their source:
-    // `target_identity` above folds only where the dialect folds, so the two
-    // targets stay distinct keys, and `rewrite_upstream_refs` disambiguates a
-    // reference that folds onto several keys by its own spelling. The guard's
-    // own comment named this as the durable fix — "reconstructing the matcher's
-    // resolution from outside the matcher is what kept failing" — and with the
-    // resolution done inside the matcher, a run that is provably safe now
-    // succeeds instead of being refused, while a genuinely ambiguous REFERENCE
-    // still fails closed via `ambiguous_refs`.
+    // NOTE: a whole-run case refusal used to sit here. Read what follows
+    // carefully before deciding it is now redundant — an earlier revision of
+    // this note argued exactly that, and it was wrong.
+    //
+    // The refusal MOVED; it did not disappear. Two SELECTED models whose
+    // targets differ only by case are still refused, at `shadow_owners.insert`
+    // above, because `shadow_key` is built with `collision_identity`, which
+    // always folds — so both derive the same shadow key whichever mode
+    // `shadow_target` used. `case_differing_targets_collide_on_every_dialect`
+    // exists to pin that, and this comment must not be read as an argument for
+    // collapsing `collision_identity` back into `target_identity`.
+    //
+    // What genuinely changed is narrower: where only ONE of such a pair is
+    // selected, there is a single `shadow_owners` entry and no production-target
+    // collision, so that run now succeeds where the old guard rejected it. And
+    // the misdirection the guard was really protecting against — a read landing
+    // on the wrong model's shadow — is now prevented at its source, by
+    // `target_identity` keeping the two targets distinct and by
+    // `rewrite_upstream_refs` comparing per component. A reference that matches
+    // only under folding is reported and refused per REFERENCE rather than by
+    // rejecting the whole run.
 
     // Reverse index of the rename keys, so a key that `rewrite_upstream_refs`
     // reports as rewritten can be mapped back to the model that produces it.
@@ -6268,7 +6276,20 @@ fn apply_shadow_rewrite(
                 .iter_mut()
                 .find(|n| n.name == consumer)
             else {
-                continue;
+                // Unreachable today: `Project` construction pushes exactly one
+                // `DagNode` per model, keyed on the same `config.name` this
+                // looks up. It is a `bail!` rather than a `continue` because the
+                // failure it would otherwise produce is silent AND compound —
+                // the derived edge is dropped, and because `added` stays 0 the
+                // re-topological-sort below is skipped too, so a consumer can
+                // share an execution layer with the producer whose shadow table
+                // it reads. Under `--parallel` that reads a table which has not
+                // been written yet, and the run reports success.
+                anyhow::bail!(
+                    "shadow mode derived a dependency on '{producer}' for model '{consumer}', \
+                     but '{consumer}' has no node in the compiled DAG — the model set and the \
+                     DAG have diverged, so the execution order cannot be corrected safely"
+                );
             };
             if !node.depends_on.contains(&producer) {
                 node.depends_on.push(producer);
@@ -16963,6 +16984,65 @@ timestamp_column = "ts"
             message.contains("match only when identifier case is ignored")
                 && message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
             "the refusal must explain the unobservable-connection-state reason: {message}"
+        );
+    }
+
+    /// E9 — a model that is routed but has no DAG node fails the run loudly.
+    ///
+    /// Unreachable today (`Project` construction pushes one node per model), and
+    /// that is exactly why it costs nothing to enforce now. The failure it
+    /// replaces was silent AND compound: the derived edge was dropped, and
+    /// because `added` stayed 0 the re-topological-sort was skipped too, so a
+    /// consumer could share an execution layer with the producer whose shadow
+    /// table it reads — reading a table not yet written, and reporting success.
+    ///
+    /// Mutation: restore `else { continue; }` and this passes.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_fails_when_a_routed_model_has_no_dag_node() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // `consumer` physically reads `producer`'s target, so the rewrite
+        // derives a consumer -> producer edge and needs the consumer's node.
+        write_model_with_target(
+            &models_dir,
+            "producer",
+            "SELECT 1 AS id",
+            "main",
+            "producer",
+        );
+        write_model_with_target(
+            &models_dir,
+            "consumer",
+            "SELECT id FROM main.producer",
+            "main",
+            "consumer",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        // Diverge the DAG from the model set, which is the state the bail!
+        // exists to refuse to execute under.
+        compiled.project.dag_nodes.retain(|n| n.name != "consumer");
+
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_duckdb::dialect::DuckDbSqlDialect,
+            false,
+        )
+        .expect_err("a derived edge with no node to attach it to must not be dropped silently");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("has no node in the compiled DAG"),
+            "the refusal must name the divergence: {message}"
         );
     }
 

@@ -261,10 +261,16 @@ fn tail_matches_with_case(
 pub struct UpstreamRewriteOutcome {
     /// The statement re-serialized after rewriting.
     pub sql: String,
-    /// The rename keys (lowercase `catalog.schema.table`) that matched at
-    /// least one relation and were rewritten. Callers that require *every*
-    /// upstream reference to be redirected compare this against the rename
-    /// key set and fail closed on any miss.
+    /// The rename keys that matched at least one relation and were rewritten,
+    /// returned **verbatim** — exactly the `String` the caller supplied in
+    /// `renames`, never re-derived or folded. (It used to say "lowercase",
+    /// which stopped being true once keys became case-preserving.)
+    ///
+    /// That is a contract two callers depend on: shadow execution looks these
+    /// up in an `owner_by_key` map built from the same key space to attribute
+    /// derived DAG edges, and replay compares them against its own key set to
+    /// require that *every* upstream was redirected. A key normalised on the
+    /// way out would miss both lookups silently.
     pub rewritten_keys: HashSet<String>,
     /// Display strings of relations that matched **more than one** rename
     /// key (a partially-qualified reference whose tail is shared by several
