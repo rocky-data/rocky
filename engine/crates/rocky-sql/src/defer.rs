@@ -308,7 +308,7 @@ pub fn rewrite_upstream_refs(
     let mut rewriter = UpstreamRewriter {
         renames: &split,
         case_rules,
-        scopes: Vec::new(),
+        scopes: CteScopeStack::new(case_rules),
         rewritten_keys: HashSet::new(),
         ambiguous_refs: Vec::new(),
         case_fold_only_refs: Vec::new(),
@@ -337,23 +337,90 @@ struct UpstreamRewriter<'a> {
     renames: &'a [(Vec<String>, &'a String, &'a DeferTarget)],
     /// Per-component case semantics for this dialect.
     case_rules: IdentifierCaseRules,
-    scopes: Vec<CteScope>,
+    scopes: CteScopeStack,
     rewritten_keys: HashSet<String>,
     ambiguous_refs: Vec<String>,
     case_fold_only_refs: Vec<String>,
 }
 
-impl UpstreamRewriter<'_> {
-    /// The lookup form of an identifier: resolved the way the warehouse resolves
-    /// it, then folded unless case is part of identity.
-    ///
-    /// Used for BOTH the CTE frames and the reference tested against them, so
-    /// the two cannot disagree. They did: frames stored the alias verbatim and
-    /// `is_shadowed` compared exactly, while relation matching folded. On a
-    /// case-insensitive dialect `WITH Orders … FROM orders` therefore did not
-    /// register as shadowed — those are ONE CTE there — and the reference was
-    /// rewritten to a shadow table, so the query silently read something the
-    /// author never named.
+/// Which part of a query's `WITH` structure the walk is currently inside.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Region {
+    /// The query's own body, or a subquery of it: every alias is visible.
+    Body,
+    /// The body of the CTE at this index: only the aliases before it are.
+    Cte(usize),
+}
+
+/// One query's CTE aliases, plus where in that query the walk currently is.
+///
+/// A non-recursive CTE is visible to the CTEs declared AFTER it and to the
+/// query body — never to the ones before it.
+///
+/// `body_addr` maps the heap address of each CTE's body `Query` to that CTE's
+/// index. `Cte::query` is a `Box<Query>`, so the address is stable for the
+/// whole walk and the visitor is handed that same allocation when it descends.
+/// Keying on identity rather than on arrival order is deliberate: the previous
+/// design counted completed child queries and so depended on `with` being
+/// visited before `body` and on CTE bodies arriving in declaration order.
+/// Neither is guaranteed by `sqlparser`'s `VisitorMut` contract, which promises
+/// only "before/after visiting children". Nothing here assumes either.
+///
+/// The one residual assumption: a CTE body is visited AS a direct child
+/// `Query`. If a future `sqlparser` flattens that or introduces its own CTE
+/// hook, the address lookup finds nothing, `region` stays [`Region::Body`],
+/// every alias is visible everywhere, and an upstream reference inside an
+/// earlier CTE body is left unrewritten — reading production while the model
+/// writes its shadow. `cte_visibility_is_positional` case 1 is the detector;
+/// `sqlparser_visits_with_before_body` is the canary that names the cause.
+struct CteScope {
+    /// Lookup-form aliases in declaration order.
+    aliases: Vec<String>,
+    /// Address of each CTE body `Query` → its index in `aliases`.
+    body_addr: HashMap<usize, usize>,
+    /// `WITH RECURSIVE`: every alias is visible everywhere in the query,
+    /// including its own body. Broader than SQL, and deliberately preserved.
+    recursive: bool,
+    region: Region,
+}
+
+impl CteScope {
+    /// The aliases visible at the walk's current position in this query.
+    fn visible(&self) -> &[String] {
+        match self.region {
+            _ if self.recursive => &self.aliases,
+            Region::Body => &self.aliases,
+            Region::Cte(i) => &self.aliases[..i],
+        }
+    }
+}
+
+/// The CTE scope stack shared by both rewriters in this module.
+///
+/// Both need the identical alias rule, so this is one struct rather than a
+/// trait. Owning it in both visitors is what keeps them from drifting apart:
+/// every alias that enters a frame goes through [`Self::lookup_form`], and the
+/// reference tested against it goes through the same function, so the frame and
+/// the test cannot disagree about case or quoting. They did — frames stored the
+/// alias verbatim and compared exactly while relation matching folded, so on a
+/// case-insensitive dialect `WITH Orders … FROM orders` was not treated as
+/// shadowed (those are ONE CTE there) and the reference was rewritten to a
+/// table the author never named.
+struct CteScopeStack {
+    frames: Vec<CteScope>,
+    case_rules: IdentifierCaseRules,
+}
+
+impl CteScopeStack {
+    fn new(case_rules: IdentifierCaseRules) -> Self {
+        Self {
+            frames: Vec::new(),
+            case_rules,
+        }
+    }
+
+    /// The lookup form of an identifier: resolved the way the warehouse
+    /// resolves it, then folded unless case is part of identity.
     ///
     /// CTE names live in the table namespace, so the `table` rule governs.
     fn lookup_form(&self, value: &str, quoted: bool) -> String {
@@ -369,68 +436,68 @@ impl UpstreamRewriter<'_> {
         }
     }
 
-    fn is_shadowed(&self, name: &str) -> bool {
-        self.scopes
-            .iter()
-            .any(|frame| frame.in_scope.contains(name))
+    fn addr_of(query: &Query) -> usize {
+        std::ptr::from_ref(query).addr()
     }
-}
 
-/// One query's CTE scope, revealed in declaration order.
-///
-/// A non-recursive CTE is visible to the CTEs declared AFTER it and to the
-/// query body — never to the ones before it. Installing every alias up front
-/// (which this did) makes a later CTE shadow a reference in an earlier CTE's
-/// body, so an upstream read there is left unrewritten and reads PRODUCTION
-/// while the run routes that upstream to a shadow target.
-///
-/// `pending` holds the aliases not yet in scope, in declaration order.
-/// `children_done` counts direct child queries already walked: `with` is
-/// visited before `body`, so the first `pending.len()` of them are exactly the
-/// CTE bodies, and each completion promotes the next alias into `in_scope`.
-/// Later direct children (subqueries in the body) run with the full set, which
-/// is what `while children_done <= pending.len()` preserves.
-#[derive(Default)]
-struct CteScope {
-    in_scope: HashSet<String>,
-    pending: Vec<String>,
-    children_done: usize,
+    /// Call from `pre_visit_query`. Positions the PARENT frame — this query is
+    /// either one of its CTE bodies or part of its body — then pushes this
+    /// query's own frame.
+    fn enter_query(&mut self, query: &Query) {
+        let addr = Self::addr_of(query);
+        if let Some(parent) = self.frames.last_mut() {
+            parent.region = parent
+                .body_addr
+                .get(&addr)
+                .copied()
+                .map_or(Region::Body, Region::Cte);
+        }
+        let mut frame = CteScope {
+            aliases: Vec::new(),
+            body_addr: HashMap::new(),
+            recursive: query.with.as_ref().is_some_and(|w| w.recursive),
+            region: Region::Body,
+        };
+        if let Some(with) = &query.with {
+            for (index, cte) in with.cte_tables.iter().enumerate() {
+                let alias = &cte.alias.name;
+                frame
+                    .aliases
+                    .push(self.lookup_form(&alias.value, alias.quote_style.is_some()));
+                frame.body_addr.insert(Self::addr_of(&cte.query), index);
+            }
+        }
+        self.frames.push(frame);
+    }
+
+    /// Call from `post_visit_query`. Leaving a child returns the parent to its
+    /// own body, where every alias is visible again.
+    fn exit_query(&mut self) {
+        self.frames.pop();
+        if let Some(parent) = self.frames.last_mut() {
+            parent.region = Region::Body;
+        }
+    }
+
+    /// Whether `value` names a CTE in scope at this point of the walk.
+    fn is_shadowed(&self, value: &str, quoted: bool) -> bool {
+        let name = self.lookup_form(value, quoted);
+        self.frames
+            .iter()
+            .any(|frame| frame.visible().contains(&name))
+    }
 }
 
 impl VisitorMut for UpstreamRewriter<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        let mut frame = CteScope::default();
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                let alias = &cte.alias.name;
-                let name = self.lookup_form(&alias.value, alias.quote_style.is_some());
-                // A RECURSIVE CTE may reference itself, so it is in scope for
-                // its own body; a plain one is not.
-                if with.recursive {
-                    frame.in_scope.insert(name);
-                } else {
-                    frame.pending.push(name);
-                }
-            }
-        }
-        self.scopes.push(frame);
+        self.scopes.enter_query(query);
         ControlFlow::Continue(())
     }
 
     fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
-        self.scopes.pop();
-        // This query was a direct child of its parent. If it was one of the
-        // parent's CTE bodies, the alias it defines becomes visible to whatever
-        // the parent walks next.
-        if let Some(parent) = self.scopes.last_mut() {
-            parent.children_done += 1;
-            if parent.children_done <= parent.pending.len() {
-                let name = parent.pending[parent.children_done - 1].clone();
-                parent.in_scope.insert(name);
-            }
-        }
+        self.scopes.exit_query();
         ControlFlow::Continue(())
     }
 
@@ -451,7 +518,9 @@ impl VisitorMut for UpstreamRewriter<'_> {
         }
         // A bare name shadowed by a CTE in scope refers to the CTE.
         if spelled_parts.len() == 1
-            && self.is_shadowed(&self.lookup_form(spelled_parts[0].0, spelled_parts[0].1))
+            && self
+                .scopes
+                .is_shadowed(spelled_parts[0].0, spelled_parts[0].1)
         {
             return ControlFlow::Continue(());
         }
@@ -850,6 +919,81 @@ mod tests {
         let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
         let err = qualify_deferred_refs("NOT VALID SQL ;;;", &deferred);
         assert!(err.is_err());
+    }
+
+    /// DEPENDENCY CANARY for `CteScopeStack`'s one residual assumption.
+    ///
+    /// The scope stack keys CTE bodies by the heap address of their `Query`, so
+    /// it no longer depends on `with` preceding `body` or on CTE bodies arriving
+    /// in declaration order. What it DOES still require is that each CTE body is
+    /// visited **as a direct child `Query`**, so `pre_visit_query` is handed that
+    /// same allocation.
+    ///
+    /// If a future `sqlparser` flattens that traversal or adds its own CTE hook,
+    /// the address lookup finds nothing, `region` stays `Body`, every alias
+    /// becomes visible everywhere, and an upstream reference inside an earlier
+    /// CTE body is silently left unrewritten — reading production while the
+    /// model writes its shadow.
+    ///
+    /// This test has no source mutation by design: it guards against a
+    /// `cargo update` of sqlparser, not against an edit here. Its source-mutation
+    /// partner is `cte_visibility_is_positional` case 1, which fails the moment
+    /// the address lookup stops resolving. This one names the cause; that one
+    /// proves it matters.
+    #[test]
+    fn sqlparser_visits_each_cte_body_as_a_direct_child_query() {
+        use sqlparser::ast::Statement;
+
+        #[derive(Default)]
+        struct Recorder {
+            events: Vec<String>,
+            depth: usize,
+        }
+        impl VisitorMut for Recorder {
+            type Break = ();
+            fn pre_visit_query(&mut self, q: &mut Query) -> ControlFlow<()> {
+                let with = q.with.as_ref().map_or(0, |w| w.cte_tables.len());
+                self.events.push(format!("query-pre(ctes={with})"));
+                self.depth += 1;
+                ControlFlow::Continue(())
+            }
+            fn post_visit_query(&mut self, _q: &mut Query) -> ControlFlow<()> {
+                self.depth -= 1;
+                self.events.push("query-post".to_string());
+                ControlFlow::Continue(())
+            }
+            fn pre_visit_relation(&mut self, r: &mut ObjectName) -> ControlFlow<()> {
+                self.events.push(format!("rel({r})"));
+                ControlFlow::Continue(())
+            }
+        }
+
+        let mut stmt: Statement = parse_single_statement(
+            "WITH a AS (SELECT * FROM x), b AS (SELECT * FROM y) SELECT * FROM z",
+        )
+        .unwrap();
+        let mut rec = Recorder::default();
+        let _: ControlFlow<()> = stmt.visit(&mut rec);
+
+        assert_eq!(
+            rec.events,
+            vec![
+                "query-pre(ctes=2)",
+                "query-pre(ctes=0)",
+                "rel(x)",
+                "query-post",
+                "query-pre(ctes=0)",
+                "rel(y)",
+                "query-post",
+                "rel(z)",
+                "query-post",
+            ],
+            "sqlparser's traversal changed. The load-bearing part is that each \
+             CTE body appears as its own query-pre/query-post pair — if those \
+             disappeared, CteScopeStack's address keying silently stops working. \
+             Order within the walk is NOT load-bearing and this assertion may be \
+             relaxed for an ordering change alone."
+        );
     }
 
     // -- rewrite_upstream_refs ---------------------------------------------
