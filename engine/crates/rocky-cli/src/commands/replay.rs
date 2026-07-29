@@ -1626,14 +1626,18 @@ async fn replay_execute_warehouse(
 /// compared (`verify`) via [`build_execute_verdict`].
 /// Map each recorded in-run upstream identity to its replay-namespace target.
 ///
-/// Keys are the recorded identity **verbatim**. They used to be lowercased, and
-/// that folding is what let two recorded upstreams differing only by case
-/// collapse into ONE map entry, last write wins — after which the caller's
+/// Keys are `TargetIdentity`, folded per component under the warehouse's own
+/// rules. They used to be unconditionally lowercased, and that blanket folding
+/// is what let two recorded upstreams differing only by case — two distinct
+/// objects on Snowflake or BigQuery — collapse into ONE map entry, last write
+/// wins — after which the caller's
 /// completeness check iterated the SURVIVING keys, so the lost upstream was
 /// never checked, its reference was never redirected, and the replayed recipe
 /// read the production upstream's current contents while the check reported
-/// success. Verbatim keys make that collapse impossible by construction rather
-/// than detectable by counting; two distinct identities are two distinct keys.
+/// success. Keying on the dialect's real identity makes that collapse
+/// impossible where the two ARE distinct objects, by construction rather than
+/// by counting — while still collapsing them on a dialect that genuinely folds,
+/// where one entry is the correct answer.
 ///
 /// Extracted from the caller so that property is directly testable.
 ///
@@ -1645,9 +1649,15 @@ async fn replay_execute_warehouse(
 fn build_replay_renames(
     upstreams: &[String],
     replay_schema: &str,
-) -> std::result::Result<std::collections::HashMap<String, rocky_sql::defer::DeferTarget>, String> {
-    let mut renames: std::collections::HashMap<String, rocky_sql::defer::DeferTarget> =
-        std::collections::HashMap::new();
+    case_rules: rocky_sql::defer::IdentifierCaseRules,
+) -> std::result::Result<
+    std::collections::HashMap<rocky_sql::defer::TargetIdentity, rocky_sql::defer::DeferTarget>,
+    String,
+> {
+    let mut renames: std::collections::HashMap<
+        rocky_sql::defer::TargetIdentity,
+        rocky_sql::defer::DeferTarget,
+    > = std::collections::HashMap::new();
     for upstream in upstreams {
         let parts: Vec<&str> = upstream.split('.').collect();
         let [up_catalog, up_schema, up_table] = parts.as_slice() else {
@@ -1665,7 +1675,7 @@ fn build_replay_renames(
             ));
         }
         renames.insert(
-            upstream.clone(),
+            rocky_sql::defer::TargetIdentity::of(up_catalog, up_schema, up_table, case_rules),
             rocky_sql::defer::DeferTarget {
                 catalog: (*up_catalog).to_string(),
                 schema: replay_schema.to_string(),
@@ -1721,12 +1731,6 @@ async fn replay_execute_warehouse_node(
     let sql = if cand.in_run_upstreams.is_empty() {
         cand.ir.sql.clone()
     } else {
-        let renames = match build_replay_renames(&cand.in_run_upstreams, replay_schema) {
-            Ok(renames) => renames,
-            Err(reason) => {
-                return non_replayable_exec(&cand.model_name, cand.nondeterministic, vec![reason]);
-            }
-        };
         // The warehouse's OWN rules, not `all_insensitive()`. That blanket was
         // justified on the keys being folded, which was true — but the
         // justification does not reach the REFERENCES: the matcher folds both
@@ -1745,6 +1749,13 @@ async fn replay_execute_warehouse_node(
                         "cannot redirect upstream references into the replay namespace: {e:#}"
                     )],
                 );
+            }
+        };
+        let renames = match build_replay_renames(&cand.in_run_upstreams, replay_schema, case_rules)
+        {
+            Ok(renames) => renames,
+            Err(reason) => {
+                return non_replayable_exec(&cand.model_name, cand.nondeterministic, vec![reason]);
             }
         };
         let outcome =
@@ -2443,43 +2454,76 @@ mod tests {
 
     // -- warehouse replay: namespacing + isolation -------------------------
 
-    /// E6 — two recorded upstreams differing only by case stay TWO entries.
+    /// E6 — two recorded upstreams differing only by case stay TWO entries
+    /// exactly where the warehouse says they are two objects.
     ///
-    /// The keys were lowercased, so such a pair collapsed to one map entry,
-    /// last write wins. The caller's completeness check then iterates
-    /// `renames.keys()` — the surviving key only — so the lost upstream was
-    /// never checked, its reference never redirected, and the replayed recipe
-    /// read the production upstream's current contents while the check PASSED.
+    /// The keys were unconditionally lowercased, so such a pair collapsed to one
+    /// map entry, last write wins. The caller's completeness check then iterates
+    /// the surviving keys only, so the lost upstream was never checked, its
+    /// reference never redirected, and the replayed recipe read the production
+    /// upstream's current contents while the check PASSED.
     ///
-    /// Mutation: restore `upstream.to_ascii_lowercase()` as the key. The map
-    /// drops to one entry and this fails.
+    /// The folding half is not an afterthought — it is what makes this a
+    /// correctness rule rather than a blanket "never fold". On DuckDB the two
+    /// spellings ARE one object, and one entry is the right answer.
+    ///
+    /// Mutation: key on `upstream.to_ascii_lowercase()`. The case-sensitive half
+    /// drops to one entry and fails.
     #[test]
-    fn replay_renames_do_not_collapse_case_differing_upstreams() {
+    fn replay_renames_collapse_case_differing_upstreams_only_where_the_dialect_folds() {
+        use rocky_sql::defer::IdentifierCaseRules;
         let upstreams = vec!["cat.s.T".to_string(), "cat.s.t".to_string()];
-        let renames = super::build_replay_renames(&upstreams, "replay_ns").unwrap();
+
+        // Case-sensitive: two objects, two keys, two replay tables.
+        let sensitive = super::build_replay_renames(
+            &upstreams,
+            "replay_ns",
+            IdentifierCaseRules::uniform(true),
+        )
+        .unwrap();
         assert_eq!(
-            renames.len(),
+            sensitive.len(),
             2,
-            "case-differing upstreams are distinct objects and must keep distinct keys: {:?}",
-            renames.keys().collect::<Vec<_>>()
+            "case-differing upstreams are distinct objects here and must keep distinct keys"
         );
-        for key in &upstreams {
-            assert!(
-                renames.contains_key(key),
-                "{key} must be present verbatim, not folded"
-            );
-        }
-        // Each maps to its own replay table, so neither can shadow the other.
-        assert_eq!(renames["cat.s.T"].table, "s__T");
-        assert_eq!(renames["cat.s.t"].table, "s__t");
+        let tables: std::collections::BTreeSet<&str> =
+            sensitive.values().map(|t| t.table.as_str()).collect();
+        assert_eq!(
+            tables,
+            ["s__T", "s__t"].into_iter().collect(),
+            "each upstream gets its own replay table, so neither can shadow the other"
+        );
+
+        // Case-insensitive: ONE object, so one entry is correct.
+        let folding = super::build_replay_renames(
+            &upstreams,
+            "replay_ns",
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
+        assert_eq!(
+            folding.len(),
+            1,
+            "on a folding dialect the two spellings name one object"
+        );
     }
 
     /// The extracted helper keeps the caller's two fail-closed validations.
     #[test]
     fn replay_renames_reject_malformed_upstream_keys() {
-        let err = super::build_replay_renames(&["cat.s".to_string()], "ns").unwrap_err();
+        let err = super::build_replay_renames(
+            &["cat.s".to_string()],
+            "ns",
+            rocky_sql::defer::IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap_err();
         assert!(err.contains("catalog.schema.table"), "{err}");
-        let err = super::build_replay_renames(&["cat.s.bad-name".to_string()], "ns").unwrap_err();
+        let err = super::build_replay_renames(
+            &["cat.s.bad-name".to_string()],
+            "ns",
+            rocky_sql::defer::IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap_err();
         assert!(err.contains("not a valid SQL identifier"), "{err}");
     }
 

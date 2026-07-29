@@ -5975,27 +5975,16 @@ fn apply_shadow_rewrite(
     // #1281 tracks reading the live setting, which would replace them.
     let case_rules = dialect_case_rules(dialect)?;
     let collision_identity = |catalog: &str, schema: &str, table: &str| {
-        format!("{catalog}.{schema}.{table}").to_ascii_lowercase()
+        rocky_sql::defer::CollisionIdentity::of(catalog, schema, table)
     };
     let target_identity = |catalog: &str, schema: &str, table: &str| {
-        let component = |value: &str, sensitive: bool| {
-            if sensitive {
-                value.to_string()
-            } else {
-                value.to_ascii_lowercase()
-            }
-        };
-        format!(
-            "{}.{}.{}",
-            component(catalog, case_rules.catalog),
-            component(schema, case_rules.schema),
-            component(table, case_rules.table),
-        )
+        rocky_sql::defer::TargetIdentity::of(catalog, schema, table, case_rules)
     };
 
     let quote_style = rewrite_quote_style(dialect)?;
 
-    let mut production_targets: HashMap<String, Vec<String>> = HashMap::new();
+    let mut production_targets: HashMap<rocky_sql::defer::CollisionIdentity, Vec<String>> =
+        HashMap::new();
     for model in &compile_result.project.models {
         production_targets
             .entry(collision_identity(
@@ -6006,8 +5995,14 @@ fn apply_shadow_rewrite(
             .or_default()
             .push(model.config.name.clone());
     }
-    let mut shadow_owners: HashMap<String, String> = HashMap::new();
-    let mut routes: HashMap<String, (String, rocky_sql::defer::DeferTarget)> = HashMap::new();
+    let mut shadow_owners: HashMap<rocky_sql::defer::CollisionIdentity, String> = HashMap::new();
+    let mut routes: HashMap<
+        String,
+        (
+            rocky_sql::defer::TargetIdentity,
+            rocky_sql::defer::DeferTarget,
+        ),
+    > = HashMap::new();
     for model in &compile_result.project.models {
         if !is_selected(&model.config.name) {
             continue;
@@ -6171,9 +6166,9 @@ fn apply_shadow_rewrite(
     // reports as rewritten can be mapped back to the model that produces it.
     // Every routed model materializes something: strategies that do not are
     // rejected above.
-    let owner_by_key: HashMap<&str, &str> = routes
+    let owner_by_key: HashMap<&rocky_sql::defer::TargetIdentity, &str> = routes
         .iter()
-        .map(|(name, (original_key, _))| (original_key.as_str(), name.as_str()))
+        .map(|(name, (original_key, _))| (original_key, name.as_str()))
         .collect();
     // Edges discovered by the rewrite: `(consumer, producer)`. Collected here
     // and applied to `dag_nodes` after the loop, which holds `models` mutably.
@@ -6202,11 +6197,12 @@ fn apply_shadow_rewrite(
         // pointing it at the not-yet-populated shadow target would change what
         // the model computes.
         //
-        let renames: HashMap<String, rocky_sql::defer::DeferTarget> = routes
-            .iter()
-            .filter(|(name, _)| name.as_str() != model.config.name.as_str())
-            .map(|(_, route)| route.clone())
-            .collect();
+        let renames: HashMap<rocky_sql::defer::TargetIdentity, rocky_sql::defer::DeferTarget> =
+            routes
+                .iter()
+                .filter(|(name, _)| name.as_str() != model.config.name.as_str())
+                .map(|(_, route)| route.clone())
+                .collect();
         if !renames.is_empty() {
             let outcome = rocky_sql::defer::rewrite_upstream_refs(&model.sql, &renames, case_rules)
                 .with_context(|| {
@@ -6247,7 +6243,7 @@ fn apply_shadow_rewrite(
             // and consumer can share an execution layer and the consumer reads
             // a shadow target that has not been written yet.
             for key in &outcome.rewritten_keys {
-                if let Some(producer) = owner_by_key.get(key.as_str())
+                if let Some(producer) = owner_by_key.get(key)
                     && *producer != model.config.name.as_str()
                 {
                     derived_edges.push((model.config.name.clone(), (*producer).to_string()));

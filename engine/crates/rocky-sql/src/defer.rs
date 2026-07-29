@@ -231,6 +231,84 @@ impl IdentifierCaseRules {
     }
 }
 
+/// The identity of a warehouse object, for answering **"is this reference
+/// definitely THIS object?"**
+///
+/// Folded per component per dialect: verbatim where case is part of identity,
+/// lowercased where it is not. Answering "same" when unsure would redirect a
+/// read to a table the model never named, so this demands proof.
+///
+/// Deliberately a distinct type from [`CollisionIdentity`], which answers the
+/// opposite question and fails closed in the opposite direction. The two were
+/// both `String`, built fourteen lines apart and consumed in the same loop, and
+/// every defect in this area lived in or beside that pair. Keeping them apart is
+/// now the compiler's job rather than the reader's.
+///
+/// Holds the three parts rather than a joined string: a component containing a
+/// dot used to be re-split wrongly on the way into the matcher.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TargetIdentity([String; 3]);
+
+impl TargetIdentity {
+    /// Build from a target's parts under this dialect's rules.
+    #[must_use]
+    pub fn of(catalog: &str, schema: &str, table: &str, rules: IdentifierCaseRules) -> Self {
+        let fold = |value: &str, sensitive: bool| {
+            if sensitive {
+                value.to_string()
+            } else {
+                value.to_ascii_lowercase()
+            }
+        };
+        Self([
+            fold(catalog, rules.catalog),
+            fold(schema, rules.schema),
+            fold(table, rules.table),
+        ])
+    }
+
+    /// The `[catalog, schema, table]` parts, already folded.
+    #[must_use]
+    pub fn parts(&self) -> &[String; 3] {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TargetIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.0[0], self.0[1], self.0[2])
+    }
+}
+
+/// The identity of a warehouse object, for answering **"could these two be the
+/// SAME object?"**
+///
+/// **Always** folds, on every dialect, and takes no [`IdentifierCaseRules`] *by
+/// construction* so it cannot accidentally be made case-aware. Whether case
+/// separates two objects is connection state Rocky cannot observe — a Snowflake
+/// account may set `QUOTED_IDENTIFIERS_IGNORE_CASE`, a BigQuery dataset may be
+/// `is_case_insensitive` — and answering "different" when they are in fact one
+/// object lets two models write the same table with no error at all. That is
+/// unrecoverable, while the remedy for an over-strict answer (rename a target)
+/// is trivial. This asymmetry is permanent; do not "unify" it with
+/// [`TargetIdentity`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CollisionIdentity(String);
+
+impl CollisionIdentity {
+    /// Build from a target's parts. No rules parameter, deliberately.
+    #[must_use]
+    pub fn of(catalog: &str, schema: &str, table: &str) -> Self {
+        Self(format!("{catalog}.{schema}.{table}").to_ascii_lowercase())
+    }
+}
+
+impl std::fmt::Display for CollisionIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Whether `spelled` matches the tail of `key_exact`, comparing each component
 /// case-sensitively only where `rules` says case is part of identity.
 ///
@@ -271,7 +349,7 @@ pub struct UpstreamRewriteOutcome {
     /// derived DAG edges, and replay compares them against its own key set to
     /// require that *every* upstream was redirected. A key normalised on the
     /// way out would miss both lookups silently.
-    pub rewritten_keys: HashSet<String>,
+    pub rewritten_keys: HashSet<TargetIdentity>,
     /// Display strings of relations that matched **more than one** rename
     /// key (a partially-qualified reference whose tail is shared by several
     /// upstreams). Ambiguous references are left untouched — callers must
@@ -309,20 +387,16 @@ pub struct UpstreamRewriteOutcome {
 /// Returns [`ParseError`] when `sql` is not a single parseable statement.
 pub fn rewrite_upstream_refs(
     sql: &str,
-    renames: &HashMap<String, DeferTarget>,
+    renames: &HashMap<TargetIdentity, DeferTarget>,
     case_rules: IdentifierCaseRules,
 ) -> Result<UpstreamRewriteOutcome, ParseError> {
     let mut statement = parse_single_statement(sql)?;
 
-    // Pre-split each rename key into its (catalog, schema, table) parts once,
-    // preserving case — the comparison below decides per component whether case
-    // matters.
-    let split: Vec<(Vec<String>, &String, &DeferTarget)> = renames
+    // The parts come straight off the key — no re-splitting on `.`, which used
+    // to mis-handle a component containing one.
+    let split: Vec<(&[String; 3], &TargetIdentity, &DeferTarget)> = renames
         .iter()
-        .map(|(key, target)| {
-            let exact: Vec<String> = key.split('.').map(str::to_string).collect();
-            (exact, key, target)
-        })
+        .map(|(key, target)| (key.parts(), key, target))
         .collect();
 
     let mut rewriter = UpstreamRewriter {
@@ -354,11 +428,11 @@ pub fn rewrite_upstream_refs(
 /// in scope is a reference to that CTE, never to the upstream.
 struct UpstreamRewriter<'a> {
     /// `(key parts, original key, replacement)` triples, key parts as spelled.
-    renames: &'a [(Vec<String>, &'a String, &'a DeferTarget)],
+    renames: &'a [(&'a [String; 3], &'a TargetIdentity, &'a DeferTarget)],
     /// Per-component case semantics for this dialect.
     case_rules: IdentifierCaseRules,
     scopes: CteScopeStack,
-    rewritten_keys: HashSet<String>,
+    rewritten_keys: HashSet<TargetIdentity>,
     ambiguous_refs: Vec<String>,
     case_fold_only_refs: Vec<String>,
 }
@@ -562,11 +636,11 @@ impl VisitorMut for UpstreamRewriter<'_> {
         // then two DIFFERENT objects and redirecting a read of one to the
         // other's replacement would silently read the wrong table. Where it is
         // not, the comparison folds, exactly as it always has.
-        let candidates: Vec<&(Vec<String>, &String, &DeferTarget)> = self
+        let candidates: Vec<&(&[String; 3], &TargetIdentity, &DeferTarget)> = self
             .renames
             .iter()
             .filter(|(key_exact, _, _)| {
-                tail_matches_with_case(key_exact, &original, self.case_rules)
+                tail_matches_with_case(*key_exact, &original, self.case_rules)
             })
             .collect();
         match candidates.as_slice() {
@@ -590,7 +664,7 @@ impl VisitorMut for UpstreamRewriter<'_> {
                 // and rule-based matching coincide, so this can never fire.
                 if self.renames.iter().any(|(key_exact, _, _)| {
                     tail_matches_with_case(
-                        key_exact,
+                        *key_exact,
                         &original,
                         IdentifierCaseRules::all_insensitive(),
                     )
@@ -1190,11 +1264,22 @@ mod tests {
 
     // -- rewrite_upstream_refs ---------------------------------------------
 
-    fn renames_map(entries: &[(&str, DeferTarget)]) -> HashMap<String, DeferTarget> {
-        entries
-            .iter()
-            .map(|(k, v)| ((*k).to_string(), v.clone()))
-            .collect()
+    /// A `catalog.schema.table` string as a `TargetIdentity`, spelling
+    /// preserved. `uniform(true)` folds nothing, so the parts are exactly as
+    /// written — which is what these tests mean when they write a key.
+    fn tid(key: &str) -> TargetIdentity {
+        let parts: Vec<&str> = key.split('.').collect();
+        assert_eq!(parts.len(), 3, "test keys are catalog.schema.table");
+        TargetIdentity::of(
+            parts[0],
+            parts[1],
+            parts[2],
+            IdentifierCaseRules::uniform(true),
+        )
+    }
+
+    fn renames_map(entries: &[(&str, DeferTarget)]) -> HashMap<TargetIdentity, DeferTarget> {
+        entries.iter().map(|(k, v)| (tid(k), v.clone())).collect()
     }
 
     #[test]
@@ -1207,7 +1292,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.sql, "SELECT * FROM cat.replay_ns.raw__orders");
-        assert!(out.rewritten_keys.contains("cat.raw.orders"));
+        assert!(out.rewritten_keys.contains(&tid("cat.raw.orders")));
         assert!(out.ambiguous_refs.is_empty());
     }
 
@@ -1228,7 +1313,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bare.sql, "SELECT * FROM cat.replay_ns.raw__orders");
-        assert!(bare.rewritten_keys.contains("cat.raw.orders"));
+        assert!(bare.rewritten_keys.contains(&tid("cat.raw.orders")));
     }
 
     #[test]
@@ -1400,12 +1485,12 @@ mod tests {
 
         let upper = rewrite_upstream_refs("SELECT * FROM cat.raw.Orders", &renames, rules).unwrap();
         assert_eq!(upper.sql, "SELECT * FROM cat.shadow.upper__orders");
-        assert!(upper.rewritten_keys.contains("cat.raw.Orders"));
+        assert!(upper.rewritten_keys.contains(&tid("cat.raw.Orders")));
         assert!(upper.ambiguous_refs.is_empty());
 
         let lower = rewrite_upstream_refs("SELECT * FROM cat.raw.orders", &renames, rules).unwrap();
         assert_eq!(lower.sql, "SELECT * FROM cat.shadow.lower__orders");
-        assert!(lower.rewritten_keys.contains("cat.raw.orders"));
+        assert!(lower.rewritten_keys.contains(&tid("cat.raw.orders")));
         assert!(lower.ambiguous_refs.is_empty());
     }
 
@@ -1659,7 +1744,7 @@ mod tests {
             "a later CTE must not shadow an earlier body's upstream read: {}",
             out.sql
         );
-        assert!(out.rewritten_keys.contains("cat.raw.orders"));
+        assert!(out.rewritten_keys.contains(&tid("cat.raw.orders")));
 
         // 2. Later CTE body referencing an EARLIER CTE: shadowed.
         let out = rewrite_upstream_refs(
