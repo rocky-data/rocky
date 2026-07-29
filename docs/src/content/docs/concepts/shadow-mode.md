@@ -62,9 +62,16 @@ On DuckDB, Databricks and Trino — where case is not part of object identity �
 `Orders` and `orders` name one table and either spelling is redirected. On
 BigQuery and Snowflake they are two tables, so a reference is matched exactly:
 a model reading `raw.Orders` is **not** redirected to the shadow of a model
-whose target is `raw.orders`, because it never read that table. Two selected
-models whose targets differ only by case are therefore routed independently on
-those warehouses, rather than the run being refused.
+whose target is `raw.orders`, because it never read that table.
+
+Deciding whether two *targets* collide is the opposite question, and Rocky
+answers it conservatively on every warehouse: two selected models whose targets
+differ only by identifier case are always treated as one object, and the run is
+refused. Case-sensitivity is connection state Rocky cannot observe — a Snowflake
+account may set `QUOTED_IDENTIFIERS_IGNORE_CASE`, and a BigQuery dataset may be
+created `is_case_insensitive` — so assuming the two are distinct could let both
+models write the same shadow table with no error. Rename one target so they
+differ by more than case.
 
 ## Shadow target rewriting
 

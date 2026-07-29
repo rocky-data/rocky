@@ -5865,8 +5865,17 @@ fn dialect_case_rules(
         // may opt out with QUOTED_IDENTIFIERS_IGNORE_CASE —
         // docs.snowflake.com/en/sql-reference/identifiers-syntax
         //
-        // Both opt-outs would only ever make a rejected run acceptable, never
-        // the reverse, so assuming the default is the fail-closed choice.
+        // ‼️ Read this narrowly. Both opt-outs are CONNECTION state Rocky cannot
+        // observe, so "case-sensitive" here is an assumption, not a fact, and it
+        // is only fail-closed for the question this function answers: may a
+        // reference be redirected to a replacement registered under a different
+        // spelling? Assuming sensitivity answers "no", which is the safe answer.
+        //
+        // It is the FAIL-OPEN answer for the opposite question — could two
+        // targets be the same object? — because it says they are distinct and
+        // therefore do not collide. That question is deliberately NOT asked here:
+        // `apply_shadow_rewrite` answers it with its own always-folding
+        // `collision_identity`. Do not reuse this function for it.
         "bigquery" | "snowflake" => Ok(uniform(true)),
         other => anyhow::bail!(
             "shadow/branch execution does not know whether '{other}' treats identifier case as \
@@ -5898,20 +5907,35 @@ fn apply_shadow_rewrite(
         model_name_filter.is_none_or(|selected| selected == name)
             && model_set.is_none_or(|set| set.contains(name))
     };
-    // Object identity for this dialect, per component.
+    // TWO identities, because the two questions asked below fail closed in
+    // OPPOSITE directions. Collapsing them into one key is what made an earlier
+    // revision of this function wrong in each direction in turn.
     //
-    // This was unconditionally lowercased, which is the defect the case guard
-    // below used to paper over: on a dialect where case IS identity, two models
-    // whose targets differ only by case folded to ONE key, so one model's route
-    // silently displaced the other's in `renames` and `owner_by_key` and its
-    // reads were redirected to the wrong shadow target. Folding only where the
-    // dialect actually folds keeps them distinct.
+    // `target_identity` — "is this reference definitely THIS object?" Answering
+    // yes when unsure redirects a read to a table it never named, so it demands
+    // proof: it folds only where the dialect folds. This is the key space the
+    // rename map, `owner_by_key` and `rewritten_keys` all share.
     //
-    // Used for every keyed comparison here — production-target collisions,
-    // shadow-target ownership, and the rename keys handed to the matcher — so
-    // all of them share one notion of "the same object", and `rewritten_keys`
-    // comes back in the same key space `owner_by_key` is built in.
+    // `collision_identity` — "could these two be the SAME object?" Answering no
+    // when unsure lets two models write one table with no error at all, so it
+    // assumes the worst: it always folds. That matters because case-sensitivity
+    // is not purely a dialect property — it is CONNECTION state Rocky cannot
+    // observe. A Snowflake account with `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE`
+    // resolves Rocky's double-quoted targets case-insensitively (Rocky does not
+    // pin that parameter), and a BigQuery dataset can carry `is_case_insensitive`
+    // per dataset. Under either, `orders` and `Orders` are ONE object — so
+    // treating them as distinct here would silently route two models to the same
+    // shadow table.
+    //
+    // Note this inverts a justification that used to sit in
+    // `dialect_case_rules`: assuming case-SENSITIVE was once the fail-closed
+    // choice because it only ever caused a REFUSAL. Once the same answer also
+    // drives collision detection, assuming sensitivity became the fail-OPEN
+    // choice. Hence the split rather than one shared rule.
     let case_rules = dialect_case_rules(dialect)?;
+    let collision_identity = |catalog: &str, schema: &str, table: &str| {
+        format!("{catalog}.{schema}.{table}").to_ascii_lowercase()
+    };
     let target_identity = |catalog: &str, schema: &str, table: &str| {
         let component = |value: &str, sensitive: bool| {
             if sensitive {
@@ -5933,7 +5957,7 @@ fn apply_shadow_rewrite(
     let mut production_targets: HashMap<String, Vec<String>> = HashMap::new();
     for model in &compile_result.project.models {
         production_targets
-            .entry(target_identity(
+            .entry(collision_identity(
                 &model.config.target.catalog,
                 &model.config.target.schema,
                 &model.config.target.table,
@@ -6037,7 +6061,7 @@ fn apply_shadow_rewrite(
         })?;
 
         let original_key = target_identity(&original.catalog, &original.schema, &original.table);
-        let shadow_key = target_identity(&shadow.catalog, &shadow.schema, &shadow.table);
+        let shadow_key = collision_identity(&shadow.catalog, &shadow.schema, &shadow.table);
         if let Some(production_models) = production_targets.get(&shadow_key) {
             anyhow::bail!(
                 "shadow target '{}.{}.{}' for model '{}' collides with the production target of \
@@ -6053,7 +6077,12 @@ fn apply_shadow_rewrite(
         if let Some(existing_model) = shadow_owners.insert(shadow_key, model.config.name.clone()) {
             anyhow::bail!(
                 "shadow target '{}.{}.{}' is shared by selected models '{}' and '{}'. Choose a \
-                 suffix or shadow schema that preserves a distinct target for every model",
+                 suffix or shadow schema that preserves a distinct target for every model. \
+                 (Targets differing only by identifier case count as shared: whether case \
+                 separates two objects depends on connection state Rocky cannot observe — a \
+                 Snowflake account may set QUOTED_IDENTIFIERS_IGNORE_CASE, a BigQuery dataset \
+                 is_case_insensitive — so they are treated as one object rather than risk two \
+                 models writing it.)",
                 shadow.catalog,
                 shadow.schema,
                 shadow.table,
@@ -16750,21 +16779,27 @@ timestamp_column = "ts"
         .expect("write model toml");
     }
 
-    /// `target_identity` folds only where the dialect folds — which changes the
-    /// COLLISION checks, not just the rename keys, and that loosening deserves
-    /// its own test rather than riding on the routing tests.
+    /// Two selected models whose targets differ only by case are refused on
+    /// EVERY dialect, including the case-sensitive ones.
     ///
-    /// Two selected models whose targets differ only by case:
-    /// - on Snowflake they are two objects, so both route independently and
-    ///   neither the production-collision nor the shared-shadow-target check
-    ///   fires. This is what the deleted case guard used to refuse.
-    /// - on DuckDB they are ONE object, so they must still collide on their
-    ///   shared shadow target. Without the per-dialect fold this test would pass
-    ///   vacuously on both sides, so the DuckDB half is the control: it proves
-    ///   the identity did not simply become exact everywhere.
+    /// An earlier revision of this change let them route independently on
+    /// Snowflake and BigQuery, on the grounds that case is part of object
+    /// identity there. That is a fail-open: identifier identity is CONNECTION
+    /// state, not dialect state. A Snowflake account with
+    /// `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` resolves Rocky's double-quoted
+    /// targets case-insensitively — and Rocky does not pin that parameter — so
+    /// `orders_rocky_shadow` and `Orders_rocky_shadow` would be ONE table and the
+    /// two models would silently write over each other. BigQuery's per-dataset
+    /// `is_case_insensitive` does the same.
+    ///
+    /// So the collision check always folds while the reference MATCHER stays
+    /// case-aware (covered in `rocky-sql`'s `defer` tests). The two questions
+    /// fail closed in opposite directions, which is why they no longer share a
+    /// key. Reverting `collision_identity` to the case-aware `target_identity`
+    /// makes the Snowflake half pass and fails this test.
     #[cfg(feature = "duckdb")]
     #[test]
-    fn case_differing_targets_collide_only_where_the_dialect_folds() {
+    fn case_differing_targets_collide_on_every_dialect() {
         let build = || {
             let tmp = tempfile::TempDir::new().expect("temp dir");
             let models_dir = tmp.path().join("models");
@@ -16780,52 +16815,35 @@ timestamp_column = "ts"
             (tmp, compiled)
         };
 
-        // Snowflake: two distinct objects, so both route.
-        let (_tmp, mut compiled) = build();
-        super::apply_shadow_rewrite(
-            &mut compiled,
-            None,
-            None,
-            &rocky_core::shadow::ShadowConfig::default(),
-            &rocky_snowflake::dialect::SnowflakeSqlDialect,
-            false,
-        )
-        .expect("case-differing targets are distinct objects on a case-sensitive dialect");
-        let table_of = |n: &str| {
-            compiled
-                .project
-                .models
-                .iter()
-                .find(|m| m.config.name == n)
-                .expect("model present")
-                .config
-                .target
-                .table
-                .clone()
-        };
-        assert_eq!(table_of("lower"), "orders_rocky_shadow");
-        assert_eq!(
-            table_of("upper"),
-            "Orders_rocky_shadow",
-            "the upper-case model keeps its own spelling, so the two shadows stay distinct"
-        );
-
-        // DuckDB: one object, so the two shadow targets are the same table and
-        // the shared-shadow-target check must still fire.
-        let (_tmp2, mut compiled2) = build();
-        let err = super::apply_shadow_rewrite(
-            &mut compiled2,
-            None,
-            None,
-            &rocky_core::shadow::ShadowConfig::default(),
-            &rocky_duckdb::dialect::DuckDbSqlDialect,
-            false,
-        )
-        .expect_err("on a folding dialect the two models share one shadow target");
-        assert!(
-            format!("{err:#}").contains("is shared by selected models"),
-            "the folding dialect must still detect the shared target: {err:#}"
-        );
+        for (name, dialect) in [
+            (
+                "snowflake",
+                &rocky_snowflake::dialect::SnowflakeSqlDialect
+                    as &dyn rocky_core::traits::SqlDialect,
+            ),
+            ("duckdb", &rocky_duckdb::dialect::DuckDbSqlDialect),
+        ] {
+            let (_tmp, mut compiled) = build();
+            let err = super::apply_shadow_rewrite(
+                &mut compiled,
+                None,
+                None,
+                &rocky_core::shadow::ShadowConfig::default(),
+                dialect,
+                false,
+            )
+            .expect_err("targets differing only by case may be one object on any dialect — refuse");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("is shared by selected models"),
+                "{name} must report the shared shadow target: {message}"
+            );
+            assert!(
+                message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+                "{name} must explain that case-identity is unobservable connection state: \
+                 {message}"
+            );
+        }
     }
 
     /// An in-run upstream read spelled as a physical `schema.table` name must
