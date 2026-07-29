@@ -1107,6 +1107,115 @@ mod tests {
         assert_eq!(cell_i64(&model_rows.rows[0][0]), 2, "model rows");
     }
 
+    /// #1272 sentinel: `rocky run --dag --shadow` must not touch a production
+    /// seed table.
+    ///
+    /// A seed node dispatches to `run_seed`, which DROPs and repopulates the
+    /// seed's CONFIGURED target and accepts no shadow config — so before the
+    /// refusal, a shadow DAG isolated the models and destroyed the seed tables
+    /// beside them, exit 0.
+    ///
+    /// Non-vacuous by construction, and deliberately NOT an assertion on the
+    /// error string: the CSV grows to three rows between the two runs, so a
+    /// seed node that executed would leave FOUR rows behind. Asserting the
+    /// production table still holds the original two proves the seed did not
+    /// run, rather than proving an error was formatted. Deleting the refusal
+    /// makes the row count 4 and fails it.
+    #[tokio::test]
+    async fn shadow_dag_refuses_seeds_and_leaves_the_production_seed_table_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("seeds")).unwrap();
+
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/countries.toml"),
+            "name = \"countries\"\n\n\
+             [target]\n\
+             catalog = \"proj\"\n\
+             schema = \"seeds\"\n\
+             table = \"countries\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("seeds/countries.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let state_path = root.join(".rocky-state.redb");
+
+        // Establish the production seed table: two rows.
+        run_with_dag(
+            &config_path,
+            &state_path,
+            false,
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+        )
+        .await
+        .expect("the non-shadow DAG seeds production");
+
+        // Grow the CSV. A seed node that runs now would leave three rows.
+        std::fs::write(
+            root.join("seeds/countries.csv"),
+            "code,name\nUS,United States\nGB,United Kingdom\nFR,France\n",
+        )
+        .unwrap();
+
+        let shadow_config = rocky_core::shadow::ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: None,
+            cleanup_after: false,
+        };
+        let err = run_with_dag(
+            &config_path,
+            &state_path,
+            false,
+            &crate::commands::run::SkipRunOptions::default(),
+            Some(&shadow_config),
+        )
+        .await
+        .expect_err("a shadow DAG containing a seed must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("countries"),
+            "the refusal names the offending seed: {msg}"
+        );
+
+        // The sentinel: production still holds the ORIGINAL two rows, so the
+        // seed node never executed.
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT COUNT(*) FROM proj.seeds.countries")
+            .unwrap();
+        assert_eq!(
+            cell_i64(&rows.rows[0][0]),
+            2,
+            "the shadow run must not have repopulated the production seed table"
+        );
+    }
+
     #[tokio::test]
     async fn transformation_nodes_execute_only_their_model() {
         let dir = tempfile::tempdir().unwrap();
