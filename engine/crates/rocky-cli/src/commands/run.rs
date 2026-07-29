@@ -16750,6 +16750,84 @@ timestamp_column = "ts"
         .expect("write model toml");
     }
 
+    /// `target_identity` folds only where the dialect folds — which changes the
+    /// COLLISION checks, not just the rename keys, and that loosening deserves
+    /// its own test rather than riding on the routing tests.
+    ///
+    /// Two selected models whose targets differ only by case:
+    /// - on Snowflake they are two objects, so both route independently and
+    ///   neither the production-collision nor the shared-shadow-target check
+    ///   fires. This is what the deleted case guard used to refuse.
+    /// - on DuckDB they are ONE object, so they must still collide on their
+    ///   shared shadow target. Without the per-dialect fold this test would pass
+    ///   vacuously on both sides, so the DuckDB half is the control: it proves
+    ///   the identity did not simply become exact everywhere.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn case_differing_targets_collide_only_where_the_dialect_folds() {
+        let build = || {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(&models_dir, "lower", "SELECT 1 AS id", "main", "orders");
+            write_model_with_target(&models_dir, "upper", "SELECT 2 AS id", "main", "Orders");
+            let compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            (tmp, compiled)
+        };
+
+        // Snowflake: two distinct objects, so both route.
+        let (_tmp, mut compiled) = build();
+        super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect("case-differing targets are distinct objects on a case-sensitive dialect");
+        let table_of = |n: &str| {
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == n)
+                .expect("model present")
+                .config
+                .target
+                .table
+                .clone()
+        };
+        assert_eq!(table_of("lower"), "orders_rocky_shadow");
+        assert_eq!(
+            table_of("upper"),
+            "Orders_rocky_shadow",
+            "the upper-case model keeps its own spelling, so the two shadows stay distinct"
+        );
+
+        // DuckDB: one object, so the two shadow targets are the same table and
+        // the shared-shadow-target check must still fire.
+        let (_tmp2, mut compiled2) = build();
+        let err = super::apply_shadow_rewrite(
+            &mut compiled2,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_duckdb::dialect::DuckDbSqlDialect,
+            false,
+        )
+        .expect_err("on a folding dialect the two models share one shadow target");
+        assert!(
+            format!("{err:#}").contains("is shared by selected models"),
+            "the folding dialect must still detect the shared target: {err:#}"
+        );
+    }
+
     /// An in-run upstream read spelled as a physical `schema.table` name must
     /// be routed to that upstream's shadow target even when the sidecar
     /// declares no `depends_on`.
