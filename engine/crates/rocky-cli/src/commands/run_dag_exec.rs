@@ -240,37 +240,48 @@ pub async fn run_with_dag(
         .collect();
     unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name);
 
-    // A seed node is dispatched straight to `run_seed`, which DROPs, recreates
-    // and repopulates the seed's CONFIGURED target — it takes no shadow config
-    // and there is no rewrite anywhere on that path. Under `--shadow` /
-    // `--branch` that is a production write inside a run whose entire promise is
-    // that production is untouched, so refuse before the executor mutates
-    // anything rather than isolate the models and quietly destroy the seed
-    // tables beside them.
+    // `--dag` cannot isolate a run, so it refuses to pretend it can.
     //
-    // Refusal, not skipping: skipping would silently change what ran, and a
-    // shadow run over a stale seed is exactly the green-DAG-over-stale-data
-    // failure the seed-discovery error handling above exists to prevent.
-    // Routing seed targets is the real fix, and it is bigger than it looks —
-    // the target rewrite would have to reach every model that reads the seed by
-    // bare name, which `apply_shadow_rewrite` does not do today because it
-    // routes only selected *models*.
+    // #1272 was filed because `--dag --shadow` silently wrote production. The
+    // obvious repair — thread `shadow_config` into every sub-run — is necessary
+    // but NOT sufficient, and shipping it alone would have replaced a visible
+    // wrong with an invisible one. Four independent reasons, each verified:
+    //
+    // 1. **Cross-model reads are not routed.** The DAG dispatches each
+    //    transformation model as its own ONE-model sub-run, so
+    //    `apply_shadow_rewrite` runs with `model_name_filter = Some(this
+    //    model)`. Its rename set is every OTHER routed model, and with a single
+    //    routed model that set is empty — nothing is rewritten. For `a -> b`,
+    //    `b_shadow` is therefore built by reading PRODUCTION `a`. Measured: with
+    //    `a` changed to emit 2, a shadow run yields `a_shadow = 2` and
+    //    `b_shadow = 1`, and exits 0. That is a false green — the operator then
+    //    compares shadow against production and sees agreement that the run
+    //    never established.
+    // 2. **Seeds are not routed.** A seed node dispatches to `seed::run_seed`,
+    //    which takes no shadow config and DROPs, recreates and repopulates its
+    //    CONFIGURED target.
+    // 3. **Replication suffix mode corrupts the SOURCE.** `TableTask` carries one
+    //    `table_name` for both sides and `run()` stores the SUFFIXED name in it,
+    //    so the copy reads `<source_schema>.<table>_rocky_shadow`.
+    // 4. **Snapshot and load are unrouted** and already refuse inside `run()`.
+    //
+    // Refusing whole rather than carving out the narrow survivors (a
+    // single-model DAG; replication under `schema_override`) is deliberate:
+    // every carve-out is another surface for exactly this class of defect, and
+    // this path has now produced four of them. Lift the refusal when the DAG
+    // executes its transformation models as one shadow-aware unit — at which
+    // point the per-node `shadow_config` threading below is what carries it.
     if shadow_config.is_some() {
-        let seed_labels: Vec<&str> = dag
-            .nodes
-            .iter()
-            .filter(|n| n.kind == NodeKind::Seed)
-            .map(|n| n.label.as_str())
-            .collect();
-        if !seed_labels.is_empty() {
-            anyhow::bail!(
-                "--shadow / --branch is not supported for a DAG containing seed(s) {}: seed \
-                 targets are not rewritten, so the run would drop and repopulate the production \
-                 seed table(s). Load the seeds separately with `rocky seed` and re-run the DAG \
-                 without the flag, or remove the seeds from this project's DAG",
-                seed_labels.join(", "),
-            );
-        }
+        anyhow::bail!(
+            "--shadow / --branch is not supported by `rocky run --dag`: the DAG runs each model \
+             as its own sub-run, so a model's reads of an upstream built by this same run are \
+             NOT redirected to that upstream's shadow target — the downstream shadow table would \
+             be built from production data and the run would still report success. Seed, \
+             snapshot and load nodes are not routed at all, and replication's suffix mode \
+             rewrites the source it reads. Run the shadow pipeline without `--dag` (a single \
+             `rocky run --shadow` routes every selected model and rewrites the reads between \
+             them), or run the DAG without the flag"
+        );
     }
 
     info!(
@@ -1115,12 +1126,12 @@ mod tests {
     /// refusal, a shadow DAG isolated the models and destroyed the seed tables
     /// beside them, exit 0.
     ///
-    /// Non-vacuous by construction, and deliberately NOT an assertion on the
-    /// error string: the CSV grows to three rows between the two runs, so a
-    /// seed node that executed would leave FOUR rows behind. Asserting the
-    /// production table still holds the original two proves the seed did not
-    /// run, rather than proving an error was formatted. Deleting the refusal
-    /// makes the row count 4 and fails it.
+    /// Non-vacuous by construction, and deliberately NOT resting on the error
+    /// string: the CSV grows to three rows between the two runs, so a seed node
+    /// that executed would leave three rows behind. Asserting the production
+    /// table still holds the original two proves the seed did not run, rather
+    /// than proving an error was formatted. Deleting the refusal makes the row
+    /// count 3 and fails it.
     #[tokio::test]
     async fn shadow_dag_refuses_seeds_and_leaves_the_production_seed_table_untouched() {
         let dir = tempfile::tempdir().unwrap();
@@ -1197,8 +1208,8 @@ mod tests {
         .expect_err("a shadow DAG containing a seed must be refused");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("countries"),
-            "the refusal names the offending seed: {msg}"
+            msg.contains("--shadow / --branch is not supported by `rocky run --dag`"),
+            "the DAG refuses shadow before executing anything: {msg}"
         );
 
         // The sentinel: production still holds the ORIGINAL two rows, so the
@@ -1214,6 +1225,104 @@ mod tests {
             2,
             "the shadow run must not have repopulated the production seed table"
         );
+    }
+
+    /// #1272: `rocky run --dag --shadow` must refuse rather than build a
+    /// downstream shadow table from PRODUCTION data.
+    ///
+    /// This is the measurement that decided the refusal. `b` reads `a`; the DAG
+    /// dispatches each as its own one-model sub-run, so `apply_shadow_rewrite`
+    /// sees a single routed model and its rename set — every OTHER routed model
+    /// — is empty. Nothing in `b`'s SQL is rewritten.
+    ///
+    /// Before the refusal this test recorded, with `a` changed to emit 2:
+    ///   proj.silver.a = 1, proj.silver.b = 1        (production, untouched)
+    ///   proj.silver.a_shadow = 2                    (isolated correctly)
+    ///   proj.silver.b_shadow = 1                    <-- read PRODUCTION a
+    /// and `run_with_dag` returned Ok. A false green: the operator compares
+    /// shadow against production and sees an agreement the run never
+    /// established.
+    ///
+    /// The assertion is on the ABSENCE of the shadow tables, not on the error
+    /// text, so it fails if the refusal is ever lifted without the routing
+    /// landing first — `b_shadow` reappearing with the stale value 1 is exactly
+    /// the defect.
+    #[tokio::test]
+    async fn shadow_dag_refuses_rather_than_build_a_downstream_from_production() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\ntype = \"duckdb\"\npath = \"{}\"\n\n\
+                 [pipeline.silver]\ntype = \"transformation\"\n\n\
+                 [pipeline.silver.target]\nadapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\nauto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(root.join("models/a.sql"), "SELECT 1 AS v\n").unwrap();
+        std::fs::write(
+            root.join("models/a.toml"),
+            "name = \"a\"\n\n[target]\ncatalog = \"proj\"\nschema = \"silver\"\ntable = \"a\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("models/b.sql"), "SELECT v FROM proj.silver.a\n").unwrap();
+        std::fs::write(
+            root.join("models/b.toml"),
+            "name = \"b\"\n\n[target]\ncatalog = \"proj\"\nschema = \"silver\"\ntable = \"b\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let state_path = root.join(".rocky-state.redb");
+        run_with_dag(
+            &config_path,
+            &state_path,
+            false,
+            &crate::commands::run::SkipRunOptions::default(),
+            None,
+        )
+        .await
+        .expect("the non-shadow DAG builds production");
+
+        // Divergence: an isolated run would have to compute 2 all the way
+        // through, so a downstream holding 1 proves it read production.
+        std::fs::write(root.join("models/a.sql"), "SELECT 2 AS v\n").unwrap();
+
+        let shadow_config = rocky_core::shadow::ShadowConfig {
+            suffix: "_shadow".to_string(),
+            schema_override: None,
+            cleanup_after: false,
+        };
+        run_with_dag(
+            &config_path,
+            &state_path,
+            false,
+            &crate::commands::run::SkipRunOptions::default(),
+            Some(&shadow_config),
+        )
+        .await
+        .expect_err("a shadow DAG must be refused, not silently mis-isolated");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        for table in ["proj.silver.a_shadow", "proj.silver.b_shadow"] {
+            assert!(
+                guard
+                    .execute_sql(&format!("SELECT v FROM {table}"))
+                    .is_err(),
+                "{table} must not exist: the refusal fires before the executor runs"
+            );
+        }
+        // Production is untouched by the refused run.
+        let prod_b = guard.execute_sql("SELECT v FROM proj.silver.b").unwrap();
+        assert_eq!(cell_i64(&prod_b.rows[0][0]), 1, "production b untouched");
     }
 
     #[tokio::test]

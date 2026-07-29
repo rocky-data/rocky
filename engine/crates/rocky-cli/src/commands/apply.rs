@@ -3837,11 +3837,11 @@ mod tests {
     /// at all is what refutes the "a stored plan carries no shadow routing"
     /// justification the dropped argument used to carry.
     ///
-    /// Observed through the seed refusal, which fires only when `run_with_dag`
-    /// actually receives a shadow config: with the routing dropped, this project
-    /// instead materializes `proj.seeds.countries` in production and returns
-    /// `Ok`. Both halves are asserted, so restoring the `None` fails on the
-    /// missing error AND on the production table appearing.
+    /// Observed through the DAG's shadow refusal, which fires only when
+    /// `run_with_dag` actually receives a shadow config: with the routing
+    /// dropped, this project instead materializes `proj.seeds.countries` in
+    /// production and returns `Ok`. Both halves are asserted, so restoring the
+    /// `None` fails on the missing error AND on the production table appearing.
     #[tokio::test]
     async fn a_stored_dag_shadow_plan_carries_its_shadow_routing_into_execution() {
         let dir = tempfile::tempdir().unwrap();
@@ -3907,8 +3907,8 @@ mod tests {
         .expect_err("a stored --dag --shadow plan must reach the shadow-aware DAG path");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("countries"),
-            "the shadow config reached run_with_dag, so its seed refusal names the seed: {msg}"
+            msg.contains("--shadow / --branch is not supported by `rocky run --dag`"),
+            "the shadow config reached run_with_dag, so its shadow refusal fired: {msg}"
         );
 
         // The sentinel: nothing was materialized. With the routing dropped, the
