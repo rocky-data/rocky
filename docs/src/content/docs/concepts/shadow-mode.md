@@ -64,6 +64,14 @@ BigQuery and Snowflake they are two tables, so a reference is matched exactly:
 a model reading `raw.Orders` is **not** redirected to the shadow of a model
 whose target is `raw.orders`, because it never read that table.
 
+One gap remains on Snowflake, unchanged from before this behaviour existed:
+matching compares the spelled text of a reference, and Snowflake resolves an
+*unquoted* identifier by upper-casing it while Rocky writes its targets quoted.
+A model whose target is configured in lower case, read by an unquoted reference,
+can therefore have that read redirected even though the two name different
+objects. Configuring Snowflake targets in upper case — the idiomatic choice —
+avoids it entirely. Tracked in issue #1282.
+
 Where a reference matches a routed upstream **only if case is ignored**, Rocky
 refuses the run rather than guess. Redirecting it could read a table the model
 never named; leaving it would read production while the model writes its shadow.

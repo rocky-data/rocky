@@ -5876,6 +5876,25 @@ fn dialect_case_rules(
         // therefore do not collide. That question is deliberately NOT asked here:
         // `apply_shadow_rewrite` answers it with its own always-folding
         // `collision_identity`. Do not reuse this function for it.
+        // ‼️ Snowflake has a SECOND identity axis this deliberately does not
+        // model yet: it resolves an UNQUOTED identifier by upper-casing it,
+        // while Rocky renders its targets QUOTED. So a configured target
+        // `orders` is the object `orders`, which an unquoted `FROM orders` does
+        // NOT name — it names `ORDERS`. Matching on spelled text therefore
+        // rewrites a read of one object to the replacement for another.
+        //
+        // `IdentifierCaseRules::uniform_uppercasing` implements and tests that
+        // resolution (see `defer.rs`'s
+        // `snowflake_resolves_unquoted_identifiers_before_matching`), and
+        // enabling it here is a one-line change. It is NOT enabled because doing
+        // so refuses every lowercase-configured Snowflake project — including
+        // this repo's own fixtures — and while the reasoning says such a project
+        // could not read its upstream in production either, that conclusion has
+        // not been verified against a live Snowflake account. Shipping it
+        // untested would trade a known, pre-existing and unchanged hazard for an
+        // unmeasured break. Tracked as #1282; #1281 would settle it exactly.
+        //
+        // Unchanged from the behaviour on `main`, which also matched on text.
         "bigquery" | "snowflake" => Ok(uniform(true)),
         other => anyhow::bail!(
             "shadow/branch execution does not know whether '{other}' treats identifier case as \

@@ -153,6 +153,19 @@ pub struct IdentifierCaseRules {
     pub schema: bool,
     /// Case distinguishes two tables.
     pub table: bool,
+    /// The dialect resolves an UNQUOTED identifier by upper-casing it, so its
+    /// written spelling is not its identity.
+    ///
+    /// Quoting is a second identity axis, independent of case. Snowflake stores
+    /// an unquoted `orders` as `ORDERS` while a quoted `"orders"` stays exactly
+    /// as written — and Rocky renders Snowflake targets QUOTED, so a configured
+    /// target `orders` is the object `orders`, which an unquoted `FROM orders`
+    /// does NOT name. Ignoring this makes two texts that look identical refer to
+    /// different tables.
+    ///
+    /// Only meaningful where `catalog`/`schema`/`table` are case-sensitive; a
+    /// dialect that folds every identifier already treats the two forms alike.
+    pub unquoted_uppercases: bool,
 }
 
 impl IdentifierCaseRules {
@@ -165,6 +178,7 @@ impl IdentifierCaseRules {
             catalog: false,
             schema: false,
             table: false,
+            unquoted_uppercases: false,
         }
     }
 
@@ -176,6 +190,20 @@ impl IdentifierCaseRules {
             catalog: case_sensitive,
             schema: case_sensitive,
             table: case_sensitive,
+            unquoted_uppercases: false,
+        }
+    }
+
+    /// [`uniform`] plus the unquoted-uppercasing rule — Snowflake's shape.
+    ///
+    /// [`uniform`]: IdentifierCaseRules::uniform
+    #[must_use]
+    pub const fn uniform_uppercasing(case_sensitive: bool) -> Self {
+        Self {
+            catalog: case_sensitive,
+            schema: case_sensitive,
+            table: case_sensitive,
+            unquoted_uppercases: true,
         }
     }
 
@@ -343,20 +371,34 @@ impl VisitorMut for UpstreamRewriter<'_> {
     fn pre_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<Self::Break> {
         // Extract the spelled parts — bail on anything that is not a plain
         // identifier chain (e.g. a table function).
-        let mut original: Vec<&str> = Vec::with_capacity(relation.0.len());
+        // `(value, was_quoted)`. Quotedness is part of identity on dialects that
+        // fold unquoted identifiers, so it must survive to the comparison.
+        let mut spelled_parts: Vec<(&str, bool)> = Vec::with_capacity(relation.0.len());
         for part in &relation.0 {
             let Some(ident) = part.as_ident() else {
                 return ControlFlow::Continue(());
             };
-            original.push(ident.value.as_str());
+            spelled_parts.push((ident.value.as_str(), ident.quote_style.is_some()));
         }
-        if original.is_empty() || original.len() > 3 {
+        if spelled_parts.is_empty() || spelled_parts.len() > 3 {
             return ControlFlow::Continue(());
         }
         // A bare name shadowed by a CTE in scope refers to the CTE.
-        if original.len() == 1 && self.is_shadowed(original[0]) {
+        if spelled_parts.len() == 1 && self.is_shadowed(spelled_parts[0].0) {
             return ControlFlow::Continue(());
         }
+        // Resolve each part to the name the warehouse will actually look up.
+        let resolved: Vec<String> = spelled_parts
+            .iter()
+            .map(|(value, quoted)| {
+                if self.case_rules.unquoted_uppercases && !quoted {
+                    value.to_uppercase()
+                } else {
+                    (*value).to_string()
+                }
+            })
+            .collect();
+        let original: Vec<&str> = resolved.iter().map(String::as_str).collect();
         // Tail-match each rename key, comparing every component under the
         // dialect's own rule for that component. Where case is part of identity
         // this is an exact comparison, because `raw.Orders` and `raw.orders` are
@@ -919,7 +961,8 @@ mod tests {
         // usability floor for the refusal above: a model that spells its
         // upstream the way the target is configured — including the bare-name
         // idiom Rocky models normally use — is unaffected on a case-sensitive
-        // dialect.
+        // dialect that does not fold unquoted identifiers (BigQuery). Snowflake,
+        // which does fold them, is covered separately below.
         for spelling in ["cat.raw.orders", "raw.orders", "orders"] {
             let out = rewrite_upstream_refs(
                 &format!("SELECT * FROM {spelling}"),
@@ -1015,6 +1058,7 @@ mod tests {
             catalog: true,
             schema: false,
             table: false,
+            unquoted_uppercases: false,
         };
         let out =
             rewrite_upstream_refs("SELECT * FROM Raw.orders", &renames, catalog_only).unwrap();
@@ -1029,11 +1073,64 @@ mod tests {
             catalog: true,
             schema: true,
             table: false,
+            unquoted_uppercases: false,
         };
         let out =
             rewrite_upstream_refs("SELECT * FROM Raw.orders", &renames, schema_sensitive).unwrap();
         assert_eq!(out.sql, "SELECT * FROM cat.shadow.upper__raw");
         assert!(out.ambiguous_refs.is_empty());
+    }
+
+    /// Snowflake's quoting axis: identical TEXT can name different objects.
+    ///
+    /// Rocky renders Snowflake targets quoted, so a configured target `orders`
+    /// is the object `orders`. Snowflake resolves an unquoted `FROM orders` to
+    /// `ORDERS` — a different table. Matching on spelled text alone (which this
+    /// matcher did before, and on `main` still does) rewrites that read to the
+    /// shadow and silently changes its source.
+    ///
+    /// The matrix below is the whole point: with an UPPERCASE configured target
+    /// — the Snowflake-idiomatic choice — an unquoted reference resolves onto it
+    /// and routes normally, so the common case is unaffected. It is only the
+    /// lowercase/mixed-case configured target that becomes a near-miss, and such
+    /// a model could not have read its upstream in production either.
+    #[test]
+    fn snowflake_resolves_unquoted_identifiers_before_matching() {
+        let rules = IdentifierCaseRules::uniform_uppercasing(true);
+
+        // Upper-case target: the idiomatic Snowflake shape. Unquoted references
+        // resolve onto it, quoted ones must spell it exactly.
+        let upper = renames_map(&[("CAT.RAW.ORDERS", target("CAT", "SHADOW", "ORDERS"))]);
+        for spelling in ["cat.raw.orders", "CAT.RAW.ORDERS", "raw.orders", "orders"] {
+            let out =
+                rewrite_upstream_refs(&format!("SELECT * FROM {spelling}"), &upper, rules).unwrap();
+            assert_eq!(
+                out.sql, "SELECT * FROM CAT.SHADOW.ORDERS",
+                "unquoted {spelling} resolves upper and routes"
+            );
+            assert!(out.case_fold_only_refs.is_empty(), "{spelling}");
+        }
+
+        // Lower-case target: Rocky created `"orders"`, which an UNQUOTED
+        // reference cannot name. Reported, not silently rewritten.
+        let lower = renames_map(&[("cat.raw.orders", target("cat", "shadow", "orders"))]);
+        let out = rewrite_upstream_refs("SELECT * FROM cat.raw.orders", &lower, rules).unwrap();
+        assert!(
+            out.rewritten_keys.is_empty(),
+            "an unquoted ref resolves to CAT.RAW.ORDERS, not cat.raw.orders: {}",
+            out.sql
+        );
+        assert_eq!(
+            out.case_fold_only_refs,
+            vec!["cat.raw.orders".to_string()],
+            "the near-miss must be reported so the caller refuses"
+        );
+
+        // Quoted, spelled exactly: that IS the object, so it routes.
+        let out = rewrite_upstream_refs("SELECT * FROM \"cat\".\"raw\".\"orders\"", &lower, rules)
+            .unwrap();
+        assert_eq!(out.sql, "SELECT * FROM cat.shadow.orders");
+        assert!(out.case_fold_only_refs.is_empty());
     }
 
     /// A CTE still shadows a bare name before any of this runs.
