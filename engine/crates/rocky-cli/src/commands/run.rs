@@ -5940,6 +5940,9 @@ fn apply_shadow_rewrite(
     // choice because it only ever caused a REFUSAL. Once the same answer also
     // drives collision detection, assuming sensitivity became the fail-OPEN
     // choice. Hence the split rather than one shared rule.
+    //
+    // Both rules are placeholders for a fact Rocky cannot currently obtain;
+    // #1281 tracks reading the live setting, which would replace them.
     let case_rules = dialect_case_rules(dialect)?;
     let collision_identity = |catalog: &str, schema: &str, table: &str| {
         format!("{catalog}.{schema}.{table}").to_ascii_lowercase()
@@ -6196,7 +6199,7 @@ fn apply_shadow_rewrite(
                  dataset may be is_case_insensitive). Redirecting could read the wrong table and \
                  not redirecting would read production, so neither is safe. Spell the reference \
                  exactly as the upstream's configured target, or rename one so they differ by \
-                 more than case",
+                 more than case (#1281 tracks reading the live setting instead of assuming it)",
                 outcome.case_fold_only_refs,
                 model.config.name
             );
