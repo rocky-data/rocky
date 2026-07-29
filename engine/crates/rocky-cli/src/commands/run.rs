@@ -5727,6 +5727,11 @@ fn apply_defer_rewrite(
         return Ok(());
     }
 
+    // Governs CTE-alias comparison inside the rewrite, not the `deferred`
+    // lookup (which is by exact model name). Same dialect table the shadow path
+    // uses, deliberately shared rather than copied.
+    let case_rules = dialect_case_rules(dialect)?;
+
     // Rewrite each selected model's SQL in place. Only the selected models
     // execute, so rewriting just those is sufficient (and avoids touching
     // upstream SQL that won't run).
@@ -5734,8 +5739,8 @@ fn apply_defer_rewrite(
         if !selected_set.contains(model.config.name.as_str()) {
             continue;
         }
-        let rewritten =
-            rocky_sql::defer::qualify_deferred_refs(&model.sql, &deferred).map_err(|e| {
+        let rewritten = rocky_sql::defer::qualify_deferred_refs(&model.sql, &deferred, case_rules)
+            .map_err(|e| {
                 anyhow::anyhow!(
                     "`--defer` could not rewrite the upstream references in model '{}': its SQL \
                      did not parse ({e}). `--defer` parses each selected model's SQL to qualify \
@@ -5768,6 +5773,11 @@ fn apply_defer_rewrite(
 /// Unknown dialects fail closed. A new adapter that quotes its targets would
 /// otherwise inherit bare rendering silently, which is exactly the defect this
 /// function exists to prevent.
+///
+/// ‼️ Keep this function's dialect arms in step with [`dialect_case_rules`].
+/// Both are called on the `--defer` and shadow paths, so a dialect added to one
+/// and not the other turns a supported warehouse into a hard refusal on a path
+/// nobody was thinking about.
 fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
@@ -5838,8 +5848,9 @@ fn reject_unsupported_shadow(
 ///
 /// Re-confirm against the vendor when adding a dialect.
 ///
-/// Unknown dialects fail closed.
-fn dialect_case_rules(
+/// Unknown dialects fail closed. ‼️ Keep the arms in step with
+/// [`rewrite_quote_style`] — see the note there.
+pub(crate) fn dialect_case_rules(
     dialect: &dyn rocky_core::traits::SqlDialect,
 ) -> Result<rocky_sql::defer::IdentifierCaseRules> {
     let uniform = rocky_sql::defer::IdentifierCaseRules::uniform;

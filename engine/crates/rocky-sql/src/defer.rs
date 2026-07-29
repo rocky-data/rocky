@@ -91,6 +91,19 @@ impl DeferTarget {
 /// deferred `orders` *within that subquery*, while a genuine top-level `FROM
 /// orders` with no shadowing CTE is still qualified.
 ///
+/// `case_rules` governs CTE-alias comparison ONLY. The `deferred` lookup itself
+/// stays exact — see the note in `pre_visit_relation`.
+///
+/// Unlike [`rewrite_upstream_refs`] this reports no case near-misses, and that
+/// asymmetry is deliberate rather than an omission. That matcher compares a
+/// *spelled qualified reference* against a *configured warehouse target* — two
+/// independently authored spellings that can genuinely disagree about case, so
+/// a near-match is ambiguous and has to be refused. Here both sides come from
+/// one source of truth: a bare identifier is matched against a Rocky model name,
+/// exactly as `resolve::classify_table_ref` matches it, and the replacement is
+/// rendered by `rewrite_quote_style`, which tracks the same `format_table_ref`
+/// the producing model's DDL used. There is no second spelling to mismatch.
+///
 /// Re-serialization preserves the statement's semantics, but the AST round
 /// trip may strip comments and trailing semicolons and normalize incidental
 /// whitespace — callers only invoke this in `--defer` mode, never on the
@@ -102,6 +115,7 @@ impl DeferTarget {
 pub fn qualify_deferred_refs(
     sql: &str,
     deferred: &HashMap<String, DeferTarget>,
+    case_rules: IdentifierCaseRules,
 ) -> Result<String, ParseError> {
     if deferred.is_empty() {
         return Ok(sql.to_string());
@@ -117,7 +131,7 @@ pub fn qualify_deferred_refs(
     // breaks, so the `ControlFlow` is always `Continue`.
     let mut rewriter = DeferRewriter {
         deferred,
-        scopes: Vec::new(),
+        scopes: CteScopeStack::new(case_rules),
     };
     let _: ControlFlow<()> = statement.visit(&mut rewriter);
 
@@ -594,39 +608,30 @@ impl VisitorMut for UpstreamRewriter<'_> {
 /// Scope-aware visitor that qualifies bare deferred-model references while
 /// honouring lexical CTE shadowing.
 ///
-/// `scopes` is a stack of the CTE names introduced by each enclosing query's
-/// `WITH` clause. A query's frame is pushed in `pre_visit_query` (before its
-/// body *and* its CTE bodies are walked) and popped in `post_visit_query`, so
-/// a name on the stack shadows the deferred model for exactly the subtree
-/// where that `WITH` is in scope.
+/// Shares [`CteScopeStack`] with [`UpstreamRewriter`], so CTE visibility is
+/// positional and alias comparison follows the dialect's own case and quoting
+/// rules. Before that was shared, this visitor installed every alias up front
+/// and compared them verbatim, which cost it two defects at once: a later CTE
+/// shadowed a reference in an earlier CTE's body (leaving that upstream
+/// unqualified, to resolve against whatever the working schema happens to
+/// hold), and on a folding dialect `WITH Orders … FROM orders` was not treated
+/// as shadowed at all, so the reference was qualified to the production table
+/// instead of reading the CTE.
 struct DeferRewriter<'a> {
     deferred: &'a HashMap<String, DeferTarget>,
-    scopes: Vec<HashSet<String>>,
-}
-
-impl DeferRewriter<'_> {
-    /// Whether `name` is shadowed by a CTE in any enclosing scope.
-    fn is_shadowed(&self, name: &str) -> bool {
-        self.scopes.iter().any(|frame| frame.contains(name))
-    }
+    scopes: CteScopeStack,
 }
 
 impl VisitorMut for DeferRewriter<'_> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
-        let mut frame: HashSet<String> = HashSet::new();
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                frame.insert(cte.alias.name.value.clone());
-            }
-        }
-        self.scopes.push(frame);
+        self.scopes.enter_query(query);
         ControlFlow::Continue(())
     }
 
     fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
-        self.scopes.pop();
+        self.scopes.exit_query();
         ControlFlow::Continue(())
     }
 
@@ -639,11 +644,20 @@ impl VisitorMut for DeferRewriter<'_> {
         let Some(ident) = relation.0[0].as_ident() else {
             return ControlFlow::Continue(());
         };
-        let name = ident.value.clone();
-        if self.is_shadowed(&name) {
+        if self
+            .scopes
+            .is_shadowed(&ident.value, ident.quote_style.is_some())
+        {
             return ControlFlow::Continue(());
         }
-        if let Some(target) = self.deferred.get(&name) {
+        // ‼️ EXACT, and deliberately not routed through `case_rules`. These keys
+        // are Rocky MODEL names, not warehouse identifiers, and
+        // `resolve::classify_table_ref` resolves a bare name to a model with an
+        // exact `HashSet::contains`. Folding here would qualify a reference the
+        // compiler gave no dependency edge to, so `--defer` would disagree with
+        // the DAG about what a name means. The case axis reaches the SCOPE STACK
+        // above and nothing else.
+        if let Some(target) = self.deferred.get(&ident.value) {
             *relation = target.to_object_name();
         }
         ControlFlow::Continue(())
@@ -682,14 +696,24 @@ mod tests {
     #[test]
     fn qualifies_a_bare_upstream_ref() {
         let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
-        let out = qualify_deferred_refs("SELECT * FROM orders", &deferred).unwrap();
+        let out = qualify_deferred_refs(
+            "SELECT * FROM orders",
+            &deferred,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert_eq!(out, "SELECT * FROM prod.orders");
     }
 
     #[test]
     fn qualifies_with_catalog_when_present() {
         let deferred = deferred_map(&[("orders", target("warehouse", "prod", "orders"))]);
-        let out = qualify_deferred_refs("SELECT * FROM orders", &deferred).unwrap();
+        let out = qualify_deferred_refs(
+            "SELECT * FROM orders",
+            &deferred,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert_eq!(out, "SELECT * FROM warehouse.prod.orders");
     }
 
@@ -699,8 +723,12 @@ mod tests {
         // `o.col` column refs are never in relation position, so only the
         // table name is rewritten.
         let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
-        let out =
-            qualify_deferred_refs("SELECT o.id FROM orders o WHERE o.id > 0", &deferred).unwrap();
+        let out = qualify_deferred_refs(
+            "SELECT o.id FROM orders o WHERE o.id > 0",
+            &deferred,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         // The table name is qualified; the alias `o` and the `o.col` column
         // refs are untouched (they were never in relation position).
         assert!(out.contains("prod.orders"), "got: {out}");
@@ -719,6 +747,7 @@ mod tests {
         let out = qualify_deferred_refs(
             "SELECT o.id, c.name FROM orders o JOIN customers c ON o.cid = c.id",
             &deferred,
+            IdentifierCaseRules::all_insensitive(),
         )
         .unwrap();
         assert!(out.contains("FROM prod.orders"), "got: {out}");
@@ -731,8 +760,12 @@ mod tests {
         // subquery relations too. This is the case that motivates visiting
         // the whole AST.
         let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
-        let out =
-            qualify_deferred_refs("SELECT * FROM (SELECT id FROM orders) sub", &deferred).unwrap();
+        let out = qualify_deferred_refs(
+            "SELECT * FROM (SELECT id FROM orders) sub",
+            &deferred,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert!(
             out.contains("prod.orders"),
             "subquery ref must be qualified: {out}"
@@ -748,6 +781,7 @@ mod tests {
         let out = qualify_deferred_refs(
             "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
             &deferred,
+            IdentifierCaseRules::all_insensitive(),
         )
         .unwrap();
         assert!(
@@ -767,6 +801,7 @@ mod tests {
         let out = qualify_deferred_refs(
             "SELECT * FROM (WITH orders AS (SELECT 1 AS id) SELECT * FROM orders) sub",
             &deferred,
+            IdentifierCaseRules::all_insensitive(),
         )
         .unwrap();
         assert!(
@@ -786,6 +821,7 @@ mod tests {
             "SELECT id FROM events WHERE id IN \
              (WITH orders AS (SELECT 1 AS id) SELECT id FROM orders)",
             &deferred,
+            IdentifierCaseRules::all_insensitive(),
         )
         .unwrap();
         assert!(
@@ -804,6 +840,7 @@ mod tests {
             "SELECT 1 AS id UNION ALL \
              (WITH orders AS (SELECT 2 AS id) SELECT id FROM orders)",
             &deferred,
+            IdentifierCaseRules::all_insensitive(),
         )
         .unwrap();
         assert!(
@@ -817,7 +854,12 @@ mod tests {
         // Case D (positive control): a genuine top-level `FROM orders` with no
         // shadowing CTE anywhere is still qualified.
         let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
-        let out = qualify_deferred_refs("SELECT * FROM orders", &deferred).unwrap();
+        let out = qualify_deferred_refs(
+            "SELECT * FROM orders",
+            &deferred,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert!(
             out.contains("prod.orders"),
             "top-level deferred ref with no shadow must be qualified: {out}"
@@ -836,6 +878,7 @@ mod tests {
             "SELECT * FROM orders WHERE id IN \
              (WITH orders AS (SELECT 1 AS id) SELECT id FROM orders)",
             &deferred,
+            IdentifierCaseRules::all_insensitive(),
         )
         .unwrap();
         // Exactly one occurrence of the qualified production ref (the outer
@@ -861,7 +904,12 @@ mod tests {
             "orders",
             quoted_target("my-gcp-project-123", "prod", "orders", '`'),
         )]);
-        let out = qualify_deferred_refs("SELECT * FROM orders", &deferred).unwrap();
+        let out = qualify_deferred_refs(
+            "SELECT * FROM orders",
+            &deferred,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert_eq!(out, "SELECT * FROM `my-gcp-project-123`.`prod`.`orders`");
     }
 
@@ -870,7 +918,12 @@ mod tests {
         // A two-part `staging.orders` is an external source ref, not a model
         // ref — it must not be rewritten even if `orders` is deferred.
         let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
-        let out = qualify_deferred_refs("SELECT * FROM staging.orders", &deferred).unwrap();
+        let out = qualify_deferred_refs(
+            "SELECT * FROM staging.orders",
+            &deferred,
+            IdentifierCaseRules::all_insensitive(),
+        )
+        .unwrap();
         assert!(out.contains("staging.orders"), "got: {out}");
         assert!(!out.contains("prod.orders"), "got: {out}");
     }
@@ -883,6 +936,7 @@ mod tests {
         let out = qualify_deferred_refs(
             "SELECT * FROM orders JOIN customers ON orders.cid = customers.id",
             &deferred,
+            IdentifierCaseRules::all_insensitive(),
         )
         .unwrap();
         assert!(out.contains("prod.orders"), "got: {out}");
@@ -897,7 +951,8 @@ mod tests {
     fn empty_deferred_map_is_a_noop() {
         let deferred: HashMap<String, DeferTarget> = HashMap::new();
         let sql = "SELECT * FROM orders";
-        let out = qualify_deferred_refs(sql, &deferred).unwrap();
+        let out =
+            qualify_deferred_refs(sql, &deferred, IdentifierCaseRules::all_insensitive()).unwrap();
         assert_eq!(out, sql);
     }
 
@@ -907,6 +962,7 @@ mod tests {
         let out = qualify_deferred_refs(
             "SELECT a.id FROM orders a JOIN orders b ON a.id = b.id",
             &deferred,
+            IdentifierCaseRules::all_insensitive(),
         )
         .unwrap();
         // Both occurrences qualified; aliases `a`/`b` preserved.
@@ -917,7 +973,11 @@ mod tests {
     #[test]
     fn unparseable_sql_returns_err() {
         let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
-        let err = qualify_deferred_refs("NOT VALID SQL ;;;", &deferred);
+        let err = qualify_deferred_refs(
+            "NOT VALID SQL ;;;",
+            &deferred,
+            IdentifierCaseRules::all_insensitive(),
+        );
         assert!(err.is_err());
     }
 
@@ -994,6 +1054,132 @@ mod tests {
              Order within the walk is NOT load-bearing and this assertion may be \
              relaxed for an ordering change alone."
         );
+    }
+
+    /// E1/E5 — `--defer` CTE visibility is positional, and RECURSIVE still
+    /// shadows its own body.
+    ///
+    /// Before the shared scope stack, every alias was installed before any body
+    /// was walked, so a later CTE shadowed a reference in an EARLIER CTE's body
+    /// and that upstream was left unqualified — to resolve against whatever the
+    /// working schema happens to hold. `defer_resolves_unbuilt_upstream_to_prod_schema`
+    /// in `run.rs` seeds a decoy table expressly to show that such a read can
+    /// succeed silently rather than fail loudly.
+    ///
+    /// Position 4 (recursive) previously worked *by accident* — the up-front
+    /// install covered the self-reference. A naive positional port would have
+    /// regressed it, which is why it is pinned here.
+    #[test]
+    fn defer_cte_visibility_is_positional() {
+        let deferred = deferred_map(&[("up", target("", "prod", "up"))]);
+        let rules = IdentifierCaseRules::all_insensitive();
+
+        // 1. Earlier CTE body, later CTE of the same name: NOT shadowed.
+        let out = qualify_deferred_refs(
+            "WITH first AS (SELECT * FROM up), up AS (SELECT 1 AS id) SELECT * FROM first",
+            &deferred,
+            rules,
+        )
+        .unwrap();
+        assert!(
+            out.contains("FROM prod.up"),
+            "a later CTE must not shadow an earlier body's upstream read: {out}"
+        );
+
+        // 2. Later CTE body referencing an EARLIER CTE: shadowed.
+        let out = qualify_deferred_refs(
+            "WITH up AS (SELECT 1 AS id), second AS (SELECT * FROM up) SELECT * FROM second",
+            &deferred,
+            rules,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("prod.up"),
+            "an earlier CTE must shadow a later body's reference: {out}"
+        );
+
+        // 3. Query body sees every CTE.
+        let out = qualify_deferred_refs(
+            "WITH a AS (SELECT 1 AS id), up AS (SELECT 2 AS id) SELECT * FROM up",
+            &deferred,
+            rules,
+        )
+        .unwrap();
+        assert!(!out.contains("prod.up"), "the body sees every CTE: {out}");
+
+        // 4. RECURSIVE: in scope for its own body.
+        let out = qualify_deferred_refs(
+            "WITH RECURSIVE up AS (SELECT 1 AS id UNION ALL SELECT id FROM up) \
+             SELECT * FROM up",
+            &deferred,
+            rules,
+        )
+        .unwrap();
+        assert!(
+            !out.contains("prod.up"),
+            "a recursive CTE shadows its own self-reference: {out}"
+        );
+    }
+
+    /// E2/E3 — `--defer` compares CTE aliases by resolved identity.
+    ///
+    /// On a folding dialect `WITH Orders … FROM orders` is ONE CTE, so the
+    /// reference must read it. Comparing aliases verbatim (as this did) left it
+    /// unshadowed and qualified it to the PRODUCTION table instead.
+    ///
+    /// The quoted half pins the second axis: under Snowflake's shape a quoted
+    /// alias keeps its case while an unquoted reference resolves upper, so
+    /// `WITH "orders"` must NOT shadow a bare `orders`.
+    #[test]
+    fn defer_cte_alias_comparison_follows_dialect_identity() {
+        let deferred = deferred_map(&[("orders", target("", "prod", "orders"))]);
+
+        for (cte, reference) in [("Orders", "orders"), ("orders", "ORDERS")] {
+            let out = qualify_deferred_refs(
+                &format!("WITH {cte} AS (SELECT 1 AS id) SELECT * FROM {reference}"),
+                &deferred,
+                IdentifierCaseRules::all_insensitive(),
+            )
+            .unwrap();
+            assert!(
+                !out.contains("prod.orders"),
+                "CTE {cte} must shadow {reference} on a folding dialect: {out}"
+            );
+        }
+
+        // Snowflake shape: quoted alias, unquoted reference -> different names.
+        let out = qualify_deferred_refs(
+            "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
+            &deferred,
+            IdentifierCaseRules::uniform_uppercasing(true),
+        )
+        .unwrap();
+        assert!(
+            out.contains("prod.orders"),
+            "a quoted alias must not shadow an unquoted reference there: {out}"
+        );
+    }
+
+    /// E4 — the `deferred` lookup itself stays EXACT, on every dialect.
+    ///
+    /// Its keys are Rocky model names, and `resolve::classify_table_ref` matches
+    /// a bare name to a model with an exact `HashSet::contains`. Folding this
+    /// lookup would qualify a reference the compiler gave no dependency edge to,
+    /// so `--defer` would disagree with the DAG about what a name means. The
+    /// case axis reaches the scope stack only.
+    #[test]
+    fn defer_model_name_lookup_stays_exact() {
+        let deferred = deferred_map(&[("Orders", target("", "prod", "orders"))]);
+        for rules in [
+            IdentifierCaseRules::all_insensitive(),
+            IdentifierCaseRules::uniform(true),
+        ] {
+            let out = qualify_deferred_refs("SELECT * FROM orders", &deferred, rules).unwrap();
+            assert_eq!(
+                out, "SELECT * FROM orders",
+                "a differently-cased bare name is not a ModelRef, so it is not qualified"
+            );
+        }
     }
 
     // -- rewrite_upstream_refs ---------------------------------------------
