@@ -271,6 +271,7 @@ pub async fn run_with_dag(
     // this path has now produced four of them. Lift the refusal when the DAG
     // executes its transformation models as one shadow-aware unit — at which
     // point the per-node `shadow_config` threading below is what carries it.
+    // Tracked as #1279.
     if shadow_config.is_some() {
         anyhow::bail!(
             "--shadow / --branch is not supported by `rocky run --dag`: the DAG runs each model \

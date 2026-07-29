@@ -2218,7 +2218,8 @@ pub async fn run(
             // Refuse rather than let either outcome stand. The real fix is to
             // give `TableTask` separate source and target names, which is a
             // wider change than it looks — the field also feeds asset keys,
-            // drift comparison, checks and state/watermark keys.
+            // drift comparison, checks and state/watermark keys. Tracked as
+            // #1280.
             if let Some(cfg) = shadow_config
                 && cfg.schema_override.is_none()
             {
