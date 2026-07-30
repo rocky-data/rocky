@@ -20,13 +20,24 @@ use rocky_core::models::Model;
 /// `run` reports the absent directory it decided against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelsDir {
-    /// The base directory exists and is confined to the project root.
+    /// The base directory exists, and resolved inside the project root **at the
+    /// moment it was checked**.
+    ///
+    /// Precisely that, and no more: the path handed back is the ordinary
+    /// (non-canonical) one, so a symlink component retargeted after this check
+    /// and before the directory is opened is not caught. Closing that window
+    /// needs a directory handle carried from check to open, which no caller
+    /// does today. The guarantee is therefore a guard against a
+    /// **misconfigured** `models` glob, not against an adversary who can
+    /// already write inside the project tree — one who can retarget a symlink
+    /// there can equally edit `rocky.toml` or the model SQL, which no path
+    /// check would stop.
     Present(PathBuf),
     /// The base directory does not exist. A no-op for every caller.
     ///
     /// Containment is **not** asserted for this variant, matching the order the
     /// existence check has always run in: an absent directory is never read, so
-    /// there is nothing to confine. Only `Present` has been proven in-tree.
+    /// there is nothing to confine.
     Absent(PathBuf),
 }
 
@@ -39,18 +50,26 @@ pub enum ModelsDir {
 /// which never exists — the pipeline contributes no models and the caller sees an
 /// empty, apparently-successful result (#1268).
 ///
-/// This is the single derivation. `resolve_models_dir` (its `Option`-returning
-/// wrapper), `run`'s session gate and `validate`'s existence check all consume
-/// it, so a glob shape cannot be understood one way when deciding whether to
-/// build and another way when building. `scope.rs`, `branch.rs`, `gc.rs` and
-/// `apply.rs` derive the same base inline with the same character set; they are
-/// deliberately left alone, because `gc` and `apply` feed a **policy** target map
-/// where turning a tolerant derivation into a fallible one is a fail-open (an
-/// emptied map leaves targets unresolved, and an unresolved target is evaluated
-/// against default attributes — see `apply::resolve_touched_apply_targets`).
+/// A glob that is *all* wildcard (`**/*.sql`) has an empty base, which falls
+/// back to `models` rather than the project root. That fallback was previously
+/// unreachable here: `str::split` yields `Some("")` for a leading wildcard, never
+/// `None`, so `unwrap_or` never fired and the empty base joined to the project
+/// root — while `gc.rs` and `apply.rs`, which filter the empty case, resolved
+/// `models`. Execution therefore loaded one directory while the **policy** target
+/// map was built from another, and a missing mapping leaves a target evaluated
+/// against default attributes (see `apply::resolve_touched_apply_targets`). All
+/// five sites now agree.
 ///
-/// Mirrors `scope.rs`'s containment check: a `models = "../../etc"` escape must
-/// never read outside the project tree.
+/// `resolve_models_dir` (its `Option`-returning wrapper), `run`'s session gate and
+/// `validate` consume this, so a glob cannot be understood one way when deciding
+/// whether to build and another way when building.
+///
+/// **Containment is not universal.** This function and `scope.rs` confine the
+/// base to the project root; `branch promote` (`branch.rs`) joins and loads it
+/// without confinement, so it still consumes a glob that `run` and `validate`
+/// now refuse. `gc` and `apply` are deliberately left infallible — they feed the
+/// policy target map, where an error that empties the map is a fail-open rather
+/// than a fix.
 pub fn locate_models_dir(models_glob: &str, config_path: &Path) -> Result<ModelsDir> {
     // `Path::new("rocky.toml").parent()` is `Some("")`, not `None`, and an empty
     // path fails to canonicalize — normalize it to the cwd so a relative default
@@ -62,6 +81,7 @@ pub fn locate_models_dir(models_glob: &str, config_path: &Path) -> Result<Models
     let models_base = models_glob
         .split(&['*', '?', '['][..])
         .next()
+        .filter(|base| !base.is_empty())
         .unwrap_or("models");
     let models_dir = project_root.join(models_base.trim_end_matches('/'));
     if !models_dir.exists() {
@@ -76,9 +96,20 @@ pub fn locate_models_dir(models_glob: &str, config_path: &Path) -> Result<Models
             project_root.display()
         )
     })?;
-    if let Ok(canonical_models) = models_dir.canonicalize()
-        && !canonical_models.starts_with(&canonical_root)
-    {
+    // Fail CLOSED when the models directory cannot be resolved. This previously
+    // swallowed the error and returned `Present` with the containment check
+    // simply skipped — so a directory that exists but cannot be canonicalized
+    // (a parent component that denies traversal, or a removal racing the
+    // `exists()` above) was loaded unconfined. A probe that cannot answer
+    // "is this inside the project?" is not the same as a probe that answers yes.
+    let canonical_models = models_dir.canonicalize().with_context(|| {
+        format!(
+            "models directory '{}' exists but could not be resolved, so it \
+             cannot be confirmed to be inside the project root",
+            models_dir.display()
+        )
+    })?;
+    if !canonical_models.starts_with(&canonical_root) {
         anyhow::bail!(
             "models directory '{}' resolves outside the project root '{}'",
             canonical_models.display(),
@@ -325,6 +356,30 @@ mod tests {
             locate_models_dir("nope/**", &config).expect("locate"),
             ModelsDir::Absent(root.join("nope")),
             "the absent branch must name the directory it decided against"
+        );
+    }
+
+    /// An all-wildcard glob has an empty base, which must fall back to `models`
+    /// — not join to the project root. `split` yields `Some("")` here, never
+    /// `None`, so the `unwrap_or` fallback only fires because of the `.filter`.
+    ///
+    /// This is what `gc.rs` and `apply.rs` already derived for the same glob;
+    /// before the filter, execution loaded the project root while the policy
+    /// target map was built from `<project>/models`.
+    ///
+    /// Mutation that must turn this red: drop `.filter(|base| !base.is_empty())`.
+    #[test]
+    fn an_all_wildcard_glob_falls_back_to_the_models_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+        std::fs::create_dir_all(root.join("models")).expect("mkdir models");
+
+        assert_eq!(
+            locate_models_dir("**/*.sql", &config).expect("locate"),
+            ModelsDir::Present(root.join("models")),
+            "an empty base must mean `models`, not the project root"
         );
     }
 

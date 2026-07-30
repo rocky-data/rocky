@@ -14,9 +14,11 @@
 //!   directory really contains a loadable model, so a run that does not refuse
 //!   would visibly build it.
 //!
-//! The unit-level derivation table lives in `models_loader`'s own tests; these
-//! two cover the seam those tests cannot reach, because `run`'s decision is
-//! built inline inside `run()`.
+//! Scope: these exercise plain `run()` only, which is where the decision is
+//! built inline and therefore unreachable from a unit test. They do **not**
+//! pin the other consumers of the shared derivation (`tick`, `run --dag`,
+//! `scope`, `validate`) — `validate`'s share is covered by its own unit tests,
+//! and the unit-level derivation table lives in `models_loader`'s tests.
 
 #![cfg(feature = "duckdb")]
 
@@ -177,7 +179,10 @@ async fn an_escaping_models_glob_is_refused_and_builds_nothing() {
     // The models live OUTSIDE the project root, and really do load.
     write_project(&root, &db, "../outside/**", &dir.path().join("outside"));
 
-    let err = run_pipeline(&root.join("rocky.toml"), &root.join(".rocky-state.redb"))
+    let state_path = root.join(".rocky-state.redb");
+    assert!(!db.exists(), "sanity: no database before the run");
+
+    let err = run_pipeline(&root.join("rocky.toml"), &state_path)
         .await
         .expect_err("a glob escaping the project root must be refused");
     let rendered = format!("{err:#}");
@@ -186,13 +191,17 @@ async fn an_escaping_models_glob_is_refused_and_builds_nothing() {
         "the refusal must name the containment breach, got: {rendered}"
     );
 
-    // The refusal has to land before any warehouse mutation. If the database
-    // was never created, the escape was refused before execution.
-    if db.exists() {
-        assert_eq!(
-            orders_tables(&db).await,
-            0,
-            "a refused run must not have materialized the out-of-tree model"
-        );
-    }
+    // Unconditional, and stronger than "the escaped model's target is absent":
+    // the refusal must land before ANY warehouse work, so the database file the
+    // adapter would open must never come into existence at all. Asserting only
+    // that `orders` is missing would pass for a regression that created the
+    // database, or mutated some other object, before failing.
+    assert!(
+        !db.exists(),
+        "the refusal must precede any warehouse mutation, but the database was created"
+    );
+    assert!(
+        !state_path.exists(),
+        "a refused run must not open a state session"
+    );
 }

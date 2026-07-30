@@ -128,10 +128,15 @@ pub(crate) fn resolve_transformation_managed_tables(
 
     // The `models` field is a glob like "models/**" — extract the base
     // directory (everything before any glob wildcard).
+    // `.filter` before `.unwrap_or`: `split` yields `Some("")` for an all-wildcard
+    // glob (`**/*.sql`), never `None`, so without it the fallback is unreachable
+    // and the empty base joins to the project root — a different directory from
+    // the one `gc` and `apply` derive for the same glob.
     let models_base = tx
         .models
         .split(&['*', '?', '['][..])
         .next()
+        .filter(|base| !base.is_empty())
         .unwrap_or("models");
     let models_dir = project_root.join(models_base.trim_end_matches('/'));
 

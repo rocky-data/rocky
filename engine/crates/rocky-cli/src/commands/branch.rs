@@ -1113,10 +1113,15 @@ fn discover_transformation_branch_targets(
     // resolution rule as `scope::resolve_transformation_managed_tables` and
     // `run_local::run_transformation`.
     let project_root = config_path.parent().unwrap_or(Path::new("."));
+    // `.filter` before `.unwrap_or`: `split` yields `Some("")` for an all-wildcard
+    // glob, never `None`, so without it the fallback is unreachable and the empty
+    // base joins to the project root — a different directory from the one `gc`
+    // and `apply` derive for the same glob.
     let models_base = pipeline
         .models
         .split(&['*', '?', '['][..])
         .next()
+        .filter(|base| !base.is_empty())
         .unwrap_or("models");
     let models_dir = project_root.join(models_base.trim_end_matches('/'));
 

@@ -2440,6 +2440,38 @@ models = "{models_glob}"
         );
     }
 
+    /// A `models` glob escaping the project root is reported as a V047 error and
+    /// fails the validation, rather than passing the project as healthy — `run`
+    /// refuses to execute it, so `validate` must say so.
+    ///
+    /// Mutation that must turn this red: map the `Err` arm to a warning, or drop
+    /// the `ok = false`.
+    #[test]
+    fn an_escaping_models_glob_is_a_v047_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        // The escape target must exist, or the glob is merely absent (V025).
+        let config_path = write_transformation_project(&root, "../outside/**", "../outside", "");
+
+        let out = validate_inner(&config_path).unwrap();
+
+        assert!(!out.valid, "an escaping glob must fail validation");
+        let v047: Vec<_> = out.messages.iter().filter(|m| m.code == "V047").collect();
+        assert_eq!(v047.len(), 1, "messages: {:?}", out.messages);
+        assert_eq!(v047[0].severity, "error");
+        assert!(
+            v047[0].message.contains("outside the project root"),
+            "the message must name the breach, got: {}",
+            v047[0].message
+        );
+        assert_eq!(
+            v047[0].field.as_deref(),
+            Some("pipeline.silver.models"),
+            "the field path must point an IDE at the offending key"
+        );
+    }
+
     /// A replication-only project that happens to hold a `models/` directory
     /// keeps reporting what it reported before the derivation changed — no
     /// transformation pipeline declares a directory, so the fallback applies.
