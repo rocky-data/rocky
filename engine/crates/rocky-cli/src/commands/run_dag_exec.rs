@@ -20,20 +20,22 @@ use tracing::info;
 use rocky_core::dag_executor::{DagExecutor, NodeDispatcher, NodeFuture, NodeStatus};
 use rocky_core::unified_dag::{self, NodeId, NodeKind};
 
-use super::run::SkipRunOptions;
+use super::run::{PartitionRunOptions, SkipRunOptions};
 use crate::output::{DagRunNodeOutput, DagRunOutput, print_json};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Runs one pipeline sub-run: `(config_path, loaded, state_path,
-/// pipeline_name, model_name, skip_opts) -> Result<(), String>`.
+/// pipeline_name, model_name, partition_opts, skip_opts, shadow_config) ->
+/// Result<(), String>`.
 ///
-/// Injected into [`CliDispatcher`] so the escape-hatch flags flow to a single,
+/// Injected into [`CliDispatcher`] so the outer run options flow to a single,
 /// observable seam. Production wraps [`super::run::run`] with the DAG sub-run's
 /// fixed arguments ([`default_sub_runner`]); tests substitute a recorder that
-/// captures the exact [`SkipRunOptions`] and `Arc<LoadedConfig>` the dispatch
-/// passes — so reverting the dispatch to `SkipRunOptions::default()` (or to a
-/// per-node config reload) is caught.
+/// captures the exact [`PartitionRunOptions`], [`SkipRunOptions`],
+/// `ShadowConfig` and `Arc<LoadedConfig>` the dispatch passes — so replacing
+/// any of them with defaults, reloading config per node, or widening the
+/// partition options back out to include `--parallel`, is caught.
 type SubRunner = Arc<
     dyn Fn(
             PathBuf,
@@ -41,6 +43,7 @@ type SubRunner = Arc<
             PathBuf,
             String,
             Option<String>,
+            PartitionRunOptions,
             SkipRunOptions,
             Option<rocky_core::shadow::ShadowConfig>,
         ) -> Pin<Box<dyn Future<Output = std::result::Result<(), String>> + Send>>
@@ -51,10 +54,10 @@ type SubRunner = Arc<
 /// The production [`SubRunner`]: drives one pipeline through [`super::run::run`]
 /// with the DAG sub-run's fixed arguments (no `--defer`/`--var`, config-derived
 /// TTL, no idempotency key). Only `config`, `loaded`, `state`, `pipeline`,
-/// `model_name`, and `skip_opts` vary per node — `loaded` is always a clone of
-/// the ONE snapshot `run_with_dag` captured, never a per-node reload, and
-/// transformation nodes supply their model name so each node materializes only
-/// itself; other pipeline nodes pass `None`.
+/// `model_name`, `partition_opts`, and `skip_opts` vary per node — `loaded` is
+/// always a clone of the ONE snapshot `run_with_dag` captured, never a per-node
+/// reload, and transformation nodes supply their model name so each node
+/// materializes only itself; other pipeline nodes pass `None`.
 ///
 /// Because each transformation model runs as its own sub-run — with its own
 /// [`super::skip_gate::SkipGate`] instance — `--skip-unchanged` cannot observe a
@@ -71,6 +74,7 @@ fn default_sub_runner() -> SubRunner {
          state_path: PathBuf,
          pipeline_name: String,
          model_name: Option<String>,
+         partition_opts,
          skip_opts,
          shadow_config: Option<rocky_core::shadow::ShadowConfig>| {
             Box::pin(async move {
@@ -81,15 +85,6 @@ fn default_sub_runner() -> SubRunner {
                     model_name.as_deref(),
                 )
                 .map_err(|e| format!("{e:#}"))?;
-                let partition_opts = super::PartitionRunOptions {
-                    partition: None,
-                    from: None,
-                    to: None,
-                    latest: false,
-                    missing: false,
-                    lookback: None,
-                    parallel: 1,
-                };
                 super::run::run(
                     &config_path,
                     loaded,
@@ -171,6 +166,11 @@ pub async fn run_with_dag(
     config_path: &Path,
     state_path: &Path,
     json: bool,
+    // The caller's time-interval partition options. Every sub-run must receive
+    // the same *selection*; otherwise an explicit historical partition silently
+    // degrades to `Latest` (#1283). The `parallel` field is deliberately not
+    // honored here — see [`sub_run_partition_opts`].
+    partition_opts: &PartitionRunOptions,
     // Build-escape-hatch overlay (`--force-rebuild` / `--no-reuse`). Threaded
     // into every sub-run so `rocky run --dag --force-rebuild` actually forces a
     // build (and `--no-reuse` disables content-addressed reuse + column-skip)
@@ -306,6 +306,7 @@ pub async fn run_with_dag(
         state_path: state_path.to_path_buf(),
         seeds_dir,
         node_pipelines,
+        partition_opts: partition_opts.clone(),
         skip_opts: *skip_opts,
         shadow_config: shadow_config.cloned(),
         sub_runner: default_sub_runner(),
@@ -462,6 +463,11 @@ struct CliDispatcher {
     /// Maps each pipeline-bound node to its owning pipeline name. Seed and
     /// source-marker nodes carry no entry (their `pipeline` is `None`).
     node_pipelines: HashMap<NodeId, String>,
+    /// The outer DAG invocation's time-interval partition options, exactly as
+    /// the caller passed them. [`Self::dispatch`] narrows them through
+    /// [`sub_run_partition_opts`] on the way to each sub-run — the selection
+    /// travels, the concurrency does not.
+    partition_opts: PartitionRunOptions,
     /// The `--force-rebuild` / `--no-reuse` build-escape-hatch overlay, threaded
     /// from the outer `run_with_dag` so each sub-run honors it. `Copy`, so the
     /// per-node closure captures a value (no borrow escaping the dispatcher).
@@ -475,12 +481,68 @@ struct CliDispatcher {
     sub_runner: SubRunner,
 }
 
+/// The partition options one DAG sub-run receives: the caller's **selection**,
+/// with concurrency pinned to 1.
+///
+/// The two halves of [`PartitionRunOptions`] answer different questions and the
+/// DAG owns only one of them.
+///
+/// `--partition` / `--from`/`--to` / `--latest` / `--missing` / `--lookback`
+/// choose *which* partitions to build. They must reach every sub-run: dropping
+/// them is what made `rocky run --dag --partition 2020-01-01` rebuild the
+/// latest partition and exit 0 (#1283).
+///
+/// `--parallel` chooses *how many* warehouse queries run at once, and the DAG
+/// already owns that dimension — it dispatches every node in a layer
+/// concurrently. Honoring the flag per sub-run on top of that would give
+/// node-fan-out × per-partition-fan-out, and `run_with_dag` builds its
+/// [`DagExecutor`] with no `max_concurrency`, so the left-hand factor is
+/// unbounded. `rocky run` refuses that multiplication by construction:
+/// `super::run::execute_models` excludes `time_interval` from concurrent model
+/// execution precisely because it "already self-parallelizes per-partition".
+/// The DAG must not reintroduce what the non-DAG path is careful to avoid, so
+/// per-sub-run concurrency stays at 1 — byte-identical to the value the DAG
+/// passed before any selection was threaded.
+///
+/// Giving `--parallel` a single meaning on both paths — by bounding node
+/// fan-out here rather than partition fan-out below — is #1288.
+fn sub_run_partition_opts(caller: &PartitionRunOptions) -> PartitionRunOptions {
+    // Destructured field-by-field rather than `..caller.clone()` ON PURPOSE.
+    // Struct-update syntax would silently thread any field added later, which
+    // is right for another selection knob and wrong for another concurrency or
+    // resource knob — exactly the mistake this function exists to prevent. The
+    // exhaustive pattern stops compiling instead, so the next field has to pick
+    // a side deliberately.
+    let PartitionRunOptions {
+        partition,
+        from,
+        to,
+        latest,
+        missing,
+        lookback,
+        parallel: _,
+    } = caller;
+    PartitionRunOptions {
+        partition: partition.clone(),
+        from: from.clone(),
+        to: to.clone(),
+        latest: *latest,
+        missing: *missing,
+        lookback: *lookback,
+        parallel: 1,
+    }
+}
+
 impl NodeDispatcher for CliDispatcher {
     fn dispatch(&self, id: &NodeId, kind: NodeKind, label: &str) -> Option<NodeFuture> {
         let config_path = self.config_path.clone();
         // `Arc::clone`, NOT a reload: every node executes the one snapshot.
         let loaded = Arc::clone(&self.loaded);
         let state_path = self.state_path.clone();
+        // The narrowing happens HERE, at the one seam every sub-run crosses,
+        // rather than where the dispatcher is built — so no construction path
+        // can hand a sub-run the caller's `--parallel`.
+        let partition_opts = sub_run_partition_opts(&self.partition_opts);
         let skip_opts = self.skip_opts;
         let shadow_config = self.shadow_config.clone();
         let sub_runner = self.sub_runner.clone();
@@ -536,11 +598,9 @@ impl NodeDispatcher for CliDispatcher {
                 let model_name = matches!(kind, NodeKind::Transformation).then_some(label.clone());
                 // Drive the sub-run through the injected [`SubRunner`] against
                 // the canonical state path the caller resolved, threading the
-                // build-escape-hatch `skip_opts` (`--force-rebuild` /
-                // `--no-reuse`) so they are honored per sub-run rather than
-                // dropped at the DAG boundary. Passing anything other than
-                // `skip_opts` here reintroduces the silent-drop bug, which the
-                // `sub_runner` recorder test catches.
+                // partition selection and the build-escape-hatch options so
+                // they are honored per sub-run rather than dropped at the DAG
+                // boundary.
                 Some(Box::pin(async move {
                     (sub_runner)(
                         config_path,
@@ -548,6 +608,7 @@ impl NodeDispatcher for CliDispatcher {
                         state_path,
                         pipeline_name,
                         model_name,
+                        partition_opts,
                         skip_opts,
                         shadow_config,
                     )
@@ -559,7 +620,7 @@ impl NodeDispatcher for CliDispatcher {
 }
 
 #[cfg(test)]
-mod skip_opts_threading_tests {
+mod run_opts_threading_tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -568,10 +629,10 @@ mod skip_opts_threading_tests {
     use rocky_core::dag_executor::NodeDispatcher;
     use rocky_core::unified_dag::{NodeId, NodeKind};
 
-    use super::super::run::SkipRunOptions;
+    use super::super::run::{PartitionRunOptions, SkipRunOptions};
     use super::{CliDispatcher, SubRunner, models_dir_for_model_scope};
 
-    type RecordedSubRun = (Option<String>, SkipRunOptions);
+    type RecordedSubRun = (Option<String>, PartitionRunOptions, SkipRunOptions);
 
     const DEFAULT_GLOB_CONFIG: &str = r#"
 [adapter]
@@ -692,6 +753,7 @@ adapter = "default"
     /// returning the dispatcher and the node ids in dispatch order.
     fn dispatcher_with_nodes(
         loaded: Arc<LoadedConfig>,
+        partition_opts: PartitionRunOptions,
         skip_opts: SkipRunOptions,
         shadow_config: Option<rocky_core::shadow::ShadowConfig>,
         recorder: SubRunner,
@@ -711,6 +773,7 @@ adapter = "default"
             state_path: std::path::PathBuf::from(".rocky-state.redb"),
             seeds_dir: std::path::PathBuf::from("seeds"),
             node_pipelines,
+            partition_opts,
             skip_opts,
             shadow_config,
             sub_runner: recorder,
@@ -718,29 +781,46 @@ adapter = "default"
         (dispatcher, node_ids)
     }
 
-    /// 🔴 DEFECT 3 regression: `rocky run --dag --force-rebuild` / `--no-reuse`
-    /// must reach each sub-run. Pre-fix, `run_with_dag` passed
-    /// `SkipRunOptions::default()` to every sub-run, silently dropping the
-    /// escape hatches (a column-skip-eligible content-addressed model would
-    /// still skip under `--dag --force-rebuild`).
+    /// The whole sub-run options contract in one test: the partition
+    /// **selection** and the build escape hatches reach each sub-run verbatim,
+    /// and `--parallel` does **not**.
     ///
-    /// Non-vacuous: a recording [`SubRunner`] captures the EXACT `SkipRunOptions`
-    /// the pipeline dispatch passes. Reverting the dispatch call argument to
-    /// `SkipRunOptions::default()` makes the recorded value `default()` and
-    /// fails the assertion. (The behavioral end-to-end proof — a
-    /// content-addressed model not skipping — needs s3 and is exercised by the
-    /// live sandbox.)
+    /// Three defects meet here. `SkipRunOptions::default()` used to replace the
+    /// escape hatches. An empty `PartitionRunOptions` used to replace the
+    /// selection, so `--partition <historical>` silently rebuilt the latest
+    /// partition (#1283). And threading the options wholesale would carry
+    /// `--parallel` — whose `rocky run` default is 4, against the 1 this
+    /// boundary has always passed — into a fan-out the DAG does not bound
+    /// (#1288, and see [`sub_run_partition_opts`]).
+    ///
+    /// Non-vacuous, and it guards the call site rather than a helper: the
+    /// recorder captures what a real `dispatch()` hands the sub-runner, so
+    /// reverting the narrowing to `self.partition_opts.clone()` fails on
+    /// `parallel`, and dropping it to `default()` fails on the selection. The
+    /// dispatcher is deliberately given `parallel: 3` — a value no assertion
+    /// below expects to survive. (The historical-partition behavior is proven
+    /// end-to-end further down; the content-addressed escape-hatch behavior
+    /// needs S3 and is exercised by the live sandbox.)
     #[tokio::test]
-    async fn dispatch_passes_the_threaded_skip_opts_to_each_sub_run() {
+    async fn dispatch_passes_the_selection_but_not_the_concurrency_to_each_sub_run() {
         let recorded: Arc<Mutex<Vec<RecordedSubRun>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = recorded.clone();
         // A recorder sub-runner: capture the skip_opts and return Ok without
         // running a real pipeline.
         let recorder: SubRunner = Arc::new(
-            move |_config, _loaded, _state, _pipeline, model_name, skip_opts, _shadow| {
+            move |_config,
+                  _loaded,
+                  _state,
+                  _pipeline,
+                  model_name,
+                  partition_opts,
+                  skip_opts,
+                  _shadow| {
                 let sink = sink.clone();
                 Box::pin(async move {
-                    sink.lock().unwrap().push((model_name, skip_opts));
+                    sink.lock()
+                        .unwrap()
+                        .push((model_name, partition_opts, skip_opts));
                     Ok(())
                 })
             },
@@ -752,8 +832,23 @@ adapter = "default"
             no_reuse: true,
             no_prune: false,
         };
-        let (dispatcher, node_ids) =
-            dispatcher_with_nodes(test_loaded_config(), skip_opts, None, recorder, 1);
+        let partition_opts = PartitionRunOptions {
+            partition: Some("2020-01-02".into()),
+            from: Some("2020-01-01".into()),
+            to: Some("2020-01-03".into()),
+            latest: true,
+            missing: true,
+            lookback: Some(2),
+            parallel: 3,
+        };
+        let (dispatcher, node_ids) = dispatcher_with_nodes(
+            test_loaded_config(),
+            partition_opts,
+            skip_opts,
+            None,
+            recorder,
+            1,
+        );
 
         // Drive a real pipeline-node dispatch through the production path.
         let fut = dispatcher
@@ -768,12 +863,28 @@ adapter = "default"
             Some("dim_orders_0"),
             "a transformation node's dispatched label is its model scope"
         );
+        let opts = &got[0].1;
+        // Every selection field survives verbatim — this is #1283.
+        assert_eq!(opts.partition.as_deref(), Some("2020-01-02"));
+        assert_eq!(opts.from.as_deref(), Some("2020-01-01"));
+        assert_eq!(opts.to.as_deref(), Some("2020-01-03"));
+        assert!(opts.latest);
+        assert!(opts.missing);
+        assert_eq!(opts.lookback, Some(2));
+        // ...and concurrency does not. The dispatcher holds 3; the sub-run
+        // must see 1, because the DAG already fans out per node and does not
+        // cap that fan-out. Threading it wholesale makes this 3.
+        assert_eq!(
+            opts.parallel, 1,
+            "--parallel must NOT reach the sub-run: the DAG owns node fan-out \
+             and does not bound it, so honoring it here multiplies (#1288)"
+        );
         assert!(
-            got[0].1.force_rebuild,
+            got[0].2.force_rebuild,
             "--force-rebuild must reach the sub-run, not be dropped to default()"
         );
         assert!(
-            got[0].1.no_reuse,
+            got[0].2.no_reuse,
             "--no-reuse must reach the sub-run, not be dropped to default()"
         );
     }
@@ -805,7 +916,14 @@ adapter = "default"
         let recorded: Arc<Mutex<Vec<RecordedShadow>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = recorded.clone();
         let recorder: SubRunner = Arc::new(
-            move |_config, _loaded, _state, _pipeline, model_name, _skip_opts, shadow| {
+            move |_config,
+                  _loaded,
+                  _state,
+                  _pipeline,
+                  model_name,
+                  _partition,
+                  _skip_opts,
+                  shadow| {
                 let sink = sink.clone();
                 Box::pin(async move {
                     sink.lock().unwrap().push((model_name, shadow));
@@ -821,6 +939,7 @@ adapter = "default"
         };
         let (dispatcher, node_ids) = dispatcher_with_nodes(
             test_loaded_config(),
+            PartitionRunOptions::default(),
             SkipRunOptions::default(),
             Some(shadow_config),
             recorder,
@@ -869,7 +988,7 @@ adapter = "default"
         let recorded: Arc<Mutex<Vec<Arc<LoadedConfig>>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = recorded.clone();
         let recorder: SubRunner = Arc::new(
-            move |_config, loaded, _state, _pipeline, _model, _skip, _shadow| {
+            move |_config, loaded, _state, _pipeline, _model, _partition, _skip, _shadow| {
                 let sink = sink.clone();
                 Box::pin(async move {
                     sink.lock().unwrap().push(loaded);
@@ -881,6 +1000,7 @@ adapter = "default"
         let loaded = test_loaded_config();
         let (dispatcher, node_ids) = dispatcher_with_nodes(
             Arc::clone(&loaded),
+            PartitionRunOptions::default(),
             SkipRunOptions::default(),
             None,
             recorder,
@@ -983,6 +1103,7 @@ mod tests {
             state_path: root.join(".rocky-state.redb"),
             seeds_dir: root.join("seeds"),
             node_pipelines: HashMap::new(),
+            partition_opts: PartitionRunOptions::default(),
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
             sub_runner: default_sub_runner(),
@@ -1083,6 +1204,7 @@ mod tests {
             &config_path,
             &state_path,
             false,
+            &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             None,
         )
@@ -1180,6 +1302,7 @@ mod tests {
             &config_path,
             &state_path,
             false,
+            &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             None,
         )
@@ -1202,6 +1325,7 @@ mod tests {
             &config_path,
             &state_path,
             false,
+            &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             Some(&shadow_config),
         )
@@ -1285,6 +1409,7 @@ mod tests {
             &config_path,
             &state_path,
             false,
+            &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             None,
         )
@@ -1304,6 +1429,7 @@ mod tests {
             &config_path,
             &state_path,
             false,
+            &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             Some(&shadow_config),
         )
@@ -1324,6 +1450,94 @@ mod tests {
         // Production is untouched by the refused run.
         let prod_b = guard.execute_sql("SELECT v FROM proj.silver.b").unwrap();
         assert_eq!(cell_i64(&prod_b.rows[0][0]), 1, "production b untouched");
+    }
+
+    #[tokio::test]
+    async fn historical_partition_selection_reaches_dag_model_sub_run() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models).unwrap();
+
+        let db_path = root.join("proj.duckdb");
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date, COUNT(*) AS order_count \
+             FROM raw__orders.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date \
+             GROUP BY 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("daily_orders.toml"),
+            "depends_on = []\n\n\
+             [[sources]]\ncatalog = \"\"\nschema = \"raw__orders\"\ntable = \"orders\"\n\n\
+             [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+             granularity = \"day\"\nfirst_partition = \"2020-01-01\"\nlookback = 0\n\n\
+             [target]\ncatalog = \"proj\"\nschema = \"marts\"\ntable = \"daily_orders\"\n",
+        )
+        .unwrap();
+
+        {
+            let seed = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            seed.execute_statement("CREATE SCHEMA raw__orders")
+                .await
+                .unwrap();
+            seed.execute_statement(
+                "CREATE TABLE raw__orders.orders AS \
+                 SELECT TIMESTAMP '2020-01-01 12:00:00' AS order_at",
+            )
+            .await
+            .unwrap();
+        }
+
+        let partition_opts = PartitionRunOptions {
+            partition: Some("2020-01-01".into()),
+            parallel: 1,
+            ..Default::default()
+        };
+        run_with_dag(
+            &root.join("rocky.toml"),
+            &root.join(".rocky-state.redb"),
+            false,
+            &partition_opts,
+            &SkipRunOptions::default(),
+            None,
+        )
+        .await
+        .expect("historical DAG partition run should succeed");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql(
+                "SELECT CAST(order_date AS VARCHAR), order_count \
+                 FROM proj.marts.daily_orders",
+            )
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1, "the requested partition materializes");
+        assert_eq!(rows.rows[0][0].as_str(), Some("2020-01-01"));
+        assert_eq!(cell_i64(&rows.rows[0][1]), 1);
     }
 
     #[tokio::test]
@@ -1389,6 +1603,7 @@ mod tests {
             &root.join("rocky.toml"),
             &root.join(".rocky-state.redb"),
             false,
+            &PartitionRunOptions::default(),
             &crate::commands::run::SkipRunOptions::default(),
             None,
         )

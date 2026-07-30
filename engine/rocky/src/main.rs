@@ -926,6 +926,12 @@ enum Command {
         /// the same dependency layer run up to N at a time, with a barrier
         /// at each layer boundary. Warehouse-query parallelism only — state
         /// writes serialize through redb, and DuckDB always runs serial.
+        ///
+        /// NOT honored under `--dag`: that path runs every node in a layer
+        /// concurrently and does not currently cap that fan-out, and its
+        /// sub-runs execute one partition at a time regardless of this flag.
+        /// `--parallel 1` therefore does not force `--dag` serial. Tracked
+        /// as #1288.
         #[arg(long, default_value = "4")]
         parallel: u32,
 
@@ -3357,6 +3363,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                     &cli.config,
                     &state_path,
                     json,
+                    &partition_opts,
                     &skip_opts,
                     shadow_config.as_ref(),
                 );

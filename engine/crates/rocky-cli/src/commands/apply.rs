@@ -624,12 +624,20 @@ async fn execute_run_plan(
 
     let models_dir_path = run_plan.models_dir.as_ref().map(std::path::PathBuf::from);
 
-    // `--dag` runs every pipeline as a unified DAG. The DAG runner is
-    // currently flag-light (it reads config + tooling defaults rather than
-    // walking the same flag matrix as `commands::run::run`), so we dispatch
-    // to it for plans that captured `dag = true` and let the future
-    // unification land separately. This preserves the parity-with-`rocky run`
-    // shape for the alias-deprecation path.
+    // `--dag` runs every pipeline as a unified DAG. The DAG runner is still
+    // flag-light — it reads config + tooling defaults rather than walking the
+    // same flag matrix as `commands::run::run` — so a persisted `filter`, `env`,
+    // `idempotency_key`, `resume` / `resume_latest`, `pipeline`, `models_dir` or
+    // `governance_override`, plus the cache TTL, are all NOT replayed into its
+    // sub-runs: `run_with_dag` takes no such arguments, resolves each model set
+    // from the pipeline config, and `default_sub_runner` passes `None` for the
+    // rest. The future unification lands separately. Partition *selection* is
+    // the carve-out, because dropping it
+    // is not a missing convenience but a wrong answer: the time-interval runner
+    // reads an empty selection as `--latest`, so a reviewed historical
+    // partition applied clean while rebuilding the current one (#1283). It is
+    // replayed below; `--parallel` deliberately is not (see
+    // `run_dag_exec::sub_run_partition_opts` and #1288).
     if run_plan.dag {
         // Fail-closed (D): the DAG runner dispatches sub-runs with NO governance
         // context, so a governed (agent) DAG apply would execute every pipeline
@@ -650,6 +658,7 @@ async fn execute_run_plan(
             config_path,
             state_path,
             output_json,
+            &partition_opts,
             &crate::commands::run::SkipRunOptions::default(),
             // Shadow routing IS part of a persisted plan's contract: the plan
             // captures `shadow` / `shadow_suffix` / `shadow_schema` / `branch`,
@@ -3926,6 +3935,127 @@ mod tests {
             seeded.is_none(),
             "the apply must not have materialized the production seed table"
         );
+    }
+
+    /// 🔴 #1283 regression, APPLY leg: a persisted `rocky plan --dag
+    /// --partition <historical>` must rebuild *that* partition when applied,
+    /// not the current one.
+    ///
+    /// The direct `rocky run --dag` leg is covered in `run_dag_exec`; this is
+    /// the other half of #1283 and it is a genuinely different path — the
+    /// selection is reconstructed by `execute_run_plan` from the plan's fields,
+    /// which is where it used to be rebuilt and then thrown away at the
+    /// `run_with_dag` call. (This test constructs the `RunPlan` in memory and so
+    /// exercises the replay, NOT the plan-file JSON round-trip; persistence is
+    /// covered by the `write_plan` / `read_plan` tests.)
+    ///
+    /// Non-vacuous by construction: the seeded row sits in `2020-01-01` and the
+    /// plan asks for `2020-01-01`, while the pre-fix behavior — an empty
+    /// selection, which the runner reads as `--latest` — targets the partition
+    /// containing now(), which holds no rows. Dropping `&partition_opts` at the
+    /// call below therefore materializes an empty table and fails the row
+    /// assertion. It also proves the happy path is *reachable*: unlike the
+    /// shadow test above, this one expects `Ok` and real rows, so an earlier
+    /// gate turning it into an error would fail it too.
+    #[tokio::test]
+    async fn a_stored_dag_partition_plan_rebuilds_that_partition_not_the_latest() {
+        use rocky_core::traits::WarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models).unwrap();
+        let db_path = root.join("proj.duckdb");
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date, COUNT(*) AS order_count \
+             FROM raw__orders.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date \
+             GROUP BY 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("daily_orders.toml"),
+            "depends_on = []\n\n\
+             [[sources]]\ncatalog = \"\"\nschema = \"raw__orders\"\ntable = \"orders\"\n\n\
+             [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+             granularity = \"day\"\nfirst_partition = \"2020-01-01\"\nlookback = 0\n\n\
+             [target]\ncatalog = \"proj\"\nschema = \"marts\"\ntable = \"daily_orders\"\n",
+        )
+        .unwrap();
+
+        {
+            let seed = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            seed.execute_statement("CREATE SCHEMA raw__orders")
+                .await
+                .unwrap();
+            seed.execute_statement(
+                "CREATE TABLE raw__orders.orders AS \
+                 SELECT TIMESTAMP '2020-01-01 12:00:00' AS order_at",
+            )
+            .await
+            .unwrap();
+        }
+
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+        );
+        // Exactly what `rocky plan --dag --partition 2020-01-01` persists.
+        let run_plan = RunPlan {
+            dag: true,
+            partition: Some("2020-01-01".to_string()),
+            models: vec![],
+            execution_layers: vec![],
+            ..minimal_run_plan()
+        };
+
+        execute_run_plan(
+            &config_path,
+            loaded,
+            "plan-dag-partition",
+            run_plan,
+            &root.join(".rocky-state.redb"),
+            false,
+            "apply-run-id",
+            // A human apply: the governed `--dag` refusal does not apply.
+            None,
+        )
+        .await
+        .expect("a stored --dag partition plan must apply cleanly");
+
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql(
+                "SELECT CAST(order_date AS VARCHAR), order_count \
+                 FROM proj.marts.daily_orders",
+            )
+            .expect("the plan's partition materialized a table");
+        assert_eq!(
+            rows.rows.len(),
+            1,
+            "the plan's requested partition must be the one that was rebuilt"
+        );
+        assert_eq!(rows.rows[0][0].as_str(), Some("2020-01-01"));
     }
 
     fn minimal_run_plan() -> RunPlan {
