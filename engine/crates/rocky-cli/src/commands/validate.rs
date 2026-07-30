@@ -181,14 +181,12 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     // project whose entire model set it had never looked at.
     let models_dirs = transformation_models_dirs(&cfg, config_path);
     let loaded_models = if !models_dirs.is_empty() {
-        match models_dirs
-            .iter()
-            .try_fold(Vec::new(), |mut acc, dir| {
-                crate::models_loader::load_project_models(dir).map(|models| {
-                    acc.extend(models);
-                    acc
-                })
-            }) {
+        match models_dirs.iter().try_fold(Vec::new(), |mut acc, dir| {
+            crate::models_loader::load_project_models(dir).map(|models| {
+                acc.extend(models);
+                acc
+            })
+        }) {
             Ok(models) => {
                 let count = models.len();
                 if count > 0 {
@@ -279,9 +277,12 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
 /// spelling it `models/**` and `models` — do not load it twice and double the
 /// reported model count.
 ///
-/// Falls back to `<project>/models` when no transformation pipeline names a
-/// directory that exists, so a replication-only project that happens to hold a
-/// models directory keeps reporting exactly what it reported before.
+/// Falls back to `<project>/models` only when the config declares **no**
+/// transformation pipeline at all, so a replication-only project that happens to
+/// hold a models directory keeps reporting exactly what it reported before. The
+/// fallback deliberately does not fire for a project whose declared directory is
+/// merely missing: reporting a model count from a directory no pipeline names
+/// would contradict the V025 warning raised for the one that is absent.
 ///
 /// A glob escaping the project root is skipped rather than propagated: the
 /// per-pipeline check already reports that same glob as a V047 error in this
@@ -291,10 +292,12 @@ fn transformation_models_dirs(
     config_path: &Path,
 ) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut saw_transformation = false;
     for pc in cfg.pipelines.values() {
         let rocky_core::config::PipelineConfig::Transformation(t) = pc else {
             continue;
         };
+        saw_transformation = true;
         if let Ok(crate::models_loader::ModelsDir::Present(dir)) =
             crate::models_loader::locate_models_dir(&t.models, config_path)
             && !dirs.contains(&dir)
@@ -302,7 +305,7 @@ fn transformation_models_dirs(
             dirs.push(dir);
         }
     }
-    if dirs.is_empty() {
+    if !saw_transformation {
         let default = config_path
             .parent()
             .unwrap_or(Path::new("."))
@@ -2349,6 +2352,139 @@ table = "b"
             .collect();
         assert_eq!(dag_errors.len(), 1);
         assert!(dag_errors[0].message.contains("circular"));
+    }
+
+    /// Write a transformation project whose models live in `models_subdir`,
+    /// declared through `models_glob`. Returns the config path.
+    fn write_transformation_project(
+        root: &Path,
+        models_glob: &str,
+        models_subdir: &str,
+        extra_pipeline: &str,
+    ) -> PathBuf {
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "wh.duckdb"
+
+[pipeline.silver]
+type = "transformation"
+models = "{models_glob}"
+
+[pipeline.silver.target]
+{extra_pipeline}
+"#
+            ),
+        )
+        .unwrap();
+        let models_dir = root.join(models_subdir);
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            models_dir.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        std::fs::write(models_dir.join("orders.sql"), "SELECT 1 AS id").unwrap();
+        config_path
+    }
+
+    /// The models directory came from a hardcoded `<project>/models`, so a
+    /// project declaring `models = "transforms/**"` — which `run` honours — was
+    /// reported as having no models at all, with no diagnostic saying so.
+    ///
+    /// Mutation that must turn this red: derive the directory as
+    /// `config_path.parent().join("models")` again.
+    #[test]
+    fn models_are_loaded_from_the_declared_glob_not_a_hardcoded_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path =
+            write_transformation_project(dir.path(), "transforms/**", "transforms", "");
+
+        let out = validate_inner(&config_path).unwrap();
+
+        assert!(
+            out.models.found,
+            "the declared models directory must be found; messages: {:?}",
+            out.messages
+        );
+        assert_eq!(out.models.count, 1, "the declared model must be loaded");
+        assert!(out.models.dag_valid, "the DAG must be validated");
+    }
+
+    /// Two pipelines pointing at one directory must not load it twice — the
+    /// count is the project's model count, not a per-pipeline sum.
+    ///
+    /// Mutation that must turn this red: drop the `!dirs.contains(&dir)` guard
+    /// in `transformation_models_dirs`.
+    #[test]
+    fn two_pipelines_sharing_a_models_directory_do_not_double_the_count() {
+        let dir = tempfile::tempdir().unwrap();
+        // The second pipeline spells the same directory differently, which must
+        // still de-duplicate to one resolved path.
+        let config_path = write_transformation_project(
+            dir.path(),
+            "models/**",
+            "models",
+            "\n[pipeline.gold]\ntype = \"transformation\"\nmodels = \"models\"\n\n[pipeline.gold.target]\n",
+        );
+
+        let out = validate_inner(&config_path).unwrap();
+
+        assert_eq!(
+            out.models.count, 1,
+            "one model in one shared directory must be counted once"
+        );
+    }
+
+    /// A replication-only project that happens to hold a `models/` directory
+    /// keeps reporting what it reported before the derivation changed — no
+    /// transformation pipeline declares a directory, so the fallback applies.
+    #[test]
+    fn a_project_with_no_transformation_pipeline_falls_back_to_the_default_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[adapter]
+type = "duckdb"
+path = "wh.duckdb"
+
+[pipeline.raw]
+type = "replication"
+
+[pipeline.raw.source]
+adapter = "default"
+
+[pipeline.raw.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.raw.target]
+adapter = "default"
+catalog_template = "c"
+schema_template = "s"
+"#,
+        )
+        .unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        std::fs::write(
+            models_dir.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        std::fs::write(models_dir.join("orders.sql"), "SELECT 1 AS id").unwrap();
+
+        let out = validate_inner(&config_path).unwrap();
+
+        assert!(out.models.found, "the default directory must still be read");
+        assert_eq!(out.models.count, 1);
     }
 
     #[test]
