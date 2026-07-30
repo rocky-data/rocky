@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -171,13 +171,24 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
         validate_schedule_dag(&cfg, &mut out);
     }
 
-    // Validate models directory if it exists
-    let models_dir = config_path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join("models");
-    let loaded_models = if models_dir.exists() {
-        match crate::models_loader::load_project_models(&models_dir) {
+    // Validate the models the transformation pipelines actually declare.
+    //
+    // This was hardcoded to `<project>/models`, so a project whose models live
+    // anywhere else — `models = "transforms/**"`, a glob `run` honours — was
+    // reported as having **no models at all**: `found: false`, no DAG check, no
+    // lint input, and no diagnostic saying why. The per-pipeline check above
+    // stayed quiet too, because `transforms` does exist, so `validate` passed a
+    // project whose entire model set it had never looked at.
+    let models_dirs = transformation_models_dirs(&cfg, config_path);
+    let loaded_models = if !models_dirs.is_empty() {
+        match models_dirs
+            .iter()
+            .try_fold(Vec::new(), |mut acc, dir| {
+                crate::models_loader::load_project_models(dir).map(|models| {
+                    acc.extend(models);
+                    acc
+                })
+            }) {
             Ok(models) => {
                 let count = models.len();
                 if count > 0 {
@@ -257,6 +268,50 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     lint_config(&cfg, &loaded_models, &mut out);
 
     Ok(out)
+}
+
+/// Every distinct models directory this config's transformation pipelines
+/// declare, in `[pipeline.*]` declaration order (`IndexMap`, so deterministic),
+/// derived through the same [`crate::models_loader::locate_models_dir`] that
+/// `run` uses.
+///
+/// De-duplicated by resolved path, so two pipelines sharing one directory — or
+/// spelling it `models/**` and `models` — do not load it twice and double the
+/// reported model count.
+///
+/// Falls back to `<project>/models` when no transformation pipeline names a
+/// directory that exists, so a replication-only project that happens to hold a
+/// models directory keeps reporting exactly what it reported before.
+///
+/// A glob escaping the project root is skipped rather than propagated: the
+/// per-pipeline check already reports that same glob as a V047 error in this
+/// run's output, so the failure is named once rather than swallowed.
+fn transformation_models_dirs(
+    cfg: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for pc in cfg.pipelines.values() {
+        let rocky_core::config::PipelineConfig::Transformation(t) = pc else {
+            continue;
+        };
+        if let Ok(crate::models_loader::ModelsDir::Present(dir)) =
+            crate::models_loader::locate_models_dir(&t.models, config_path)
+            && !dirs.contains(&dir)
+        {
+            dirs.push(dir);
+        }
+    }
+    if dirs.is_empty() {
+        let default = config_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("models");
+        if default.exists() {
+            dirs.push(default);
+        }
+    }
+    dirs
 }
 
 /// Converts one error from the shared post-parse validation chain into a
