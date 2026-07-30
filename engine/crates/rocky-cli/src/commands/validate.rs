@@ -916,27 +916,40 @@ fn validate_transformation_pipeline(
         });
     }
 
-    // Check that the models base directory exists
-    let config_dir = config_path.parent().unwrap_or(Path::new("."));
-    // Extract the directory portion of the glob (e.g., "models" from "models/**")
-    let models_base = pipeline
-        .models
-        .split("**")
-        .next()
-        .unwrap_or(&pipeline.models)
-        .trim_end_matches('/');
-    let models_path = config_dir.join(models_base);
-    if !models_path.exists() {
-        msgs.push(ValidateMessage {
-            severity: "warn".into(),
-            code: "V025".into(),
-            message: format!(
-                "pipeline.{name}: models directory '{}' does not exist",
-                models_base
-            ),
-            file: None,
-            field: Some(format!("pipeline.{name}.models")),
-        });
+    // Check that the models base directory exists, through the ONE shared
+    // derivation. Splitting the glob on `**` alone left `models/*.sql` intact and
+    // then probed it as a literal directory, so `validate` warned "does not
+    // exist" about a directory that does, and its model-count and DAG checks saw
+    // an empty project (#1268).
+    match crate::models_loader::locate_models_dir(&pipeline.models, config_path) {
+        Ok(crate::models_loader::ModelsDir::Present(_)) => {}
+        Ok(crate::models_loader::ModelsDir::Absent(path)) => {
+            msgs.push(ValidateMessage {
+                severity: "warn".into(),
+                code: "V025".into(),
+                message: format!(
+                    "pipeline.{name}: models directory '{}' does not exist",
+                    path.display()
+                ),
+                file: None,
+                field: Some(format!("pipeline.{name}.models")),
+            });
+        }
+        // A glob resolving outside the project root is a config error, not a
+        // missing directory. `run` refuses to execute it and `scope` refuses to
+        // resolve managed tables from it; before this, `validate` reported the
+        // project healthy and left the operator to discover the refusal at run
+        // time.
+        Err(e) => {
+            ok = false;
+            msgs.push(ValidateMessage {
+                severity: "error".into(),
+                code: "V047".into(),
+                message: format!("pipeline.{name}: {e:#}"),
+                file: None,
+                field: Some(format!("pipeline.{name}.models")),
+            });
+        }
     }
 
     msgs.push(ValidateMessage {

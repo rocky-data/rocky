@@ -12,20 +12,46 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rocky_core::models::Model;
 
-/// Resolve a transformation pipeline's `models` glob to its base directory,
-/// confined to the project root. Returns `None` when the directory does not
-/// exist. Mirrors `scope.rs`'s containment check: a `models = "../../etc"`
-/// escape must never read outside the project tree.
+/// Where a transformation pipeline's `models` glob points, and whether anything
+/// is there.
+///
+/// Both variants carry the derived path: a caller that must distinguish "no
+/// models to build" from "models at this path" needs the path in *both* cases —
+/// `run` reports the absent directory it decided against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelsDir {
+    /// The base directory exists and is confined to the project root.
+    Present(PathBuf),
+    /// The base directory does not exist. A no-op for every caller.
+    ///
+    /// Containment is **not** asserted for this variant, matching the order the
+    /// existence check has always run in: an absent directory is never read, so
+    /// there is nothing to confine. Only `Present` has been proven in-tree.
+    Absent(PathBuf),
+}
+
+/// Derive a `models` glob's base directory and confine it to the project root,
+/// without deciding what an absent directory means.
 ///
 /// The base is the leading run of characters before the first wildcard, so
 /// `models/**` and `models/*.sql` both resolve to `models`. Splitting on `**`
-/// alone would leave `models/*.sql` intact and then probe it as a literal
-/// directory, which never exists — the pipeline would contribute no models and
-/// the caller would see an empty, apparently-successful result.
+/// alone leaves `models/*.sql` intact and then probes it as a literal directory,
+/// which never exists — the pipeline contributes no models and the caller sees an
+/// empty, apparently-successful result (#1268).
 ///
-/// Lifted here from `tick`, which already had the hardened version, so every
-/// caller that needs a pipeline's model directory shares one derivation.
-pub fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Option<PathBuf>> {
+/// This is the single derivation. `resolve_models_dir` (its `Option`-returning
+/// wrapper), `run`'s session gate and `validate`'s existence check all consume
+/// it, so a glob shape cannot be understood one way when deciding whether to
+/// build and another way when building. `scope.rs`, `branch.rs`, `gc.rs` and
+/// `apply.rs` derive the same base inline with the same character set; they are
+/// deliberately left alone, because `gc` and `apply` feed a **policy** target map
+/// where turning a tolerant derivation into a fallible one is a fail-open (an
+/// emptied map leaves targets unresolved, and an unresolved target is evaluated
+/// against default attributes — see `apply::resolve_touched_apply_targets`).
+///
+/// Mirrors `scope.rs`'s containment check: a `models = "../../etc"` escape must
+/// never read outside the project tree.
+pub fn locate_models_dir(models_glob: &str, config_path: &Path) -> Result<ModelsDir> {
     // `Path::new("rocky.toml").parent()` is `Some("")`, not `None`, and an empty
     // path fails to canonicalize — normalize it to the cwd so a relative default
     // config (the common case) still resolves its models.
@@ -39,7 +65,7 @@ pub fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Optio
         .unwrap_or("models");
     let models_dir = project_root.join(models_base.trim_end_matches('/'));
     if !models_dir.exists() {
-        return Ok(None);
+        return Ok(ModelsDir::Absent(models_dir));
     }
     // Confine to the project root. Both sides canonicalized so intra-project
     // symlinks resolve before the prefix check (macOS `/tmp` is itself a
@@ -59,7 +85,19 @@ pub fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Optio
             canonical_root.display(),
         );
     }
-    Ok(Some(models_dir))
+    Ok(ModelsDir::Present(models_dir))
+}
+
+/// Resolve a transformation pipeline's `models` glob to its base directory,
+/// confined to the project root. `None` when the directory does not exist.
+///
+/// The `Option`-shaped view of [`locate_models_dir`], for callers that treat an
+/// absent directory as "nothing to do" and never need to name it.
+pub fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Option<PathBuf>> {
+    Ok(match locate_models_dir(models_glob, config_path)? {
+        ModelsDir::Present(dir) => Some(dir),
+        ModelsDir::Absent(_) => None,
+    })
 }
 
 /// Load all models under `models_dir` (top level + immediate subdirectories),

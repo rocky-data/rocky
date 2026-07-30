@@ -1881,18 +1881,29 @@ pub async fn run(
             // re-checked `exists()` itself: a dir created (or a symlink
             // retargeted) between the two checks executed models and persisted
             // state with NO session — the RD-003 shape through a race.
-            let tx_config_dir = config_path.parent().unwrap_or(Path::new("."));
-            let tx_models_base = t
-                .models
-                .split("**")
-                .next()
-                .unwrap_or(&t.models)
-                .trim_end_matches('/');
-            let tx_models_dir = tx_config_dir.join(tx_models_base);
-            let models_dir_decision = if tx_models_dir.exists() {
-                super::run_local::ModelsDirDecision::Present(tx_models_dir)
-            } else {
-                super::run_local::ModelsDirDecision::Absent(tx_models_dir)
+            // The base comes from the ONE shared derivation
+            // (`models_loader::locate_models_dir`), which splits on the first
+            // wildcard rather than on `**` alone. Splitting on `**` left
+            // `models = "models/*.sql"` intact, probed it as a literal
+            // directory, never found it, and took `Absent` — a supported glob
+            // shape that silently built nothing and exited 0 (#1268).
+            //
+            // It also carries the project-root containment `scope.rs` already
+            // applies, so a `models = "../../etc/**"` escape is refused here
+            // instead of being executed. That refusal fires only for a base
+            // that EXISTS; an absent directory is a no-op with nothing to
+            // confine, which is the order the existence check has always run
+            // in.
+            let models_dir_decision = match crate::models_loader::locate_models_dir(
+                &t.models,
+                config_path,
+            )? {
+                crate::models_loader::ModelsDir::Present(dir) => {
+                    super::run_local::ModelsDirDecision::Present(dir)
+                }
+                crate::models_loader::ModelsDir::Absent(dir) => {
+                    super::run_local::ModelsDirDecision::Absent(dir)
+                }
             };
             let tx_noop = matches!(
                 models_dir_decision,
