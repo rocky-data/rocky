@@ -23,7 +23,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rocky_core::traits::WarehouseAdapter;
 use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
 /// Count tables named `orders` in `main`, the target every fixture here writes.
@@ -129,7 +128,7 @@ async fn run_pipeline(config_path: &Path, state_path: &Path) -> anyhow::Result<(
 async fn a_wildcard_file_glob_materializes_its_models() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
-    let db = root.join("glob.duckdb");
+    let db = root.join("wh.duckdb");
     write_project(root, &db, "models/*.sql", &root.join("models"));
 
     run_pipeline(&root.join("rocky.toml"), &root.join(".rocky-state.redb"))
@@ -150,7 +149,7 @@ async fn a_wildcard_file_glob_materializes_its_models() {
 async fn the_recursive_glob_form_still_materializes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
-    let db = root.join("glob.duckdb");
+    let db = root.join("wh.duckdb");
     write_project(root, &db, "models/**", &root.join("models"));
 
     run_pipeline(&root.join("rocky.toml"), &root.join(".rocky-state.redb"))
@@ -174,7 +173,7 @@ async fn an_escaping_models_glob_is_refused_and_builds_nothing() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("project");
     std::fs::create_dir_all(&root).expect("mkdir project");
-    let db = root.join("glob.duckdb");
+    let db = root.join("wh.duckdb");
     // The models live OUTSIDE the project root, and really do load.
     write_project(
         &root,
