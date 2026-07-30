@@ -175,12 +175,7 @@ async fn an_escaping_models_glob_is_refused_and_builds_nothing() {
     std::fs::create_dir_all(&root).expect("mkdir project");
     let db = root.join("wh.duckdb");
     // The models live OUTSIDE the project root, and really do load.
-    write_project(
-        &root,
-        &db,
-        "../outside/**",
-        &dir.path().join("outside"),
-    );
+    write_project(&root, &db, "../outside/**", &dir.path().join("outside"));
 
     let err = run_pipeline(&root.join("rocky.toml"), &root.join(".rocky-state.redb"))
         .await
