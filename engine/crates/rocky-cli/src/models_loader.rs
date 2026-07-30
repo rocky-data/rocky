@@ -306,6 +306,28 @@ mod tests {
         }
     }
 
+    /// `Absent` carries the path it decided against, which `run` reports and
+    /// `validate` names in its warning. An `Option` cannot express that, which
+    /// is why `locate_models_dir` exists alongside `resolve_models_dir`.
+    #[test]
+    fn locate_models_dir_names_the_absent_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+        std::fs::create_dir_all(root.join("models")).expect("mkdir models");
+
+        assert_eq!(
+            locate_models_dir("models/*.sql", &config).expect("locate"),
+            ModelsDir::Present(root.join("models")),
+        );
+        assert_eq!(
+            locate_models_dir("nope/**", &config).expect("locate"),
+            ModelsDir::Absent(root.join("nope")),
+            "the absent branch must name the directory it decided against"
+        );
+    }
+
     /// A glob escaping the project root is refused rather than read.
     #[test]
     fn resolve_models_dir_refuses_an_escape() {
