@@ -41,6 +41,29 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROCKY_BIN="${ROCKY_BIN:-$REPO/engine/target/release/rocky}"
 DURATION_HOURS="${DURATION_HOURS:-24}"
 SAMPLE_SECONDS="${SAMPLE_SECONDS:-30}"
+# Harvest far less often than we sample, because harvesting is NOT free and the
+# harness was measuring itself (#1256).
+#
+# `GET /api/v1/runs` -> `StateStore::list_runs` deserialises the WHOLE
+# RUN_HISTORY table and only then truncates to 50 (#1304), so its working set
+# scales with total history: ~8.59 KB per row, measured. Two controlled
+# experiments established that at a FIXED history size RSS steps up once and
+# then holds — an allocator high-water mark, not a leak — but this soak adds a
+# run per minute, so every 30s harvest scanned a slightly larger table and
+# pushed that high-water mark up monotonically. That produced a linear
+# ~480-500 KB/h RSS climb which was twice mistaken for a product leak.
+# It accounted for 92-96% of the growth in both 24h runs.
+#
+# HOW LOW CAN THE CADENCE GO? It is bounded by the 50-row response cap, not by
+# taste: a harvest sees only the newest 50 runs, so at one run per minute we
+# must poll at least every 50 minutes or runs vanish between harvests. 600s
+# gives a 5x margin at that rate. RAISE THIS ONLY WITH THE CAP IN MIND — and if
+# the fixture's run cadence ever goes above one per minute, recompute it
+# (safe_interval < 50 / runs_per_minute, in minutes).
+#
+# G6's log-corroboration still cross-checks harvested runs against the tick
+# log, so a cadence mistake surfaces as a verdict failure rather than silently.
+HARVEST_SECONDS="${HARVEST_SECONDS:-600}"
 # Bash arithmetic is integer-only, so DURATION_HOURS must be whole. Set
 # DURATION_SECONDS directly to smoke-test the harness over a few minutes.
 if [[ -n "${DURATION_SECONDS:-}" ]]; then
@@ -289,11 +312,13 @@ jq -n \
   --arg state_path "$STATE_PATH" \
   --argjson t0 "$T0" --argjson end "$END" --argjson pid "$SERVE_PID" \
   --argjson sample "$SAMPLE_SECONDS" --argjson poll "$POLL_SECONDS" \
+  --argjson harvest "$HARVEST_SECONDS" \
   --argjson drain "$DRAIN_SECONDS" --argjson port "$PORT" \
   --argjson token_was_set "$TOKEN_WAS_SET" \
   --argjson ulimit "$(ulimit -n)" \
   '{binary:$bin, version:$version, git_sha:$sha, branch:$branch, state_path:$state_path,
-    t0:$t0, planned_end:$end, pid:$pid, sample_interval:$sample, poll_interval:$poll,
+    t0:$t0, planned_end:$end, pid:$pid, sample_interval:$sample, harvest_interval:$harvest,
+    poll_interval:$poll,
     drain_timeout:$drain, port:$port, cron:"* * * * *", timezone:"UTC", catchup:"latest",
     retry_max:0, serve_token_was_unset:$token_was_set, ulimit_n:$ulimit}' \
   >"$OUT/meta.json"
@@ -325,8 +350,9 @@ harvest() { # -> appends projected Schedule runs, tagged with harvest time
   return 1
 }
 
-say "sampling every ${SAMPLE_SECONDS}s"
+say "sampling every ${SAMPLE_SECONDS}s, harvesting every ${HARVEST_SECONDS}s"
 n=0
+LAST_HARVEST=0
 while (( $(date +%s) < END )); do
   T=$(date +%s)
 
@@ -337,7 +363,15 @@ while (( $(date +%s) < END )); do
   fi
 
   HCODE=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$BASE/api/v1/health" 2>/dev/null)
-  harvest "$T" && HARV=ok || HARV=err
+  # Sample every iteration; harvest on its own slower cadence (see
+  # HARVEST_SECONDS). `skip` is recorded distinctly from `ok`/`err` so a reader
+  # can tell "not harvested this iteration" from "harvest failed".
+  if (( T - LAST_HARVEST >= HARVEST_SECONDS )); then
+    harvest "$T" && HARV=ok || HARV=err
+    LAST_HARVEST="$T"
+  else
+    HARV=skip
+  fi
 
   read -r RSS VSZ STAT < <(ps -o rss=,vsz=,stat= -p "$SERVE_PID" 2>/dev/null)
   read -r CHILD ZOMB < <(ps -A -o pid=,ppid=,stat= 2>/dev/null |
