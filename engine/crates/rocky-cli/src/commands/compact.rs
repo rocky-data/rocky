@@ -1457,7 +1457,7 @@ async fn prepare_compact_apply(
         &loaded.config,
         config_path,
         ir_plans.iter().map(|ir| ir.target_table.clone()),
-    );
+    )?;
     crate::commands::apply::gate_maintenance_apply(
         root,
         &plan,

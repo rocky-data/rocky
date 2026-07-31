@@ -503,7 +503,7 @@ async fn prepare_archive_apply(
         &loaded.config,
         config_path,
         ir_plans.iter().filter_map(|ir| ir.target_table.clone()),
-    );
+    )?;
     crate::commands::apply::gate_maintenance_apply(
         root,
         &plan,

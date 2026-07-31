@@ -349,7 +349,14 @@ pub async fn run_with_dag(
 /// nothing and can never fail on a `models/` directory it would not have
 /// executed. Each pipeline's base directory and complete file glob are derived
 /// from its `models` setting exactly the way [`super::run`] derives them, so
-/// `--dag` and a plain run agree on which files are in scope.
+/// `--dag` and a plain run apply the same **glob** to the files they see.
+///
+/// They do **not** yet see the same files. This walk reads the base directory
+/// plus one level of subdirectories, while a plain run compiles through
+/// `Project::load_models_with_db`, which reads the base directory only — so a
+/// `models/staging/` layout is a DAG node here and invisible to `rocky run`.
+/// The glob is not what limits either: `models/**` matches at every depth.
+/// Unifying the two traversals is #1262; this doc must not claim it is done.
 ///
 /// A missing directory is not an error here — that matches `run`, which treats
 /// an absent models directory as a no-op rather than a failure.

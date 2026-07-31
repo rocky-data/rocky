@@ -2527,17 +2527,26 @@ pub(crate) fn resolve_touched_apply_targets(
     config: &rocky_core::config::RockyConfig,
     config_path: &Path,
     targets: impl IntoIterator<Item = String>,
-) -> BTreeMap<String, PolicyCapability> {
-    let models_dir = match resolve_confined_config_models_dir(config_path, Some(config)) {
-        Ok(dir) => Some(dir),
-        Err(error) => {
-            tracing::warn!(
-                error = %format!("{error:#}"),
-                "models glob could not be confined; policy target attributes fall back to defaults"
-            );
-            None
-        }
-    };
+) -> Result<BTreeMap<String, PolicyCapability>> {
+    // Fail CLOSED. This map is a POLICY input for `rocky compact` / `rocky
+    // archive` — both destructive. Degrading an unconfinable models glob to
+    // "no models" would leave every target unresolved, and this function's own
+    // doc is explicit that an unresolved target reaches `default_agent_effect`
+    // *only* when no configured rule's scope is satisfied by the default
+    // attribute set — it is NOT guaranteed to. A rule that allows under
+    // default attributes would therefore authorize a destructive apply the
+    // operator's real model attributes might have denied.
+    //
+    // Same reasoning `locate_models_dir` states for itself: a probe that
+    // cannot answer "is this inside the project?" is not a probe that answers
+    // yes. If we cannot say what this apply touches, we refuse rather than
+    // guess.
+    let models_dir = resolve_confined_config_models_dir(config_path, Some(config)).context(
+        "refusing to gate this apply: the project's models glob could not be confined to the \
+         project root, so the touched-target attributes backing the policy decision cannot be \
+         established",
+    )?;
+    let models_dir = Some(models_dir);
     let models_glob = resolve_config_models_glob(config_path, Some(config));
     // Physical FQN (lowercased) → logical model name, plus the set of known
     // logical names, from the project's model sidecars. Best-effort: a load
@@ -2586,7 +2595,7 @@ pub(crate) fn resolve_touched_apply_targets(
         };
         touched.insert(name, PolicyCapability::Apply);
     }
-    touched
+    Ok(touched)
 }
 
 /// Gate a maintenance apply (`compact` / `archive`) under
@@ -4040,12 +4049,47 @@ mod tests {
 
         let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
         let touched =
-            resolve_touched_apply_targets(&cfg, &config_path, ["wh.gold.payments".to_string()]);
+            resolve_touched_apply_targets(&cfg, &config_path, ["wh.gold.payments".to_string()])
+                .expect("a confinable models glob must resolve targets, not refuse");
 
         assert!(
             touched.contains_key("payments"),
             "the physical FQN must map to the logical model name so an \
              attribute-scoped policy rule still fires; got {touched:?}"
+        );
+    }
+
+    /// A models glob that cannot be confined to the project root REFUSES the
+    /// maintenance gate rather than degrading to "no models".
+    ///
+    /// This map is a policy input for `rocky compact` / `rocky archive`, both
+    /// destructive. An empty map leaves every target unresolved, and this
+    /// function's own doc is explicit that an unresolved target reaches
+    /// `default_agent_effect` *only* when no configured rule's scope is
+    /// satisfied by the default attribute set — it is NOT guaranteed to. So a
+    /// permissive rule could authorize an apply the real attributes denied.
+    #[test]
+    fn an_unconfinable_models_glob_refuses_rather_than_resolving_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        let config_path = root.join("proj").join("rocky.toml");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n\n\
+             [pipeline.silver]\ntype = \"transformation\"\nmodels = \"../outside/**\"\n\n\
+             [pipeline.silver.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        let err = resolve_touched_apply_targets(&cfg, &config_path, ["wh.gold.x".to_string()])
+            .expect_err("an escaping models glob must refuse, not resolve nothing");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to gate this apply"),
+            "the refusal must be explicit about why it is failing closed: {msg}"
         );
     }
 

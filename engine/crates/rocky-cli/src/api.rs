@@ -2014,15 +2014,16 @@ mod tests {
     /// `--column-lineage` must not fail on the ordinary nested layout: staging
     /// models one level down feeding marts at the root.
     ///
-    /// The model loader reads the root plus one level below; the lineage compile
-    /// reads only the root. So `fct` is compiled while the `stg` it selects from
-    /// is invisible, and the compiler reports `unknown dependency 'stg'`. That
-    /// is an artifact of the shallower read, not a defect in the project.
+    /// The lineage compile now uses the DAG's OWN already-loaded model set
+    /// (`compile_preloaded_models`) rather than re-reading the models
+    /// directory, so `stg` is no longer invisible to it and the compiler no
+    /// longer reports `unknown dependency 'stg'` for this shape.
     ///
     /// A previous revision surfaced that error instead of swallowing it and so
     /// turned this — the single most common project shape — into a hard
-    /// failure. Compiling the DAG's own model set is the real fix (#1262); until
-    /// then this asserts the tolerance stays.
+    /// failure. That tolerance is still asserted, but the edge itself is now
+    /// pinned too: checking node labels alone would stay green if the lineage
+    /// silently regressed to the old root-only read.
     #[tokio::test]
     async fn dag_column_lineage_tolerates_nested_model_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -2060,6 +2061,21 @@ mod tests {
         let labels: Vec<&str> = out.nodes.iter().map(|n| n.label.as_str()).collect();
         assert!(labels.contains(&"stg"), "nested model missing: {labels:?}");
         assert!(labels.contains(&"fct"), "root model missing: {labels:?}");
+
+        // The point of compiling the DAG's own model set: the nested `stg` is
+        // visible to lineage, so the `stg -> fct` edge exists. Labels alone
+        // would not catch a regression to the old root-only read.
+        let edges: Vec<(&str, &str)> = out
+            .edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str()))
+            .collect();
+        assert!(
+            edges
+                .iter()
+                .any(|(f, t)| f.contains("stg") && t.contains("fct")),
+            "the nested model must contribute a lineage edge, not just a node: {edges:?}"
+        );
     }
 
     /// A configured-but-empty root is not a second root.
