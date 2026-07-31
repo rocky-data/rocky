@@ -1443,7 +1443,30 @@ pub async fn run(
     // just the named model. Dagster uses this for per-asset materialization
     // when it controls the DAG scheduling.
     if let Some(target_model) = model_name_filter {
-        let mdir = models_dir.unwrap_or_else(|| Path::new("models"));
+        // With `--pipeline` and no explicit `--models`, derive the models
+        // directory from THAT pipeline's own glob instead of the hardcoded
+        // `models` (#1292). The adapter is already resolved per-pipeline below,
+        // so without this a project whose pipelines declare distinct model
+        // roots picked the right warehouse but looked for the model in the
+        // wrong directory. Mirrors `models_dir_for_model_scope`, which the
+        // unified-DAG sub-runner has always used for exactly this reason.
+        //
+        // An explicit `--models` still wins: it is an operator override, and
+        // the DAG sub-runner passes one for every model-scoped sub-run.
+        let derived_models_dir: Option<std::path::PathBuf> = match (models_dir, pipeline_name_arg) {
+            (None, Some(pipeline_name)) => match rocky_cfg.pipelines.get(pipeline_name) {
+                Some(rocky_core::config::PipelineConfig::Transformation(t)) => {
+                    crate::models_loader::resolve_models_dir(&t.models, config_path)?
+                }
+                // A non-transformation pipeline is rejected a few lines below
+                // with a better message than a missing-directory error.
+                _ => None,
+            },
+            _ => None,
+        };
+        let mdir = models_dir
+            .or(derived_models_dir.as_deref())
+            .unwrap_or_else(|| Path::new("models"));
         anyhow::ensure!(
             mdir.exists(),
             "models directory '{}' not found (required for --model)",
