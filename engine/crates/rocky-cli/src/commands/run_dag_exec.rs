@@ -256,7 +256,24 @@ pub async fn run_with_dag(
         .flatten()
         .map(|m| (m.config.name.clone(), m.sql.clone()))
         .collect();
-    unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name);
+    // Each model's physical target, so a read spelled `main.orders_current`
+    // resolves to whichever model WRITES that table rather than only to a node
+    // whose label happens to be `orders_current` (#1275). This is the only
+    // graph `--dag` schedules from, and it spans pipelines — so unlike the
+    // per-`Project` resolver it also orders a physical read across two
+    // transformation pipelines.
+    let target_by_model: HashMap<String, (String, String, String)> = models_by_pipeline
+        .values()
+        .flatten()
+        .map(|m| {
+            let t = &m.config.target;
+            (
+                m.config.name.clone(),
+                (t.catalog.clone(), t.schema.clone(), t.table.clone()),
+            )
+        })
+        .collect();
+    unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name, &target_by_model);
 
     // `--dag` cannot isolate a run, so it refuses to pretend it can.
     //

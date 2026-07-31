@@ -71,6 +71,14 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+// The quote-stripping canonicalizer this module used to own now lives in
+// `rocky_sql::identifier`, shared with `rocky_compiler::resolve` — which
+// resolves the same physical reads into DAG *ordering* edges. One copy, so the
+// two cannot drift on what `"main"."orders"` means. The
+// `canonicalize_identifier_cases` test below is unchanged from when the body
+// lived here; passing unchanged is the evidence the move was behavior-neutral.
+use rocky_sql::identifier::canonicalize_identifier;
+
 /// Index of every model's produced target, for resolving a physical `FROM` /
 /// `JOIN` read back to the model that produces that table.
 ///
@@ -199,65 +207,6 @@ impl ProducerIndex {
             Some(_) => ReadResolution::Ambiguous,
         }
     }
-}
-
-/// Split a possibly-quoted SQL table identifier into its lowercased, unquoted
-/// parts, or `None` when it can't be cleanly canonicalized.
-///
-/// The read identity arrives from the SQL lineage walk, where sqlparser renders
-/// an `ObjectName` back to a string **with** its original quote characters
-/// (`"main"."orders_current"`), while the producer index keys are the clean,
-/// structured `config.target` parts. Matching therefore requires stripping the
-/// quotes the same way for the read side. Quote styles recognized: double-quote
-/// `"…"` (DuckDB / Snowflake / Postgres), backtick `` `…` `` (BigQuery /
-/// Databricks), bracket `[…]` (T-SQL). Inside a quoted segment a `.` is a
-/// literal, not a separator; a doubled closing quote (`""`, ` `` `) is an
-/// escaped quote character.
-///
-/// Returns `None` — so the caller **fails closed** — on any identity that can't
-/// be unambiguously slotted into the `schema.table` index: unbalanced quotes, an
-/// empty segment (`a..b`, a trailing dot), or a segment that after unquoting
-/// still contains a `.` (a quoted identifier with an embedded dot). Doing string
-/// surgery here rather than a naive `replace('"', "")` is deliberate — the naive
-/// form would mis-split a quoted identifier that legitimately contains a dot.
-fn canonicalize_identifier(read: &str) -> Option<Vec<String>> {
-    let mut parts: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut chars = read.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' | '`' | '[' => {
-                let close = if ch == '[' { ']' } else { ch };
-                loop {
-                    match chars.next() {
-                        // Unbalanced quote — cannot canonicalize.
-                        None => return None,
-                        Some(c) if c == close => {
-                            // A doubled closing quote (`""` / ` `` `) is an
-                            // escaped literal, not the end of the segment.
-                            // Brackets have no doubling convention.
-                            if close != ']' && chars.peek() == Some(&close) {
-                                chars.next();
-                                cur.push(close);
-                            } else {
-                                break;
-                            }
-                        }
-                        Some(c) => cur.push(c),
-                    }
-                }
-            }
-            '.' => parts.push(std::mem::take(&mut cur)),
-            c => cur.push(c),
-        }
-    }
-    parts.push(cur);
-    // An empty segment or an embedded dot (from a quoted identifier) can't be
-    // slotted into the `schema.table` index — fail closed.
-    if parts.iter().any(|p| p.is_empty() || p.contains('.')) {
-        return None;
-    }
-    Some(parts.into_iter().map(|p| p.to_lowercase()).collect())
 }
 
 /// Conservative, fail-closed downstream-closure tracker for one run.

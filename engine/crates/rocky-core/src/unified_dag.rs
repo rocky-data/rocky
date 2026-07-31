@@ -780,20 +780,53 @@ fn format_test_label(model_name: &str, test: &crate::tests::TestDecl, index: usi
 /// `model_sql_by_name` maps model name → compiled SQL text. The caller is
 /// responsible for compiling models first; this function does no IO.
 ///
+/// `target_by_model` maps model name → its physical `(catalog, schema, table)`.
+/// Without it a reference is matched only by its **last segment** against a
+/// node's *logical label*, so a model named `stage_orders` that writes
+/// `main.orders_current` was never found from `FROM main.orders_current` — the
+/// reader and its producer shared an execution phase and raced (#1275). Pass
+/// the targets and a physical read resolves to whoever writes that table
+/// whatever the model is called. Models absent from the map still fall back to
+/// label matching.
+///
+/// This is the unified-DAG counterpart of
+/// `rocky_compiler::resolve::classify_table_ref`. It is a **separate** graph:
+/// `rocky run --dag` schedules phases from this DAG, not from any `Project`, so
+/// fixing the compiler's resolver alone left this scheduler co-scheduling the
+/// very reads that fix was about — including within a single pipeline. Matching
+/// here is deliberately looser (last segment / tail) because this graph spans
+/// pipelines and node labels are not warehouse identities; an extra edge costs
+/// serialisation, a missing one costs a stale read.
+///
 /// Inferred edges are de-duplicated against existing ones, so calling this
 /// repeatedly is idempotent.
 pub fn infer_runtime_dependencies(
     dag: &mut UnifiedDag,
     model_sql_by_name: &HashMap<String, String>,
+    target_by_model: &HashMap<String, (String, String, String)>,
 ) {
     // Build a set of producing node names (everything that creates a table:
     // transformations, seeds, loads). Maps logical table name → NodeId.
     let mut producers: HashMap<String, NodeId> = HashMap::new();
+    // Physical `(schema, table)` → producing nodes and their configured
+    // catalog, so a read spelled as a warehouse table finds the model that
+    // writes it even when the model's name and its target table differ
+    // (#1275). The catalog is kept per producer and applied as a filter rather
+    // than folded into the key, mirroring
+    // `rocky_compiler::resolve::ProducerIndex`: a 2-part read carries no
+    // catalog and binds to the session default at execution time.
+    let mut producers_by_target: HashMap<(String, String), Vec<(NodeId, String)>> = HashMap::new();
     for node in &dag.nodes {
         match node.kind {
             NodeKind::Transformation | NodeKind::Seed | NodeKind::Load | NodeKind::Replication => {
                 // Index by lowercase label so case-insensitive SQL refs match.
                 producers.insert(node.label.to_lowercase(), node.id.clone());
+                if let Some((catalog, schema, table)) = target_by_model.get(&node.label) {
+                    producers_by_target
+                        .entry((schema.to_lowercase(), table.to_lowercase()))
+                        .or_default()
+                        .push((node.id.clone(), catalog.to_lowercase()));
+                }
             }
             _ => {}
         }
@@ -819,31 +852,108 @@ pub fn infer_runtime_dependencies(
             continue;
         };
         for table_name in refs {
-            // Match by the bare table name (last segment of any qualified ref).
+            let mut matched: Vec<NodeId> = Vec::new();
+            // A qualified read may name a producer's TARGET rather than its
+            // label. Canonicalize through `rocky_sql::identifier` — the same
+            // splitter the compiler and failure containment use — because the
+            // lineage walk renders an `ObjectName` with its original quote
+            // characters, so a naive `split('.')` leaves `"main"."orders"`
+            // carrying quotes and matching nothing.
+            if let Some(parts) = rocky_sql::identifier::canonicalize_identifier(&table_name) {
+                let (read_catalog, tail) = match parts.as_slice() {
+                    [schema, table] => (None, Some((schema, table))),
+                    [catalog, schema, table] => (Some(catalog), Some((schema, table))),
+                    _ => (None, None),
+                };
+                if let Some((schema, table)) = tail
+                    && let Some(ids) = producers_by_target.get(&(schema.clone(), table.clone()))
+                {
+                    // Same catalog rule as the compiler: a catalog-less read
+                    // matches any catalog; an explicit one matches its own, or
+                    // a producer that declares none (that model materializes in
+                    // the session default catalog, which is unobservable).
+                    matched.extend(ids.iter().filter_map(
+                        |(id, producer_catalog)| match read_catalog {
+                            None => Some(id.clone()),
+                            Some(read)
+                                if producer_catalog.is_empty() || producer_catalog == read =>
+                            {
+                                Some(id.clone())
+                            }
+                            Some(_) => None,
+                        },
+                    ));
+                }
+            }
+            // Also match by the bare table name (last segment of any qualified
+            // ref) against node labels — the original behaviour, which is what
+            // resolves a bare `FROM orders` and a seed reference.
             let bare = table_name
                 .rsplit('.')
                 .next()
                 .unwrap_or(&table_name)
                 .to_lowercase();
-            let Some(producer_id) = producers.get(&bare) else {
-                continue;
-            };
-            // Skip self-references and already-known edges.
-            if *producer_id == node.id {
-                continue;
+            if let Some(producer_id) = producers.get(&bare) {
+                matched.push(producer_id.clone());
             }
-            let key = (producer_id.clone(), node.id.clone());
-            if existing.insert(key) {
-                new_edges.push(UnifiedEdge {
-                    from: producer_id.clone(),
-                    to: node.id.clone(),
-                    edge_type: EdgeType::DataDependency,
-                });
+            for producer_id in matched {
+                // Skip self-references and already-known edges.
+                if producer_id == node.id {
+                    continue;
+                }
+                let key = (producer_id.clone(), node.id.clone());
+                if existing.insert(key) {
+                    new_edges.push(UnifiedEdge {
+                        from: producer_id.clone(),
+                        to: node.id.clone(),
+                        edge_type: EdgeType::DataDependency,
+                    });
+                }
             }
         }
     }
 
-    dag.edges.extend(new_edges);
+    extend_while_schedulable(dag, new_edges);
+}
+
+/// Add `candidates` to `dag.edges`, skipping any edge that would make the graph
+/// unschedulable.
+///
+/// [`DagExecutor::execute`] calls [`execution_phases`] with `?`, so a cycle is
+/// not a degraded plan — it aborts the whole `rocky run --dag`. Physical-target
+/// resolution is deliberately generous (a catalog-less read matches every
+/// candidate catalog; an empty configured catalog is a wildcard), so it can
+/// pair two models into a cycle the declared graph does not have. Turning a
+/// project that runs today into a hard failure is not an acceptable price for
+/// an ordering improvement, so an edge that would close a cycle is dropped.
+///
+/// This mirrors `rocky_compiler::resolve::add_physical_edges_while_acyclic`,
+/// which makes the same trade for the same reason on the other graph. The whole
+/// batch is tried first — one `execution_phases` call in the overwhelmingly
+/// common case — and only a cycle forces the edge-at-a-time fallback.
+///
+/// [`DagExecutor::execute`]: crate::dag_executor::DagExecutor::execute
+fn extend_while_schedulable(dag: &mut UnifiedDag, candidates: Vec<UnifiedEdge>) {
+    if candidates.is_empty() {
+        return;
+    }
+    // A graph that already cannot be scheduled is reported by the caller
+    // exactly as it was before any edge was inferred.
+    if execution_phases(dag).is_err() {
+        return;
+    }
+    let baseline = dag.edges.len();
+    dag.edges.extend(candidates.iter().cloned());
+    if execution_phases(dag).is_ok() {
+        return;
+    }
+    dag.edges.truncate(baseline);
+    for edge in candidates {
+        dag.edges.push(edge);
+        if execution_phases(dag).is_err() {
+            dag.edges.pop();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2190,12 +2300,214 @@ mod tests {
         let mut sql = HashMap::new();
         sql.insert("stg_orders".into(), "SELECT * FROM orders".into());
 
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_runtime_dependencies(&mut dag, &sql, &HashMap::new());
 
         assert_eq!(dag.edges.len(), 1);
         assert_eq!(dag.edges[0].from, NodeId::new("transformation", "orders"));
         assert_eq!(dag.edges[0].to, NodeId::new("transformation", "stg_orders"));
         assert_eq!(dag.edges[0].edge_type, EdgeType::DataDependency);
+    }
+
+    /// #1275: `rocky run --dag` schedules from THIS graph, not from any
+    /// `Project`, and it used to resolve a table reference only by matching the
+    /// reference's last segment against a node's *logical label*. A model whose
+    /// name differs from the table it writes was therefore invisible to a
+    /// physical read of that table: `stage_orders` writing `main.orders_current`
+    /// was never found from `FROM main.orders_current`, so reader and producer
+    /// shared an execution phase and raced.
+    ///
+    /// Non-vacuous: with an empty `target_by_model` — the pre-fix input — no
+    /// edge is inferred and both nodes land in phase 0.
+    #[test]
+    fn infer_resolves_a_physical_target_read_whose_producer_is_named_differently() {
+        let models = [
+            ("stage_orders", NodeKind::Transformation),
+            ("rollup", NodeKind::Transformation),
+        ];
+        // QUOTED deliberately: the lineage walk renders an `ObjectName` with
+        // its original quote characters, so a naive `split('.')` leaves the
+        // quotes attached and matches nothing. Same trap the compiler side
+        // covers in `quoted_and_case_differing_physical_reads_all_resolve`.
+        let mut sql = HashMap::new();
+        sql.insert(
+            "rollup".into(),
+            "SELECT id FROM \"main\".\"Orders_Current\"".into(),
+        );
+        let mut targets: HashMap<String, (String, String, String)> = HashMap::new();
+        targets.insert(
+            "stage_orders".into(),
+            (String::new(), "main".into(), "orders_current".into()),
+        );
+        targets.insert(
+            "rollup".into(),
+            (String::new(), "main".into(), "rollup".into()),
+        );
+
+        // Control: the pre-fix behaviour, kept in the same test so a failure
+        // here cannot be mistaken for the assertion below passing vacuously.
+        let mut unfixed = dag_with_models(&models);
+        infer_runtime_dependencies(&mut unfixed, &sql, &HashMap::new());
+        assert!(
+            unfixed.edges.is_empty(),
+            "premise: label matching alone finds no producer for main.orders_current"
+        );
+
+        let mut dag = dag_with_models(&models);
+        infer_runtime_dependencies(&mut dag, &sql, &targets);
+
+        assert_eq!(dag.edges.len(), 1, "the physical read must be an edge");
+        assert_eq!(
+            dag.edges[0].from,
+            NodeId::new("transformation", "stage_orders")
+        );
+        assert_eq!(dag.edges[0].to, NodeId::new("transformation", "rollup"));
+
+        let phases = execution_phases(&dag).expect("orderable");
+        let phase_of = |name: &str| {
+            phases
+                .iter()
+                .position(|p| p.iter().any(|n| n.label == name))
+                .expect("node is in a phase")
+        };
+        assert!(
+            phase_of("stage_orders") < phase_of("rollup"),
+            "the producer must run in an earlier phase: {phases:?}"
+        );
+    }
+
+    /// A model reading its OWN physical target (the incremental watermark
+    /// shape) must not become its own upstream — `execution_phases` reports a
+    /// cycle for a self-edge.
+    #[test]
+    fn infer_does_not_self_edge_on_a_read_of_the_models_own_target() {
+        let mut dag = dag_with_models(&[("orders", NodeKind::Transformation)]);
+        let mut sql = HashMap::new();
+        sql.insert(
+            "orders".into(),
+            "SELECT id FROM main.orders_current WHERE ts > 0".into(),
+        );
+        let mut targets: HashMap<String, (String, String, String)> = HashMap::new();
+        targets.insert(
+            "orders".into(),
+            (String::new(), "main".into(), "orders_current".into()),
+        );
+
+        infer_runtime_dependencies(&mut dag, &sql, &targets);
+
+        assert!(dag.edges.is_empty(), "a self-read is not a dependency");
+        assert!(execution_phases(&dag).is_ok());
+    }
+
+    /// A read naming a catalog the producer does not declare is a different
+    /// object — no edge. Keeps this graph's catalog rule aligned with the
+    /// compiler's `three_part_read_of_another_catalog_is_external`; the two
+    /// disagreeing is how one of them ends up looser than its own safety net.
+    #[test]
+    fn infer_does_not_match_a_read_of_a_different_catalog() {
+        let mut dag = dag_with_models(&[
+            ("stage_orders", NodeKind::Transformation),
+            ("rollup", NodeKind::Transformation),
+        ]);
+        let mut sql = HashMap::new();
+        sql.insert(
+            "rollup".into(),
+            "SELECT id FROM other_catalog.main.orders_current".into(),
+        );
+        let mut targets: HashMap<String, (String, String, String)> = HashMap::new();
+        targets.insert(
+            "stage_orders".into(),
+            ("warehouse".into(), "main".into(), "orders_current".into()),
+        );
+
+        infer_runtime_dependencies(&mut dag, &sql, &targets);
+
+        assert!(dag.edges.is_empty());
+    }
+
+    /// `DagExecutor::execute` calls `execution_phases` with `?`, so a cycle is
+    /// not a degraded plan — it aborts the whole `rocky run --dag`. Physical
+    /// resolution is deliberately generous, so it can pair two models into a
+    /// cycle the declared graph does not have. An edge that would close one is
+    /// dropped rather than allowed to turn a project that runs today into a
+    /// hard failure.
+    ///
+    /// Non-vacuous: without `extend_while_schedulable` both edges are added and
+    /// `execution_phases` returns `Err`.
+    #[test]
+    fn infer_drops_an_edge_that_would_make_the_dag_unschedulable() {
+        let mut dag = dag_with_models(&[
+            ("a", NodeKind::Transformation),
+            ("b", NodeKind::Transformation),
+        ]);
+        let mut sql = HashMap::new();
+        sql.insert("a".into(), "SELECT id FROM main.b_out".into());
+        sql.insert("b".into(), "SELECT id FROM main.a_out".into());
+        let mut targets: HashMap<String, (String, String, String)> = HashMap::new();
+        targets.insert("a".into(), (String::new(), "main".into(), "a_out".into()));
+        targets.insert("b".into(), (String::new(), "main".into(), "b_out".into()));
+
+        infer_runtime_dependencies(&mut dag, &sql, &targets);
+
+        assert_eq!(
+            dag.edges.len(),
+            1,
+            "one direction survives: {:?}",
+            dag.edges
+        );
+        assert!(
+            execution_phases(&dag).is_ok(),
+            "the run must still be schedulable"
+        );
+    }
+
+    /// The #1291 collision shape: two models declaring one target that each
+    /// read it. Nothing here dedupes by target identity, so each would match
+    /// the other; the schedulability guard is what keeps `--dag` runnable.
+    #[test]
+    fn infer_keeps_a_collision_pair_schedulable() {
+        let mut dag = dag_with_models(&[
+            ("a", NodeKind::Transformation),
+            ("b", NodeKind::Transformation),
+        ]);
+        let mut sql = HashMap::new();
+        sql.insert("a".into(), "SELECT id FROM main.shared".into());
+        sql.insert("b".into(), "SELECT id FROM main.shared".into());
+        let mut targets: HashMap<String, (String, String, String)> = HashMap::new();
+        targets.insert("a".into(), (String::new(), "main".into(), "shared".into()));
+        targets.insert("b".into(), (String::new(), "main".into(), "shared".into()));
+
+        infer_runtime_dependencies(&mut dag, &sql, &targets);
+
+        assert!(
+            execution_phases(&dag).is_ok(),
+            "a duplicate-target pair must not abort the whole --dag run"
+        );
+    }
+
+    /// An explicitly declared cycle is reported exactly as it was before any
+    /// edge was inferred — the guard must not paper over a real one.
+    #[test]
+    fn infer_leaves_a_pre_existing_cycle_reported() {
+        let mut dag = dag_with_models(&[
+            ("a", NodeKind::Transformation),
+            ("b", NodeKind::Transformation),
+        ]);
+        dag.edges.push(UnifiedEdge {
+            from: NodeId::new("transformation", "a"),
+            to: NodeId::new("transformation", "b"),
+            edge_type: EdgeType::DataDependency,
+        });
+        dag.edges.push(UnifiedEdge {
+            from: NodeId::new("transformation", "b"),
+            to: NodeId::new("transformation", "a"),
+            edge_type: EdgeType::DataDependency,
+        });
+        let mut sql = HashMap::new();
+        sql.insert("a".into(), "SELECT 1 AS id".into());
+
+        infer_runtime_dependencies(&mut dag, &sql, &HashMap::new());
+
+        assert!(execution_phases(&dag).is_err());
     }
 
     #[test]
@@ -2211,7 +2523,7 @@ mod tests {
             "SELECT * FROM main.raw.customers".into(),
         );
 
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_runtime_dependencies(&mut dag, &sql, &HashMap::new());
         assert_eq!(dag.edges.len(), 1);
         assert_eq!(dag.edges[0].from, NodeId::new("seed", "customers"));
     }
@@ -2232,7 +2544,7 @@ mod tests {
         let mut sql = HashMap::new();
         sql.insert("stg_orders".into(), "SELECT * FROM orders".into());
 
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_runtime_dependencies(&mut dag, &sql, &HashMap::new());
 
         // No duplicate added.
         assert_eq!(dag.edges.len(), 1);
@@ -2244,7 +2556,7 @@ mod tests {
         let mut sql = HashMap::new();
         sql.insert("loop_model".into(), "SELECT * FROM loop_model".into());
 
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_runtime_dependencies(&mut dag, &sql, &HashMap::new());
         assert_eq!(dag.edges.len(), 0);
     }
 
@@ -2258,8 +2570,8 @@ mod tests {
         let mut sql = HashMap::new();
         sql.insert("stg_orders".into(), "SELECT * FROM orders".into());
 
-        infer_runtime_dependencies(&mut dag, &sql);
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_runtime_dependencies(&mut dag, &sql, &HashMap::new());
+        infer_runtime_dependencies(&mut dag, &sql, &HashMap::new());
 
         assert_eq!(dag.edges.len(), 1);
     }
@@ -2274,7 +2586,7 @@ mod tests {
             "SELECT * FROM nonexistent_external_table".into(),
         );
 
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_runtime_dependencies(&mut dag, &sql, &HashMap::new());
         assert_eq!(dag.edges.len(), 0);
     }
 
@@ -2285,7 +2597,7 @@ mod tests {
         sql.insert("model_a".into(), "this is not sql".into());
 
         // Should not panic; invalid SQL just yields no inferred edges.
-        infer_runtime_dependencies(&mut dag, &sql);
+        infer_runtime_dependencies(&mut dag, &sql, &HashMap::new());
         assert_eq!(dag.edges.len(), 0);
     }
 }

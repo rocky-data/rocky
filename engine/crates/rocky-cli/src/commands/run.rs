@@ -6269,15 +6269,19 @@ fn apply_shadow_rewrite(
 
         // Redirect a read of ANY *other* selected model's production target,
         // not just the models named in this one's `depends_on`. The declared
-        // graph is not a complete read set: `resolve::classify_table_ref`
-        // auto-derives a dependency only from a BARE single-part name that
-        // matches a model name, so a model reading an in-run upstream by its
-        // physical `schema.table` (classified `SourceRef`) or
-        // `catalog.schema.table` (`RawRef`) name gets no edge — and would
-        // otherwise keep reading production while writing its shadow target.
-        // `commands::containment` refuses to trust `dag_nodes` for the same
-        // reason. Keyed by the upstream's production identity, which is what
-        // `rewrite_upstream_refs` tail-matches against.
+        // graph is not a complete read set, and this rewrite has never relied
+        // on it being one — `commands::containment` refuses to trust
+        // `dag_nodes` for the same reason. Keyed by the upstream's production
+        // identity, which is what `rewrite_upstream_refs` tail-matches against.
+        //
+        // `resolve::classify_table_ref` now derives an edge from a physical
+        // `schema.table` / `catalog.schema.table` read too (#1275), so the two
+        // agree far more often than they used to. They are still not the same
+        // question and this must not be narrowed to `depends_on`: the compiler
+        // drops a derived edge that would close a cycle, and it resolves only
+        // within one pipeline's model set — in both cases the read is real and
+        // still has to be routed, or the model writes its shadow target while
+        // reading production.
         //
         // A model's OWN identity is excluded: a self-read (an incremental
         // model's `WHERE ts > (SELECT MAX(ts) FROM <own target>)`) must keep
@@ -17211,13 +17215,17 @@ timestamp_column = "ts"
     /// be routed to that upstream's shadow target even when the sidecar
     /// declares no `depends_on`.
     ///
-    /// The declared graph is not a complete read set:
-    /// `rocky_compiler::resolve::classify_table_ref` auto-derives a dependency
-    /// only from a BARE single-part name matching a model name, so a two-part
-    /// `main.orders` is classified `SourceRef` and produces no DAG edge.
-    /// Routing off `depends_on` alone therefore left such a model writing its
-    /// shadow target while still reading production — the containment ledger
-    /// refuses to trust `dag_nodes` for exactly this reason.
+    /// Routing off the *sidecar's* `depends_on` alone left such a model writing
+    /// its shadow target while still reading production, so the rewrite is
+    /// keyed on the read set rather than on declared edges — the same reason
+    /// the containment ledger refuses to trust `dag_nodes`.
+    ///
+    /// The premise below asserts the compiler now derives that edge itself
+    /// (#1275). It used to assert the opposite — `depends_on` EMPTY, because
+    /// `classify_table_ref` fired only on a bare single-part name — which is
+    /// exactly the co-scheduling defect #1275 fixed. The rewrite's own
+    /// behaviour is unchanged either way: it never consulted `depends_on`, and
+    /// the two `sql_of` assertions are what this test is actually for.
     ///
     /// The bare-name model is the control: it proves the rewrite is reached at
     /// all, so a failure of the qualified assertion isolates the regression.
@@ -17256,8 +17264,9 @@ timestamp_column = "ts"
                 .project
                 .dag_nodes
                 .iter()
-                .any(|n| n.name == "mart_qualified" && n.depends_on.is_empty()),
-            "premise: a two-part physical read must not auto-derive a dependency"
+                .any(|n| n.name == "mart_qualified" && n.depends_on == ["orders"]),
+            "premise: a two-part physical read auto-derives its producer (#1275), \
+             and the sidecar still declares nothing"
         );
 
         let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;

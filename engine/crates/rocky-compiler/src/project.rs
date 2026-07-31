@@ -609,6 +609,74 @@ mod tests {
         assert!(project.target_collisions.is_empty());
     }
 
+    /// #1275, end to end through project construction: a model reading another
+    /// model's target by physical name must land in a LATER `Project::layers`
+    /// entry, because `layers` is precisely what `run.rs::execute_models`
+    /// batches `--parallel` over.
+    ///
+    /// Pre-fix this project produced one layer holding both models, so an
+    /// adapter reporting `supports_concurrent_execution()` ran the consumer
+    /// against a table its producer had not written.
+    #[test]
+    fn a_physical_target_read_separates_the_execution_layers() {
+        let models = vec![
+            with_target(make_model("orders", "SELECT 1 AS id"), "", "main", "orders"),
+            with_target(
+                make_model("mart_qualified", "SELECT id FROM main.orders"),
+                "",
+                "main",
+                "mart_qualified",
+            ),
+        ];
+
+        let project = Project::from_models(models).expect("must still construct");
+
+        assert_eq!(
+            project.layers,
+            vec![
+                vec!["orders".to_string()],
+                vec!["mart_qualified".to_string()]
+            ],
+            "producer and consumer must not share a layer"
+        );
+        assert_eq!(project.execution_order, vec!["orders", "mart_qualified"]);
+    }
+
+    /// A physical read that would close a cycle must not turn into a
+    /// `ProjectError`: `ci-diff` falls back to filename-stem classification on
+    /// a load failure and the LSP publishes nothing at all, so an unloadable
+    /// project is silence. The dropped edge is reported as a D012 warning on
+    /// `resolve_diagnostics` instead.
+    #[test]
+    fn a_cyclic_physical_read_still_loads_the_project() {
+        let models = vec![
+            with_target(
+                make_model("a", "SELECT id FROM main.b_out"),
+                "",
+                "main",
+                "a_out",
+            ),
+            with_target(
+                make_model("b", "SELECT id FROM main.a_out"),
+                "",
+                "main",
+                "b_out",
+            ),
+        ];
+
+        let project = Project::from_models(models)
+            .expect("a physical-read cycle must not make the project unloadable");
+        assert_eq!(project.layers.iter().flatten().count(), 2);
+        assert!(
+            project
+                .resolve_diagnostics
+                .iter()
+                .any(|d| &*d.code == "D012"),
+            "the dropped edge must be visible: {:?}",
+            project.resolve_diagnostics
+        );
+    }
+
     #[test]
     fn test_project_from_models_linear() {
         let models = vec![

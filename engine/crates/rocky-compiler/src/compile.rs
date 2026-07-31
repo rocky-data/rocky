@@ -357,6 +357,13 @@ pub fn compile_project(
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    // Dependency-resolution diagnostics (D011 depends_on/SQL mismatch, D012
+    // dropped physical edge) were recorded on `Project` but never merged here,
+    // so nothing that reads `CompileResult::diagnostics` — `rocky compile`, the
+    // LSP, `rocky run`'s JSON — ever showed one. A warning no surface renders is
+    // not a mitigation. All are warning-severity, so `has_errors` below is
+    // unchanged and nothing new is excluded from execution.
+    diagnostics.extend(project.resolve_diagnostics.iter().cloned());
 
     let has_errors = diagnostics
         .iter()
@@ -563,6 +570,13 @@ pub fn compile_incremental(
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    // Dependency-resolution diagnostics (D011 depends_on/SQL mismatch, D012
+    // dropped physical edge) were recorded on `Project` but never merged here,
+    // so nothing that reads `CompileResult::diagnostics` — `rocky compile`, the
+    // LSP, `rocky run`'s JSON — ever showed one. A warning no surface renders is
+    // not a mitigation. All are warning-severity, so `has_errors` below is
+    // unchanged and nothing new is excluded from execution.
+    diagnostics.extend(project.resolve_diagnostics.iter().cloned());
 
     let has_errors = diagnostics
         .iter()
@@ -772,5 +786,63 @@ mod tests {
             unified_dag: None,
         };
         assert!(target_collision_diagnostics(&project).is_empty());
+    }
+
+    /// Dependency-resolution diagnostics must reach `CompileResult`.
+    ///
+    /// They were recorded on `Project::resolve_diagnostics` and never merged
+    /// here, so **D011** and the D012 dropped-physical-edge report were
+    /// invisible to `rocky compile`, the LSP and `rocky run --output json` — a
+    /// warning no surface renders is not a mitigation.
+    ///
+    /// Non-vacuous: delete the `diagnostics.extend(project.resolve_diagnostics…)`
+    /// line and this fails while `a_cyclic_physical_read_still_loads_the_project`
+    /// (which asserts on the `Project` field) still passes.
+    #[test]
+    fn resolve_diagnostics_reach_the_compile_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        // Mutual physical reads: one derived edge closes a cycle and is
+        // dropped, which emits exactly one D012.
+        for (name, reads, table) in [("a", "b_out", "a_out"), ("b", "a_out", "b_out")] {
+            std::fs::write(
+                models.join(format!("{name}.sql")),
+                format!("SELECT id FROM main.{reads}"),
+            )
+            .unwrap();
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!("[target]\ncatalog = \"wh\"\nschema = \"main\"\ntable = \"{table}\"\n"),
+            )
+            .unwrap();
+        }
+
+        let result = compile(&CompilerConfig {
+            models_dir: models,
+            ..Default::default()
+        })
+        .expect("a physical-read cycle must not fail the compile");
+
+        let d012: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "D012")
+            .collect();
+        assert_eq!(
+            d012.len(),
+            1,
+            "the dropped edge must be visible in the compile output: {:?}",
+            result
+                .diagnostics
+                .iter()
+                .map(|d| &*d.code)
+                .collect::<Vec<_>>()
+        );
+        assert!(!d012[0].is_error(), "D012 is a warning");
+        assert!(
+            !result.has_errors,
+            "surfacing a warning must not start failing the compile"
+        );
     }
 }
