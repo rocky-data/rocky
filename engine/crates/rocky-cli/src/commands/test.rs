@@ -178,6 +178,14 @@ pub fn run_test(
 // ---------------------------------------------------------------------------
 
 /// Load all models from a directory including one level of subdirectories.
+///
+/// Deliberately NOT [`crate::models_loader::load_project_models`], which walks
+/// the whole tree, collects `.rocky` DSL models too, and treats a load failure
+/// as an error. Adopting it here would change three things at once for
+/// `--declarative` — which models run, which files are read, and whether a
+/// broken sidecar aborts the command — so the switch belongs in its own change
+/// with its own note. Until then the declarative runner sees strictly less than
+/// `rocky list models` does.
 fn load_all_models(models_dir: &Path) -> Result<Vec<models::Model>> {
     let mut all = models::load_models_from_dir(models_dir).context(format!(
         "failed to load models from {}",

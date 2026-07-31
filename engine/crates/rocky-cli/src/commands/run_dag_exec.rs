@@ -384,8 +384,11 @@ pub async fn run_with_dag(
 /// nothing and can never fail on a `models/` directory it would not have
 /// executed. Each pipeline's base directory is derived from its `models` setting
 /// exactly the way [`super::run`] derives it, so `--dag` and a plain run agree
-/// on which files are in scope. Note this is a base directory plus one level of
-/// subdirectory, NOT true glob matching — see `crate::models_loader` and #1262.
+/// on the base DIRECTORY. They do not agree on the file set: this walks the
+/// whole tree below that base, while the compile a plain run drives reads only
+/// the base itself. Note also that the base is walked in full, NOT glob-matched:
+/// `models/*.sql` and `models/**` both load everything under `models` — see
+/// `crate::models_loader`.
 ///
 /// A missing directory is not an error here — that matches `run`, which treats
 /// an absent models directory as a no-op rather than a failure.
@@ -437,8 +440,8 @@ pub(super) fn load_transformation_models(
         };
 
         let mut models: Vec<rocky_core::models::Model> = Vec::new();
-        // Names already seen inside THIS pipeline's own tree. The loader reads a
-        // base directory plus one level below it, so one pipeline can reach the
+        // Names already seen inside THIS pipeline's own tree. The loader walks
+        // the whole tree below the base directory, so one pipeline can reach the
         // same name twice (`transforms/orders` and `transforms/staging/orders`)
         // — that is a duplicate no matter how many pipelines exist.
         let mut seen_here: HashMap<String, String> = HashMap::new();
@@ -1703,7 +1706,7 @@ mod tests {
     /// Guards the seam that per-pipeline attribution nearly broke: a duplicate
     /// model name inside ONE pipeline's tree.
     ///
-    /// The loader reads a base directory plus one level below it, so a single
+    /// The loader walks the whole tree below a base directory, so a single
     /// pipeline can reach `orders` at both `transforms/orders` and
     /// `transforms/staging/orders`. Keying the duplicate check on the resolved
     /// DIRECTORY — needed so two pipelines sharing a directory reach

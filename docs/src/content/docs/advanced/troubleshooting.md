@@ -16,7 +16,7 @@ A model references another model that doesn't exist in the project.
 **Possible causes:**
 - The referenced model file is missing or misnamed
 - The `name` field in the `.toml` sidecar doesn't match the file name
-- The model is in a subdirectory that Rocky isn't scanning
+- The model is in a subdirectory. `rocky list models` and `rocky dag` walk the whole tree under `models/`, but the compiler reads only the models directory itself, so `rocky compile` treats `models/staging/stg_orders.sql` as absent
 
 **Fix:** Check that the referenced model exists in `models/` and its `name` field matches. Rocky auto-discovers dependencies from SQL table references; bare names matching model file names become DAG edges.
 

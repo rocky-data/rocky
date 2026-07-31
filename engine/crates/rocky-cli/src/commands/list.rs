@@ -125,8 +125,8 @@ pub fn list_models_output(models_dir: &Path) -> Result<ListModelsOutput> {
     Ok(ListModelsOutput::new(build_model_entries(models_dir)?))
 }
 
-/// Build the model-entry rows by loading the models directory (with the
-/// one-level subdirectory scan).
+/// Build the model-entry rows by loading the models directory (walking every
+/// subdirectory below it).
 fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
     let models = load_all_models(models_dir)?;
 
@@ -165,9 +165,10 @@ fn build_model_entries(models_dir: &Path) -> Result<Vec<ListModelEntry>> {
 
 /// Execute `rocky list models`.
 ///
-/// Loads models from the given directory and all immediate subdirectories
-/// (handles the common `models/{layer}/*.sql` layout). Each subdirectory
-/// is scanned independently so per-directory `_defaults.toml` files work.
+/// Loads models from the given directory and every directory below it, at any
+/// depth (handles the common `models/{layer}/*.sql` layout, and `models/marts/
+/// core/` too). Each directory is scanned independently so per-directory
+/// `_defaults.toml` files work.
 pub fn list_models(models_dir: &Path, json: bool) -> Result<()> {
     let entries = build_model_entries(models_dir)?;
 
@@ -259,7 +260,8 @@ pub fn list_sources(config_path: &Path, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Load all models from a directory (with subdirectory scan, incl. `.rocky`).
+/// Load all models from a directory and every directory below it (incl.
+/// `.rocky`).
 fn load_all_models(models_dir: &Path) -> Result<Vec<rocky_core::models::Model>> {
     let mut all = crate::models_loader::load_project_models(models_dir)?;
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));

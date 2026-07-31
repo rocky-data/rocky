@@ -39,13 +39,13 @@ const DAG_SCHEMA_VERSION: &str = "1";
 /// Three states rather than an `Option`, because "no root" and "several roots"
 /// both lack a single directory to compile but mean opposite things: the first
 /// has no lineage to report, the second has lineage this command cannot see.
-/// Both currently produce an empty list; keeping them apart is what lets #1262
-/// give the second one a real answer without disturbing the first.
+/// Both currently produce an empty list; keeping them apart is what lets a
+/// later fix give the second one a real answer without disturbing the first.
 enum LineageSource {
-    /// Compile this directory. Note this still inherits #1262: the compiler
-    /// reads the directory itself, while the model loader also reads one level
-    /// below it, so a project keeping its models in `<root>/staging/` has models
-    /// in the DAG that the compile cannot see.
+    /// Compile this directory. Note the compiler reads only the directory
+    /// itself, while the model loader walks the whole tree below it, so a
+    /// project keeping its models in `<root>/staging/` has models in the DAG
+    /// that the compile cannot see.
     Root(std::path::PathBuf),
     /// No transformation models exist, so no lineage does either. Empty is the
     /// complete answer.
@@ -464,7 +464,7 @@ fn build_column_lineage_from_models(
     //
     // This tolerance is pre-existing and is deliberately left alone. Propagating
     // these errors looks obviously right and is not: the compiler reads only the
-    // top level of `models_dir` while the model loader also reads one level
+    // top level of `models_dir` while the model loader walks every directory
     // below it, so the ordinary `models/staging/stg.sql` → `models/fct.sql`
     // layout compiles to `unknown dependency 'stg' referenced by 'fct'` — a
     // artifact of the shallower read, not a defect in the project. Surfacing it
@@ -524,7 +524,7 @@ fn union_by_model_name(by_pipeline: &rocky_core::unified_dag::ModelsByPipeline) 
     all
 }
 
-/// Load models from a directory and its immediate subdirectories
+/// Load models from a directory and every directory below it, at any depth
 /// (including `.rocky` DSL files), sorted by name.
 pub(super) fn load_all_models(models_dir: &Path) -> Result<Vec<Model>> {
     let mut all = crate::models_loader::load_project_models(models_dir)?;

@@ -202,7 +202,7 @@ fn strategy_wire_name(s: MaskStrategy) -> &'static str {
     s.as_str()
 }
 
-/// Recursive model loader (top level + one level of subdirectories,
+/// Recursive model loader (the models root and every directory below it,
 /// including `.rocky` DSL files).
 fn load_all_models(models_dir: &Path) -> Result<Vec<Model>> {
     let mut all = crate::models_loader::load_project_models(models_dir)?;

@@ -1068,8 +1068,8 @@ async fn discover_replication_branch_targets(
 
 /// Transformation pipeline path for [`discover_branch_targets`].
 ///
-/// Walks the model files under the pipeline's `models` glob (top-level +
-/// immediate subdirectories — same surface `rocky list models` and the
+/// Walks the model files under the pipeline's `models` glob (the root and
+/// every directory below it — same surface `rocky list models` and the
 /// catalog scope resolver use) and emits one `(prod, branch_source)` pair
 /// per model. Each model's sidecar `[target]` block supplies the production
 /// catalog/schema/table; the branch source rewrites the schema to the
@@ -1133,9 +1133,20 @@ fn discover_transformation_branch_targets(
         );
     }
 
-    // Load the same way `rocky list models` does: top-level files plus
-    // immediate subdirectories (incl. `.rocky` DSL). Keeps behavior consistent
-    // with the rest of the transformation surface (run, plan, list).
+    // Load the same way `rocky list models` does: top-level files plus every
+    // directory below them (incl. `.rocky` DSL). That matches `list` and `dag`,
+    // NOT the compile a plain `run` drives, which reads only the top level.
+    //
+    // **No collision validation runs on this path, at any depth.** Promotion
+    // emits one step per model straight from this list without compiling, so
+    // the E036 two-models-one-physical-table diagnostic never fires here —
+    // not for a subdirectory model, and not for two top-level ones either.
+    // Two models sharing a target therefore promote as two `CREATE OR REPLACE`
+    // against one table, last writer wins. Recursing the loader (#1262) did not
+    // open that hole, but it does hand this path more models, so more
+    // collisions can reach it. Closing it needs a collision check the
+    // destructive consumers of a raw model set share — `gc`, `apply` and this
+    // one — rather than a bespoke one bolted on here.
     let all_models = crate::models_loader::load_project_models(&models_dir)?;
 
     let shadow_cfg = ShadowConfig {

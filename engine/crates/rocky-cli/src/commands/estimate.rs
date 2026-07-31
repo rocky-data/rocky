@@ -161,7 +161,7 @@ async fn run_explain(
     })
 }
 
-/// Load all models from a directory including one level of subdirectories
+/// Load all models from a directory and every directory below it
 /// (including `.rocky` DSL files).
 fn load_all_models(models_dir: &Path) -> Result<Vec<models::Model>> {
     let mut all = crate::models_loader::load_project_models(models_dir)?;

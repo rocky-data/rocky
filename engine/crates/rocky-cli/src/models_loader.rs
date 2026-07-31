@@ -1,12 +1,14 @@
 //! Shared model-directory loader for CLI commands.
 //!
-//! The canonical "load every model in the project" path: top-level dir plus
-//! one level of immediate subdirectories, including **both** `.sql` (sidecar
-//! `.toml`) and `.rocky` DSL files. Commands that need the model list (but not
-//! the resolved DAG) should use this instead of
+//! The canonical "load every model in the project" path: the models root and
+//! **every** directory beneath it, at any depth, including **both** `.sql`
+//! (sidecar `.toml`) and `.rocky` DSL files. Commands that need the model list
+//! (but not the resolved DAG) should use this instead of
 //! [`rocky_core::models::load_models_from_dir`], which collects only `.sql`
-//! files and therefore silently drops `.rocky` DSL models.
+//! files in a single directory and therefore silently drops both `.rocky` DSL
+//! models and everything in a subdirectory.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -131,8 +133,8 @@ pub fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Optio
     })
 }
 
-/// Load all models under `models_dir` (top level + immediate subdirectories),
-/// including `.rocky` DSL files.
+/// Load every model under `models_dir`, at any depth, including `.rocky` DSL
+/// files.
 ///
 /// A load failure in **any** of those directories is an error. Subdirectory
 /// failures used to be discarded, so a malformed model one level down simply
@@ -141,11 +143,20 @@ pub fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Optio
 /// nothing for that subtree. That is the same silent-success class as the
 /// top-level load, which stopped being swallowed in #1244.
 ///
-/// **Scope.** This reads the top level plus one level down. A model at
-/// `models/a/b/` is still not loaded at all — not an error, simply absent
-/// (#1262). Propagating subdirectory errors does not close that hole, and a
-/// project nesting models deeper than one level still silently builds nothing
-/// for the deeper subtree.
+/// The walk is fully recursive as of #1262. It previously read the root plus
+/// one level of immediate subdirectories, so a model at `models/a/b/` was not
+/// loaded at all — not an error, simply absent — even though the default
+/// `models/**` glob reads as recursive. A malformed sidecar down there could
+/// not even fail, because the file was never opened.
+///
+/// **Scope: the compile path is still flat.** `rocky run` (without `--dag`)
+/// compiles through [`rocky_compiler::compile`], which loads models with
+/// `Project::load_models_with_db` — a single directory, no descent at all. So
+/// `rocky list models` and `rocky run --dag` now see the whole tree while a
+/// plain `rocky run` still sees only the models sitting directly in the root.
+/// Widening the compile path materializes tables that projects have never had
+/// built, which is the materialization change #1268 deliberately kept out of a
+/// discovery fix; it needs its own change and its own release note.
 pub fn load_project_models(models_dir: &Path) -> Result<Vec<Model>> {
     let (models, mut errors) = load_project_models_partial(models_dir);
     if errors.is_empty() {
@@ -176,46 +187,121 @@ pub fn load_project_models(models_dir: &Path) -> Result<Vec<Model>> {
 pub fn load_project_models_partial(models_dir: &Path) -> (Vec<Model>, Vec<anyhow::Error>) {
     let mut all = Vec::new();
     let mut errors = Vec::new();
+    let mut visited: HashSet<PathBuf> = HashSet::new();
+    visited.insert(visit_key(models_dir));
 
-    match load_one_dir(models_dir) {
-        Ok(models) => all.extend(models),
-        Err(e) => errors.push(e),
-    }
+    // Pre-order depth-first over an explicit stack — not a recursive function,
+    // so a pathologically deep tree cannot overflow the thread stack. Children
+    // are pushed in reverse sorted order so they pop in sorted order, making
+    // both the model order and the "which broken directory is reported first"
+    // answer independent of `read_dir`'s arbitrary ordering.
+    let mut stack: Vec<(PathBuf, usize)> = vec![(models_dir.to_path_buf(), 0)];
 
-    // `load_dir_models` returns no models for a directory that does not exist,
-    // and several callers rely on that (`rocky docs` on a project with no
-    // models, for one). Only descend when there is something to descend into,
-    // so an absent directory stays a non-error rather than failing `read_dir`.
-    if !models_dir.is_dir() {
-        return (all, errors);
-    }
-
-    let entries = match std::fs::read_dir(models_dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            errors.push(anyhow::Error::new(e).context(format!(
-                "failed to read models directory {}",
-                models_dir.display()
-            )));
-            return (all, errors);
-        }
-    };
-    let mut subdirs: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    // Deterministic order: with more than one broken subdirectory, the same one
-    // is always reported first.
-    subdirs.sort();
-
-    for subdir in subdirs {
-        match load_one_dir(&subdir) {
+    while let Some((dir, depth)) = stack.pop() {
+        match load_one_dir(&dir) {
             Ok(models) => all.extend(models),
             Err(e) => errors.push(e),
         }
+
+        // `load_dir_models` returns no models for a directory that does not
+        // exist, and several callers rely on that (`rocky docs` on a project
+        // with no models, for one). Only descend when there is something to
+        // descend into, so an absent directory stays a non-error rather than
+        // failing `read_dir`.
+        if !dir.is_dir() {
+            continue;
+        }
+
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                errors.push(
+                    anyhow::Error::new(e)
+                        .context(format!("failed to read models directory {}", dir.display())),
+                );
+                continue;
+            }
+        };
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        for entry in entries {
+            // NOT `entries.flatten()`. A per-entry `io::Error` dropped there is
+            // a directory that vanishes with nothing said about it — the silent
+            // drop this walk exists to close, reintroduced one level down.
+            match entry {
+                Ok(entry) if entry.path().is_dir() => subdirs.push(entry.path()),
+                Ok(_) => {}
+                Err(e) => errors.push(anyhow::Error::new(e).context(format!(
+                    "failed to read an entry of models directory {}",
+                    dir.display()
+                ))),
+            }
+        }
+        subdirs.sort();
+
+        // `is_dir` follows symlinks, and always has: a `models/staging`
+        // symlinked at a shared directory loads today and must keep loading.
+        // That is also how a cycle gets in, so each directory is entered at
+        // most once, keyed on its resolved identity. A directory that cannot
+        // be canonicalized falls back to its own path — it is loaded today, so
+        // failing to resolve it must not drop it.
+        //
+        // Selected WITHOUT marking anything visited, so the depth check below
+        // sees only genuinely-unvisited children. Marking first would both
+        // report a ceiling breach for a subtree that is nothing but a cycle
+        // back to an already-loaded directory, and mark directories visited
+        // that are then abandoned — a later, legitimately shallow path to one
+        // of them would be skipped with no error at all. `batch` dedups two
+        // siblings that alias one directory, which the mark-as-you-go form got
+        // for free.
+        let mut batch: HashSet<PathBuf> = HashSet::new();
+        let fresh: Vec<(PathBuf, PathBuf)> = subdirs
+            .into_iter()
+            .filter_map(|subdir| {
+                let key = visit_key(&subdir);
+                (!visited.contains(&key) && batch.insert(key.clone())).then_some((subdir, key))
+            })
+            .collect();
+        if fresh.is_empty() {
+            continue;
+        }
+
+        if depth + 1 > MAX_MODELS_TREE_DEPTH {
+            errors.push(anyhow::anyhow!(
+                "models directory '{}' nests deeper than the {MAX_MODELS_TREE_DEPTH}-level \
+                 limit; models below it were not loaded",
+                dir.display(),
+            ));
+            continue;
+        }
+
+        visited.extend(fresh.iter().map(|(_, key)| key.clone()));
+        stack.extend(
+            fresh
+                .into_iter()
+                .rev()
+                .map(|(subdir, _)| (subdir, depth + 1)),
+        );
     }
     (all, errors)
+}
+
+/// How deep below the models root the walk descends.
+///
+/// Cycles are broken by the visited set, so this is not what makes the walk
+/// terminate — it is a ceiling on nesting no real project reaches. Exceeding it
+/// is an **error**, never a silent stop: quietly truncating the walk is the
+/// exact failure recursing here exists to close (#1262).
+const MAX_MODELS_TREE_DEPTH: usize = 64;
+
+/// The identity a directory is deduplicated on while walking.
+///
+/// Canonical where possible so two paths reaching one directory — a symlink and
+/// its target, or a symlink pointing back at an ancestor — are entered once.
+/// A directory that cannot be resolved keys on its own path rather than being
+/// skipped: it is loaded today, and a probe that cannot answer "have I been
+/// here?" is not a reason to drop a model.
+fn visit_key(dir: &Path) -> PathBuf {
+    dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
 }
 
 /// Load one directory's models, naming that directory in the error.
@@ -258,6 +344,215 @@ mod tests {
         let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, ["stg", "top"]);
+    }
+
+    /// The regression #1262 exists for: the walk stopped after one level, so a
+    /// model at `models/a/b/` was not loaded — not an error, simply absent —
+    /// while the default `models/**` glob reads as recursive.
+    #[test]
+    fn loads_models_at_every_depth() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        write_model(&models.join("a"), "lvl1");
+        write_model(&models.join("a").join("b"), "lvl2");
+        write_model(&models.join("a").join("b").join("c"), "lvl3");
+
+        let loaded = load_project_models(&models).expect("load");
+        let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["lvl1", "lvl2", "lvl3", "top"]);
+    }
+
+    /// A malformed sidecar two levels down must fail exactly the way the top
+    /// level fails. This is what proves the file is *read*: before #1262 the
+    /// same broken TOML changed nothing at all, because nothing ever opened it.
+    #[test]
+    fn a_broken_model_below_the_first_subdirectory_level_is_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        let deep = models.join("marts").join("core");
+        write(&deep.join("broken.sql"), "SELECT 1\n");
+        write(&deep.join("broken.toml"), "name = [\n");
+
+        let err = load_project_models(&models).expect_err("a depth-2 failure must propagate");
+        let rendered = format!("{err:#}");
+
+        // The same shape the top level produces — `load_one_dir`'s context,
+        // naming the directory that failed.
+        let top_only = tmp.path().join("top-only");
+        write(&top_only.join("broken.sql"), "SELECT 1\n");
+        write(&top_only.join("broken.toml"), "name = [\n");
+        let top_err = load_project_models(&top_only).expect_err("top-level failure");
+        let top_rendered = format!("{top_err:#}");
+        assert_eq!(
+            rendered.replace(&deep.display().to_string(), "<dir>"),
+            top_rendered.replace(&top_only.display().to_string(), "<dir>"),
+            "a deep failure must render identically to the top-level one"
+        );
+        assert!(
+            rendered.contains(&deep.display().to_string()),
+            "the error must name the failing directory, got: {rendered}"
+        );
+    }
+
+    /// Discovery order must not depend on `read_dir`'s arbitrary ordering, or
+    /// every downstream DAG/doc listing churns between runs and machines.
+    ///
+    /// Directories are created in scrambled order and each holds a model whose
+    /// name sorts against the directory order, so the assertion discriminates
+    /// both against an unsorted walk and against globally name-sorting the
+    /// result (which would return `m00..m07`).
+    #[test]
+    fn discovery_order_is_deterministic() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "root");
+        for (dir, model) in [
+            ("d05", "m02"),
+            ("d01", "m07"),
+            ("d07", "m00"),
+            ("d03", "m05"),
+            ("d00", "m06"),
+            ("d06", "m01"),
+            ("d02", "m04"),
+            ("d04", "m03"),
+        ] {
+            write_model(&models.join(dir), model);
+        }
+
+        let names: Vec<String> = load_project_models(&models)
+            .expect("load")
+            .iter()
+            .map(|m| m.config.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "root", "m06", "m07", "m04", "m05", "m03", "m02", "m01", "m00"
+            ],
+            "models must come back in directory-sorted order, root first"
+        );
+    }
+
+    /// A symlink pointing back at an ancestor must not spin forever, and the
+    /// models it reaches must not be loaded twice (a duplicate name is a hard
+    /// error downstream in `Project::from_models`).
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_cycle_terminates_and_loads_each_model_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        write_model(&models.join("staging"), "stg");
+        std::os::unix::fs::symlink(&models, models.join("staging").join("loop")).expect("symlink");
+
+        let loaded = load_project_models(&models).expect("load");
+        let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["stg", "top"]);
+    }
+
+    /// A symlinked subdirectory is followed — `is_dir()` has always followed
+    /// symlinks, so a project sharing a models subtree that way keeps loading.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_subdirectory_is_followed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        let shared = tmp.path().join("shared");
+        write_model(&shared, "shared_model");
+        std::os::unix::fs::symlink(&shared, models.join("linked")).expect("symlink");
+
+        let loaded = load_project_models(&models).expect("load");
+        let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["shared_model", "top"]);
+    }
+
+    /// Nesting past the ceiling is reported, never silently truncated —
+    /// a quiet stop is the #1262 failure in a new place.
+    #[test]
+    fn nesting_past_the_depth_ceiling_is_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        let mut deep = models.clone();
+        for i in 0..=MAX_MODELS_TREE_DEPTH {
+            deep = deep.join(format!("d{i}"));
+        }
+        write_model(&deep, "too_deep");
+
+        let err = load_project_models(&models).expect_err("over-deep nesting must be reported");
+        assert!(
+            format!("{err:#}").contains("nests deeper than"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// A directory sitting exactly at the ceiling whose only child is a symlink
+    /// back to somewhere already loaded has nothing unseen below it, so the
+    /// ceiling must stay quiet. Reporting a breach there would fail a project
+    /// over a subtree that contains no model the walk has not already read.
+    ///
+    /// Mutation that must turn this red: mark children visited before the
+    /// depth check instead of after.
+    #[test]
+    #[cfg(unix)]
+    fn the_depth_ceiling_ignores_a_cycle_back_to_a_loaded_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        let mut deepest = models.clone();
+        for i in 0..MAX_MODELS_TREE_DEPTH {
+            deepest = deepest.join(format!("d{i}"));
+        }
+        write_model(&deepest, "deepest");
+        std::os::unix::fs::symlink(&models, deepest.join("loop")).expect("symlink");
+
+        let loaded = load_project_models(&models).expect("a cycle at the ceiling is not a breach");
+        let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["deepest", "top"]);
+    }
+
+    /// Two siblings symlinked at one directory must load its models once. The
+    /// mark-as-you-go filter got this for free; selecting without marking has
+    /// to dedup within the batch explicitly.
+    #[test]
+    #[cfg(unix)]
+    fn two_siblings_aliasing_one_directory_load_it_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        let shared = tmp.path().join("shared");
+        write_model(&shared, "shared_model");
+        std::os::unix::fs::symlink(&shared, models.join("alias_a")).expect("symlink a");
+        std::os::unix::fs::symlink(&shared, models.join("alias_b")).expect("symlink b");
+
+        let loaded = load_project_models(&models).expect("load");
+        let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["shared_model", "top"]);
+    }
+
+    /// Everything the loader is willing to walk it walked before too. Hidden
+    /// directories are **not** excluded today — `read_dir` yields them and
+    /// `is_dir()` accepts them — so a model under one loads, and adding an
+    /// exclusion here would be a new silent drop of exactly the #1262 kind.
+    #[test]
+    fn hidden_directories_are_walked_at_every_depth() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        write_model(&models.join(".hidden"), "hidden_lvl1");
+        write_model(&models.join(".hidden").join("deeper"), "hidden_lvl2");
+
+        let loaded = load_project_models(&models).expect("load");
+        let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["hidden_lvl1", "hidden_lvl2", "top"]);
     }
 
     /// The regression this change exists for: a malformed sidecar one level down

@@ -1926,7 +1926,7 @@ mod tests {
     /// `--column-lineage` must not fail on the ordinary nested layout: staging
     /// models one level down feeding marts at the root.
     ///
-    /// The model loader reads the root plus one level below; the lineage compile
+    /// The model loader walks the whole tree below the root; the lineage compile
     /// reads only the root. So `fct` is compiled while the `stg` it selects from
     /// is invisible, and the compiler reports `unknown dependency 'stg'`. That
     /// is an artifact of the shallower read, not a defect in the project.

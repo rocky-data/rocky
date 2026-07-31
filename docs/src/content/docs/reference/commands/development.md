@@ -543,7 +543,7 @@ rocky list deps <model>      # What this model depends on
 rocky list consumers <model> # What depends on this model
 ```
 
-All subcommands support `--output json` via `-o json`. Models are discovered from the `models/` directory (and immediate subdirectories for the common `models/{layer}/` layout).
+All subcommands support `--output json` via `-o json`. Models are discovered from the `models/` directory and every directory beneath it, so both `models/{layer}/` and `models/marts/core/` are picked up. Each directory is read on its own, so a per-directory `_defaults.toml` applies to the models beside it. Nesting deeper than 64 levels is reported as an error rather than skipped.
 
 See the [CLI Reference](/reference/cli/#rocky-list) for full examples and JSON output schemas.
 - [`rocky validate`](/reference/commands/core-pipeline/#rocky-validate) -- validate config after registering the adapter

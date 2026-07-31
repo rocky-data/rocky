@@ -179,8 +179,8 @@ pub(crate) fn resolve_transformation_managed_tables(
         );
     }
 
-    // Load all models the same way `rocky list models` does: top-level +
-    // immediate subdirectories, including `.rocky` DSL files.
+    // Load all models the same way `rocky list models` does: the root and
+    // every directory below it, including `.rocky` DSL files.
     let all_models = crate::models_loader::load_project_models(&models_dir)?;
 
     let mut managed = HashSet::new();
