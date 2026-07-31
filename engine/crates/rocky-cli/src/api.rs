@@ -1923,6 +1923,36 @@ mod tests {
         assert!(out.column_lineage.is_empty());
     }
 
+    /// A project whose models do not compile must not report "no lineage".
+    ///
+    /// The compile failure used to be flattened into an empty edge list. Now
+    /// that a genuinely model-less project also yields an empty list and calls
+    /// that the complete answer, the two must not look identical: a
+    /// compile-broken project would otherwise be reported as one that simply
+    /// has no column lineage.
+    #[tokio::test]
+    async fn dag_column_lineage_surfaces_compile_failure() {
+        let (dir, config_path) = custom_root_dag_project();
+        // Replace a model's SQL with something that cannot parse.
+        std::fs::write(
+            dir.path().join("transforms").join("fct.sql"),
+            "SELECT FROM WHERE ((",
+        )
+        .unwrap();
+        let state_path = pinned_state_path(dir.path());
+
+        let err = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect_err("a compile failure must not be reported as empty lineage");
+        assert!(
+            format!("{err:#}").contains("column lineage"),
+            "error must say lineage could not be compiled, got: {err:#}"
+        );
+
+        // Unchanged for the structural DAG, which never compiles.
+        dag_output(&config_path, &state_path, None, None, None, false, None)
+            .expect("the structural DAG must not depend on model SQL compiling");
+    }
+
     /// A configured-but-empty root is not a second root.
     ///
     /// Counting roots by what *resolves* rather than by what actually yields

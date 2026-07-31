@@ -452,7 +452,24 @@ fn build_column_lineage_from_models(
 
     let result = match rocky_compiler::compile::compile(&compile_config) {
         Ok(r) => r,
-        Err(_) => return Ok(vec![]),
+        // The compiler found no models directly in this root. That is the #1262
+        // depth gap — the loader also reads one level below, so the DAG can hold
+        // nodes this compile cannot see — and it is the pre-existing tolerated
+        // case, left as-is rather than widened into a refusal that would break
+        // the ordinary `<root>/staging/` layout.
+        Err(rocky_compiler::compile::CompileError::Project(
+            rocky_compiler::project::ProjectError::NoModels { .. },
+        )) => return Ok(vec![]),
+        // Anything else is a real failure: a model that will not parse, a broken
+        // contract, a semantic-graph error. This used to be flattened into an
+        // empty edge list, which since the caller now treats "empty" as a
+        // COMPLETE answer for a project with no models, would report a
+        // compile-broken project as one that simply has no lineage. The caller
+        // asked for lineage; failing to produce it is not the same as there
+        // being none.
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context("failed to compile column lineage"));
+        }
     };
 
     let graph = &result.semantic_graph;
