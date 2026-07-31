@@ -1247,9 +1247,13 @@ enum Command {
 
     /// Show the full unified DAG (all pipeline stages and dependencies)
     Dag {
-        /// Models directory
-        #[arg(long, default_value = "models")]
-        models: PathBuf,
+        /// Models directory. Omit to use each transformation pipeline's own
+        /// configured `models` location — which is what `rocky run --dag` does,
+        /// and what makes the two agree. Passing this overrides the location
+        /// for EVERY transformation pipeline, so a project with more than one
+        /// is refused rather than silently building each model twice (#1261).
+        #[arg(long)]
+        models: Option<PathBuf>,
         /// Seeds directory
         #[arg(long)]
         seeds: Option<PathBuf>,
@@ -3552,7 +3556,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         } => rocky_cli::commands::run_dag(
             &cli.config,
             &state_path,
-            &models,
+            models
+                .as_deref()
+                .unwrap_or_else(|| std::path::Path::new("models")),
+            models.is_some(),
             seeds.as_deref(),
             contracts.as_deref(),
             column_lineage,

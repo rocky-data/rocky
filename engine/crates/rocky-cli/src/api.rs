@@ -821,6 +821,10 @@ async fn full_dag(
             &config_path,
             &state_path,
             &models_dir,
+            // The server's configured models dir is an explicit location, the
+            // API analogue of `rocky dag --models`, so it keeps overriding every
+            // transformation pipeline exactly as it did before.
+            true,
             None, // seeds_dir → falls back to <config_dir>/seeds, matching `rocky dag`
             contracts_dir.as_deref(),
             false, // include_column_lineage
@@ -1763,6 +1767,7 @@ mod tests {
                 &config_path,
                 &state_path,
                 &models_dir,
+                true,
                 None,
                 None,
                 false,

@@ -211,7 +211,7 @@ pub async fn run_with_dag(
     // validate a `models/` directory that only transformation pipelines
     // consume (`add_transformation_nodes`), so an unrelated broken model there
     // failed a replication-only run that `rocky run` executes happily.
-    let models = load_transformation_models(config_path, cfg)?;
+    let models_by_pipeline = load_transformation_models(config_path, cfg)?;
 
     // Seed-discovery errors are NOT recoverable into "no seeds": seed nodes and
     // the seed→model edges that order a model after the seed it reads are built
@@ -227,15 +227,19 @@ pub async fn run_with_dag(
         Vec::new()
     };
 
-    let mut dag = unified_dag::build_unified_dag(cfg, &models, &seeds)
+    let mut dag = unified_dag::build_unified_dag(cfg, &models_by_pipeline, &seeds)
         .context("failed to build unified DAG")?;
 
     // Infer cross-step edges from each model's SQL `FROM` references so a
     // model that reads a seed (or replication load) is ordered *after* it,
     // even when no explicit `depends_on` is declared. Without this, a seed
     // and a model that selects from it both land in layer 0 and race.
-    let sql_by_name: HashMap<String, String> = models
-        .iter()
+    //
+    // Flattened across pipelines: `build_unified_dag` has already refused any
+    // model claimed by two of them, so a name appears at most once here.
+    let sql_by_name: HashMap<String, String> = models_by_pipeline
+        .values()
+        .flatten()
         .map(|m| (m.config.name.clone(), m.sql.clone()))
         .collect();
     unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name);
@@ -360,57 +364,76 @@ pub async fn run_with_dag(
     Ok(())
 }
 
-/// Load the union of every transformation pipeline's declared model set.
+/// Load each transformation pipeline's own model set, keyed by pipeline name.
 ///
 /// Only transformation pipelines consume models, so a project without one loads
 /// nothing and can never fail on a `models/` directory it would not have
-/// executed. The base directory is derived from each pipeline's `models` glob
-/// exactly the way [`super::run`] derives it (the prefix up to the first `**`),
-/// so `--dag` and a plain run agree on which files are in scope.
+/// executed. Each pipeline's base directory is derived from its `models` setting
+/// exactly the way [`super::run`] derives it, so `--dag` and a plain run agree
+/// on which files are in scope. Note this is a base directory plus one level of
+/// subdirectory, NOT true glob matching — see `crate::models_loader` and #1262.
 ///
 /// A missing directory is not an error here — that matches `run`, which treats
 /// an absent models directory as a no-op rather than a failure.
 ///
-/// Directories are deduplicated by canonical path, so two pipelines that write
-/// the same directory differently (`models/**` and `./models/**`) load it once
-/// instead of twice.
+/// Attribution is per pipeline, which is the half of #1261 that
+/// `build_unified_dag` needs: given one flat list it gave every transformation
+/// pipeline the same nodes and the DAG collapsed into
+/// `circular dependency detected involving: []`. Two pipelines pointed at the
+/// SAME directory therefore both load it — deliberately not deduplicated across
+/// pipelines, because that shared claim is exactly what `build_unified_dag` has
+/// to see in order to refuse it by name.
 ///
-/// A model name reached from more than one place is an ERROR, not a silent
-/// pick-the-first. `build_unified_dag` keys a transformation node by model name
-/// alone, so two models sharing a name cannot both be built — today that
-/// surfaces from the executor as `circular dependency detected involving: []`
-/// (#1261), which names nothing. Failing here names both files instead.
-///
-/// Per-pipeline attribution is deliberately not attempted: `build_unified_dag`
-/// takes one flat model list and gives every transformation pipeline the same
-/// nodes, which is the other half of #1261.
-fn load_transformation_models(
+/// A model name reached from more than one DIRECTORY is still an ERROR, not a
+/// silent pick-the-first: a transformation node is keyed by model name alone, so
+/// two distinct files sharing a name cannot both be built. Failing here names
+/// both files. (Two pipelines sharing ONE directory is a different situation and
+/// is diagnosed by `build_unified_dag` instead, which can name the pipelines.)
+pub(super) fn load_transformation_models(
     config_path: &Path,
     cfg: &rocky_core::config::RockyConfig,
-) -> Result<Vec<rocky_core::models::Model>> {
+) -> Result<rocky_core::unified_dag::ModelsByPipeline> {
     use rocky_core::config::PipelineConfig;
 
-    // (canonical key, path as configured) — the key only deduplicates, the
-    // configured path is what error messages should show.
-    let mut dirs: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for pipeline in cfg.pipelines.values() {
+    let mut by_pipeline = rocky_core::unified_dag::ModelsByPipeline::new();
+    // model name -> the canonical FILE it was first loaded from.
+    //
+    // Keyed on the file, not on the pipeline's base directory. Two pipelines
+    // whose roots nest (`transforms/**` and `transforms/staging/**`) reach the
+    // SAME file through different bases, and a base-keyed check called that a
+    // duplicate — reporting "declared in both X and X", naming one path twice.
+    // It is not a duplicate name; it is one model claimed by two pipelines,
+    // which `build_unified_dag` reports properly because it can name them.
+    let mut file_of_name: HashMap<String, (PathBuf, String)> = HashMap::new();
+
+    for (pipeline_name, pipeline) in &cfg.pipelines {
         let PipelineConfig::Transformation(t) = pipeline else {
             continue;
         };
         let Some(dir) = crate::models_loader::resolve_models_dir(&t.models, config_path)? else {
             continue;
         };
-        let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-        if !dirs.iter().any(|(seen_key, _)| seen_key == &key) {
-            dirs.push((key, dir));
-        }
-    }
 
-    let mut models: Vec<rocky_core::models::Model> = Vec::new();
-    let mut by_name: HashMap<String, String> = HashMap::new();
-    for (_, dir) in dirs {
+        let mut models: Vec<rocky_core::models::Model> = Vec::new();
+        // Names already seen inside THIS pipeline's own tree. The loader reads a
+        // base directory plus one level below it, so one pipeline can reach the
+        // same name twice (`transforms/orders` and `transforms/staging/orders`)
+        // — that is a duplicate no matter how many pipelines exist.
+        let mut seen_here: HashMap<String, String> = HashMap::new();
         for model in super::dag::load_all_models(&dir)? {
-            if let Some(first) = by_name.get(&model.config.name) {
+            let canonical = std::fs::canonicalize(&model.file_path)
+                .unwrap_or_else(|_| PathBuf::from(&model.file_path));
+
+            // Two genuinely distinct FILES sharing a model name: within this
+            // pipeline, or against one already loaded for another. Either way
+            // the DAG could only build one of them, so name both files.
+            let clash = seen_here.get(&model.config.name).or_else(|| {
+                file_of_name
+                    .get(&model.config.name)
+                    .filter(|(seen_canonical, _)| seen_canonical != &canonical)
+                    .map(|(_, seen_display)| seen_display)
+            });
+            if let Some(first) = clash {
                 anyhow::bail!(
                     "duplicate model name '{}': declared in both {} and {}. A \
                      transformation node is keyed by model name alone, so two \
@@ -420,12 +443,18 @@ fn load_transformation_models(
                     model.file_path,
                 );
             }
-            by_name.insert(model.config.name.clone(), model.file_path.clone());
+
+            seen_here.insert(model.config.name.clone(), model.file_path.clone());
+            file_of_name.insert(
+                model.config.name.clone(),
+                (canonical, model.file_path.clone()),
+            );
             models.push(model);
         }
+        models.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
+        by_pipeline.insert(pipeline_name.clone(), models);
     }
-    models.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
-    Ok(models)
+    Ok(by_pipeline)
 }
 
 fn status_str(s: &NodeStatus) -> &'static str {
@@ -1538,6 +1567,185 @@ mod tests {
         assert_eq!(rows.rows.len(), 1, "the requested partition materializes");
         assert_eq!(rows.rows[0][0].as_str(), Some("2020-01-01"));
         assert_eq!(cell_i64(&rows.rows[0][1]), 1);
+    }
+
+    /// 🔴 #1261 regression, CLI seam: a project with TWO transformation
+    /// pipelines, each with its own models directory, must build and execute.
+    ///
+    /// The `unified_dag` unit tests own the graph shape; this owns the wiring
+    /// that feeds it — `load_transformation_models` keying models by the
+    /// pipeline whose configured directory they came from. Pre-fix this project
+    /// could not run at all: every model got a node under both pipelines and the
+    /// DAG failed with `circular dependency detected involving: [...]` before
+    /// executing anything.
+    ///
+    /// Non-vacuous: it asserts BOTH targets materialize, so collapsing the
+    /// attribution back to one flat list fails at DAG build, and mis-attributing
+    /// a model to the wrong pipeline fails at execution (the sub-run is scoped
+    /// to its pipeline, which would not find the model).
+    /// Nested roots reach ONE file through two pipelines — that is a shared
+    /// claim, not a duplicate name, and must be reported as such.
+    ///
+    /// `alpha = "transforms/**"` and `beta = "transforms/staging/**"`: the
+    /// one-level loader returns `transforms/staging/orders` for BOTH. Keying the
+    /// duplicate check on each pipeline's base directory saw two different bases
+    /// and reported "declared in both <path> and <same path>" — naming one file
+    /// twice and never reaching the error that can name `alpha` and `beta`.
+    /// Keying on the resolved file instead makes the two cases distinguishable.
+    #[test]
+    fn nested_pipeline_roots_reaching_one_file_report_the_shared_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("transforms/staging")).unwrap();
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \"p.duckdb\"\n\n\
+             [pipeline.alpha]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+             [pipeline.alpha.target]\nadapter = \"default\"\n\n\
+             [pipeline.beta]\ntype = \"transformation\"\nmodels = \"transforms/staging/**\"\n\n\
+             [pipeline.beta.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("transforms/staging/orders.sql"),
+            "SELECT 1 AS id\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("transforms/staging/orders.toml"),
+            "depends_on = []\n\n[target]\ncatalog = \"p\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+
+        let config_path = root.join("rocky.toml");
+        let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
+        // Loading must SUCCEED — one file reached twice is not a duplicate name.
+        let by_pipeline = load_transformation_models(&config_path, &cfg)
+            .expect("one file reached through two roots is not a duplicate name");
+
+        // ...and the shared claim is then reported by the DAG, which can name
+        // the pipelines.
+        let err = rocky_core::unified_dag::build_unified_dag(&cfg, &by_pipeline, &[])
+            .expect_err("two pipelines claiming one model must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("alpha") && msg.contains("beta"), "got: {msg}");
+        assert!(
+            !msg.contains("duplicate model name"),
+            "must not be reported as a duplicate name: {msg}"
+        );
+    }
+
+    /// Guards the seam that per-pipeline attribution nearly broke: a duplicate
+    /// model name inside ONE pipeline's tree.
+    ///
+    /// The loader reads a base directory plus one level below it, so a single
+    /// pipeline can reach `orders` at both `transforms/orders` and
+    /// `transforms/staging/orders`. Keying the duplicate check on the resolved
+    /// DIRECTORY — needed so two pipelines sharing a directory reach
+    /// `build_unified_dag`, which names them — silently let that through,
+    /// because both copies resolve to the same directory. The check is per
+    /// pipeline as well as across directories.
+    #[test]
+    fn a_duplicate_name_inside_one_pipelines_tree_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("transforms/staging")).unwrap();
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter]\ntype = \"duckdb\"\npath = \"p.duckdb\"\n\n\
+             [pipeline.silver]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+             [pipeline.silver.target]\nadapter = \"default\"\n",
+        )
+        .unwrap();
+        for sub in ["transforms", "transforms/staging"] {
+            std::fs::write(root.join(sub).join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                root.join(sub).join("orders.toml"),
+                "depends_on = []\n\n[target]\ncatalog = \"p\"\nschema = \"s\"\ntable = \"orders\"\n",
+            )
+            .unwrap();
+        }
+
+        let cfg = rocky_core::config::load_rocky_config(&root.join("rocky.toml")).unwrap();
+        let err = load_transformation_models(&root.join("rocky.toml"), &cfg)
+            .expect_err("one pipeline reaching the same model name twice must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate model name 'orders'"),
+            "must name the model, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_transformation_pipelines_with_distinct_model_dirs_both_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("models/silver")).unwrap();
+        std::fs::create_dir_all(root.join("models/gold")).unwrap();
+        let db_path = root.join("proj.duckdb");
+
+        std::fs::write(
+            root.join("rocky.toml"),
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\
+                 models = \"models/silver/**\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n\n\
+                 [pipeline.gold]\n\
+                 type = \"transformation\"\n\
+                 models = \"models/gold/**\"\n\
+                 depends_on = [\"silver\"]\n\n\
+                 [pipeline.gold.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.gold.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        std::fs::write(root.join("models/silver/stg.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            root.join("models/silver/stg.toml"),
+            "depends_on = []\n\n[target]\ncatalog = \"proj\"\nschema = \"s\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("models/gold/fct.sql"), "SELECT 2 AS id\n").unwrap();
+        std::fs::write(
+            root.join("models/gold/fct.toml"),
+            "depends_on = []\n\n[target]\ncatalog = \"proj\"\nschema = \"g\"\ntable = \"fct\"\n",
+        )
+        .unwrap();
+
+        run_with_dag(
+            &root.join("rocky.toml"),
+            &root.join(".rocky-state.redb"),
+            false,
+            &PartitionRunOptions::default(),
+            &SkipRunOptions::default(),
+            None,
+        )
+        .await
+        .expect("a two-transformation-pipeline DAG must build and run");
+
+        let adapter = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        for (table, expected) in [("proj.s.stg", 1i64), ("proj.g.fct", 2i64)] {
+            let rows = guard
+                .execute_sql(&format!("SELECT id FROM {table}"))
+                .unwrap_or_else(|e| panic!("{table} should have materialized: {e}"));
+            assert_eq!(rows.rows.len(), 1, "{table} row count");
+            assert_eq!(cell_i64(&rows.rows[0][0]), expected, "{table} value");
+        }
     }
 
     #[tokio::test]

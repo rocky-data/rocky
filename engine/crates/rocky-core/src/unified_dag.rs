@@ -61,6 +61,23 @@ pub enum UnifiedDagError {
 
     #[error("self-loop detected on node '{node}'")]
     SelfLoop { node: String },
+
+    /// Two or more transformation pipelines resolve to a model set containing
+    /// the same model. The unified DAG keys a transformation node by model
+    /// name, so it cannot represent one model as two nodes — see
+    /// [`build_unified_dag`].
+    #[error(
+        "model '{model}' is claimed by transformation pipelines {}. The unified DAG builds \
+         each model once, so it cannot run the same model under two pipelines. Give each \
+         pipeline its own `models` directory, or run them separately with \
+         `rocky run --pipeline <name>` (which supports this).",
+        .pipelines.join(" and ")
+    )]
+    ModelClaimedByMultiplePipelines {
+        model: String,
+        /// Sorted, so the message is deterministic.
+        pipelines: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +294,45 @@ pub struct DagSummary {
 // DAG construction
 // ---------------------------------------------------------------------------
 
+/// Each transformation pipeline's own models, keyed by pipeline name.
+///
+/// `BTreeMap` rather than `HashMap` so node and error ordering is deterministic
+/// across runs — the DAG payload is compared in CI fixtures and diffed by users.
+pub type ModelsByPipeline = std::collections::BTreeMap<String, Vec<Model>>;
+
+/// Refuses a model that more than one transformation pipeline resolved to.
+///
+/// Two pipelines whose `models` locations overlap — most easily by both taking
+/// the `models/**` default — each claim every model in the shared directory.
+/// See [`build_unified_dag`] for why that is refused rather than represented.
+fn reject_models_claimed_twice(
+    models_by_pipeline: &ModelsByPipeline,
+) -> Result<(), UnifiedDagError> {
+    // BTreeMap iteration is sorted, so `claimants` is built in pipeline-name
+    // order and the message reads the same every run.
+    let mut claimants: std::collections::BTreeMap<&str, Vec<String>> = Default::default();
+    for (pipeline, models) in models_by_pipeline {
+        for model in models {
+            claimants
+                .entry(model.config.name.as_str())
+                .or_default()
+                .push(pipeline.clone());
+        }
+    }
+    // Report the first offender by model name rather than collecting all of
+    // them: the fix is per-pipeline config, so a user resolves them one at a
+    // time anyway, and the sorted map makes "first" deterministic.
+    for (model, pipelines) in claimants {
+        if pipelines.len() > 1 {
+            return Err(UnifiedDagError::ModelClaimedByMultiplePipelines {
+                model: model.to_string(),
+                pipelines,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Builds a unified DAG from the current configuration, loaded models, and seeds.
 ///
 /// Each pipeline in `config.pipelines` becomes one or more nodes:
@@ -298,11 +354,65 @@ pub struct DagSummary {
 ///   plus cross-step references to seeds and loads).
 /// - Implicit test-after-model relationships.
 /// - Replication sugar (Source → Load within each replication pipeline).
+///
+/// # Model attribution
+///
+/// `models_by_pipeline` maps each transformation pipeline to **its own** models
+/// — the ones its configured `models` location resolved to, not the project's
+/// whole model set. Passing one flat list for every transformation pipeline is
+/// what #1261 was: each model then got a node under every transformation
+/// pipeline, all sharing the id `transformation:<model>`, and the duplicates
+/// made phase computation report `circular dependency detected involving: []`.
+/// The unified DAG was therefore unusable for any project with two or more
+/// transformation pipelines — the standard silver/gold layering — which is also
+/// the only way to run such a project, since `rocky run` refuses a multi-pipeline
+/// project without `--pipeline`.
+///
+/// A node id stays `transformation:<model>`; it is *not* qualified by pipeline.
+/// That id is a published contract (`DagNodeOutput.id`, `execution_layers`, and
+/// `DagOutput.schema_version`, which orchestrators pin against), and because
+/// every transformation pipeline previously received the same flat list, any
+/// project that produces a valid DAG today has at most one transformation
+/// pipeline with models — so no working project's ids change here.
+///
+/// The cost of keeping ids unqualified is that one model cannot appear under two
+/// pipelines. That is refused with
+/// [`UnifiedDagError::ModelClaimedByMultiplePipelines`] rather than represented.
+/// `rocky run --pipeline <name>` does support it (the same model can be built
+/// into two different warehouses that way), and nothing that works today is lost
+/// — such a config errors out at DAG build already, just unintelligibly.
+/// Representing it here would need a collision-safe occurrence identity carried
+/// through runtime dependency inference, per-partition state keys, lineage
+/// output, and Dagster asset keys; that is deliberately not attempted.
+///
+/// # Errors
+///
+/// Returns [`UnifiedDagError::ModelClaimedByMultiplePipelines`] when two
+/// transformation pipelines resolve to the same model, plus the validation
+/// errors [`validate_dag`] raises.
 pub fn build_unified_dag(
     config: &RockyConfig,
-    models: &[Model],
+    models_by_pipeline: &ModelsByPipeline,
     seeds: &[SeedFile],
 ) -> Result<UnifiedDag, UnifiedDagError> {
+    reject_models_claimed_twice(models_by_pipeline)?;
+
+    // The union, for the cross-step dependency pass below. A model appears
+    // under exactly one pipeline (the check above guarantees it), so this
+    // neither duplicates nor drops anything.
+    let all_models: Vec<&Model> = models_by_pipeline.values().flatten().collect();
+
+    // model name -> owning transformation pipeline. Unambiguous because
+    // `reject_models_claimed_twice` above guarantees one claimant per model.
+    let pipeline_of: HashMap<&str, &str> = models_by_pipeline
+        .iter()
+        .flat_map(|(pipeline, models)| {
+            models
+                .iter()
+                .map(move |m| (m.config.name.as_str(), pipeline.as_str()))
+        })
+        .collect();
+
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
@@ -361,9 +471,17 @@ pub fn build_unified_dag(
                     .extend([source_id, load_id]);
             }
             PipelineConfig::Transformation(_) => {
+                // THIS pipeline's models, not the project's. A pipeline the
+                // caller resolved no models for contributes no nodes, which is
+                // how a transformation pipeline whose directory is absent or
+                // empty behaves — the same no-op `run` treats it as.
+                let own_models = models_by_pipeline
+                    .get(pipeline_name)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
                 add_transformation_nodes(
                     pipeline_name,
-                    models,
+                    own_models,
                     &mut nodes,
                     &mut edges,
                     &mut pipeline_node_ids,
@@ -417,7 +535,7 @@ pub fn build_unified_dag(
     // A model's depends_on may reference seeds or other step types by name.
     // Intra-pipeline model deps were already wired in add_transformation_nodes;
     // here we wire cross-step references (seed, replication load, etc.).
-    resolve_cross_step_deps(models, &name_to_node, &mut edges);
+    resolve_cross_step_deps(&all_models, &pipeline_of, &name_to_node, &mut edges);
 
     // Wire inter-pipeline depends_on edges.
     for (pipeline_name, pipeline_cfg) in &config.pipelines {
@@ -512,23 +630,38 @@ pub fn build_unified_dag(
 /// Resolves cross-step dependencies for models.
 ///
 /// For each model, checks if any `depends_on` entry refers to a seed, load,
-/// or other non-model node via the `name_to_node` map. If the dependency is
-/// already wired as an intra-pipeline model edge, it is skipped.
+/// or other non-model node via the `name_to_node` map.
+///
+/// `pipeline_of` gives each model's owning transformation pipeline. A dependency
+/// on a model in the SAME pipeline was already wired by
+/// [`add_transformation_nodes`] and is skipped here; a dependency on a model in
+/// a DIFFERENT pipeline was not, and must be wired here.
+///
+/// That distinction is load-bearing. `add_transformation_nodes` only sees its
+/// own pipeline's models, so it cannot wire `gold.fct depends_on = ["stg"]` when
+/// `stg` belongs to `silver`. Skipping every name that appears anywhere in the
+/// project — which is what "already wired" used to mean, back when every
+/// pipeline received the whole model list — drops that edge entirely and lets
+/// `fct` run alongside the `stg` it reads. Silent wrong ordering, which is worse
+/// than the loud failure this fix replaced.
 fn resolve_cross_step_deps(
-    models: &[Model],
+    models: &[&Model],
+    pipeline_of: &HashMap<&str, &str>,
     name_to_node: &HashMap<String, NodeId>,
     edges: &mut Vec<UnifiedEdge>,
 ) {
-    let model_names: HashSet<&str> = models.iter().map(|m| m.config.name.as_str()).collect();
-
     for model in models {
         let model_id = NodeId::new("transformation", &model.config.name);
+        let own_pipeline = pipeline_of.get(model.config.name.as_str()).copied();
         for dep in &model.config.depends_on {
-            // Skip intra-pipeline model deps — already wired.
-            if model_names.contains(dep.as_str()) {
+            // Already wired intra-pipeline: same owning pipeline, model→model.
+            if let Some(dep_pipeline) = pipeline_of.get(dep.as_str())
+                && Some(*dep_pipeline) == own_pipeline
+            {
                 continue;
             }
-            // Check if this dep is a known cross-step node.
+            // A seed, a replication load, or a model in ANOTHER transformation
+            // pipeline — all of which resolve through `name_to_node`.
             if let Some(dep_node_id) = name_to_node.get(dep.as_str()) {
                 edges.push(UnifiedEdge {
                     from: dep_node_id.clone(),
@@ -898,6 +1031,35 @@ pub fn validate(dag: &UnifiedDag) -> Vec<UnifiedDagError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Attributes a flat model list to the config's single transformation
+    /// pipeline — the shape every test here uses.
+    ///
+    /// Panics when the config has more than one, deliberately: attribution is
+    /// exactly what #1261 was about, so a multi-transformation-pipeline test
+    /// has to state it explicitly rather than inherit a guess.
+    fn owned_by_sole_transformation(config: &RockyConfig, models: Vec<Model>) -> ModelsByPipeline {
+        let names: Vec<&String> = config
+            .pipelines
+            .iter()
+            .filter(|(_, p)| matches!(p, PipelineConfig::Transformation(_)))
+            .map(|(n, _)| n)
+            .collect();
+        match names.as_slice() {
+            [one] => ModelsByPipeline::from([((*one).clone(), models)]),
+            [] => {
+                assert!(
+                    models.is_empty(),
+                    "models supplied but the config declares no transformation pipeline"
+                );
+                ModelsByPipeline::new()
+            }
+            many => panic!(
+                "{} transformation pipelines — build the ModelsByPipeline explicitly",
+                many.len()
+            ),
+        }
+    }
     use crate::config::*;
     use crate::models::{ModelConfig, StrategyConfig, TargetConfig};
     use crate::seeds::SeedConfig;
@@ -1063,7 +1225,7 @@ mod tests {
     #[test]
     fn test_single_replication_pipeline_expands_to_source_and_load() {
         let config = config_with_pipelines(vec![("raw_ingest", repl_pipeline(vec![]))]);
-        let dag = build_unified_dag(&config, &[], &[]).unwrap();
+        let dag = build_unified_dag(&config, &ModelsByPipeline::new(), &[]).unwrap();
 
         // Replication sugar: Source + Load = 2 nodes
         assert_eq!(dag.node_count(), 2);
@@ -1083,6 +1245,156 @@ mod tests {
         assert_eq!(dag.edges[0].edge_type, EdgeType::DataDependency);
     }
 
+    /// 🔴 #1261 regression: two transformation pipelines with DISTINCT model
+    /// sets must produce one node per model, attributed to the owning pipeline.
+    ///
+    /// Pre-fix `build_unified_dag` handed every transformation pipeline the same
+    /// flat list, so each model got a node under BOTH — duplicate ids, duplicate
+    /// edges, and phase computation reporting a cycle. Measured on the release
+    /// before this fix, this exact shape produced
+    /// `circular dependency detected involving: ["transformation:fct",
+    /// "transformation:stg", "transformation:fct", "transformation:stg"]`.
+    ///
+    /// This is the silver/gold layering, and `rocky run` refuses a
+    /// multi-pipeline project without `--pipeline`, so `--dag` was the only way
+    /// to run it and it did not work.
+    ///
+    /// Non-vacuous on both counts: reverting to one flat list makes this 4
+    /// nodes (and `execution_phases` fail), and dropping the attribution makes
+    /// the `pipeline` assertions fail.
+    #[test]
+    fn two_transformation_pipelines_each_own_only_their_models() {
+        let config = config_with_pipelines(vec![
+            ("silver", transform_pipeline(vec![])),
+            ("gold", transform_pipeline(vec!["silver"])),
+        ]);
+        let models_by_pipeline = ModelsByPipeline::from([
+            ("silver".to_string(), vec![model("stg", vec![], vec![])]),
+            ("gold".to_string(), vec![model("fct", vec![], vec![])]),
+        ]);
+
+        let dag = build_unified_dag(&config, &models_by_pipeline, &[]).unwrap();
+
+        assert_eq!(dag.node_count(), 2, "one node per model, not one per pair");
+        let owner = |label: &str| {
+            dag.nodes
+                .iter()
+                .find(|n| n.label == label)
+                .unwrap_or_else(|| panic!("no node labelled {label}"))
+                .pipeline
+                .clone()
+        };
+        assert_eq!(owner("stg").as_deref(), Some("silver"));
+        assert_eq!(owner("fct").as_deref(), Some("gold"));
+
+        // Ids stay UNQUALIFIED. `DagNodeOutput.id` is a published contract that
+        // orchestrators pin against via `schema_version`; qualifying them here
+        // would break every consumer for no gain.
+        let mut ids: Vec<String> = dag.nodes.iter().map(|n| n.id.to_string()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["transformation:fct", "transformation:stg"]);
+
+        // And the graph is actually usable — this is what regressed.
+        execution_phases(&dag).expect("phases must compute for a 2-transformation-pipeline DAG");
+    }
+
+    /// A model-level `depends_on` that crosses pipelines must still produce an
+    /// edge, with NO pipeline-level `depends_on` to fall back on.
+    ///
+    /// This is the seam per-pipeline attribution nearly broke silently.
+    /// `add_transformation_nodes` only sees its own pipeline's models, so it
+    /// cannot wire `gold.fct -> silver.stg`; and `resolve_cross_step_deps` used
+    /// to skip every dependency naming any model in the project, on the premise
+    /// that intra-pipeline wiring had already handled it — true only while every
+    /// pipeline received the whole model list. Together they dropped the edge
+    /// entirely and let `fct` run in the same layer as the `stg` it reads.
+    ///
+    /// Deliberately no `transform_pipeline(vec!["silver"])`: a pipeline-level
+    /// dependency would order these two anyway and hide the defect. The first
+    /// version of this fix shipped without this test and the red team caught it.
+    #[test]
+    fn a_model_depends_on_across_pipelines_still_gets_an_edge() {
+        let config = config_with_pipelines(vec![
+            ("silver", transform_pipeline(vec![])),
+            ("gold", transform_pipeline(vec![])),
+        ]);
+        let models_by_pipeline = ModelsByPipeline::from([
+            ("silver".to_string(), vec![model("stg", vec![], vec![])]),
+            ("gold".to_string(), vec![model("fct", vec!["stg"], vec![])]),
+        ]);
+
+        let dag = build_unified_dag(&config, &models_by_pipeline, &[]).unwrap();
+
+        let stg = NodeId::new("transformation", "stg");
+        let fct = NodeId::new("transformation", "fct");
+        assert!(
+            dag.edges
+                .iter()
+                .any(|e| e.from == stg && e.to == fct && e.edge_type == EdgeType::DataDependency),
+            "gold.fct depends_on silver.stg must be an edge; edges were {:?}",
+            dag.edges
+        );
+
+        // And it has to actually order them — an edge that does not separate the
+        // layers would still let them run together.
+        let phases = execution_phases(&dag).expect("phases");
+        let layer_of = |id: &NodeId| {
+            phases
+                .iter()
+                .position(|layer| layer.iter().any(|n| &n.id == id))
+                .unwrap_or_else(|| panic!("{id} is in no layer"))
+        };
+        let layers: Vec<Vec<String>> = phases
+            .iter()
+            .map(|l| l.iter().map(|n| n.id.to_string()).collect())
+            .collect();
+        assert!(
+            layer_of(&stg) < layer_of(&fct),
+            "stg must run before fct, got layers {layers:?}"
+        );
+    }
+
+    /// The other half of #1261: two transformation pipelines resolving to the
+    /// SAME model (most easily by both taking the `models/**` default) is
+    /// refused BY NAME rather than represented.
+    ///
+    /// The DAG keys a transformation node by model name, so it cannot build one
+    /// model under two pipelines. `rocky run --pipeline <name>` does support
+    /// that (verified: the same model materializes into two different
+    /// warehouses), so the capability is not lost — it just is not expressible
+    /// in one graph, and saying so beats
+    /// `circular dependency detected involving: []`.
+    #[test]
+    fn a_model_claimed_by_two_transformation_pipelines_is_refused_by_name() {
+        let config = config_with_pipelines(vec![
+            ("silver", transform_pipeline(vec![])),
+            ("gold", transform_pipeline(vec![])),
+        ]);
+        // Both pipelines resolved the same directory, so both claim `shared`.
+        let models_by_pipeline = ModelsByPipeline::from([
+            ("silver".to_string(), vec![model("shared", vec![], vec![])]),
+            ("gold".to_string(), vec![model("shared", vec![], vec![])]),
+        ]);
+
+        let err = build_unified_dag(&config, &models_by_pipeline, &[])
+            .expect_err("a doubly-claimed model must be refused, not silently duplicated");
+
+        match &err {
+            UnifiedDagError::ModelClaimedByMultiplePipelines { model, pipelines } => {
+                assert_eq!(model, "shared");
+                // Sorted, so the message is stable across runs.
+                assert_eq!(pipelines, &vec!["gold".to_string(), "silver".to_string()]);
+            }
+            other => panic!("expected ModelClaimedByMultiplePipelines, got {other:?}"),
+        }
+
+        // The message has to name both pipelines and point at the way out,
+        // because the whole complaint in #1261 was an error that named nothing.
+        let msg = err.to_string();
+        assert!(msg.contains("gold and silver"), "must name both: {msg}");
+        assert!(msg.contains("--pipeline"), "must offer the way out: {msg}");
+    }
+
     #[test]
     fn test_pipeline_chaining_with_replication_sugar() {
         let config = config_with_pipelines(vec![
@@ -1091,7 +1403,12 @@ mod tests {
         ]);
 
         let models = vec![model("stg_orders", vec![], vec![])];
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
 
         // 2 replication nodes (source + load) + 1 transformation = 3 nodes
         assert_eq!(dag.node_count(), 3);
@@ -1128,7 +1445,12 @@ mod tests {
             model("fct_orders", vec!["stg_orders", "stg_customers"], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(dag.node_count(), 3);
 
@@ -1169,7 +1491,12 @@ mod tests {
         ];
 
         let models = vec![model("stg_orders", vec![], test_decls)];
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
 
         // 1 model + 2 test nodes
         assert_eq!(dag.node_count(), 3);
@@ -1199,7 +1526,11 @@ mod tests {
             config_with_pipelines(vec![("silver", transform_pipeline(vec!["nonexistent"]))]);
 
         let models = vec![model("stg_orders", vec![], vec![])];
-        let result = build_unified_dag(&config, &models, &[]);
+        let result = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        );
         assert!(matches!(
             result,
             Err(UnifiedDagError::UnknownDependency { .. })
@@ -1209,7 +1540,7 @@ mod tests {
     #[test]
     fn test_empty_config() {
         let config = config_with_pipelines(vec![]);
-        let dag = build_unified_dag(&config, &[], &[]).unwrap();
+        let dag = build_unified_dag(&config, &ModelsByPipeline::new(), &[]).unwrap();
         assert!(dag.nodes.is_empty());
         assert!(dag.edges.is_empty());
     }
@@ -1227,7 +1558,12 @@ mod tests {
             model("dim_customers", vec![], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
 
         // 2 replication (source + load) + 2 transformation + 1 quality = 5 nodes
         assert_eq!(dag.node_count(), 5);
@@ -1252,7 +1588,7 @@ mod tests {
     fn test_seed_nodes_created() {
         let config = config_with_pipelines(vec![("silver", transform_pipeline(vec![]))]);
         let seeds = vec![seed("dim_date"), seed("country_codes")];
-        let dag = build_unified_dag(&config, &[], &seeds).unwrap();
+        let dag = build_unified_dag(&config, &ModelsByPipeline::new(), &seeds).unwrap();
 
         // 2 seed nodes, no models
         assert_eq!(dag.node_count(), 2);
@@ -1278,7 +1614,12 @@ mod tests {
         let seeds = vec![seed("dim_date")];
         let models = vec![model("fct_orders", vec!["dim_date"], vec![])];
 
-        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &seeds,
+        )
+        .unwrap();
 
         // 1 seed + 1 model = 2 nodes
         assert_eq!(dag.node_count(), 2);
@@ -1299,7 +1640,12 @@ mod tests {
 
         // Model explicitly depends on raw_ingest (the replication pipeline name).
         let models = vec![model("stg_orders", vec!["raw_ingest"], vec![])];
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
 
         // Cross-step edge: load:raw_ingest -> transformation:stg_orders
         let cross_edges: Vec<_> = dag
@@ -1320,7 +1666,12 @@ mod tests {
             model("fct_orders", vec!["stg_orders", "dim_date"], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &seeds,
+        )
+        .unwrap();
 
         // fct_orders has two incoming edges: one from stg_orders, one from dim_date
         let fct_incoming: Vec<_> = dag
@@ -1350,7 +1701,12 @@ mod tests {
             model("fct_orders", vec!["stg_orders", "dim_date"], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &seeds,
+        )
+        .unwrap();
 
         // source + load + 2 models + 1 seed + 1 quality = 6 nodes
         assert_eq!(dag.node_count(), 6);
@@ -1379,7 +1735,12 @@ mod tests {
         ]);
 
         let models = vec![model("stg_orders", vec![], vec![])];
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
         let phases = execution_phases(&dag).unwrap();
 
         // Phase 0: source, Phase 1: load, Phase 2: stg_orders
@@ -1399,7 +1760,12 @@ mod tests {
             model("fct_orders", vec!["stg_orders", "stg_customers"], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
         let phases = execution_phases(&dag).unwrap();
 
         assert_eq!(phases.len(), 2);
@@ -1422,7 +1788,12 @@ mod tests {
         }];
 
         let models = vec![model("stg_orders", vec![], test_decls)];
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
         let phases = execution_phases(&dag).unwrap();
 
         // Phase 0: stg_orders, Phase 1: test node
@@ -1441,7 +1812,12 @@ mod tests {
             model("c", vec![], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
         let phases = execution_phases(&dag).unwrap();
 
         // All in one phase
@@ -1460,7 +1836,12 @@ mod tests {
             model("d", vec!["b", "c"], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
         let phases = execution_phases(&dag).unwrap();
 
         assert_eq!(phases.len(), 3);
@@ -1477,7 +1858,12 @@ mod tests {
         let seeds = vec![seed("dim_date")];
         let models = vec![model("fct_orders", vec!["dim_date"], vec![])];
 
-        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &seeds,
+        )
+        .unwrap();
         let phases = execution_phases(&dag).unwrap();
 
         // Phase 0: seed, Phase 1: model
@@ -1502,7 +1888,12 @@ mod tests {
             model("fct_orders", vec!["stg_orders"], vec![]),
         ];
 
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
 
         let roots = dag.roots();
         assert_eq!(roots.len(), 1);
@@ -1553,7 +1944,12 @@ mod tests {
 
         let models = vec![model("a", vec![], vec![]), model("b", vec!["a"], vec![])];
 
-        let dag = build_unified_dag(&config, &models, &[]).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &[],
+        )
+        .unwrap();
 
         let a_id = NodeId::new("transformation", "a");
         let b_id = NodeId::new("transformation", "b");
@@ -1580,7 +1976,12 @@ mod tests {
         let seeds = vec![seed("dim_date")];
         let models = vec![model("stg_orders", vec![], vec![])];
 
-        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &seeds,
+        )
+        .unwrap();
         let summary = dag.summary();
 
         assert_eq!(summary.total_nodes, 4); // source + load + seed + model
@@ -1603,7 +2004,12 @@ mod tests {
         let seeds = vec![seed("dim_date")];
         let models = vec![model("stg_orders", vec!["dim_date"], vec![])];
 
-        let dag = build_unified_dag(&config, &models, &seeds).unwrap();
+        let dag = build_unified_dag(
+            &config,
+            &owned_by_sole_transformation(&config, models.clone()),
+            &seeds,
+        )
+        .unwrap();
         let errors = validate(&dag);
         assert!(errors.is_empty(), "expected no errors, got: {errors:?}");
     }

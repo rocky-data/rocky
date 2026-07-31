@@ -43,6 +43,7 @@ pub fn run_dag(
     config_path: &Path,
     state_path: &Path,
     models_dir: &Path,
+    models_dir_is_explicit: bool,
     seeds_dir: Option<&Path>,
     contracts_dir: Option<&Path>,
     include_column_lineage: bool,
@@ -53,6 +54,7 @@ pub fn run_dag(
         config_path,
         state_path,
         models_dir,
+        models_dir_is_explicit,
         seeds_dir,
         contracts_dir,
         include_column_lineage,
@@ -81,6 +83,10 @@ pub fn dag_output(
     config_path: &Path,
     state_path: &Path,
     models_dir: &Path,
+    // Whether the caller passed `--models` explicitly. When false, `models_dir`
+    // is only the fallback root for loading + the lineage compile, and graph
+    // attribution comes from each pipeline's own configured directory.
+    models_dir_is_explicit: bool,
     seeds_dir: Option<&Path>,
     contracts_dir: Option<&Path>,
     include_column_lineage: bool,
@@ -95,8 +101,38 @@ pub fn dag_output(
         .clone()
         .with_ttl_override(cache_ttl_override);
 
-    // Load models from the models directory (including subdirectories).
+    // Load models from the models directory (including subdirectories). This
+    // flat list still drives the enriched output and the column-lineage
+    // compile, both of which are keyed by model name and pipeline-agnostic.
     let models = load_all_models(models_dir)?;
+
+    // Attribution for the graph itself is per transformation pipeline. Handing
+    // every transformation pipeline the same list gave each model a node under
+    // each of them, all sharing one id, and the DAG collapsed into
+    // `circular dependency detected involving: []` (#1261).
+    //
+    // `--models` is an explicit whole-project override, so under it every
+    // transformation pipeline genuinely does declare the same directory — and a
+    // project with two of them is then refused by name, which is the honest
+    // answer to "these two pipelines both build this model". Without the flag,
+    // each pipeline resolves its own directory, which is also what `rocky run
+    // --dag` has always done: before this, `rocky dag --models models` and
+    // `rocky run --dag` disagreed, the former giving a node to a model no
+    // pipeline declared.
+    let models_by_pipeline = if models_dir_is_explicit {
+        let mut m = rocky_core::unified_dag::ModelsByPipeline::new();
+        for (name, pipeline) in &cfg.pipelines {
+            if matches!(
+                pipeline,
+                rocky_core::config::PipelineConfig::Transformation(_)
+            ) {
+                m.insert(name.clone(), models.clone());
+            }
+        }
+        m
+    } else {
+        super::run_dag_exec::load_transformation_models(config_path, &cfg)?
+    };
 
     // Load seeds if the directory exists. A discovery failure is propagated, not
     // flattened to "no seeds": the seed nodes and the seed→model edges are built
@@ -124,7 +160,7 @@ pub fn dag_output(
     };
 
     // Build the unified DAG.
-    let dag = unified_dag::build_unified_dag(&cfg, &models, &seeds)
+    let dag = unified_dag::build_unified_dag(&cfg, &models_by_pipeline, &seeds)
         .context("failed to build unified DAG")?;
 
     // Compute execution phases (topological layers).
