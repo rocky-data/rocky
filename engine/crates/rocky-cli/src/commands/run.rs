@@ -7285,9 +7285,24 @@ pub(crate) async fn execute_models(
     // run reported `status: "Success"`, exit 0, `materializations: []` —
     // an orchestrator consuming `--output json` saw fully green while zero
     // data materialized.
+    // Two DIFFERENT questions, deliberately separated (they were conflated,
+    // and the conflation is what made a compile error in one model fail a run
+    // that never selected it):
+    //
+    //   * `compile_failed_models` — the EXCLUSION set. Every model with an
+    //     error diagnostic, in scope or not, so nothing broken executes.
+    //   * the reported failure — only models THIS invocation would have run.
+    //     A `--model X` / backfill-scoped run must not inherit an unrelated
+    //     model's compile error as its own failure. Under `rocky run --dag`
+    //     each node is its own model-scoped sub-run, so reporting out-of-scope
+    //     errors made every node fail whenever any one model was broken — and
+    //     `DagExecutor` then skipped the healthy descendants of nodes that had
+    //     actually materialized successfully. The broken model's OWN node
+    //     still reports it, which is where it belongs.
     let mut compile_failed_models: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
     if compile_result.has_errors {
+        let mut reported: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for d in &compile_result.diagnostics {
             if d.is_error() {
                 warn!(
@@ -7296,10 +7311,17 @@ pub(crate) async fn execute_models(
                     message = &*d.message,
                     "compile error"
                 );
-                // Surface every error diagnostic as a run error so JSON
-                // consumers see the code + message; count each distinct
+                compile_failed_models.insert(d.model.clone());
+
+                let in_scope = model_name_filter.is_none_or(|selected| selected == d.model)
+                    && model_set.is_none_or(|set| set.contains(d.model.as_str()));
+                if !in_scope {
+                    continue;
+                }
+                // Surface every in-scope error diagnostic as a run error so
+                // JSON consumers see the code + message; count each distinct
                 // model once toward `tables_failed`.
-                if compile_failed_models.insert(d.model.clone()) {
+                if reported.insert(d.model.as_str()) {
                     output.tables_failed += 1;
                 }
                 output.errors.push(crate::output::TableErrorOutput {
@@ -7312,7 +7334,8 @@ pub(crate) async fn execute_models(
         }
         warn!(
             failed_models = compile_failed_models.len(),
-            "model(s) failed to compile — excluded from execution; run will report failure"
+            reported = reported.len(),
+            "model(s) failed to compile — excluded from execution; in-scope ones fail the run"
         );
     }
 

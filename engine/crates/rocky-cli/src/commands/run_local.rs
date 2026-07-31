@@ -1434,19 +1434,31 @@ auto_create_schemas = true
     async fn try_run(
         config_path: &Path,
         state_path: &Path,
+        pipeline: Option<&str>,
         model_name_filter: Option<&str>,
     ) -> anyhow::Result<()> {
+        // `--models` is supplied ONLY when no pipeline is named. With a
+        // pipeline, the engine derives the directory from that pipeline's own
+        // glob (#1292) and passing an explicit override would bypass exactly
+        // the behaviour under test. Without one, there is nothing to derive
+        // from, so the caller must point at the project's `models` — the
+        // bare fallback is process-CWD-relative and would not find it.
+        let derived = config_path.parent().unwrap().join("models");
+        let models_dir = match (pipeline, model_name_filter) {
+            (None, Some(_)) => Some(derived.as_path()),
+            _ => None,
+        };
         super::super::run::run(
             config_path,
             std::sync::Arc::new(
                 rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
             ),
             None,
-            Some("gold"),
+            pipeline,
             state_path,
             None,
             false,
-            None,
+            models_dir,
             false,
             None,
             false,
@@ -1535,6 +1547,7 @@ auto_create_schemas = true
         let err = try_run(
             &root.join("rocky.toml"),
             &root.join("state.redb"),
+            Some("gold"),
             Some("mart"),
         )
         .await
@@ -1546,64 +1559,64 @@ auto_create_schemas = true
         );
     }
 
+    /// #1291, red-team finding S2: a target collision must not poison a
+    /// model-scoped run of an UNRELATED model.
+    ///
+    /// Reported compile failures are scoped to the models the invocation would
+    /// actually run; the exclusion set still covers everything. Without that
+    /// split, every `rocky run --dag` node — each of which is its own
+    /// `--model X` sub-run compiling the whole pipeline root — inherited the
+    /// colliding pair's E036 errors, returned failure despite materializing
+    /// correctly, and `DagExecutor` then skipped its healthy descendants.
+    ///
+    /// Non-vacuous: pre-fix this returns `Err("2 model(s) failed")` even
+    /// though `healthy` builds fine.
+    #[tokio::test]
+    async fn a_collision_does_not_fail_a_model_scoped_run_of_another_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let db = root.join("wh.duckdb");
+        write_config(root, &db, "");
+        write_model_targeting(&models, "a", "SELECT 1 AS id", "shared");
+        write_model_targeting(&models, "b", "SELECT 2 AS id", "shared");
+        write_model_targeting(&models, "healthy", "SELECT 3 AS id", "healthy");
+
+        try_run(
+            &root.join("rocky.toml"),
+            &root.join("state.redb"),
+            None,
+            Some("healthy"),
+        )
+        .await
+        .expect("an unrelated model's collision must not fail this run");
+
+        assert_eq!(count_rows(&db, "healthy").await, 1);
+
+        // The colliding pair is still excluded from execution, not merely
+        // unreported — the whole point of keeping the two sets separate.
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let existing = adapter
+            .execute_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'main' AND table_name = 'shared'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            existing.rows[0][0]
+                .as_i64()
+                .or_else(|| existing.rows[0][0].as_str().and_then(|s| s.parse().ok())),
+            Some(0),
+            "the colliding target must still never be written"
+        );
+    }
+
     /// The `[run]` block that enables the skip gate + rowcount fallback (a
     /// full_refresh leaf over a raw source has no tracked timestamp column, so
     /// rowcount is the available B3 signal).
     const SKIP_ENABLED: &str = "\n[run]\nskip_unchanged = true\nskip_rowcount_fallback = true\n";
-
-    /// Like [`write_model`] but pins an explicit `[target] table`, so two
-    /// differently-named models can be aimed at one physical table — the
-    /// #1291 shape. (`write_model` derives `table` from the model name, which
-    /// the duplicate-*name* check already keeps unique.)
-    fn write_model_targeting(dir: &Path, name: &str, sql: &str, table: &str) {
-        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql}\n")).unwrap();
-        std::fs::write(
-            dir.join(format!("{name}.toml")),
-            format!(
-                "[strategy]\ntype = \"full_refresh\"\n\n\
-                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"{table}\"\n"
-            ),
-        )
-        .unwrap();
-    }
-
-    /// Drive `run()` and hand back the `Result`, so a test can assert a
-    /// refusal. [`run_full_dag`] unwraps, which cannot express that.
-    async fn try_run(
-        config_path: &Path,
-        state_path: &Path,
-        model_name_filter: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let models_dir = config_path.parent().unwrap().join("models");
-        super::super::run::run(
-            config_path,
-            std::sync::Arc::new(
-                rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
-            ),
-            None,
-            None,
-            state_path,
-            None,
-            false,
-            model_name_filter.map(|_| models_dir.as_path()),
-            false,
-            None,
-            false,
-            None,
-            &PartitionRunOptions::default(),
-            model_name_filter,
-            None,
-            None,
-            None,
-            &DeferOptions::default(),
-            &SkipRunOptions::default(),
-            &rocky_core::run_vars::RunVars::new(),
-            None,
-            None,
-            false,
-        )
-        .await
-    }
 
     /// #1291: two models resolving to one physical table never both execute.
     ///
@@ -1628,9 +1641,14 @@ auto_create_schemas = true
         write_model_targeting(&models, "a", "SELECT 1 AS id", "shared");
         write_model_targeting(&models, "b", "SELECT 2 AS id", "shared");
 
-        let err = try_run(&root.join("rocky.toml"), &root.join("state.redb"), None)
-            .await
-            .expect_err("two models writing one table must not both build");
+        let err = try_run(
+            &root.join("rocky.toml"),
+            &root.join("state.redb"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("two models writing one table must not both build");
         assert!(
             format!("{err:#}").contains("2 model(s) failed"),
             "both colliding models are excluded, not just one: {err:#}"
@@ -1672,9 +1690,14 @@ auto_create_schemas = true
         write_model_targeting(&models, "b", "SELECT 2 AS id", "shared");
         write_model_targeting(&models, "healthy", "SELECT 3 AS id", "healthy");
 
-        try_run(&root.join("rocky.toml"), &root.join("state.redb"), None)
-            .await
-            .expect_err("the run still reports failure for the colliding pair");
+        try_run(
+            &root.join("rocky.toml"),
+            &root.join("state.redb"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the run still reports failure for the colliding pair");
 
         assert_eq!(
             count_rows(&db, "healthy").await,
