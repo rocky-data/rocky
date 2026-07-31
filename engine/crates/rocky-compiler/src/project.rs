@@ -32,12 +32,91 @@ pub struct Project {
     pub lineage_cache: HashMap<String, lineage::LineageResult>,
     /// Diagnostics from dependency resolution (e.g., D011 mismatch warnings).
     pub resolve_diagnostics: Vec<crate::diagnostic::Diagnostic>,
+    /// Groups of models that resolve to the SAME physical target (#1291).
+    ///
+    /// Deliberately not a [`ProjectError`]. A hard construction failure is
+    /// swallowed into silence by every tolerant caller — `ci-diff` logs at
+    /// `debug!` and falls back to filename-stem classification, and the LSP's
+    /// `Err` arm publishes no diagnostic at all — and it would make any
+    /// historical ref containing a collision unloadable, foreclosing the
+    /// base-∪-head target-occupancy fix #1236 wants. So construction records
+    /// the collision, `compile` renders it as an E036 error diagnostic, and
+    /// the *execution* boundary refuses, which is where two concurrent
+    /// writers to one table actually do damage.
+    pub target_collisions: Vec<TargetCollision>,
     /// Optional unified DAG spanning all pipeline types, seeds, and tests.
     ///
     /// This is populated by the CLI when full project context is available
     /// (config + models + seeds). `None` when only model-level compilation
     /// is performed.
     pub unified_dag: Option<UnifiedDag>,
+}
+
+/// Two or more models resolving to one physical `catalog.schema.table`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetCollision {
+    /// The shared target as the user spelled it, for the message.
+    pub target: String,
+    /// Colliding model names, sorted — so the message is deterministic.
+    pub models: Vec<String>,
+}
+
+/// Group models by the physical object their target names.
+///
+/// Identity is [`rocky_sql::defer::CollisionIdentity`], which ASCII-lowercases
+/// every component and deliberately takes no dialect rules: answering
+/// "different" for two spellings that are one object would let both models
+/// write the same table with no error at all, which is the failure this is
+/// here to prevent.
+///
+/// **Scope.** The key is `catalog.schema.table` only — not adapter routing
+/// identity, which #1291 also asks for. `from_models` receives `Vec<Model>`
+/// and no `RockyConfig`, so it cannot resolve an adapter name to a physical
+/// destination. That is sound *today* only because the per-model adapter
+/// override is coded but not wired: `rocky_core::cross_engine::effective_model_adapter`
+/// has no production call sites, and execution resolves exactly one warehouse
+/// adapter per *pipeline*. The day a model-level adapter is honored, this key
+/// becomes unsound and must grow the adapter's routing identity. The
+/// cross-*pipeline* half belongs next to `reject_models_claimed_twice` in
+/// `unified_dag`, which does have the config.
+///
+/// `Ephemeral` models are excluded: they carry a fully populated but phantom
+/// target and are never materialized, so two of them — or one beside a real
+/// model — are not two writers to one table.
+fn collide_on_target(models: &[Model]) -> Vec<TargetCollision> {
+    let mut by_identity: std::collections::BTreeMap<String, (String, Vec<String>)> =
+        std::collections::BTreeMap::new();
+
+    for m in models {
+        if matches!(
+            m.config.strategy,
+            rocky_core::models::StrategyConfig::Ephemeral
+        ) {
+            continue;
+        }
+        let t = &m.config.target;
+        let identity =
+            rocky_sql::defer::CollisionIdentity::of(&t.catalog, &t.schema, &t.table).to_string();
+        let spelled = if t.catalog.is_empty() {
+            format!("{}.{}", t.schema, t.table)
+        } else {
+            format!("{}.{}.{}", t.catalog, t.schema, t.table)
+        };
+        by_identity
+            .entry(identity)
+            .or_insert_with(|| (spelled, Vec::new()))
+            .1
+            .push(m.config.name.clone());
+    }
+
+    by_identity
+        .into_values()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(target, mut models)| {
+            models.sort();
+            TargetCollision { target, models }
+        })
+        .collect()
 }
 
 /// Errors during project loading.
@@ -164,6 +243,10 @@ impl Project {
             }
         }
 
+        // Duplicate *targets*, unlike duplicate names, are recorded rather than
+        // rejected — see the field doc on `Project::target_collisions`.
+        let target_collisions = collide_on_target(&models);
+
         let (dag_nodes, lineage_cache, resolve_diagnostics) =
             resolve::resolve_dependencies(&models)?;
         let execution_order = dag::topological_sort(&dag_nodes)?;
@@ -176,6 +259,7 @@ impl Project {
             layers,
             lineage_cache,
             resolve_diagnostics,
+            target_collisions,
             unified_dag: None,
         })
     }
@@ -449,6 +533,80 @@ mod tests {
             ProjectError::DuplicateModel { name } => assert_eq!(name, "orders"),
             other => panic!("expected DuplicateModel, got {other:?}"),
         }
+    }
+
+    /// Give a model an explicit target, so two differently-named models can be
+    /// pointed at one physical table (the #1291 shape). `make_model` defaults
+    /// `table` to the model name, which is already unique via the
+    /// duplicate-name check.
+    fn with_target(mut m: Model, catalog: &str, schema: &str, table: &str) -> Model {
+        m.config.target = TargetConfig {
+            catalog: catalog.to_string(),
+            schema: schema.to_string(),
+            table: table.to_string(),
+        };
+        m
+    }
+
+    /// #1291: two models resolving to one physical table are RECORDED, not
+    /// rejected — construction must still succeed so tolerant readers
+    /// (`ci-diff` across two refs, the LSP) keep loading the project.
+    #[test]
+    fn duplicate_target_is_recorded_not_rejected() {
+        let models = vec![
+            with_target(make_model("a", "SELECT 1 AS id"), "c", "s", "shared"),
+            with_target(make_model("b", "SELECT 2 AS id"), "c", "s", "shared"),
+        ];
+        let project =
+            Project::from_models(models).expect("a duplicate TARGET must not fail construction");
+        assert_eq!(project.target_collisions.len(), 1);
+        assert_eq!(project.target_collisions[0].models, vec!["a", "b"]);
+        assert_eq!(project.target_collisions[0].target, "c.s.shared");
+    }
+
+    /// Identity folds case, because answering "different" for two spellings
+    /// that are one warehouse object is the fail-open this exists to prevent.
+    #[test]
+    fn duplicate_target_identity_folds_case() {
+        let models = vec![
+            with_target(make_model("a", "SELECT 1 AS id"), "c", "s", "Shared"),
+            with_target(make_model("b", "SELECT 2 AS id"), "C", "S", "shared"),
+        ];
+        let project = Project::from_models(models).unwrap();
+        assert_eq!(
+            project.target_collisions.len(),
+            1,
+            "case-only differences name one object"
+        );
+    }
+
+    /// Ephemeral models carry a fully populated but phantom target and are
+    /// never materialized, so they are not a second writer.
+    #[test]
+    fn ephemeral_models_do_not_collide() {
+        let mut eph = with_target(make_model("a", "SELECT 1 AS id"), "c", "s", "shared");
+        eph.config.strategy = StrategyConfig::Ephemeral;
+        let models = vec![
+            eph,
+            with_target(make_model("b", "SELECT 2 AS id"), "c", "s", "shared"),
+        ];
+        let project = Project::from_models(models).unwrap();
+        assert!(
+            project.target_collisions.is_empty(),
+            "an ephemeral model materializes nothing, so it cannot be the second writer"
+        );
+    }
+
+    /// Distinct targets stay clean — guards against the check firing on every
+    /// project.
+    #[test]
+    fn distinct_targets_do_not_collide() {
+        let models = vec![
+            with_target(make_model("a", "SELECT 1 AS id"), "c", "s", "a"),
+            with_target(make_model("b", "SELECT 2 AS id"), "c", "s", "b"),
+        ];
+        let project = Project::from_models(models).unwrap();
+        assert!(project.target_collisions.is_empty());
     }
 
     #[test]

@@ -7171,6 +7171,13 @@ pub(crate) async fn execute_models(
         );
     }
 
+    // #1291 is enforced by the E036 error diagnostic rather than a refusal
+    // here. Error-severity diagnostics already exclude their model from
+    // execution and count it toward `tables_failed` (see the `has_errors`
+    // block below), which contains the blast radius better than aborting the
+    // whole invocation: the colliding models do not execute — so there is no
+    // concurrent write — while every other model in the project still builds.
+
     // Per-model surrogate-key specs — loaded ONCE here (execute-from-owned-value,
     // #1) so the SAME owned map feeds BOTH the TOCTOU fingerprint below AND
     // execution (via `ExecutionContext`), with no post-verification reload that

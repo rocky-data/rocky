@@ -1551,6 +1551,138 @@ auto_create_schemas = true
     /// rowcount is the available B3 signal).
     const SKIP_ENABLED: &str = "\n[run]\nskip_unchanged = true\nskip_rowcount_fallback = true\n";
 
+    /// Like [`write_model`] but pins an explicit `[target] table`, so two
+    /// differently-named models can be aimed at one physical table — the
+    /// #1291 shape. (`write_model` derives `table` from the model name, which
+    /// the duplicate-*name* check already keeps unique.)
+    fn write_model_targeting(dir: &Path, name: &str, sql: &str, table: &str) {
+        std::fs::write(dir.join(format!("{name}.sql")), format!("{sql}\n")).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"{table}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Drive `run()` and hand back the `Result`, so a test can assert a
+    /// refusal. [`run_full_dag`] unwraps, which cannot express that.
+    async fn try_run(
+        config_path: &Path,
+        state_path: &Path,
+        model_name_filter: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let models_dir = config_path.parent().unwrap().join("models");
+        super::super::run::run(
+            config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
+            ),
+            None,
+            None,
+            state_path,
+            None,
+            false,
+            model_name_filter.map(|_| models_dir.as_path()),
+            false,
+            None,
+            false,
+            None,
+            &PartitionRunOptions::default(),
+            model_name_filter,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// #1291: two models resolving to one physical table never both execute.
+    ///
+    /// `rocky-compiler` rejects duplicate model *names* but not duplicate
+    /// *targets*, so `a` and `b` here are independent DAG nodes with no edge
+    /// between them — same execution layer, and under `--parallel > 1` or the
+    /// uncapped `--dag` fan-out they write one table concurrently. Even
+    /// serially the survivor is whichever sorts last.
+    ///
+    /// The E036 error diagnostic excludes both from execution and fails the
+    /// run. Non-vacuous in two directions: the run must report failure, AND
+    /// `main.shared` must not exist afterwards — so an enforcement that fired
+    /// only after the first model materialized would still fail this.
+    #[tokio::test]
+    async fn two_models_targeting_one_table_never_both_execute() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let db = root.join("wh.duckdb");
+        write_config(root, &db, "");
+        write_model_targeting(&models, "a", "SELECT 1 AS id", "shared");
+        write_model_targeting(&models, "b", "SELECT 2 AS id", "shared");
+
+        let err = try_run(&root.join("rocky.toml"), &root.join("state.redb"), None)
+            .await
+            .expect_err("two models writing one table must not both build");
+        assert!(
+            format!("{err:#}").contains("2 model(s) failed"),
+            "both colliding models are excluded, not just one: {err:#}"
+        );
+
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let existing = adapter
+            .execute_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'main' AND table_name = 'shared'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            existing.rows[0][0]
+                .as_i64()
+                .or_else(|| existing.rows[0][0].as_str().and_then(|s| s.parse().ok())),
+            Some(0),
+            "enforcement must land before any DDL — the shared table may not exist"
+        );
+    }
+
+    /// The blast radius is contained: a collision fails ONLY the colliding
+    /// models, and every other model in the project still builds.
+    ///
+    /// This is the property that made an error diagnostic the right shape over
+    /// either a hard `ProjectError` at construction (which makes the whole
+    /// project unloadable, and is silently swallowed by `ci-diff` and the LSP)
+    /// or a whole-run refusal (which strands the healthy models too).
+    #[tokio::test]
+    async fn a_target_collision_does_not_stop_the_healthy_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let db = root.join("wh.duckdb");
+        write_config(root, &db, "");
+        write_model_targeting(&models, "a", "SELECT 1 AS id", "shared");
+        write_model_targeting(&models, "b", "SELECT 2 AS id", "shared");
+        write_model_targeting(&models, "healthy", "SELECT 3 AS id", "healthy");
+
+        try_run(&root.join("rocky.toml"), &root.join("state.redb"), None)
+            .await
+            .expect_err("the run still reports failure for the colliding pair");
+
+        assert_eq!(
+            count_rows(&db, "healthy").await,
+            1,
+            "a model with its own target must still materialize"
+        );
+    }
+
     /// Regression test for the full-DAG `--skip-unchanged` bug.
     ///
     /// Before the fix, `run() → run_transformation` opened a non-canonical

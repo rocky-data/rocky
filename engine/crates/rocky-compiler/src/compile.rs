@@ -356,6 +356,7 @@ pub fn compile_project(
     diagnostics.extend(freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
+    diagnostics.extend(target_collision_diagnostics(&project));
 
     let has_errors = diagnostics
         .iter()
@@ -561,6 +562,7 @@ pub fn compile_incremental(
     diagnostics.extend(freshness_diagnostics);
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
+    diagnostics.extend(target_collision_diagnostics(&project));
 
     let has_errors = diagnostics
         .iter()
@@ -594,6 +596,40 @@ pub fn compile_incremental(
         timings,
         model_timings,
     })
+}
+
+/// Render each same-physical-target group as one E036 error per participating
+/// model (#1291), so every colliding model lights up in an editor rather than
+/// just the first.
+///
+/// Error severity, not warning: two models writing one table is a
+/// configuration mistake whose survivor depends on scheduling. It is reported
+/// rather than raised as a `ProjectError` so tolerant readers — `ci-diff`
+/// comparing two arbitrary refs, the LSP — keep loading the project; the
+/// execution boundary is what refuses.
+fn target_collision_diagnostics(project: &crate::project::Project) -> Vec<Diagnostic> {
+    project
+        .target_collisions
+        .iter()
+        .flat_map(|c| {
+            let others = c.models.join(", ");
+            c.models.iter().map(move |name| {
+                Diagnostic::error(
+                    "E036",
+                    name,
+                    format!(
+                        "models [{others}] all target '{}' — two models writing one table \
+                         is a configuration error, and which one survives depends on \
+                         execution order",
+                        c.target
+                    ),
+                )
+                .with_suggestion(
+                    "give each model its own `[target] table`, or delete the duplicate model",
+                )
+            })
+        })
+        .collect()
 }
 
 fn validate_all_contracts(
