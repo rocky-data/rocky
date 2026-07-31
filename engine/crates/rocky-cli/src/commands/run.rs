@@ -1453,10 +1453,23 @@ pub async fn run(
         //
         // An explicit `--models` still wins: it is an operator override, and
         // the DAG sub-runner passes one for every model-scoped sub-run.
+        // `locate_models_dir`, NOT `resolve_models_dir`: the latter collapses
+        // `Absent(path)` to `None`, which would drop straight back through the
+        // `unwrap_or_else` below to the CWD-relative `models` — re-introducing
+        // exactly the mis-routing this fixes. A pipeline whose configured root
+        // is missing must fail naming ITS path, never silently execute against
+        // a same-named model from some other directory that happens to sit in
+        // the process working directory.
         let derived_models_dir: Option<std::path::PathBuf> = match (models_dir, pipeline_name_arg) {
             (None, Some(pipeline_name)) => match rocky_cfg.pipelines.get(pipeline_name) {
                 Some(rocky_core::config::PipelineConfig::Transformation(t)) => {
-                    crate::models_loader::resolve_models_dir(&t.models, config_path)?
+                    match crate::models_loader::locate_models_dir(&t.models, config_path)? {
+                        // Both arms carry the pipeline's own path. `Absent` is
+                        // handed on deliberately so the existence check below
+                        // rejects it by name.
+                        crate::models_loader::ModelsDir::Present(dir)
+                        | crate::models_loader::ModelsDir::Absent(dir) => Some(dir),
+                    }
                 }
                 // A non-transformation pipeline is rejected a few lines below
                 // with a better message than a missing-directory error.
