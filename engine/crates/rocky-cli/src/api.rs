@@ -1923,34 +1923,55 @@ mod tests {
         assert!(out.column_lineage.is_empty());
     }
 
-    /// A project whose models do not compile must not report "no lineage".
+    /// `--column-lineage` must not fail on the ordinary nested layout: staging
+    /// models one level down feeding marts at the root.
     ///
-    /// The compile failure used to be flattened into an empty edge list. Now
-    /// that a genuinely model-less project also yields an empty list and calls
-    /// that the complete answer, the two must not look identical: a
-    /// compile-broken project would otherwise be reported as one that simply
-    /// has no column lineage.
+    /// The model loader reads the root plus one level below; the lineage compile
+    /// reads only the root. So `fct` is compiled while the `stg` it selects from
+    /// is invisible, and the compiler reports `unknown dependency 'stg'`. That
+    /// is an artifact of the shallower read, not a defect in the project.
+    ///
+    /// A previous revision surfaced that error instead of swallowing it and so
+    /// turned this — the single most common project shape — into a hard
+    /// failure. Compiling the DAG's own model set is the real fix (#1262); until
+    /// then this asserts the tolerance stays.
     #[tokio::test]
-    async fn dag_column_lineage_surfaces_compile_failure() {
-        let (dir, config_path) = custom_root_dag_project();
-        // Replace a model's SQL with something that cannot parse.
+    async fn dag_column_lineage_tolerates_nested_model_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("transforms");
+        std::fs::create_dir_all(root.join("staging")).unwrap();
+
+        std::fs::write(root.join("staging").join("stg.sql"), "SELECT 1 AS id").unwrap();
         std::fs::write(
-            dir.path().join("transforms").join("fct.sql"),
-            "SELECT FROM WHERE ((",
+            root.join("staging").join("stg.toml"),
+            "name = \"stg\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("fct.sql"), "SELECT id FROM stg").unwrap();
+        std::fs::write(
+            root.join("fct.toml"),
+            "name = \"fct\"\ndepends_on = [\"stg\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"fct\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
         )
         .unwrap();
         let state_path = pinned_state_path(dir.path());
 
-        let err = dag_output(&config_path, &state_path, None, None, None, true, None)
-            .expect_err("a compile failure must not be reported as empty lineage");
-        assert!(
-            format!("{err:#}").contains("column lineage"),
-            "error must say lineage could not be compiled, got: {err:#}"
-        );
-
-        // Unchanged for the structural DAG, which never compiles.
-        dag_output(&config_path, &state_path, None, None, None, false, None)
-            .expect("the structural DAG must not depend on model SQL compiling");
+        let out = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("the ordinary nested layout must not fail `--column-lineage`");
+        // Both models are in the DAG even though the compile cannot see one.
+        let labels: Vec<&str> = out.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert!(labels.contains(&"stg"), "nested model missing: {labels:?}");
+        assert!(labels.contains(&"fct"), "root model missing: {labels:?}");
     }
 
     /// A configured-but-empty root is not a second root.
@@ -1982,14 +2003,24 @@ mod tests {
     /// Two transformation pipelines whose model roots differ.
     fn split_root_dag_project() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        for (sub, model) in [("silver", "stg"), ("gold", "fct")] {
+        // `fct` in the gold root reads `stg` from the silver root, so the
+        // fixture exercises a cross-PIPELINE edge, not just two islands.
+        for (sub, model, sql, depends) in [
+            ("silver", "stg", "SELECT 1 AS id", ""),
+            (
+                "gold",
+                "fct",
+                "SELECT id FROM stg",
+                "depends_on = [\"stg\"]\n",
+            ),
+        ] {
             let root = dir.path().join(sub);
             std::fs::create_dir_all(&root).unwrap();
-            std::fs::write(root.join(format!("{model}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(root.join(format!("{model}.sql")), sql).unwrap();
             std::fs::write(
                 root.join(format!("{model}.toml")),
                 format!(
-                    "name = \"{model}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                    "name = \"{model}\"\n{depends}\n[strategy]\ntype = \"full_refresh\"\n\n\
                      [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{model}\"\n"
                 ),
             )
@@ -2010,38 +2041,35 @@ mod tests {
         (dir, config_path)
     }
 
-    /// Column lineage is refused — not silently truncated — when the project's
-    /// transformation pipelines declare different model roots.
+    /// Split model roots yield no column lineage, and must not fail the command.
     ///
-    /// The compiler reads a single root (#1262), and `column_lineage` is a bare
-    /// list with no "unavailable" encoding, so compiling whichever root happened
-    /// to sort first would emit a partial answer indistinguishable from a
-    /// complete one.
+    /// The compiler reads one root (#1262) and there is no root covering both,
+    /// so there are no edges to report. An earlier revision raised a hard error
+    /// here; that broke projects which previously succeeded, and recommended a
+    /// `--models <dir>` workaround that is itself refused for exactly these
+    /// projects. Correctness belongs in #1262 — compiling the DAG's own model
+    /// set instead of re-reading one directory — not in a refusal here.
     #[tokio::test]
-    async fn dag_column_lineage_refuses_disagreeing_model_roots() {
+    async fn dag_column_lineage_is_empty_across_split_model_roots() {
         let (dir, config_path) = split_root_dag_project();
         let state_path = pinned_state_path(dir.path());
 
-        let err = dag_output(&config_path, &state_path, None, None, None, true, None)
-            .expect_err("disagreeing model roots must refuse column lineage");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("#1262"),
-            "error must name the tracking issue: {msg}"
-        );
-        assert!(
-            msg.contains("--models"),
-            "error must name the scoping workaround: {msg}"
-        );
+        let out = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("split model roots must not fail `--column-lineage`");
+        assert!(out.column_lineage.is_empty());
 
-        // The refusal is scoped to the opt-in flag: the structural DAG — what
-        // plain `rocky dag` and `GET /api/v1/dag` ask for — still builds, with a
-        // node from each root.
-        let structural = dag_output(&config_path, &state_path, None, None, None, false, None)
-            .expect("the structural DAG must still build across split roots");
-        let labels: Vec<&str> = structural.nodes.iter().map(|n| n.label.as_str()).collect();
+        // The DAG itself — the thing #1261 is actually about — is complete, with
+        // a node from each root and the cross-pipeline edge between them.
+        let labels: Vec<&str> = out.nodes.iter().map(|n| n.label.as_str()).collect();
         assert!(labels.contains(&"stg"), "silver root missing: {labels:?}");
         assert!(labels.contains(&"fct"), "gold root missing: {labels:?}");
+        assert!(
+            out.edges
+                .iter()
+                .any(|e| e.from.contains("stg") && e.to.contains("fct")),
+            "the cross-pipeline edge must survive: {:?}",
+            out.edges
+        );
     }
 
     /// GET `url`, retrying while the endpoint returns a *documented-retryable*

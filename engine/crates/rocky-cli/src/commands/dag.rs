@@ -36,21 +36,22 @@ const DAG_SCHEMA_VERSION: &str = "1";
 /// Where `--column-lineage` should compile from, once the models have been
 /// loaded and attributed.
 ///
-/// Three states, because "no root" and "several roots" both lack a single
-/// directory to compile but mean opposite things: the first has no lineage to
-/// report, the second has lineage this command cannot report correctly.
+/// Three states rather than an `Option`, because "no root" and "several roots"
+/// both lack a single directory to compile but mean opposite things: the first
+/// has no lineage to report, the second has lineage this command cannot see.
+/// Both currently produce an empty list; keeping them apart is what lets #1262
+/// give the second one a real answer without disturbing the first.
 enum LineageSource {
     /// Compile this directory. Note this still inherits #1262: the compiler
     /// reads the directory itself, while the model loader also reads one level
-    /// below it, so a project keeping its models in `<root>/staging/` gets a
-    /// correct DAG and empty lineage. Pre-existing and unchanged here — closing
-    /// it means teaching `rocky-compiler` to walk, not widening this refusal
-    /// into the common nested layout.
+    /// below it, so a project keeping its models in `<root>/staging/` has models
+    /// in the DAG that the compile cannot see.
     Root(std::path::PathBuf),
     /// No transformation models exist, so no lineage does either. Empty is the
     /// complete answer.
     NoModels,
-    /// Models came from several roots and the compiler reads one.
+    /// Models came from several roots and the compiler reads one, so no single
+    /// root covers them. Yields empty — see the match arm for why not an error.
     SeveralRoots,
 }
 
@@ -165,15 +166,12 @@ pub fn dag_output(
             let loaded = super::run_dag_exec::load_transformation_models(config_path, &cfg)?;
             let models = union_by_model_name(&loaded.by_pipeline);
             // The compiler reads exactly one root (#1262), so lineage is only
-            // answerable when the models came from one. Picking an arbitrary
-            // root would emit lineage that silently omits every other root's
-            // models; `column_lineage` has no "unavailable" encoding, so a
-            // partial list is indistinguishable from a complete one.
+            // fully answerable when the models came from one.
             //
-            // Zero roots is NOT that situation and must not be folded into it:
-            // a project with no transformation models has no lineage, and empty
-            // is the complete answer rather than a withheld one. Conflating the
-            // two made `rocky dag --column-lineage` fail on every
+            // Zero roots is a different situation and must not be folded in with
+            // several: a project with no transformation models has no lineage,
+            // and empty is the complete answer rather than an unavailable one.
+            // Conflating the two made `rocky dag --column-lineage` fail on every
             // replication-only project with a message about "different model
             // directories" it does not have.
             let source = match loaded.contributing_roots.as_slice() {
@@ -364,22 +362,27 @@ fn build_dag_output(
             state_path,
             schema_cache_cfg,
         )?,
-        // Nothing to compile, and nothing withheld.
+        // Nothing to compile.
         (true, LineageSource::NoModels) => vec![],
-        // Lineage was asked for and cannot be answered correctly: the compiler
-        // reads one model root (#1262) and this project's models came from
-        // several. Refusing beats returning the edges of whichever root won a
-        // coin flip — `column_lineage` is a bare list, so a caller cannot tell a
-        // partial answer from a complete one. Narrow by construction: only
-        // `--column-lineage` reaches here, so plain `rocky dag` and
-        // `GET /api/v1/dag` are untouched, and the SDK always passes `--models`.
-        (true, LineageSource::SeveralRoots) => anyhow::bail!(
-            "cannot compute column lineage: this project's transformation \
-             models come from more than one directory, and lineage is compiled \
-             from a single root (#1262). Re-run scoped to one root with \
-             `rocky dag --column-lineage --models <dir>`, or drop \
-             `--column-lineage` for the structural DAG.",
-        ),
+        // Models came from several roots and the compiler reads one, so there is
+        // no root that covers them. This returns empty rather than refusing, and
+        // that is a deliberate scope decision, not an oversight.
+        //
+        // An earlier revision of this change raised a hard error here. It was
+        // wrong twice over: `--models <dir>`, the workaround it recommended, is
+        // itself refused for these projects (every transformation pipeline would
+        // then claim the same models), and the projects it failed had previously
+        // *succeeded* — with a 0-node DAG, because the old flat load of a
+        // nonexistent `models/` came back empty. Turning that into an error
+        // bought nothing and broke a working call.
+        //
+        // The honest fix is not a refusal but removing the second, shallower
+        // read: compile the model set the DAG was built from instead of
+        // re-reading one directory off disk. `Project::from_models` already
+        // exists for that. Tracked in #1262, which also covers the related gap
+        // where a single root's `<root>/staging/` models are in the DAG but not
+        // in the compile.
+        (true, LineageSource::SeveralRoots) => vec![],
     };
 
     Ok(DagOutput {
@@ -450,26 +453,25 @@ fn build_column_lineage_from_models(
         ..Default::default()
     };
 
+    // A compile failure yields no lineage rather than failing the command.
+    //
+    // This tolerance is pre-existing and is deliberately left alone. Propagating
+    // these errors looks obviously right and is not: the compiler reads only the
+    // top level of `models_dir` while the model loader also reads one level
+    // below it, so the ordinary `models/staging/stg.sql` → `models/fct.sql`
+    // layout compiles to `unknown dependency 'stg' referenced by 'fct'` — a
+    // artifact of the shallower read, not a defect in the project. Surfacing it
+    // turned `rocky dag --column-lineage` into a hard failure for the most
+    // common project shape there is.
+    //
+    // So this genuinely cannot be tightened until the compile stops re-reading
+    // disk and takes the DAG's own model set (#1262). Until then an empty list
+    // means "no lineage, or it could not be computed", and the two are not
+    // distinguishable here — which is the status quo this change preserves
+    // rather than the one it introduces.
     let result = match rocky_compiler::compile::compile(&compile_config) {
         Ok(r) => r,
-        // The compiler found no models directly in this root. That is the #1262
-        // depth gap — the loader also reads one level below, so the DAG can hold
-        // nodes this compile cannot see — and it is the pre-existing tolerated
-        // case, left as-is rather than widened into a refusal that would break
-        // the ordinary `<root>/staging/` layout.
-        Err(rocky_compiler::compile::CompileError::Project(
-            rocky_compiler::project::ProjectError::NoModels { .. },
-        )) => return Ok(vec![]),
-        // Anything else is a real failure: a model that will not parse, a broken
-        // contract, a semantic-graph error. This used to be flattened into an
-        // empty edge list, which since the caller now treats "empty" as a
-        // COMPLETE answer for a project with no models, would report a
-        // compile-broken project as one that simply has no lineage. The caller
-        // asked for lineage; failing to produce it is not the same as there
-        // being none.
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context("failed to compile column lineage"));
-        }
+        Err(_) => return Ok(vec![]),
     };
 
     let graph = &result.semantic_graph;
