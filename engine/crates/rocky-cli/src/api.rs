@@ -812,7 +812,14 @@ async fn full_dag(
     let Some(config_path) = state.config_path.clone() else {
         return Err(ApiError::engine_not_ready());
     };
-    let models_dir = state.models_dir.clone();
+    // Only a models dir the operator actually named is a whole-project
+    // override, the API analogue of `rocky dag --models`. `serve` without
+    // `--models` falls back to `models` internally, and passing that default on
+    // as an override replaced every transformation pipeline's own directory —
+    // reproducing #1261 over HTTP on projects `rocky dag` handled correctly.
+    let models_dir = state
+        .models_dir_is_explicit
+        .then(|| state.models_dir.clone());
     let contracts_dir = state.contracts_dir.clone();
     let state_path = state_path_for(&state);
 
@@ -820,11 +827,7 @@ async fn full_dag(
         dag_output(
             &config_path,
             &state_path,
-            &models_dir,
-            // The server's configured models dir is an explicit location, the
-            // API analogue of `rocky dag --models`, so it keeps overriding every
-            // transformation pipeline exactly as it did before.
-            true,
+            models_dir.as_deref(),
             None, // seeds_dir → falls back to <config_dir>/seeds, matching `rocky dag`
             contracts_dir.as_deref(),
             false, // include_column_lineage
@@ -1766,14 +1769,102 @@ mod tests {
             &dag_output(
                 &config_path,
                 &state_path,
-                &models_dir,
-                true,
+                // `pinned_server` builds state the way `serve` without
+                // `--models` does, so the reference is `rocky dag` without
+                // `--models` too. Passing an explicit dir on this side only
+                // would compare two different commands.
+                None,
                 None,
                 None,
                 false,
                 None,
             )
             .unwrap(),
+        );
+        assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+    }
+
+    /// A project whose transformation pipeline declares a **custom** model root,
+    /// so the conventional `models/` directory does not exist at all.
+    fn custom_root_dag_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let transforms = dir.path().join("transforms");
+        std::fs::create_dir_all(&transforms).unwrap();
+
+        std::fs::write(transforms.join("stg.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            transforms.join("stg.toml"),
+            "name = \"stg\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"stg\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+
+        (dir, config_path)
+    }
+
+    /// `GET /api/v1/dag` must match `rocky dag` on a project whose models live
+    /// somewhere other than `models/`.
+    ///
+    /// This is the case the original `parity_dag` structurally could not see. It
+    /// passed `models = "models/**"` — the conventional root — so the server's
+    /// "override every pipeline with my models dir" behavior picked the same
+    /// directory the pipeline had declared anyway, and passing `true` on both
+    /// sides of the comparison agreed on the same wrong thing. Here the override
+    /// would point at a `models/` that does not exist, so it can only produce an
+    /// empty graph (#1261).
+    ///
+    /// The non-emptiness assertion is load-bearing and comes first: parity
+    /// between two empty DAGs is exactly the failure being tested for.
+    #[tokio::test]
+    async fn parity_dag_custom_models_root() {
+        let (dir, config_path) = custom_root_dag_project();
+        // What `serve` without `--models` holds: the conventional default,
+        // which for this project is a directory that was never created.
+        let default_models_dir = dir.path().join("models");
+        let state_path = pinned_state_path(dir.path());
+        let state = pinned_server(
+            default_models_dir,
+            Some(config_path.clone()),
+            &state_path,
+        );
+        let base = spawn_router(state).await;
+        let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let api = resp.text().await.unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&api).unwrap();
+        let stg = parsed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["label"] == "stg")
+            .expect("the custom-root model must reach the served DAG");
+
+        // Finding 1: the node existing is not enough. Enrichment reads a flat
+        // name-keyed model list, and deriving that from the fallback `models/`
+        // while building the graph per pipeline produced a correctly-shaped node
+        // whose target and strategy were silently `null`.
+        assert_eq!(
+            stg["target"]["table"], "stg",
+            "node must carry its target, not just its name"
+        );
+        assert_eq!(stg["target"]["schema"], "s");
+        assert!(
+            !stg["strategy"].is_null(),
+            "node must carry its materialization strategy"
+        );
+
+        let reference = reference_bytes(
+            &dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
         );
         assert_eq!(api, reference, "GET /dag must match `rocky dag`");
     }
@@ -2964,6 +3055,7 @@ adapter = "db"
         };
         let state = ServerState::with_auth_and_webhook(
             simple_project_models(),
+            false, // models_dir_is_explicit — irrelevant to webhook ingress
             None,
             Some(config_path),
             None,

@@ -42,8 +42,7 @@ const DAG_SCHEMA_VERSION: &str = "1";
 pub fn run_dag(
     config_path: &Path,
     state_path: &Path,
-    models_dir: &Path,
-    models_dir_is_explicit: bool,
+    models_dir: Option<&Path>,
     seeds_dir: Option<&Path>,
     contracts_dir: Option<&Path>,
     include_column_lineage: bool,
@@ -54,7 +53,6 @@ pub fn run_dag(
         config_path,
         state_path,
         models_dir,
-        models_dir_is_explicit,
         seeds_dir,
         contracts_dir,
         include_column_lineage,
@@ -82,11 +80,18 @@ pub fn run_dag(
 pub fn dag_output(
     config_path: &Path,
     state_path: &Path,
-    models_dir: &Path,
-    // Whether the caller passed `--models` explicitly. When false, `models_dir`
-    // is only the fallback root for loading + the lineage compile, and graph
-    // attribution comes from each pipeline's own configured directory.
-    models_dir_is_explicit: bool,
+    // `Some(dir)` is an explicit whole-project override (`rocky dag --models`):
+    // every transformation pipeline is read from that one directory. `None`
+    // means "no override" — each pipeline resolves its own configured
+    // directory, and the enrichment list and lineage root are derived from
+    // those rather than from any fallback path.
+    //
+    // The two used to be a `(&Path, bool)` pair, which let a caller pass a
+    // directory and *contradict* it with the flag. `rocky serve` did exactly
+    // that: its `--models` carried `default_value = "models"`, so the untouched
+    // default arrived flagged as explicit and overrode every pipeline (#1261).
+    // An `Option` makes that pair unrepresentable.
+    models_dir: Option<&Path>,
     seeds_dir: Option<&Path>,
     contracts_dir: Option<&Path>,
     include_column_lineage: bool,
@@ -101,37 +106,55 @@ pub fn dag_output(
         .clone()
         .with_ttl_override(cache_ttl_override);
 
-    // Load models from the models directory (including subdirectories). This
-    // flat list still drives the enriched output and the column-lineage
-    // compile, both of which are keyed by model name and pipeline-agnostic.
-    let models = load_all_models(models_dir)?;
-
-    // Attribution for the graph itself is per transformation pipeline. Handing
-    // every transformation pipeline the same list gave each model a node under
-    // each of them, all sharing one id, and the DAG collapsed into
+    // Attribution for the graph is per transformation pipeline. Handing every
+    // transformation pipeline the same list gave each model a node under each
+    // of them, all sharing one id, and the DAG collapsed into
     // `circular dependency detected involving: []` (#1261).
     //
-    // `--models` is an explicit whole-project override, so under it every
-    // transformation pipeline genuinely does declare the same directory — and a
-    // project with two of them is then refused by name, which is the honest
-    // answer to "these two pipelines both build this model". Without the flag,
-    // each pipeline resolves its own directory, which is also what `rocky run
-    // --dag` has always done: before this, `rocky dag --models models` and
-    // `rocky run --dag` disagreed, the former giving a node to a model no
-    // pipeline declared.
-    let models_by_pipeline = if models_dir_is_explicit {
-        let mut m = rocky_core::unified_dag::ModelsByPipeline::new();
-        for (name, pipeline) in &cfg.pipelines {
-            if matches!(
-                pipeline,
-                rocky_core::config::PipelineConfig::Transformation(_)
-            ) {
-                m.insert(name.clone(), models.clone());
+    // Three things come out of this: the per-pipeline attribution the graph is
+    // built from, the flat name-keyed list the nodes are *enriched* from, and
+    // the single directory the optional column-lineage compile reads. All three
+    // must describe the same set of models — deriving the graph per pipeline
+    // while enriching from a fallback `models/` left a project with a custom
+    // root (`models = "transforms/**"`) holding correctly-shaped nodes whose
+    // target, strategy and freshness were all silently `None`.
+    let (models, models_by_pipeline, lineage_root) = match models_dir {
+        // An explicit whole-project override: every transformation pipeline
+        // genuinely does declare this one directory — and a project with two of
+        // them is then refused by name, which is the honest answer to "these two
+        // pipelines both build this model".
+        Some(dir) => {
+            let models = load_all_models(dir)?;
+            let mut by_pipeline = rocky_core::unified_dag::ModelsByPipeline::new();
+            for (name, pipeline) in &cfg.pipelines {
+                if matches!(
+                    pipeline,
+                    rocky_core::config::PipelineConfig::Transformation(_)
+                ) {
+                    by_pipeline.insert(name.clone(), models.clone());
+                }
             }
+            (models, by_pipeline, Some(dir.to_path_buf()))
         }
-        m
-    } else {
-        super::run_dag_exec::load_transformation_models(config_path, &cfg)?
+        // No override: each pipeline resolves its own directory, which is also
+        // what `rocky run --dag` has always done. Before #1261, `rocky dag
+        // --models models` and `rocky run --dag` disagreed, the former giving a
+        // node to a model no pipeline declared.
+        None => {
+            let by_pipeline = super::run_dag_exec::load_transformation_models(config_path, &cfg)?;
+            let models = union_by_model_name(&by_pipeline);
+            let roots = super::run_dag_exec::transformation_model_dirs(config_path, &cfg)?;
+            // The compiler reads exactly one root (#1262), so lineage is only
+            // answerable when the pipelines agree on one. Picking an arbitrary
+            // root would emit lineage that silently omits every other pipeline's
+            // models; `column_lineage` has no "unavailable" encoding, so a
+            // partial list is indistinguishable from a complete one.
+            let lineage_root = match roots.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            };
+            (models, by_pipeline, lineage_root)
+        }
     };
 
     // Load seeds if the directory exists. A discovery failure is propagated, not
@@ -174,7 +197,7 @@ pub fn dag_output(
         &models,
         &seeds,
         include_column_lineage,
-        models_dir,
+        lineage_root.as_deref(),
         contracts_dir,
         &cfg,
         state_path,
@@ -190,7 +213,9 @@ fn build_dag_output(
     models: &[Model],
     seeds: &[SeedFile],
     include_column_lineage: bool,
-    models_dir: &Path,
+    // The single model root the lineage compile reads, or `None` when the
+    // project's transformation pipelines don't agree on one (see #1262).
+    lineage_root: Option<&Path>,
     contracts_dir: Option<&Path>,
     cfg: &rocky_core::config::RockyConfig,
     state_path: &Path,
@@ -304,16 +329,29 @@ fn build_dag_output(
     };
 
     // Column lineage (optional).
-    let column_lineage = if include_column_lineage {
-        build_column_lineage_from_models(
-            models_dir,
+    let column_lineage = match (include_column_lineage, lineage_root) {
+        (false, _) => vec![],
+        (true, Some(root)) => build_column_lineage_from_models(
+            root,
             contracts_dir,
             cfg,
             state_path,
             schema_cache_cfg,
-        )?
-    } else {
-        vec![]
+        )?,
+        // Lineage was asked for and cannot be answered correctly: the compiler
+        // reads one model root (#1262) and this project's transformation
+        // pipelines declare several. Refusing beats returning the edges of
+        // whichever root won a coin flip — `column_lineage` is a bare list, so a
+        // caller cannot tell a partial answer from a complete one. Narrow by
+        // construction: only `--column-lineage` reaches here, so plain
+        // `rocky dag` and `GET /api/v1/dag` are untouched.
+        (true, None) => anyhow::bail!(
+            "cannot compute column lineage: this project's transformation \
+             pipelines declare different model directories, and lineage is \
+             compiled from a single root (#1262). Re-run scoped to one root \
+             with `rocky dag --column-lineage --models <dir>`, or drop \
+             `--column-lineage` for the structural DAG.",
+        ),
     };
 
     Ok(DagOutput {
@@ -407,6 +445,29 @@ fn build_column_lineage_from_models(
         .collect();
 
     Ok(edges)
+}
+
+/// Flatten a per-pipeline attribution back into the single name-keyed list the
+/// node enrichment and the `model_map` lookup want, sorted by name to match
+/// [`load_all_models`].
+///
+/// Deduping by name is safe rather than lossy: `load_transformation_models`
+/// has already refused two *distinct files* sharing a model name, so a name
+/// reaching this twice is one file claimed by two pipelines — same `Model`
+/// either way. That claim is itself refused downstream by `build_unified_dag`,
+/// which can name both pipelines; this only has to not panic before it does.
+fn union_by_model_name(by_pipeline: &rocky_core::unified_dag::ModelsByPipeline) -> Vec<Model> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all: Vec<Model> = Vec::new();
+    for models in by_pipeline.values() {
+        for model in models {
+            if seen.insert(model.config.name.clone()) {
+                all.push(model.clone());
+            }
+        }
+    }
+    all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
+    all
 }
 
 /// Load models from a directory and its immediate subdirectories

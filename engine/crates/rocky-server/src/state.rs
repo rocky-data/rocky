@@ -18,6 +18,18 @@ use crate::schema_cache_throttle::SchemaCacheThrottle;
 /// Shared server state holding the latest compilation result.
 pub struct ServerState {
     pub models_dir: PathBuf,
+    /// Whether [`Self::models_dir`] was named explicitly (`serve --models`) or
+    /// is just the conventional default.
+    ///
+    /// Only the DAG projection cares. `GET /api/v1/dag` treats an explicit
+    /// directory as a whole-project override, reading every transformation
+    /// pipeline from it — the HTTP analogue of `rocky dag --models`. Applying
+    /// that override to a *defaulted* path is what reproduced #1261 over HTTP:
+    /// pipelines that declare their own model directories had them silently
+    /// replaced by `models`, collapsing the graph. Defaults to `false`, so a
+    /// state built by any constructor that does not name it keeps each
+    /// pipeline's own directory — the non-overriding, more conservative read.
+    pub models_dir_is_explicit: bool,
     pub contracts_dir: Option<PathBuf>,
     pub config_path: Option<PathBuf>,
     pub compile_result: RwLock<Option<CompileResult>>,
@@ -93,6 +105,10 @@ impl ServerState {
     ) -> Arc<Self> {
         Self::with_auth_and_webhook(
             models_dir,
+            // Not an explicit `--models`: this constructor's callers (the LSP,
+            // the scheduler, tests) point at a directory they derived, not one
+            // a user named, so pipelines keep their own model directories.
+            false,
             contracts_dir,
             config_path,
             auth_token,
@@ -110,6 +126,7 @@ impl ServerState {
     #[allow(clippy::too_many_arguments)]
     pub fn with_auth_and_webhook(
         models_dir: PathBuf,
+        models_dir_is_explicit: bool,
         contracts_dir: Option<PathBuf>,
         config_path: Option<PathBuf>,
         auth_token: Option<String>,
@@ -119,6 +136,7 @@ impl ServerState {
     ) -> Arc<Self> {
         let state = Arc::new(Self {
             models_dir,
+            models_dir_is_explicit,
             contracts_dir,
             config_path,
             state_path,

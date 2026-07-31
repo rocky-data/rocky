@@ -31,6 +31,10 @@ const WEBHOOK_RATE_LIMIT_RPS: f64 = 10.0;
 #[allow(clippy::too_many_arguments)]
 pub async fn run_serve(
     models_dir: &Path,
+    // Whether `models_dir` came from an explicit `--models`, as opposed to the
+    // conventional default. Only `GET /api/v1/dag` distinguishes them; see
+    // `rocky_server::state::ServerState::models_dir_is_explicit`.
+    models_dir_is_explicit: bool,
     contracts_dir: Option<&Path>,
     config_path: Option<&Path>,
     host: String,
@@ -75,6 +79,7 @@ pub async fn run_serve(
 
     let state = rocky_server::state::ServerState::with_auth_and_webhook(
         models_dir.to_path_buf(),
+        models_dir_is_explicit,
         contracts_dir.map(std::path::Path::to_path_buf),
         config_path.map(std::path::Path::to_path_buf),
         token,

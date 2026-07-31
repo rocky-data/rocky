@@ -457,6 +457,39 @@ pub(super) fn load_transformation_models(
     Ok(by_pipeline)
 }
 
+/// The distinct model roots this project's transformation pipelines resolve to,
+/// in `cfg.pipelines` order.
+///
+/// Deliberately mirrors [`load_transformation_models`]'s resolution — same
+/// `resolve_models_dir`, same "a pipeline whose directory is absent contributes
+/// nothing" rule — so the roots reported here are exactly the roots the models
+/// were loaded from. Distinctness is by canonical path: two pipelines spelling
+/// one directory differently (`transforms` and `./transforms`) are one root,
+/// not two.
+pub(super) fn transformation_model_dirs(
+    config_path: &Path,
+    cfg: &rocky_core::config::RockyConfig,
+) -> Result<Vec<PathBuf>> {
+    use rocky_core::config::PipelineConfig;
+
+    let mut canonical_seen: Vec<PathBuf> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for pipeline in cfg.pipelines.values() {
+        let PipelineConfig::Transformation(t) = pipeline else {
+            continue;
+        };
+        let Some(dir) = crate::models_loader::resolve_models_dir(&t.models, config_path)? else {
+            continue;
+        };
+        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !canonical_seen.contains(&canonical) {
+            canonical_seen.push(canonical);
+            dirs.push(dir);
+        }
+    }
+    Ok(dirs)
+}
+
 fn status_str(s: &NodeStatus) -> &'static str {
     match s {
         NodeStatus::Pending => "pending",
