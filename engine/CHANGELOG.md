@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two models declaring the same physical `catalog.schema.table` are now reported and no longer both execute.** `rocky-compiler` rejects duplicate model *names* but said nothing about duplicate *targets*, so two models writing one table were independent DAG nodes with no edge between them — they landed in the same execution layer and, under `--parallel > 1` or the uncapped `--dag` node fan-out, wrote that table concurrently. Even serially the surviving rows were decided by execution order, which is alphabetical. Project construction now records each colliding group and `rocky compile` reports it as an **E036** error naming every participating model, which excludes exactly those models from execution and fails the run — so the concurrent write cannot happen, while every model with its own target still builds. Identity is the same case-folding `catalog.schema.table` key shadow-target collision detection already uses, because answering "different" for two spellings that name one warehouse object is the fail-open this exists to prevent. `ephemeral` models are excluded: they carry a populated but phantom target and materialize nothing, so they are never the second writer. Deliberately *not* a hard project-load failure — that is swallowed into silence by every tolerant reader (`rocky ci-diff` falls back to filename-stem classification, the LSP publishes no diagnostic at all), would make any historical ref containing a collision unloadable, and would foreclose deciding added/removed from target occupancy across both refs. **Scope:** the key is `catalog.schema.table`, not adapter routing identity — sound today only because the per-model adapter override is coded but not wired, and noted in-code as the thing to revisit when it is. The cross-*pipeline* case (two pipelines claiming one target) is not covered here. (#1291)
+
 ## [1.68.0] - 2026-07-31
 
 ### Added

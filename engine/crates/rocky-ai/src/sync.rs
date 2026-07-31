@@ -378,6 +378,7 @@ mod tests {
                 layers: vec![],
                 lineage_cache: std::collections::HashMap::new(),
                 resolve_diagnostics: vec![],
+                target_collisions: vec![],
                 unified_dag: None,
             },
             semantic_graph: SemanticGraph::new(IndexMap::new(), vec![]),
