@@ -1831,11 +1831,7 @@ mod tests {
         // which for this project is a directory that was never created.
         let default_models_dir = dir.path().join("models");
         let state_path = pinned_state_path(dir.path());
-        let state = pinned_server(
-            default_models_dir,
-            Some(config_path.clone()),
-            &state_path,
-        );
+        let state = pinned_server(default_models_dir, Some(config_path.clone()), &state_path);
         let base = spawn_router(state).await;
         let resp = reqwest::get(format!("{base}/api/v1/dag")).await.unwrap();
         assert_eq!(resp.status(), 200);
@@ -1867,6 +1863,77 @@ mod tests {
             &dag_output(&config_path, &state_path, None, None, None, false, None).unwrap(),
         );
         assert_eq!(api, reference, "GET /dag must match `rocky dag`");
+
+        // A single custom root is still a root the compiler can read, so
+        // `--column-lineage` must keep working here. Guards the refusal added
+        // below from widening into "any project that isn't `models/`".
+        dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("one model root must still compile column lineage");
+    }
+
+    /// Two transformation pipelines whose model roots differ.
+    fn split_root_dag_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        for (sub, model) in [("silver", "stg"), ("gold", "fct")] {
+            let root = dir.path().join(sub);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(format!("{model}.sql")), "SELECT 1 AS id").unwrap();
+            std::fs::write(
+                root.join(format!("{model}.toml")),
+                format!(
+                    "name = \"{model}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{model}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.silver]\ntype = \"transformation\"\nmodels = \"silver/**\"\n\n\
+             [pipeline.silver.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.gold]\ntype = \"transformation\"\nmodels = \"gold/**\"\n\n\
+             [pipeline.gold.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+
+        (dir, config_path)
+    }
+
+    /// Column lineage is refused — not silently truncated — when the project's
+    /// transformation pipelines declare different model roots.
+    ///
+    /// The compiler reads a single root (#1262), and `column_lineage` is a bare
+    /// list with no "unavailable" encoding, so compiling whichever root happened
+    /// to sort first would emit a partial answer indistinguishable from a
+    /// complete one.
+    #[tokio::test]
+    async fn dag_column_lineage_refuses_disagreeing_model_roots() {
+        let (dir, config_path) = split_root_dag_project();
+        let state_path = pinned_state_path(dir.path());
+
+        let err = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect_err("disagreeing model roots must refuse column lineage");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("#1262"),
+            "error must name the tracking issue: {msg}"
+        );
+        assert!(
+            msg.contains("--models"),
+            "error must name the scoping workaround: {msg}"
+        );
+
+        // The refusal is scoped to the opt-in flag: the structural DAG — what
+        // plain `rocky dag` and `GET /api/v1/dag` ask for — still builds, with a
+        // node from each root.
+        let structural = dag_output(&config_path, &state_path, None, None, None, false, None)
+            .expect("the structural DAG must still build across split roots");
+        let labels: Vec<&str> = structural.nodes.iter().map(|n| n.label.as_str()).collect();
+        assert!(labels.contains(&"stg"), "silver root missing: {labels:?}");
+        assert!(labels.contains(&"fct"), "gold root missing: {labels:?}");
     }
 
     /// GET `url`, retrying while the endpoint returns a *documented-retryable*
