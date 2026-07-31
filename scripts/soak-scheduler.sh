@@ -7,7 +7,16 @@
 #
 #   * zero missed fires        — every due occurrence produced a run
 #   * zero duplicate fires     — exactly one submission per occurrence
-#   * flat RSS                 — no memory growth
+#   * bounded RSS              — NOT "no memory growth". The claim is narrower:
+#                                the final quarter's least-squares slope is
+#                                under 200 KB/h, and the RSS series actually
+#                                covered that quarter. A bounded structure fills
+#                                once and then holds, so growth still present at
+#                                hour 18-24 is a leak however small the absolute
+#                                delta is. Growth slower than the threshold, and
+#                                growth that starts late enough to be diluted by
+#                                the rest of the quarter, fall outside this
+#                                gate's sensitivity rather than being ruled out
 #   * flat fd count            — the sharp one; a leaked redb handle or lock
 #                                sentinel does NOT move RSS
 #   * no zombie children       — one subprocess per fire, all reaped

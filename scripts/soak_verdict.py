@@ -91,6 +91,92 @@ def window(samples: list[dict], key: str, lo: float, hi: float) -> list[float]:
 
 
 # --------------------------------------------------------------------------
+# G3b calibration — the final-quarter RSS slope
+# --------------------------------------------------------------------------
+#
+# G3's percentage-AND-absolute conjunction is a catastrophic-growth trip. It
+# cannot see the leak class this harness exists to hunt: two real 24h runs grew
+# 45.0% / +11.77 MB and 40.45% / +11.16 MB and both cleared it, including the
+# run whose curve was the JobRegistry leak's existence proof. Neither reached
+# the 20 MB floor, so the conjunction never fired.
+#
+# The discriminating measurement is the FINAL QUARTER. A bounded structure
+# fills once — the job cache reaches its cap around hour 8.5 at one job per
+# minute — and must then be flat. Growth still present at hour 18-24 is not a
+# fill, it is a leak. Nothing here looks for an inflection at the fill point:
+# on both reference runs the curve is linear end to end (pre-fill +506.9 KB/h,
+# post-fill +481.9 KB/h), so there is no knee to detect.
+#
+# THRESHOLD, from the data. Least-squares slope over the last 25% of samples:
+#
+#   leaking runs, measured                 +526.9 and +456.0 KB/h
+#   noise band, both runs detrended and    <=130.1 KB/h over 4h windows
+#     surveyed over late-run windows        <=58.2 KB/h over 6h windows
+#
+# 200 KB/h sits ~1.5x above the worst noise slope a 4h window produced and
+# ~2.3x below the smaller of the two real leaks. In absolute terms it is
+# ~4.7 MB/day still accumulating past hour 18, which no bounded structure
+# should show.
+#
+# THE THRESHOLD AND THE WINDOW FLOOR ARE ONE CONSTANT, NOT TWO. The noise band
+# widens sharply as the window shrinks — the same survey gives ~188 KB/h at 3h,
+# ~1900-2900 KB/h at 1h. Lowering the floor without raising the threshold turns
+# G3b into a false-positive generator. The floor cannot be a clean 6h either:
+# a nominal 24h run samples 23.99h, so its final quarter is 21592s (5.998h).
+#
+# EVIDENCE, not just arithmetic. A slope is only as good as its coverage, so
+# this is default-deny: on a run long enough to judge, an RSS series that does
+# not cover the window is INVALID, never a quiet PASS. Three readings four hours
+# apart fit a perfect flat line while leaving two hours unobserved.
+#
+# The slope must be fitted to the harness's own sampling grid, whole. Anything
+# less is a subset, and NO statistic over timestamps can detect a subset chosen
+# in a way that correlates with the values it contains: retain one jitter phase
+# through the first half of the window and another through the second, and a
+# real +220 KB/h leak fits as -448 KB/h with every gap still inside the cap.
+# Regular spacing does not rescue it — that construction is perfectly regular.
+# So the rule is not a density heuristic; it removes the freedom to fit a subset
+# at all, from either direction:
+#
+#   * every recorded row in the window must be alive and carry an RSS reading,
+#     which forecloses selection by nulling the reading; and
+#   * no gap may exceed 1.5x the declared sampling interval, which forecloses
+#     selection by omitting the whole row — at a declared 30s cadence a 60s gap
+#     means a scheduled sample is missing, whatever the reason.
+#
+# Both reference runs are complete — 720 of 720 readings in the final quarter,
+# worst gap 31s — so neither rule costs anything that has ever been observed,
+# and an INVALID here means re-run, not "leaking".
+#
+# The gap is ALSO capped absolutely at 90s, never inferred from the declared
+# interval alone, because `SAMPLE_SECONDS` is a harness knob a coarse run could
+# turn down to widen its own gaps. 90s is 3x the harness's default sampling, the
+# same tolerance G0 already applies to sample spacing. It bounds the cadence the
+# slope is fitted at, which matters: re-running the survey above on both traces
+# decimated to each cadence, sweeping every phase offset (a fixed every-Nth
+# alignment can alias periodic jitter, and phase 0 alone understates the band by
+# up to 60%), gives
+#
+#   cadence     30s    60s    90s   120s   240s   300s   600s
+#   4h window  130.1  137.7  146.9  164.3  197.8  201.5  342.8   KB/h
+#   6h window   58.2   60.1   63.9   71.7   86.0   88.0  153.1   KB/h
+#
+# so the cap and the window floor together are what keep 200 KB/h above the
+# noise. The binding case is the coarsest cadence at the shortest window — 90s
+# over 4h, 146.9 KB/h, a 1.36x margin — against 3.4x in the nominal case of a
+# 24h run sampled at 30s. Widening either constant eats that margin directly:
+# at 300s over 4h the noise band has already crossed the threshold.
+#
+# Calibration provenance: n=2, same host, same workload, and the noise band was
+# measured by detrending runs that were themselves leaking. Re-derive it if the
+# workload changes.
+FINAL_QUARTER_SLOPE_MAX_KB_H = 200.0
+FINAL_QUARTER_MIN_SPAN_S = 4 * 3600
+FINAL_QUARTER_MAX_GAP_S = 90
+FINAL_QUARTER_GAP_INTERVALS = 1.5
+
+
+# --------------------------------------------------------------------------
 # gates
 # --------------------------------------------------------------------------
 
@@ -328,7 +414,7 @@ def gate_fires(run: dict) -> list[dict]:
 
 
 def gate_resources(run: dict) -> list[dict]:
-    """G3 RSS (loose), G4 fd (sharp), G5 zombies."""
+    """G3a RSS growth (loose), G3b final-quarter RSS slope, G4 fd (sharp), G5 zombies."""
     findings = []
     samples = [s for s in run["samples"] if s.get("alive") == 1]
     if len(samples) < 10:
@@ -353,8 +439,9 @@ def gate_resources(run: dict) -> list[dict]:
             }
         ]
 
-    # G3 — RSS. Conjunction of percentage AND absolute so drift on a small
-    # baseline cannot trip it.
+    # G3a — RSS, catastrophic growth. Conjunction of percentage AND absolute so
+    # drift on a small baseline cannot trip it. Deliberately blind to a slow
+    # leak; G3b below is the gate for that and fires independently of this one.
     base_rss = median(window(samples, "rss_kb", warm, base_hi))
     tail_rss = median(window(samples, "rss_kb", tail_lo, t_end))
     rss_slope = ols_slope_per_hour(
@@ -373,9 +460,123 @@ def gate_resources(run: dict) -> list[dict]:
         if growth_pct > 10 and delta_mb > 20:
             findings.append(
                 {
-                    "gate": "G3",
+                    "gate": "G3a",
                     "status": "FAIL",
                     "detail": f"RSS grew {growth_pct:.1f}% (+{delta_mb:.1f} MB)",
+                }
+            )
+
+    # G3b — final-quarter RSS slope. See the calibration block above. This is
+    # the gate for a slow leak and is evaluated INDEPENDENTLY of G3a: the two
+    # real leaks that motivated it clear G3a's conjunction comfortably.
+    #
+    # ONE-SIDED, deliberately. Falling RSS is a pass: freed entries return to
+    # allocator free lists rather than to the OS, so a bounded structure holding
+    # at high-water — or dipping, as one reference run does twice inside its own
+    # final quarter — is exactly what "flat" looks like in practice.
+    # The window is cut from the SAMPLE timeline, never from where RSS readings
+    # happen to exist: a run whose rss_kb went null at hour 18 must not be able
+    # to shrink its own final quarter down to nothing and out of the gate.
+    quarter_lo = max(t_end - (t_end - t_start) * 0.25, warm)
+    quarter_h = (t_end - quarter_lo) / 3600.0
+    # Counted over EVERY recorded row in the window, not the alive-filtered
+    # view: a row that is not alive, or carries no reading, is a hole either way.
+    rows = [s for s in run["samples"] if quarter_lo <= s["t"] <= t_end]
+    quarter = [
+        (s["t"], float(s["rss_kb"]))
+        for s in rows
+        if s.get("alive") == 1 and s.get("rss_kb") is not None
+    ]
+    dropped = len(rows) - len(quarter)
+    gap_cap = min(
+        FINAL_QUARTER_MAX_GAP_S,
+        FINAL_QUARTER_GAP_INTERVALS * run["meta"].get("sample_interval", 30),
+    )
+    # Worst blind stretch inside the window, counting both edges: a series that
+    # starts late or stops early leaves the same hole as one that skips.
+    if quarter:
+        blind = max(
+            [quarter[0][0] - quarter_lo, t_end - quarter[-1][0]]
+            + [b[0] - a[0] for a, b in zip(quarter, quarter[1:])]
+        )
+    else:
+        blind = t_end - quarter_lo
+    fq = run["metrics"].setdefault("rss", {})
+    fq["final_quarter"] = {
+        "from_epoch": quarter_lo,
+        "window_h": round(quarter_h, 2),
+        "samples": len(quarter),
+        "dropped_readings": dropped,
+        "worst_blind_gap_s": round(blind),
+        "slope_kb_per_h": None,
+        "threshold_kb_per_h": FINAL_QUARTER_SLOPE_MAX_KB_H,
+        "min_window_h": FINAL_QUARTER_MIN_SPAN_S / 3600.0,
+        "max_gap_s": gap_cap,
+    }
+
+    if t_end - quarter_lo < FINAL_QUARTER_MIN_SPAN_S:
+        # A genuinely short run — harness smoke-testing, not a soak. Say so out
+        # loud so a green verdict is never read as "memory is flat" when it only
+        # means "no gate fired".
+        findings.append(
+            {
+                "gate": "G3b",
+                "status": "INFO",
+                "detail": f"final-quarter slope NOT EVALUATED: this run's last 25% is "
+                f"{quarter_h:.2f}h, short of the {FINAL_QUARTER_MIN_SPAN_S / 3600.0:.0f}h floor "
+                "the threshold is calibrated for. A PASS below means no gate fired — it is NOT "
+                "evidence that RSS is flat.",
+            }
+        )
+    elif dropped or blind > gap_cap:
+        # Long enough to judge, so the evidence is owed. Default-deny: a fitted
+        # line through a series that does not cover the window is not a
+        # measurement of that window.
+        why = []
+        if dropped:
+            why.append(f"{dropped} of {len(rows)} recorded sample(s) are not live or carry no "
+                       "RSS reading")
+        if blind > gap_cap:
+            why.append(
+                f"the worst unobserved stretch is {blind:.0f}s against a {gap_cap:.0f}s cap"
+            )
+        findings.append(
+            {
+                "gate": "G3b",
+                "status": "INVALID",
+                "detail": f"the final quarter is {quarter_h:.2f}h — long enough to judge — but the "
+                f"RSS series does not cover it: {'; '.join(why)}. A slope fitted through this "
+                "cannot see a leak hiding in the stretch it never looked at, is fitted at a "
+                "cadence the threshold is not calibrated for, and — where readings are missing "
+                "rather than merely coarse — is fitted to a subset that was not chosen "
+                "independently of the values it contains.",
+            }
+        )
+    else:
+        # Coverage holds at <=90s across a >=4h window, so OLS has >=3 distinct x.
+        quarter_slope = ols_slope_per_hour(quarter)
+        fq["final_quarter"]["slope_kb_per_h"] = round(quarter_slope, 1)
+        if quarter_slope > FINAL_QUARTER_SLOPE_MAX_KB_H:
+            findings.append(
+                {
+                    "gate": "G3b",
+                    "status": "FAIL",
+                    "detail": f"RSS gained ground across the final quarter: least-squares slope "
+                    f"{quarter_slope:+.0f} KB/h over {quarter_h:.2f}h ({len(quarter)} readings), "
+                    f"above the {FINAL_QUARTER_SLOPE_MAX_KB_H:.0f} KB/h ceiling. A bounded "
+                    "structure fills once and then holds, so this window is neither flat nor a "
+                    "fill that finished before it. Read the series before promoting — a steady "
+                    "climb and a single large late step both land here.",
+                }
+            )
+        else:
+            findings.append(
+                {
+                    "gate": "G3b",
+                    "status": "INFO",
+                    "detail": f"final-quarter RSS slope {quarter_slope:+.0f} KB/h over "
+                    f"{quarter_h:.2f}h ({len(quarter)} readings) — within the "
+                    f"{FINAL_QUARTER_SLOPE_MAX_KB_H:.0f} KB/h band.",
                 }
             )
 
@@ -614,7 +815,21 @@ def self_test() -> int:
         if got != want:
             failures.append(f"{name}: expected {want}, got {got}")
 
-    def synth(minutes: int, *, drop: set[int] = frozenset(), dup: set[int] = frozenset()) -> dict:
+    def synth(
+        minutes: int,
+        *,
+        drop: set[int] = frozenset(),
+        dup: set[int] = frozenset(),
+        rss=None,
+        interval: int = 30,
+        omit=None,
+    ) -> dict:
+        """`rss` maps seconds-since-start to an RSS in KB, or to None for a
+        sample where the reading is missing; the default is dead flat.
+        `interval` is the sampling cadence the whole run was recorded at, and
+        `omit` drops whole sample rows — a different hole from a null reading."""
+        rss = rss or (lambda _elapsed: 50_000)
+        omit = omit or (lambda _elapsed: False)
         harvest, n = [], 0
         for m in range(minutes):
             if m in drop:
@@ -632,9 +847,9 @@ def self_test() -> int:
                 )
         samples = [
             {
-                "t": base + i * 30,
+                "t": base + s,
                 "alive": 1,
-                "rss_kb": 50_000,
+                "rss_kb": None if rss(s) is None else round(rss(s)),
                 "fd_total": 42,
                 "fd_redb": 2,
                 "fd_lock": 1,
@@ -643,12 +858,13 @@ def self_test() -> int:
                 "fd_other": 35,
                 "zombies": 0,
             }
-            for i in range(minutes * 2)
+            for s in range(0, minutes * 60, interval)
+            if not omit(s)
         ]
         end = base + minutes * 60
         return {
             "dir": "synthetic",
-            "meta": {"t0": base, "planned_end": end, "sample_interval": 30},
+            "meta": {"t0": base, "planned_end": end, "sample_interval": interval},
             "samples": samples,
             "harvest": harvest,
             "fires": dedup_fires(harvest),
@@ -705,6 +921,123 @@ def self_test() -> int:
     # does not contain.
     check("run shorter than warmup is INVALID", analyse(synth(5))["verdict"], "INVALID")
 
+    # G3b — the final-quarter slope. Sized like the two real 24h runs the old
+    # conjunction could not see: ~490 KB/h, ~11 MB total, which never reaches
+    # the 20 MB absolute floor.
+    day = 24 * 60
+
+    def gate_status(result: dict, gate: str) -> str:
+        hits = [f["status"] for f in result["findings"] if f["gate"] == gate]
+        return hits[0] if hits else "SILENT"
+
+    check("a flat 24h run passes", analyse(synth(day))["verdict"], "PASS")
+
+    slow_leak = analyse(synth(day, rss=lambda s: 50_000 + 490.0 * s / 3600.0))
+    check("a ~490 KB/h leak fails", slow_leak["verdict"], "FAIL")
+    check("...and it is G3b that catches it", gate_status(slow_leak, "G3b"), "FAIL")
+    # The regression this pins: the leak must be invisible to G3a, otherwise the
+    # fixture is not reproducing the class of leak that reported PASS.
+    check("...while G3a stays silent on it", gate_status(slow_leak, "G3a"), "SILENT")
+
+    # A correctly bounded structure fills once — the job cache caps around hour
+    # 8.5 at one job per minute — and then holds. That ramp is entirely outside
+    # the final quarter, so it must not fail. This is the false positive that
+    # would sink the gate, and the reason no inflection detection is needed.
+    fill_s = 8.53 * 3600
+    filled = analyse(synth(day, rss=lambda s: 50_000 + 490.0 * min(s, fill_s) / 3600.0))
+    check("a one-time cache fill then flat passes", filled["verdict"], "PASS")
+    check("...with G3b evaluated, not skipped", gate_status(filled, "G3b"), "INFO")
+
+    # Freed entries return to allocator free lists, not to the OS, so falling
+    # RSS is a pass — the gate is one-sided by design.
+    check(
+        "declining RSS passes",
+        analyse(synth(day, rss=lambda s: 60_000 - 490.0 * s / 3600.0))["verdict"],
+        "PASS",
+    )
+
+    # Below the calibrated window floor the slope is noise-dominated, so it is
+    # not evaluated — and the report must say so rather than let PASS be read
+    # as "RSS is flat".
+    short = analyse(synth(180))
+    check("a 3h run still passes", short["verdict"], "PASS")
+    check("...and declares G3b unevaluated", gate_status(short, "G3b"), "INFO")
+    check(
+        "...saying so explicitly",
+        "stated"
+        if any("NOT EVALUATED" in f["detail"] for f in short["findings"] if f["gate"] == "G3b")
+        else "silent",
+        "stated",
+    )
+
+    # On a run LONG ENOUGH to judge, the RSS evidence is owed. Each of these
+    # reported PASS before the coverage requirements existed: the window is cut
+    # from the sample timeline, so a series that stops early cannot shrink the
+    # quarter out of the gate, and a series too sparse to see between its own
+    # points cannot certify the gaps it never looked at.
+    hour = 3600
+    check(
+        "a 24h run whose RSS readings stop at hour 18 is INVALID",
+        analyse(synth(day, rss=lambda s: 50_000 if s < 18 * hour else None))["verdict"],
+        "INVALID",
+    )
+    check(
+        "a 24h run with no RSS readings at all is INVALID",
+        analyse(synth(day, rss=lambda _s: None))["verdict"],
+        "INVALID",
+    )
+    check(
+        "three readings spanning 4h do not certify the quarter",
+        analyse(
+            synth(day, rss=lambda s: 50_000 if s in (18 * hour, 20 * hour, 22 * hour) else None)
+        )["verdict"],
+        "INVALID",
+    )
+    check(
+        "sampling too sparse to cover the quarter is INVALID",
+        analyse(synth(day, rss=lambda s: 50_000 if s % 1800 == 0 else None))["verdict"],
+        "INVALID",
+    )
+
+    # The cadence boundary, both sides. A run sampled every 90s sits exactly on
+    # the cap and must still evaluate and still catch the leak; 120s is past it,
+    # and the survey in the calibration block puts the noise band there within
+    # 1.2x of the threshold at the window floor, so it is INVALID not judged.
+    coarse = analyse(synth(day, interval=90))
+    check("a 90s sampling cadence still evaluates", gate_status(coarse, "G3b"), "INFO")
+    check("...and passes when flat", coarse["verdict"], "PASS")
+    coarse_leak = analyse(synth(day, interval=90, rss=lambda s: 50_000 + 490.0 * s / 3600.0))
+    check("a leak at a 90s cadence is still caught", gate_status(coarse_leak, "G3b"), "FAIL")
+    check(
+        "a 120s cadence is past the calibrated range",
+        analyse(synth(day, interval=120))["verdict"],
+        "INVALID",
+    )
+
+    # Selection bias, the hole no timestamp statistic can see: which samples the
+    # slope is fitted to must not depend on what those samples say. Both routes
+    # into a subset are closed, and the pair below also pins the boundary — the
+    # last sample outside the window versus the first one inside it.
+    last_out = int((day * 60 - 30) * 0.75) // 30 * 30
+    check(
+        "a single missing RSS reading inside the final quarter is INVALID",
+        analyse(synth(day, rss=lambda s: None if s == last_out + 30 else 50_000))["verdict"],
+        "INVALID",
+    )
+    check(
+        "...while the same hole one sample earlier is outside the window",
+        analyse(synth(day, rss=lambda s: None if s == last_out else 50_000))["verdict"],
+        "PASS",
+    )
+    # Omitting the row entirely leaves no null to count, so the gap rule is what
+    # catches it: at a declared 30s cadence a 90s spacing means samples are
+    # missing, and that is exactly the spacing the phase-switch attack needs.
+    check(
+        "whole sample rows omitted from the final quarter is INVALID",
+        analyse(synth(day, omit=lambda s: s > last_out and s % 90 != 0))["verdict"],
+        "INVALID",
+    )
+
     # One late fire in a long run is noise and must not throw away 24h of data;
     # a systematic drift toward the 60s misattribution cliff must.
     one_late = synth(180)
@@ -746,8 +1079,14 @@ def main() -> int:
               f"state_busy={t['state_busy']} drained={t['drained']}")
     if "rss" in metrics:
         r = metrics["rss"]
-        print(f"  rss {r['baseline_kb']:.0f} -> {r['final_kb']:.0f} KB "
-              f"({r['growth_pct']:+.1f}%, slope {r['slope_kb_per_h']} KB/h)")
+        if "baseline_kb" in r:
+            print(f"  rss {r['baseline_kb']:.0f} -> {r['final_kb']:.0f} KB "
+                  f"({r['growth_pct']:+.1f}%, slope {r['slope_kb_per_h']} KB/h)")
+        q = r.get("final_quarter")
+        if q:
+            got = "NOT MEASURED" if q["slope_kb_per_h"] is None else f"{q['slope_kb_per_h']:+.1f} KB/h"
+            print(f"      final quarter ({q['window_h']:.2f}h, n={q['samples']}): {got} "
+                  f"(fail above {q['threshold_kb_per_h']:.0f} KB/h)")
     if "fd" in metrics:
         f = metrics["fd"]
         print(f"  fd  {f['baseline']:.0f} -> {f['final']:.0f} "
