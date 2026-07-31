@@ -135,11 +135,18 @@ pub fn dag_output(
     //
     // Three things come out of this: the per-pipeline attribution the graph is
     // built from, the flat name-keyed list the nodes are *enriched* from, and
-    // the single directory the optional column-lineage compile reads. All three
-    // must describe the same set of models — deriving the graph per pipeline
-    // while enriching from a fallback `models/` left a project with a custom
-    // root (`models = "transforms/**"`) holding correctly-shaped nodes whose
-    // target, strategy and freshness were all silently `None`.
+    // where the optional column-lineage compile reads.
+    //
+    // The first two describe exactly the same set of models, and must: deriving
+    // the graph per pipeline while enriching from a fallback `models/` left a
+    // project with a custom root (`models = "transforms/**"`) holding
+    // correctly-shaped nodes whose target, strategy and freshness were all
+    // silently `None`.
+    //
+    // The third does NOT, and cannot yet. The compiler reads a single directory
+    // and only its top level, so it covers that set only when the models came
+    // from one root and sit directly in it; otherwise lineage comes back empty
+    // or partial. That gap is #1262 — see `LineageSource`.
     let (models, models_by_pipeline, lineage_source) = match models_dir {
         // An explicit whole-project override: every transformation pipeline
         // genuinely does declare this one directory — and a project with two of
