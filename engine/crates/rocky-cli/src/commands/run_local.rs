@@ -1290,6 +1290,59 @@ auto_create_schemas = true
         .unwrap();
     }
 
+    /// #1291, red-team finding S2: a target collision must not poison a
+    /// model-scoped run of an UNRELATED model.
+    ///
+    /// Reported compile failures are scoped to the models the invocation would
+    /// actually run; the exclusion set still covers everything. Without that
+    /// split, every `rocky run --dag` node — each of which is its own
+    /// `--model X` sub-run compiling the whole pipeline root — inherited the
+    /// colliding pair's E036 errors, returned failure despite materializing
+    /// correctly, and `DagExecutor` then skipped its healthy descendants.
+    ///
+    /// Non-vacuous: pre-fix this returns `Err("2 model(s) failed")` even
+    /// though `healthy` builds fine.
+    #[tokio::test]
+    async fn a_collision_does_not_fail_a_model_scoped_run_of_another_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let db = root.join("wh.duckdb");
+        write_config(root, &db, "");
+        write_model_targeting(&models, "a", "SELECT 1 AS id", "shared");
+        write_model_targeting(&models, "b", "SELECT 2 AS id", "shared");
+        write_model_targeting(&models, "healthy", "SELECT 3 AS id", "healthy");
+
+        try_run(
+            &root.join("rocky.toml"),
+            &root.join("state.redb"),
+            Some("healthy"),
+        )
+        .await
+        .expect("an unrelated model's collision must not fail this run");
+
+        assert_eq!(count_rows(&db, "healthy").await, 1);
+
+        // The colliding pair is still excluded from execution, not merely
+        // unreported — the whole point of keeping the two sets separate.
+        let adapter = DuckDbWarehouseAdapter::open(&db).unwrap();
+        let existing = adapter
+            .execute_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'main' AND table_name = 'shared'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            existing.rows[0][0]
+                .as_i64()
+                .or_else(|| existing.rows[0][0].as_str().and_then(|s| s.parse().ok())),
+            Some(0),
+            "the colliding target must still never be written"
+        );
+    }
+
     /// The `[run]` block that enables the skip gate + rowcount fallback (a
     /// full_refresh leaf over a raw source has no tracked timestamp column, so
     /// rowcount is the available B3 signal).
