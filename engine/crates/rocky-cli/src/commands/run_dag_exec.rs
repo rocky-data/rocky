@@ -164,6 +164,18 @@ fn models_dir_for_model_scope(
 /// `rocky run` invocation — it must never invent its own `.rocky_state` file.
 pub async fn run_with_dag(
     config_path: &Path,
+    // The caller's ONE fingerprinted config snapshot (#1120). Taken as a
+    // parameter rather than loaded here so a governed `rocky apply` of a
+    // `--dag` plan executes the *same instance* its apply gate read and
+    // fingerprinted: this function performs NO config load of its own, and a
+    // `rocky.toml` swap between the gate and DAG execution can no longer make
+    // the DAG run a different config than the one that was approved (#1289).
+    //
+    // Non-optional on purpose. An `Option` would leave a fallback load in
+    // place, so a future caller could silently reopen the window; requiring
+    // the snapshot enforces "no config read" at compile time, the same shape
+    // `run_seed` / `run_load` adopted for #1120.
+    loaded: std::sync::Arc<rocky_core::config::LoadedConfig>,
     state_path: &Path,
     json: bool,
     // The caller's time-interval partition options. Every sub-run must receive
@@ -197,10 +209,12 @@ pub async fn run_with_dag(
     // (`Arc::clone` per node in the dispatcher), so a `rocky.toml` swap
     // mid-DAG cannot make later nodes execute a different config than the
     // one the DAG was built from.
-    let loaded = std::sync::Arc::new(
-        rocky_core::config::load_rocky_config_fingerprinted(config_path)
-            .with_context(|| format!("failed to load config from {}", config_path.display()))?,
-    );
+    //
+    // It now arrives from the caller (#1289) rather than being loaded here.
+    // Loading it here made this the ONE apply path that re-read `rocky.toml`
+    // after its gate had already read and fingerprinted it, so a swap in that
+    // window executed a config the gate never approved while still reporting
+    // success against the reviewed plan id.
     let cfg = &loaded.config;
 
     // Load models from the model set each transformation pipeline actually
@@ -1092,6 +1106,19 @@ mod tests {
 
     use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
+    /// The one config snapshot every [`run_with_dag`] caller must supply
+    /// (#1289). Production callers get theirs from the apply gate; a test that
+    /// is not exercising the gate loads it the same way `rocky run --dag`
+    /// does. Tests that need to prove the snapshot is *honored* build it
+    /// themselves and then mutate `rocky.toml` — see
+    /// `a_stored_dag_plan_executes_the_gates_snapshot_not_a_reload`.
+    fn dag_snapshot(config_path: &Path) -> std::sync::Arc<rocky_core::config::LoadedConfig> {
+        std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(config_path)
+                .expect("test fixture config must load"),
+        )
+    }
+
     fn cell_i64(v: &serde_json::Value) -> i64 {
         v.as_i64()
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
@@ -1262,6 +1289,7 @@ mod tests {
         let state_path = root.join(".rocky-state.redb");
         run_with_dag(
             &config_path,
+            dag_snapshot(&config_path),
             &state_path,
             false,
             &PartitionRunOptions::default(),
@@ -1360,6 +1388,7 @@ mod tests {
         // Establish the production seed table: two rows.
         run_with_dag(
             &config_path,
+            dag_snapshot(&config_path),
             &state_path,
             false,
             &PartitionRunOptions::default(),
@@ -1383,6 +1412,7 @@ mod tests {
         };
         let err = run_with_dag(
             &config_path,
+            dag_snapshot(&config_path),
             &state_path,
             false,
             &PartitionRunOptions::default(),
@@ -1467,6 +1497,7 @@ mod tests {
         let state_path = root.join(".rocky-state.redb");
         run_with_dag(
             &config_path,
+            dag_snapshot(&config_path),
             &state_path,
             false,
             &PartitionRunOptions::default(),
@@ -1487,6 +1518,7 @@ mod tests {
         };
         run_with_dag(
             &config_path,
+            dag_snapshot(&config_path),
             &state_path,
             false,
             &PartitionRunOptions::default(),
@@ -1577,6 +1609,7 @@ mod tests {
         };
         run_with_dag(
             &root.join("rocky.toml"),
+            dag_snapshot(&root.join("rocky.toml")),
             &root.join(".rocky-state.redb"),
             false,
             &partition_opts,
@@ -1759,6 +1792,7 @@ mod tests {
 
         run_with_dag(
             &root.join("rocky.toml"),
+            dag_snapshot(&root.join("rocky.toml")),
             &root.join(".rocky-state.redb"),
             false,
             &PartitionRunOptions::default(),
@@ -1841,6 +1875,7 @@ mod tests {
 
         run_with_dag(
             &root.join("rocky.toml"),
+            dag_snapshot(&root.join("rocky.toml")),
             &root.join(".rocky-state.redb"),
             false,
             &PartitionRunOptions::default(),

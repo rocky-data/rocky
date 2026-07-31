@@ -3369,8 +3369,18 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 )
                 .await
             } else if dag {
+                // `rocky run --dag` has no apply gate above it, so it loads the
+                // one snapshot itself and hands it down. `run_with_dag` takes it
+                // as a required parameter so that no caller can re-read the file
+                // between a gate and execution (#1289).
+                let loaded = std::sync::Arc::new(
+                    rocky_core::config::load_rocky_config_fingerprinted(&cli.config).with_context(
+                        || format!("failed to load config from {}", cli.config.display()),
+                    )?,
+                );
                 let run_future = rocky_cli::commands::run_with_dag(
                     &cli.config,
+                    loaded,
                     &state_path,
                     json,
                     &partition_opts,

@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.68.0] - 2026-07-31
+### Fixed
+
+- **`rocky apply` of a `--dag` run plan now executes the config its apply gate approved, instead of re-reading `rocky.toml`.** `execute_run_plan` documents on its own `loaded` parameter that it performs no config load of its own — the single fingerprinted snapshot (#1120) is threaded from gate through execution so a `rocky.toml` swap in that window cannot make execution diverge from what was reviewed. The `--dag` branch broke that invariant: it passed only `config_path` onward, and `run_with_dag` loaded and fingerprinted the file again. A write to `rocky.toml` between the gate and DAG execution therefore ran a different adapter, different targets and different governance than the gate approved, while still reporting success against the reviewed plan id — and the plan-identity checks (`config_policy_identity`) had already run against the gate's snapshot, not the reloaded one. The non-DAG apply path threaded the snapshot correctly, so this was the only apply that re-read. `run_with_dag` now takes the snapshot as a **required** parameter rather than an `Option`, so the fallback load is gone entirely and a future caller cannot silently reopen the window — the same shape `run_seed` / `run_load` adopted for #1120. `rocky run --dag`, which has no gate above it, loads the one snapshot in `main.rs` and hands it down. Narrow in practice (it needs a write inside the gate→execute window) but it was a documented invariant the path silently did not hold. (#1289)
 
 ### Added
 

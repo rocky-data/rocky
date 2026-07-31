@@ -656,6 +656,12 @@ async fn execute_run_plan(
         // contract.
         return crate::commands::run_with_dag(
             config_path,
+            // The gate's own snapshot — NOT a re-read (#1289). `execute_run_plan`
+            // documents on its `loaded` parameter that it performs no config load
+            // of its own; this branch used to violate that by handing `run_with_dag`
+            // only a path, which then loaded the file again after the gate had
+            // fingerprinted it.
+            std::sync::Arc::clone(&loaded),
             state_path,
             output_json,
             &partition_opts,
@@ -4056,6 +4062,110 @@ mod tests {
             "the plan's requested partition must be the one that was rebuilt"
         );
         assert_eq!(rows.rows[0][0].as_str(), Some("2020-01-01"));
+    }
+
+    /// #1289: a `--dag` apply executes the snapshot its GATE read, not a fresh
+    /// `rocky.toml`.
+    ///
+    /// `execute_run_plan` documents on its own `loaded` parameter that it
+    /// performs no config load of its own, but the `--dag` branch passed only
+    /// `config_path` onward and `run_with_dag` then re-read the file — so this
+    /// was the one apply path that reopened the gate→execution swap window
+    /// #1120 closed everywhere else.
+    ///
+    /// The drill is the seed-leg drill from `run_dag_exec`, applied one level
+    /// up: capture the snapshot (adapter → warehouse A), overwrite
+    /// `rocky.toml` to point at warehouse B, then apply. Both DuckDB files
+    /// share the STEM `proj`, so `catalog = "proj"` is valid under either
+    /// config and only the physical path differs — the config swap is the sole
+    /// variable.
+    ///
+    /// Non-vacuous by construction, in two directions: pre-fix the reload
+    /// picks up config B, so the rows land in B (failing the row assertion)
+    /// and opening B's adapter creates the file (failing the `!exists`
+    /// assertion). Post-fix nothing re-reads `rocky.toml`, so B is never
+    /// opened and its file is never created. It also expects `Ok`, so an
+    /// earlier gate turning this into an error fails it too — unlike
+    /// `a_stored_dag_shadow_plan_carries_its_shadow_routing_into_execution`,
+    /// whose `Err` arm fires *after* the load and is therefore identical
+    /// before and after this fix.
+    #[tokio::test]
+    async fn a_stored_dag_plan_executes_the_gates_snapshot_not_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models).unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        std::fs::create_dir(root.join("b")).unwrap();
+
+        let db_a = root.join("a/proj.duckdb");
+        let db_b = root.join("b/proj.duckdb");
+        let config_path = root.join("rocky.toml");
+        let config_for = |db: &std::path::Path| {
+            format!(
+                "[adapter.local]\n\
+                 type = \"duckdb\"\n\
+                 path = \"{}\"\n\n\
+                 [pipeline.silver]\n\
+                 type = \"transformation\"\n\n\
+                 [pipeline.silver.target]\n\
+                 adapter = \"local\"\n\n\
+                 [pipeline.silver.target.governance]\n\
+                 auto_create_catalogs = true\n\
+                 auto_create_schemas = true\n",
+                db.display()
+            )
+        };
+
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS v\n").unwrap();
+        std::fs::write(
+            models.join("orders.toml"),
+            "depends_on = []\n\n\
+             [strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"proj\"\nschema = \"marts\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+
+        // The gate reads config A and fingerprints it.
+        std::fs::write(&config_path, config_for(&db_a)).unwrap();
+        let loaded = std::sync::Arc::new(
+            rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+        );
+
+        // The swap window: `rocky.toml` now routes to a different warehouse.
+        std::fs::write(&config_path, config_for(&db_b)).unwrap();
+
+        execute_run_plan(
+            &config_path,
+            loaded,
+            "plan-dag-snapshot",
+            RunPlan {
+                dag: true,
+                models: vec![],
+                execution_layers: vec![],
+                ..minimal_run_plan()
+            },
+            &root.join(".rocky-state.redb"),
+            false,
+            "apply-run-id",
+            // A human apply: the governed `--dag` refusal does not apply.
+            None,
+        )
+        .await
+        .expect("a stored --dag plan must apply cleanly");
+
+        assert!(
+            !db_b.exists(),
+            "the swapped-in config must never be read: opening warehouse B would create its file"
+        );
+
+        let adapter = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db_a).unwrap();
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let rows = guard
+            .execute_sql("SELECT v FROM proj.marts.orders")
+            .expect("the gate's snapshot routed the build into warehouse A");
+        assert_eq!(rows.rows.len(), 1, "the model materialized in warehouse A");
     }
 
     fn minimal_run_plan() -> RunPlan {
