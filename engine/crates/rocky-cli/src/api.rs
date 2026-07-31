@@ -1798,6 +1798,15 @@ mod tests {
              [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"stg\"\n",
         )
         .unwrap();
+        // A real column dependency, so column lineage has an edge to assert on
+        // rather than only a `Result::is_ok` to check.
+        std::fs::write(transforms.join("fct.sql"), "SELECT id FROM stg").unwrap();
+        std::fs::write(
+            transforms.join("fct.toml"),
+            "name = \"fct\"\ndepends_on = [\"stg\"]\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"fct\"\n",
+        )
+        .unwrap();
 
         let config_path = dir.path().join("rocky.toml");
         std::fs::write(
@@ -1865,10 +1874,79 @@ mod tests {
         assert_eq!(api, reference, "GET /dag must match `rocky dag`");
 
         // A single custom root is still a root the compiler can read, so
-        // `--column-lineage` must keep working here. Guards the refusal added
-        // below from widening into "any project that isn't `models/`".
-        dag_output(&config_path, &state_path, None, None, None, true, None)
-            .expect("one model root must still compile column lineage");
+        // `--column-lineage` must keep working here. Asserting on the EDGES,
+        // not on `is_ok`: an empty lineage list is also `Ok`, so a bare
+        // success check would have passed against the pre-fix code that
+        // compiled the wrong directory.
+        let lineage = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("one model root must still compile column lineage")
+            .column_lineage;
+        assert!(
+            lineage
+                .iter()
+                .any(|e| e.source.model == "stg" && e.target.model == "fct"),
+            "expected a stg->fct column edge, got {lineage:?}"
+        );
+    }
+
+    /// A project with no transformation pipeline at all.
+    fn replication_only_project() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter.local]\ntype = \"duckdb\"\n\n\
+             [pipeline.load]\ntype = \"replication\"\nstrategy = \"full_refresh\"\n\n\
+             [pipeline.load.source]\nadapter = \"local\"\n\n\
+             [pipeline.load.source.schema_pattern]\nprefix = \"raw__\"\n\
+             separator = \"__\"\ncomponents = [\"source\"]\n\n\
+             [pipeline.load.target]\nadapter = \"local\"\n\
+             catalog_template = \"warehouse\"\nschema_template = \"analytics\"\n",
+        )
+        .unwrap();
+        (dir, config_path)
+    }
+
+    /// Zero model roots is "no lineage exists", not "lineage is unavailable".
+    ///
+    /// Folding the zero case into the several-roots refusal made
+    /// `rocky dag --column-lineage` fail on every replication-only project with
+    /// a complaint about "different model directories" it does not have — a
+    /// regression against a call that previously succeeded with an empty list.
+    #[tokio::test]
+    async fn dag_column_lineage_allows_project_with_no_models() {
+        let (dir, config_path) = replication_only_project();
+        let state_path = pinned_state_path(dir.path());
+
+        let out = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("a project with no transformation models must not refuse lineage");
+        assert!(out.column_lineage.is_empty());
+    }
+
+    /// A configured-but-empty root is not a second root.
+    ///
+    /// Counting roots by what *resolves* rather than by what actually yields
+    /// models refuses a project whose only models live under one directory,
+    /// merely because a sibling pipeline points at an empty one.
+    #[tokio::test]
+    async fn dag_column_lineage_ignores_roots_that_contribute_nothing() {
+        let (dir, config_path) = custom_root_dag_project();
+        // A second transformation pipeline whose directory exists but is empty.
+        std::fs::create_dir_all(dir.path().join("unused")).unwrap();
+        let mut cfg = std::fs::read_to_string(&config_path).unwrap();
+        cfg.push_str(
+            "\n[pipeline.empty]\ntype = \"transformation\"\nmodels = \"unused/**\"\n\n\
+             [pipeline.empty.target.governance]\nauto_create_schemas = true\n",
+        );
+        std::fs::write(&config_path, cfg).unwrap();
+
+        let state_path = pinned_state_path(dir.path());
+        let out = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("an empty root must not count as a second root");
+        assert!(
+            !out.column_lineage.is_empty(),
+            "the contributing root's lineage must still be compiled"
+        );
     }
 
     /// Two transformation pipelines whose model roots differ.

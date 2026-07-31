@@ -211,7 +211,7 @@ pub async fn run_with_dag(
     // validate a `models/` directory that only transformation pipelines
     // consume (`add_transformation_nodes`), so an unrelated broken model there
     // failed a replication-only run that `rocky run` executes happily.
-    let models_by_pipeline = load_transformation_models(config_path, cfg)?;
+    let models_by_pipeline = load_transformation_models(config_path, cfg)?.by_pipeline;
 
     // Seed-discovery errors are NOT recoverable into "no seeds": seed nodes and
     // the seed→model edges that order a model after the seed it reads are built
@@ -392,10 +392,18 @@ pub async fn run_with_dag(
 pub(super) fn load_transformation_models(
     config_path: &Path,
     cfg: &rocky_core::config::RockyConfig,
-) -> Result<rocky_core::unified_dag::ModelsByPipeline> {
+) -> Result<TransformationModels> {
     use rocky_core::config::PipelineConfig;
 
     let mut by_pipeline = rocky_core::unified_dag::ModelsByPipeline::new();
+    // Distinct roots that actually yielded at least one model, and their
+    // canonical forms for the distinctness test. Recorded during this single
+    // pass rather than by a second walk of the config: a separate resolver pass
+    // can disagree with this one whenever the filesystem changes underneath, and
+    // a root that resolves but contributes nothing is not a root the lineage
+    // compile needs to cover.
+    let mut contributing_roots: Vec<PathBuf> = Vec::new();
+    let mut canonical_roots: Vec<PathBuf> = Vec::new();
     // model name -> the canonical FILE it was first loaded from.
     //
     // Keyed on the file, not on the pipeline's base directory. Two pipelines
@@ -452,42 +460,32 @@ pub(super) fn load_transformation_models(
             models.push(model);
         }
         models.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
+        if !models.is_empty() {
+            let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            if !canonical_roots.contains(&canonical) {
+                canonical_roots.push(canonical);
+                contributing_roots.push(dir.clone());
+            }
+        }
         by_pipeline.insert(pipeline_name.clone(), models);
     }
-    Ok(by_pipeline)
+    Ok(TransformationModels {
+        by_pipeline,
+        contributing_roots,
+    })
 }
 
-/// The distinct model roots this project's transformation pipelines resolve to,
-/// in `cfg.pipelines` order.
-///
-/// Deliberately mirrors [`load_transformation_models`]'s resolution — same
-/// `resolve_models_dir`, same "a pipeline whose directory is absent contributes
-/// nothing" rule — so the roots reported here are exactly the roots the models
-/// were loaded from. Distinctness is by canonical path: two pipelines spelling
-/// one directory differently (`transforms` and `./transforms`) are one root,
-/// not two.
-pub(super) fn transformation_model_dirs(
-    config_path: &Path,
-    cfg: &rocky_core::config::RockyConfig,
-) -> Result<Vec<PathBuf>> {
-    use rocky_core::config::PipelineConfig;
-
-    let mut canonical_seen: Vec<PathBuf> = Vec::new();
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    for pipeline in cfg.pipelines.values() {
-        let PipelineConfig::Transformation(t) = pipeline else {
-            continue;
-        };
-        let Some(dir) = crate::models_loader::resolve_models_dir(&t.models, config_path)? else {
-            continue;
-        };
-        let canonical = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-        if !canonical_seen.contains(&canonical) {
-            canonical_seen.push(canonical);
-            dirs.push(dir);
-        }
-    }
-    Ok(dirs)
+/// Every transformation model in the project, attributed to the pipeline that
+/// declared it, plus the roots those models were actually loaded from.
+#[derive(Debug)]
+pub(super) struct TransformationModels {
+    pub by_pipeline: rocky_core::unified_dag::ModelsByPipeline,
+    /// The distinct directories that contributed at least one model, in
+    /// `cfg.pipelines` order. A pipeline whose directory is absent, or present
+    /// but empty, contributes nothing and is not listed — so "how many roots
+    /// are there" answers the question the lineage compile actually asks
+    /// ("whose models must I cover"), not "how many were configured".
+    pub contributing_roots: Vec<PathBuf>,
 }
 
 fn status_str(s: &NodeStatus) -> &'static str {
@@ -1654,7 +1652,8 @@ mod tests {
         let cfg = rocky_core::config::load_rocky_config(&config_path).unwrap();
         // Loading must SUCCEED — one file reached twice is not a duplicate name.
         let by_pipeline = load_transformation_models(&config_path, &cfg)
-            .expect("one file reached through two roots is not a duplicate name");
+            .expect("one file reached through two roots is not a duplicate name")
+            .by_pipeline;
 
         // ...and the shared claim is then reported by the DAG, which can name
         // the pipelines.

@@ -33,6 +33,27 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// shape). The two must NOT be collapsed into one shared const.
 const DAG_SCHEMA_VERSION: &str = "1";
 
+/// Where `--column-lineage` should compile from, once the models have been
+/// loaded and attributed.
+///
+/// Three states, because "no root" and "several roots" both lack a single
+/// directory to compile but mean opposite things: the first has no lineage to
+/// report, the second has lineage this command cannot report correctly.
+enum LineageSource {
+    /// Compile this directory. Note this still inherits #1262: the compiler
+    /// reads the directory itself, while the model loader also reads one level
+    /// below it, so a project keeping its models in `<root>/staging/` gets a
+    /// correct DAG and empty lineage. Pre-existing and unchanged here — closing
+    /// it means teaching `rocky-compiler` to walk, not widening this refusal
+    /// into the common nested layout.
+    Root(std::path::PathBuf),
+    /// No transformation models exist, so no lineage does either. Empty is the
+    /// complete answer.
+    NoModels,
+    /// Models came from several roots and the compiler reads one.
+    SeveralRoots,
+}
+
 /// Execute `rocky dag`.
 ///
 /// `cache_ttl_override`: CLI `--cache-ttl` flag override for the
@@ -118,7 +139,7 @@ pub fn dag_output(
     // while enriching from a fallback `models/` left a project with a custom
     // root (`models = "transforms/**"`) holding correctly-shaped nodes whose
     // target, strategy and freshness were all silently `None`.
-    let (models, models_by_pipeline, lineage_root) = match models_dir {
+    let (models, models_by_pipeline, lineage_source) = match models_dir {
         // An explicit whole-project override: every transformation pipeline
         // genuinely does declare this one directory — and a project with two of
         // them is then refused by name, which is the honest answer to "these two
@@ -134,26 +155,33 @@ pub fn dag_output(
                     by_pipeline.insert(name.clone(), models.clone());
                 }
             }
-            (models, by_pipeline, Some(dir.to_path_buf()))
+            (models, by_pipeline, LineageSource::Root(dir.to_path_buf()))
         }
         // No override: each pipeline resolves its own directory, which is also
         // what `rocky run --dag` has always done. Before #1261, `rocky dag
         // --models models` and `rocky run --dag` disagreed, the former giving a
         // node to a model no pipeline declared.
         None => {
-            let by_pipeline = super::run_dag_exec::load_transformation_models(config_path, &cfg)?;
-            let models = union_by_model_name(&by_pipeline);
-            let roots = super::run_dag_exec::transformation_model_dirs(config_path, &cfg)?;
+            let loaded = super::run_dag_exec::load_transformation_models(config_path, &cfg)?;
+            let models = union_by_model_name(&loaded.by_pipeline);
             // The compiler reads exactly one root (#1262), so lineage is only
-            // answerable when the pipelines agree on one. Picking an arbitrary
-            // root would emit lineage that silently omits every other pipeline's
+            // answerable when the models came from one. Picking an arbitrary
+            // root would emit lineage that silently omits every other root's
             // models; `column_lineage` has no "unavailable" encoding, so a
             // partial list is indistinguishable from a complete one.
-            let lineage_root = match roots.as_slice() {
-                [only] => Some(only.clone()),
-                _ => None,
+            //
+            // Zero roots is NOT that situation and must not be folded into it:
+            // a project with no transformation models has no lineage, and empty
+            // is the complete answer rather than a withheld one. Conflating the
+            // two made `rocky dag --column-lineage` fail on every
+            // replication-only project with a message about "different model
+            // directories" it does not have.
+            let source = match loaded.contributing_roots.as_slice() {
+                [] => LineageSource::NoModels,
+                [only] => LineageSource::Root(only.clone()),
+                _ => LineageSource::SeveralRoots,
             };
-            (models, by_pipeline, lineage_root)
+            (models, loaded.by_pipeline, source)
         }
     };
 
@@ -197,7 +225,7 @@ pub fn dag_output(
         &models,
         &seeds,
         include_column_lineage,
-        lineage_root.as_deref(),
+        lineage_source,
         contracts_dir,
         &cfg,
         state_path,
@@ -213,9 +241,7 @@ fn build_dag_output(
     models: &[Model],
     seeds: &[SeedFile],
     include_column_lineage: bool,
-    // The single model root the lineage compile reads, or `None` when the
-    // project's transformation pipelines don't agree on one (see #1262).
-    lineage_root: Option<&Path>,
+    lineage_source: LineageSource,
     contracts_dir: Option<&Path>,
     cfg: &rocky_core::config::RockyConfig,
     state_path: &Path,
@@ -329,27 +355,29 @@ fn build_dag_output(
     };
 
     // Column lineage (optional).
-    let column_lineage = match (include_column_lineage, lineage_root) {
+    let column_lineage = match (include_column_lineage, lineage_source) {
         (false, _) => vec![],
-        (true, Some(root)) => build_column_lineage_from_models(
-            root,
+        (true, LineageSource::Root(root)) => build_column_lineage_from_models(
+            &root,
             contracts_dir,
             cfg,
             state_path,
             schema_cache_cfg,
         )?,
+        // Nothing to compile, and nothing withheld.
+        (true, LineageSource::NoModels) => vec![],
         // Lineage was asked for and cannot be answered correctly: the compiler
-        // reads one model root (#1262) and this project's transformation
-        // pipelines declare several. Refusing beats returning the edges of
-        // whichever root won a coin flip — `column_lineage` is a bare list, so a
-        // caller cannot tell a partial answer from a complete one. Narrow by
-        // construction: only `--column-lineage` reaches here, so plain
-        // `rocky dag` and `GET /api/v1/dag` are untouched.
-        (true, None) => anyhow::bail!(
+        // reads one model root (#1262) and this project's models came from
+        // several. Refusing beats returning the edges of whichever root won a
+        // coin flip — `column_lineage` is a bare list, so a caller cannot tell a
+        // partial answer from a complete one. Narrow by construction: only
+        // `--column-lineage` reaches here, so plain `rocky dag` and
+        // `GET /api/v1/dag` are untouched, and the SDK always passes `--models`.
+        (true, LineageSource::SeveralRoots) => anyhow::bail!(
             "cannot compute column lineage: this project's transformation \
-             pipelines declare different model directories, and lineage is \
-             compiled from a single root (#1262). Re-run scoped to one root \
-             with `rocky dag --column-lineage --models <dir>`, or drop \
+             models come from more than one directory, and lineage is compiled \
+             from a single root (#1262). Re-run scoped to one root with \
+             `rocky dag --column-lineage --models <dir>`, or drop \
              `--column-lineage` for the structural DAG.",
         ),
     };
