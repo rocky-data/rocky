@@ -56,6 +56,9 @@ pub async fn run_transformation(
     // decided whether to create this run's `RemoteStateSession`. This
     // function must never re-check the filesystem for the models dir.
     models_dir: ModelsDirDecision,
+    // Config-relative model-file glob resolved into the same path form as the
+    // models directory. The compiler applies it before parsing.
+    models_glob: &str,
     pipeline: &rocky_core::config::TransformationPipelineConfig,
     rocky_cfg: &rocky_core::config::RockyConfig,
     output_json: bool,
@@ -155,6 +158,7 @@ pub async fn run_transformation(
             let failures_before = output.tables_failed;
             let exec_result = super::run::execute_models(
                 models_dir,
+                Some(models_glob),
                 warehouse_adapter.as_ref(),
                 Some(&store),
                 partition_opts,
@@ -2371,9 +2375,11 @@ auto_create_schemas = true
         let rocky_core::config::PipelineConfig::Transformation(t) = pipeline_config else {
             panic!("test config must resolve to a transformation pipeline");
         };
+        let models_glob = dir.join("models/**").to_string_lossy().into_owned();
 
         super::run_transformation(
             super::ModelsDirDecision::Absent(models_dir.clone()),
+            &models_glob,
             t,
             rocky_cfg,
             false, // output_json

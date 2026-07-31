@@ -145,6 +145,18 @@ pub fn compile(config: &CompilerConfig) -> Result<CompileResult, CompileError> {
     compile_with_db(&mut db, config)
 }
 
+/// Compile only model source files matching `models_glob`.
+///
+/// The glob must use the same path form as [`CompilerConfig::models_dir`].
+/// Filtering happens before parsing.
+pub fn compile_matching(
+    config: &CompilerConfig,
+    models_glob: &str,
+) -> Result<CompileResult, CompileError> {
+    let mut db = crate::salsa_compile::RockyDatabase::default();
+    compile_with_db_matching(&mut db, config, models_glob)
+}
+
 /// Compile a project using the caller's salsa database for the
 /// per-file parse + lower pipeline.
 ///
@@ -166,6 +178,37 @@ pub fn compile_with_db(
     db: &mut crate::salsa_compile::RockyDatabase,
     config: &CompilerConfig,
 ) -> Result<CompileResult, CompileError> {
+    compile_with_db_inner(db, config, None)
+}
+
+/// Compile only matching model source files using the caller's salsa database.
+pub fn compile_with_db_matching(
+    db: &mut crate::salsa_compile::RockyDatabase,
+    config: &CompilerConfig,
+    models_glob: &str,
+) -> Result<CompileResult, CompileError> {
+    compile_with_db_inner(db, config, Some(models_glob))
+}
+
+/// Compile already-loaded models through the normal preprocessing pipeline.
+///
+/// This preserves the same ordering as [`compile`]: run variables are
+/// substituted before [`Project::from_models`] performs dependency resolution
+/// and lineage extraction.
+pub fn compile_preloaded_models(
+    models: Vec<rocky_core::models::Model>,
+    config: &CompilerConfig,
+) -> Result<CompileResult, CompileError> {
+    let total_start = Instant::now();
+    let load_start = Instant::now();
+    compile_preloaded_models_inner(models, config, total_start, load_start)
+}
+
+fn compile_with_db_inner(
+    db: &mut crate::salsa_compile::RockyDatabase,
+    config: &CompilerConfig,
+    models_glob: Option<&str>,
+) -> Result<CompileResult, CompileError> {
     let total_start = Instant::now();
 
     // 1. Load project, substitute per-run variables, then resolve.
@@ -178,7 +221,21 @@ pub fn compile_with_db(
     //    lineage extraction on the raw `@var(` text fails and load returns an
     //    error before `compile_project` can substitute.
     let load_start = Instant::now();
-    let mut models = Project::load_models_with_db(&config.models_dir, db)?;
+    let models = match models_glob {
+        Some(models_glob) => {
+            Project::load_models_matching_with_db(&config.models_dir, models_glob, db)?
+        }
+        None => Project::load_models_with_db(&config.models_dir, db)?,
+    };
+    compile_preloaded_models_inner(models, config, total_start, load_start)
+}
+
+fn compile_preloaded_models_inner(
+    mut models: Vec<rocky_core::models::Model>,
+    config: &CompilerConfig,
+    total_start: Instant,
+    load_start: Instant,
+) -> Result<CompileResult, CompileError> {
     let run_var_diagnostics = substitute_run_vars_into_models(&mut models, &config.run_vars);
     let project = Project::from_models(models)?;
     let project_load_ms = load_start.elapsed().as_millis() as u64;

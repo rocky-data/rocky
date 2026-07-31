@@ -27,9 +27,9 @@ use crate::registry::{AdapterRegistry, resolve_pipeline};
 ///   parses each schema through the source `schema_pattern`, resolves
 ///   target catalog/schema from the target templates, and collects
 ///   `catalog.schema.table` for every discovered table.
-/// - **Transformation**: loads model files from the models directory
-///   (same walk as `rocky list models`) and extracts the `target`
-///   coordinates from each model's TOML sidecar.
+/// - **Transformation**: loads model files selected by the pipeline's `models`
+///   glob and extracts the `target` coordinates from each selected model's TOML
+///   sidecar.
 /// - **Other types** (quality, snapshot, load): not yet supported —
 ///   returns `Ok(None)`.
 pub(crate) async fn resolve_managed_tables(
@@ -123,65 +123,21 @@ pub(crate) fn resolve_transformation_managed_tables(
     tx: &rocky_core::config::TransformationPipelineConfig,
     config_path: &Path,
 ) -> Result<Option<HashSet<String>>> {
-    // Models directory is relative to the config file's parent.
-    let project_root = config_path.parent().unwrap_or(Path::new("."));
-
-    // The `models` field is a glob like "models/**" — extract the base
-    // directory (everything before any glob wildcard).
-    // `.filter` before `.unwrap_or`: `split` yields `Some("")` for an all-wildcard
-    // glob (`**/*.sql`), never `None`, so without it the fallback is unreachable
-    // and the empty base joins to the project root — a different directory from
-    // the one `gc` and `apply` derive for the same glob.
-    let models_base = tx
-        .models
-        .split(&['*', '?', '['][..])
-        .next()
-        .filter(|base| !base.is_empty())
-        .unwrap_or("models");
-    let models_dir = project_root.join(models_base.trim_end_matches('/'));
-
-    if !models_dir.exists() {
-        tracing::warn!(
-            models_dir = %models_dir.display(),
-            "models directory does not exist; cannot resolve managed tables"
-        );
-        return Ok(None);
-    }
-
-    // Confine `models_dir` to the project root. Without this, a config
-    // with `models = "../../etc"` (or a symlink-escape on the
-    // filesystem) can read files outside the project tree and surface
-    // them through `rocky list models`, LSP hovers, or error output.
-    //
-    // Both sides are canonicalized so symlinks within the project are
-    // resolved before the prefix check. Asymmetric resolution (one
-    // canonical, one not) would false-positive reject legitimate paths
-    // on platforms where the system tempdir or `/tmp` is itself a
-    // symlink (macOS: `/var/folders/...` -> `/private/var/folders/...`).
-    //
-    // The project root is required to canonicalize — if it doesn't
-    // exist we bail early with a useful error. The models directory
-    // is allowed to not exist yet (`load_models_from_dir` below will
-    // surface the natural error); we only run the containment check
-    // when both sides resolve.
-    let canonical_root = project_root.canonicalize().context(format!(
-        "project root '{}' could not be resolved",
-        project_root.display()
-    ))?;
-    if let Ok(canonical_models) = models_dir.canonicalize()
-        && !canonical_models.starts_with(&canonical_root)
-    {
-        bail!(
-            "models directory '{}' resolves outside the project root '{}'. \
-                 Refusing to load — adjust `models = \"...\"` in rocky.toml.",
-            canonical_models.display(),
-            canonical_root.display(),
-        );
-    }
+    let models_dir = match crate::models_loader::locate_models_dir(&tx.models, config_path)? {
+        crate::models_loader::ModelsDir::Present(dir) => dir,
+        crate::models_loader::ModelsDir::Absent(dir) => {
+            tracing::warn!(
+                models_dir = %dir.display(),
+                "models directory does not exist; cannot resolve managed tables"
+            );
+            return Ok(None);
+        }
+    };
 
     // Load all models the same way `rocky list models` does: top-level +
     // immediate subdirectories, including `.rocky` DSL files.
-    let all_models = crate::models_loader::load_project_models(&models_dir)?;
+    let models_glob = crate::models_loader::resolved_models_glob(&tx.models, config_path);
+    let all_models = crate::models_loader::load_project_models_matching(&models_dir, &models_glob)?;
 
     let mut managed = HashSet::new();
     for model in &all_models {

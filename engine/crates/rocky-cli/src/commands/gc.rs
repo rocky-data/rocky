@@ -105,7 +105,9 @@ use rocky_core::state::{
     TombstoneRecord,
 };
 
-use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy};
+use crate::commands::apply::{
+    PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy_matching,
+};
 use crate::commands::replay::classify_model;
 use crate::commands::review::record_plan_review_escalation;
 use crate::output::{
@@ -1451,8 +1453,9 @@ async fn execute_gc_apply(
 ///
 /// Mirrors how the backfill apply threads `run_plan.models_dir` instead of a
 /// hardcoded `models`: the base directory comes from the first transformation
-/// pipeline's `models` glob (everything before the first wildcard), resolved
-/// relative to the config file's parent — the same derivation
+/// pipeline's `models` glob (the complete literal directory components before
+/// the first wildcard-bearing component), resolved relative to the config
+/// file's parent — the same derivation
 /// `crate::scope::resolve_transformation_managed_tables` uses. Falls back to
 /// `models` when no config or no transformation pipeline is present.
 ///
@@ -1468,12 +1471,11 @@ pub(crate) fn gc_models_dir(
             _ => None,
         })
     });
-    let base = glob
-        .as_deref()
-        .and_then(|g| g.split(&['*', '?', '['][..]).next())
-        .filter(|b| !b.is_empty())
-        .unwrap_or("models");
-    project_root.join(base.trim_end_matches('/'))
+    project_root.join(
+        glob.as_deref()
+            .map(|glob| crate::models_loader::models_base(glob, project_root))
+            .unwrap_or_else(|| std::path::PathBuf::from("models")),
+    )
 }
 
 /// Apply a `PlanKind::Gc` plan — evict its derivable artifacts, each behind a
@@ -1576,7 +1578,14 @@ pub(crate) async fn run_gc_apply_in_with(
         .iter()
         .map(|e| (e.model_name.clone(), PolicyCapability::Gc))
         .collect();
-    let models_dir = gc_models_dir(loaded_cfg.as_ref(), config_path);
+    let models_dir = match loaded_cfg.as_ref() {
+        Some(cfg) => {
+            crate::commands::apply::resolve_confined_config_models_dir(config_path, Some(cfg))?
+        }
+        None => gc_models_dir(None, config_path),
+    };
+    let models_glob =
+        crate::commands::apply::resolve_config_models_glob(config_path, loaded_cfg.as_ref());
 
     // SEAM-SCOPED SYNC (S1, #1089) — download half, BEFORE the policy gate.
     // Two ledgers matter here and both are among the tables `rocky run`
@@ -1633,12 +1642,13 @@ pub(crate) async fn run_gc_apply_in_with(
     // backend + models-dir above, rather than reloading the config inside
     // `evaluate_apply_policy` — a `rocky.toml` swap between the loads must not let
     // the state-backend/download and the policy gate disagree.
-    let gate = evaluate_apply_policy_with_policy(
+    let gate = evaluate_apply_policy_with_policy_matching(
         loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         plan_record.enforcement_principal(runtime_principal),
         &touched,
         &models_dir,
+        models_glob.as_deref(),
         state_path,
         &marker_freezes,
     );

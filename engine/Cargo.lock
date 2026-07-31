@@ -4069,6 +4069,7 @@ dependencies = [
  "anyhow",
  "bumpalo",
  "chrono",
+ "glob",
  "indexmap",
  "miette",
  "rayon",

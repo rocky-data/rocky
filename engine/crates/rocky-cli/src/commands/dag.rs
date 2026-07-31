@@ -33,20 +33,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// shape). The two must NOT be collapsed into one shared const.
 const DAG_SCHEMA_VERSION: &str = "1";
 
-/// Where `--column-lineage` should compile from, once the models have been
-/// loaded and attributed.
+/// Which already-loaded models `--column-lineage` should compile.
 ///
-/// Three states rather than an `Option`, because "no root" and "several roots"
-/// both lack a single directory to compile but mean opposite things: the first
-/// has no lineage to report, the second has lineage this command cannot see.
-/// Both currently produce an empty list; keeping them apart is what lets #1262
-/// give the second one a real answer without disturbing the first.
+/// Three states rather than an `Option`, because "no models" and "several
+/// roots" both produce no compile today but mean opposite things: the first has
+/// no lineage to report, while the second is the pre-existing #1262 limitation.
 enum LineageSource {
-    /// Compile this directory. Note this still inherits #1262: the compiler
-    /// reads the directory itself, while the model loader also reads one level
-    /// below it, so a project keeping its models in `<root>/staging/` has models
-    /// in the DAG that the compile cannot see.
-    Root(std::path::PathBuf),
+    /// Compile this exact glob-selected set without re-reading its directory.
+    Models(Vec<Model>),
     /// No transformation models exist, so no lineage does either. Empty is the
     /// complete answer.
     NoModels,
@@ -135,7 +129,7 @@ pub fn dag_output(
     //
     // Three things come out of this: the per-pipeline attribution the graph is
     // built from, the flat name-keyed list the nodes are *enriched* from, and
-    // where the optional column-lineage compile reads.
+    // which exact set the optional column-lineage compile receives.
     //
     // The first two describe exactly the same set of models, and must: deriving
     // the graph per pipeline while enriching from a fallback `models/` left a
@@ -143,10 +137,10 @@ pub fn dag_output(
     // correctly-shaped nodes whose target, strategy and freshness were all
     // silently `None`.
     //
-    // The third does NOT, and cannot yet. The compiler reads a single directory
-    // and only its top level, so it covers that set only when the models came
-    // from one root and sit directly in it; otherwise lineage comes back empty
-    // or partial. That gap is #1262 — see `LineageSource`.
+    // The third is the same already-loaded set whenever it came from one
+    // contributing root. Re-reading the directory here would ignore the
+    // configured file glob and could emit lineage for a model absent from the
+    // DAG, or lose all lineage to a malformed non-matching sidecar.
     let (models, models_by_pipeline, lineage_source) = match models_dir {
         // An explicit whole-project override: every transformation pipeline
         // genuinely does declare this one directory — and a project with two of
@@ -163,7 +157,8 @@ pub fn dag_output(
                     by_pipeline.insert(name.clone(), models.clone());
                 }
             }
-            (models, by_pipeline, LineageSource::Root(dir.to_path_buf()))
+            let lineage_models = models.clone();
+            (models, by_pipeline, LineageSource::Models(lineage_models))
         }
         // No override: each pipeline resolves its own directory, which is also
         // what `rocky run --dag` has always done. Before #1261, `rocky dag
@@ -183,7 +178,7 @@ pub fn dag_output(
             // directories" it does not have.
             let source = match loaded.contributing_roots.as_slice() {
                 [] => LineageSource::NoModels,
-                [only] => LineageSource::Root(only.clone()),
+                [_] => LineageSource::Models(models.clone()),
                 _ => LineageSource::SeveralRoots,
             };
             (models, loaded.by_pipeline, source)
@@ -362,8 +357,8 @@ fn build_dag_output(
     // Column lineage (optional).
     let column_lineage = match (include_column_lineage, lineage_source) {
         (false, _) => vec![],
-        (true, LineageSource::Root(root)) => build_column_lineage_from_models(
-            &root,
+        (true, LineageSource::Models(lineage_models)) => build_column_lineage_from_models(
+            &lineage_models,
             contracts_dir,
             cfg,
             state_path,
@@ -437,14 +432,14 @@ fn extract_partition_shape(strategy: &StrategyConfig) -> Option<PartitionShapeOu
 /// Build column-level lineage edges by compiling models and extracting
 /// the semantic graph.
 fn build_column_lineage_from_models(
-    models_dir: &Path,
+    models: &[Model],
     contracts_dir: Option<&Path>,
     _cfg: &rocky_core::config::RockyConfig,
     state_path: &Path,
     schema_cache_cfg: &rocky_core::config::SchemaCacheConfig,
 ) -> Result<Vec<LineageEdgeRecord>> {
     let compile_config = rocky_compiler::compile::CompilerConfig {
-        models_dir: models_dir.to_path_buf(),
+        models_dir: std::path::PathBuf::new(),
         contracts_dir: contracts_dir.map(Path::to_path_buf),
         // Typed columns flow from the persisted schema cache (populated
         // by `rocky run` / `rocky discover --with-schemas`) straight
@@ -460,26 +455,16 @@ fn build_column_lineage_from_models(
         ..Default::default()
     };
 
-    // A compile failure yields no lineage rather than failing the command.
-    //
-    // This tolerance is pre-existing and is deliberately left alone. Propagating
-    // these errors looks obviously right and is not: the compiler reads only the
-    // top level of `models_dir` while the model loader also reads one level
-    // below it, so the ordinary `models/staging/stg.sql` → `models/fct.sql`
-    // layout compiles to `unknown dependency 'stg' referenced by 'fct'` — a
-    // artifact of the shallower read, not a defect in the project. Surfacing it
-    // turned `rocky dag --column-lineage` into a hard failure for the most
-    // common project shape there is.
-    //
-    // So this genuinely cannot be tightened until the compile stops re-reading
-    // disk and takes the DAG's own model set (#1262). Until then an empty list
-    // means "no lineage, or it could not be computed", and the two are not
-    // distinguishable here — which is the status quo this change preserves
-    // rather than the one it introduces.
-    let result = match rocky_compiler::compile::compile(&compile_config) {
-        Ok(r) => r,
-        Err(_) => return Ok(vec![]),
-    };
+    // Compile the exact model objects used to build the DAG. Filtering already
+    // happened before parsing, so an excluded malformed sidecar cannot erase
+    // selected-model lineage and an excluded valid model cannot add an edge.
+    // Preserve the existing tolerant surface: a lineage-only compile failure
+    // yields no lineage rather than failing `rocky dag`.
+    let result =
+        match rocky_compiler::compile::compile_preloaded_models(models.to_vec(), &compile_config) {
+            Ok(r) => r,
+            Err(_) => return Ok(vec![]),
+        };
 
     let graph = &result.semantic_graph;
     let edges: Vec<LineageEdgeRecord> = graph

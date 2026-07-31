@@ -179,15 +179,27 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     // lint input, and no diagnostic saying why. The per-pipeline check above
     // stayed quiet too, because `transforms` does exist, so `validate` passed a
     // project whose entire model set it had never looked at.
-    let models_dirs = transformation_models_dirs(&cfg, config_path);
-    let loaded_models = if !models_dirs.is_empty() {
-        match models_dirs.iter().try_fold(Vec::new(), |mut acc, dir| {
-            crate::models_loader::load_project_models(dir).map(|models| {
-                acc.extend(models);
-                acc
-            })
-        }) {
-            Ok(models) => {
+    let model_selections = transformation_model_selections(&cfg, config_path);
+    let loaded_models = if !model_selections.is_empty() {
+        match model_selections
+            .iter()
+            .try_fold(Vec::new(), |mut acc, (dir, glob)| {
+                let loaded = match glob {
+                    Some(glob) => crate::models_loader::load_project_models_matching(dir, glob),
+                    None => crate::models_loader::load_project_models(dir),
+                };
+                loaded.map(|models| {
+                    acc.extend(models);
+                    acc
+                })
+            }) {
+            Ok(mut models) => {
+                // Overlapping pipeline globs may select the same source. Count
+                // and validate each physical model once while preserving two
+                // genuinely distinct files that declare the same logical name
+                // (the DAG validator must still report that collision).
+                let mut seen_paths = std::collections::HashSet::new();
+                models.retain(|model| seen_paths.insert(model.file_path.clone()));
                 let count = models.len();
                 if count > 0 {
                     out.push(ValidateMessage {
@@ -287,11 +299,11 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
 /// A glob escaping the project root is skipped rather than propagated: the
 /// per-pipeline check already reports that same glob as a V047 error in this
 /// run's output, so the failure is named once rather than swallowed.
-fn transformation_models_dirs(
+fn transformation_model_selections(
     cfg: &rocky_core::config::RockyConfig,
     config_path: &Path,
-) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
+) -> Vec<(PathBuf, Option<String>)> {
+    let mut selections: Vec<(PathBuf, Option<String>)> = Vec::new();
     let mut saw_transformation = false;
     for pc in cfg.pipelines.values() {
         let rocky_core::config::PipelineConfig::Transformation(t) = pc else {
@@ -300,9 +312,17 @@ fn transformation_models_dirs(
         saw_transformation = true;
         if let Ok(crate::models_loader::ModelsDir::Present(dir)) =
             crate::models_loader::locate_models_dir(&t.models, config_path)
-            && !dirs.contains(&dir)
         {
-            dirs.push(dir);
+            let selection = (
+                dir,
+                Some(crate::models_loader::resolved_models_glob(
+                    &t.models,
+                    config_path,
+                )),
+            );
+            if !selections.contains(&selection) {
+                selections.push(selection);
+            }
         }
     }
     if !saw_transformation {
@@ -311,10 +331,10 @@ fn transformation_models_dirs(
             .unwrap_or(Path::new("."))
             .join("models");
         if default.exists() {
-            dirs.push(default);
+            selections.push((default, None));
         }
     }
-    dirs
+    selections
 }
 
 /// Converts one error from the shared post-parse validation chain into a
@@ -2418,18 +2438,18 @@ models = "{models_glob}"
     /// Two pipelines pointing at one directory must not load it twice — the
     /// count is the project's model count, not a per-pipeline sum.
     ///
-    /// Mutation that must turn this red: drop the `!dirs.contains(&dir)` guard
-    /// in `transformation_models_dirs`.
+    /// Mutation that must turn this red: remove the post-load `seen_paths`
+    /// de-duplication.
     #[test]
     fn two_pipelines_sharing_a_models_directory_do_not_double_the_count() {
         let dir = tempfile::tempdir().unwrap();
-        // The second pipeline spells the same directory differently, which must
-        // still de-duplicate to one resolved path.
+        // The second pipeline overlaps the first but carries a distinct glob,
+        // so selection-level de-duplication alone is insufficient.
         let config_path = write_transformation_project(
             dir.path(),
             "models/**",
             "models",
-            "\n[pipeline.gold]\ntype = \"transformation\"\nmodels = \"models\"\n\n[pipeline.gold.target]\n",
+            "\n[pipeline.gold]\ntype = \"transformation\"\nmodels = \"models/order*.sql\"\n\n[pipeline.gold.target]\n",
         );
 
         let out = validate_inner(&config_path).unwrap();

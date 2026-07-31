@@ -1491,6 +1491,18 @@ pub fn parse_model_inline_with_context(
 /// directory-level defaults for `target.catalog`, `target.schema`,
 /// and `strategy`. Per-model sidecars override these defaults.
 pub fn load_models_from_dir(dir: &Path) -> Result<Vec<Model>, ModelError> {
+    load_models_from_dir_filtered(dir, |_| true)
+}
+
+/// Load models from one directory whose primary `.sql` paths satisfy
+/// `include`.
+///
+/// Filtering happens before a model or its sidecar is read, so an unrelated
+/// non-matching file cannot fail or broaden a glob-scoped compile.
+pub fn load_models_from_dir_filtered(
+    dir: &Path,
+    include: impl Fn(&Path) -> bool,
+) -> Result<Vec<Model>, ModelError> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -1517,7 +1529,7 @@ pub fn load_models_from_dir(dir: &Path) -> Result<Vec<Model>, ModelError> {
             if path.file_name()?.to_str()? == "_defaults.toml" {
                 return None;
             }
-            if path.extension()?.to_str()? == "sql" {
+            if path.extension()?.to_str()? == "sql" && include(&path) {
                 Some(path)
             } else {
                 None
@@ -1726,13 +1738,24 @@ struct SurrogateKeySidecar {
 pub fn load_surrogate_keys_from_dir(
     dir: &Path,
 ) -> Result<std::collections::HashMap<String, Vec<SurrogateKeySpec>>, ModelError> {
+    load_surrogate_keys_from_dir_filtered(dir, |_| true)
+}
+
+/// Load surrogate-key specs only for model source paths satisfying `include`.
+///
+/// Filtering happens before a model or its sidecar is read, so callers that
+/// compile a glob-selected model set do not reparse unrelated sidecars.
+pub fn load_surrogate_keys_from_dir_filtered(
+    dir: &Path,
+    include: impl Fn(&Path) -> bool,
+) -> Result<std::collections::HashMap<String, Vec<SurrogateKeySpec>>, ModelError> {
     let mut out = std::collections::HashMap::new();
     if !dir.exists() {
         return Ok(out);
     }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+        if path.extension().and_then(|e| e.to_str()) != Some("sql") || !include(&path) {
             continue;
         }
         let stem = path

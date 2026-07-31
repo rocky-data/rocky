@@ -41,14 +41,87 @@ pub enum ModelsDir {
     Absent(PathBuf),
 }
 
+/// Return the literal directory prefix of a `models` glob.
+///
+/// Wildcards apply to path components, so a wildcard-bearing component is not
+/// part of the directory prefix: both `models/*.sql` and
+/// `models/orders*.sql` resolve to `models`, while `models/staging/**`
+/// resolves to `models/staging`. A literal model source such as
+/// `models/orders.sql` also resolves to its parent directory. A wildcard in the
+/// first component keeps the historical `models` fallback.
+pub(crate) fn models_base(models_glob: &str, project_root: &Path) -> PathBuf {
+    if models_glob.is_empty() {
+        return PathBuf::from("models");
+    }
+    let Some(wildcard) = models_glob.find(&['*', '?', '['][..]) else {
+        let path = Path::new(models_glob);
+        if is_model_source(path) && !project_root.join(path).is_dir() {
+            return path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+        }
+        return PathBuf::from(models_glob);
+    };
+    let literal_prefix = &models_glob[..wildcard];
+    let base = if literal_prefix.ends_with(['/', '\\']) {
+        Path::new(literal_prefix)
+    } else {
+        Path::new(literal_prefix)
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+    };
+    if base.as_os_str().is_empty() {
+        PathBuf::from("models")
+    } else {
+        base.to_path_buf()
+    }
+}
+
+/// Resolve a model-file glob relative to its config file.
+pub(crate) fn resolved_models_glob(models_glob: &str, config_path: &Path) -> String {
+    let project_root = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let effective_glob = if models_glob.is_empty() {
+        PathBuf::from("models/**")
+    } else if models_glob
+        .find(&['*', '?', '['][..])
+        .is_some_and(|wildcard| !models_glob[..wildcard].contains(['/', '\\']))
+    {
+        // A wildcard in the first component uses the historical `models`
+        // base. Match against that same base rather than the project root.
+        Path::new("models").join(models_glob)
+    } else {
+        PathBuf::from(models_glob)
+    };
+    let resolved = project_root.join(&effective_glob);
+    if effective_glob
+        .to_string_lossy()
+        .contains(&['*', '?', '['][..])
+        || (is_model_source(&effective_glob) && !resolved.is_dir())
+    {
+        resolved
+    } else {
+        resolved.join("**")
+    }
+    .to_string_lossy()
+    .into_owned()
+}
+
+fn is_model_source(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("sql" | "rocky")
+    )
+}
+
 /// Derive a `models` glob's base directory and confine it to the project root,
 /// without deciding what an absent directory means.
 ///
-/// The base is the leading run of characters before the first wildcard, so
-/// `models/**` and `models/*.sql` both resolve to `models`. Splitting on `**`
-/// alone leaves `models/*.sql` intact and then probes it as a literal directory,
-/// which never exists — the pipeline contributes no models and the caller sees an
-/// empty, apparently-successful result (#1268).
+/// The base contains the literal path components before the first
+/// wildcard-bearing component, so `models/**`, `models/*.sql`, and
+/// `models/orders*.sql` all resolve to `models`. Taking every literal character
+/// before the wildcard instead leaves the last form as `models/orders` and
+/// probes it as a directory, so the pipeline silently contributes no models.
 ///
 /// A glob that is *all* wildcard (`**/*.sql`) has an empty base, which falls
 /// back to `models` rather than the project root. That fallback was previously
@@ -58,18 +131,12 @@ pub enum ModelsDir {
 /// `models`. Execution therefore loaded one directory while the **policy** target
 /// map was built from another, and a missing mapping leaves a target evaluated
 /// against default attributes (see `apply::resolve_touched_apply_targets`). All
-/// five sites now agree.
+/// consumers now agree.
 ///
-/// `resolve_models_dir` (its `Option`-returning wrapper), `run`'s session gate and
-/// `validate` consume this, so a glob cannot be understood one way when deciding
-/// whether to build and another way when building.
-///
-/// **Containment is not universal.** This function and `scope.rs` confine the
-/// base to the project root; `branch promote` (`branch.rs`) joins and loads it
-/// without confinement, so it still consumes a glob that `run` and `validate`
-/// now refuse. `gc` and `apply` are deliberately left infallible — they feed the
-/// policy target map, where an error that empties the map is a fail-open rather
-/// than a fix.
+/// `resolve_models_dir` (its `Option`-returning wrapper), execution, validation,
+/// scope, branch, and the policy/apply paths all consume this, so a glob cannot
+/// be understood or confined one way when deciding what to build and another
+/// way when building it.
 pub fn locate_models_dir(models_glob: &str, config_path: &Path) -> Result<ModelsDir> {
     // `Path::new("rocky.toml").parent()` is `Some("")`, not `None`, and an empty
     // path fails to canonicalize — normalize it to the cwd so a relative default
@@ -78,12 +145,7 @@ pub fn locate_models_dir(models_glob: &str, config_path: &Path) -> Result<Models
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let models_base = models_glob
-        .split(&['*', '?', '['][..])
-        .next()
-        .filter(|base| !base.is_empty())
-        .unwrap_or("models");
-    let models_dir = project_root.join(models_base.trim_end_matches('/'));
+    let models_dir = project_root.join(models_base(models_glob, project_root));
     if !models_dir.exists() {
         return Ok(ModelsDir::Absent(models_dir));
     }
@@ -155,6 +217,35 @@ pub fn load_project_models(models_dir: &Path) -> Result<Vec<Model>> {
     }
 }
 
+/// Load only project models whose primary source path matches `models_glob`.
+pub fn load_project_models_matching(models_dir: &Path, models_glob: &str) -> Result<Vec<Model>> {
+    let load = |dir: &Path| {
+        rocky_compiler::project::load_dir_models_matching(dir, models_glob)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("failed to load models from {}", dir.display()))
+    };
+    let (models, mut errors) = load_project_models_partial_with(models_dir, &load);
+    if errors.is_empty() {
+        Ok(models)
+    } else {
+        Err(errors.remove(0))
+    }
+}
+
+/// Load every matching model that parses and return one error per directory
+/// that failed.
+pub fn load_project_models_matching_partial(
+    models_dir: &Path,
+    models_glob: &str,
+) -> (Vec<Model>, Vec<anyhow::Error>) {
+    let load = |dir: &Path| {
+        rocky_compiler::project::load_dir_models_matching(dir, models_glob)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .with_context(|| format!("failed to load models from {}", dir.display()))
+    };
+    load_project_models_partial_with(models_dir, &load)
+}
+
 /// Load everything that loads, returning the models plus one error per
 /// directory that failed.
 ///
@@ -174,10 +265,17 @@ pub fn load_project_models(models_dir: &Path) -> Result<Vec<Model>> {
 /// Strict callers should use [`load_project_models`], which surfaces the first
 /// error instead.
 pub fn load_project_models_partial(models_dir: &Path) -> (Vec<Model>, Vec<anyhow::Error>) {
+    load_project_models_partial_with(models_dir, &load_one_dir)
+}
+
+fn load_project_models_partial_with(
+    models_dir: &Path,
+    load_one: &impl Fn(&Path) -> Result<Vec<Model>>,
+) -> (Vec<Model>, Vec<anyhow::Error>) {
     let mut all = Vec::new();
     let mut errors = Vec::new();
 
-    match load_one_dir(models_dir) {
+    match load_one(models_dir) {
         Ok(models) => all.extend(models),
         Err(e) => errors.push(e),
     }
@@ -210,7 +308,7 @@ pub fn load_project_models_partial(models_dir: &Path) -> (Vec<Model>, Vec<anyhow
     subdirs.sort();
 
     for subdir in subdirs {
-        match load_one_dir(&subdir) {
+        match load_one(&subdir) {
             Ok(models) => all.extend(models),
             Err(e) => errors.push(e),
         }
@@ -306,6 +404,22 @@ mod tests {
         assert_eq!(names, ["top"]);
     }
 
+    #[test]
+    fn matching_load_skips_metadata_in_a_directory_with_no_matching_models() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "orders");
+        write_model(&models.join("excluded"), "customers");
+        write(&models.join("excluded/_defaults.toml"), "target = [\n");
+        let glob = models.join("orders*.sql").to_string_lossy().into_owned();
+
+        let loaded = load_project_models_matching(&models, &glob)
+            .expect("metadata belonging only to excluded models must not be parsed");
+
+        let names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        assert_eq!(names, ["orders"]);
+    }
+
     /// `models` is documented as a glob, not a directory. Deriving the base by
     /// splitting on `**` alone leaves `models/*.sql` intact, which is then
     /// probed as a literal directory, never exists, and silently contributes no
@@ -322,6 +436,9 @@ mod tests {
         for (glob, expected) in [
             ("models/**", Some("models")),
             ("models/*.sql", Some("models")),
+            ("models/orders*.sql", Some("models")),
+            ("models/staging/orders*.sql", Some("models/staging")),
+            ("transforms/stag*/orders.sql", Some("transforms")),
             ("models/staging/**", Some("models/staging")),
             ("models", Some("models")),
             ("transforms/**", Some("transforms")),
@@ -335,6 +452,59 @@ mod tests {
                 "glob {glob:?}"
             );
         }
+    }
+
+    #[test]
+    fn base_derivation_keeps_fallback_and_absolute_root_semantics() {
+        let root = Path::new("/project");
+        assert_eq!(models_base("", root), Path::new("models"));
+        assert_eq!(models_base("orders*.sql", root), Path::new("models"));
+        assert_eq!(models_base("/orders*.sql", root), Path::new("/"));
+        assert_eq!(models_base("models/orders.sql", root), Path::new("models"));
+        assert_eq!(models_base("orders.sql", root), Path::new(""));
+        assert_eq!(models_base("/orders.rocky", root), Path::new("/"));
+    }
+
+    #[test]
+    fn a_leading_wildcard_matches_inside_the_models_fallback() {
+        let resolved = resolved_models_glob("ord*.sql", Path::new("/project/rocky.toml"));
+        assert_eq!(resolved, "/project/models/ord*.sql");
+
+        let recursive = resolved_models_glob("**/*.sql", Path::new("/project/rocky.toml"));
+        assert_eq!(recursive, "/project/models/**/*.sql");
+    }
+
+    #[test]
+    fn a_literal_model_file_remains_an_exact_glob() {
+        assert_eq!(
+            resolved_models_glob("models/orders.sql", Path::new("/project/rocky.toml")),
+            "/project/models/orders.sql"
+        );
+        assert_eq!(
+            resolved_models_glob("orders.rocky", Path::new("/project/rocky.toml")),
+            "/project/orders.rocky"
+        );
+        assert_eq!(
+            resolved_models_glob("", Path::new("/project/rocky.toml")),
+            "/project/models/**"
+        );
+    }
+
+    #[test]
+    fn a_literal_directory_with_a_model_extension_remains_a_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models.sql");
+        std::fs::create_dir_all(&models).expect("mkdir models.sql");
+        let config = tmp.path().join("rocky.toml");
+
+        assert_eq!(
+            models_base("models.sql", tmp.path()),
+            Path::new("models.sql")
+        );
+        assert_eq!(
+            resolved_models_glob("models.sql", &config),
+            models.join("**").to_string_lossy()
+        );
     }
 
     /// `Absent` carries the path it decided against, which `run` reports and
@@ -393,7 +563,8 @@ mod tests {
         let config = root.join("rocky.toml");
         std::fs::write(&config, "").expect("write config");
 
-        let err = resolve_models_dir("../outside/**", &config).expect_err("escape must be refused");
+        let err = resolve_models_dir("../outside/order*.sql", &config)
+            .expect_err("literal-prefix escape must be refused");
         assert!(
             format!("{err:#}").contains("outside the project root"),
             "unexpected error: {err:#}"

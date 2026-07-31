@@ -1109,34 +1109,20 @@ fn discover_transformation_branch_targets(
         }
     }
 
-    // Models directory is relative to the config file's parent — same
-    // resolution rule as `scope::resolve_transformation_managed_tables` and
-    // `run_local::run_transformation`.
-    let project_root = config_path.parent().unwrap_or(Path::new("."));
-    // `.filter` before `.unwrap_or`: `split` yields `Some("")` for an all-wildcard
-    // glob, never `None`, so without it the fallback is unreachable and the empty
-    // base joins to the project root — a different directory from the one `gc`
-    // and `apply` derive for the same glob.
-    let models_base = pipeline
-        .models
-        .split(&['*', '?', '['][..])
-        .next()
-        .filter(|base| !base.is_empty())
-        .unwrap_or("models");
-    let models_dir = project_root.join(models_base.trim_end_matches('/'));
-
-    if !models_dir.exists() {
-        anyhow::bail!(
+    let models_dir = match crate::models_loader::locate_models_dir(&pipeline.models, config_path)? {
+        crate::models_loader::ModelsDir::Present(dir) => dir,
+        crate::models_loader::ModelsDir::Absent(dir) => anyhow::bail!(
             "models directory '{}' does not exist — transformation-pipeline `branch promote` \
              requires the project's `models` glob to resolve to an on-disk directory",
-            models_dir.display()
-        );
-    }
+            dir.display()
+        ),
+    };
 
     // Load the same way `rocky list models` does: top-level files plus
     // immediate subdirectories (incl. `.rocky` DSL). Keeps behavior consistent
     // with the rest of the transformation surface (run, plan, list).
-    let all_models = crate::models_loader::load_project_models(&models_dir)?;
+    let models_glob = crate::models_loader::resolved_models_glob(&pipeline.models, config_path);
+    let all_models = crate::models_loader::load_project_models_matching(&models_dir, &models_glob)?;
 
     let shadow_cfg = ShadowConfig {
         suffix: "_rocky_shadow".to_string(),
@@ -2807,7 +2793,7 @@ path = ":memory:"
 
 [pipeline.t]
 type = "transformation"
-models = "models/**"
+models = "models/fct*.sql"
 
 [pipeline.t.target]
 adapter = "default"
@@ -2839,11 +2825,11 @@ adapter = "default"
             .await
             .expect("transformation-pipeline branch promote enumeration must succeed");
 
-        // Two models → two planned promote targets.
+        // The literal-prefix glob selects only fct_orders.
         assert_eq!(
             planned.len(),
-            2,
-            "expected 2 planned targets, got {planned:?}",
+            1,
+            "expected 1 planned target, got {planned:?}",
             planned = planned.len()
         );
 
@@ -2859,10 +2845,49 @@ adapter = "default"
             "fct_orders pairing missing: {fqns:?}"
         );
         assert!(
-            fqns.contains(
-                "warehouse.marts.dim_customers <- warehouse.branch__fix-price.dim_customers"
-            ),
-            "dim_customers pairing missing: {fqns:?}"
+            !fqns.iter().any(|target| target.contains("dim_customers")),
+            "nonmatching model must not be promoted: {fqns:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transformation_branch_targets_refuse_an_escaping_literal_prefix_glob() {
+        let tmp = TempDir::new().unwrap();
+        let project = tmp.path().join("project");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        write_transformation_model(
+            &outside,
+            "orders",
+            "warehouse",
+            "marts",
+            "orders",
+            "SELECT 1 AS id",
+        );
+        let config_path = project.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.t]
+type = "transformation"
+models = "../outside/ord*.sql"
+
+[pipeline.t.target]
+adapter = "default"
+"#,
+        )
+        .unwrap();
+
+        let error = discover_branch_targets(&config_path, &sample_record("fix-price"), None, None)
+            .await
+            .expect_err("branch target discovery must refuse an out-of-project glob");
+        assert!(
+            format!("{error:#}").contains("outside the project root"),
+            "unexpected error: {error:#}"
         );
     }
 

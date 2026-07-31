@@ -9,6 +9,12 @@
 //!   and exited 0 having built nothing. The assertion is on the **table in the
 //!   warehouse**, not on a planned materialization — a run that plans work and
 //!   builds none is exactly the failure being closed.
+//! - **`models = "models/ord*.sql"` materializes its models.** RED before
+//!   #1293: the shared derivation retained the literal filename prefix and
+//!   probed `models/ord` as a directory.
+//! - **`models = "models/orders.sql"` materializes exactly that model.** A
+//!   wildcard-free model path is still a valid file glob; it must not be
+//!   treated as a directory and expanded to `models/orders.sql/**`.
 //! - **A glob resolving outside the project root is refused.** This is a new
 //!   refusal surface, so it is probed rather than assumed: the escaping
 //!   directory really contains a loadable model, so a run that does not refuse
@@ -27,23 +33,23 @@ use std::sync::Arc;
 
 use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
-/// Count tables named `orders` in `main`, the target every fixture here writes.
-async fn orders_tables(db: &Path) -> u64 {
+/// Count a named table in `main`.
+async fn named_tables(db: &Path, table: &str) -> u64 {
     let adapter = DuckDbWarehouseAdapter::open(db).expect("verify open");
     let conn = adapter.shared_connector();
     let guard = conn.lock().unwrap();
     let out = guard
-        .execute_sql(
+        .execute_sql(&format!(
             "SELECT COUNT(*) FROM information_schema.tables \
-             WHERE table_schema = 'main' AND table_name = 'orders'",
-        )
+             WHERE table_schema = 'main' AND table_name = '{table}'"
+        ))
         .expect("information_schema query");
     rocky_core::checks::cell_as_u64(out.rows[0].first())
         .unwrap_or_else(|| panic!("expected integer cell, got {:?}", out.rows[0][0]))
 }
 
-/// A transformation project whose single model selects a literal, so nothing
-/// needs seeding. `models_glob` is the field under test.
+/// A transformation project whose models select literals, so nothing needs
+/// seeding. `models_glob` is the field under test.
 fn write_project(root: &Path, db: &Path, models_glob: &str, models_dir: &Path) {
     std::fs::create_dir_all(models_dir).expect("mkdir models");
     std::fs::write(
@@ -63,6 +69,18 @@ fn write_project(root: &Path, db: &Path, models_glob: &str, models_dir: &Path) {
         ),
     )
     .expect("write sidecar");
+    std::fs::write(
+        models_dir.join("customers.sql"),
+        "SELECT 2 AS id, 'customer' AS name\n",
+    )
+    .expect("write non-matching sql");
+    std::fs::write(
+        models_dir.join("customers.toml"),
+        format!(
+            "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"{catalog}\"\nschema = \"main\"\n"
+        ),
+    )
+    .expect("write non-matching sidecar");
     std::fs::write(
         root.join("rocky.toml"),
         format!(
@@ -120,6 +138,40 @@ async fn run_pipeline(config_path: &Path, state_path: &Path) -> anyhow::Result<(
     .await
 }
 
+/// Invoke the model-scoped path used by `rocky run --pipeline silver --model
+/// orders`, still without a `--models` override.
+async fn run_pipeline_model(config_path: &Path, state_path: &Path) -> anyhow::Result<()> {
+    let loaded = Arc::new(
+        rocky_core::config::load_rocky_config_fingerprinted(config_path).expect("load config"),
+    );
+    rocky_cli::commands::run(
+        config_path,
+        loaded,
+        None,
+        Some("silver"),
+        state_path,
+        None,
+        false,
+        None,
+        false,
+        None,
+        false,
+        None,
+        &rocky_cli::commands::PartitionRunOptions::default(),
+        Some("orders"),
+        None,
+        None,
+        None,
+        &rocky_cli::commands::DeferOptions::default(),
+        &rocky_cli::commands::SkipRunOptions::default(),
+        &rocky_core::run_vars::RunVars::new(),
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
 /// `models = "models/*.sql"` is a supported glob shape. Before #1268 the base
 /// derivation split on `**` alone, so this project built nothing and reported
 /// success.
@@ -138,11 +190,116 @@ async fn a_wildcard_file_glob_materializes_its_models() {
         .expect("the run must succeed");
 
     assert_eq!(
-        orders_tables(&db).await,
+        named_tables(&db, "orders").await,
         1,
         "a `models/*.sql` glob must materialize its model; 0 means the base \
          derivation took the Absent branch and the run silently built nothing"
     );
+}
+
+/// A literal prefix in the wildcard-bearing filename component is not a
+/// directory component. Before #1293 this resolved to the nonexistent
+/// `models/ord` directory and the run reported success without building.
+///
+/// Mutation that must turn this red: restore the old split-at-first-wildcard
+/// implementation in `models_base`.
+#[tokio::test]
+async fn a_literal_prefix_file_glob_materializes_its_models() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let db = root.join("wh.duckdb");
+    write_project(root, &db, "models/ord*.sql", &root.join("models"));
+    std::fs::write(root.join("models/customers.toml"), "name = [\n")
+        .expect("break the non-matching sidecar");
+    run_pipeline(&root.join("rocky.toml"), &root.join(".rocky-state.redb"))
+        .await
+        .expect("the run must succeed");
+
+    assert_eq!(
+        named_tables(&db, "orders").await,
+        1,
+        "a `models/ord*.sql` glob must materialize its model; 0 means the \
+         literal filename prefix was mistaken for a directory"
+    );
+    assert_eq!(
+        named_tables(&db, "customers").await,
+        0,
+        "a non-matching model must not be materialized"
+    );
+}
+
+/// A literal path to one model source is a valid glob pattern. The selector
+/// must use its parent as the load base and preserve the path as an exact
+/// match, rather than probing the `.sql` file as a directory.
+#[tokio::test]
+async fn a_literal_model_file_glob_materializes_only_that_model() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let db = root.join("wh.duckdb");
+    write_project(root, &db, "models/orders.sql", &root.join("models"));
+
+    run_pipeline(&root.join("rocky.toml"), &root.join(".rocky-state.redb"))
+        .await
+        .expect("the run must succeed");
+
+    assert_eq!(named_tables(&db, "orders").await, 1);
+    assert_eq!(
+        named_tables(&db, "customers").await,
+        0,
+        "an exact model-file glob must not broaden to sibling models"
+    );
+}
+
+#[tokio::test]
+async fn a_literal_model_file_glob_works_with_a_relative_config_path() {
+    let cwd = std::env::current_dir().expect("cwd");
+    let dir = tempfile::tempdir_in(&cwd).expect("tempdir in cwd");
+    let root = dir.path();
+    let relative_root = root.strip_prefix(&cwd).expect("tempdir below cwd");
+    let db = root.join("wh.duckdb");
+    write_project(root, &db, "models/orders.sql", &root.join("models"));
+
+    run_pipeline(
+        &relative_root.join("rocky.toml"),
+        &root.join(".rocky-state.redb"),
+    )
+    .await
+    .expect("a config-relative exact glob must match config-relative model paths");
+
+    assert_eq!(named_tables(&db, "orders").await, 1);
+    assert_eq!(named_tables(&db, "customers").await, 0);
+}
+
+#[tokio::test]
+async fn a_literal_directory_named_with_a_model_extension_remains_a_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let db = root.join("wh.duckdb");
+    write_project(root, &db, "models.sql", &root.join("models.sql"));
+
+    run_pipeline(&root.join("rocky.toml"), &root.join(".rocky-state.redb"))
+        .await
+        .expect("an existing models.sql directory must retain directory semantics");
+
+    assert_eq!(named_tables(&db, "orders").await, 1);
+    assert_eq!(named_tables(&db, "customers").await, 1);
+}
+
+#[tokio::test]
+async fn a_model_scoped_run_honors_the_pipelines_literal_prefix_glob() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let db = root.join("wh.duckdb");
+    write_project(root, &db, "models/ord*.sql", &root.join("models"));
+    std::fs::write(root.join("models/customers.toml"), "name = [\n")
+        .expect("break the non-matching sidecar");
+
+    run_pipeline_model(&root.join("rocky.toml"), &root.join(".rocky-state.redb"))
+        .await
+        .expect("the model-scoped run must ignore the non-matching sidecar");
+
+    assert_eq!(named_tables(&db, "orders").await, 1);
+    assert_eq!(named_tables(&db, "customers").await, 0);
 }
 
 /// The `**` form must keep working — the fix is a widening of which shapes
@@ -158,7 +315,11 @@ async fn the_recursive_glob_form_still_materializes() {
         .await
         .expect("the run must succeed");
 
-    assert_eq!(orders_tables(&db).await, 1, "`models/**` must still build");
+    assert_eq!(
+        named_tables(&db, "orders").await,
+        1,
+        "`models/**` must still build"
+    );
 }
 
 /// A `models` glob pointing outside the project root is refused, not executed.

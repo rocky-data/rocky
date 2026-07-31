@@ -34,7 +34,7 @@
 //! no model filter so the engine's existing replication arm executes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
@@ -250,7 +250,6 @@ async fn run_apply_run_plan(
     // gated as agent; a human applier resolves to human (humans are ungated in
     // v0). Enforcement uses the apply-time runtime principal, not the plan's
     // stored (tamperable) field. Absent `[policy]` this is a no-op.
-    let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     // THE single fingerprinted config snapshot for this apply (#1120): the
     // replication-only check, the pre-gate sync decision, the policy gate,
     // `execute_run_plan`'s preflight/seam reads, AND `run()`'s execution all
@@ -270,13 +269,14 @@ async fn run_apply_run_plan(
             )
         })?,
     );
+    let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     // Finding #1: a replication-only plan runs NO models, so it gates none.
     let executable = if is_replication_only(&loaded.config, &run_plan) {
         Vec::new()
     } else {
-        run_executable_models(models_dir, &run_plan)
+        run_executable_models(&models_dir, models_glob.as_deref(), &run_plan)
     };
     let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.enforcement_principal(runtime_principal);
@@ -288,12 +288,13 @@ async fn run_apply_run_plan(
     // marker-only freeze (its ledger row erased by a concurrent state upload)
     // must still deny at this gate. Same guard, fail-closed on transport error.
     let marker_freezes = marker_freezes_before_gate(&loaded.config, &touched).await?;
-    let gate = evaluate_apply_policy_with_policy(
+    let gate = evaluate_apply_policy_with_policy_matching(
         loaded.config.policy.as_ref(),
         plan_id,
         principal,
         &touched,
-        models_dir,
+        &models_dir,
+        models_glob.as_deref(),
         state_path,
         &marker_freezes,
     );
@@ -305,7 +306,8 @@ async fn run_apply_run_plan(
         loaded.config.policy.as_ref(),
         principal,
         &touched,
-        models_dir,
+        &models_dir,
+        models_glob.as_deref(),
     );
 
     // Finding 3 (pre-run half): the plain rule decision the gate just recorded
@@ -847,14 +849,21 @@ pub enum PolicyGate {
 /// `models_dir`, mirroring `rocky policy check`: `classifications` is the
 /// distinct column-classification set, `layer` is the `layer` tag, and
 /// `contracted` is the presence of a sibling `.contract.toml`.
-fn model_attributes(models_dir: &Path) -> BTreeMap<String, ModelAttributes> {
+fn model_attributes(
+    models_dir: &Path,
+    models_glob: Option<&str>,
+) -> BTreeMap<String, ModelAttributes> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         ..Default::default()
     };
-    let Ok(result) = compile::compile(&config) else {
+    let result = match models_glob {
+        Some(glob) => compile::compile_matching(&config, glob),
+        None => compile::compile(&config),
+    };
+    let Ok(result) = result else {
         return BTreeMap::new();
     };
 
@@ -1193,10 +1202,34 @@ pub fn evaluate_apply_policy_with_policy(
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
 ) -> PolicyGate {
-    let (policy, attrs_map) = match resolve_policy_and_attrs(policy, touched, models_dir) {
-        Ok(pair) => pair,
-        Err(gate) => return gate,
-    };
+    evaluate_apply_policy_with_policy_matching(
+        policy,
+        plan_id,
+        principal,
+        touched,
+        models_dir,
+        None,
+        state_path,
+        marker_freezes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn evaluate_apply_policy_with_policy_matching(
+    policy: Option<&rocky_core::config::PolicyConfig>,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    state_path: &Path,
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
+) -> PolicyGate {
+    let (policy, attrs_map) =
+        match resolve_policy_and_attrs(policy, touched, models_dir, models_glob) {
+            Ok(pair) => pair,
+            Err(gate) => return gate,
+        };
 
     // Snapshot the decision ledger *before* this apply writes any rows, so the
     // dynamic breakers (autonomy-budget burn, active freezes) reflect only
@@ -1348,22 +1381,25 @@ fn fail_closed_budget_gate(touched: &BTreeMap<String, PolicyCapability>, why: &s
 /// `deny` for *every* agent replication, even under `allow`. So the snapshot
 /// and the decision-row writes both go through the caller's already-open
 /// `ledger`, never a fresh open.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_apply_policy_with_store(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
+    models_glob: Option<&str>,
     ledger: &StateStore,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
 ) -> PolicyGate {
     // Finding 1: takes the SAME `[policy]` snapshot `run` already holds (its L1212
     // `rocky_cfg`), not a reload — the in-run replication gate must evaluate the
     // config `run` executed against, not one a mid-run `rocky.toml` swap points at.
-    let (policy, attrs_map) = match resolve_policy_and_attrs(policy, touched, models_dir) {
-        Ok(pair) => pair,
-        Err(gate) => return gate,
-    };
+    let (policy, attrs_map) =
+        match resolve_policy_and_attrs(policy, touched, models_dir, models_glob) {
+            Ok(pair) => pair,
+            Err(gate) => return gate,
+        };
 
     // Snapshot + record through the held handle. A genuine list error (real
     // corruption, not an in-process collision) still fails closed for agents.
@@ -1399,6 +1435,7 @@ fn resolve_policy_and_attrs(
     policy: Option<&rocky_core::config::PolicyConfig>,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
+    models_glob: Option<&str>,
 ) -> std::result::Result<
     (
         rocky_core::config::PolicyConfig,
@@ -1415,7 +1452,7 @@ fn resolve_policy_and_attrs(
     if touched.is_empty() {
         return Err(PolicyGate::Allow);
     }
-    Ok((policy.clone(), model_attributes(models_dir)))
+    Ok((policy.clone(), model_attributes(models_dir, models_glob)))
 }
 
 /// The per-model evaluation loop shared by [`evaluate_apply_policy`] and
@@ -1561,22 +1598,67 @@ fn touched_models_for_run(
     plan.embedded_capabilities().touched(executable_models)
 }
 
+/// Resolve the model directory and file glob the run executor will use.
+fn run_model_selection(
+    config: &rocky_core::config::RockyConfig,
+    config_path: &Path,
+    run_plan: &RunPlan,
+) -> Result<(PathBuf, Option<String>)> {
+    // Model-only execution gives an explicit `--models` directory precedence
+    // over the owning pipeline's configured glob. The apply-time gate must make
+    // the same choice or it can evaluate one same-named model's attributes and
+    // execute another.
+    if run_plan.model.is_some()
+        && let Some(models_dir) = run_plan.models_dir.as_deref()
+    {
+        return Ok((PathBuf::from(models_dir), None));
+    }
+
+    let pipeline = match run_plan.pipeline.as_deref() {
+        Some(name) => config.pipelines.get(name),
+        None => config.pipelines.values().find(|pipeline| {
+            matches!(
+                pipeline,
+                rocky_core::config::PipelineConfig::Transformation(_)
+            )
+        }),
+    };
+    if let Some(rocky_core::config::PipelineConfig::Transformation(tx)) = pipeline {
+        let models_dir = match crate::models_loader::locate_models_dir(&tx.models, config_path)? {
+            crate::models_loader::ModelsDir::Present(dir)
+            | crate::models_loader::ModelsDir::Absent(dir) => dir,
+        };
+        let models_glob = crate::models_loader::resolved_models_glob(&tx.models, config_path);
+        return Ok((models_dir, Some(models_glob)));
+    }
+
+    Ok((
+        PathBuf::from(run_plan.models_dir.as_deref().unwrap_or("models")),
+        None,
+    ))
+}
+
 /// Re-derive the set of models a `Run` / `AiAuthored` apply will actually
-/// execute, the same way the run does: compile `models_dir` and keep only the
-/// models the plan's `--model` selection targets (all of them when unset).
+/// execute, using the same directory, file glob, and `--model` selection.
 ///
-/// The plan's persisted `models` list is *informational* (serde-default,
-/// re-derived at apply via recompile), so the gate must recompute the real
-/// execution selection rather than trust it. A compile failure here yields an
-/// empty set — the apply's own recompile will fail identically and execute
-/// nothing, so there is nothing to gate.
-fn run_executable_models(models_dir: &Path, run_plan: &RunPlan) -> Vec<String> {
+/// The plan's persisted `models` list is informational, so the gate recompiles
+/// the real execution selection. A compile failure yields an empty set because
+/// the apply's own recompile will fail identically and execute nothing.
+fn run_executable_models(
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    run_plan: &RunPlan,
+) -> Vec<String> {
     use rocky_compiler::compile::{self, CompilerConfig};
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         ..Default::default()
     };
-    let Ok(result) = compile::compile(&config) else {
+    let result = match models_glob {
+        Some(glob) => compile::compile_matching(&config, glob),
+        None => compile::compile(&config),
+    };
+    let Ok(result) = result else {
         return Vec::new();
     };
     result
@@ -1617,6 +1699,7 @@ fn run_executable_models(models_dir: &Path, run_plan: &RunPlan) -> Vec<String> {
 fn touched_models_for_promote(
     promote: &PromotePlan,
     models_dir: &Path,
+    models_glob: Option<&str>,
 ) -> BTreeMap<String, PolicyCapability> {
     // The full executable target set: every SQL target plus every target a
     // finding named (a finding target may, in principle, not appear in
@@ -1631,7 +1714,7 @@ fn touched_models_for_promote(
     if target_fqns.is_empty() {
         return BTreeMap::new();
     }
-    let target_to_name = compile_target_to_name(models_dir);
+    let target_to_name = compile_target_to_name(models_dir, models_glob);
     target_fqns
         .into_iter()
         .map(|fqn| {
@@ -2197,13 +2280,15 @@ impl GovernedRunContext<'_> {
         // No compiled model dir for replication targets — evaluate against
         // bare-named attributes (a nonexistent dir yields an empty attr map, so
         // every target matches by name / the default posture).
-        let models_dir = resolve_config_models_dir(self.config_path, Some(cfg));
+        let models_dir = resolve_confined_config_models_dir(self.config_path, Some(cfg))?;
+        let models_glob = resolve_config_models_glob(self.config_path, Some(cfg));
         let gate = evaluate_apply_policy_with_store(
             cfg.policy.as_ref(),
             self.plan_id,
             self.principal,
             &touched,
             &models_dir,
+            models_glob.as_deref(),
             ledger,
             marker_freezes,
         );
@@ -2216,8 +2301,13 @@ impl GovernedRunContext<'_> {
         // forced run id, and the outer frame consumes this set through
         // `run_verify_after`. Absent/failed checks therefore halt fail-closed
         // after the mutation, matching the transformation contract.
-        let required =
-            required_verify_after(cfg.policy.as_ref(), self.principal, &touched, &models_dir);
+        let required = required_verify_after(
+            cfg.policy.as_ref(),
+            self.principal,
+            &touched,
+            &models_dir,
+            models_glob.as_deref(),
+        );
         self.replication_verify_after
             .lock()
             .map_err(|_| {
@@ -2276,8 +2366,13 @@ pub(crate) fn gate_promote_plan(
             )
         })?,
     );
-    let promote_models_dir = resolve_config_models_dir(config_path, Some(&loaded.config));
-    let touched = touched_models_for_promote(promote_plan, &promote_models_dir);
+    let promote_models_dir = resolve_confined_config_models_dir(config_path, Some(&loaded.config))?;
+    let promote_models_glob = resolve_config_models_glob(config_path, Some(&loaded.config));
+    let touched = touched_models_for_promote(
+        promote_plan,
+        &promote_models_dir,
+        promote_models_glob.as_deref(),
+    );
     // Finding 4-apply: pull the authoritative remote freeze/budget ledger before
     // the gate reads it, so a cross-pod freeze is enforced. Placed inside the
     // shared gate so BOTH promote entry points (`rocky apply <promote>` and
@@ -2287,12 +2382,13 @@ pub(crate) fn gate_promote_plan(
     // Durable freeze-marker LIST beside the ledger sync — one blocking seam
     // covers both promote entry points (same guard, fail-closed).
     let marker_freezes = marker_freezes_before_gate_blocking(&loaded.config, &touched)?;
-    let gate = evaluate_apply_policy_with_policy(
+    let gate = evaluate_apply_policy_with_policy_matching(
         loaded.config.policy.as_ref(),
         plan_id,
         principal,
         &touched,
         &promote_models_dir,
+        promote_models_glob.as_deref(),
         state_path,
         &marker_freezes,
     );
@@ -2301,10 +2397,10 @@ pub(crate) fn gate_promote_plan(
 }
 
 /// Resolve the models directory for the promote gate from an ALREADY-LOADED
-/// config snapshot: the first transformation pipeline's `models` glob base
-/// (everything before the first wildcard), relative to `config_path`'s parent.
-/// Falls back to `<project>/models` when the snapshot is `None` or declares no
-/// transformation pipeline. Mirrors the backfill/gc resolution.
+/// config snapshot: the complete literal directory components in the first
+/// transformation pipeline's `models` glob, relative to `config_path`'s
+/// parent. Falls back to `<project>/models` when the snapshot is `None` or
+/// declares no transformation pipeline. Mirrors the backfill/gc resolution.
 ///
 /// Finding 1: takes the snapshot rather than reloading `rocky.toml`, so a
 /// governed path resolves the models dir from the SAME config it gates on.
@@ -2319,24 +2415,64 @@ fn resolve_config_models_dir(
             _ => None,
         })
     });
-    let base = glob
-        .as_deref()
-        .and_then(|g| g.split(&['*', '?', '['][..]).next())
-        .filter(|b| !b.is_empty())
-        .unwrap_or("models");
-    project_root.join(base.trim_end_matches('/'))
+    project_root.join(
+        glob.as_deref()
+            .map(|glob| crate::models_loader::models_base(glob, project_root))
+            .unwrap_or_else(|| std::path::PathBuf::from("models")),
+    )
+}
+
+pub(crate) fn resolve_config_models_glob(
+    config_path: &Path,
+    cfg: Option<&rocky_core::config::RockyConfig>,
+) -> Option<String> {
+    cfg.and_then(|cfg| {
+        cfg.pipelines.values().find_map(|pipeline| match pipeline {
+            rocky_core::config::PipelineConfig::Transformation(tx) => Some(
+                crate::models_loader::resolved_models_glob(&tx.models, config_path),
+            ),
+            _ => None,
+        })
+    })
+}
+
+pub(crate) fn resolve_confined_config_models_dir(
+    config_path: &Path,
+    cfg: Option<&rocky_core::config::RockyConfig>,
+) -> Result<PathBuf> {
+    if let Some(models_glob) = cfg.and_then(|cfg| {
+        cfg.pipelines.values().find_map(|pipeline| match pipeline {
+            rocky_core::config::PipelineConfig::Transformation(tx) => Some(tx.models.as_str()),
+            _ => None,
+        })
+    }) {
+        return Ok(
+            match crate::models_loader::locate_models_dir(models_glob, config_path)? {
+                crate::models_loader::ModelsDir::Present(dir)
+                | crate::models_loader::ModelsDir::Absent(dir) => dir,
+            },
+        );
+    }
+    Ok(resolve_config_models_dir(config_path, cfg))
 }
 
 /// Compile `models_dir` and map each model's `target.full_name()` to its
 /// logical name (`config.name`). Used to translate breaking-change findings
 /// (keyed by target) into the model names the policy scope matches on.
-fn compile_target_to_name(models_dir: &Path) -> BTreeMap<String, String> {
+fn compile_target_to_name(
+    models_dir: &Path,
+    models_glob: Option<&str>,
+) -> BTreeMap<String, String> {
     use rocky_compiler::compile::{self, CompilerConfig};
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         ..Default::default()
     };
-    let Ok(result) = compile::compile(&config) else {
+    let result = match models_glob {
+        Some(glob) => compile::compile_matching(&config, glob),
+        None => compile::compile(&config),
+    };
+    let Ok(result) = result else {
         return BTreeMap::new();
     };
     let ir = super::ci_diff::project_ir_from_compile(&result);
@@ -2392,7 +2528,17 @@ pub(crate) fn resolve_touched_apply_targets(
     config_path: &Path,
     targets: impl IntoIterator<Item = String>,
 ) -> BTreeMap<String, PolicyCapability> {
-    let models_dir = super::gc::gc_models_dir(Some(config), config_path);
+    let models_dir = match resolve_confined_config_models_dir(config_path, Some(config)) {
+        Ok(dir) => Some(dir),
+        Err(error) => {
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "models glob could not be confined; policy target attributes fall back to defaults"
+            );
+            None
+        }
+    };
+    let models_glob = resolve_config_models_glob(config_path, Some(config));
     // Physical FQN (lowercased) → logical model name, plus the set of known
     // logical names, from the project's model sidecars. Best-effort: a load
     // failure just leaves the maps empty and every target falls through as-is.
@@ -2406,7 +2552,13 @@ pub(crate) fn resolve_touched_apply_targets(
     // permissive default. Keep every mapping that loaded and warn about the rest
     // — those specific targets still fall back to defaults, which is exactly the
     // pre-existing limitation documented above.
-    let (models, load_errors) = crate::models_loader::load_project_models_partial(&models_dir);
+    let (models, load_errors) = match (models_dir.as_deref(), models_glob.as_deref()) {
+        (Some(dir), Some(glob)) => {
+            crate::models_loader::load_project_models_matching_partial(dir, glob)
+        }
+        (Some(dir), None) => crate::models_loader::load_project_models_partial(dir),
+        (None, _) => (Vec::new(), Vec::new()),
+    };
     for e in &load_errors {
         tracing::warn!(
             error = %format!("{e:#}"),
@@ -2462,7 +2614,8 @@ pub(crate) async fn gate_maintenance_apply(
     runtime_principal: PolicyPrincipal,
     touched: &BTreeMap<String, PolicyCapability>,
 ) -> Result<()> {
-    let models_dir = super::gc::gc_models_dir(Some(config), config_path);
+    let models_dir = resolve_confined_config_models_dir(config_path, Some(config))?;
+    let models_glob = resolve_config_models_glob(config_path, Some(config));
     // Pull the authoritative remote freeze/budget ledger before the gate reads
     // it (fail-closed; a no-op unless a `[policy]` block + non-empty touched set
     // + a remote backend mean the gate will actually consult the ledger).
@@ -2470,12 +2623,13 @@ pub(crate) async fn gate_maintenance_apply(
     // The durable freeze-marker LIST, same guard — a marker-only freeze whose
     // ledger row was erased by a concurrent state upload must still deny.
     let marker_freezes = marker_freezes_before_gate(config, touched).await?;
-    let gate = evaluate_apply_policy_with_policy(
+    let gate = evaluate_apply_policy_with_policy_matching(
         config.policy.as_ref(),
         plan_id,
         plan.enforcement_principal(runtime_principal),
         touched,
         &models_dir,
+        models_glob.as_deref(),
         state_path,
         &marker_freezes,
     );
@@ -2530,6 +2684,7 @@ fn required_verify_after(
     principal: PolicyPrincipal,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
+    models_glob: Option<&str>,
 ) -> Vec<String> {
     // Finding 1: takes the SAME `[policy]` snapshot the gate used, rather than
     // reloading `rocky.toml` — a swap between the gate and this resolution could
@@ -2537,7 +2692,7 @@ fn required_verify_after(
     let Some(policy) = policy else {
         return Vec::new();
     };
-    let attrs_map = model_attributes(models_dir);
+    let attrs_map = model_attributes(models_dir, models_glob);
     let mut names: BTreeSet<String> = BTreeSet::new();
     for (model, capability) in touched {
         let owned;
@@ -2755,7 +2910,6 @@ async fn run_apply_ai_authored_plan(
     // embedded, reviewed capability classification) supersedes the fixed
     // AiAuthored gate. Absent a `[policy]` block the evaluator is never
     // constructed and the pre-policy-plane marker gate remains — byte-identical to today.
-    let models_dir = Path::new(run_plan.models_dir.as_deref().unwrap_or("models"));
     // THE single fingerprinted config snapshot for this apply (#1120) — the
     // replication-only check, the pre-gate sync decision, the policy gate,
     // `execute_run_plan`'s reads, and `run()`'s execution all read THIS
@@ -2770,13 +2924,14 @@ async fn run_apply_ai_authored_plan(
             )
         })?,
     );
+    let (models_dir, models_glob) = run_model_selection(&loaded.config, config_path, &run_plan)?;
     // Gate on the models this apply will ACTUALLY execute (fresh compile +
     // `--model` selection), not the plan's informational `models` list.
     // Finding #1: a replication-only plan runs NO models, so it gates none.
     let executable = if is_replication_only(&loaded.config, &run_plan) {
         Vec::new()
     } else {
-        run_executable_models(models_dir, &run_plan)
+        run_executable_models(&models_dir, models_glob.as_deref(), &run_plan)
     };
     let touched = touched_models_for_run(&plan, &executable);
     let principal = plan.enforcement_principal(runtime_principal);
@@ -2787,12 +2942,13 @@ async fn run_apply_ai_authored_plan(
     // Durable freeze-marker LIST, hoisted beside the ledger sync (same guard,
     // fail-closed) — see the twin note in `run_apply_run_plan`.
     let marker_freezes = marker_freezes_before_gate(&loaded.config, &touched).await?;
-    let gate = evaluate_apply_policy_with_policy(
+    let gate = evaluate_apply_policy_with_policy_matching(
         loaded.config.policy.as_ref(),
         plan_id,
         principal,
         &touched,
-        models_dir,
+        &models_dir,
+        models_glob.as_deref(),
         state_path,
         &marker_freezes,
     );
@@ -2815,7 +2971,8 @@ async fn run_apply_ai_authored_plan(
         loaded.config.policy.as_ref(),
         principal,
         &touched,
-        models_dir,
+        &models_dir,
+        models_glob.as_deref(),
     );
 
     // Finding 3 (pre-run half): make the plain rule decision durable on remote
@@ -3795,6 +3952,57 @@ mod tests {
     use crate::output::{ReplicationTableSnapshot, RunPlan};
     use crate::plan_store::write_plan;
 
+    #[tokio::test]
+    async fn maintenance_gate_refuses_an_escaping_models_glob() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let project = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&project)?;
+        std::fs::create_dir_all(&outside)?;
+        std::fs::write(outside.join("orders.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            outside.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )?;
+
+        let config_path = project.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"warehouse.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"../outside/ord*.sql\"\n\n\
+             [pipeline.p.target]\nadapter = \"default\"\n",
+        )?;
+        let config = rocky_core::config::load_rocky_config(&config_path)?;
+        let plan = PersistedPlan {
+            plan_id: "maintenance-plan".to_string(),
+            kind: PlanKind::Compact,
+            created_at: chrono::Utc::now(),
+            format_version: 2,
+            principal: None,
+            payload: serde_json::json!({}),
+        };
+        let touched = BTreeMap::from([("orders".to_string(), PolicyCapability::Apply)]);
+
+        let error = gate_maintenance_apply(
+            &project,
+            &plan,
+            &plan.plan_id,
+            &config,
+            &config_path,
+            &project.join("state.redb"),
+            PolicyPrincipal::Agent,
+            &touched,
+        )
+        .await
+        .expect_err("maintenance apply must reject models outside the project");
+
+        assert!(
+            format!("{error:#}").contains("outside the project root"),
+            "unexpected error: {error:#}"
+        );
+        Ok(())
+    }
+
     /// A physical FQN must still resolve to its logical model name when an
     /// UNRELATED model elsewhere in the tree fails to load.
     ///
@@ -4195,6 +4403,35 @@ mod tests {
             models: vec!["schema.orders".to_string()],
             execution_layers: vec![vec!["schema.orders".to_string()]],
         }
+    }
+
+    #[test]
+    fn model_only_gate_selection_honors_the_plans_models_override() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let configured = dir.path().join("configured");
+        let override_dir = dir.path().join("override");
+        std::fs::create_dir_all(&configured)?;
+        std::fs::create_dir_all(&override_dir)?;
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"warehouse.duckdb\"\n\n\
+             [pipeline.silver]\ntype = \"transformation\"\nmodels = \"configured/ord*.sql\"\n\n\
+             [pipeline.silver.target]\nadapter = \"default\"\n",
+        )?;
+        let config = rocky_core::config::load_rocky_config(&config_path)?;
+        let mut plan = minimal_run_plan();
+        plan.pipeline = Some("silver".to_string());
+        plan.model = Some("orders".to_string());
+        plan.models_dir = Some(override_dir.to_string_lossy().into_owned());
+
+        let (selected_dir, selected_glob) = run_model_selection(&config, &config_path, &plan)?;
+        assert_eq!(selected_dir, override_dir);
+        assert_eq!(
+            selected_glob, None,
+            "an explicit models directory is not constrained by the pipeline glob"
+        );
+        Ok(())
     }
 
     /// `rocky apply <compact-plan-id>` with a run plan dispatches to run, not compact.
@@ -5118,7 +5355,7 @@ effect = "deny"
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = Vec::new(); // the informational list is EMPTY
         rp.model = None;
-        let exec = super::run_executable_models(&models_dir, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp);
         assert!(
             exec.contains(&"orders".to_string()) && exec.contains(&"customers".to_string()),
             "the executable set must come from the compile, not the empty list: {exec:?}"
@@ -5139,11 +5376,30 @@ effect = "deny"
         rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
         rp.models = vec!["orders".to_string(), "customers".to_string()]; // over-lists
         rp.model = Some("orders".to_string());
-        let exec = super::run_executable_models(&models_dir, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp);
         assert_eq!(
             exec,
             vec!["orders".to_string()],
             "only the selected model executes"
+        );
+    }
+
+    #[test]
+    fn run_executable_models_honors_the_pipeline_file_glob() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        write_min_model(&models_dir, "customers");
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.model = None;
+        let glob = models_dir.join("ord*.sql").to_string_lossy().into_owned();
+
+        let exec = super::run_executable_models(&models_dir, Some(&glob), &rp);
+        assert_eq!(
+            exec,
+            vec!["orders".to_string()],
+            "the policy gate must evaluate exactly the files the run executes"
         );
     }
 
@@ -5173,7 +5429,7 @@ effect = "deny"
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let plan = read_plan(dir.path(), &plan_id)?;
 
-        let exec = super::run_executable_models(&models_dir, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp);
         let touched = super::touched_models_for_run(&plan, &exec);
         assert!(!touched.is_empty(), "D1: real models must be gated");
         let gate = super::evaluate_apply_policy(
@@ -5219,7 +5475,7 @@ effect = "deny"
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let plan = read_plan(dir.path(), &plan_id)?;
 
-        let exec = super::run_executable_models(&models_dir, &rp);
+        let exec = super::run_executable_models(&models_dir, None, &rp);
         let touched = super::touched_models_for_run(&plan, &exec);
         assert!(
             !touched.contains_key("customers"),
@@ -5511,7 +5767,7 @@ effect = "allow"
         };
         // Empty models_dir → nothing compiles; the fail-closed path must still
         // gate the plan's SQL target.
-        let touched = super::touched_models_for_promote(&promote, Path::new("/nonexistent"));
+        let touched = super::touched_models_for_promote(&promote, Path::new("/nonexistent"), None);
         assert_eq!(
             touched.get("cat.prod.orders"),
             Some(&PolicyCapability::Promote),
@@ -5547,7 +5803,7 @@ effect = "allow"
         };
         // No compilable project → target_to_name is empty → the fail-closed
         // path keeps the changed target under its own name.
-        let touched = super::touched_models_for_promote(&promote, Path::new("/nonexistent"));
+        let touched = super::touched_models_for_promote(&promote, Path::new("/nonexistent"), None);
         assert_eq!(
             touched.get("cat.prod.orders"),
             Some(&PolicyCapability::Promote),
@@ -5572,7 +5828,9 @@ effect = "allow"
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
         };
-        assert!(super::touched_models_for_promote(&promote, Path::new("/nonexistent")).is_empty());
+        assert!(
+            super::touched_models_for_promote(&promote, Path::new("/nonexistent"), None).is_empty()
+        );
     }
 
     /// 🔴 D4 regression: with NON-empty findings, the promote gate must still
@@ -5619,7 +5877,7 @@ effect = "allow"
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
         };
-        let touched = super::touched_models_for_promote(&promote, &models_dir);
+        let touched = super::touched_models_for_promote(&promote, &models_dir, None);
         // Both targets — mapped to their logical names — are gated, even though
         // only `orders` produced a finding.
         assert_eq!(touched.get("orders"), Some(&PolicyCapability::Promote));
@@ -5657,7 +5915,7 @@ effect = "allow"
             plan_audit: vec![],
             created_at: chrono::Utc::now(),
         };
-        let touched = super::touched_models_for_promote(&promote, &models_dir);
+        let touched = super::touched_models_for_promote(&promote, &models_dir, None);
         assert!(
             touched.contains_key("orders"),
             "the FQN must map to the logical name 'orders': {touched:?}"

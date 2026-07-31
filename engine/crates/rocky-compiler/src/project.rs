@@ -138,6 +138,9 @@ pub enum ProjectError {
     #[error("no models found in {path}")]
     NoModels { path: String },
 
+    #[error("invalid models glob '{pattern}': {reason}")]
+    InvalidModelsGlob { pattern: String, reason: String },
+
     #[error(
         "duplicate model name '{name}': two or more models share this name. \
          Model names must be unique within a project — rename one."
@@ -197,10 +200,40 @@ impl Project {
         models_dir: &Path,
         db: &mut crate::salsa_compile::RockyDatabase,
     ) -> Result<Vec<Model>, ProjectError> {
-        let mut models = models::load_models_from_dir(models_dir)?;
+        Self::load_models_with_db_filtered(models_dir, db, &|_| true)
+    }
 
-        // Also load .rocky files via the salsa pipeline
-        let rocky_models = load_rocky_models_with_db(models_dir, db)?;
+    /// Load only model source files matching `models_glob`, without resolving
+    /// dependencies.
+    ///
+    /// The glob must use the same path form as `models_dir` (both absolute or
+    /// both relative). Filtering precedes parsing, so a non-matching malformed
+    /// model cannot fail the selected project.
+    pub fn load_models_matching_with_db(
+        models_dir: &Path,
+        models_glob: &str,
+        db: &mut crate::salsa_compile::RockyDatabase,
+    ) -> Result<Vec<Model>, ProjectError> {
+        let pattern = compile_models_glob(models_glob)?;
+        if !has_matching_model_source(models_dir, &pattern)? {
+            return Err(ProjectError::NoModels {
+                path: models_dir.display().to_string(),
+            });
+        }
+        Self::load_models_with_db_filtered(models_dir, db, &|path| {
+            model_path_matches(&pattern, path)
+        })
+    }
+
+    fn load_models_with_db_filtered(
+        models_dir: &Path,
+        db: &mut crate::salsa_compile::RockyDatabase,
+        include: &impl Fn(&Path) -> bool,
+    ) -> Result<Vec<Model>, ProjectError> {
+        let mut models = models::load_models_from_dir_filtered(models_dir, include)?;
+
+        // Also load matching .rocky files via the salsa pipeline.
+        let rocky_models = load_rocky_models_with_db_filtered(models_dir, db, include)?;
         if !rocky_models.is_empty() {
             info!(count = rocky_models.len(), "loaded .rocky models");
             models.extend(rocky_models);
@@ -302,6 +335,56 @@ pub fn load_dir_models(dir: &Path) -> Result<Vec<Model>, ProjectError> {
     Ok(models)
 }
 
+/// Load matching `.sql` and `.rocky` models without resolving dependencies.
+pub fn load_dir_models_matching(dir: &Path, models_glob: &str) -> Result<Vec<Model>, ProjectError> {
+    let pattern = compile_models_glob(models_glob)?;
+    if !has_matching_model_source(dir, &pattern)? {
+        return Ok(Vec::new());
+    }
+    let include = |path: &Path| model_path_matches(&pattern, path);
+    let mut models = models::load_models_from_dir_filtered(dir, include)?;
+    let mut db = crate::salsa_compile::RockyDatabase::default();
+    models.extend(load_rocky_models_with_db_filtered(dir, &mut db, &include)?);
+    Ok(models)
+}
+
+fn compile_models_glob(models_glob: &str) -> Result<glob::Pattern, ProjectError> {
+    glob::Pattern::new(models_glob).map_err(|error| ProjectError::InvalidModelsGlob {
+        pattern: models_glob.to_string(),
+        reason: error.to_string(),
+    })
+}
+
+fn model_path_matches(pattern: &glob::Pattern, path: &Path) -> bool {
+    pattern.matches_path_with(
+        path,
+        glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        },
+    )
+}
+
+fn has_matching_model_source(dir: &Path, pattern: &glob::Pattern) -> Result<bool, ProjectError> {
+    if !dir.exists() {
+        return Ok(false);
+    }
+    let entries = std::fs::read_dir(dir).map_err(models::ModelError::from)?;
+    for entry in entries {
+        let entry = entry.map_err(models::ModelError::from)?;
+        let path = entry.path();
+        if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("sql" | "rocky")
+        ) && model_path_matches(pattern, &path)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Load `.rocky` files from a directory through the salsa database.
 ///
 /// Sequential rather than rayon-parallel: salsa's `RockyDatabase` is
@@ -313,6 +396,14 @@ pub fn load_dir_models(dir: &Path) -> Result<Vec<Model>, ProjectError> {
 fn load_rocky_models_with_db(
     dir: &Path,
     db: &mut crate::salsa_compile::RockyDatabase,
+) -> Result<Vec<Model>, ProjectError> {
+    load_rocky_models_with_db_filtered(dir, db, &|_| true)
+}
+
+fn load_rocky_models_with_db_filtered(
+    dir: &Path,
+    db: &mut crate::salsa_compile::RockyDatabase,
+    include: &impl Fn(&Path) -> bool,
 ) -> Result<Vec<Model>, ProjectError> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -339,7 +430,7 @@ fn load_rocky_models_with_db(
         .map_err(models::ModelError::ReadFile)?
         .filter_map(|entry| {
             let path = entry.ok()?.path();
-            if path.extension().is_some_and(|ext| ext == "rocky") {
+            if path.extension().is_some_and(|ext| ext == "rocky") && include(&path) {
                 Some(path)
             } else {
                 None
@@ -745,6 +836,28 @@ mod tests {
         let names: Vec<_> = models.iter().map(|m| m.config.name.as_str()).collect();
         assert!(names.contains(&"stg"), "sql model loaded: {names:?}");
         assert!(names.contains(&"agg"), "rocky DSL model loaded: {names:?}");
+    }
+
+    #[test]
+    fn matching_loader_filters_before_parsing_sql_and_keeps_rocky() {
+        let _guard = crate::salsa_compile::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        std::fs::write(d.join("broken.sql"), "SELECT 1").unwrap();
+        std::fs::write(d.join("broken.toml"), "name = [").unwrap();
+        std::fs::write(d.join("agg.rocky"), "from source\nselect { id }\n").unwrap();
+        std::fs::write(
+            d.join("agg.toml"),
+            "[target]\ncatalog = \"c\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+
+        let glob = d.join("agg*.rocky").to_string_lossy().into_owned();
+        let models = load_dir_models_matching(d, &glob).expect("load matching model");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].config.name, "agg");
     }
 
     /// Regression: a `.rocky` DSL model resolves a config group through the

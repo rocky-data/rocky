@@ -85,7 +85,9 @@ use rocky_iceberg::uniform_writer::{
 };
 use rocky_ir::ModelIr;
 
-use crate::commands::apply::{PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy};
+use crate::commands::apply::{
+    PolicyGate, ai_plan_is_reviewed, evaluate_apply_policy_with_policy_matching,
+};
 use crate::commands::gc::{check_recipe_produces_output, gc_models_dir};
 use crate::commands::review::record_plan_review_escalation;
 use crate::commands::run_content_addressed::{build_object_store, table_relative_add_path};
@@ -955,7 +957,14 @@ pub(crate) async fn run_restore_apply_in_with(
         .iter()
         .map(|r| (r.model_name.clone(), PolicyCapability::Restore))
         .collect();
-    let models_dir = gc_models_dir(loaded_cfg.as_ref(), config_path);
+    let models_dir = match loaded_cfg.as_ref() {
+        Some(cfg) => {
+            crate::commands::apply::resolve_confined_config_models_dir(config_path, Some(cfg))?
+        }
+        None => gc_models_dir(None, config_path),
+    };
+    let models_glob =
+        crate::commands::apply::resolve_config_models_glob(config_path, loaded_cfg.as_ref());
     // Finding 2a (download-before, UNCONDITIONAL): `rocky restore` reads the
     // TOMBSTONES ledger from local state, so for a remote backend it must pull the
     // authoritative remote state regardless of `[policy]` presence — the earlier
@@ -977,12 +986,13 @@ pub(crate) async fn run_restore_apply_in_with(
         Some(cfg) => crate::commands::apply::marker_freezes_before_gate(cfg, &touched).await?,
         None => Vec::new(),
     };
-    let gate = evaluate_apply_policy_with_policy(
+    let gate = evaluate_apply_policy_with_policy_matching(
         loaded_cfg.as_ref().and_then(|c| c.policy.as_ref()),
         plan_id,
         plan_record.enforcement_principal(runtime_principal),
         &touched,
         &models_dir,
+        models_glob.as_deref(),
         state_path,
         &marker_freezes,
     );
