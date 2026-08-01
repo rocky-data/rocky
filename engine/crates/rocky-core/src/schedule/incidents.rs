@@ -93,15 +93,10 @@ pub fn is_bundle_name(name: &str) -> bool {
     if !ts_ok || b[16] != b'-' {
         return false;
     }
-    let num = |r: std::ops::Range<usize>| -> u32 { stem[r].parse().unwrap_or(u32::MAX) };
-    let (month, day) = (num(4..6), num(6..8));
-    let (hour, minute, second) = (num(9..11), num(11..13), num(13..15));
-    if !((1..=12).contains(&month)
-        && (1..=31).contains(&day)
-        && hour < 24
-        && minute < 60
-        && second < 60)
-    {
+    // A real calendar instant, not merely digit-shaped: chrono rejects the
+    // Feb-30 class that independent range bounds cannot (the writer formats
+    // with `%Y%m%dT%H%M%SZ`, so this parse accepts exactly what it emits).
+    if chrono::NaiveDateTime::parse_from_str(&stem[..15], "%Y%m%dT%H%M%S").is_err() {
         return false;
     }
     // `<pipeline>-<short-id>`: inert charset, at least one separator, and a
@@ -145,8 +140,8 @@ pub fn write_incident(rocky_dir: &Path, bundle: &IncidentBundle) -> io::Result<P
     let name = format!(
         "{}-{}-{}.json",
         bundle.recorded_at.format("%Y%m%dT%H%M%SZ"),
-        sanitize(&bundle.pipeline),
-        short_id
+        normalize_segment(sanitize(&bundle.pipeline)),
+        normalize_segment(short_id)
     );
     debug_assert!(is_bundle_name(&name), "{name}");
     let path = dir.join(name);
@@ -190,6 +185,28 @@ fn sweep(dir: &Path) -> io::Result<()> {
         std::fs::remove_file(old)?;
     }
     Ok(())
+}
+
+/// A filename segment must be non-empty and must not begin or end with the
+/// `-` the name format uses as its separator — otherwise a legal pipeline
+/// name like `-orders` would produce a file the matcher (and therefore the
+/// retention sweep and the brief inventory) refuses to recognize as Rocky's
+/// own. Empty becomes `_`; boundary hyphens become `_`. Lossy on purpose:
+/// the bundle JSON carries the exact names, the filename only has to be
+/// unambiguous.
+fn normalize_segment(s: String) -> String {
+    if s.is_empty() {
+        return "_".to_string();
+    }
+    let mut chars: Vec<char> = s.chars().collect();
+    let last = chars.len() - 1;
+    if chars[0] == '-' {
+        chars[0] = '_';
+    }
+    if chars[last] == '-' {
+        chars[last] = '_';
+    }
+    chars.into_iter().collect()
 }
 
 /// Pipeline names and submission ids reach a filename; keep the charset
@@ -331,8 +348,44 @@ mod tests {
             "20261301T120000Z-orders-x.json",
             "20260801T250000Z-orders-x.json",
             "20260832T120000Z-orders-x.json",
+            "20260229T120000Z-orders-x.json",
+            "20260230T120000Z-orders-x.json",
+            "20260431T120000Z-orders-x.json",
         ] {
             assert!(!is_bundle_name(bad), "{bad}");
+        }
+        // A real leap day is a real instant.
+        assert!(is_bundle_name("20280229T120000Z-orders-x.json"));
+    }
+
+    /// Writer↔matcher agreement by construction: for ANY pipeline name and
+    /// submission id — including the hostile and boundary cases — the file
+    /// the writer produces is a file the matcher recognizes. Without this,
+    /// a legal `-orders` pipeline would write bundles the retention sweep
+    /// and the brief inventory both disown.
+    #[test]
+    fn every_written_bundle_is_recognized_by_the_matcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let at = chrono::Utc::now();
+        let pipelines = [
+            "orders", "-orders", "orders-", "-", "", "---", "../x", "días",
+        ];
+        let ids = ["abcdefg-rest", "-x", "x-", "", "sub-1", "12345678deadbeef"];
+        for (i, pipeline) in pipelines.iter().enumerate() {
+            for (j, id) in ids.iter().enumerate() {
+                let mut b = bundle(
+                    pipeline,
+                    at + chrono::Duration::seconds((i * 10 + j) as i64),
+                );
+                b.submission_id = (*id).to_string();
+                let path = write_incident(tmp.path(), &b).unwrap();
+                let name = path.file_name().unwrap().to_str().unwrap();
+                assert!(
+                    is_bundle_name(name),
+                    "writer produced {name} for pipeline {pipeline:?} id {id:?} \
+                     but the matcher disowns it"
+                );
+            }
         }
     }
 }

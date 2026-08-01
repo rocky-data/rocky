@@ -2200,5 +2200,6 @@ mod tests {
             s.failed_in_window, 1,
             "an inventory failure must not zero the run counts already computed"
         );
+        assert_eq!(s.runs_in_window, 1);
     }
 }
