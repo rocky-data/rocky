@@ -89,3 +89,41 @@ fn open_read_only_ignores_write_lock() {
     let _reader = StateStore::open_read_only(&path)
         .expect("read-only open should not be blocked by the advisory lock");
 }
+
+/// #1234: a *transient* holder is waited out rather than turned into a hard
+/// `LockHeldByOther`.
+///
+/// The advisory acquire inside `StateStore::open` made exactly one attempt
+/// while the redb open immediately below it already retried contention — so a
+/// momentary holder failed the open outright. That is not a test-only concern:
+/// the end-of-run retention sweep opens the store the same way and swallows
+/// the error as a warning, so the sweep silently did not run.
+///
+/// Non-vacuous in both directions. The holder is released after ~100ms, well
+/// inside the 5x50ms budget, so a correct implementation acquires; a
+/// single-attempt implementation fails immediately at t=0, before the release.
+/// And `second_writer_fails_when_lock_held_externally` above still pins the
+/// other side — a holder that never releases must still error.
+#[test]
+fn a_transient_lock_holder_is_retried_not_refused() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("state.redb");
+    let lock_path = path.with_extension("redb.lock");
+
+    let holder = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    FileExt::try_lock(&holder).expect("clean temp dir");
+
+    let released = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(holder);
+    });
+
+    StateStore::open(&path).expect("a holder released inside the retry budget must be waited out");
+    released.join().unwrap();
+}

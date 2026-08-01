@@ -562,6 +562,13 @@ pub struct StateWriterLock {
 /// lock lives on `<path>.redb.lock` (never the state file), so the caller may
 /// atomically `rename` a new state file into `path` while holding this guard.
 pub fn try_acquire_writer_lock(path: &Path) -> Result<StateWriterLock, StateError> {
+    let (file, lock_path) = open_lock_file(path)?;
+    lock_once(&file, path, &lock_path)?;
+    Ok(StateWriterLock { _file: file })
+}
+
+/// Open (creating if absent) the sidecar lock file for `path`.
+fn open_lock_file(path: &Path) -> Result<(std::fs::File, std::path::PathBuf), StateError> {
     let lock_path = path.with_extension("redb.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -573,7 +580,12 @@ pub fn try_acquire_writer_lock(path: &Path) -> Result<StateWriterLock, StateErro
             path: lock_path.display().to_string(),
             source: e,
         })?;
-    FileExt::try_lock(&file).map_err(|e| match e {
+    Ok((file, lock_path))
+}
+
+/// One non-blocking `flock` attempt on an already-open lock file.
+fn lock_once(file: &std::fs::File, path: &Path, lock_path: &Path) -> Result<(), StateError> {
+    FileExt::try_lock(file).map_err(|e| match e {
         fs4::TryLockError::WouldBlock => StateError::LockHeldByOther {
             path: path.display().to_string(),
         },
@@ -581,8 +593,47 @@ pub fn try_acquire_writer_lock(path: &Path) -> Result<StateWriterLock, StateErro
             path: lock_path.display().to_string(),
             source,
         },
-    })?;
-    Ok(StateWriterLock { _file: file })
+    })
+}
+
+/// Acquire the advisory writer lock, retrying a *transient* holder on the same
+/// budget [`open_redb_with_retry`] already uses for the redb open directly
+/// below it (#1234).
+///
+/// The asymmetry this removes: the redb open retried contention while the lock
+/// acquire immediately below it made exactly one attempt, so any momentary
+/// holder became a hard `LockHeldByOther`. The holder is momentary far more
+/// often than it looks — a `flock` on a lock file this process itself created
+/// can be briefly contended when another *thread* of the same binary spawns a
+/// child process, because the descriptor is inherited across the fork window.
+/// That is why `cargo test` (threads in one process) saw it and `cargo nextest`
+/// (a process per test) did not, and why the exposure is not test-only: the
+/// end-of-run retention sweep opens the store the same way and swallows this
+/// error as a warning, so the sweep silently did not happen.
+///
+/// The retry re-attempts the lock on the ALREADY-OPEN file rather than
+/// reopening it, so a genuine external holder is not raced against.
+///
+/// Deliberately private and used only by [`StateStore::open_inner`]. The public
+/// [`try_acquire_writer_lock`] keeps its single-attempt, non-blocking contract —
+/// `state_sync`'s download path and the apply seam rely on it to fail fast
+/// rather than block.
+fn acquire_writer_lock_with_retry(path: &Path) -> Result<StateWriterLock, StateError> {
+    let (file, lock_path) = open_lock_file(path)?;
+    for attempt in 0..REDB_OPEN_RETRY_ATTEMPTS {
+        match lock_once(&file, path, &lock_path) {
+            Ok(()) => return Ok(StateWriterLock { _file: file }),
+            // Only a *contended* lock is retryable; an I/O error is terminal.
+            Err(e @ StateError::LockHeldByOther { .. }) => {
+                if attempt + 1 == REDB_OPEN_RETRY_ATTEMPTS {
+                    return Err(e);
+                }
+                std::thread::sleep(REDB_OPEN_RETRY_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the final attempt returns rather than falling through")
 }
 
 /// Embedded state store backed by redb for tracking watermarks and run history.
@@ -844,7 +895,7 @@ impl StateStore {
         // of them reaches the lock check. Read-only opens skip the lock. Shared
         // with `state_sync`'s publish path via [`try_acquire_writer_lock`].
         let lock = if matches!(mode, OpenMode::ReadWrite) {
-            Some(try_acquire_writer_lock(path)?)
+            Some(acquire_writer_lock_with_retry(path)?)
         } else {
             None
         };
