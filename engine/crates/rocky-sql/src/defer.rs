@@ -302,6 +302,17 @@ impl CollisionIdentity {
     pub fn of(catalog: &str, schema: &str, table: &str) -> Self {
         Self(format!("{catalog}.{schema}.{table}").to_ascii_lowercase())
     }
+
+    /// Build from an already-qualified `catalog.schema.table` string.
+    ///
+    /// For callers holding a target joined upstream — a persisted plan step,
+    /// where the components were flattened at plan time and cannot be
+    /// recovered. Equivalent to [`Self::of`] on the same components, so the
+    /// fold stays defined in exactly one place.
+    #[must_use]
+    pub fn of_qualified(qualified: &str) -> Self {
+        Self(qualified.to_ascii_lowercase())
+    }
 }
 
 impl std::fmt::Display for CollisionIdentity {
@@ -2045,5 +2056,25 @@ mod tests {
             out.sql
         );
         assert!(out.sql.contains("other.schema.customers c"), "{}", out.sql);
+    }
+
+    /// `of_qualified` is documented as equivalent to `of` on the same
+    /// components. Pinned, because the seam that uses it keys on a *string*
+    /// built elsewhere, and a doc claim of equivalence is worth exactly as
+    /// much as the test behind it.
+    #[test]
+    fn collision_identity_of_qualified_agrees_with_of() {
+        for (c, s, t) in [
+            ("cat", "raw", "orders"),
+            ("CAT", "Raw", "ORDERS"),
+            ("cat", "schema", "TABLE"),
+            ("", "raw", "orders"),
+        ] {
+            assert_eq!(
+                CollisionIdentity::of(c, s, t),
+                CollisionIdentity::of_qualified(&format!("{c}.{s}.{t}")),
+                "constructors must agree for {c}.{s}.{t}"
+            );
+        }
     }
 }

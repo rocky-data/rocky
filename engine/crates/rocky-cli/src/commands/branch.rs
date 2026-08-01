@@ -764,6 +764,48 @@ pub(crate) fn run_breaking_change_gate_for_plan(
     )
 }
 
+/// Refuse a promote plan whose steps replace one production table twice.
+///
+/// Discovery already refuses two models sharing a target (#1310), but a
+/// `PromotePlan` is a **persisted** artifact and the two plan entrypoints —
+/// `branch promote --plan <id>` and `rocky apply <promote-plan>` — deserialize
+/// their steps and execute them verbatim, by documented contract re-deriving
+/// nothing. A plan written before that guard existed, or on a checkout that
+/// did not have it, therefore still replays the collision: two
+/// `CREATE OR REPLACE` statements against one table, back to back, with the
+/// later silently winning and exit 0.
+///
+/// So the property is enforced here, at the one seam every promote crosses,
+/// rather than only where plans are built. Steps carry the target already
+/// joined, so identity comes from `CollisionIdentity::of_qualified` — the same
+/// fold the compiler's E036 uses.
+///
+/// **This covers replication promotes too**, which discovery-side never did:
+/// two connectors whose schemas resolve through `target.schema_template` to
+/// one catalog+schema, both holding a table of that name, plan two
+/// replacements of one table. Same defect, so refusing is right — but it is a
+/// path #1310 does not mention, and a configuration relying on last-write-wins
+/// there will now fail.
+fn reject_duplicate_promote_targets(targets: &[crate::output::PromoteTargetPlan]) -> Result<()> {
+    let mut claimed: std::collections::HashMap<rocky_sql::defer::CollisionIdentity, &str> =
+        std::collections::HashMap::new();
+    for step in targets {
+        let key = rocky_sql::defer::CollisionIdentity::of_qualified(&step.target);
+        if let Some(prior) = claimed.insert(key, step.source.as_str()) {
+            anyhow::bail!(
+                "refusing to apply this promote plan: two steps both replace the production \
+                 table {}, reading from '{prior}' and '{}', so its contents would be decided by \
+                 step order. Discovery refuses this shape, so the plan predates that guard or \
+                 was built by a path that bypassed it — rebuild it with `rocky plan promote` \
+                 after giving each model its own `[target] table`.",
+                step.target,
+                step.source
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Execute a list of promote targets against the warehouse adapter.
 ///
 /// This is the apply-time executor — it takes the pre-built SQL statements
@@ -787,6 +829,10 @@ pub(crate) async fn run_promote_apply(
     pipeline_name: Option<&str>,
 ) -> Result<(Vec<crate::output::PromoteTarget>, bool)> {
     use crate::registry::AdapterRegistry;
+
+    // Before the adapter is even opened: a plan that would replace one table
+    // twice is refused without touching the warehouse.
+    reject_duplicate_promote_targets(targets)?;
 
     let rocky_cfg = &loaded.config;
     let registry = AdapterRegistry::from_config(rocky_cfg)?;
@@ -4315,6 +4361,133 @@ mod duplicate_target_refusal_tests {
         )
         .expect("a filtered promote of one model must still plan");
         assert_eq!(planned.len(), 1, "exactly the filtered model plans");
+    }
+
+    /// The persisted-plan bypass: a `PromotePlan` built before discovery
+    /// refused collisions still deserializes and executes verbatim, because
+    /// the apply entrypoints re-derive nothing. The executor seam must refuse
+    /// it too — this is the check that holds for `branch promote --plan` and
+    /// `rocky apply <promote-plan>`, which never reach discovery at all.
+    #[test]
+    fn apply_refuses_a_persisted_plan_that_replaces_one_table_twice() {
+        let step = |source: &str| crate::output::PromoteTargetPlan {
+            target: "wh.main.orders".to_string(),
+            source: source.to_string(),
+            statement: format!("CREATE OR REPLACE TABLE wh.main.orders AS SELECT * FROM {source}"),
+        };
+        let err = reject_duplicate_promote_targets(&[step("wh.br.alpha"), step("wh.br.beta")])
+            .expect_err("a plan replacing one table twice must refuse");
+        let msg = format!("{err:#}");
+        for needle in ["wh.main.orders", "wh.br.alpha", "wh.br.beta"] {
+            assert!(msg.contains(needle), "error must name {needle:?}: {msg}");
+        }
+    }
+
+    /// Case-variant targets in a persisted plan are one physical table on a
+    /// case-insensitive warehouse, so the plan-side check folds case just as
+    /// discovery does — a plan is not a way to launder the spelling past it.
+    #[test]
+    fn apply_refuses_case_variant_targets_in_one_plan() {
+        let step = |target: &str| crate::output::PromoteTargetPlan {
+            target: target.to_string(),
+            source: format!("wh.br.{}", target.rsplit('.').next().unwrap()),
+            statement: String::new(),
+        };
+        assert!(
+            reject_duplicate_promote_targets(&[step("wh.main.orders"), step("wh.main.ORDERS")])
+                .is_err(),
+            "case-variant targets name one object and must refuse"
+        );
+    }
+
+    /// The guard is **wired into** `run_promote_apply`, and runs before the
+    /// adapter is resolved.
+    ///
+    /// The tests above call the helper directly, so they would all stay green
+    /// if the call site vanished — a helper with no call site is exactly the
+    /// shape that looks fixed and is not. This one pins the wiring: the config
+    /// has two pipelines and the selector is `None`, which `resolve_pipeline`
+    /// rejects, so *any* ordering that lets the executor reach adapter
+    /// resolution first surfaces "multiple pipelines" instead. Getting the
+    /// collision error proves the guard ran, and ran first.
+    #[tokio::test]
+    async fn run_promote_apply_refuses_before_resolving_an_adapter() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"probe.duckdb\"\n\n\
+             [pipeline.one]\ntype = \"transformation\"\nmodels = \"models\"\n\n\
+             [pipeline.one.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.two]\ntype = \"transformation\"\nmodels = \"models\"\n\n\
+             [pipeline.two.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let loaded = rocky_core::config::LoadedConfig {
+            config: rocky_core::config::load_rocky_config(&config_path).unwrap(),
+            fingerprint: "0000000000000000".to_string(),
+        };
+        let step = |source: &str| crate::output::PromoteTargetPlan {
+            target: "wh.main.orders".to_string(),
+            source: source.to_string(),
+            statement: String::new(),
+        };
+
+        let err = run_promote_apply(&loaded, &[step("wh.br.alpha"), step("wh.br.beta")], None)
+            .await
+            .expect_err("a colliding plan must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("wh.main.orders"),
+            "expected the collision refusal, got: {msg}"
+        );
+    }
+
+    /// The seam guard refuses collisions, not ordinary multi-step plans.
+    #[test]
+    fn apply_accepts_a_plan_whose_steps_have_distinct_targets() {
+        let step = |target: &str| crate::output::PromoteTargetPlan {
+            target: target.to_string(),
+            source: "wh.br.src".to_string(),
+            statement: String::new(),
+        };
+        reject_duplicate_promote_targets(&[step("wh.main.orders"), step("wh.main.customers")])
+            .expect("distinct targets must apply");
+    }
+
+    /// The seam check keys on the plan step's `target`, a string built by
+    /// `TargetRef::full_name()` at plan time — while the sibling `statement`
+    /// field on the same struct **is** dialect-quoted. If `target` ever picked
+    /// up that quoting, `of_qualified` would fold `"cat"."raw"."orders"` rather
+    /// than `cat.raw.orders`, still self-consistent across steps but no longer
+    /// the identity E036 computes — and nothing else here would notice. Pin
+    /// the shape at its source.
+    #[test]
+    fn planned_promote_targets_are_unquoted_and_fold_to_the_component_identity() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = project_with_targets(&tmp, ["t_alpha", "t_beta"]);
+        let pipeline = transformation_pipeline(&config_path);
+        let record = sample_branch_record_for_promote("fix-price");
+        let planned =
+            discover_transformation_branch_targets(&pipeline, &config_path, &record, None)
+                .expect("distinct targets must plan");
+
+        for p in &planned {
+            let name = p.prod.full_name();
+            assert!(
+                !name.contains(['"', '`', '[', ']']),
+                "plan targets must stay unquoted, got {name}"
+            );
+            assert_eq!(
+                rocky_sql::defer::CollisionIdentity::of_qualified(&name),
+                rocky_sql::defer::CollisionIdentity::of(
+                    &p.prod.catalog,
+                    &p.prod.schema,
+                    &p.prod.table
+                ),
+                "the seam's key must equal the component identity for {name}"
+            );
+        }
     }
 
     /// Distinct targets keep planning both — the guard refuses collisions,
