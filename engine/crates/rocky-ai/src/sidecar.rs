@@ -98,6 +98,38 @@ impl SidecarMaterialization {
     }
 }
 
+impl SidecarMaterialization {
+    /// The in-memory strategy this materialization becomes on disk.
+    ///
+    /// Verification needs it because strategy is not cosmetic: the compiler
+    /// excludes `ephemeral` models from duplicate-target detection, since they
+    /// materialize nothing and cannot be a second writer. Verifying an
+    /// ephemeral model as `full_refresh` therefore rejects a target collision
+    /// that will not exist once the sidecar is written (#1302).
+    #[must_use]
+    pub fn to_strategy(&self) -> rocky_core::models::StrategyConfig {
+        use rocky_core::models::StrategyConfig;
+        match self {
+            Self::FullRefresh => StrategyConfig::FullRefresh,
+            Self::Incremental { watermark } => StrategyConfig::Incremental {
+                timestamp_column: watermark.clone(),
+            },
+            // `unique_key: None` is the incomplete-sidecar case the CLI warns
+            // about, and it is the one arm with no faithful mapping: the key
+            // is *skipped* from the emitted TOML, so the file that gets
+            // written does not load at all until a human fills it in. An
+            // empty key is the nearest loadable shape and is inert for
+            // verification — the merge-key check only fires for keys naming
+            // columns the model does not output, and there are none.
+            Self::Merge { unique_key } => StrategyConfig::Merge {
+                unique_key: unique_key.clone().unwrap_or_default(),
+                update_columns: None,
+            },
+            Self::Ephemeral => StrategyConfig::Ephemeral,
+        }
+    }
+}
+
 /// `catalog.schema.table` triple. Parsed from the `--target` CLI flag or
 /// derived from the model name (default: `generated.ai.<name>`).
 #[derive(Debug, Clone)]

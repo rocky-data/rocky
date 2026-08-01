@@ -201,6 +201,14 @@ pub async fn run_ai(
             source_column_info: &empty_source_column_info,
         });
 
+    // `--target` goes IN to generation, not on after it.
+    //
+    // It used to be applied only when writing the sidecar, so verification
+    // typechecked the model against the default `generated.ai.<name>` and
+    // then something else was written to disk. `rocky ai "<intent>" --target
+    // c.s.shared` could therefore report a clean compile-verify while writing
+    // a model that duplicates an existing model's physical target (#1302).
+    // `generate_model` falls back to the same default when this is `None`.
     let result = generate::generate_model(
         intent,
         &model_schemas,
@@ -208,17 +216,17 @@ pub async fn run_ai(
         fmt,
         &client,
         3,
-        validation_context.as_ref(),
+        generate::Verification {
+            context: validation_context.as_ref(),
+            target: parsed_target_override.as_ref(),
+            materialization: Some(&parsed_materialization),
+        },
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Resolve target. `--target` overrides the default; otherwise we
-    // mirror the in-memory default from `build_generated_model`
-    // (`generated.ai.<name>`) so the on-disk sidecar matches what AI
-    // validation already typechecked against.
-    let resolved_target =
-        parsed_target_override.unwrap_or_else(|| SidecarTarget::default_for(&result.name));
+    // Literally the value verification used, not a second derivation of it.
+    let resolved_target = result.target.clone();
 
     let dir = std::path::Path::new(models_dir);
     let written = write_model_files(
@@ -368,9 +376,19 @@ pub async fn run_ai_sync(
                     // models BEFORE writing it. An unvalidated proposal that
                     // does not parse or typecheck must never land on disk.
                     let format = proposed_source_format(&model.file_path);
+                    // `None` everywhere: this validates the proposed SQL in
+                    // isolation, under a synthetic name, target and
+                    // `full_refresh` strategy — NOT under the existing
+                    // model's own config. That is weaker than it looks: a
+                    // proposal that drops the partition column of a
+                    // `time_interval` model passes here and fails the next
+                    // real compile. Pre-existing, and out of scope for #1302,
+                    // which is about `rocky ai`; tracked separately.
                     if let Err(diagnostics) = rocky_ai::generate::validate_proposed_source(
                         &proposal.proposed_source,
                         format,
+                        None,
+                        None,
                         None,
                     ) {
                         anyhow::bail!(
@@ -572,7 +590,8 @@ mod tests {
         let format = proposed_source_format(model_path.to_str().unwrap());
 
         // Mirror the apply gate: validate first, only write on success.
-        let validation = rocky_ai::generate::validate_proposed_source(bad_proposal, format, None);
+        let validation =
+            rocky_ai::generate::validate_proposed_source(bad_proposal, format, None, None, None);
         assert!(validation.is_err(), "bad proposal must fail validation");
 
         // The gate bails before writing — confirm the file is unchanged.
