@@ -272,47 +272,23 @@ fn load_project_models_partial_with(
     models_dir: &Path,
     load_one: &impl Fn(&Path) -> Result<Vec<Model>>,
 ) -> (Vec<Model>, Vec<anyhow::Error>) {
+    // The traversal itself lives in rocky-core (`model_walk`) so every
+    // scanner of a models tree — this loader, the compiler's model loading,
+    // the sidecar loaders — sees the same directory set (#1262). This
+    // function's job is only to run `load_one` over each visited directory
+    // and to surface every walk error beside the load errors: a dropped walk
+    // error is a directory that vanished with nothing said about it, the
+    // silent-drop family this walk exists to close.
+    let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
     let mut all = Vec::new();
     let mut errors = Vec::new();
-
-    match load_one(models_dir) {
-        Ok(models) => all.extend(models),
-        Err(e) => errors.push(e),
-    }
-
-    // `load_dir_models` returns no models for a directory that does not exist,
-    // and several callers rely on that (`rocky docs` on a project with no
-    // models, for one). Only descend when there is something to descend into,
-    // so an absent directory stays a non-error rather than failing `read_dir`.
-    if !models_dir.is_dir() {
-        return (all, errors);
-    }
-
-    let entries = match std::fs::read_dir(models_dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            errors.push(anyhow::Error::new(e).context(format!(
-                "failed to read models directory {}",
-                models_dir.display()
-            )));
-            return (all, errors);
-        }
-    };
-    let mut subdirs: Vec<PathBuf> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_dir())
-        .collect();
-    // Deterministic order: with more than one broken subdirectory, the same one
-    // is always reported first.
-    subdirs.sort();
-
-    for subdir in subdirs {
-        match load_one(&subdir) {
+    for dir in dirs {
+        match load_one(&dir) {
             Ok(models) => all.extend(models),
             Err(e) => errors.push(e),
         }
     }
+    errors.extend(walk_errors.into_iter().map(anyhow::Error::new));
     (all, errors)
 }
 
@@ -346,16 +322,44 @@ mod tests {
     }
 
     #[test]
-    fn loads_top_level_and_one_subdirectory_level() {
+    fn loads_models_at_every_depth() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let models = tmp.path().join("models");
         write_model(&models, "top");
         write_model(&models.join("staging"), "stg");
+        write_model(&models.join("staging").join("deep"), "lvl2");
+        write_model(&models.join("staging").join("deep").join("deeper"), "lvl3");
 
         let loaded = load_project_models(&models).expect("load");
         let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["stg", "top"]);
+        assert_eq!(names, ["lvl2", "lvl3", "stg", "top"]);
+    }
+
+    /// The #1262 silent drop, pinned at its sharpest: a malformed sidecar two
+    /// levels down is an ERROR — proving the file is actually read — where it
+    /// used to be invisible because the walk never reached it.
+    #[test]
+    fn a_broken_model_below_the_first_subdirectory_level_is_an_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        write(&models.join("a").join("b").join("broken.sql"), "SELECT 1\n");
+        write(
+            &models.join("a").join("b").join("broken.toml"),
+            "name = [\n",
+        );
+
+        let err = load_project_models(&models).expect_err("a deep failure must propagate");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load models from"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("a{}b", std::path::MAIN_SEPARATOR)),
+            "the error must name the deep directory: {rendered}"
+        );
     }
 
     /// The regression this change exists for: a malformed sidecar one level down

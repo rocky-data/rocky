@@ -31,6 +31,7 @@ pub mod lakehouse;
 pub mod macros;
 pub mod masking;
 pub mod mmap;
+pub mod model_walk;
 pub mod models;
 pub mod object_store;
 pub mod optimize;
