@@ -246,6 +246,14 @@ impl Project {
 
         let mut models = Vec::new();
         for dir in &dirs {
+            // Participation rule (#1262, shared with the CLI matching loader):
+            // a directory contributing no model under the active filter has
+            // its metadata skipped — malformed defaults beside only
+            // non-matching sources must fail NEITHER loader, or the surfaces
+            // disagree.
+            if !dir_contributes_models(dir, include) {
+                continue;
+            }
             models.extend(models::load_models_from_dir_filtered(dir, include)?);
 
             // Also load matching .rocky files via the salsa pipeline.
@@ -355,7 +363,12 @@ pub fn load_dir_models(dir: &Path) -> Result<Vec<Model>, ProjectError> {
 /// Load matching `.sql` and `.rocky` models without resolving dependencies.
 pub fn load_dir_models_matching(dir: &Path, models_glob: &str) -> Result<Vec<Model>, ProjectError> {
     let pattern = compile_models_glob(models_glob)?;
-    if !has_matching_model_source(dir, &pattern)? {
+    // Per-DIRECTORY on purpose: callers walk the tree themselves and invoke
+    // this once per visited directory, so the participation question here is
+    // "does THIS directory contribute", never "does anything below it" — the
+    // tree-wide answer is [`has_matching_model_source`]'s job, behind the
+    // NoModels pre-check only.
+    if !dir_has_matching_model_source(dir, &pattern)? {
         return Ok(Vec::new());
     }
     let include = |path: &Path| model_path_matches(&pattern, path);
@@ -433,6 +446,34 @@ fn load_rocky_models_with_db(
     db: &mut crate::salsa_compile::RockyDatabase,
 ) -> Result<Vec<Model>, ProjectError> {
     load_rocky_models_with_db_filtered(dir, db, &|_| true)
+}
+
+/// Whether `dir` contributes any model under `include` — the participation
+/// rule both walks share (#1262). A directory that contributes nothing has
+/// its metadata (`_defaults.toml`, groups, test definitions) skipped
+/// entirely, mirroring the #1305 contract: "directories with no matching
+/// source skip their defaults, groups, and test definitions, so unrelated
+/// malformed metadata cannot fail the selected run." Without this rule the
+/// two loaders disagree on malformed metadata in non-participating deep
+/// directories — listing succeeds while compiling fails, the exact
+/// surface-disagreement family this fix exists to close.
+fn dir_contributes_models(dir: &Path, include: &impl Fn(&Path) -> bool) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // Unreadable directories are the walk's problem (it surfaces them);
+        // for participation purposes they contribute nothing.
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("sql" | "rocky")
+        ) && include(&path)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn load_rocky_models_with_db_filtered(
@@ -1102,6 +1143,37 @@ mod recursive_load_tests {
             .expect("a deep-only project must load, not report NoModels");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].config.name, "only");
+    }
+
+    /// The red-team repro (#1328 review, F1): malformed `_defaults.toml` in a
+    /// deep directory whose sources all fail the filter. The participation
+    /// rule must make BOTH loaders skip that directory's metadata — listing
+    /// and compiling must agree, and both must succeed.
+    #[test]
+    fn malformed_metadata_in_a_non_participating_directory_fails_neither_loader() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        write_model(&models, "orders");
+        let deep = models.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        // Non-matching source + malformed defaults beside it.
+        write(&deep.join("customers.sql"), "SELECT 1 AS id\n");
+        write(
+            &deep.join("customers.toml"),
+            "name = \"customers\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"customers\"\n",
+        );
+        write(&deep.join("_defaults.toml"), "this is not toml [\n");
+
+        let glob = format!("{}/orders*.sql", models.display());
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let compiled = Project::load_models_matching_with_db(&models, &glob, &mut db)
+            .expect("the compiler must skip a non-participating directory's metadata");
+        assert_eq!(compiled.len(), 1);
+        assert_eq!(compiled[0].config.name, "orders");
+
+        let listed = load_dir_models_matching(&models, &glob)
+            .expect("the matching loader must skip it identically");
+        assert_eq!(listed.len(), 1, "both surfaces agree: orders only");
     }
 
     /// A malformed sidecar two levels down fails the STRICT compile load —
