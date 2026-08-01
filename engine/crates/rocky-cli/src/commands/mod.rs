@@ -130,7 +130,10 @@ pub use export_openapi::export_openapi;
 pub use export_schemas::{export_schemas, schemas_hash};
 pub use fmt::run_fmt;
 pub use gc::{run_gc_derivable, run_gc_plan};
-pub use history::{history_runs_output, model_history_output, recipe_history_output, run_history};
+pub use history::{
+    history_runs_output, history_runs_output_filtered, model_history_output, recipe_history_output,
+    run_history,
+};
 pub use hooks::{run_hooks_list, run_hooks_test};
 pub use import_dbt::run_import_dbt;
 pub use imports_update::run_imports_update;

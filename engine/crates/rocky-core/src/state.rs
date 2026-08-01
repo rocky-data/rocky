@@ -2267,13 +2267,29 @@ impl StateStore {
 
     /// List recent runs (newest first).
     pub fn list_runs(&self, limit: usize) -> Result<Vec<RunRecord>, StateError> {
+        self.list_runs_matching(limit, |_| true)
+    }
+
+    /// List the `limit` most recent runs (newest first) satisfying `keep`.
+    ///
+    /// The predicate applies BEFORE the recency cap — the point of this
+    /// variant (#1304): filtering the capped result instead lets a busy
+    /// project's non-matching runs crowd every match out of the window, and
+    /// the caller reads "no matching runs" off a project full of them.
+    pub fn list_runs_matching(
+        &self,
+        limit: usize,
+        keep: impl Fn(&RunRecord) -> bool,
+    ) -> Result<Vec<RunRecord>, StateError> {
         let txn = self.db.begin_read()?;
         let table = txn.open_table(RUN_HISTORY)?;
         let mut runs = Vec::new();
         for entry in table.iter()? {
             let (_, value) = entry?;
             let run: RunRecord = serde_json::from_slice(value.value())?;
-            runs.push(run);
+            if keep(&run) {
+                runs.push(run);
+            }
         }
         // Sort by started_at descending
         runs.sort_by_key(|run| std::cmp::Reverse(run.started_at));
@@ -7983,6 +7999,41 @@ mod tests {
         r.started_at = started_at;
         r.finished_at = started_at;
         r
+    }
+
+    /// The #1304 filter-below-the-cap contract: a matching run older than 50
+    /// non-matching ones is still returned, where filtering the capped result
+    /// would report "no matching runs" over a project full of them.
+    #[test]
+    fn list_runs_matching_filters_below_the_recency_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&tmp.path().join("s.redb")).unwrap();
+        let base = chrono::Utc::now();
+        let mut old_schedule = run_at("run-schedule", base - chrono::Duration::hours(100));
+        old_schedule.trigger = RunTrigger::Schedule;
+        store.record_run(&old_schedule).unwrap();
+        for i in 0..55 {
+            let mut r = run_at(
+                &format!("run-manual-{i}"),
+                base - chrono::Duration::hours(i),
+            );
+            r.trigger = RunTrigger::Manual;
+            store.record_run(&r).unwrap();
+        }
+
+        let capped = store.list_runs(50).unwrap();
+        assert!(
+            capped
+                .iter()
+                .all(|r| !matches!(r.trigger, RunTrigger::Schedule)),
+            "precondition: the schedule run is outside the 50 newest"
+        );
+
+        let matched = store
+            .list_runs_matching(50, |r| matches!(r.trigger, RunTrigger::Schedule))
+            .unwrap();
+        assert_eq!(matched.len(), 1, "the filter must reach below the cap");
+        assert_eq!(matched[0].run_id, "run-schedule");
     }
 
     fn dag_snapshot_at(timestamp: chrono::DateTime<Utc>, hash: &str) -> DagSnapshot {

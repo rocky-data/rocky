@@ -162,6 +162,12 @@ pub struct HistoryArgs {
     /// project-level run summary.
     #[serde(default)]
     pub model: Option<String>,
+    /// When set (project-level form only), return only runs whose trigger
+    /// matches — e.g. `"Schedule"` for scheduler-submitted runs. The filter
+    /// applies BEFORE the recency cap, so a busy project's manual runs cannot
+    /// crowd scheduler runs out of the window.
+    #[serde(default)]
+    pub trigger: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -882,7 +888,13 @@ impl RockyMcpServer {
                 }))
             }
             None => {
-                let out = commands::history_runs_output(&state_path, None, false).map_err(|e| {
+                let out = commands::history_runs_output_filtered(
+                    &state_path,
+                    None,
+                    false,
+                    params.0.trigger.as_deref(),
+                )
+                .map_err(|e| {
                     ToolError::internal(
                         format!("{e:#}"),
                         "Could not read the run history from the state store; ensure the \
@@ -2620,6 +2632,55 @@ impl RockyMcpServer {
         let value = serde_json::to_value(&output).map_err(|e| {
             ToolError::internal(
                 format!("failed to serialize the estate brief: {e}"),
+                "Retry; if it persists this is an internal serialization bug.",
+            )
+        })?;
+        Ok(Json(value))
+    }
+
+    #[tool(
+        description = "Read-only scheduler snapshot: per-pipeline cron/after/freshness cursors, \
+         last submission and outcome, consecutive failures, active claims, and tick-lock state. \
+         Reports stored state only — it does NOT evaluate demand (side-effect free; \
+         `rocky tick --dry-run` is the evaluation). `next_fire_at` in the past means an overdue \
+         pipeline, not a future promise."
+    )]
+    async fn schedule_status(
+        &self,
+        Parameters(_args): Parameters<NoArgs>,
+    ) -> ToolResult<serde_json::Value> {
+        let config_path = self.config_path.clone();
+        let state_path = self.state_path();
+        // The SAME `.rocky` derivation the API route and the reconciler use,
+        // so this snapshot reports against the tick lock a `serve --scheduler`
+        // or a cron `rocky tick` actually holds.
+        let rocky_dir = commands::scheduler::rocky_dir_for_config(&config_path);
+        let output = tokio::task::spawn_blocking(move || {
+            commands::schedule_status::schedule_status_output(
+                &config_path,
+                &state_path,
+                &rocky_dir,
+                chrono::Utc::now(),
+            )
+        })
+        .await
+        .map_err(|e| {
+            ToolError::internal(
+                format!("schedule status task failed: {e}"),
+                "Retry; if it persists this is an internal join error.",
+            )
+        })?
+        .map_err(|e| {
+            ToolError::internal(
+                format!("{e:#}"),
+                "Could not read the schedule state; ensure the project config parses and the \
+                 state store is readable. A project with no [schedule] blocks returns an empty \
+                 snapshot, not an error.",
+            )
+        })?;
+        let value = serde_json::to_value(&output).map_err(|e| {
+            ToolError::internal(
+                format!("failed to serialize the schedule snapshot: {e}"),
                 "Retry; if it persists this is an internal serialization bug.",
             )
         })?;

@@ -141,10 +141,32 @@ pub fn history_runs_output(
     since: Option<&str>,
     audit: bool,
 ) -> Result<HistoryOutput> {
+    history_runs_output_filtered(state_path, since, audit, None)
+}
+
+/// [`history_runs_output`] restricted to runs whose `trigger` matches.
+///
+/// The filter applies BELOW the 50-run recency cap (#1304): filtering the
+/// capped result instead would let a busy project's manual runs crowd every
+/// scheduler run out of the window, reporting "no matching runs" over a
+/// project full of them.
+pub fn history_runs_output_filtered(
+    state_path: &Path,
+    since: Option<&str>,
+    audit: bool,
+    trigger: Option<&str>,
+) -> Result<HistoryOutput> {
     let store = StateStore::open_read_only(state_path)?;
     let since_ts = parse_since(since)?;
 
-    let runs = store.list_runs(50)?;
+    let runs = match trigger {
+        Some(trigger) => {
+            // Match on the same Debug form the output serializes (`"Schedule"`,
+            // `"Webhook"`, ...) so the filter vocabulary IS the wire vocabulary.
+            store.list_runs_matching(50, |run| format!("{:?}", run.trigger) == trigger)?
+        }
+        None => store.list_runs(50)?,
+    };
     let filtered: Vec<_> = if let Some(ts) = since_ts {
         runs.into_iter().filter(|r| r.started_at >= ts).collect()
     } else {

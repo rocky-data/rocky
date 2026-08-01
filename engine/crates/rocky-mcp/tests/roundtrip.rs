@@ -103,6 +103,7 @@ async fn tools_list_returns_expected_set() {
             "propose",
             "review_queue",
             "sample_rows",
+            "schedule_status",
             "scorecard",
             "suggest_freshness_block",
             "test",

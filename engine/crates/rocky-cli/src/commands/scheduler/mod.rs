@@ -50,7 +50,7 @@ pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// root, not the process cwd) joined with `.rocky`. The single derivation shared
 /// by the reconciler loop, the schedule-status endpoint, and the webhook-ingress
 /// accept path, so all three agree on the tick lock and the demand spool.
-pub(crate) fn rocky_dir_for_config(config_path: &Path) -> PathBuf {
+pub fn rocky_dir_for_config(config_path: &Path) -> PathBuf {
     config_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
