@@ -4,7 +4,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fs4::FileExt;
-use redb::{Database, ReadableTable, TableDefinition, TableHandle, WriteTransaction};
+use redb::{
+    Database, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle, WriteTransaction,
+};
 use thiserror::Error;
 
 use crate::config::SchemaMismatchPolicy;
@@ -2242,6 +2244,30 @@ impl StateStore {
 // State store: run history, quality, DAG methods
 // ---------------------------------------------------------------------------
 
+/// Just enough of a [`RunRecord`] to order it.
+///
+/// Deliberately not `RunRecord`: `list_runs` has to visit every row to find
+/// the newest few, and decoding each one in full — `models_executed` included
+/// — is what made that scan cost memory proportional to the whole history
+/// rather than to the page returned (#1304).
+///
+/// Serde walks the fields this does not name without materializing their
+/// contents, so a row costs its timestamp plus an owned `run_id` rather than
+/// its whole payload. The JSON is still fully scanned — a parser cannot seek
+/// to a field — so this is a smaller constant, not a smaller complexity.
+///
+/// A record that is valid JSON with a readable `started_at` but an
+/// undecodable field elsewhere therefore no longer fails the whole listing;
+/// it fails only if it lands in the page being materialized. That is a
+/// deliberate improvement on a read path — one damaged row should not make
+/// history unlistable — but it is a behaviour change worth naming. Malformed
+/// *syntax* still fails either way, since ignoring a field still validates
+/// it.
+#[derive(serde::Deserialize)]
+struct RunOrderKey {
+    started_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl StateStore {
     /// Record a pipeline run.
     pub fn record_run(&self, run: &RunRecord) -> Result<(), StateError> {
@@ -2266,8 +2292,88 @@ impl StateStore {
     }
 
     /// List recent runs (newest first).
+    ///
+    /// **The page is selected by `started_at`, so a caller's filter must be
+    /// aligned with that or it belongs inside the store.** Filtering the
+    /// returned page by anything else — a trigger kind, a status, a model —
+    /// asks "which of the newest N match?" and answers empty whenever the
+    /// newest N happen to contain none, while matching runs sit just outside
+    /// the cap. A `started_at` bound is safe because it agrees with the
+    /// ordering; nothing else is.
+    ///
+    /// Two callers already do this and are wrong for it, both pre-existing:
+    /// `preview` scans the newest 50 for a run matching `git_branch`, so a
+    /// branch whose newest run is rank 51 reports as having none; and
+    /// [`Self::get_model_history`] filters `list_runs(100)` by model name, so
+    /// a model absent from the last 100 runs looks like it has no history.
+    /// Both need the predicate pushed into the scan rather than applied to
+    /// its result; tracked separately from the cost fix in #1304.
     pub fn list_runs(&self, limit: usize) -> Result<Vec<RunRecord>, StateError> {
-        self.list_runs_matching(limit, |_| true)
+        // Deliberately NOT `list_runs_matching(limit, |_| true)`. That variant
+        // takes a predicate over a whole `RunRecord`, so it must decode every
+        // row to evaluate it. The unfiltered case does not, and it is the hot
+        // one — 28 call sites including `GET /api/v1/runs`. Keeping the two
+        // apart is what buys the win below (#1304).
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(RUN_HISTORY)?;
+
+        // When the caller wants everything, the two-pass scan is strictly more
+        // work — every row's key decoded, then every row fetched and decoded
+        // again — and measurably slower (~1.1x on a 1440-run history). The
+        // split only pays when a page is genuinely smaller than the history,
+        // which is the case #1304 is about. `brief`, `audit` and `review` all
+        // pass a 10_000 cap and would otherwise regress.
+        if limit as u64 >= table.len()? {
+            let mut runs = Vec::new();
+            for entry in table.iter()? {
+                let (_, value) = entry?;
+                runs.push(serde_json::from_slice::<RunRecord>(value.value())?);
+            }
+            runs.sort_by_key(|run| std::cmp::Reverse(run.started_at));
+            return Ok(runs);
+        }
+
+        // Pass 1: ordering keys only.
+        //
+        // `RUN_HISTORY` is keyed by `run_id`, so iteration order says nothing
+        // about time and the newest `limit` rows cannot be found without
+        // visiting every row. That much is unavoidable without a secondary
+        // index. What *is* avoidable is materializing every row: a
+        // `RunRecord` carries an unbounded `models_executed`, and decoding
+        // one only to drop it is what made the working set of a single
+        // `GET /api/v1/runs` scale at ~8.6 KB per row of history — enough to
+        // account for most of the RSS growth in a 24h soak (#1304).
+        //
+        // Serde walks the fields `RunOrderKey` does not name without
+        // materializing their contents, so a row costs its timestamp plus an
+        // owned `run_id` here — not its `models_executed`. Pass one is still
+        // O(rows) in retained memory, with a constant measured in tens of
+        // bytes rather than kilobytes, and the JSON is still fully scanned
+        // since a parser cannot seek to a field.
+        let mut keys: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let order: RunOrderKey = serde_json::from_slice(value.value())?;
+            keys.push((order.started_at, key.value().to_string()));
+        }
+
+        // Newest first. `sort_by` is stable and pass 1 collected in redb key
+        // order, so runs sharing a `started_at` keep their `run_id` order —
+        // the same tie-break the previous single-pass sort produced.
+        keys.sort_by_key(|(started_at, _)| std::cmp::Reverse(*started_at));
+        keys.truncate(limit);
+
+        // Pass 2: materialize only what is returned.
+        let mut runs = Vec::with_capacity(keys.len());
+        for (_, run_id) in keys {
+            if let Some(value) = table.get(run_id.as_str())? {
+                runs.push(serde_json::from_slice(value.value())?);
+            }
+        }
+        Ok(runs)
     }
 
     /// List the `limit` most recent runs (newest first) satisfying `keep`.
@@ -2276,6 +2382,10 @@ impl StateStore {
     /// variant (#1304): filtering the capped result instead lets a busy
     /// project's non-matching runs crowd every match out of the window, and
     /// the caller reads "no matching runs" off a project full of them.
+    ///
+    /// This decodes every row, unavoidably: `keep` sees a whole `RunRecord`,
+    /// so there is nothing to defer. [`Self::list_runs`] avoids that only
+    /// because it has no predicate to evaluate.
     pub fn list_runs_matching(
         &self,
         limit: usize,
@@ -2291,7 +2401,6 @@ impl StateStore {
                 runs.push(run);
             }
         }
-        // Sort by started_at descending
         runs.sort_by_key(|run| std::cmp::Reverse(run.started_at));
         runs.truncate(limit);
         Ok(runs)
@@ -5872,6 +5981,240 @@ mod tests {
 
         let runs = store.list_runs(3).unwrap();
         assert_eq!(runs.len(), 3);
+    }
+
+    /// `list_runs` returns the newest `limit` runs, newest first — with the
+    /// table's key order deliberately the reverse of time order, so a
+    /// implementation that trusted iteration order would fail.
+    #[test]
+    fn list_runs_returns_the_newest_page_in_descending_order() {
+        let (store, _dir) = temp_store();
+        let base = Utc::now();
+        // `run-000` is the OLDEST, so redb's key order is the exact reverse of
+        // the answer. An implementation that returned the first rows it
+        // iterated — or that sorted ascending — yields run-000..002 and fails;
+        // only a descending sort by `started_at` yields run-005..003.
+        for i in 0..6u32 {
+            store
+                .record_run(&run_at(
+                    &format!("run-{i:03}"),
+                    base + chrono::Duration::minutes(i64::from(i)),
+                ))
+                .unwrap();
+        }
+
+        let runs = store.list_runs(3).unwrap();
+        let ids: Vec<&str> = runs.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(ids, ["run-005", "run-004", "run-003"]);
+        assert!(
+            runs.windows(2).all(|w| w[0].started_at >= w[1].started_at),
+            "the page must be ordered newest first"
+        );
+    }
+
+    /// Runs sharing a `started_at` keep a deterministic order, so the same
+    /// history does not produce two different pages across calls.
+    #[test]
+    fn list_runs_breaks_ties_deterministically() {
+        let (store, _dir) = temp_store();
+        let same = Utc::now();
+        for id in ["run-c", "run-a", "run-b"] {
+            store.record_run(&run_at(id, same)).unwrap();
+        }
+
+        let first: Vec<String> = store
+            .list_runs(3)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert_eq!(first, ["run-a", "run-b", "run-c"], "ties follow key order");
+        for _ in 0..3 {
+            let again: Vec<String> = store
+                .list_runs(3)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.run_id)
+                .collect();
+            assert_eq!(again, first, "the same history must page identically");
+        }
+    }
+
+    /// 1440 runs — a 24h scheduler soak at one run per minute — each carrying
+    /// 40 model executions, so a record is realistically sized rather than
+    /// minimal. This is the shape #1304 measured.
+    fn seed_measurement_history(store: &StateStore) {
+        let base = Utc::now();
+        let models: Vec<ModelExecution> = (0..40)
+            .map(|i| ModelExecution {
+                model_name: format!("model_{i:03}"),
+                started_at: base,
+                finished_at: base,
+                duration_ms: 500,
+                rows_affected: Some(1000),
+                status: "success".to_string(),
+                sql_hash: "a".repeat(64),
+                skip_hash: None,
+                upstream_freshness: None,
+                bytes_scanned: Some(1),
+                bytes_written: Some(1),
+                tenant: None,
+                recipe_hash: None,
+                input_hash: None,
+                input_proof_class: None,
+                env_hash: None,
+                hash_scheme: None,
+                output_column_hashes: None,
+                attempts: Vec::new(),
+            })
+            .collect();
+        for i in 0..1440u32 {
+            let mut r = minimal_run_record(&format!("run-{i:05}"), models.clone());
+            r.started_at = base - chrono::Duration::minutes(i64::from(i));
+            r.finished_at = r.started_at;
+            store.record_run(&r).unwrap();
+        }
+    }
+
+    /// Measures ONE path per test, deliberately.
+    ///
+    /// Peak RSS is a whole-process high-water mark, so a harness that
+    /// exercises both the small-page and whole-history paths reports the
+    /// larger of the two and says nothing about either. Run under
+    /// `/usr/bin/time -l <test-binary> <name> --exact --ignored`.
+    #[test]
+    #[ignore = "measurement harness, not an assertion"]
+    fn measure_list_runs_small_page() {
+        let (store, _dir) = temp_store();
+        seed_measurement_history(&store);
+        let t = std::time::Instant::now();
+        for _ in 0..20 {
+            let page = store.list_runs(50).unwrap();
+            assert_eq!(page.len(), 50);
+        }
+        println!("MEASURED small-page list_runs(50) x20: {:?}", t.elapsed());
+    }
+
+    #[test]
+    #[ignore = "measurement harness, not an assertion"]
+    fn measure_list_runs_whole_history() {
+        let (store, _dir) = temp_store();
+        seed_measurement_history(&store);
+        let t = std::time::Instant::now();
+        for _ in 0..5 {
+            let page = store.list_runs(10_000).unwrap();
+            assert_eq!(page.len(), 1440);
+        }
+        println!(
+            "MEASURED whole-history list_runs(10000) x5: {:?}",
+            t.elapsed()
+        );
+    }
+
+    /// The whole-history short-circuit and the two-pass page must agree.
+    ///
+    /// `limit >= len` takes a different code path — one full decode of
+    /// everything — because the two-pass split is strictly more work when
+    /// nothing is being skipped. Two paths that can disagree is the risk that
+    /// buys, so the boundary is pinned: asking for exactly `len` and asking
+    /// for `len - 1` must produce the same prefix.
+    #[test]
+    fn the_whole_history_path_agrees_with_the_paged_path() {
+        let (store, _dir) = temp_store();
+        let base = Utc::now();
+        for i in 0..8u32 {
+            store
+                .record_run(&run_at(
+                    &format!("run-{i:03}"),
+                    base - chrono::Duration::minutes(i64::from(i)),
+                ))
+                .unwrap();
+        }
+
+        let whole: Vec<String> = store
+            .list_runs(8)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        let paged: Vec<String> = store
+            .list_runs(7)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.run_id)
+            .collect();
+        assert_eq!(whole.len(), 8);
+        assert_eq!(paged.len(), 7);
+        assert_eq!(
+            whole[..7],
+            paged[..],
+            "the two paths must order identically"
+        );
+
+        // And a limit past the end still returns everything, once.
+        let over = store.list_runs(1000).unwrap();
+        assert_eq!(over.len(), 8);
+        assert_eq!(
+            over.into_iter().map(|r| r.run_id).collect::<Vec<_>>(),
+            whole
+        );
+    }
+
+    #[test]
+    fn list_runs_with_a_zero_limit_returns_nothing() {
+        let (store, _dir) = temp_store();
+        store.record_run(&run_at("run-001", Utc::now())).unwrap();
+        assert!(store.list_runs(0).unwrap().is_empty());
+    }
+
+    /// The scan must not materialize rows it is not returning.
+    ///
+    /// Asserted through an observable consequence rather than by measuring
+    /// memory: a row whose `models_executed` cannot be decoded — but whose
+    /// `started_at` can — is invisible to a listing that excludes it, and
+    /// fails only when it lands in the page. An implementation that decoded
+    /// every row in full would fail both calls.
+    ///
+    /// This also pins the behaviour change: one damaged row no longer makes
+    /// the whole history unlistable.
+    #[test]
+    fn list_runs_does_not_decode_rows_outside_the_page() {
+        let (store, _dir) = temp_store();
+        let base = Utc::now();
+        store
+            .record_run(&run_at("run-new", base))
+            .expect("healthy newer run");
+
+        // Valid JSON, readable ordering key, undecodable payload — and older,
+        // so it sorts outside a page of one.
+        let older = (base - chrono::Duration::hours(1)).to_rfc3339();
+        // Every other field is spelled exactly as `RunRecord` expects — the
+        // enums are `Success` / `Manual`, not lowercase — so `models_executed`
+        // is the single reason this cannot decode. Without that care the test
+        // still passes, but on the status enum rather than on the unbounded
+        // field this change is actually about.
+        let damaged = format!(
+            r#"{{"run_id":"run-old","started_at":"{older}","finished_at":"{older}",
+                 "status":"Success","models_executed":[{{"not_a_model":true}}],
+                 "trigger":"Manual","config_hash":"h"}}"#
+        );
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(RUN_HISTORY).unwrap();
+            table.insert("run-old", damaged.as_bytes()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let page = store
+            .list_runs(1)
+            .expect("a damaged row outside the page must not fail the listing");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].run_id, "run-new");
+
+        assert!(
+            store.list_runs(2).is_err(),
+            "a damaged row INSIDE the page must still surface, not be skipped"
+        );
     }
 
     #[test]
