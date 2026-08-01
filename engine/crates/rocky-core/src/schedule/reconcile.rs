@@ -1170,7 +1170,12 @@ async fn execute_claimed(
                 claim: terminal_claim,
                 bookkeeping,
             } => {
-                let attempts = terminal_claim.cycle_attempts;
+                // Two different counters, deliberately: the tick's public
+                // `ExecutedDemand.attempts` is the FROZEN contract's total-
+                // submissions audit counter; the incident bundle reports the
+                // attempts consumed by THIS demand cycle.
+                let attempts = terminal_claim.attempts;
+                let bundle_attempts = terminal_claim.cycle_attempts;
                 let mutation = ScheduleStateMutation::Terminal {
                     outcome: bookkeeping.outcome,
                     cf_delta: bookkeeping.cf_delta,
@@ -1212,7 +1217,7 @@ async fn execute_claimed(
                                 Some(demand.logical_ts),
                                 &submission_id,
                                 Some(run_outcome.exit_code),
-                                attempts,
+                                bundle_attempts,
                                 consecutive_failures,
                                 now,
                             );
@@ -2349,6 +2354,71 @@ cron = "also invalid"
                     .next()
                     .is_none(),
             "no incident bundle on drain"
+        );
+    }
+
+    /// The tick's public `attempts` and the incident bundle's `attempts` are
+    /// DIFFERENT counters and must stay decoupled: total submissions (the
+    /// frozen tick contract) vs attempts within this demand cycle. A standing
+    /// demand that fails across two cycles makes them diverge — 2 vs 1.
+    #[test]
+    fn tick_attempts_stay_total_while_bundle_attempts_are_cycle_scoped() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(AFTER_ONLY);
+        // Cycle 1: raw succeeds, staging fails (released with failure backoff).
+        with_store(&state_path, |store| {
+            seed_run(
+                store,
+                "raw",
+                None,
+                RunStatus::Success,
+                at(2026, 5, 2, 3, 5),
+                at(2026, 5, 2, 3, 10),
+            );
+        });
+        let spawner = CapturingSpawner::new(0);
+        spawner.script("staging", [1, 1]);
+        let report1 = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                at(2026, 5, 2, 3, 20),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+        assert_eq!(report1.executed.len(), 1);
+        assert_eq!(report1.executed[0].attempts, 1, "first submission overall");
+
+        // Cycle 2 (past the failure backoff): re-claimed — a fresh cycle, but
+        // the SECOND submission overall.
+        let report2 = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                at(2026, 5, 2, 3, 40),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+        assert_eq!(report2.executed.len(), 1, "{:?}", report2.skipped);
+        assert_eq!(
+            report2.executed[0].attempts, 2,
+            "the public tick contract reports TOTAL submissions"
+        );
+
+        // The newest bundle reports the cycle's attempts: 1, not 2.
+        let mut bundles: Vec<_> = std::fs::read_dir(opts.rocky_dir.join("incidents"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect();
+        bundles.sort();
+        let newest: crate::schedule::incidents::IncidentBundle =
+            serde_json::from_slice(&std::fs::read(bundles.last().unwrap()).unwrap()).unwrap();
+        assert_eq!(
+            newest.attempts, 1,
+            "the bundle reports attempts within THIS cycle"
         );
     }
 
