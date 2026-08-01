@@ -298,9 +298,39 @@ pub struct CollisionIdentity(String);
 
 impl CollisionIdentity {
     /// Build from a target's parts. No rules parameter, deliberately.
+    ///
+    /// Folds with Unicode [`str::to_lowercase`], not `to_ascii_lowercase`.
+    /// An ASCII-only fold answers "different" for `TÄBLE` and `täble`, which
+    /// a case-insensitive warehouse resolves to one object — precisely the
+    /// unrecoverable direction this type exists to avoid.
+    ///
+    /// Widening is safe here in the sense that matters — it is monotone. It
+    /// can only make more things equal, never fewer, so no collision detected
+    /// before goes undetected now and no consumer (they all refuse on a match)
+    /// is un-gated. `unicode_fold_never_splits_an_ascii_equality` proves the
+    /// monotonicity over every Unicode scalar rather than asserting it.
+    ///
+    /// It is *not* merely additive at the output, and three distinct effects
+    /// are worth naming because "only adds refusals" glosses all of them:
+    ///
+    /// 1. **New groups.** Two singleton targets `TÄBLE` and `täble` produced
+    ///    no E036 at all before; they now merge into a group and both models
+    ///    are newly reported. This is the point of the change, not a side
+    ///    effect — but it is a project that used to compile and no longer
+    ///    does.
+    /// 2. **Absorbed singletons.** A singleton can join an existing group,
+    ///    enlarging a diagnostic that was already firing.
+    /// 3. **Reordering without merging.** `rocky-compiler` groups into a
+    ///    `BTreeMap` keyed on the folded string and emits in that order, so a
+    ///    fold that changes a key changes group order even when nothing
+    ///    merges: `İ` sorts after `z` folded to ASCII, and before it folded to
+    ///    `i` + U+0307.
+    ///
+    /// No participant is ever lost — `compile` emits one hard error per model
+    /// in a group, merged or not.
     #[must_use]
     pub fn of(catalog: &str, schema: &str, table: &str) -> Self {
-        Self(format!("{catalog}.{schema}.{table}").to_ascii_lowercase())
+        Self(format!("{catalog}.{schema}.{table}").to_lowercase())
     }
 
     /// Build from an already-qualified `catalog.schema.table` string.
@@ -311,7 +341,7 @@ impl CollisionIdentity {
     /// fold stays defined in exactly one place.
     #[must_use]
     pub fn of_qualified(qualified: &str) -> Self {
-        Self(qualified.to_ascii_lowercase())
+        Self(qualified.to_lowercase())
     }
 }
 
@@ -2058,6 +2088,101 @@ mod tests {
         assert!(out.sql.contains("other.schema.customers c"), "{}", out.sql);
     }
 
+    /// **The widening's load-bearing safety property**, proven over the whole
+    /// of Unicode rather than argued.
+    ///
+    /// The justification for replacing `to_ascii_lowercase` with Unicode
+    /// `to_lowercase` is that the new fold is strictly *coarser* — it can
+    /// merge keys that were distinct, never split keys that were equal. If
+    /// some pair folded equal under ASCII but differs under Unicode, a
+    /// collision detected today would silently stop being detected: a
+    /// fail-open introduced by a change justified as fail-closed.
+    ///
+    /// Several shapes per scalar because `to_lowercase` is context-sensitive
+    /// (Greek final sigma folds differently at the end of a word), so the
+    /// position of the scalar in the string matters.
+    #[test]
+    fn unicode_fold_never_splits_an_ascii_equality() {
+        for cp in 0u32..=0x0010_FFFF {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            for shape in [
+                format!("A{c}z"),
+                format!("A{c}"),
+                format!("{c}z"),
+                c.to_string(),
+            ] {
+                let upper = shape.to_ascii_uppercase();
+                let lower = shape.to_ascii_lowercase();
+                // The two are equal under the OLD fold by construction.
+                assert_eq!(upper.to_ascii_lowercase(), lower.to_ascii_lowercase());
+                // They must remain equal under the NEW one.
+                assert_eq!(
+                    upper.to_lowercase(),
+                    lower.to_lowercase(),
+                    "U+{cp:04X} in {shape:?} splits an equality the ASCII fold established"
+                );
+            }
+        }
+    }
+
+    /// The key is a single `catalog.schema.table` string, so a scalar that
+    /// folded *into* a `.` would let one component's contents manufacture a
+    /// component boundary. No scalar does; asserted rather than assumed,
+    /// since it is what makes the joined form safe.
+    #[test]
+    fn no_scalar_lowercases_into_the_component_separator() {
+        for cp in 0u32..=0x0010_FFFF {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            if c == '.' {
+                continue;
+            }
+            let folded: String = c.to_lowercase().collect();
+            assert!(
+                !folded.contains('.'),
+                "U+{cp:04X} folds to {folded:?}, which contains the component separator"
+            );
+        }
+    }
+
+    /// Case-variant spellings are one identity — the property every collision
+    /// gate leans on. The non-ASCII pair is the one an `to_ascii_lowercase`
+    /// fold gets wrong: `Ä` stays uppercase, so the two keys differ and two
+    /// models writing one table on a case-insensitive warehouse pass every
+    /// gate silently.
+    #[test]
+    fn collision_identity_folds_case_including_non_ascii() {
+        for (a, b) in [
+            (("cat", "raw", "ORDERS"), ("cat", "raw", "orders")),
+            (("CAT", "RAW", "orders"), ("cat", "raw", "orders")),
+            (("cat", "raw", "TÄBLE"), ("cat", "raw", "täble")),
+            (("cat", "SCHÉMA", "t"), ("cat", "schéma", "t")),
+        ] {
+            assert_eq!(
+                CollisionIdentity::of(a.0, a.1, a.2),
+                CollisionIdentity::of(b.0, b.1, b.2),
+                "{a:?} and {b:?} name one object on a case-insensitive warehouse"
+            );
+        }
+    }
+
+    /// The fold must not go so far that genuinely distinct targets merge —
+    /// an over-strict identity refuses a legitimate project.
+    #[test]
+    fn collision_identity_keeps_distinct_targets_distinct() {
+        assert_ne!(
+            CollisionIdentity::of("cat", "raw", "orders"),
+            CollisionIdentity::of("cat", "raw", "order")
+        );
+        assert_ne!(
+            CollisionIdentity::of("cat", "raw", "täble"),
+            CollisionIdentity::of("cat", "raw", "table")
+        );
+    }
+
     /// `of_qualified` is documented as equivalent to `of` on the same
     /// components. Pinned, because the seam that uses it keys on a *string*
     /// built elsewhere, and a doc claim of equivalence is worth exactly as
@@ -2067,7 +2192,7 @@ mod tests {
         for (c, s, t) in [
             ("cat", "raw", "orders"),
             ("CAT", "Raw", "ORDERS"),
-            ("cat", "schema", "TABLE"),
+            ("cat", "schéma", "TÄBLE"),
             ("", "raw", "orders"),
         ] {
             assert_eq!(

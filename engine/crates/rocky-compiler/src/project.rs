@@ -63,11 +63,14 @@ pub struct TargetCollision {
 
 /// Group models by the physical object their target names.
 ///
-/// Identity is [`rocky_sql::defer::CollisionIdentity`], which ASCII-lowercases
-/// every component and deliberately takes no dialect rules: answering
+/// Identity is [`rocky_sql::defer::CollisionIdentity`], which case-folds with
+/// Unicode `to_lowercase` and deliberately takes no dialect rules: answering
 /// "different" for two spellings that are one object would let both models
 /// write the same table with no error at all, which is the failure this is
 /// here to prevent.
+///
+/// Note the grouping order below follows the folded key, so a change to the
+/// fold reorders these diagnostics even where it merges nothing.
 ///
 /// **Scope.** The key is `catalog.schema.table` only — not adapter routing
 /// identity, which #1291 also asks for. `from_models` receives `Vec<Model>`

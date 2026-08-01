@@ -1182,13 +1182,17 @@ fn discover_transformation_branch_targets(
     // the later source silently overwriting the earlier, exit 0 (#1310).
     // Promote never compiles, so the compiler's duplicate-target diagnostic
     // (E036, #1303) cannot fire on this path; refuse here, at discovery,
-    // before anything is planned. Keyed case-insensitively: on a
-    // case-insensitive warehouse the variants collide physically, and two
-    // models whose targets differ only by case is refused as the safe
-    // direction for a destructive path. Checked on the POST-filter set — the
-    // set that will actually execute — so `--filter` can still promote one
-    // model out of a project that has a collision elsewhere.
-    let mut claimed: std::collections::HashMap<(String, String, String), String> =
+    // before anything is planned. Checked on the POST-filter set — the set
+    // that will actually execute — so `--filter` can still promote one model
+    // out of a project that has a collision elsewhere.
+    //
+    // Identity is `CollisionIdentity`, the same key the compiler's E036 and
+    // the apply seam below use, rather than a fold spelled out here. Two gates
+    // answering "is this one physical object?" differently is the hazard, and
+    // this is the more destructive of them: were promote to hand-roll the
+    // fold, a later correction to identity (#1281, #1282) would silently not
+    // reach it.
+    let mut claimed: std::collections::HashMap<rocky_sql::defer::CollisionIdentity, String> =
         std::collections::HashMap::new();
     for model in &all_models {
         // Skip ephemeral models — they have no physical table to promote.
@@ -1219,11 +1223,7 @@ fn discover_transformation_branch_targets(
             schema: model.config.target.schema.clone(),
             table: model.config.target.table.clone(),
         };
-        let key = (
-            prod.catalog.to_lowercase(),
-            prod.schema.to_lowercase(),
-            prod.table.to_lowercase(),
-        );
+        let key = rocky_sql::defer::CollisionIdentity::of(&prod.catalog, &prod.schema, &prod.table);
         if let Some(prior) = claimed.insert(key, model.config.name.clone()) {
             anyhow::bail!(
                 "duplicate promote target {}.{}.{}: models '{prior}' and '{}' both resolve to \
