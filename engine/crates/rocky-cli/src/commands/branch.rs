@@ -1131,6 +1131,19 @@ fn discover_transformation_branch_targets(
     };
 
     let mut planned = Vec::new();
+    // Two models resolving to one physical target would both plan a
+    // replacement against it, and execution runs the steps back to back —
+    // the later source silently overwriting the earlier, exit 0 (#1310).
+    // Promote never compiles, so the compiler's duplicate-target diagnostic
+    // (E036, #1303) cannot fire on this path; refuse here, at discovery,
+    // before anything is planned. Keyed case-insensitively: on a
+    // case-insensitive warehouse the variants collide physically, and two
+    // models whose targets differ only by case is refused as the safe
+    // direction for a destructive path. Checked on the POST-filter set — the
+    // set that will actually execute — so `--filter` can still promote one
+    // model out of a project that has a collision elsewhere.
+    let mut claimed: std::collections::HashMap<(String, String, String), String> =
+        std::collections::HashMap::new();
     for model in &all_models {
         // Skip ephemeral models — they have no physical table to promote.
         // Mirrors how `rocky run` skips ephemeral materializations during
@@ -1160,6 +1173,23 @@ fn discover_transformation_branch_targets(
             schema: model.config.target.schema.clone(),
             table: model.config.target.table.clone(),
         };
+        let key = (
+            prod.catalog.to_lowercase(),
+            prod.schema.to_lowercase(),
+            prod.table.to_lowercase(),
+        );
+        if let Some(prior) = claimed.insert(key, model.config.name.clone()) {
+            anyhow::bail!(
+                "duplicate promote target {}.{}.{}: models '{prior}' and '{}' both resolve to \
+                 it, and promoting both would execute two replacements with the later silently \
+                 overwriting the earlier. Point one model's [target] elsewhere (the compiler \
+                 reports this as E036; `branch promote` does not compile, so it refuses here).",
+                prod.catalog,
+                prod.schema,
+                prod.table,
+                model.config.name
+            );
+        }
         let branch_source = shadow::shadow_target(&prod, &shadow_cfg);
         planned.push(PlannedPromote {
             prod,
@@ -4202,5 +4232,114 @@ adapter = "default"
                 .expect("filter must succeed");
         assert_eq!(planned.len(), 1, "filter must keep only the matching model");
         assert_eq!(planned[0].prod.table, "fct_orders");
+    }
+}
+
+#[cfg(test)]
+mod duplicate_target_refusal_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// A temp project whose two models both resolve to `probe.main.<table>`,
+    /// with the second's target case-varied so the case-insensitive key is
+    /// exercised, not just byte equality.
+    fn project_with_targets(tmp: &TempDir, tables: [&str; 2]) -> std::path::PathBuf {
+        let root = tmp.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        for (name, table) in ["alpha", "beta"].iter().zip(tables) {
+            std::fs::write(models.join(format!("{name}.sql")), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                models.join(format!("{name}.toml")),
+                format!(
+                    "[strategy]\ntype = \"full_refresh\"\n\n\
+                     [target]\ncatalog = \"probe\"\nschema = \"main\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let config = root.join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"probe.duckdb\"\n\n\
+             [pipeline.probe]\ntype = \"transformation\"\nmodels = \"models\"\n\n\
+             [pipeline.probe.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        config
+    }
+
+    fn transformation_pipeline(
+        config_path: &std::path::Path,
+    ) -> rocky_core::config::TransformationPipelineConfig {
+        let cfg = rocky_core::config::load_rocky_config(config_path).unwrap();
+        match cfg.pipelines.get("probe").cloned().unwrap() {
+            rocky_core::config::PipelineConfig::Transformation(t) => *t,
+            other => panic!("fixture must be a transformation pipeline, got {other:?}"),
+        }
+    }
+
+    /// The #1310 depth-0 repro: two models, one physical target (case-varied)
+    /// — discovery refuses before anything is planned, naming both models and
+    /// the target. Pre-fix, both were planned and execution ran two
+    /// replacements back to back, the later silently overwriting the earlier.
+    #[test]
+    fn discovery_refuses_two_models_sharing_a_target() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = project_with_targets(&tmp, ["shared", "Shared"]);
+        let pipeline = transformation_pipeline(&config_path);
+        let record = sample_branch_record_for_promote("fix-price");
+        let err = discover_transformation_branch_targets(&pipeline, &config_path, &record, None)
+            .expect_err("a duplicate promote target must refuse, not plan");
+        let msg = format!("{err:#}");
+        for needle in ["duplicate promote target", "alpha", "beta", "E036"] {
+            assert!(msg.contains(needle), "error must mention {needle:?}: {msg}");
+        }
+    }
+
+    /// `--filter` semantics pinned: the collision check runs on the set that
+    /// will actually execute, so selecting one model out of a colliding pair
+    /// still promotes — refusing there would make a messy project's targeted
+    /// promote impossible, which is not this guard's job.
+    #[test]
+    fn discovery_with_a_filter_narrowing_to_one_model_still_plans() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = project_with_targets(&tmp, ["shared", "shared"]);
+        let pipeline = transformation_pipeline(&config_path);
+        let record = sample_branch_record_for_promote("fix-price");
+        let planned = discover_transformation_branch_targets(
+            &pipeline,
+            &config_path,
+            &record,
+            Some("model=alpha"),
+        )
+        .expect("a filtered promote of one model must still plan");
+        assert_eq!(planned.len(), 1, "exactly the filtered model plans");
+    }
+
+    /// Distinct targets keep planning both — the guard refuses collisions,
+    /// not multi-model promotes.
+    #[test]
+    fn discovery_plans_two_models_with_distinct_targets() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = project_with_targets(&tmp, ["t_alpha", "t_beta"]);
+        let pipeline = transformation_pipeline(&config_path);
+        let record = sample_branch_record_for_promote("fix-price");
+        let planned =
+            discover_transformation_branch_targets(&pipeline, &config_path, &record, None)
+                .expect("distinct targets must plan");
+        assert_eq!(planned.len(), 2);
+    }
+
+    fn sample_branch_record_for_promote(name: &str) -> BranchRecord {
+        BranchRecord {
+            name: name.to_string(),
+            schema_prefix: format!("branch__{name}"),
+            created_by: "tester".to_string(),
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-05-03T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            description: None,
+        }
     }
 }
