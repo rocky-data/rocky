@@ -260,7 +260,7 @@ pub(crate) fn run_backfill_in(
     // apply-time TOCTOU gate rejects a post-plan swap of any, built from the SAME
     // `models_dir` the apply choke-point re-reads.
     let extras = crate::commands::apply::ExecutionExtras::build(
-        &rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap_or_default(),
+        &rocky_core::models::load_surrogate_keys_from_tree(models_dir).unwrap_or_default(),
         &compiled.project.models,
         &resolved_mask,
     );

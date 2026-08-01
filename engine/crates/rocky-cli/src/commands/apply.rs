@@ -1800,7 +1800,7 @@ pub(crate) fn execution_ir_fingerprint(
 /// schema drift (that class is finding #2, deferred).
 ///
 /// - **Surrogate keys (#1).** `[[surrogate_key]]` sidecar blocks are loaded by
-///   [`load_surrogate_keys_from_dir`](rocky_core::models::load_surrogate_keys_from_dir),
+///   [`load_surrogate_keys_from_tree`](rocky_core::models::load_surrogate_keys_from_tree),
 ///   NOT by the compiler, so they are absent from `ModelConfig` and invisible to
 ///   the config+SQL projection. A model that gains/changes a surrogate key wraps
 ///   its SELECT at materialization time — a different physical write.

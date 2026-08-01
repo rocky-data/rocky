@@ -7184,7 +7184,7 @@ pub(crate) async fn execute_models(
         .map(|model| std::path::PathBuf::from(&model.file_path))
         .collect();
     let surrogate_keys =
-        rocky_core::models::load_surrogate_keys_from_dir_filtered(models_dir, |path| {
+        rocky_core::models::load_surrogate_keys_from_tree_filtered(models_dir, |path| {
             selected_model_paths.contains(path)
         })
         .context("invalid surrogate_key configuration")?;
@@ -15758,7 +15758,7 @@ timestamp_column = "ts"
             ..Default::default()
         };
         let result = compile::compile(&cc).unwrap();
-        let sk = rocky_core::models::load_surrogate_keys_from_dir(models_dir).unwrap();
+        let sk = rocky_core::models::load_surrogate_keys_from_tree(models_dir).unwrap();
         let extras = crate::commands::apply::ExecutionExtras::build(
             &sk,
             &result.project.models,

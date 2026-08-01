@@ -193,7 +193,8 @@ pub fn compute_catalog_output(
     let result = compile::compile(&config).context("compile failed")?;
 
     // Per-column descriptions from sidecar `[columns]` tables (best-effort).
-    let column_docs = rocky_core::models::load_column_docs_from_dir(models_dir).unwrap_or_default();
+    let column_docs =
+        rocky_core::models::load_column_docs_from_tree(models_dir).unwrap_or_default();
 
     // 3. Resolve project name from the config (first pipeline if multi).
     let project_name = match &rocky_cfg {

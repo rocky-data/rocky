@@ -3860,3 +3860,142 @@ SELECT 1
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tree-wide sidecar loading (#1262)
+// ---------------------------------------------------------------------------
+//
+// The per-directory loaders above read exactly one directory, which was
+// consistent while every scanner was flat. With model discovery and the
+// compile path walking the whole tree, a per-directory sidecar read beside
+// them becomes the sharpest silent drop of the family: a deep model would
+// MATERIALIZE — but without its surrogate keys, unit tests, or column docs,
+// because the sidecar map never contained it. These wrappers walk the same
+// `crate::model_walk` tree every other scanner walks and union the
+// per-directory maps.
+//
+// Union semantics: FIRST WINS along the walk's deterministic pre-order — a
+// deep entry can only add, never override a shallower one. For a flat
+// project this is byte-identical to the per-directory loader; for a nested
+// one it adds the deep entries that were previously ignored wholesale.
+//
+// Walk errors are NOT propagated here — but never silently discarded
+// either. Every caller of these loaders is tolerant (`.unwrap_or_default()`),
+// so failing the whole map on one unreadable subtree would drop every OTHER
+// model's sidecars with it — the strictness-turned-fail-open trap. Instead
+// each walk error is logged at WARN: the model loaders walking the same tree
+// surface the same errors strictly on their own paths, and the warning keeps
+// the sidecar half visible even on a path that never strictly loads models.
+
+/// Warn-and-continue for walk errors inside the tolerant tree loaders — see
+/// the module note above: visible, never fatal.
+fn warn_walk_errors(root: &Path, errors: Vec<crate::model_walk::ModelWalkError>) {
+    for error in errors {
+        tracing::warn!(
+            root = %root.display(),
+            error = %error,
+            "sidecar tree walk could not fully read the models tree"
+        );
+    }
+}
+
+/// [`load_surrogate_keys_from_dir`], across the whole models tree.
+pub fn load_surrogate_keys_from_tree(
+    root: &Path,
+) -> Result<std::collections::HashMap<String, Vec<SurrogateKeySpec>>, ModelError> {
+    load_surrogate_keys_from_tree_filtered(root, |_| true)
+}
+
+/// [`load_surrogate_keys_from_dir_filtered`], across the whole models tree.
+pub fn load_surrogate_keys_from_tree_filtered(
+    root: &Path,
+    include: impl Fn(&Path) -> bool,
+) -> Result<std::collections::HashMap<String, Vec<SurrogateKeySpec>>, ModelError> {
+    let (dirs, walk_errors) = crate::model_walk::walk_model_dirs(root);
+    warn_walk_errors(root, walk_errors);
+    let mut out = std::collections::HashMap::new();
+    for dir in dirs {
+        for (name, specs) in load_surrogate_keys_from_dir_filtered(&dir, &include)? {
+            out.entry(name).or_insert(specs);
+        }
+    }
+    Ok(out)
+}
+
+/// [`load_unit_tests_from_dir`], across the whole models tree.
+pub fn load_unit_tests_from_tree(
+    root: &Path,
+) -> Result<std::collections::HashMap<String, Vec<UnitTestDef>>, ModelError> {
+    let (dirs, walk_errors) = crate::model_walk::walk_model_dirs(root);
+    warn_walk_errors(root, walk_errors);
+    let mut out = std::collections::HashMap::new();
+    for dir in dirs {
+        for (name, defs) in load_unit_tests_from_dir(&dir)? {
+            out.entry(name).or_insert(defs);
+        }
+    }
+    Ok(out)
+}
+
+/// [`load_column_docs_from_dir`], across the whole models tree.
+pub fn load_column_docs_from_tree(
+    root: &Path,
+) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, String>>, ModelError>
+{
+    let (dirs, walk_errors) = crate::model_walk::walk_model_dirs(root);
+    warn_walk_errors(root, walk_errors);
+    let mut out = std::collections::HashMap::new();
+    for dir in dirs {
+        for (name, docs) in load_column_docs_from_dir(&dir)? {
+            out.entry(name).or_insert(docs);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tree_sidecar_tests {
+    use super::*;
+
+    /// A deep model's surrogate-key spec reaches the tree map — previously it
+    /// was ignored wholesale, so the model materialized WITHOUT its keys.
+    #[test]
+    fn a_deep_surrogate_key_spec_is_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let deep = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            deep.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"orders\"\n\n\
+             [[surrogate_key]]\nname = \"sk\"\ncolumns = [\"id\"]\n",
+        )
+        .unwrap();
+        let map = load_surrogate_keys_from_tree(tmp.path()).unwrap();
+        assert!(map.contains_key("orders"), "{map:?}");
+    }
+
+    /// First wins along the walk: a shallow entry is never overridden by a
+    /// deeper one — flat projects behave byte-identically to the per-dir
+    /// loader.
+    #[test]
+    fn a_shallow_entry_is_not_overridden_by_a_deep_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let deep = root.join("z");
+        std::fs::create_dir_all(&deep).unwrap();
+        for (dir, cols) in [(root, "shallow_col"), (&*deep, "deep_col")] {
+            std::fs::write(dir.join("m.sql"), "SELECT 1 AS id\n").unwrap();
+            std::fs::write(
+                dir.join("m.toml"),
+                format!(
+                    "name = \"m\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"m\"\n\n\
+                     [[surrogate_key]]\nname = \"sk\"\ncolumns = [\"{cols}\"]\n"
+                ),
+            )
+            .unwrap();
+        }
+        let map = load_surrogate_keys_from_tree(root).unwrap();
+        assert_eq!(map["m"][0].columns, vec!["shallow_col"]);
+    }
+}

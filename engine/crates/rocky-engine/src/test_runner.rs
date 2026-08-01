@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use rocky_compiler::compile::CompilerConfig;
-use rocky_core::models::load_unit_tests_from_dir;
+use rocky_core::models::load_unit_tests_from_tree;
 use rocky_core::unit_test::{
     MismatchKind, RowMismatch, UnitTestDef, UnitTestResult, fixture_to_sql, json_to_sql_literal,
 };
@@ -216,7 +216,7 @@ pub fn run_unit_tests(
     models_dir: &Path,
     model_filter: Option<&str>,
 ) -> anyhow::Result<UnitTestRun> {
-    let unit_tests = load_unit_tests_from_dir(models_dir)?;
+    let unit_tests = load_unit_tests_from_tree(models_dir)?;
     if unit_tests.is_empty() {
         return Ok(UnitTestRun {
             results: Vec::new(),

@@ -183,7 +183,7 @@ fn emit_models(
     // Declared surrogate-key specs, applied per model so the emitted SELECT is
     // wrapped identically to the materialization path (see `apply_surrogate_keys`).
     let surrogate_keys: HashMap<String, Vec<SurrogateKeySpec>> =
-        rocky_core::models::load_surrogate_keys_from_dir(models_dir)
+        rocky_core::models::load_surrogate_keys_from_tree(models_dir)
             .context("invalid surrogate_key configuration")?;
 
     let mut emitted = Vec::new();
