@@ -1030,7 +1030,18 @@ def self_test() -> int:
     for s in rss_outage["samples"]:
         if s["t"] >= rss_lo:
             s["rss_kb"] = None
-    check("rss outage across the tail window is INVALID", analyse(rss_outage)["verdict"], "INVALID")
+    # Assert the GATE, not just the verdict. G3b independently reports INVALID
+    # for this same fixture — its final quarter is nulled too — so a
+    # verdict-only assertion passes without G3a and proves nothing about the
+    # gate under test.
+    rss_outage_gates = sorted(
+        {f["gate"] + ":" + f["status"] for f in analyse(rss_outage)["findings"]}
+    )
+    check(
+        "rss outage makes G3a itself INVALID",
+        "G3a:INVALID" in rss_outage_gates,
+        True,
+    )
 
     # A zero baseline is INVALID, not a crash. Widening the guard from
     # truthiness to `is not None` is what let 0 reach the growth division —
