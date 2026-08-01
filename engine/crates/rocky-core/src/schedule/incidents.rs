@@ -147,11 +147,47 @@ pub fn write_incident(rocky_dir: &Path, bundle: &IncidentBundle) -> io::Result<P
     let json = serde_json::to_vec_pretty(bundle)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     // Collision-safe: sanitize/normalize are lossy, so two DISTINCT incidents
-    // can land on the same name in the same second — create_new + a numbered
-    // variant keeps both instead of silently overwriting the first.
+    // can land on the same name in the same second — a numbered variant keeps
+    // both instead of silently overwriting the first. Two invariants matter:
+    //
+    // * variants are ZERO-PADDED (`-002`…`-999`) so they sort in write order
+    //   (the retention sweep sorts names; ASCII `-` < `.` means the base
+    //   itself sorts after its variants, but every file in one collision
+    //   group shares the same second, so intra-group order is within the
+    //   name format's documented 1-second resolution either way);
+    // * the slot is chosen as max-existing + 1, NEVER first-free: a slot the
+    //   sweep deleted must stay dead, or a reused low slot would sort oldest
+    //   and be swept again immediately — freezing retention while every
+    //   NEWEST bundle vanishes (and the returned path would not exist).
     let stem = name.strip_suffix(".json").expect("constructed with .json");
+    let mut k: u32 = {
+        let prefix = format!("{stem}-");
+        let mut max_variant = 0;
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let fname = entry.file_name();
+            let Some(fname) = fname.to_str() else {
+                continue;
+            };
+            if fname == name {
+                max_variant = max_variant.max(1);
+            } else if let Some(v) = fname
+                .strip_prefix(&prefix)
+                .and_then(|r| r.strip_suffix(".json"))
+                .and_then(|d| (d.len() == 3).then(|| d.parse::<u32>().ok()).flatten())
+            {
+                max_variant = max_variant.max(v);
+            }
+        }
+        max_variant
+    };
     let mut path = dir.join(&name);
-    let mut k = 1;
+    if k > 0 {
+        k += 1;
+        let variant = format!("{stem}-{k:03}.json");
+        debug_assert!(is_bundle_name(&variant), "{variant}");
+        path = dir.join(variant);
+    }
     loop {
         match std::fs::OpenOptions::new()
             .write(true)
@@ -163,9 +199,11 @@ pub fn write_incident(rocky_dir: &Path, bundle: &IncidentBundle) -> io::Result<P
                 f.write_all(&json)?;
                 break;
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && k < 100 => {
+            // A racing writer took the slot between the scan and the open
+            // (ticks are lock-serialized, so this is belt-and-braces).
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && k < 999 => {
                 k += 1;
-                let variant = format!("{stem}-{k}.json");
+                let variant = format!("{stem}-{k:03}.json");
                 debug_assert!(is_bundle_name(&variant), "{variant}");
                 path = dir.join(variant);
             }
@@ -399,6 +437,38 @@ mod tests {
         assert!(
             is_bundle_name(n2),
             "the variant is still a bundle name: {n2}"
+        );
+    }
+
+    /// The round-4 review trace: a flood of DISTINCT incidents colliding on
+    /// one base name must roll retention forward — every write's returned
+    /// path exists, the newest bundles survive, and a swept slot is never
+    /// reused (a reused low slot would sort oldest and be deleted again
+    /// immediately, freezing the retained set).
+    #[test]
+    fn a_single_name_collision_flood_rolls_retention_forward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut last = None;
+        for _ in 0..(INCIDENTS_KEPT + 3) {
+            let path = write_incident(tmp.path(), &bundle("p", at)).unwrap();
+            assert!(
+                path.exists(),
+                "a write must never return a path the sweep already deleted: {path:?}"
+            );
+            last = Some(path);
+        }
+        let dir = tmp.path().join("incidents");
+        let count = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .count();
+        assert_eq!(count, INCIDENTS_KEPT, "retention holds at the cap");
+        assert!(
+            last.unwrap().exists(),
+            "the newest bundle must survive its own sweep"
         );
     }
 
