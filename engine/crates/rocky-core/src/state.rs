@@ -2310,10 +2310,12 @@ impl StateStore {
     /// its result; tracked separately from the cost fix in #1304.
     pub fn list_runs(&self, limit: usize) -> Result<Vec<RunRecord>, StateError> {
         // Deliberately NOT `list_runs_matching(limit, |_| true)`. That variant
-        // takes a predicate over a whole `RunRecord`, so it must decode every
-        // row to evaluate it. The unfiltered case does not, and it is the hot
-        // one — 28 call sites including `GET /api/v1/runs`. Keeping the two
-        // apart is what buys the win below (#1304).
+        // takes a predicate over a whole `RunRecord`, so it must decode a row
+        // to evaluate it — and with an always-true predicate that is every row
+        // in the page, plus the `limit >= len` shortcut below lost. The
+        // unfiltered case is also the hot one — 28 call sites including
+        // `GET /api/v1/runs`. Keeping the two apart is what buys the win below
+        // (#1304).
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -2376,6 +2378,82 @@ impl StateStore {
         Ok(runs)
     }
 
+    /// Walk run history newest-first, keeping what `weigh` selects, and stop
+    /// as soon as the kept items are worth `limit`.
+    ///
+    /// `weigh` returns `None` to skip a run, or `Some((weight, value))` to keep
+    /// `value` as carrying `weight` toward `limit`. The weight is what lets one
+    /// scan serve two different questions: [`Self::list_runs_matching`] counts
+    /// runs, so every kept run weighs 1; [`Self::get_model_history`] counts
+    /// *executions*, so a run weighs however many executions of that model it
+    /// recorded — which is not always 1, and getting that wrong is the bug this
+    /// signature exists to prevent (see `get_model_history`).
+    ///
+    /// The shape mirrors [`Self::list_runs`]: order by the cheap key first,
+    /// then materialize only the candidates the walk reaches. Both passes run
+    /// inside one read transaction, so pass 2's `get` sees the same snapshot
+    /// pass 1 ordered.
+    ///
+    /// # Errors
+    ///
+    /// Pass 1 must parse every row's `started_at` to order the table at all, so
+    /// a row that is not valid JSON, or whose ordering key is unreadable, fails
+    /// the read at any `limit`.
+    ///
+    /// A row that orders fine but whose full payload cannot decode fails only
+    /// if the walk reaches it — which is a weaker guarantee than `list_runs`'s,
+    /// and the difference matters. `list_runs` decodes exactly its page, so a
+    /// damaged row outside it is never touched. This has to decode a candidate
+    /// to weigh it at all, so a damaged row reached *before* the page fills
+    /// fails the read even though it would never have been returned. Stopping
+    /// early narrows that exposure; it does not remove it, and that is why
+    /// `weigh` must not over-report how much more the caller needs.
+    fn scan_runs_newest_first<T>(
+        &self,
+        limit: usize,
+        mut weigh: impl FnMut(RunRecord) -> Option<(usize, T)>,
+    ) -> Result<Vec<T>, StateError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(RUN_HISTORY)?;
+
+        // Pass 1: ordering keys only, exactly as `list_runs` does — the table
+        // is keyed by `run_id`, so time order has to be established before
+        // "newest N" means anything. This is O(rows) on every call; what the
+        // early stop below bounds is the full-record decoding, not this walk.
+        let mut keys: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            let order: RunOrderKey = serde_json::from_slice(value.value())?;
+            keys.push((order.started_at, key.value().to_string()));
+        }
+        // Newest first. `sort_by_key` is stable and pass 1 collected in redb
+        // key order, so runs sharing a `started_at` keep their `run_id` order —
+        // the same tie-break `list_runs` produces.
+        keys.sort_by_key(|(started_at, _)| std::cmp::Reverse(*started_at));
+
+        // Pass 2: newest-first, decoding only until the page is worth `limit`.
+        // Reserve as `list_runs` does — at most `limit` items can be kept, and
+        // for a weight-1 caller that bound is exact.
+        let mut kept = Vec::with_capacity(limit.min(keys.len()));
+        let mut weight = 0usize;
+        for (_, run_id) in keys {
+            if weight >= limit {
+                break;
+            }
+            if let Some(value) = table.get(run_id.as_str())? {
+                let run: RunRecord = serde_json::from_slice(value.value())?;
+                if let Some((w, value)) = weigh(run) {
+                    weight = weight.saturating_add(w);
+                    kept.push(value);
+                }
+            }
+        }
+        Ok(kept)
+    }
+
     /// List the `limit` most recent runs (newest first) satisfying `keep`.
     ///
     /// The predicate applies BEFORE the recency cap — the point of this
@@ -2383,44 +2461,66 @@ impl StateStore {
     /// project's non-matching runs crowd every match out of the window, and
     /// the caller reads "no matching runs" off a project full of them.
     ///
-    /// This decodes every row, unavoidably: `keep` sees a whole `RunRecord`,
-    /// so there is nothing to defer. [`Self::list_runs`] avoids that only
-    /// because it has no predicate to evaluate.
+    /// `keep` sees a whole `RunRecord`, so unlike [`Self::list_runs`] this
+    /// cannot answer without decoding — but it does not have to decode
+    /// *everything*. It orders by the cheap key first (as `list_runs` does),
+    /// then walks newest-first and **stops as soon as `limit` matches are
+    /// found**.
+    ///
+    /// That bound is what keeps the predicate affordable where it is asked
+    /// repeatedly — `optimize` asks once per model in a loop — but it bounds
+    /// the *decoding* only. Pass 1 still parses every row's ordering key on
+    /// every call, so the per-call table walk is unchanged from `list_runs`;
+    /// removing that needs a secondary time index, which is a change to the
+    /// key rather than to this call. Decoding everything also remains the worst
+    /// case, since a predicate matching nothing has to look at every row.
     pub fn list_runs_matching(
         &self,
         limit: usize,
         keep: impl Fn(&RunRecord) -> bool,
     ) -> Result<Vec<RunRecord>, StateError> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(RUN_HISTORY)?;
-        let mut runs = Vec::new();
-        for entry in table.iter()? {
-            let (_, value) = entry?;
-            let run: RunRecord = serde_json::from_slice(value.value())?;
-            if keep(&run) {
-                runs.push(run);
-            }
-        }
-        runs.sort_by_key(|run| std::cmp::Reverse(run.started_at));
-        runs.truncate(limit);
-        Ok(runs)
+        // Each kept run weighs exactly 1 because the unit here *is* the run.
+        self.scan_runs_newest_first(limit, |run| keep(&run).then_some((1, run)))
     }
 
-    /// Get execution history for a specific model across runs.
+    /// Get execution history for a specific model across runs, newest first.
+    ///
+    /// `limit` counts **executions of this model**, which is what the name
+    /// promises. It used to mean "of this model's executions within the last
+    /// 100 runs, give me `limit`" — a window the caller never chose and could
+    /// not see. A weekly model in a project that runs hourly reported no
+    /// history at all — and by extension nothing the column-skip gate could
+    /// use to skip a rebuild (#1332).
+    ///
+    /// The predicate runs *inside* the scan, before any recency cap, so a model
+    /// absent from the last N runs is still found.
+    ///
+    /// The scan counts **executions, not runs**, and the difference is not
+    /// cosmetic. A run does not carry one execution of a model: a partitioned
+    /// (`time_interval`) build records one `ModelExecution` per partition, so a
+    /// single run can already fill the requested page. Asking
+    /// [`Self::list_runs_matching`] for `limit` *runs* would be sufficient but
+    /// not necessary — and the surplus is not free, because the walk keeps
+    /// decoding past a page it has already filled. If an older row's payload is
+    /// damaged, that surplus turns a read that should have succeeded into an
+    /// error; `optimize` asks for 100 executions per model, so a 24-partition
+    /// model would over-scan by roughly 20x. Weighing each run by the number of
+    /// matching executions it carries is what stops the walk at the real page
+    /// boundary.
     pub fn get_model_history(
         &self,
         model_name: &str,
         limit: usize,
     ) -> Result<Vec<ModelExecution>, StateError> {
-        let runs = self.list_runs(100)?; // look at last 100 runs
-        let mut history: Vec<ModelExecution> = runs
-            .into_iter()
-            .flat_map(|run| {
-                run.models_executed
-                    .into_iter()
-                    .filter(|m| m.model_name == model_name)
-            })
-            .collect();
+        let per_run = self.scan_runs_newest_first(limit, |run| {
+            let execs: Vec<ModelExecution> = run
+                .models_executed
+                .into_iter()
+                .filter(|m| m.model_name == model_name)
+                .collect();
+            (!execs.is_empty()).then_some((execs.len(), execs))
+        })?;
+        let mut history: Vec<ModelExecution> = per_run.into_iter().flatten().collect();
         history.truncate(limit);
         Ok(history)
     }
@@ -6245,6 +6345,217 @@ mod tests {
             store.list_runs(2).is_err(),
             "a damaged row INSIDE the page must still surface, not be skipped"
         );
+    }
+
+    /// `list_runs_matching` stops once the page is full.
+    ///
+    /// Asserted through an observable consequence rather than by counting
+    /// decodes: a row that is valid JSON with a readable `started_at` but an
+    /// undecodable payload, sitting *older* than the page, must not be
+    /// reached. A version that decoded the whole table to evaluate the
+    /// predicate — which is what this was before — fails.
+    ///
+    /// The bound matters because `optimize` asks this once per model in a loop.
+    /// (The skip gate asks it per model too, but that path is opt-in and, for
+    /// the column-level gate, content-addressed and unpartitioned only — so it
+    /// is not the "every `rocky run`" cost an earlier revision claimed.)
+    #[test]
+    fn list_runs_matching_stops_once_the_page_is_full() {
+        let (store, _dir) = temp_store();
+        let base = Utc::now();
+
+        // Two healthy, newest runs that satisfy the predicate.
+        for i in 0..2u32 {
+            store
+                .record_run(&run_at(
+                    &format!("run-new-{i}"),
+                    base + chrono::Duration::minutes(i64::from(i)),
+                ))
+                .unwrap();
+        }
+
+        // An older row whose payload cannot decode.
+        let older = (base - chrono::Duration::hours(1)).to_rfc3339();
+        let damaged = format!(
+            r#"{{"run_id":"run-old","started_at":"{older}","finished_at":"{older}",
+                 "status":"Success","models_executed":[{{"not_a_model":true}}],
+                 "trigger":"Manual","config_hash":"h"}}"#
+        );
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(RUN_HISTORY).unwrap();
+            table.insert("run-old", damaged.as_bytes()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        // Count predicate invocations: length alone cannot distinguish
+        // "stopped at the page" from "walked everything and kept two".
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        let page = store
+            .list_runs_matching(2, |_| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            })
+            .expect("a full page must not reach rows beyond it");
+
+        // Assert identity AND order, not just length: a mutant that drops the
+        // `sort_by_key` returns these in redb key order — `run-new-0` before
+        // `run-new-1` — and a length-only assertion passes it.
+        let ids: Vec<&str> = page.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["run-new-1", "run-new-0"],
+            "newest first, and the older damaged row must not appear"
+        );
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the walk must stop at the page rather than offering every row to the predicate"
+        );
+
+        // And asking for more DOES reach it, so the assertions above are
+        // bounded by the limit rather than by the row being unreachable.
+        assert!(
+            store.list_runs_matching(3, |_| true).is_err(),
+            "a page large enough to include the damaged row must surface it"
+        );
+    }
+
+    /// `get_model_history`'s `limit` counts **executions**, so a single
+    /// partitioned run that already fills the page must end the walk.
+    ///
+    /// Asking `list_runs_matching` for `limit` *runs* is sufficient but not
+    /// necessary, and the surplus is observable: the walk decodes past a page
+    /// it has already filled and errors on a damaged older row it never needed.
+    /// `optimize` asks for 100 executions per model, so a 24-partition model
+    /// over-scans by roughly 20x on the way to that error.
+    ///
+    /// Mutation that must turn this red: weigh each run as 1 rather than by its
+    /// matching-execution count (i.e. route this through
+    /// `list_runs_matching(limit, ...)`).
+    #[test]
+    fn model_history_stops_when_one_run_already_fills_the_execution_page() {
+        let (store, _dir) = temp_store();
+        let base = Utc::now();
+
+        // One `time_interval` run, two partitions of the same model — the
+        // production shape: `models_executed` carries one entry per
+        // materialization, so a partitioned build records several per run.
+        let mut partitioned = run_at("run-partitioned", base);
+        partitioned.models_executed = vec![model_execution("hourly"), model_execution("hourly")];
+        store.record_run(&partitioned).unwrap();
+
+        // An older row that DOES name the model — so the predicate would keep
+        // it — but whose execution payload is missing required fields and
+        // cannot decode. Naming the model is the point: a row the predicate
+        // would reject proves nothing about stopping, since a full scan would
+        // discard it anyway. Reaching this one is unnecessary only because the
+        // page is already full.
+        let older = (base - chrono::Duration::hours(1)).to_rfc3339();
+        let damaged = format!(
+            r#"{{"run_id":"run-old","started_at":"{older}","finished_at":"{older}",
+                 "status":"Success","models_executed":[{{"model_name":"hourly"}}],
+                 "trigger":"Manual","config_hash":"h"}}"#
+        );
+        let txn = store.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(RUN_HISTORY).unwrap();
+            table.insert("run-old", damaged.as_bytes()).unwrap();
+        }
+        txn.commit().unwrap();
+
+        let history = store
+            .get_model_history("hourly", 2)
+            .expect("one run already carries both executions — the damaged older row is surplus");
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().all(|e| e.model_name == "hourly"));
+    }
+
+    /// A minimal `ModelExecution` for the named model.
+    fn model_execution(model_name: &str) -> ModelExecution {
+        ModelExecution {
+            model_name: model_name.to_string(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            duration_ms: 1,
+            rows_affected: None,
+            status: "success".to_string(),
+            sql_hash: "h".to_string(),
+            skip_hash: None,
+            upstream_freshness: None,
+            bytes_scanned: None,
+            bytes_written: None,
+            tenant: None,
+            recipe_hash: None,
+            input_hash: None,
+            input_proof_class: None,
+            env_hash: None,
+            hash_scheme: None,
+            output_column_hashes: None,
+            attempts: Vec::new(),
+        }
+    }
+
+    /// #1332: a model absent from the recent window still has history.
+    ///
+    /// This used to read `list_runs(100)` and filter afterwards, so a model
+    /// executed 101 runs ago reported no history — and by extension no
+    /// metrics and no average duration. The `limit` parameter read as "the
+    /// last N executions of this model" while meaning "N of its executions
+    /// within the last 100 runs", a window the caller never chose.
+    #[test]
+    fn model_history_finds_a_model_older_than_any_recency_window() {
+        let (store, _dir) = temp_store();
+        let base = Utc::now();
+
+        // The one run that touched `weekly`, older than everything else.
+        let mut weekly = minimal_run_record(
+            "run-00000",
+            vec![model_execution("weekly"), model_execution("orders")],
+        );
+        weekly.started_at = base;
+        weekly.finished_at = base;
+        store.record_run(&weekly).unwrap();
+
+        // 150 newer runs that never touch it — comfortably past the old
+        // 100-run window.
+        for i in 1..=150u32 {
+            let mut r = minimal_run_record(&format!("run-{i:05}"), vec![model_execution("orders")]);
+            r.started_at = base + chrono::Duration::minutes(i64::from(i));
+            r.finished_at = r.started_at;
+            store.record_run(&r).unwrap();
+        }
+
+        let history = store.get_model_history("weekly", 10).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "a model executed before the recency window still has history"
+        );
+        assert_eq!(history[0].model_name, "weekly");
+
+        // And the control: a model that genuinely never ran has none, so the
+        // fix is finding real history rather than reporting something for
+        // every name.
+        assert!(store.get_model_history("never_ran", 10).unwrap().is_empty());
+    }
+
+    /// `limit` counts executions of the model, not runs scanned.
+    #[test]
+    fn model_history_limit_counts_this_models_executions() {
+        let (store, _dir) = temp_store();
+        let base = Utc::now();
+        for i in 0..5u32 {
+            let mut r = minimal_run_record(
+                &format!("run-{i:05}"),
+                vec![model_execution("orders"), model_execution("other")],
+            );
+            r.started_at = base + chrono::Duration::minutes(i64::from(i));
+            r.finished_at = r.started_at;
+            store.record_run(&r).unwrap();
+        }
+        assert_eq!(store.get_model_history("orders", 3).unwrap().len(), 3);
+        assert_eq!(store.get_model_history("orders", 99).unwrap().len(), 5);
     }
 
     #[test]

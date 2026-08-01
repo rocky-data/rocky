@@ -254,6 +254,36 @@ pub enum PreviewDiffAlgorithmSelector {
     Bisection,
 }
 
+/// The newest run on `branch_name`, and the newest run that is not on it.
+///
+/// Both sides are asked for **separately, with the predicate inside the
+/// scan**. Preview used to walk the newest 50 runs looking for both, which
+/// cannot work: `list_runs` orders by `started_at`, not by branch, so a busy
+/// `main` could fill the whole window and a feature branch whose newest run
+/// was rank 51 found nothing. Preview then reported an empty diff —
+/// indistinguishable from "this branch changed nothing" (#1332).
+///
+/// Ordering by time is still what makes each half meaningful: within the runs
+/// that match, `list_runs_matching` returns the newest. Only the *cap* had to
+/// stop being shared between two questions it could not both answer.
+fn newest_branch_and_base_runs(
+    store: &rocky_core::state::StateStore,
+    branch_name: &str,
+) -> Result<(
+    Option<rocky_core::state::RunRecord>,
+    Option<rocky_core::state::RunRecord>,
+)> {
+    let branch_run = store
+        .list_runs_matching(1, |r| r.git_branch.as_deref() == Some(branch_name))?
+        .into_iter()
+        .next();
+    let base_run = store
+        .list_runs_matching(1, |r| r.git_branch.as_deref() != Some(branch_name))?
+        .into_iter()
+        .next();
+    Ok((branch_run, base_run))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_preview_diff(
     config_path: &Path,
@@ -270,26 +300,10 @@ pub async fn run_preview_diff(
     let store = rocky_core::state::StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
-    // Pull the latest two runs from the state store and pair them up by
-    // branch-name. The *latest* run keyed to the branch is "branch"; the
-    // most recent prior run *not* tagged to this branch is "base."
-    // Tighter branch-vs-main partitioning lands when `git_branch` is
-    // plumbed through the state-store branch record (today the audit
-    // trail records `git_branch` on the RunRecord directly).
-    let mut branch_run: Option<rocky_core::state::RunRecord> = None;
-    let mut base_run: Option<rocky_core::state::RunRecord> = None;
-    for record in store.list_runs(50)? {
-        if record.git_branch.as_deref() == Some(branch_name) {
-            if branch_run.is_none() {
-                branch_run = Some(record);
-            }
-        } else if base_run.is_none() {
-            base_run = Some(record);
-        }
-        if branch_run.is_some() && base_run.is_some() {
-            break;
-        }
-    }
+    // Tighter branch-vs-main partitioning lands when `git_branch` is plumbed
+    // through the state-store branch record (today the audit trail records
+    // `git_branch` on the RunRecord directly).
+    let (branch_run, base_run) = newest_branch_and_base_runs(&store, branch_name)?;
 
     let (mut summary, mut models) = match (branch_run.as_ref(), base_run.as_ref()) {
         (Some(b), Some(p)) => build_preview_diff(b, p),
@@ -962,22 +976,7 @@ pub async fn run_preview_cost(
     let store = rocky_core::state::StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
-    // Branch run = newest run with `git_branch == branch_name`.
-    // Base run = newest run with a different (or absent) `git_branch`.
-    let mut branch_run: Option<rocky_core::state::RunRecord> = None;
-    let mut base_run: Option<rocky_core::state::RunRecord> = None;
-    for record in store.list_runs(50)? {
-        if record.git_branch.as_deref() == Some(branch_name) {
-            if branch_run.is_none() {
-                branch_run = Some(record);
-            }
-        } else if base_run.is_none() {
-            base_run = Some(record);
-        }
-        if branch_run.is_some() && base_run.is_some() {
-            break;
-        }
-    }
+    let (branch_run, base_run) = newest_branch_and_base_runs(&store, branch_name)?;
 
     // Resolve adapter cost params + project-level budget best-effort.
     // A missing or malformed config silently skips both projections —
@@ -1955,6 +1954,90 @@ mod tests {
         assert!(text.contains("preview branch 'fix-price'"));
         assert!(text.contains("run_id=<no-op>"));
         assert!(text.contains("pruned: 0, copied: 0, skipped: 0"));
+    }
+
+    /// A `RunRecord` with everything defaulted except id and start time.
+    fn sample_run(
+        run_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> rocky_core::state::RunRecord {
+        // Built by deserialization rather than by naming every optional field,
+        // and it doubles as a check that the required set has not grown.
+        serde_json::from_value(serde_json::json!({
+            "run_id": run_id,
+            "started_at": started_at.to_rfc3339(),
+            "finished_at": started_at.to_rfc3339(),
+            "status": "Success",
+            "models_executed": [],
+            "trigger": "Manual",
+            "config_hash": "h",
+        }))
+        .expect("run record fixture must deserialize")
+    }
+
+    /// #1332: a branch whose newest run is outside the recency window is
+    /// still found.
+    ///
+    /// Preview used to take the newest 50 runs and look for both sides in
+    /// them. A busy `main` fills that window, so a feature branch's run at
+    /// rank 51 was invisible and preview reported an empty diff —
+    /// indistinguishable from "this branch changed nothing", which is the
+    /// worst possible way to be wrong about a diff.
+    #[test]
+    fn newest_branch_run_is_found_beyond_the_old_recency_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            // The branch's only run, older than everything else.
+            let mut on_branch = sample_run("run-00000", base);
+            on_branch.git_branch = Some("feature_x".to_string());
+            store.record_run(&on_branch).unwrap();
+
+            // 80 newer runs on `main` — past the old 50-run window.
+            for i in 1..=80u32 {
+                let mut r = sample_run(
+                    &format!("run-{i:05}"),
+                    base + chrono::Duration::minutes(i64::from(i)),
+                );
+                r.git_branch = Some("main".to_string());
+                store.record_run(&r).unwrap();
+            }
+        }
+
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (branch_run, base_run) =
+            newest_branch_and_base_runs(&store, "feature_x").expect("selection must succeed");
+
+        let branch_run = branch_run.expect("the branch's run is found regardless of its rank");
+        assert_eq!(branch_run.run_id, "run-00000");
+        // And the base side is still the newest non-branch run, so ordering
+        // within each half is unchanged.
+        assert_eq!(
+            base_run.expect("a base run exists").run_id,
+            "run-00080",
+            "base is the NEWEST run not on the branch"
+        );
+    }
+
+    /// A branch with no runs at all reports none — so the test above is
+    /// finding a real run, not returning something for every name.
+    #[test]
+    fn a_branch_with_no_runs_selects_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut r = sample_run("run-00001", chrono::Utc::now());
+            r.git_branch = Some("main".to_string());
+            store.record_run(&r).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (branch_run, base_run) = newest_branch_and_base_runs(&store, "never_used").unwrap();
+        assert!(branch_run.is_none());
+        assert!(base_run.is_some(), "the main run is still a valid base");
     }
 
     /// A populated preview output renders the counts and the run id.

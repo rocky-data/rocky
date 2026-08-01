@@ -8818,17 +8818,30 @@ enum ColumnSkipOutcome {
 /// The newest recorded execution of `model_name`, paired with its owning
 /// run id.
 ///
-/// Same source data and ordering as [`StateStore::get_model_history`] (the
-/// last 100 runs, newest-first by run `started_at`; the first execution found
-/// wins) — re-derived here so the run id survives, because the column-skip
-/// liveness gate needs `(run_id, model)` to resolve the prior build's
-/// artifact rows. `None` when no execution is recorded in the retained window
-/// or the history read fails; the caller fails closed to a build either way.
+/// Same source data and ordering as [`StateStore::get_model_history`] —
+/// re-derived here so the run id survives, because the column-skip liveness
+/// gate needs `(run_id, model)` to resolve the prior build's artifact rows.
+///
+/// "Same as `get_model_history`" is load-bearing and was briefly false. Both
+/// used to read a fixed 100-run window and filter it afterwards; when that
+/// method started filtering *inside* the scan (#1332), this did not, so a
+/// model last executed 101 runs ago became visible to history and metrics
+/// while remaining invisible here — forcing the caller to rebuild something
+/// it could have skipped. Two reads of one question have to move together.
+///
+/// `None` when the model has no recorded execution at all, or the history
+/// read fails; the caller fails closed to a build either way.
 fn latest_execution_with_run_id(
     store: &StateStore,
     model_name: &str,
 ) -> Option<(String, rocky_core::state::ModelExecution)> {
-    let runs = store.list_runs(100).ok()?;
+    let runs = store
+        .list_runs_matching(1, |run| {
+            run.models_executed
+                .iter()
+                .any(|m| m.model_name == model_name)
+        })
+        .ok()?;
     runs.into_iter().find_map(|run| {
         let exec = run
             .models_executed
@@ -21026,6 +21039,143 @@ timestamp_column = "ts"
             ),
             "--force-rebuild must force a build even when every skip clause holds"
         );
+    }
+
+    /// #1332 wiring: the column-skip gate must find a prior build however far
+    /// back it is, not just within a fixed 100-run window.
+    ///
+    /// `latest_execution_with_run_id` documents itself as using the same source
+    /// and ordering as `StateStore::get_model_history`. When that method
+    /// started filtering *inside* the scan, this one still read `list_runs(100)`
+    /// — so a model last built 101 runs ago stayed invisible **here** while
+    /// being visible to history, and the gate rebuilt something it could have
+    /// skipped. Nothing about that is visible at the state layer, which is why
+    /// this drives the real gate rather than the helper.
+    ///
+    /// Mutation that must turn this red: restore `store.list_runs(100)` in
+    /// `latest_execution_with_run_id`.
+    #[test]
+    fn column_skip_finds_a_prior_build_beyond_the_old_recency_window() {
+        use rocky_ir::{GovernanceConfig, TargetRef};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = StateStore::open(&tmp.path().join("state")).unwrap();
+
+        let mut model_ir = ModelIr::transformation(
+            TargetRef {
+                catalog: "cat".into(),
+                schema: "sch".into(),
+                table: "fct".into(),
+            },
+            MaterializationStrategy::ContentAddressed {
+                storage_prefix: "s3://bucket/fct".into(),
+                partition_columns: vec![],
+            },
+            vec![],
+            "SELECT amount FROM u".into(),
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: false,
+            },
+            None,
+            None,
+        );
+        model_ir.name = std::sync::Arc::from("fct");
+
+        let adapter = "duckdb";
+        let identity = crate::output::recipe_identity_internal(&model_ir, adapter);
+        let target_by_model = build_reuse_target_by_model([("u", &target_cfg("cat", "sch", "u"))]);
+        let mut built = std::collections::HashMap::new();
+        built.insert("cat.sch.u".to_string(), vec![ch("amount", "H_AMOUNT")]);
+        let prior_baseline =
+            compute_consumer_baseline(&model_ir.sql, &target_by_model, &built).unwrap();
+        let now = chrono::DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+
+        let prior_exec = rocky_core::state::ModelExecution {
+            model_name: "fct".to_string(),
+            started_at: now,
+            finished_at: now,
+            duration_ms: 0,
+            rows_affected: None,
+            status: "success".to_string(),
+            sql_hash: String::new(),
+            skip_hash: None,
+            upstream_freshness: Some(prior_baseline),
+            bytes_scanned: None,
+            bytes_written: None,
+            tenant: None,
+            recipe_hash: Some(identity.recipe_hash.clone()),
+            input_hash: None,
+            input_proof_class: None,
+            env_hash: Some(identity.env_hash.clone()),
+            hash_scheme: Some(identity.hash_scheme.clone()),
+            output_column_hashes: Some(vec![ch("amount", "H_FCT_OUT")]),
+            attempts: Vec::new(),
+        };
+        let base_run = rocky_core::state::RunRecord {
+            run_id: "run-prior".to_string(),
+            started_at: now,
+            finished_at: now,
+            status: rocky_core::state::RunStatus::Success,
+            models_executed: vec![prior_exec],
+            trigger: rocky_core::state::RunTrigger::Manual,
+            config_hash: "cfg".to_string(),
+            triggering_identity: None,
+            session_source: rocky_core::state::SessionSource::Cli,
+            git_commit: None,
+            git_branch: None,
+            idempotency_key: None,
+            target_catalog: None,
+            hostname: "test".to_string(),
+            rocky_version: "test".to_string(),
+            check_outcomes: Vec::new(),
+            pipeline: None,
+            submission_id: None,
+        };
+        store.record_run(&base_run).unwrap();
+        store
+            .record_artifact(&rocky_core::state::ArtifactRecord {
+                blake3_hash: "F1HASH".to_string(),
+                run_id: "run-prior".to_string(),
+                model_name: "fct".to_string(),
+                file_path: "s3://bucket/fct/F1HASH.parquet".to_string(),
+                commit_version: 0,
+                size_bytes: 100,
+                written_at: now,
+            })
+            .unwrap();
+
+        // 101 NEWER runs that never touch `fct` — one past the old window, so
+        // the prior build sits at rank 102 and a fixed 100-run read misses it.
+        for i in 0..101 {
+            let mut noise = base_run.clone();
+            noise.run_id = format!("run-noise-{i}");
+            noise.started_at = now + chrono::Duration::minutes(i64::from(i) + 1);
+            noise.finished_at = noise.started_at;
+            noise.models_executed = vec![];
+            store.record_run(&noise).unwrap();
+        }
+
+        // The prior build is still authoritative, so the gate must SKIP.
+        match try_content_addressed_column_skip(
+            true,
+            false,
+            "fct",
+            &model_ir,
+            adapter,
+            Some(&store),
+            &target_by_model,
+            &built,
+        ) {
+            ColumnSkipOutcome::Skip { prior_blake3, .. } => {
+                assert_eq!(
+                    prior_blake3, "F1HASH",
+                    "the gate must resolve the rank-102 prior build's artifact"
+                );
+            }
+            _ => panic!("expected a skip on the out-of-window prior build"),
+        }
     }
 
     /// FIX-cluster regression: the column-level skip **fails closed on a
