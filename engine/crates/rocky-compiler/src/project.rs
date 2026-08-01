@@ -233,13 +233,27 @@ impl Project {
         db: &mut crate::salsa_compile::RockyDatabase,
         include: &impl Fn(&Path) -> bool,
     ) -> Result<Vec<Model>, ProjectError> {
-        let mut models = models::load_models_from_dir_filtered(models_dir, include)?;
+        // The whole tree, through the one shared walk (#1262) — the same
+        // directory set every other scanner sees, so `rocky list models`
+        // can never show a model this compile will not build. Compile is a
+        // strict consumer: the first walk error fails the load, because an
+        // unreadable subtree silently missing from a compile is the
+        // silent-drop family this closes.
+        let (dirs, walk_errors) = rocky_core::model_walk::walk_model_dirs(models_dir);
+        if let Some(walk_error) = walk_errors.into_iter().next() {
+            return Err(models::ModelError::from(std::io::Error::other(walk_error)).into());
+        }
 
-        // Also load matching .rocky files via the salsa pipeline.
-        let rocky_models = load_rocky_models_with_db_filtered(models_dir, db, include)?;
-        if !rocky_models.is_empty() {
-            info!(count = rocky_models.len(), "loaded .rocky models");
-            models.extend(rocky_models);
+        let mut models = Vec::new();
+        for dir in &dirs {
+            models.extend(models::load_models_from_dir_filtered(dir, include)?);
+
+            // Also load matching .rocky files via the salsa pipeline.
+            let rocky_models = load_rocky_models_with_db_filtered(dir, db, include)?;
+            if !rocky_models.is_empty() {
+                info!(count = rocky_models.len(), dir = %dir.display(), "loaded .rocky models");
+                models.extend(rocky_models);
+            }
         }
 
         if models.is_empty() {
@@ -369,7 +383,25 @@ fn model_path_matches(pattern: &glob::Pattern, path: &Path) -> bool {
     )
 }
 
-fn has_matching_model_source(dir: &Path, pattern: &glob::Pattern) -> Result<bool, ProjectError> {
+fn has_matching_model_source(root: &Path, pattern: &glob::Pattern) -> Result<bool, ProjectError> {
+    // Walks the same tree the loader walks (#1262): a project whose only
+    // matching sources sit below the first level must not be reported as
+    // having no models. Walk errors are ignored HERE on purpose — this is a
+    // pre-check answering "is there anything at all"; the loader immediately
+    // behind it surfaces the same errors strictly.
+    let (dirs, _) = rocky_core::model_walk::walk_model_dirs(root);
+    for dir in dirs {
+        if dir_has_matching_model_source(&dir, pattern)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn dir_has_matching_model_source(
+    dir: &Path,
+    pattern: &glob::Pattern,
+) -> Result<bool, ProjectError> {
     if !dir.exists() {
         return Ok(false);
     }
@@ -1015,5 +1047,76 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod recursive_load_tests {
+    use super::*;
+
+    fn write(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    fn write_model(dir: &Path, name: &str) {
+        write(&dir.join(format!("{name}.sql")), "SELECT 1 AS id\n");
+        write(
+            &dir.join(format!("{name}.toml")),
+            &format!(
+                "name = \"{name}\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"{name}\"\n"
+            ),
+        );
+    }
+
+    /// The compile path sees the same tree every other scanner sees (#1262):
+    /// a model two levels down loads, where it used to be silently absent —
+    /// which is what made `rocky list models` show a model `run` would then
+    /// fail to find.
+    #[test]
+    fn compile_path_loads_models_at_every_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        write_model(&models.join("a").join("b"), "lvl2");
+
+        let loaded = Project::load_models(&models).expect("load");
+        let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["lvl2", "top"]);
+    }
+
+    /// A project whose ONLY matching sources sit below the first level is not
+    /// "no models" — the glob pre-check walks the same tree the loader walks.
+    #[test]
+    fn a_deep_only_project_is_not_no_models() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        write_model(&models.join("staging").join("deep"), "only");
+
+        let mut db = crate::salsa_compile::RockyDatabase::default();
+        let glob = format!("{}/**", models.display());
+        let loaded = Project::load_models_matching_with_db(&models, &glob, &mut db)
+            .expect("a deep-only project must load, not report NoModels");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].config.name, "only");
+    }
+
+    /// A malformed sidecar two levels down fails the STRICT compile load —
+    /// proving the file is read — where the flat loader never opened it.
+    #[test]
+    fn a_broken_deep_sidecar_fails_the_compile_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let models = tmp.path().join("models");
+        write_model(&models, "top");
+        write(&models.join("a").join("b").join("broken.sql"), "SELECT 1\n");
+        write(
+            &models.join("a").join("b").join("broken.toml"),
+            "name = [\n",
+        );
+
+        Project::load_models(&models).expect_err("a deep malformed sidecar must fail the load");
     }
 }
