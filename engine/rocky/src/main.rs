@@ -2622,6 +2622,37 @@ enum StateAction {
         #[command(subcommand)]
         action: RetentionAction,
     },
+    /// Runtime schedule holds: pause or resume a pipeline's schedule.
+    Schedule {
+        #[command(subcommand)]
+        action: ScheduleHoldAction,
+    },
+}
+
+/// Subcommands under `rocky state schedule`.
+#[derive(Subcommand)]
+enum ScheduleHoldAction {
+    /// Pause a pipeline's schedule: a durable hold that suppresses every
+    /// demand source (cron, after, freshness, webhook) until resumed, with a
+    /// `paused` skip recorded each tick. Reaches a RUNNING `serve --scheduler`
+    /// immediately — unlike editing `[schedule] enabled`, which a resident
+    /// scheduler cannot see until restart.
+    ///
+    /// The hold controls whichever scheduler reads the SAME state file this
+    /// command writes. A `serve --scheduler --state-path X` is controlled by
+    /// `rocky --state-path X state schedule pause <pipeline>` — the output
+    /// names the file acted on so a wrong-instance pause is never silent.
+    Pause {
+        /// The pipeline whose schedule to pause.
+        pipeline: String,
+    },
+    /// Resume a paused pipeline's schedule. The human-only counterpart of the
+    /// agent-facing `pause_schedule` MCP tool: resuming re-enables autonomous
+    /// runs, so it is deliberately not exposed to agents.
+    Resume {
+        /// The pipeline whose schedule to resume.
+        pipeline: String,
+    },
 }
 
 /// Subcommands under `rocky state retention`.
@@ -3526,6 +3557,19 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 action: RetentionAction::Sweep { dry_run },
             }) => {
                 rocky_cli::commands::state_retention_sweep(&cli.config, &state_path, dry_run, json)
+            }
+            Some(StateAction::Schedule { action }) => {
+                let (pipeline, paused) = match action {
+                    ScheduleHoldAction::Pause { pipeline } => (pipeline, true),
+                    ScheduleHoldAction::Resume { pipeline } => (pipeline, false),
+                };
+                rocky_cli::commands::state_schedule_hold(
+                    &cli.config,
+                    &state_path,
+                    &pipeline,
+                    paused,
+                    json,
+                )
             }
         },
         Command::Compile {

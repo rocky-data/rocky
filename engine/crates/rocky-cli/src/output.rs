@@ -2999,6 +2999,29 @@ pub struct StateOutput {
     pub schema_version_on_disk: Option<u32>,
 }
 
+/// JSON output for `rocky state schedule pause|resume`.
+///
+/// The runtime schedule hold: `paused = true` after a pause, `false` after a
+/// resume; `changed = false` means the flag already held the requested value
+/// (the command is idempotent — a repeated pause is not a second action).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ScheduleHoldOutput {
+    pub version: String,
+    pub command: String,
+    /// The pipeline whose schedule the hold applies to.
+    pub pipeline: String,
+    /// The hold state after this command.
+    pub paused: bool,
+    /// `false` when the flag already held the requested value.
+    pub changed: bool,
+    /// The state file this hold was written to. A scheduler reads the flag
+    /// only if it uses the SAME file — a `serve --scheduler --state-path X`
+    /// is controlled by running this command with that same `--state-path`,
+    /// not by the project default. Surfaced so a wrong-instance pause can
+    /// never be silently "successful".
+    pub state_path: String,
+}
+
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct WatermarkEntry {
     pub table: String,
@@ -5108,6 +5131,19 @@ impl StateOutput {
             watermarks,
             schema_version_supported: rocky_core::state::current_schema_version(),
             schema_version_on_disk,
+        }
+    }
+}
+
+impl ScheduleHoldOutput {
+    pub fn new(pipeline: &str, paused: bool, changed: bool, state_path: &std::path::Path) -> Self {
+        ScheduleHoldOutput {
+            version: VERSION.to_string(),
+            command: "state-schedule-hold".to_string(),
+            pipeline: pipeline.to_string(),
+            paused,
+            changed,
+            state_path: state_path.display().to_string(),
         }
     }
 }

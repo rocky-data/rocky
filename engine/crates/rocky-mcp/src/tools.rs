@@ -2769,6 +2769,10 @@ impl RockyMcpServer {
             "pipeline": args.pipeline,
             "paused": true,
             "changed": changed,
+            // The acted-on store, so a wrong-instance pause can never be
+            // silently "successful" — a scheduler is controlled by this hold
+            // only if it reads the SAME state file.
+            "state_path": self.state_path().display().to_string(),
             "resume": "rocky state schedule resume <pipeline> (human CLI)",
         })))
     }

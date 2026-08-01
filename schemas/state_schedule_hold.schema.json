@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output for `rocky state schedule pause|resume`.\n\nThe runtime schedule hold: `paused = true` after a pause, `false` after a resume; `changed = false` means the flag already held the requested value (the command is idempotent — a repeated pause is not a second action).",
+  "properties": {
+    "changed": {
+      "description": "`false` when the flag already held the requested value.",
+      "type": "boolean"
+    },
+    "command": {
+      "type": "string"
+    },
+    "paused": {
+      "description": "The hold state after this command.",
+      "type": "boolean"
+    },
+    "pipeline": {
+      "description": "The pipeline whose schedule the hold applies to.",
+      "type": "string"
+    },
+    "state_path": {
+      "description": "The state file this hold was written to. A scheduler reads the flag only if it uses the SAME file — a `serve --scheduler --state-path X` is controlled by running this command with that same `--state-path`, not by the project default. Surfaced so a wrong-instance pause can never be silently \"successful\".",
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "changed",
+    "command",
+    "paused",
+    "pipeline",
+    "state_path",
+    "version"
+  ],
+  "title": "ScheduleHoldOutput",
+  "type": "object"
+}

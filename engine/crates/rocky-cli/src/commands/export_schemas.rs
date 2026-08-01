@@ -32,8 +32,8 @@ use crate::output::{
     ProfileOutput, ProfileStorageOutput, PromotePlan, RecipeHistoryOutput, ReplayCheckOutput,
     ReplayExecuteOutput, ReplayOutput, RestoreApplyOutput, RestorePlanOutput,
     RetentionStatusOutput, RetentionSweepOutput, ReviewOutput, ReviewQueueOutput, RunOutput,
-    ScheduleStatusOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TickOutput,
-    TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    ScheduleHoldOutput, ScheduleStatusOutput, SeedOutput, StateOutput, TestAdapterOutput,
+    TestOutput, TickOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -74,6 +74,7 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<JobStatus>("job_status"),
         // HTTP-only: `GET /api/v1/schedule` has no CLI verb, but embedders still
         // need generated bindings for the payload.
+        entry::<ScheduleHoldOutput>("state_schedule_hold"),
         entry::<ScheduleStatusOutput>("schedule_status"),
         entry::<TestOutput>("test"),
         entry::<CiOutput>("ci"),

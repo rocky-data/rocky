@@ -202,6 +202,61 @@ fn emit_sweep_report(
     Ok(())
 }
 
+/// Execute `rocky state schedule pause|resume <pipeline>` — the human side of
+/// the runtime schedule hold (the agent side is the `pause_schedule` MCP tool,
+/// which is pause-only on purpose: resuming re-enables autonomous runs).
+///
+/// Refuses a pipeline with no `[schedule]` block: the hold must attach to
+/// something the reconciler consults, never a stray cursor.
+pub fn state_schedule_hold(
+    config_path: &Path,
+    state_path: &Path,
+    pipeline: &str,
+    paused: bool,
+    output_json: bool,
+) -> Result<()> {
+    let config = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("failed to load config {}", config_path.display()))?;
+    let has_schedule = config
+        .pipelines
+        .get(pipeline)
+        .map(|p| p.schedule().is_some())
+        .unwrap_or(false);
+    if !has_schedule {
+        anyhow::bail!(
+            "pipeline '{pipeline}' has no [schedule] block (or does not exist) — the hold \
+             attaches to scheduled pipelines only"
+        );
+    }
+    let store = StateStore::open(state_path).context(format!(
+        "failed to open state store at {}",
+        state_path.display()
+    ))?;
+    let changed = store
+        .set_schedule_paused(pipeline, paused)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if output_json {
+        print_json(&crate::output::ScheduleHoldOutput::new(
+            pipeline, paused, changed, state_path,
+        ))?;
+    } else {
+        let verb = if paused { "Paused" } else { "Resumed" };
+        let note = if changed {
+            ""
+        } else {
+            " (already in that state)"
+        };
+        // The acted-on store is part of the answer: a scheduler is controlled
+        // by this hold only if it reads the SAME state file.
+        println!(
+            "{verb} schedule for '{pipeline}'{note} (state: {})",
+            state_path.display()
+        );
+    }
+    Ok(())
+}
+
 fn emit_result(count: usize, dry_run: bool, output_json: bool) -> Result<()> {
     if output_json {
         print_json(&ClearSchemaCacheOutput::new(count, dry_run))?;
@@ -344,5 +399,69 @@ mod tests {
         // File exists but the table is empty.
         assert!(path.exists());
         state_clear_schema_cache(&path, false, false).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod schedule_hold_tests {
+    use super::*;
+
+    fn project(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        let config = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n\n\
+             [pipeline.p.schedule]\ncron = \"* * * * *\"\ntimezone = \"UTC\"\n",
+        )
+        .unwrap();
+        config
+    }
+
+    /// The human round-trip: pause sets the durable flag (changed=true), a
+    /// repeat is idempotent (changed=false), resume clears it — and the flag
+    /// is exactly what the reconciler consults (pinned separately in
+    /// rocky-core's demand tests).
+    #[test]
+    fn pause_and_resume_round_trip_through_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = project(&tmp);
+        let state_path = tmp.path().join("state.redb");
+
+        state_schedule_hold(&config, &state_path, "p", true, true).unwrap();
+        let store = StateStore::open_read_only(&state_path).unwrap();
+        assert!(store.get_schedule_state("p").unwrap().unwrap().paused);
+        drop(store);
+
+        // Idempotent repeat.
+        state_schedule_hold(&config, &state_path, "p", true, true).unwrap();
+
+        state_schedule_hold(&config, &state_path, "p", false, true).unwrap();
+        let store = StateStore::open_read_only(&state_path).unwrap();
+        assert!(!store.get_schedule_state("p").unwrap().unwrap().paused);
+    }
+
+    /// A pipeline with no [schedule] block is refused — the hold must attach
+    /// to something the reconciler consults, never a stray cursor.
+    #[test]
+    fn a_pipeline_without_a_schedule_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let state_path = tmp.path().join("state.redb");
+        let err = state_schedule_hold(&config, &state_path, "p", true, true)
+            .expect_err("no [schedule] must refuse");
+        assert!(
+            format!("{err:#}").contains("no [schedule] block"),
+            "{err:#}"
+        );
+        assert!(!state_path.exists(), "a refusal must not create the store");
     }
 }
