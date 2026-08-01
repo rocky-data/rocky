@@ -11,6 +11,7 @@
 
 pub mod claim;
 pub mod demand;
+pub mod incidents;
 pub mod lock;
 pub mod occurrence;
 pub mod reconcile;

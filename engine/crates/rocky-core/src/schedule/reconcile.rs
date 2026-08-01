@@ -1178,6 +1178,54 @@ async fn execute_claimed(
                         return Ok(ExecOutcome::Skipped(skip(demand, TickSkipReason::InFlight)));
                     }
                     ClaimCas::Won => {
+                        // Incident bundle: raw structured facts for a run that
+                        // finalized as FAILURE — and not for drain
+                        // interruptions (a graceful shutdown is not an
+                        // incident; the drain already forced retry_max = 0
+                        // above). Write failures warn and never fail the tick:
+                        // the outcome is committed, and diagnostics that break
+                        // the thing they diagnose are worse than none.
+                        if outcome == TerminalOutcome::Failure && !opts.drain.is_signalled() {
+                            let consecutive_failures = phase
+                                .store()
+                                .get_schedule_state(&demand.pipeline)
+                                .ok()
+                                .flatten()
+                                .map(|c| c.consecutive_failures)
+                                .unwrap_or(0);
+                            let bundle = crate::schedule::incidents::IncidentBundle {
+                                incident_version: 1,
+                                recorded_at: now,
+                                pipeline: demand.pipeline.clone(),
+                                source: format!("{:?}", demand.source).to_lowercase(),
+                                logical_ts: Some(demand.logical_ts),
+                                submission_id: submission_id.clone(),
+                                exit_code: run_outcome.exit_code,
+                                attempts,
+                                consecutive_failures,
+                                pointers: vec![
+                                    format!("rocky history --output json  # run {submission_id}"),
+                                    format!("GET /api/v1/jobs/{submission_id}  # job state"),
+                                    "GET /api/v1/schedule  # cursors + claims".to_string(),
+                                ],
+                            };
+                            match crate::schedule::incidents::write_incident(
+                                &opts.rocky_dir,
+                                &bundle,
+                            ) {
+                                Ok(path) => tracing::warn!(
+                                    pipeline = %demand.pipeline,
+                                    incident = %path.display(),
+                                    consecutive_failures,
+                                    "scheduled run failed; incident bundle written"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    pipeline = %demand.pipeline,
+                                    error = %e,
+                                    "scheduled run failed AND the incident bundle could not be written"
+                                ),
+                            }
+                        }
                         // Return with the store OPEN — it feeds the next
                         // pipeline's evaluation (the same-tick cascade contract).
                         return Ok(ExecOutcome::Executed(ExecutedDemand {
@@ -2148,6 +2196,16 @@ cron = "also invalid"
             report.executed[0].attempts, 1,
             "the single attempt is terminal"
         );
+        // A drain-interrupted failure is NOT an incident: a graceful shutdown
+        // must not litter `.rocky/incidents/`.
+        assert!(
+            !opts.rocky_dir.join("incidents").exists()
+                || std::fs::read_dir(opts.rocky_dir.join("incidents"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            "no incident bundle on drain"
+        );
     }
 
     // --- regression vii: crash-safe retry budget (standing demand) -----------
@@ -2804,6 +2862,19 @@ adapter = "db"
                 .unwrap()
                 .is_empty()
         );
+        // A genuine failure writes exactly one incident bundle with the raw
+        // facts — pipeline, source, exit — and pointer commands, no prose.
+        let bundles: Vec<_> = std::fs::read_dir(opts.rocky_dir.join("incidents"))
+            .expect("incidents dir exists after a failure")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(bundles.len(), 1, "exactly one incident for one failure");
+        let bundle: crate::schedule::incidents::IncidentBundle =
+            serde_json::from_slice(&std::fs::read(bundles[0].path()).unwrap()).unwrap();
+        assert_eq!(bundle.pipeline, "raw");
+        assert_eq!(bundle.source, "webhook");
+        assert_eq!(bundle.exit_code, 1);
+        assert!(!bundle.pointers.is_empty());
 
         // Re-tick: the claim is completed{failure}, so it never re-runs.
         rt().block_on(tick_once(
