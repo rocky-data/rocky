@@ -489,20 +489,34 @@ fn classify_model_changes(
         // So resolve every owner and publish only when they agree. Two owners
         // that happen to share a target still describe that one object, so
         // uniqueness is on the TARGET, not the model count.
-        let mut targets = models
+        let owners = models
             .iter()
-            .filter(|model| model_matches_path(model, path, models_rel))
+            .filter(|model| model_matches_path(model, path, models_rel));
+
+        // Every owner must be identifiable AND they must agree. Filtering the
+        // unpublishable ones out FIRST would be wrong: with two owners where
+        // one has a non-identifier target, dropping it leaves exactly one
+        // survivor and the path looks unique when ownership never was. The
+        // ambiguity is about which model the row describes, not about whether
+        // one of them happens to be nameable.
+        //
+        // Uniqueness is on the TARGET, not the owner count — two owners that
+        // agree still describe one object. (#1291 reports two models sharing a
+        // physical target as an E036 compile error, so agreement here is
+        // normally the contract-sidecar overlap rather than a real collision.)
+        let mut targets = Vec::new();
+        for owner in owners {
             // Same publishability contract as the both-compiled path: a target
-            // that could never name a warehouse object is withheld, not guessed.
-            .filter_map(publishable_target)
-            .collect::<Vec<_>>();
+            // that could never name a warehouse object is withheld, not
+            // guessed — and here it withholds the whole row, not just itself.
+            targets.push(publishable_target(owner)?);
+        }
         targets.sort();
         targets.dedup();
         match targets.as_slice() {
             [single] => Some(single.clone()),
             // Zero owners, or an ambiguous path: unidentified beats
-            // misidentified, which is the same choice `publishable_target`
-            // makes for an unusable identifier.
+            // misidentified.
             _ => None,
         }
     };
@@ -1792,6 +1806,57 @@ mod tests {
             None,
             "two models own this path with different targets, so neither may be \
              published as the object this row describes"
+        );
+    }
+
+    /// An owner whose target is not a publishable identifier must not be
+    /// silently dropped from the ambiguity check.
+    ///
+    /// Filtering unpublishable owners out BEFORE testing uniqueness would
+    /// leave exactly one survivor for a two-owner path, making it look unique
+    /// and publishing a target for a row whose ownership was never
+    /// established. The ambiguity is about which model the row describes, not
+    /// about whether one of them happens to be nameable.
+    #[test]
+    fn an_unidentifiable_co_owner_still_blocks_the_target() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).unwrap();
+
+        // `orders` has a perfectly publishable target; its co-owner of
+        // `orders.contract.toml` does not (a hyphen is not a SQL identifier).
+        write_model_with_identity(
+            &models,
+            "orders",
+            "orders",
+            "orders",
+            "SELECT id FROM src_orders",
+        );
+        write_model_with_identity(
+            &models,
+            "orders.contract",
+            "orders_contract",
+            "not-an-identifier",
+            "SELECT id FROM src_orders",
+        );
+        let compile = compile_head(&models, sources).expect("compile");
+        let head_models: Vec<Model> = compile.project.models.clone();
+
+        let changes = classify_model_changes(
+            &[changed("models/orders.contract.toml", 'A')],
+            Some("models"),
+            None,
+            Some(&head_models),
+        );
+
+        assert_eq!(
+            changes
+                .get("orders")
+                .and_then(|c| c.resolved_target.clone()),
+            None,
+            "an unidentifiable co-owner must withhold the row, not be filtered \
+             out until the remaining owner looks unique"
         );
     }
 
