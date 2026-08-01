@@ -95,10 +95,23 @@ def window(samples: list[dict], key: str, lo: float, hi: float) -> list[float]:
 # --------------------------------------------------------------------------
 #
 # G3's percentage-AND-absolute conjunction is a catastrophic-growth trip. It
-# cannot see the leak class this harness exists to hunt: two real 24h runs grew
-# 45.0% / +11.77 MB and 40.45% / +11.16 MB and both cleared it, including the
-# run whose curve was the JobRegistry leak's existence proof. Neither reached
-# the 20 MB floor, so the conjunction never fired.
+# cannot see the growth class this harness exists to hunt: two real 24h runs
+# grew 45.0% / +11.77 MB and 40.45% / +11.16 MB and both cleared it. Neither
+# reached the 20 MB floor, so the conjunction never fired.
+#
+# CAUSAL STORY, corrected after the fact (#1256): the growth in BOTH reference
+# runs was later shown to be ~92-96% OBSERVER-INDUCED — the harness's own 30s
+# `/api/v1/runs` polling against `list_runs`'s whole-table scan (#1304), whose
+# working set tracks a history that grew one run per minute. It was not a
+# product leak, and the job-cache fix it seemed to indict was sound all along.
+# That does NOT loosen this gate: the gate's job is to flag ANY sustained
+# final-quarter slope regardless of origin, and it correctly flagged these —
+# the attribution question is the operator's, not the gate's. Since #1256 the
+# harness harvests every 600s (20x less observer load, <~25 KB/h of induced
+# slope), so a fixed-harness run that trips 200 KB/h is presumptively real.
+# WHEN RE-DERIVING (the instruction below): use a clean-harness reference run,
+# not these two traces, and know that their `+526.9 / +456.0` slopes measure
+# the instrument, not the engine.
 #
 # The discriminating measurement is the FINAL QUARTER. A bounded structure
 # fills once — the job cache reaches its cap around hour 8.5 at one job per
@@ -643,6 +656,32 @@ def gate_resources(run: dict) -> list[dict]:
                     "by_class": classes,
                 }
             )
+    else:
+        # The sharp gate must never be satisfiable by the absence of its input
+        # (#1311). A missing median means lsof produced no readings across an
+        # entire comparison window — an outage G0's 5% whole-run null cap
+        # cannot see when the hole is concentrated (a nulled final hour of a
+        # 24h run is 4.17% of samples). Same rule G3b applies to its quarter:
+        # the window is cut from the sample timeline, never from where
+        # readings happen to exist. Missing input is a re-run, not a pass.
+        missing = [
+            name
+            for name, value in (
+                ("baseline (first hour after warmup)", base_fd),
+                ("final hour", tail_fd),
+            )
+            if value is None
+        ]
+        findings.append(
+            {
+                "gate": "G4",
+                "status": "INVALID",
+                "detail": "fd gate could not evaluate — no fd readings in the "
+                f"{' or the '.join(missing)} window; lsof failed or sampling "
+                "stopped. A verdict that never weighed the fd gate is not a "
+                "soak PASS.",
+            }
+        )
 
     if run["fd_limit_errors"]:
         findings.append(
@@ -927,6 +966,24 @@ def self_test() -> int:
         s["fd_total"] = 42 + i  # monotonic leak
         s["fd_redb"] = 2 + i
     check("fd leak fails", analyse(leak)["verdict"], "FAIL")
+
+    # #1311 — the sharp gate must fail closed when its input vanishes. A nulled
+    # final hour of a 24h run is 120/2880 samples = 4.17%, under G0's 5%
+    # whole-run null cap, so before the fix this run reported PASS with the fd
+    # gate silently skipped — a leaked-fd build could ride an lsof outage
+    # through the gate that exists to catch it.
+    fd_outage = synth(1440)
+    # Cut from the SAMPLE timeline (t_end derives from the last sample, not
+    # planned_end) — nulling from planned_end-3600 leaves one live reading at
+    # the window edge, whose median then feeds the gate normally.
+    outage_lo = fd_outage["samples"][-1]["t"] - 3600
+    for s in fd_outage["samples"]:
+        if s["t"] >= outage_lo:
+            s["fd_total"] = None
+    check("fd outage across the tail window is INVALID", analyse(fd_outage)["verdict"], "INVALID")
+    # The control guards the check above against passing for an unrelated
+    # reason: the same 24h fixture with fd intact must still PASS outright.
+    check("the 24h fixture itself passes with fd intact", analyse(synth(1440))["verdict"], "PASS")
 
     # The regression this guards: a two-sided G6 equality would FAIL here, on a
     # path the reconciler documents as benign and the harness itself induces.

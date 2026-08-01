@@ -1,0 +1,53 @@
+# CI for the operational scripts under scripts/ — most importantly the soak
+# harness's verdict logic, whose ~45 self-test assertions otherwise run only
+# when a human remembers to type `just soak-verdict-selftest` (#1311). A silent
+# regression there is discovered 24 hours into the next soak, which is the most
+# expensive possible place to find it.
+name: Scripts CI
+
+on:
+  pull_request:
+    paths:
+      - "scripts/**"
+      - ".github/workflows/scripts-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/scripts-ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  soak-verdict-selftest:
+    name: Soak-verdict self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run the verdict self-test
+        run: python3 scripts/soak_verdict.py --self-test
+
+  shellcheck:
+    name: Shellcheck scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Shellcheck the soak harness (full severity)
+        # The scripts this workflow exists to protect hold the full bar and
+        # already meet it.
+        run: shellcheck scripts/soak-scheduler.sh
+      - name: Shellcheck everything else (error severity)
+        # Six pre-existing scripts carry SC2155/SC2012/SC2015 warnings today
+        # (release.sh, the vendor_* pair, regen_fixtures.sh, build_rocky_linux.sh).
+        # Cleaning those is a separate, deliberate change — release tooling is
+        # not drive-by territory — so the fleet-wide gate starts at error
+        # severity: real breakage fails, the known warnings do not. Tighten to
+        # full severity once they are cleaned.
+        run: |
+          set -euo pipefail
+          find scripts -name '*.sh' -type f -print0 | sort -z \
+            | xargs -0 shellcheck --severity=error
+          echo "error-severity sweep clean"
