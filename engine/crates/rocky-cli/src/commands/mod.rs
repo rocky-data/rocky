@@ -264,6 +264,88 @@ pub(crate) fn filter_table_matches(filter: Option<&(String, String)>, table_name
     table_name == value
 }
 
+/// The `--filter` keys a transformation pipeline's model enumeration accepts.
+pub(crate) const TRANSFORMATION_FILTER_KEYS: &[&str] = &["table", "model", "catalog", "schema"];
+
+/// Every production target a transformation pipeline's models resolve to,
+/// after `--filter`, with the model name that owns each.
+///
+/// Shared deliberately. `branch promote` derives branch sources from these and
+/// `compare` derives shadow targets, and both must agree about which models a
+/// `--filter` selects and which the `models` glob reaches. Two enumerations
+/// walking the same tree separately is how they stop agreeing — silently, and
+/// only for the projects where it matters.
+///
+/// `ephemeral` models are excluded: they materialize nothing, so there is no
+/// physical table to promote or to compare.
+///
+/// `verb` names the caller in the two error messages, so a user sees the
+/// command they ran rather than this helper.
+pub(crate) fn transformation_prod_targets(
+    pipeline: &rocky_core::config::TransformationPipelineConfig,
+    config_path: &std::path::Path,
+    filter: Option<&str>,
+    verb: &str,
+) -> Result<Vec<(String, rocky_ir::TargetRef)>> {
+    let parsed_filter = filter.map(parse_filter).transpose()?;
+    if let Some((key, _)) = &parsed_filter
+        && !TRANSFORMATION_FILTER_KEYS.contains(&key.as_str())
+    {
+        anyhow::bail!(
+            "transformation-pipeline `{verb}` does not support `--filter {key}=...`. \
+             Supported keys: {}.",
+            TRANSFORMATION_FILTER_KEYS.join(", ")
+        );
+    }
+
+    let models_dir = match crate::models_loader::locate_models_dir(&pipeline.models, config_path)? {
+        crate::models_loader::ModelsDir::Present(dir) => dir,
+        crate::models_loader::ModelsDir::Absent(dir) => anyhow::bail!(
+            "models directory '{}' does not exist — transformation-pipeline `{verb}` \
+             requires the project's `models` glob to resolve to an on-disk directory",
+            dir.display()
+        ),
+    };
+
+    // Loaded the same way `rocky list models` does — the shared recursive walk
+    // (#1328), so a model at any depth under the glob's base is reached — and
+    // so this enumeration matches the rest of the transformation surface
+    // (run, plan, list).
+    let models_glob = crate::models_loader::resolved_models_glob(&pipeline.models, config_path);
+    let all_models = crate::models_loader::load_project_models_matching(&models_dir, &models_glob)?;
+
+    let mut targets = Vec::new();
+    for model in &all_models {
+        if matches!(
+            model.config.strategy,
+            rocky_core::models::StrategyConfig::Ephemeral
+        ) {
+            continue;
+        }
+        if let Some((key, value)) = &parsed_filter {
+            let keep = match key.as_str() {
+                "table" => model.config.target.table == *value,
+                "model" => model.config.name == *value,
+                "catalog" => model.config.target.catalog == *value,
+                "schema" => model.config.target.schema == *value,
+                _ => unreachable!("known-key guard above"),
+            };
+            if !keep {
+                continue;
+            }
+        }
+        targets.push((
+            model.config.name.clone(),
+            rocky_ir::TargetRef {
+                catalog: model.config.target.catalog.clone(),
+                schema: model.config.target.schema.clone(),
+                table: model.config.target.table.clone(),
+            },
+        ));
+    }
+    Ok(targets)
+}
+
 /// Converts a ParsedSchema into a JSON-compatible components map.
 /// Preserves the insertion order from the schema pattern definition.
 pub(crate) fn parsed_to_json_map(

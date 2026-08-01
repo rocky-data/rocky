@@ -1,7 +1,7 @@
 //! Shared model-directory loader for CLI commands.
 //!
 //! The canonical "load every model in the project" path: top-level dir plus
-//! one level of immediate subdirectories, including **both** `.sql` (sidecar
+//! every directory beneath it, including **both** `.sql` (sidecar
 //! `.toml`) and `.rocky` DSL files. Commands that need the model list (but not
 //! the resolved DAG) should use this instead of
 //! [`rocky_core::models::load_models_from_dir`], which collects only `.sql`
@@ -220,7 +220,7 @@ pub fn resolve_models_dir(models_glob: &str, config_path: &Path) -> Result<Optio
     })
 }
 
-/// Load all models under `models_dir` (top level + immediate subdirectories),
+/// Load all models under `models_dir` (every directory beneath it, #1328),
 /// including `.rocky` DSL files.
 ///
 /// A load failure in **any** of those directories is an error. Subdirectory

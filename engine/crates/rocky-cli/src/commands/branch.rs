@@ -1114,9 +1114,10 @@ async fn discover_replication_branch_targets(
 
 /// Transformation pipeline path for [`discover_branch_targets`].
 ///
-/// Walks the model files under the pipeline's `models` glob (top-level +
-/// immediate subdirectories — same surface `rocky list models` and the
-/// catalog scope resolver use) and emits one `(prod, branch_source)` pair
+/// Walks the model files under the pipeline's `models` glob (every directory
+/// beneath its base since #1328 — the same surface `rocky list models`, the
+/// catalog scope resolver and now `compare` use, through one shared
+/// enumeration) and emits one `(prod, branch_source)` pair
 /// per model. Each model's sidecar `[target]` block supplies the production
 /// catalog/schema/table; the branch source rewrites the schema to the
 /// branch's `schema_prefix` via [`shadow::shadow_target`].
@@ -1141,34 +1142,11 @@ fn discover_transformation_branch_targets(
     record: &BranchRecord,
     filter: Option<&str>,
 ) -> Result<Vec<PlannedPromote>> {
-    use super::parse_filter;
-
-    let parsed_filter = filter.map(parse_filter).transpose()?;
-    if let Some((key, _)) = &parsed_filter {
-        const KNOWN_KEYS: &[&str] = &["table", "model", "catalog", "schema"];
-        if !KNOWN_KEYS.contains(&key.as_str()) {
-            anyhow::bail!(
-                "transformation-pipeline `branch promote` does not support `--filter {key}=...`. \
-                 Supported keys: {}.",
-                KNOWN_KEYS.join(", ")
-            );
-        }
-    }
-
-    let models_dir = match crate::models_loader::locate_models_dir(&pipeline.models, config_path)? {
-        crate::models_loader::ModelsDir::Present(dir) => dir,
-        crate::models_loader::ModelsDir::Absent(dir) => anyhow::bail!(
-            "models directory '{}' does not exist — transformation-pipeline `branch promote` \
-             requires the project's `models` glob to resolve to an on-disk directory",
-            dir.display()
-        ),
-    };
-
-    // Load the same way `rocky list models` does: top-level files plus
-    // immediate subdirectories (incl. `.rocky` DSL). Keeps behavior consistent
-    // with the rest of the transformation surface (run, plan, list).
-    let models_glob = crate::models_loader::resolved_models_glob(&pipeline.models, config_path);
-    let all_models = crate::models_loader::load_project_models_matching(&models_dir, &models_glob)?;
+    // One enumeration, shared with `compare` (see the helper's docs): both
+    // must agree about which models a `--filter` selects and which the glob
+    // reaches, and two walks of the same tree is how they stop agreeing.
+    let targets =
+        super::transformation_prod_targets(pipeline, config_path, filter, "branch promote")?;
 
     let shadow_cfg = ShadowConfig {
         suffix: "_rocky_shadow".to_string(),
@@ -1194,46 +1172,18 @@ fn discover_transformation_branch_targets(
     // reach it.
     let mut claimed: std::collections::HashMap<rocky_sql::defer::CollisionIdentity, String> =
         std::collections::HashMap::new();
-    for model in &all_models {
-        // Skip ephemeral models — they have no physical table to promote.
-        // Mirrors how `rocky run` skips ephemeral materializations during
-        // the apply phase.
-        if matches!(
-            model.config.strategy,
-            rocky_core::models::StrategyConfig::Ephemeral
-        ) {
-            continue;
-        }
-
-        if let Some((key, value)) = &parsed_filter {
-            let keep = match key.as_str() {
-                "table" => model.config.target.table == *value,
-                "model" => model.config.name == *value,
-                "catalog" => model.config.target.catalog == *value,
-                "schema" => model.config.target.schema == *value,
-                _ => unreachable!("known-key guard above"),
-            };
-            if !keep {
-                continue;
-            }
-        }
-
-        let prod = TargetRef {
-            catalog: model.config.target.catalog.clone(),
-            schema: model.config.target.schema.clone(),
-            table: model.config.target.table.clone(),
-        };
+    for (model_name, prod) in targets {
         let key = rocky_sql::defer::CollisionIdentity::of(&prod.catalog, &prod.schema, &prod.table);
-        if let Some(prior) = claimed.insert(key, model.config.name.clone()) {
+        if let Some(prior) = claimed.insert(key, model_name.clone()) {
             anyhow::bail!(
-                "duplicate promote target {}.{}.{}: models '{prior}' and '{}' both resolve to \
-                 it, and promoting both would execute two replacements with the later silently \
-                 overwriting the earlier. Point one model's [target] elsewhere (the compiler \
-                 reports this as E036; `branch promote` does not compile, so it refuses here).",
+                "duplicate promote target {}.{}.{}: models '{prior}' and '{model_name}' both \
+                 resolve to it, and promoting both would execute two replacements with the later \
+                 silently overwriting the earlier. Point one model's [target] elsewhere (the \
+                 compiler reports this as E036; `branch promote` does not compile, so it refuses \
+                 here).",
                 prod.catalog,
                 prod.schema,
                 prod.table,
-                model.config.name
             );
         }
         let branch_source = shadow::shadow_target(&prod, &shadow_cfg);

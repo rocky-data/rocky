@@ -106,6 +106,12 @@ Schema override keeps the table name clean and groups all shadow tables together
 
 ## Comparison engine
 
+`rocky compare` reads the shadow tables back and diffs them against production.
+It enumerates targets differently per pipeline type — replication discovers
+them from the source, transformation reads them off its models — and compares
+each pair the same way. `rocky branch compare` does the same for a branch's
+shadow schema.
+
 The comparison evaluates three dimensions:
 
 ### Row count
