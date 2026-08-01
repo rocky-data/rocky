@@ -230,7 +230,16 @@ fn member_max_lags(tx: &TransformationPipelineConfig, config_path: &Path) -> Res
     };
     // Partial: a broken draft in one subdirectory must not drop every healthy
     // member budget and silently widen this pipeline to the project default.
-    let (models, _load_errors) = crate::models_loader::load_project_models_partial(&models_dir);
+    let (models, load_errors) = crate::models_loader::load_project_models_partial(&models_dir);
+    // Tolerant on purpose — the tick must not wedge on one broken model — but
+    // never silent: a model missing from this set is invisible to schedule
+    // evaluation, and that absence must be visible (#1262).
+    for e in &load_errors {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "some models could not be loaded; they are invisible to this tick's schedule evaluation"
+        );
+    }
     Ok(models
         .iter()
         .filter_map(|m| m.config.freshness.as_ref().map(|f| f.max_lag_seconds))
