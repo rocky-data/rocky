@@ -19,6 +19,7 @@ use rocky_core::ci_diff::{
     format_diff_table,
 };
 use rocky_core::models::Model;
+use rocky_sql::defer::CollisionIdentity;
 
 use crate::output::{CiDiffOutput, print_json};
 
@@ -52,13 +53,41 @@ struct ModelChange {
     /// models sharing a target; this is the bare warehouse identity, which is
     /// what the report publishes.
     resolved_target: Option<String>,
+    /// The physical object this row is about, whether or not it is
+    /// publishable.
+    ///
+    /// Distinct from `resolved_target`, which is withheld when a component
+    /// could never name a warehouse object. Occupancy still has to be decided
+    /// for those rows, so it is tracked separately rather than inferred by
+    /// un-qualifying the map key — a target that failed validation may itself
+    /// contain the `#` the key uses as its qualifier separator.
+    target: Option<CollisionIdentity>,
+    /// Some model in the base project resolved to `target`, whether or not it
+    /// is the model this row is keyed on.
+    base_target_occupied: bool,
+    /// Likewise for head.
+    head_target_occupied: bool,
 }
 
 impl ModelChange {
+    /// A row identifies a **warehouse target**, so Added and Removed are
+    /// statements about that target rather than about one model's assignment.
+    ///
+    /// Those coincide except when two models share a target: they get
+    /// name-qualified keys so neither vanishes from the report, and the
+    /// qualification then makes the judgement per-*model*. Retarget one of a
+    /// colliding pair and its old target was reported `removed` although the
+    /// other model still writes it — nothing was abandoned, and a reader
+    /// acting on that would drop a live table (#1236).
+    ///
+    /// Occupancy is therefore consulted alongside authorship: a target no
+    /// head model resolves to is Removed; one no base model resolved to is
+    /// Added; a target present on both sides is Modified however its
+    /// producers moved around.
     fn status(&self) -> ModelDiffStatus {
         match (
-            self.base_schema_name.is_some(),
-            self.head_schema_name.is_some(),
+            self.base_schema_name.is_some() || self.base_target_occupied,
+            self.head_schema_name.is_some() || self.head_target_occupied,
         ) {
             (true, true) => ModelDiffStatus::Modified,
             (true, false) => ModelDiffStatus::Removed,
@@ -287,11 +316,11 @@ fn model_matches_path(model: &Model, path: &str, models_rel: Option<&str>) -> bo
 /// about duplicate targets, so keying the change map purely by target would let
 /// one model silently overwrite another and vanish from the report. Colliding
 /// targets get name-qualified keys instead.
-fn ambiguous_targets(models: &[Model]) -> HashSet<String> {
+fn ambiguous_targets(models: &[Model]) -> HashSet<CollisionIdentity> {
     let mut seen = HashSet::new();
     let mut duplicated = HashSet::new();
     for model in models {
-        let target = target_identity(model);
+        let target = collision_identity(model);
         if !seen.insert(target.clone()) {
             duplicated.insert(target);
         }
@@ -299,9 +328,27 @@ fn ambiguous_targets(models: &[Model]) -> HashSet<String> {
     duplicated
 }
 
+/// The target as the user spelled it. Published, never compared.
 fn target_identity(model: &Model) -> String {
     let target = &model.config.target;
     format!("{}.{}.{}", target.catalog, target.schema, target.table)
+}
+
+/// The physical object the target names. Compared, never published.
+///
+/// One definition of "same warehouse object" for the whole command, shared
+/// with the compiler's E036 and `branch promote`. Spelling is not identity:
+/// `c.S.Orders` and `c.s.orders` may be one table, and a report that keyed
+/// rows on the raw string emitted **two rows for one object** — one pairing
+/// whichever producers happened to share a spelling on each side, so a base
+/// column supplied under one spelling read as newly added under the other.
+///
+/// Publication still uses [`target_identity`] via `publishable_target`, so
+/// the row shows the spelling the project actually uses; only pairing is
+/// canonical.
+fn collision_identity(model: &Model) -> CollisionIdentity {
+    let target = &model.config.target;
+    CollisionIdentity::of(&target.catalog, &target.schema, &target.table)
 }
 
 /// The model's target identity, but only when every component is a real SQL
@@ -350,24 +397,27 @@ fn record_model_side(
 fn record_resolved_model(
     changes: &mut HashMap<String, ModelChange>,
     model: &Model,
-    ambiguous: &HashSet<String>,
+    ambiguous: &HashSet<CollisionIdentity>,
     is_base: bool,
 ) {
-    let target = target_identity(model);
+    let identity = collision_identity(model);
     // A target shared by two models can't identify either of them; fall
     // back to pairing by name so neither disappears from the report.
-    let key = if ambiguous.contains(&target) {
-        format!("{target}#{}", model.config.name)
+    let key = if ambiguous.contains(&identity) {
+        format!("{identity}#{}", model.config.name)
     } else {
-        target.clone()
+        identity.to_string()
     };
     record_model_side(
         changes,
-        key,
+        key.clone(),
         &model.config.name,
         publishable_target(model).as_deref(),
         is_base,
     );
+    if let Some(change) = changes.get_mut(&key) {
+        change.target = Some(identity);
+    }
 }
 
 fn record_resolved_side(
@@ -375,7 +425,7 @@ fn record_resolved_side(
     models: &[Model],
     path: &str,
     models_rel: Option<&str>,
-    ambiguous: &HashSet<String>,
+    ambiguous: &HashSet<CollisionIdentity>,
     is_base: bool,
 ) {
     for model in models
@@ -439,11 +489,77 @@ fn classify_model_changes(
                 let Some(head_model) = head_by_name.get(base_model.config.name.as_str()) else {
                     continue;
                 };
+                // Deliberately the raw spelling, not `collision_identity`.
+                // This decides whether to *record*, not what a row is: a
+                // case-only change is treated as a move and both sides get
+                // recorded, and `record_resolved_model` then keys them
+                // canonically, so they land on one row comparing the model
+                // against itself. Folding here would instead skip the pair
+                // and report nothing at all — the under-reporting direction,
+                // on a question Rocky cannot settle without knowing the
+                // warehouse's case sensitivity (#1281).
                 if target_identity(base_model) == target_identity(head_model) {
                     continue;
                 }
                 record_resolved_model(&mut changes, base_model, &ambiguous, true);
                 record_resolved_model(&mut changes, head_model, &ambiguous, false);
+            }
+        }
+
+        // Occupancy pass. Everything above keys rows by (possibly name-qualified)
+        // target and records which side *authored* them. Whether a target is
+        // occupied is a property of the whole project, not of the changed
+        // files, so it is settled here against the full model sets (#1236).
+        //
+        // Identity is `CollisionIdentity`, the same key the compiler's E036
+        // and `branch promote` use, not the row's raw spelling. Two spellings
+        // that differ only by case may name one warehouse object, and if
+        // Rocky's own duplicate-target check calls them one, this must too —
+        // otherwise a surviving occupant spelled `c.s.orders` fails to cover a
+        // vacated `C.S.Orders` and the row still claims a removal.
+        //
+        // `Ephemeral` models are excluded for the reason `collide_on_target`
+        // excludes them: their target is populated but phantom and nothing is
+        // ever materialized there, so an ephemeral model cannot keep a table
+        // alive. Counting one would turn a genuine abandonment into a
+        // `Modified` row — a fail-open, and the direction that matters here,
+        // since the whole point is not to mis-describe what happens to a
+        // physical table.
+        //
+        // No schema name is borrowed from the occupant. It is tempting: the
+        // row would then carry a real `column_changes` diff instead of an
+        // empty one. But the row keeps its own `model_name`, and `lineage-diff`
+        // traces columns through that name — so borrowing publishes another
+        // model's columns under this model's identity and can name the wrong
+        // downstream consumers. It is also not well founded: a base target
+        // written by two colliding models had no uniquely defined schema to
+        // diff against. An empty diff says what is actually known — the target
+        // survives, its column delta is not attributable.
+        let occupants = |models: &[Model]| {
+            let mut by_target: HashSet<CollisionIdentity> = HashSet::new();
+            for model in models {
+                if matches!(
+                    model.config.strategy,
+                    rocky_core::models::StrategyConfig::Ephemeral
+                ) {
+                    continue;
+                }
+                by_target.insert(collision_identity(model));
+            }
+            by_target
+        };
+        let base_occupants = occupants(base);
+        let head_occupants = occupants(head);
+
+        for change in changes.values_mut() {
+            let Some(identity) = change.target.as_ref() else {
+                continue;
+            };
+            if change.base_schema_name.is_none() && base_occupants.contains(identity) {
+                change.base_target_occupied = true;
+            }
+            if change.head_schema_name.is_none() && head_occupants.contains(identity) {
+                change.head_target_occupied = true;
             }
         }
 
@@ -579,6 +695,13 @@ fn classify_model_changes(
                 // compile that DID succeed resolved it for a model owning this
                 // file, and only from the side the row's status describes.
                 resolved_target,
+                // This is the fallback path, taken when at least one ref did
+                // not compile. Occupancy is a question about a whole project,
+                // so it cannot be answered from one side; leaving it unset
+                // keeps `status()` exactly as conservative as it was here.
+                target: None,
+                base_target_occupied: false,
+                head_target_occupied: false,
             },
         );
     }
@@ -1289,6 +1412,7 @@ mod tests {
             base_schema_name,
             head_schema_name,
             resolved_target: None,
+            ..Default::default()
         }
     }
 
@@ -1910,6 +2034,24 @@ mod tests {
         .unwrap();
     }
 
+    /// Like `write_model_with_identity` but the schema is caller-chosen, so a
+    /// fixture can move a model to a different target.
+    fn write_model_at(dir: &Path, file_stem: &str, name: &str, schema: &str, table: &str) {
+        fs::write(
+            dir.join(format!("{file_stem}.sql")),
+            "SELECT id FROM src_orders",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(format!("{file_stem}.toml")),
+            format!(
+                "name = \"{name}\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"c\"\nschema = \"{schema}\"\ntable = \"{table}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
     fn write_inferred_model(dir: &Path, file_stem: &str, sql: &str) {
         fs::write(dir.join(format!("{file_stem}.sql")), sql).unwrap();
         fs::write(
@@ -2085,6 +2227,336 @@ mod tests {
         assert_eq!(fallback["orders_v2"].status(), ModelDiffStatus::Modified);
     }
 
+    /// #1236: two models share a target and one moves away. The vacated
+    /// target is still written by the other, so nothing was abandoned —
+    /// reporting it `removed` tells a reader to drop a live table.
+    ///
+    /// This shape is exactly a PR that *fixes* an E036 duplicate-target
+    /// collision, so it is a change worth making, not a broken state to
+    /// refuse.
+    #[test]
+    fn retargeting_one_of_a_colliding_pair_leaves_the_shared_target_occupied() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let base_dir = TempDir::new().unwrap();
+        write_model_at(base_dir.path(), "a", "a", "s", "orders");
+        write_model_at(base_dir.path(), "b", "b", "s", "orders");
+        let head_dir = TempDir::new().unwrap();
+        write_model_at(head_dir.path(), "a", "a", "s2", "orders");
+        write_model_at(head_dir.path(), "b", "b", "s", "orders");
+
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+        let files = parse_name_status(b"M\tmodels/a.toml\n").unwrap();
+
+        let changes = classify_model_changes(
+            &files,
+            Some("models"),
+            Some(&base_compile.project.models),
+            Some(&head_compile.project.models),
+        );
+
+        assert!(
+            changes
+                .values()
+                .all(|change| change.status() != ModelDiffStatus::Removed),
+            "c.s.orders is still written by `b`, so no row may claim a removal: {:?}",
+            changes
+                .iter()
+                .map(|(k, v)| (k, v.status()))
+                .collect::<Vec<_>>()
+        );
+
+        let shared = changes
+            .values()
+            .find(|change| change.resolved_target.as_deref() == Some("c.s.orders"))
+            .expect("the vacated target still has a row");
+        assert_eq!(shared.status(), ModelDiffStatus::Modified);
+        // Deliberately NOT `Some("b")`. The row keeps its own `model_name`,
+        // and `lineage-diff` traces columns through that name, so borrowing
+        // the occupant's schema would publish `b`'s columns under `a`'s
+        // identity. It is also not well founded: a base target written by two
+        // colliding models had no uniquely defined schema to diff against.
+        assert_eq!(shared.head_schema_name, None);
+        assert!(shared.head_target_occupied);
+
+        let moved = changes
+            .values()
+            .find(|change| change.resolved_target.as_deref() == Some("c.s2.orders"))
+            .expect("the new target has a row");
+        assert_eq!(moved.status(), ModelDiffStatus::Added);
+    }
+
+    /// Occupancy uses the compiler's physical identity, not the row's raw
+    /// spelling.
+    ///
+    /// `C.S.Orders` and `c.s.orders` may be one warehouse object, and E036
+    /// already treats them as one. If occupancy did not, a surviving occupant
+    /// spelled one way would fail to cover a target vacated in the other, and
+    /// the row would still claim a removal — the exact failure #1236 reports,
+    /// reached through a spelling difference instead.
+    #[test]
+    fn occupancy_folds_case_the_way_the_compiler_does() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let base_dir = TempDir::new().unwrap();
+        write_model_at(base_dir.path(), "a", "a", "S", "Orders");
+        write_model_at(base_dir.path(), "b", "b", "s", "orders");
+        let head_dir = TempDir::new().unwrap();
+        write_model_at(head_dir.path(), "a", "a", "s2", "orders");
+        write_model_at(head_dir.path(), "b", "b", "s", "orders");
+
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+        let files = parse_name_status(b"M\tmodels/a.toml\n").unwrap();
+
+        let changes = classify_model_changes(
+            &files,
+            Some("models"),
+            Some(&base_compile.project.models),
+            Some(&head_compile.project.models),
+        );
+
+        let vacated = changes
+            .values()
+            .find(|change| change.resolved_target.as_deref() == Some("c.S.Orders"))
+            .expect("the vacated spelling still has a row");
+        assert_eq!(
+            vacated.status(),
+            ModelDiffStatus::Modified,
+            "`b` at c.s.orders is the same physical object as c.S.Orders, so it \
+             covers the vacated target"
+        );
+    }
+
+    /// A row must never pair one model's base side with a *different*
+    /// model's head side.
+    ///
+    /// Base `a -> c.S.Orders` and `b -> c.s.orders`; head normalizes `a` onto
+    /// `c.s.orders` and moves `b` away. Keyed on the raw spelling, neither
+    /// side has a duplicate, so nothing is name-qualified — and base `b`
+    /// pairs with head `a` under `c.s.orders`, comparing `b`'s base schema
+    /// against `a`'s head schema. A column base `a` already supplied at that
+    /// physical target then reads as newly added.
+    ///
+    /// Keyed on the physical object, both producers are seen to contest one
+    /// table, so both rows are name-qualified — one row per producer, which
+    /// is what that qualification exists for, and each row compares a model
+    /// against itself.
+    #[test]
+    fn a_row_never_pairs_one_model_with_another_models_head_side() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let base_dir = TempDir::new().unwrap();
+        write_model_at(base_dir.path(), "a", "a", "S", "Orders");
+        write_model_at(base_dir.path(), "b", "b", "s", "orders");
+        let head_dir = TempDir::new().unwrap();
+        write_model_at(head_dir.path(), "a", "a", "s", "orders");
+        write_model_at(head_dir.path(), "b", "b", "s2", "orders");
+
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+        let files = parse_name_status(b"M\tmodels/a.toml\nM\tmodels/b.toml\n").unwrap();
+
+        let changes = classify_model_changes(
+            &files,
+            Some("models"),
+            Some(&base_compile.project.models),
+            Some(&head_compile.project.models),
+        );
+
+        for (key, change) in &changes {
+            if let (Some(base), Some(head)) = (&change.base_schema_name, &change.head_schema_name) {
+                assert_eq!(
+                    base, head,
+                    "row {key} compares base model {base} against head model {head}; \
+                     a row describes one target, not two producers spliced together"
+                );
+            }
+        }
+
+        // And the vacated side is still reported as surviving, not removed:
+        // `a` now writes the table `b` left.
+        assert!(
+            changes
+                .values()
+                .all(|change| change.status() != ModelDiffStatus::Removed),
+            "c.s.orders is still written by `a`: {:?}",
+            changes
+                .iter()
+                .map(|(k, v)| (k, v.status()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// An `ephemeral` model cannot keep a table alive.
+    ///
+    /// Its target is populated but phantom and nothing is ever materialized
+    /// there — which is exactly why `collide_on_target` excludes ephemerals
+    /// from E036. Counting one as an occupant would turn a genuine
+    /// abandonment into `Modified`, hiding that a real table was left behind.
+    #[test]
+    fn an_ephemeral_model_does_not_keep_a_vacated_target_occupied() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let write_ephemeral = |dir: &Path, stem: &str, name: &str, table: &str| {
+            fs::write(dir.join(format!("{stem}.sql")), "SELECT id FROM src_orders").unwrap();
+            fs::write(
+                dir.join(format!("{stem}.toml")),
+                format!(
+                    "name = \"{name}\"\n\n[strategy]\ntype = \"ephemeral\"\n\n\
+                     [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"{table}\"\n"
+                ),
+            )
+            .unwrap();
+        };
+
+        let base_dir = TempDir::new().unwrap();
+        write_model_at(base_dir.path(), "a", "a", "s", "orders");
+        write_ephemeral(base_dir.path(), "e", "e", "orders");
+        let head_dir = TempDir::new().unwrap();
+        write_model_at(head_dir.path(), "a", "a", "s2", "orders");
+        write_ephemeral(head_dir.path(), "e", "e", "orders");
+
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+        let files = parse_name_status(b"M\tmodels/a.toml\n").unwrap();
+
+        let changes = classify_model_changes(
+            &files,
+            Some("models"),
+            Some(&base_compile.project.models),
+            Some(&head_compile.project.models),
+        );
+
+        let vacated = changes
+            .values()
+            .find(|change| change.resolved_target.as_deref() == Some("c.s.orders"))
+            .expect("the vacated target still has a row");
+        assert_eq!(
+            vacated.status(),
+            ModelDiffStatus::Removed,
+            "only an ephemeral model is left at c.s.orders, and it materializes \
+             nothing — the table really is abandoned"
+        );
+    }
+
+    /// The symmetric direction, which #1236 only implies: adding a second
+    /// model at a target that already existed must not report that target
+    /// `Added`. The table is not new — this PR is *introducing* an E036
+    /// collision on it, which is the opposite problem and equally worth
+    /// describing accurately.
+    #[test]
+    fn adding_a_second_model_at_an_existing_target_is_not_an_addition() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let base_dir = TempDir::new().unwrap();
+        write_model_at(base_dir.path(), "a", "a", "s", "orders");
+        let head_dir = TempDir::new().unwrap();
+        write_model_at(head_dir.path(), "a", "a", "s", "orders");
+        write_model_at(head_dir.path(), "b", "b", "s", "orders");
+
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+        let files = parse_name_status(b"A\tmodels/b.sql\nA\tmodels/b.toml\n").unwrap();
+
+        let changes = classify_model_changes(
+            &files,
+            Some("models"),
+            Some(&base_compile.project.models),
+            Some(&head_compile.project.models),
+        );
+
+        assert!(
+            changes
+                .values()
+                .all(|change| change.status() != ModelDiffStatus::Added),
+            "c.s.orders already existed in base, so no row may call it added: {:?}",
+            changes
+                .iter()
+                .map(|(k, v)| (k, v.status()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Several survivors, and still not a removal.
+    ///
+    /// No schema name is ever taken from an occupant (see the pass), so the
+    /// flags are the only thing standing between this row and a false
+    /// `removed`. Two models continue to write the target after the third
+    /// moves away; the table is plainly not abandoned.
+    #[test]
+    fn a_target_with_several_surviving_occupants_is_occupied_without_a_name() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let base_dir = TempDir::new().unwrap();
+        for name in ["a", "b", "c"] {
+            write_model_at(base_dir.path(), name, name, "s", "orders");
+        }
+        let head_dir = TempDir::new().unwrap();
+        write_model_at(head_dir.path(), "a", "a", "s2", "orders");
+        write_model_at(head_dir.path(), "b", "b", "s", "orders");
+        write_model_at(head_dir.path(), "c", "c", "s", "orders");
+
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+        let files = parse_name_status(b"M\tmodels/a.toml\n").unwrap();
+
+        let changes = classify_model_changes(
+            &files,
+            Some("models"),
+            Some(&base_compile.project.models),
+            Some(&head_compile.project.models),
+        );
+
+        let shared = changes
+            .values()
+            .find(|change| change.resolved_target.as_deref() == Some("c.s.orders"))
+            .expect("the vacated target still has a row");
+        assert_eq!(
+            shared.status(),
+            ModelDiffStatus::Modified,
+            "`b` and `c` both still write c.s.orders, so it is not removed"
+        );
+        assert_eq!(
+            shared.head_schema_name, None,
+            "two occupants means no single model defines the target, so the row \
+             must not claim one — it records occupancy instead"
+        );
+        assert!(shared.head_target_occupied);
+    }
+
+    /// The control, and the reason this is occupancy rather than blanket
+    /// suppression: when the vacated target has no other occupant it really
+    /// is abandoned, and must still report `removed`.
+    #[test]
+    fn retargeting_a_sole_occupant_still_reports_the_old_target_removed() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let base_dir = TempDir::new().unwrap();
+        write_model_at(base_dir.path(), "a", "a", "s", "a_tbl");
+        write_model_at(base_dir.path(), "b", "b", "s", "b_tbl");
+        let head_dir = TempDir::new().unwrap();
+        write_model_at(head_dir.path(), "a", "a", "s2", "a_tbl");
+        write_model_at(head_dir.path(), "b", "b", "s", "b_tbl");
+
+        let base_compile = compile_head(base_dir.path(), sources.clone()).expect("base compile");
+        let head_compile = compile_head(head_dir.path(), sources).expect("head compile");
+        let files = parse_name_status(b"M\tmodels/a.toml\n").unwrap();
+
+        let changes = classify_model_changes(
+            &files,
+            Some("models"),
+            Some(&base_compile.project.models),
+            Some(&head_compile.project.models),
+        );
+
+        let removed = changes
+            .values()
+            .find(|change| change.status() == ModelDiffStatus::Removed)
+            .expect("an abandoned target must still report removed");
+        assert_eq!(removed.resolved_target.as_deref(), Some("c.s.a_tbl"));
+        assert!(
+            changes
+                .values()
+                .any(|change| change.status() == ModelDiffStatus::Added
+                    && change.resolved_target.as_deref() == Some("c.s2.a_tbl"))
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Ownership resolution: filename inference is not enough
     // -----------------------------------------------------------------------
@@ -2233,6 +2705,7 @@ mod tests {
                         base_schema_name: Some(format!("s{i}")),
                         head_schema_name: None,
                         resolved_target: None,
+                        ..Default::default()
                     },
                 );
             }
