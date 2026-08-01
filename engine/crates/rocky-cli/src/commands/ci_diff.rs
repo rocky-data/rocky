@@ -478,12 +478,33 @@ fn classify_model_changes(
         if !usable {
             return None;
         }
-        let model = models
+        // Ownership of a path is NOT unique. `orders.contract.toml` is the
+        // ordinary sidecar of `orders.contract.sql` *and* the contract of
+        // `orders.sql`, and `model_owns_file` deliberately matches both —
+        // see `ownership_resolves_contract_stem_and_contract_sidecar`. Taking
+        // the first match would publish an arbitrary one of their targets
+        // under a row that names the other, which breaks the field's contract
+        // that it IS the warehouse object this row describes.
+        //
+        // So resolve every owner and publish only when they agree. Two owners
+        // that happen to share a target still describe that one object, so
+        // uniqueness is on the TARGET, not the model count.
+        let mut targets = models
             .iter()
-            .find(|model| model_matches_path(model, path, models_rel))?;
-        // Same publishability contract as the both-compiled path: a target
-        // that could never name a warehouse object is withheld, not guessed.
-        publishable_target(model)
+            .filter(|model| model_matches_path(model, path, models_rel))
+            // Same publishability contract as the both-compiled path: a target
+            // that could never name a warehouse object is withheld, not guessed.
+            .filter_map(publishable_target)
+            .collect::<Vec<_>>();
+        targets.sort();
+        targets.dedup();
+        match targets.as_slice() {
+            [single] => Some(single.clone()),
+            // Zero owners, or an ambiguous path: unidentified beats
+            // misidentified, which is the same choice `publishable_target`
+            // makes for an unusable identifier.
+            _ => None,
+        }
     };
 
     let mut statuses = HashMap::new();
@@ -1719,6 +1740,58 @@ mod tests {
                 .and_then(|c| c.resolved_target.clone()),
             Some("c.s.orders".to_string()),
             "a Removed row must take the target from the base compile"
+        );
+    }
+
+    /// #1237, red-team finding: a path with MORE THAN ONE owning model must
+    /// not publish an arbitrary one of their targets.
+    ///
+    /// `orders.contract.toml` is the ordinary sidecar of `orders.contract.sql`
+    /// *and* the contract of `orders.sql`; `model_owns_file` deliberately
+    /// matches both (see `ownership_resolves_contract_stem_and_contract_sidecar`).
+    /// Taking the first match would publish one model's warehouse target under
+    /// a row naming the other — a wrong answer, not merely a missing one,
+    /// against a field documented as "the warehouse object this row describes".
+    #[test]
+    fn an_ambiguously_owned_path_publishes_no_target() {
+        let sources = source_schema("src_orders", &[("id", rocky_ir::RockyType::Int64)]);
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).unwrap();
+
+        // Two models whose ownership of `orders.contract.toml` overlaps, with
+        // DIFFERENT targets — so picking either one is observably wrong.
+        write_model_with_identity(
+            &models,
+            "orders",
+            "orders",
+            "orders",
+            "SELECT id FROM src_orders",
+        );
+        write_model_with_identity(
+            &models,
+            "orders.contract",
+            "orders_contract",
+            "orders_contract",
+            "SELECT id FROM src_orders",
+        );
+        let compile = compile_head(&models, sources).expect("compile");
+        let head_models: Vec<Model> = compile.project.models.clone();
+
+        let changes = classify_model_changes(
+            &[changed("models/orders.contract.toml", 'A')],
+            Some("models"),
+            None,
+            Some(&head_models),
+        );
+
+        assert_eq!(
+            changes
+                .get("orders")
+                .and_then(|c| c.resolved_target.clone()),
+            None,
+            "two models own this path with different targets, so neither may be \
+             published as the object this row describes"
         );
     }
 
