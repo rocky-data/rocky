@@ -181,12 +181,28 @@ pub fn write_incident(rocky_dir: &Path, bundle: &IncidentBundle) -> io::Result<P
         }
         max_variant
     };
+    // The variant namespace is exactly `-002`…`-999` — three digits, so the
+    // max-scan can parse every slot it may later need to step past. Fail
+    // closed at the boundary instead of minting a 4-digit name the scan
+    // cannot see and the sweep would treat as oldest-sorting (the round-4
+    // freeze, one namespace up). Callers warn-never-fail.
+    let exhausted = || {
+        io::Error::other(format!(
+            "incident collision namespace exhausted for {stem} (999 variants)"
+        ))
+    };
+    let variant_path = |k: u32| -> io::Result<PathBuf> {
+        if k > 999 {
+            return Err(exhausted());
+        }
+        let variant = format!("{stem}-{k:03}.json");
+        debug_assert!(is_bundle_name(&variant), "{variant}");
+        Ok(dir.join(variant))
+    };
     let mut path = dir.join(&name);
     if k > 0 {
         k += 1;
-        let variant = format!("{stem}-{k:03}.json");
-        debug_assert!(is_bundle_name(&variant), "{variant}");
-        path = dir.join(variant);
+        path = variant_path(k)?;
     }
     loop {
         match std::fs::OpenOptions::new()
@@ -200,12 +216,12 @@ pub fn write_incident(rocky_dir: &Path, bundle: &IncidentBundle) -> io::Result<P
                 break;
             }
             // A racing writer took the slot between the scan and the open
-            // (ticks are lock-serialized, so this is belt-and-braces).
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && k < 999 => {
-                k += 1;
-                let variant = format!("{stem}-{k:03}.json");
-                debug_assert!(is_bundle_name(&variant), "{variant}");
-                path = dir.join(variant);
+            // (ticks are lock-serialized, so this is belt-and-braces for the
+            // public API). A raced BASE name jumps to `-002` — the base
+            // counts as occupancy 1, so `-001` is never minted by anyone.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                k = if k == 0 { 2 } else { k + 1 };
+                path = variant_path(k)?;
             }
             Err(e) => return Err(e),
         }
@@ -469,6 +485,31 @@ mod tests {
         assert!(
             last.unwrap().exists(),
             "the newest bundle must survive its own sweep"
+        );
+    }
+
+    /// A full variant namespace fails closed: the writer must never mint a
+    /// 4-digit variant the max-scan cannot parse — that would recreate the
+    /// round-4 freeze one namespace up (swept immediately, Ok for a path
+    /// that no longer exists).
+    #[test]
+    fn an_exhausted_collision_namespace_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("incidents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let stem = "20260801T120000Z-p-sub-1234";
+        std::fs::write(dir.join(format!("{stem}.json")), "{}").unwrap();
+        for k in 2..=999 {
+            std::fs::write(dir.join(format!("{stem}-{k:03}.json")), "{}").unwrap();
+        }
+        let err = write_incident(tmp.path(), &bundle("p", at)).expect_err("namespace full");
+        assert!(err.to_string().contains("exhausted"), "{err}");
+        assert!(
+            !dir.join(format!("{stem}-1000.json")).exists(),
+            "no 4-digit variant may be minted"
         );
     }
 

@@ -5470,8 +5470,10 @@ pub struct ExecutedRunOutput {
     pub exit_code: i32,
     /// The mapped terminal outcome: `success` | `partial` | `failure`.
     pub outcome: String,
-    /// Total submissions made for this demand (the claim's monotonic audit
-    /// counter): `1` unless in-tick retries fired.
+    /// Total submissions made for this demand — the claim's monotonic audit
+    /// counter across its whole lifetime, so in-tick retries AND earlier
+    /// released cycles of a standing demand all count. `1` only when this
+    /// was the demand's first-ever submission.
     pub attempts: u32,
 }
 

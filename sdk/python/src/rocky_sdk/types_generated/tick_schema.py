@@ -13,7 +13,7 @@ class ExecutedRunOutput(BaseModel):
 
     attempts: conint(ge=0)
     """
-    Total submissions made for this demand (the claim's monotonic audit counter): `1` unless in-tick retries fired.
+    Total submissions made for this demand — the claim's monotonic audit counter across its whole lifetime, so in-tick retries AND earlier released cycles of a standing demand all count. `1` only when this was the demand's first-ever submission.
     """
     exit_code: int
     """

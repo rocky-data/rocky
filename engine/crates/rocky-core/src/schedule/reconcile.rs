@@ -2414,8 +2414,19 @@ cron = "also invalid"
             .map(|e| e.path())
             .collect();
         bundles.sort();
-        let newest: crate::schedule::incidents::IncidentBundle =
-            serde_json::from_slice(&std::fs::read(bundles.last().unwrap()).unwrap()).unwrap();
+        assert_eq!(bundles.len(), 2, "one bundle per failed cycle");
+        let read = |p: &std::path::PathBuf| -> crate::schedule::incidents::IncidentBundle {
+            serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+        };
+        let (first, newest) = (read(&bundles[0]), read(&bundles[1]));
+        assert_ne!(
+            first.submission_id, newest.submission_id,
+            "two distinct failed submissions"
+        );
+        assert_eq!(
+            newest.submission_id, report2.executed[0].submission_id,
+            "the newest bundle is cycle 2's"
+        );
         assert_eq!(
             newest.attempts, 1,
             "the bundle reports attempts within THIS cycle"
