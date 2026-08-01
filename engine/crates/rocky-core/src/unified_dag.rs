@@ -78,6 +78,24 @@ pub enum UnifiedDagError {
         /// Sorted, so the message is deterministic.
         pipelines: Vec<String>,
     },
+
+    #[error(
+        "models {} resolve to the same physical table '{target}' on adapter '{adapter}'. The \
+         unified DAG has no edge between them, so nothing orders the two writes and the \
+         surviving rows would be decided by whichever finishes last. Give one of them its \
+         own `[target] table`, point them at different \
+         adapters, or run the pipelines separately with `rocky run --pipeline <name>`.",
+        .claimants.iter().map(|(p, m)| format!("'{m}' (pipeline '{p}')"))
+            .collect::<Vec<_>>().join(" and ")
+    )]
+    DuplicatePhysicalTargetAcrossPipelines {
+        /// The target as the user spelled it.
+        target: String,
+        /// The adapter both resolve through.
+        adapter: String,
+        /// `(pipeline, model)` pairs, sorted, so the message is deterministic.
+        claimants: Vec<(String, String)>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +351,133 @@ fn reject_models_claimed_twice(
     Ok(())
 }
 
+/// Everything claiming one physical table, while
+/// [`reject_duplicate_physical_targets`] groups them.
+struct TargetClaim {
+    /// The target as the user spelled it — published in the message, never
+    /// compared. Comparison is the folded map key.
+    spelled: String,
+    /// The adapter name — which is also half the map key.
+    adapter: String,
+    /// `(pipeline, model)` pairs resolving to this table.
+    writers: Vec<(String, String)>,
+}
+
+/// Refuse two *different* pipelines whose models resolve to one physical table.
+///
+/// E036 (#1291) catches this within a single compile, which covers a plain
+/// `rocky run`, `rocky compile`, the LSP, and each `--dag` sub-run. It cannot
+/// catch it across pipelines: `--dag` discovers models per pipeline and each
+/// sub-run compiles only its own root, so neither compile ever holds both
+/// writers. The unified DAG is the only place that does — and it previously
+/// rejected duplicate model *names* while saying nothing about duplicate
+/// *targets*, so the two models became independent nodes in layer zero and
+/// both wrote one table (#1301).
+///
+/// The defect is *unordered ownership*, not a data race in the narrow sense:
+/// pipeline-bound sub-runs sharing a state path already take turns at the
+/// dispatch turnstile (#1312), so the two writes are serialized today. They
+/// are still two full replacements of one table with nothing deciding which
+/// survives, and the turnstile is a state-store detail that could change.
+/// Neither makes duplicate ownership correct.
+///
+/// **Keyed on the adapter NAME as well as `catalog.schema.table`.** That is the
+/// difference from the per-project check, and it is a real one: two pipelines
+/// may legitimately write `c.s.orders` on two different warehouses, and
+/// refusing that would be wrong.
+///
+/// The name is the right key, and a more "thorough" one is not. An earlier
+/// revision keyed on the adapter's canonically serialized config, reasoning
+/// that aliasing one warehouse under two names should not launder a collision.
+/// That is unsound in **both** directions, and the second one breaks working
+/// projects:
+///
+/// - Two Databricks blocks identical but for `timeout_secs` — unset on one,
+///   `120` on the other — serialize differently and read as two warehouses,
+///   yet `registry` normalizes both with `unwrap_or(120)` to the same host.
+///   A real collision, missed.
+/// - Two **pathless** DuckDB blocks serialize identically and read as one
+///   warehouse, yet `registry` builds `DuckDbWarehouseAdapter::in_memory()`
+///   *per adapter name*, so they are two independent databases. A legitimate
+///   project, refused.
+///
+/// A name, by contrast, is unambiguous in the direction that matters: one name
+/// is one entry in `config.adapters`, hence one destination. Two names may
+/// still alias one warehouse, so this fails **open** on aliasing — it misses
+/// that collision rather than inventing one. Closing it needs a per-adapter
+/// notion of physical destination (host + http_path, canonicalized path,
+/// account + warehouse …) that does not exist yet and cannot be approximated
+/// by serializing the config.
+///
+/// The `catalog.schema.table` half is [`rocky_sql::defer::CollisionIdentity`],
+/// shared with E036 and `branch promote` rather than respelled here: two gates
+/// disagreeing about what counts as one physical object is the failure this
+/// exists to prevent.
+///
+/// `Ephemeral` models are excluded for the reason the compiler excludes them —
+/// their target is populated but phantom and nothing is materialized there, so
+/// one can never be the second writer.
+///
+/// Only cross-pipeline groups are reported. A collision *within* one pipeline
+/// is E036's, and reporting it here as well would give one mistake two
+/// different errors from two different layers.
+fn reject_duplicate_physical_targets(
+    config: &RockyConfig,
+    models_by_pipeline: &ModelsByPipeline,
+) -> Result<(), UnifiedDagError> {
+    // Keyed by (adapter identity, folded target).
+    let mut claimants: std::collections::BTreeMap<(String, String), TargetClaim> =
+        Default::default();
+
+    for (pipeline_name, models) in models_by_pipeline {
+        let Some(pipeline) = config.pipelines.get(pipeline_name) else {
+            continue;
+        };
+        let adapter_name = pipeline.target_adapter();
+
+        for model in models {
+            if matches!(
+                model.config.strategy,
+                crate::models::StrategyConfig::Ephemeral
+            ) {
+                continue;
+            }
+            let t = &model.config.target;
+            let folded = rocky_sql::defer::CollisionIdentity::of(&t.catalog, &t.schema, &t.table)
+                .to_string();
+            let spelled = if t.catalog.is_empty() {
+                format!("{}.{}", t.schema, t.table)
+            } else {
+                format!("{}.{}.{}", t.catalog, t.schema, t.table)
+            };
+            claimants
+                .entry((adapter_name.to_string(), folded))
+                .or_insert_with(|| TargetClaim {
+                    spelled,
+                    adapter: adapter_name.to_string(),
+                    writers: Vec::new(),
+                })
+                .writers
+                .push((pipeline_name.clone(), model.config.name.clone()));
+        }
+    }
+
+    for claim in claimants.into_values() {
+        let distinct_pipelines: std::collections::BTreeSet<&str> =
+            claim.writers.iter().map(|(p, _)| p.as_str()).collect();
+        if distinct_pipelines.len() > 1 {
+            let mut writers = claim.writers;
+            writers.sort();
+            return Err(UnifiedDagError::DuplicatePhysicalTargetAcrossPipelines {
+                target: claim.spelled,
+                adapter: claim.adapter,
+                claimants: writers,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Builds a unified DAG from the current configuration, loaded models, and seeds.
 ///
 /// Each pipeline in `config.pipelines` becomes one or more nodes:
@@ -396,6 +541,7 @@ pub fn build_unified_dag(
     seeds: &[SeedFile],
 ) -> Result<UnifiedDag, UnifiedDagError> {
     reject_models_claimed_twice(models_by_pipeline)?;
+    reject_duplicate_physical_targets(config, models_by_pipeline)?;
 
     // The union, for the cross-step dependency pass below. A model appears
     // under exactly one pipeline (the check above guarantees it), so this
@@ -1352,6 +1498,282 @@ mod tests {
             layer_of(&stg) < layer_of(&fct),
             "stg must run before fct, got layers {layers:?}"
         );
+    }
+
+    /// A model with a caller-chosen physical target, for the cross-pipeline
+    /// collision tests. `model()` derives the table from the name, which is
+    /// exactly what these need to override.
+    fn model_targeting(name: &str, catalog: &str, schema: &str, table: &str) -> Model {
+        let mut m = model(name, vec![], vec![]);
+        m.config.target = TargetConfig {
+            catalog: catalog.into(),
+            schema: schema.into(),
+            table: table.into(),
+        };
+        m
+    }
+
+    /// A transformation pipeline writing through a named adapter.
+    fn transform_pipeline_on(adapter: &str) -> PipelineConfig {
+        let PipelineConfig::Transformation(mut t) = transform_pipeline(vec![]) else {
+            unreachable!("transform_pipeline builds a transformation");
+        };
+        t.target.adapter = adapter.into();
+        PipelineConfig::Transformation(t)
+    }
+
+    /// Built by deserialization rather than by naming ~30 `None` fields, so
+    /// the fixture also exercises the parse path a real `rocky.toml` takes.
+    fn duckdb_adapter(path: &str) -> AdapterConfig {
+        serde_json::from_value(serde_json::json!({ "type": "duckdb", "path": path }))
+            .expect("duckdb adapter fixture must deserialize")
+    }
+
+    /// #1301: two pipelines whose models resolve to one physical table are
+    /// refused at DAG build.
+    ///
+    /// E036 cannot see this — `--dag` compiles each pipeline's models
+    /// separately, so neither compile holds both writers. The unified DAG is
+    /// the only place that does, and it previously checked duplicate model
+    /// *names* only, so these became independent layer-zero nodes and fanned
+    /// out concurrently against one table.
+    #[test]
+    fn two_pipelines_writing_one_table_on_one_adapter_are_refused() {
+        let mut config = config_with_pipelines(vec![
+            ("silver", transform_pipeline_on("wh")),
+            ("gold", transform_pipeline_on("wh")),
+        ]);
+        config
+            .adapters
+            .insert("wh".into(), duckdb_adapter("wh.duckdb"));
+
+        let models_by_pipeline = ModelsByPipeline::from([
+            (
+                "silver".to_string(),
+                vec![model_targeting("a", "c", "s", "shared")],
+            ),
+            (
+                "gold".to_string(),
+                vec![model_targeting("b", "c", "s", "shared")],
+            ),
+        ]);
+
+        let err = build_unified_dag(&config, &models_by_pipeline, &[])
+            .expect_err("two pipelines writing one table must be refused");
+        match &err {
+            UnifiedDagError::DuplicatePhysicalTargetAcrossPipelines {
+                target, claimants, ..
+            } => {
+                assert_eq!(target, "c.s.shared");
+                assert_eq!(
+                    claimants,
+                    &vec![
+                        ("gold".to_string(), "b".to_string()),
+                        ("silver".to_string(), "a".to_string()),
+                    ],
+                    "sorted, so the message is stable"
+                );
+            }
+            other => panic!("expected DuplicatePhysicalTargetAcrossPipelines, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'a' (pipeline 'silver')"),
+            "must name both: {msg}"
+        );
+        assert!(
+            msg.contains("'b' (pipeline 'gold')"),
+            "must name both: {msg}"
+        );
+    }
+
+    /// The control, and the reason this keys on adapter identity rather than
+    /// `catalog.schema.table` alone: the same triple on two *different*
+    /// warehouses is two different tables, and refusing it would be wrong.
+    #[test]
+    fn two_pipelines_writing_one_table_on_different_adapters_are_allowed() {
+        let mut config = config_with_pipelines(vec![
+            ("silver", transform_pipeline_on("wh_a")),
+            ("gold", transform_pipeline_on("wh_b")),
+        ]);
+        config
+            .adapters
+            .insert("wh_a".into(), duckdb_adapter("a.duckdb"));
+        config
+            .adapters
+            .insert("wh_b".into(), duckdb_adapter("b.duckdb"));
+
+        let models_by_pipeline = ModelsByPipeline::from([
+            (
+                "silver".to_string(),
+                vec![model_targeting("a", "c", "s", "shared")],
+            ),
+            (
+                "gold".to_string(),
+                vec![model_targeting("b", "c", "s", "shared")],
+            ),
+        ]);
+
+        build_unified_dag(&config, &models_by_pipeline, &[])
+            .expect("the same triple on two different warehouses is two different tables");
+    }
+
+    /// Two **pathless** DuckDB adapters are two databases, not one.
+    ///
+    /// This is the case that killed the earlier canonical-config key: pathless
+    /// blocks serialize identically, so keying on the serialized config read
+    /// them as one warehouse and refused a legitimate project. `registry`
+    /// builds `DuckDbWarehouseAdapter::in_memory()` per adapter *name*, so
+    /// they are genuinely independent.
+    #[test]
+    fn two_pathless_duckdb_adapters_are_two_warehouses() {
+        let pathless = || -> AdapterConfig {
+            serde_json::from_value(serde_json::json!({ "type": "duckdb" }))
+                .expect("pathless duckdb fixture")
+        };
+        let mut config = config_with_pipelines(vec![
+            ("silver", transform_pipeline_on("mem_a")),
+            ("gold", transform_pipeline_on("mem_b")),
+        ]);
+        config.adapters.insert("mem_a".into(), pathless());
+        config.adapters.insert("mem_b".into(), pathless());
+
+        let models_by_pipeline = ModelsByPipeline::from([
+            (
+                "silver".to_string(),
+                vec![model_targeting("a", "main", "s", "shared")],
+            ),
+            (
+                "gold".to_string(),
+                vec![model_targeting("b", "main", "s", "shared")],
+            ),
+        ]);
+
+        build_unified_dag(&config, &models_by_pipeline, &[])
+            .expect("two in-memory databases are two warehouses, not one");
+    }
+
+    /// Case-variant targets on one adapter are one physical table.
+    ///
+    /// The `catalog.schema.table` half is `CollisionIdentity`, shared with
+    /// E036 and `branch promote`. Without the fold, every fixture here uses a
+    /// single spelling and a case-sensitive key would pass them all.
+    #[test]
+    fn case_variant_targets_on_one_adapter_still_collide() {
+        let mut config = config_with_pipelines(vec![
+            ("silver", transform_pipeline_on("wh")),
+            ("gold", transform_pipeline_on("wh")),
+        ]);
+        config
+            .adapters
+            .insert("wh".into(), duckdb_adapter("wh.duckdb"));
+
+        let models_by_pipeline = ModelsByPipeline::from([
+            (
+                "silver".to_string(),
+                vec![model_targeting("a", "C", "S", "Shared")],
+            ),
+            (
+                "gold".to_string(),
+                vec![model_targeting("b", "c", "s", "shared")],
+            ),
+        ]);
+
+        assert!(
+            build_unified_dag(&config, &models_by_pipeline, &[]).is_err(),
+            "two spellings of one warehouse object are one table"
+        );
+    }
+
+    /// An adapter name with no matching block still groups by that name.
+    ///
+    /// Two pipelines naming the same missing adapter collide with each other;
+    /// two naming different missing adapters do not. Neither project runs —
+    /// but `rocky dag` does not run the config validation that reports the
+    /// missing adapter, so this path is reachable and must not panic or
+    /// silently merge unrelated pipelines.
+    #[test]
+    fn an_unresolvable_adapter_name_still_groups_by_name() {
+        let config = config_with_pipelines(vec![
+            ("silver", transform_pipeline_on("ghost")),
+            ("gold", transform_pipeline_on("ghost")),
+        ]);
+        // Deliberately no `adapters` entry for "ghost".
+        let models_by_pipeline = ModelsByPipeline::from([
+            (
+                "silver".to_string(),
+                vec![model_targeting("a", "c", "s", "shared")],
+            ),
+            (
+                "gold".to_string(),
+                vec![model_targeting("b", "c", "s", "shared")],
+            ),
+        ]);
+        assert!(
+            build_unified_dag(&config, &models_by_pipeline, &[]).is_err(),
+            "one missing adapter name is still one destination"
+        );
+
+        let split = config_with_pipelines(vec![
+            ("silver", transform_pipeline_on("ghost_a")),
+            ("gold", transform_pipeline_on("ghost_b")),
+        ]);
+        build_unified_dag(&split, &models_by_pipeline, &[])
+            .expect("different adapter names are different destinations");
+    }
+
+    /// An `ephemeral` model cannot be the second writer, so it cannot collide.
+    ///
+    /// Its target is populated but phantom and nothing is materialized there —
+    /// the same reason the compiler excludes ephemerals from E036. Counting
+    /// one here would refuse a project that races nothing.
+    #[test]
+    fn an_ephemeral_model_does_not_collide_across_pipelines() {
+        let mut config = config_with_pipelines(vec![
+            ("silver", transform_pipeline_on("wh")),
+            ("gold", transform_pipeline_on("wh")),
+        ]);
+        config
+            .adapters
+            .insert("wh".into(), duckdb_adapter("wh.duckdb"));
+
+        let mut ephemeral = model_targeting("b", "c", "s", "shared");
+        ephemeral.config.strategy = StrategyConfig::Ephemeral;
+
+        let models_by_pipeline = ModelsByPipeline::from([
+            (
+                "silver".to_string(),
+                vec![model_targeting("a", "c", "s", "shared")],
+            ),
+            ("gold".to_string(), vec![ephemeral]),
+        ]);
+
+        build_unified_dag(&config, &models_by_pipeline, &[])
+            .expect("an ephemeral model materializes nothing and cannot race");
+    }
+
+    /// A collision *within* one pipeline is E036's, not this check's.
+    ///
+    /// Reporting it here as well would give one mistake two different errors
+    /// from two different layers, and the compile-time one is both earlier and
+    /// better placed to explain it.
+    #[test]
+    fn a_collision_inside_one_pipeline_is_left_to_the_compiler() {
+        let mut config = config_with_pipelines(vec![("silver", transform_pipeline_on("wh"))]);
+        config
+            .adapters
+            .insert("wh".into(), duckdb_adapter("wh.duckdb"));
+
+        let models_by_pipeline = ModelsByPipeline::from([(
+            "silver".to_string(),
+            vec![
+                model_targeting("a", "c", "s", "shared"),
+                model_targeting("b", "c", "s", "shared"),
+            ],
+        )]);
+
+        build_unified_dag(&config, &models_by_pipeline, &[])
+            .expect("a same-pipeline collision is E036's to report, not this one's");
     }
 
     /// The other half of #1261: two transformation pipelines resolving to the

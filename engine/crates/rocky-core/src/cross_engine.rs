@@ -289,6 +289,26 @@ pub fn validate_cross_engine_config(
 ///
 /// Returns the model's `adapter` field if set, otherwise falls back to
 /// the pipeline's target adapter.
+///
+/// # Not yet wired — and two collision checks assume so
+///
+/// This has no production call sites. Two duplicate-target checks are sound
+/// *because* of that, and both become wrong the day it is honored:
+///
+/// - `rocky-compiler`'s `collide_on_target` (E036) keys on
+///   `catalog.schema.table` with no adapter component at all, so two models in
+///   one pipeline routing to *different* warehouses would be refused as a
+///   collision they are not (#1291). That direction is a false refusal — safe,
+///   but a regression.
+/// - [`crate::unified_dag`]'s cross-pipeline preflight keys on the
+///   **pipeline's** adapter name (#1301). It skips same-pipeline groups
+///   entirely, so it is not the source of the refusal above — but it fails the
+///   other way: two pipelines whose *pipeline* adapters differ, whose models
+///   both override to one shared adapter, would be keyed apart and their
+///   collision **missed**.
+///
+/// Whoever wires this needs to visit both, and the two fail in opposite
+/// directions. Neither will announce itself from here.
 pub fn effective_model_adapter<'a>(model: &'a Model, pipeline_target_adapter: &'a str) -> &'a str {
     model
         .config
