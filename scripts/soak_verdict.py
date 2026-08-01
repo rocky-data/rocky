@@ -490,25 +490,36 @@ def gate_resources(run: dict) -> list[dict]:
     # form let a run with no baseline or no final-hour readings skip this gate
     # in silence and still report PASS. G3b guards its own window the same way;
     # G3a was the last gate that could quietly not run.
-    if base_rss is None or tail_rss is None:
-        missing = [
-            label
-            for label, value in (
-                ("baseline (first hour after warmup)", base_rss),
-                ("final hour", tail_rss),
+    if base_rss is None or tail_rss is None or base_rss == 0:
+        # Three ways this gate cannot produce a number, all INVALID rather than
+        # a quiet skip. The zero-baseline arm is not hypothetical bookkeeping:
+        # moving from truthiness to `is not None` is what let 0 through, and a
+        # zero baseline would divide by zero in the growth computation below.
+        # A live process never has RSS 0, so a 0 here is a bad reading — which
+        # is exactly the input class this guard exists for.
+        if base_rss == 0:
+            detail = (
+                "RSS growth gate could not evaluate — the baseline (first hour "
+                "after warmup) median is 0 KB, which no live process has; the "
+                "sampler recorded a bad reading. A verdict that never weighed "
+                "the RSS gate is not a soak PASS."
             )
-            if value is None
-        ]
-        findings.append(
-            {
-                "gate": "G3a",
-                "status": "INVALID",
-                "detail": "RSS growth gate could not evaluate — no rss_kb readings "
-                f"in the {' or the '.join(missing)} window; sampling stopped or "
-                "the process was not observable. A verdict that never weighed "
-                "the RSS gate is not a soak PASS.",
-            }
-        )
+        else:
+            missing = [
+                label
+                for label, value in (
+                    ("baseline (first hour after warmup)", base_rss),
+                    ("final hour", tail_rss),
+                )
+                if value is None
+            ]
+            detail = (
+                "RSS growth gate could not evaluate — no rss_kb readings in the "
+                f"{' or the '.join(missing)} window; sampling stopped or the "
+                "process was not observable. A verdict that never weighed the "
+                "RSS gate is not a soak PASS."
+            )
+        findings.append({"gate": "G3a", "status": "INVALID", "detail": detail})
     else:
         growth_pct = (tail_rss - base_rss) / base_rss * 100.0
         delta_mb = (tail_rss - base_rss) / 1024.0
@@ -1020,6 +1031,18 @@ def self_test() -> int:
         if s["t"] >= rss_lo:
             s["rss_kb"] = None
     check("rss outage across the tail window is INVALID", analyse(rss_outage)["verdict"], "INVALID")
+
+    # A zero baseline is INVALID, not a crash. Widening the guard from
+    # truthiness to `is not None` is what let 0 reach the growth division —
+    # truthiness had been rejecting it by accident. No live process has RSS 0,
+    # so this is a bad sampler reading, which is the input class the guard is
+    # for; dividing by it would raise instead of reporting.
+    zero_base = synth(1440)
+    base_hi_t = zero_base["samples"][0]["t"] + 600 + 3600
+    for s in zero_base["samples"]:
+        if s["t"] <= base_hi_t:
+            s["rss_kb"] = 0
+    check("a zero RSS baseline is INVALID, not a crash", analyse(zero_base)["verdict"], "INVALID")
 
     # The regression this guards: a two-sided G6 equality would FAIL here, on a
     # path the reconciler documents as benign and the harness itself induces.
