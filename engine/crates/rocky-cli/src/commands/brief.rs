@@ -1179,22 +1179,24 @@ fn build_scheduler(
     // bundle. Newest-last by name (names begin with the UTC timestamp;
     // 1-second resolution). Per-entry read errors fail the section closed:
     // an inventory that silently dropped entries could under-report.
-    let unavailable = |note: String,
-                       scheduled_pipelines: u64,
-                       paused: Vec<String>,
-                       failures: Vec<BriefSchedulerFailureEntry>| {
-        BriefSchedulerSection {
-            availability: SectionAvailability::Unavailable,
-            note: Some(note),
-            scheduled_pipelines,
-            paused,
-            consecutive_failures: failures,
-            runs_in_window: 0,
-            failed_in_window: 0,
-            incident_count: 0,
-            latest_incident: None,
-        }
-    };
+    // An incident-inventory failure marks the section unavailable but must
+    // NOT discard the run counts already soundly computed above — zeroing a
+    // known failed_in_window would be its own smoothed-over story.
+    let runs_in_window = sched_runs.len() as u64;
+    let unavailable =
+        |note: String, paused: Vec<String>, failures: Vec<BriefSchedulerFailureEntry>| {
+            BriefSchedulerSection {
+                availability: SectionAvailability::Unavailable,
+                note: Some(note),
+                scheduled_pipelines: scheduled.len() as u64,
+                paused,
+                consecutive_failures: failures,
+                runs_in_window,
+                failed_in_window,
+                incident_count: 0,
+                latest_incident: None,
+            }
+        };
     let incidents_dir = rocky_dir.join("incidents");
     if let Ok(meta) = std::fs::symlink_metadata(&incidents_dir)
         && meta.file_type().is_symlink()
@@ -1204,7 +1206,6 @@ fn build_scheduler(
                 "{} is a symlink; refusing to read through it",
                 incidents_dir.display()
             ),
-            scheduled.len() as u64,
             paused,
             failures,
         );
@@ -1218,13 +1219,25 @@ fn build_scheduler(
                     Err(e) => {
                         return unavailable(
                             format!("incidents directory unreadable: {e}"),
-                            scheduled.len() as u64,
                             paused,
                             failures,
                         );
                     }
                 };
-                if let Some(name) = entry.file_name().to_str()
+                // Regular files only — a directory or symlink wearing a
+                // bundle-shaped name is not a bundle.
+                let is_file = match entry.file_type() {
+                    Ok(ft) => ft.is_file(),
+                    Err(e) => {
+                        return unavailable(
+                            format!("incidents directory unreadable: {e}"),
+                            paused,
+                            failures,
+                        );
+                    }
+                };
+                if is_file
+                    && let Some(name) = entry.file_name().to_str()
                     && rocky_core::schedule::incidents::is_bundle_name(name)
                 {
                     names.push(name.to_string());
@@ -1241,7 +1254,6 @@ fn build_scheduler(
         Err(e) => {
             return unavailable(
                 format!("incidents directory unreadable: {e}"),
-                scheduled.len() as u64,
                 paused,
                 failures,
             );
@@ -1254,7 +1266,7 @@ fn build_scheduler(
         scheduled_pipelines: scheduled.len() as u64,
         paused,
         consecutive_failures: failures,
-        runs_in_window: sched_runs.len() as u64,
+        runs_in_window,
         failed_in_window,
         incident_count,
         latest_incident,
@@ -2138,6 +2150,7 @@ mod tests {
         std::fs::create_dir_all(&incidents).unwrap();
         std::fs::write(incidents.join("20260101T000000Z-beta-aaaaaaaa.json"), "{}").unwrap();
         std::fs::write(incidents.join("zzz-notes.json"), "{}").unwrap();
+        std::fs::create_dir_all(incidents.join("20260103T000000Z-fake-dirbundle.json")).unwrap();
 
         let s = build_scheduler(
             &config,
@@ -2146,7 +2159,10 @@ mod tests {
             &tmp.path().join(".rocky"),
             MAX_HISTORY_SCAN,
         );
-        assert_eq!(s.incident_count, 1, "foreign json is not a bundle");
+        assert_eq!(
+            s.incident_count, 1,
+            "foreign json and bundle-named directories are not bundles"
+        );
         assert_eq!(
             s.latest_incident.as_deref(),
             Some(".rocky/incidents/20260101T000000Z-beta-aaaaaaaa.json"),
@@ -2169,12 +2185,20 @@ mod tests {
         std::fs::create_dir_all(&rocky_dir).unwrap();
         std::os::unix::fs::symlink(&victim, rocky_dir.join("incidents")).unwrap();
 
+        let mut sched_fail = run("r-sched", RunStatus::Failure, vec![]);
+        sched_fail.trigger = RunTrigger::Schedule;
+        store.record_run(&sched_fail).unwrap();
+
         let s = build_scheduler(&config, &store, None, &rocky_dir, MAX_HISTORY_SCAN);
         assert!(matches!(s.availability, SectionAvailability::Unavailable));
         assert!(
             s.note.as_deref().unwrap().contains("symlink"),
             "{:?}",
             s.note
+        );
+        assert_eq!(
+            s.failed_in_window, 1,
+            "an inventory failure must not zero the run counts already computed"
         );
     }
 }

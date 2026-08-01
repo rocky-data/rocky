@@ -79,7 +79,10 @@ pub fn is_bundle_name(name: &str) -> bool {
         return false;
     };
     let b = stem.as_bytes();
-    // Timestamp prefix: 8 digits, 'T', 6 digits, 'Z'.
+    // Timestamp prefix: 8 digits, 'T', 6 digits, 'Z' — with the digit groups
+    // required to be a plausible calendar instant, not merely digit-shaped,
+    // so a foreign `00000000T000000Z-…` name cannot collide into the
+    // retention sweep's deletion set.
     if b.len() < 16 + 1 + 1 {
         return false;
     }
@@ -90,11 +93,25 @@ pub fn is_bundle_name(name: &str) -> bool {
     if !ts_ok || b[16] != b'-' {
         return false;
     }
-    // `<pipeline>-<short-id>`: non-empty, inert charset, at least one
-    // separator between the two parts.
+    let num = |r: std::ops::Range<usize>| -> u32 { stem[r].parse().unwrap_or(u32::MAX) };
+    let (month, day) = (num(4..6), num(6..8));
+    let (hour, minute, second) = (num(9..11), num(11..13), num(13..15));
+    if !((1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour < 24
+        && minute < 60
+        && second < 60)
+    {
+        return false;
+    }
+    // `<pipeline>-<short-id>`: inert charset, at least one separator, and a
+    // non-empty segment on BOTH sides of it — `Z--id` (empty pipeline) and
+    // `Z-p-` (empty id) are not names the writer produces.
     let rest = &stem[17..];
     !rest.is_empty()
         && rest.contains('-')
+        && !rest.starts_with('-')
+        && !rest.ends_with('-')
         && rest
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -308,6 +325,12 @@ mod tests {
             "20260801T120000Z-.json",
             "20260801T120000Z-noseparator.json",
             "20260801T120000Z-bad$char-x.json",
+            "20260801T120000Z--abcd1234.json",
+            "20260801T120000Z-orders-.json",
+            "00000000T000000Z-orders-x.json",
+            "20261301T120000Z-orders-x.json",
+            "20260801T250000Z-orders-x.json",
+            "20260832T120000Z-orders-x.json",
         ] {
             assert!(!is_bundle_name(bad), "{bad}");
         }
