@@ -513,7 +513,7 @@ pub async fn tick_once(
     //    otherwise never re-evaluated). Only on a healthy real tick with the
     //    store still open.
     if !opts.dry_run {
-        sweep_orphan_claims(&schedules, phase.store(), now)?;
+        sweep_orphan_claims(&schedules, phase.store(), &opts.rocky_dir, now)?;
         // Bound the id-dedup window: drop `.done` tombstones past their TTL.
         if let Err(e) = spool::sweep_tombstones(&spool::spool_dir(&opts.rocky_dir), now) {
             tracing::warn!(error = %e, "webhook tombstone sweep failed");
@@ -1000,7 +1000,15 @@ async fn execute_demand(
             PreSpawn::ResolveStuck => {
                 let current = observed.expect("ResolveStuck only arises from a stored claim");
                 // Pre-spawn only — no child runs here, so the store stays open.
-                match resolve_stuck(&key, demand, schedule, &current, phase.store(), now)? {
+                match resolve_stuck(
+                    &key,
+                    demand,
+                    schedule,
+                    &current,
+                    phase.store(),
+                    &opts.rocky_dir,
+                    now,
+                )? {
                     // Released and re-claimable this tick — loop to the pre-spawn
                     // decision, which re-claims (continuing the retry budget).
                     StuckResolution::ReClaimable => continue,
@@ -1162,7 +1170,7 @@ async fn execute_claimed(
                 claim: terminal_claim,
                 bookkeeping,
             } => {
-                let attempts = terminal_claim.attempts;
+                let attempts = terminal_claim.cycle_attempts;
                 let mutation = ScheduleStateMutation::Terminal {
                     outcome: bookkeeping.outcome,
                     cf_delta: bookkeeping.cf_delta,
@@ -1178,53 +1186,36 @@ async fn execute_claimed(
                         return Ok(ExecOutcome::Skipped(skip(demand, TickSkipReason::InFlight)));
                     }
                     ClaimCas::Won => {
-                        // Incident bundle: raw structured facts for a run that
-                        // finalized as FAILURE — and not for drain
-                        // interruptions (a graceful shutdown is not an
-                        // incident; the drain already forced retry_max = 0
-                        // above). Write failures warn and never fail the tick:
-                        // the outcome is committed, and diagnostics that break
-                        // the thing they diagnose are worse than none.
-                        if outcome == TerminalOutcome::Failure && !opts.drain.is_signalled() {
+                        // Incident bundle for a Failure OR Partial (partial
+                        // trips partial backoff exactly like failure trips
+                        // failure backoff) — unless the SPAWNER ended the
+                        // attempt for a shutdown drain. The discriminator is
+                        // the spawner's own record of what it did, not a
+                        // re-sample of the drain flag: a child that failed on
+                        // its own and merely coincided with a drain still
+                        // records its incident.
+                        if !run_outcome.drain_interrupted {
+                            // Post-CAS read of the cursor the mutation just
+                            // updated; a read error yields `None`, never a
+                            // fabricated zero.
                             let consecutive_failures = phase
                                 .store()
                                 .get_schedule_state(&demand.pipeline)
                                 .ok()
                                 .flatten()
-                                .map(|c| c.consecutive_failures)
-                                .unwrap_or(0);
-                            let bundle = crate::schedule::incidents::IncidentBundle {
-                                incident_version: 1,
-                                recorded_at: now,
-                                pipeline: demand.pipeline.clone(),
-                                source: format!("{:?}", demand.source).to_lowercase(),
-                                logical_ts: Some(demand.logical_ts),
-                                submission_id: submission_id.clone(),
-                                exit_code: run_outcome.exit_code,
+                                .map(|c| c.consecutive_failures);
+                            record_incident(
+                                &opts.rocky_dir,
+                                &demand.pipeline,
+                                demand.source,
+                                outcome,
+                                Some(demand.logical_ts),
+                                &submission_id,
+                                Some(run_outcome.exit_code),
                                 attempts,
                                 consecutive_failures,
-                                pointers: vec![
-                                    format!("rocky history --output json  # run {submission_id}"),
-                                    format!("GET /api/v1/jobs/{submission_id}  # job state"),
-                                    "GET /api/v1/schedule  # cursors + claims".to_string(),
-                                ],
-                            };
-                            match crate::schedule::incidents::write_incident(
-                                &opts.rocky_dir,
-                                &bundle,
-                            ) {
-                                Ok(path) => tracing::warn!(
-                                    pipeline = %demand.pipeline,
-                                    incident = %path.display(),
-                                    consecutive_failures,
-                                    "scheduled run failed; incident bundle written"
-                                ),
-                                Err(e) => tracing::warn!(
-                                    pipeline = %demand.pipeline,
-                                    error = %e,
-                                    "scheduled run failed AND the incident bundle could not be written"
-                                ),
-                            }
+                                now,
+                            );
                         }
                         // Return with the store OPEN — it feeds the next
                         // pipeline's evaluation (the same-tick cascade contract).
@@ -1241,6 +1232,67 @@ async fn execute_claimed(
                 }
             }
         }
+    }
+}
+
+/// Emit an incident bundle for a scheduler claim that finalized as `Failure`
+/// or `Partial` — the shared seam behind the direct child-completion arm and
+/// every recovery path that terminalizes a claim (stuck resolver,
+/// missing-record grace, orphan sweep). An incident's visibility must not
+/// depend on WHICH seam happened to observe the failure.
+///
+/// `Success` is a no-op. Facts a seam cannot know arrive as `None` and stay
+/// `None` — never a fabricated zero. Write failures warn and never fail the
+/// tick: the outcome is already committed, and diagnostics that break the
+/// thing they diagnose are worse than none.
+#[allow(clippy::too_many_arguments)]
+fn record_incident(
+    rocky_dir: &Path,
+    pipeline: &str,
+    source: crate::schedule::claim::DemandKind,
+    outcome: TerminalOutcome,
+    logical_ts: Option<DateTime<Utc>>,
+    submission_id: &str,
+    exit_code: Option<i32>,
+    attempts: u32,
+    consecutive_failures: Option<u32>,
+    now: DateTime<Utc>,
+) {
+    let outcome_str = match outcome {
+        TerminalOutcome::Failure => "failure",
+        TerminalOutcome::Partial => "partial",
+        TerminalOutcome::Success => return,
+    };
+    let bundle = crate::schedule::incidents::IncidentBundle {
+        incident_version: 1,
+        recorded_at: now,
+        pipeline: pipeline.to_string(),
+        source: source.as_str().to_string(),
+        outcome: outcome_str.to_string(),
+        logical_ts,
+        submission_id: submission_id.to_string(),
+        exit_code,
+        attempts,
+        consecutive_failures,
+        pointers: vec![
+            format!("rocky history --output json  # run {submission_id}"),
+            format!("GET /api/v1/jobs/{submission_id}  # job state (resident scheduler only)"),
+            "GET /api/v1/schedule  # cursors + claims (resident scheduler only)".to_string(),
+        ],
+    };
+    match crate::schedule::incidents::write_incident(rocky_dir, &bundle) {
+        Ok(path) => tracing::warn!(
+            pipeline = %pipeline,
+            outcome = %outcome_str,
+            incident = %path.display(),
+            "scheduled run failed; incident bundle written"
+        ),
+        Err(e) => tracing::warn!(
+            pipeline = %pipeline,
+            outcome = %outcome_str,
+            error = %e,
+            "scheduled run failed AND the incident bundle could not be written"
+        ),
     }
 }
 
@@ -1280,6 +1332,7 @@ async fn execute_claimed(
 fn sweep_orphan_claims(
     schedules: &BTreeMap<String, ResolvedSchedule>,
     store: &StateStore,
+    rocky_dir: &Path,
     now: DateTime<Utc>,
 ) -> Result<(), TickError> {
     for (key, claim) in store.list_schedule_claims()? {
@@ -1312,13 +1365,32 @@ fn sweep_orphan_claims(
         // the per-pipeline scalars (see the note above). A lost CAS is a no-op
         // (nothing else mutates claims while this tick holds the lock).
         let terminal = sweep_terminal_claim(&claim, source, outcome, now);
-        let _ = store.schedule_claim_cas(
+        let cas = store.schedule_claim_cas(
             &key,
             Some(&claim),
             &terminal,
             &pipeline,
             &ScheduleStateMutation::None,
         )?;
+        // An orphaned failure is still a failure — without a bundle here it
+        // would be invisible everywhere but `rocky history`. The sweep never
+        // touches the per-pipeline scalars, so `consecutive_failures` is
+        // honestly `None`, and the occurrence is not reconstructed
+        // (`logical_ts: None`).
+        if matches!(cas, ClaimCas::Won) && !matches!(outcome, TerminalOutcome::Success) {
+            record_incident(
+                rocky_dir,
+                &pipeline,
+                source,
+                outcome,
+                None,
+                &claim.submission_id,
+                None,
+                claim.cycle_attempts,
+                None,
+                now,
+            );
+        }
     }
     Ok(())
 }
@@ -1345,16 +1417,43 @@ fn resolve_stuck(
     schedule: &ResolvedSchedule,
     current: &ClaimRecord,
     store: &StateStore,
+    rocky_dir: &Path,
     now: DateTime<Utc>,
 ) -> Result<StuckResolution, TickError> {
     let outcome = store
         .find_terminal_run_by_submission_id(&current.submission_id)?
         .and_then(|run| run.status.terminal_outcome());
     let Some(outcome) = outcome else {
-        return resolve_missing_record(key, demand, schedule, current, store, now);
+        return resolve_missing_record(key, demand, schedule, current, store, rocky_dir, now);
     };
     let resolved = decide_resolver(current, outcome, demand.source, schedule.retry_max, now);
-    commit_resolution(key, &demand.pipeline, current, resolved, store)
+    let resolution = commit_resolution(key, &demand.pipeline, current, resolved, store)?;
+    // The claim just finalized a failure this tick's spawn never saw (a prior
+    // owner crashed after the child recorded its run). Same incident contract
+    // as the direct arm; the child's exit code is unknowable here — the run
+    // record carries the outcome, not the code.
+    if matches!(resolution, StuckResolution::Finished)
+        && !matches!(outcome, TerminalOutcome::Success)
+    {
+        let consecutive_failures = store
+            .get_schedule_state(&demand.pipeline)
+            .ok()
+            .flatten()
+            .map(|c| c.consecutive_failures);
+        record_incident(
+            rocky_dir,
+            &demand.pipeline,
+            demand.source,
+            outcome,
+            Some(demand.logical_ts),
+            &current.submission_id,
+            None,
+            current.cycle_attempts,
+            consecutive_failures,
+            now,
+        );
+    }
+    Ok(resolution)
 }
 
 /// Resolve a stuck claim with no run record: stamp the grace on first sight,
@@ -1366,6 +1465,7 @@ fn resolve_missing_record(
     schedule: &ResolvedSchedule,
     current: &ClaimRecord,
     store: &StateStore,
+    rocky_dir: &Path,
     now: DateTime<Utc>,
 ) -> Result<StuckResolution, TickError> {
     let swept = current
@@ -1396,7 +1496,29 @@ fn resolve_missing_record(
                 schedule.retry_max,
                 now,
             );
-            commit_resolution(key, &demand.pipeline, current, resolved, store)
+            let resolution = commit_resolution(key, &demand.pipeline, current, resolved, store)?;
+            // A lost attempt (crash before any run record) that just
+            // exhausted its budget is a failure nobody else will surface.
+            if matches!(resolution, StuckResolution::Finished) {
+                let consecutive_failures = store
+                    .get_schedule_state(&demand.pipeline)
+                    .ok()
+                    .flatten()
+                    .map(|c| c.consecutive_failures);
+                record_incident(
+                    rocky_dir,
+                    &demand.pipeline,
+                    demand.source,
+                    TerminalOutcome::Failure,
+                    Some(demand.logical_ts),
+                    &current.submission_id,
+                    None,
+                    current.cycle_attempts,
+                    consecutive_failures,
+                    now,
+                );
+            }
+            Ok(resolution)
         }
         Some(_) => Ok(StuckResolution::InFlight),
     }
@@ -1718,6 +1840,7 @@ cron = "also invalid"
             RunOutcome {
                 exit_code: self.exit_code,
                 pid: Some(4242),
+                drain_interrupted: false,
             }
         }
     }
@@ -2032,6 +2155,25 @@ cron = "also invalid"
             ))
             .unwrap();
         assert_eq!(spawner.run_count(), 0);
+        // The resolver-finalized failure produced exactly ONE bundle — and the
+        // follow-up tick did not double-write it (the claim is Released, not
+        // Submitted, so resolve_stuck never re-fires).
+        let bundles: Vec<_> = std::fs::read_dir(opts.rocky_dir.join("incidents"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(bundles.len(), 1, "one bundle, no double-write");
+        let bundle: crate::schedule::incidents::IncidentBundle =
+            serde_json::from_slice(&std::fs::read(bundles[0].path()).unwrap()).unwrap();
+        assert_eq!(bundle.pipeline, "staging");
+        assert_eq!(bundle.source, "after");
+        assert_eq!(bundle.submission_id, "sub-1");
+        assert_eq!(bundle.exit_code, None, "resolved from the run record");
+        assert_eq!(
+            bundle.consecutive_failures,
+            Some(1),
+            "the resolver applied the delta before the bundle read it"
+        );
         assert!(
             report2.skipped.iter().any(|s| s.pipeline == "staging"
                 && matches!(s.reason, TickSkipReason::FailureBackoff { .. })),
@@ -2134,11 +2276,13 @@ cron = "also invalid"
     impl Spawner for DrainOnRunSpawner {
         async fn run(&self, _request: &SpawnRequest) -> RunOutcome {
             self.runs.fetch_add(1, std::sync::atomic::Ordering::Release);
-            // Shutdown lands while this attempt is in flight.
+            // Shutdown lands while this attempt is in flight, and the
+            // spawner terminates the child for it (the drain-kill path).
             self.drain.signal();
             RunOutcome {
                 exit_code: 1,
                 pid: Some(4242),
+                drain_interrupted: true,
             }
         }
     }
@@ -2205,6 +2349,73 @@ cron = "also invalid"
                     .next()
                     .is_none(),
             "no incident bundle on drain"
+        );
+    }
+
+    /// A child that failed ON ITS OWN while a drain happened to be raised:
+    /// the spawner did not terminate it, so its failure is genuine and its
+    /// incident must be recorded. Discriminating on the spawner's own
+    /// `drain_interrupted` record — not a re-sample of the drain flag — is
+    /// what makes this hold.
+    #[test]
+    fn a_genuine_failure_coinciding_with_a_drain_still_records_its_incident() {
+        struct FailThenDrainSpawner {
+            drain: Drain,
+        }
+        #[async_trait]
+        impl Spawner for FailThenDrainSpawner {
+            async fn run(&self, request: &SpawnRequest) -> RunOutcome {
+                // The child exits 1 on its own; shutdown lands right after.
+                let store = StateStore::open(&request.state_path).unwrap();
+                seed_run(
+                    &store,
+                    &request.pipeline,
+                    Some(&request.submission_id),
+                    RunStatus::Failure,
+                    at(2026, 5, 2, 3, 0),
+                    at(2026, 5, 2, 3, 1),
+                );
+                drop(store);
+                self.drain.signal();
+                RunOutcome {
+                    exit_code: 1,
+                    pid: Some(4242),
+                    drain_interrupted: false,
+                }
+            }
+        }
+
+        let (state_path, _dir, mut opts) = temp_env();
+        let config = cfg(CRON_ONLY);
+        let drain = Drain::default();
+        opts.drain = drain.clone();
+        let spawner = FailThenDrainSpawner { drain };
+        // Tick 1 anchors the cron (first sight never fires); tick 2 fires it.
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 2, 2, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+        rt().block_on(tick_once(
+            &config,
+            &state_path,
+            at(2026, 5, 2, 3, 0),
+            &spawner,
+            &opts,
+        ))
+        .unwrap();
+
+        let bundles: Vec<_> = std::fs::read_dir(opts.rocky_dir.join("incidents"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(
+            bundles.len(),
+            1,
+            "a genuine failure is an incident even during shutdown"
         );
     }
 
@@ -2670,6 +2881,26 @@ freshness = true
                 "the sweep leaves consecutive_failures untouched"
             );
         });
+
+        // The orphaned failure is still an incident — the sweep emits the
+        // bundle the crashed owner never could. Facts the sweep cannot know
+        // are None, never fabricated.
+        let bundles: Vec<_> = std::fs::read_dir(opts.rocky_dir.join("incidents"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(bundles.len(), 1, "exactly one bundle for the orphan");
+        let bundle: crate::schedule::incidents::IncidentBundle =
+            serde_json::from_slice(&std::fs::read(bundles[0].path()).unwrap()).unwrap();
+        assert_eq!(bundle.pipeline, "raw");
+        assert_eq!(bundle.outcome, "failure");
+        assert_eq!(bundle.submission_id, "orphan-1");
+        assert_eq!(bundle.exit_code, None, "no child was observed");
+        assert_eq!(
+            bundle.consecutive_failures, None,
+            "the sweep does not touch scalars, so it must not report them"
+        );
+        assert_eq!(bundle.logical_ts, None);
     }
 
     // --- webhook ingress (at-most-once spool consumption) --------------------
@@ -2873,7 +3104,7 @@ adapter = "db"
             serde_json::from_slice(&std::fs::read(bundles[0].path()).unwrap()).unwrap();
         assert_eq!(bundle.pipeline, "raw");
         assert_eq!(bundle.source, "webhook");
-        assert_eq!(bundle.exit_code, 1);
+        assert_eq!(bundle.exit_code, Some(1));
         assert!(!bundle.pointers.is_empty());
 
         // Re-tick: the claim is completed{failure}, so it never re-runs.

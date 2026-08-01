@@ -1204,6 +1204,7 @@ cron = "* * * * *"
             RunOutcome {
                 exit_code: 0,
                 pid: Some(4242),
+                drain_interrupted: false,
             }
         }
     }

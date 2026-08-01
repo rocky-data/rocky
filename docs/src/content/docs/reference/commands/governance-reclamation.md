@@ -101,7 +101,7 @@ rocky brief --since 24h
 rocky brief --since 7d --output json
 ```
 
-Read-only. Composed template-first from typed queries over the state store and the decision ledger — decisions awaiting review (ranked), agent activity by principal, runs, drift, freshness, quality, cost, and the resident scheduler's posture (paused pipelines, consecutive-failure streaks, scheduler-spawned runs in the window, and the incident-bundle spool). Every line cites a `run_id`, `plan_id`, or `decision_ref`, and a section whose signal is not recorded reports `unavailable` rather than a false all-clear. The default output is a Slack/email-ready Markdown digest; `--output json` is the machine surface.
+Read-only. Composed template-first from typed queries over the state store and the decision ledger — decisions awaiting review (ranked), agent activity by principal, runs, drift, freshness, quality, cost, and the resident scheduler's posture (paused pipelines, consecutive-failure streaks, scheduler-spawned runs in the window, and the incident-bundle spool). Every event line cites a `run_id`, `plan_id`, or `decision_ref`; the scheduler's posture lines carry pipeline names and counts, and its incident line carries the newest bundle's project-relative path. A section whose signal is not recorded reports `unavailable` rather than a false all-clear. The default output is a Slack/email-ready Markdown digest; `--output json` is the machine surface.
 
 ---
 

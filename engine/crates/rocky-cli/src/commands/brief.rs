@@ -209,8 +209,9 @@ pub fn compute_brief(
     let scheduler = build_scheduler(
         config_path,
         &store,
-        &windowed_runs,
+        since_ts,
         &crate::commands::scheduler::rocky_dir_for_config(config_path),
+        MAX_HISTORY_SCAN,
     );
 
     Ok(BriefOutput {
@@ -1061,8 +1062,9 @@ fn empty_brief(
 fn build_scheduler(
     config_path: &Path,
     store: &StateStore,
-    windowed_runs: &[&RunRecord],
+    since_ts: Option<DateTime<Utc>>,
     rocky_dir: &Path,
+    scan_cap: usize,
 ) -> BriefSchedulerSection {
     let config = match rocky_core::config::load_rocky_config(config_path) {
         Ok(c) => c,
@@ -1140,10 +1142,31 @@ fn build_scheduler(
     // Both scheduler-spawned trigger kinds: coordinate demands (cron / after /
     // freshness) record `Schedule`, webhook-ingress demands record `Webhook`.
     // Both flow through the same claim machine and incident hook.
-    let sched_runs: Vec<_> = windowed_runs
-        .iter()
-        .filter(|r| matches!(r.trigger, RunTrigger::Schedule | RunTrigger::Webhook))
-        .collect();
+    //
+    // Queried with the predicate BELOW the recency cap (`list_runs_matching`),
+    // never by filtering an already-capped page: on a store where manual runs
+    // outnumber the cap, page-then-filter would report zero scheduler runs —
+    // a false all-clear — while the failed scheduled run sits just past the
+    // page boundary.
+    let sched_runs = match store.list_runs_matching(scan_cap, |r| {
+        matches!(r.trigger, RunTrigger::Schedule | RunTrigger::Webhook)
+            && in_window(r.started_at, since_ts)
+    }) {
+        Ok(runs) => runs,
+        Err(e) => {
+            return BriefSchedulerSection {
+                availability: SectionAvailability::Unavailable,
+                note: Some(format!("run ledger unreadable: {e}")),
+                scheduled_pipelines: scheduled.len() as u64,
+                paused,
+                consecutive_failures: failures,
+                runs_in_window: 0,
+                failed_in_window: 0,
+                incident_count: 0,
+                latest_incident: None,
+            };
+        }
+    };
     // Failure classes only — the skip statuses did no work and are neither
     // success nor failure (mirrors `RunStatus::terminal_outcome`).
     let failed_in_window = sched_runs
@@ -1151,39 +1174,77 @@ fn build_scheduler(
         .filter(|r| matches!(r.status, RunStatus::Failure | RunStatus::PartialFailure))
         .count() as u64;
 
-    // Incidents: newest-last by name (names begin with the UTC timestamp).
-    let (incident_count, latest_incident) = match std::fs::read_dir(rocky_dir.join("incidents")) {
+    // Incidents: count only names the incident writer itself produces
+    // (`is_bundle_name`) — a foreign `.json` in the directory is not a
+    // bundle. Newest-last by name (names begin with the UTC timestamp;
+    // 1-second resolution). Per-entry read errors fail the section closed:
+    // an inventory that silently dropped entries could under-report.
+    let unavailable = |note: String,
+                       scheduled_pipelines: u64,
+                       paused: Vec<String>,
+                       failures: Vec<BriefSchedulerFailureEntry>| {
+        BriefSchedulerSection {
+            availability: SectionAvailability::Unavailable,
+            note: Some(note),
+            scheduled_pipelines,
+            paused,
+            consecutive_failures: failures,
+            runs_in_window: 0,
+            failed_in_window: 0,
+            incident_count: 0,
+            latest_incident: None,
+        }
+    };
+    let incidents_dir = rocky_dir.join("incidents");
+    if let Ok(meta) = std::fs::symlink_metadata(&incidents_dir)
+        && meta.file_type().is_symlink()
+    {
+        return unavailable(
+            format!(
+                "{} is a symlink; refusing to read through it",
+                incidents_dir.display()
+            ),
+            scheduled.len() as u64,
+            paused,
+            failures,
+        );
+    }
+    let (incident_count, latest_incident) = match std::fs::read_dir(&incidents_dir) {
         Ok(entries) => {
-            let mut files: Vec<_> = entries
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
-                .collect();
-            files.sort();
+            let mut names: Vec<String> = Vec::new();
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        return unavailable(
+                            format!("incidents directory unreadable: {e}"),
+                            scheduled.len() as u64,
+                            paused,
+                            failures,
+                        );
+                    }
+                };
+                if let Some(name) = entry.file_name().to_str()
+                    && rocky_core::schedule::incidents::is_bundle_name(name)
+                {
+                    names.push(name.to_string());
+                }
+            }
+            names.sort();
             // Project-relative (`.rocky/incidents/<name>`): directly openable
             // from the project root, host-portable, and no absolute-path
             // disclosure on the MCP surface that reuses this projection.
-            let latest = files.last().map(|p| {
-                p.file_name().map_or_else(
-                    || p.display().to_string(),
-                    |n| format!(".rocky/incidents/{}", n.to_string_lossy()),
-                )
-            });
-            (files.len() as u64, latest)
+            let latest = names.last().map(|n| format!(".rocky/incidents/{n}"));
+            (names.len() as u64, latest)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, None),
         Err(e) => {
-            return BriefSchedulerSection {
-                availability: SectionAvailability::Unavailable,
-                note: Some(format!("incidents directory unreadable: {e}")),
-                scheduled_pipelines: scheduled.len() as u64,
+            return unavailable(
+                format!("incidents directory unreadable: {e}"),
+                scheduled.len() as u64,
                 paused,
-                consecutive_failures: failures,
-                runs_in_window: sched_runs.len() as u64,
-                failed_in_window,
-                incident_count: 0,
-                latest_incident: None,
-            };
+                failures,
+            );
         }
     };
 
@@ -1950,7 +2011,9 @@ mod tests {
         let mut sched_skip = run("r3", RunStatus::SkippedIdempotent, vec![]);
         sched_skip.trigger = RunTrigger::Schedule;
         let manual_fail = run("r4", RunStatus::Failure, vec![]);
-        let runs = [&sched_fail, &hook_ok, &sched_skip, &manual_fail];
+        for r in [&sched_fail, &hook_ok, &sched_skip, &manual_fail] {
+            store.record_run(r).unwrap();
+        }
 
         let rocky_dir = tmp.path().join(".rocky");
         let incidents = rocky_dir.join("incidents");
@@ -1959,7 +2022,7 @@ mod tests {
         std::fs::write(incidents.join("20260102T000000Z-beta-bbbbbbbb.json"), "{}").unwrap();
         std::fs::write(incidents.join("notes.txt"), "ignored").unwrap();
 
-        let s = build_scheduler(&config, &store, &runs, &rocky_dir);
+        let s = build_scheduler(&config, &store, Some(ts(1)), &rocky_dir, MAX_HISTORY_SCAN);
         assert!(matches!(s.availability, SectionAvailability::Available));
         assert_eq!(s.scheduled_pipelines, 2, "gamma has no [schedule]");
         assert_eq!(s.paused, vec!["alpha".to_string()]);
@@ -2002,7 +2065,13 @@ mod tests {
         .unwrap();
         let state_path = tmp.path().join("state.redb");
         let store = StateStore::open(&state_path).unwrap();
-        let s = build_scheduler(&config, &store, &[], &tmp.path().join(".rocky"));
+        let s = build_scheduler(
+            &config,
+            &store,
+            None,
+            &tmp.path().join(".rocky"),
+            MAX_HISTORY_SCAN,
+        );
         assert!(matches!(s.availability, SectionAvailability::NoData));
         assert_eq!(s.scheduled_pipelines, 0);
     }
@@ -2017,12 +2086,93 @@ mod tests {
         let s = build_scheduler(
             &tmp.path().join("missing.toml"),
             &store,
-            &[],
+            None,
             &tmp.path().join(".rocky"),
+            MAX_HISTORY_SCAN,
         );
         assert!(matches!(s.availability, SectionAvailability::Unavailable));
         assert!(
             s.note.as_deref().unwrap().contains("config unreadable"),
+            "{:?}",
+            s.note
+        );
+    }
+
+    /// The run query must filter BELOW the recency cap: a scheduled failure
+    /// older than a flood of newer manual runs still surfaces even when the
+    /// scan cap is smaller than the flood. Page-then-filter would return a
+    /// false all-clear here.
+    #[test]
+    fn scheduler_section_finds_runs_past_a_manual_flood() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = scheduler_project(&tmp);
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+
+        let mut sched_fail = run("sched-old", RunStatus::Failure, vec![]);
+        sched_fail.trigger = RunTrigger::Schedule;
+        sched_fail.started_at = ts(2);
+        store.record_run(&sched_fail).unwrap();
+        for i in 0..3 {
+            let mut manual = run(&format!("manual-{i}"), RunStatus::Success, vec![]);
+            manual.started_at = ts(5 + i);
+            store.record_run(&manual).unwrap();
+        }
+
+        // Cap smaller than the manual flood: a capped page of the newest 2
+        // runs contains only manual successes.
+        let s = build_scheduler(&config, &store, Some(ts(1)), &tmp.path().join(".rocky"), 2);
+        assert_eq!(s.runs_in_window, 1, "the scheduled failure must be found");
+        assert_eq!(s.failed_in_window, 1);
+    }
+
+    /// Foreign `.json` files in `.rocky/incidents/` are not bundles and must
+    /// not be counted or reported as the newest incident.
+    #[test]
+    fn scheduler_section_counts_only_real_bundle_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = scheduler_project(&tmp);
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        let incidents = tmp.path().join(".rocky").join("incidents");
+        std::fs::create_dir_all(&incidents).unwrap();
+        std::fs::write(incidents.join("20260101T000000Z-beta-aaaaaaaa.json"), "{}").unwrap();
+        std::fs::write(incidents.join("zzz-notes.json"), "{}").unwrap();
+
+        let s = build_scheduler(
+            &config,
+            &store,
+            None,
+            &tmp.path().join(".rocky"),
+            MAX_HISTORY_SCAN,
+        );
+        assert_eq!(s.incident_count, 1, "foreign json is not a bundle");
+        assert_eq!(
+            s.latest_incident.as_deref(),
+            Some(".rocky/incidents/20260101T000000Z-beta-aaaaaaaa.json"),
+            "a foreign name sorting last must not become the newest incident"
+        );
+    }
+
+    /// A symlinked incidents directory fails the section closed instead of
+    /// reading (and later sweeping) through it.
+    #[cfg(unix)]
+    #[test]
+    fn scheduler_section_refuses_a_symlinked_incidents_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = scheduler_project(&tmp);
+        let state_path = tmp.path().join("state.redb");
+        let store = StateStore::open(&state_path).unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let rocky_dir = tmp.path().join(".rocky");
+        std::fs::create_dir_all(&rocky_dir).unwrap();
+        std::os::unix::fs::symlink(&victim, rocky_dir.join("incidents")).unwrap();
+
+        let s = build_scheduler(&config, &store, None, &rocky_dir, MAX_HISTORY_SCAN);
+        assert!(matches!(s.availability, SectionAvailability::Unavailable));
+        assert!(
+            s.note.as_deref().unwrap().contains("symlink"),
             "{:?}",
             s.note
         );

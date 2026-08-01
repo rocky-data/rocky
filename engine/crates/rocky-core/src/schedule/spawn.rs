@@ -160,6 +160,14 @@ pub struct RunOutcome {
     /// The child's PID, recorded on the claim for the recovery sweep. `None`
     /// when the child could not be spawned.
     pub pid: Option<u32>,
+    /// `true` only when the SPAWNER ended this attempt because of a shutdown
+    /// drain: the pre-spawn drain gate refused to start it, or the drain
+    /// grace elapsed and the spawner terminated the child. A child that
+    /// exited on its own — even while a drain was raised — reports `false`:
+    /// its exit code is genuine. This is the discriminator the incident
+    /// writer keys on, so a real failure that happens to coincide with a
+    /// shutdown still records its incident.
+    pub drain_interrupted: bool,
 }
 
 /// Spawns a pipeline run as a child process and waits for it.
@@ -264,6 +272,7 @@ impl Spawner for SubprocessSpawner {
             return RunOutcome {
                 exit_code: 1,
                 pid: None,
+                drain_interrupted: true,
             };
         }
         let mut cmd = Self::build_command(request);
@@ -274,6 +283,7 @@ impl Spawner for SubprocessSpawner {
                 return RunOutcome {
                     exit_code: 1,
                     pid: None,
+                    drain_interrupted: false,
                 };
             }
         };
@@ -296,6 +306,7 @@ impl Spawner for SubprocessSpawner {
         };
         tokio::pin!(interrupt);
 
+        let mut drain_interrupted = false;
         let status = tokio::select! {
             status = child.wait() => status,
             kind = &mut interrupt => match kind {
@@ -316,8 +327,11 @@ impl Spawner for SubprocessSpawner {
                         None => drain_grace,
                     };
                     match tokio::time::timeout(grace, child.wait()).await {
+                        // Exited on its own within the drain grace: the exit
+                        // code is the child's genuine result, not the drain's.
                         Ok(status) => status,
                         Err(_) => {
+                            drain_interrupted = true;
                             terminate_gracefully(&mut child, pid);
                             wait_with_grace(&mut child).await
                         }
@@ -330,7 +344,11 @@ impl Spawner for SubprocessSpawner {
             Ok(s) => s.code().unwrap_or(1),
             Err(_) => 1,
         };
-        RunOutcome { exit_code, pid }
+        RunOutcome {
+            exit_code,
+            pid,
+            drain_interrupted,
+        }
     }
 }
 
@@ -470,6 +488,7 @@ impl Spawner for CapturingSpawner {
         RunOutcome {
             exit_code,
             pid: Some(pid),
+            drain_interrupted: false,
         }
     }
 }
