@@ -60,13 +60,19 @@ pub fn schedule_status_output(
     // An ABSENT state file is normal (no tick has run yet) and yields empty
     // cursors; a file that EXISTS but cannot be opened is a real fault and must
     // not be flattened into "nothing scheduled has ever run".
-    let store = match StateStore::open_read_only(state_path) {
-        Ok(store) => Some(store),
-        Err(e) => {
-            if state_path.exists() {
-                return Err(ScheduleStatusError::State(e.into()));
-            }
-            None
+    //
+    // The existence check runs BEFORE the open, not in its error branch:
+    // redb's read-only open still goes through `Database::create`, so opening
+    // an absent path MATERIALIZES the state file — a status read that writes,
+    // on the one endpoint documented side-effect free. (The check-then-open
+    // race is benign: a run starting concurrently creates the real file and
+    // the next status call reads it.)
+    let store = if !state_path.exists() {
+        None
+    } else {
+        match StateStore::open_read_only(state_path) {
+            Ok(store) => Some(store),
+            Err(e) => return Err(ScheduleStatusError::State(e.into())),
         }
     };
 
@@ -359,5 +365,37 @@ mod tests {
         // No last attempt → Throttle::Clear even though it is standing.
         let fresh = ScheduleStateRecord::default();
         assert!(reportable_throttle(&schedule(vec!["upstream"], false), &fresh, now).is_none());
+    }
+}
+
+#[cfg(test)]
+mod side_effect_free_tests {
+    use super::*;
+
+    /// The #1330 review's confirmed defect: redb's read-only open goes through
+    /// `Database::create`, so a status read of a FRESH project materialized
+    /// the state file — a write, on the one endpoint documented side-effect
+    /// free. The existence guard must keep the read genuinely read-only.
+    #[test]
+    fn a_status_read_of_a_fresh_project_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"x.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let state_path = tmp.path().join("state.redb");
+        let rocky_dir = tmp.path().join(".rocky");
+
+        let out = schedule_status_output(&config_path, &state_path, &rocky_dir, chrono::Utc::now())
+            .expect("a fresh project must yield an empty snapshot");
+        assert!(
+            !state_path.exists(),
+            "the read-only status must not materialize the state file"
+        );
+        drop(out);
     }
 }

@@ -2643,7 +2643,9 @@ impl RockyMcpServer {
          last submission and outcome, consecutive failures, active claims, and tick-lock state. \
          Reports stored state only — it does NOT evaluate demand (side-effect free; \
          `rocky tick --dry-run` is the evaluation). `next_fire_at` in the past means an overdue \
-         pipeline, not a future promise."
+         pipeline, not a future promise. Reads the project's canonical state path: a scheduler \
+         started with an explicit `--state-path` override is not visible here — query that \
+         server's GET /api/v1/schedule instead."
     )]
     async fn schedule_status(
         &self,
@@ -2672,10 +2674,11 @@ impl RockyMcpServer {
         })?
         .map_err(|e| {
             ToolError::internal(
-                format!("{e:#}"),
-                "Could not read the schedule state; ensure the project config parses and the \
-                 state store is readable. A project with no [schedule] blocks returns an empty \
-                 snapshot, not an error.",
+                // Top-level message only — the alternate chain carries absolute
+                // project paths, which do not belong on the wire.
+                format!("could not read the schedule state: {e}"),
+                "Ensure the project config parses and the state store is readable. A project \
+                 with no [schedule] blocks returns an empty snapshot, not an error.",
             )
         })?;
         let value = serde_json::to_value(&output).map_err(|e| {

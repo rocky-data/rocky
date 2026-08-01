@@ -473,7 +473,8 @@ pub struct RunHistoryLite {
     pub started_at: String,
     /// `"Success"`, `"Failed"`, `"Partial"`, etc.
     pub status: String,
-    /// `"Manual"`, `"Scheduled"`, etc.
+    /// `"Manual"`, `"Schedule"`, `"Webhook"`, etc. — the run trigger's wire
+    /// vocabulary, exactly as `history.trigger` filters on it.
     pub trigger: String,
     /// Number of models executed in the run.
     pub models_executed: usize,
