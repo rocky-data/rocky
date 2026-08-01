@@ -146,7 +146,34 @@ pub fn locate_models_dir(models_glob: &str, config_path: &Path) -> Result<Models
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let models_dir = project_root.join(models_base(models_glob, project_root));
-    if !models_dir.exists() {
+    // `try_exists`, not `exists`. `Path::exists` maps *every* metadata error to
+    // `false`, so a directory that exists but cannot be reached — a parent
+    // component denying traversal, most plainly — reported as absent. Absent is
+    // a skip for most callers, so the pipeline's models silently never loaded
+    // and the project looked model-free: a DAG with no transformation nodes
+    // reported as success, and `rocky dag --column-lineage` reporting
+    // *authoritative* emptiness (#1336).
+    //
+    // This is the same reasoning the canonicalize failure below already
+    // applies, and for the same reason: a probe that cannot answer "does this
+    // exist?" is not a probe that answers no.
+    //
+    // The blast radius, measured rather than assumed: `try_exists` converts
+    // only `NotFound` to `Ok(false)`. A genuinely missing path and a *broken
+    // symlink* therefore stay `Absent` and nothing changes for them. Every
+    // other metadata failure now propagates — `PermissionDenied`,
+    // `NotADirectory` (a non-final component of the glob's base is a regular
+    // file), `InvalidFilename` (an over-long component), and whatever a
+    // failing network mount reports. All of them are configurations that
+    // cannot resolve, and all of them previously reported as "absent" and were
+    // silently skipped. That silence is the defect, not the propagation.
+    let exists = models_dir.try_exists().with_context(|| {
+        format!(
+            "could not determine whether models directory '{}' exists",
+            models_dir.display()
+        )
+    })?;
+    if !exists {
         return Ok(ModelsDir::Absent(models_dir));
     }
     // Confine to the project root. Both sides canonicalized so intra-project
@@ -508,6 +535,106 @@ mod tests {
         assert_eq!(
             resolved_models_glob("models.sql", &config),
             models.join("**").to_string_lossy()
+        );
+    }
+
+    /// The blast radius of `try_exists`, pinned rather than described.
+    ///
+    /// Only `NotFound` becomes `Ok(false)`. A missing directory and a broken
+    /// symlink therefore stay `Absent`; a non-directory path component and an
+    /// over-long name propagate. That list started as a table in a PR
+    /// description and one row of it was wrong — the over-long case, because
+    /// the probe that "measured" it used a short path merely *named*
+    /// `nametoolong`. A test cannot make that mistake quietly.
+    #[test]
+    fn locate_models_dir_separates_missing_from_unreadable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+
+        // Missing: absent, not an error.
+        assert!(matches!(
+            locate_models_dir("nope/**", &config).expect("missing is not an error"),
+            ModelsDir::Absent(_)
+        ));
+
+        // Broken symlink: still just missing.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling"))
+                .expect("symlink");
+            assert!(
+                matches!(
+                    locate_models_dir("dangling/**", &config)
+                        .expect("a broken symlink is not an error"),
+                    ModelsDir::Absent(_)
+                ),
+                "a dangling symlink resolves to NotFound, which is an absence"
+            );
+        }
+
+        // A regular file where a directory component must be.
+        std::fs::write(root.join("notes.txt"), "x").expect("write file");
+        assert!(
+            locate_models_dir("notes.txt/models/**", &config).is_err(),
+            "a non-directory path component cannot resolve, so it must not \
+             report as merely absent"
+        );
+
+        // An over-long component.
+        let long = "x".repeat(5000);
+        assert!(
+            locate_models_dir(&format!("{long}/**"), &config).is_err(),
+            "an over-long name cannot resolve either"
+        );
+    }
+
+    /// An unreachable models directory is an error, not an absence (#1336).
+    ///
+    /// `Path::exists` collapses every metadata error to `false`, so a parent
+    /// that denies traversal used to report the directory absent — and absent
+    /// is a skip, so the project silently looked model-free.
+    ///
+    /// The probe is validated before it is trusted: if this process can still
+    /// stat through a mode-000 directory (running as root, or a filesystem
+    /// that ignores the mode), the scenario did not reproduce and asserting on
+    /// it would be asserting on nothing. Skipping loudly beats a green test
+    /// that never exercised the path.
+    #[cfg(unix)]
+    #[test]
+    fn locate_models_dir_errors_when_the_directory_cannot_be_reached() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let config = root.join("rocky.toml");
+        std::fs::write(&config, "").expect("write config");
+
+        let locked = root.join("locked");
+        std::fs::create_dir_all(locked.join("models")).expect("mkdir");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        let reproduced = locked.join("models").try_exists().is_err();
+        let result = locate_models_dir("locked/models/**", &config);
+        // Restore before asserting so a failure cannot leave an undeletable
+        // temp dir behind.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+
+        if !reproduced {
+            eprintln!(
+                "skipping: this process can stat through a mode-000 directory, \
+                 so the unreachable case did not reproduce"
+            );
+            return;
+        }
+        let err = result.expect_err("an unreachable models directory must not report as absent");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not determine whether"),
+            "the error must say the probe failed, not that the directory is \
+             missing: {msg}"
         );
     }
 
