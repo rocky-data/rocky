@@ -161,7 +161,7 @@ fn default_sub_runner() -> SubRunner {
                     false,
                 )
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| format!("{e:#}"))
             })
         },
     )
@@ -675,7 +675,7 @@ impl NodeDispatcher for CliDispatcher {
                 Some(Box::pin(async move {
                     super::seed::run_seed(&loaded, &seeds_dir, None, Some(&label), false)
                         .await
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| format!("{e:#}"))
                 }))
             }
             _ => {
