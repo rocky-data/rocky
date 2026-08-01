@@ -35,6 +35,9 @@ pub enum TableRefKind {
 }
 
 /// Errors during dependency resolution.
+/// `#[non_exhaustive]` because this enum is public and adding a variant —
+/// as #1224 just did — would otherwise break an external exhaustive match.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ResolveError {
     #[error("failed to extract lineage from model '{model}': {reason}")]
@@ -106,31 +109,30 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
     let mut lineage_cache = HashMap::with_capacity(models.len());
     let mut diagnostics = Vec::new();
 
-    // Collect EVERY parse failure before returning, rather than propagating the
-    // first (#1224). Resolution still fails; the difference is that the user
-    // sees the whole set in one pass.
+    // Collect EVERY parse failure rather than propagating the first (#1224).
+    //
+    // Done in the SAME pass as the real work, not a pre-pass: a pre-pass costs
+    // a second `extract_lineage` for every model on the success path — 2N
+    // parses on a healthy project, which is the common case and the one that
+    // must stay fast. Here a model that parses is parsed once and its result
+    // used; only a model that FAILS is recorded, and after the first failure
+    // the remaining work is skipped since the result is already an error.
     let mut parse_failures: Vec<(String, String)> = Vec::new();
-    for model in models {
-        if let Err(reason) = lineage::extract_lineage(&model.sql) {
-            parse_failures.push((model.config.name.clone(), reason));
-        }
-    }
-    if !parse_failures.is_empty() {
-        // Deterministic order: the same project must produce the same message
-        // twice, and a set that changes order between runs is unreadable in CI.
-        parse_failures.sort();
-        return Err(ResolveError::LineageExtractionMany {
-            failures: parse_failures,
-        });
-    }
 
     for model in models {
-        let lineage_result = lineage::extract_lineage(&model.sql).map_err(|reason| {
-            ResolveError::LineageExtraction {
-                model: model.config.name.clone(),
-                reason,
+        let lineage_result = match lineage::extract_lineage(&model.sql) {
+            Ok(result) => result,
+            Err(reason) => {
+                parse_failures.push((model.config.name.clone(), reason));
+                continue;
             }
-        })?;
+        };
+        if !parse_failures.is_empty() {
+            // Already failing: keep parsing to complete the report, but skip
+            // the dependency/diagnostic work whose output is about to be
+            // discarded.
+            continue;
+        }
 
         let auto_deps =
             extract_deps_from_lineage(&lineage_result, &model.config.name, &model_names);
@@ -188,6 +190,15 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
         dag_nodes.push(DagNode {
             name: model.config.name.clone(),
             depends_on: all_deps,
+        });
+    }
+
+    if !parse_failures.is_empty() {
+        // Deterministic order: the same project must produce the same message
+        // twice, and a set that changes order between runs is unreadable in CI.
+        parse_failures.sort();
+        return Err(ResolveError::LineageExtractionMany {
+            failures: parse_failures,
         });
     }
 
