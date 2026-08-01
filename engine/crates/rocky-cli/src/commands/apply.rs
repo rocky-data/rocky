@@ -852,7 +852,7 @@ pub enum PolicyGate {
 fn model_attributes(
     models_dir: &Path,
     models_glob: Option<&str>,
-) -> BTreeMap<String, ModelAttributes> {
+) -> Result<BTreeMap<String, ModelAttributes>, String> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
     let config = CompilerConfig {
@@ -863,8 +863,30 @@ fn model_attributes(
         Some(glob) => compile::compile_matching(&config, glob),
         None => compile::compile(&config),
     };
-    let Ok(result) = result else {
-        return BTreeMap::new();
+    // A compile failure must PROPAGATE, never degrade to an empty map: this
+    // map is what attribute-scoped policy rules (`layer = "gold"`,
+    // `classifications = ["pii"]`) match against, and an empty map silently
+    // resolves every model to DEFAULT attributes — a deny that stops
+    // matching, then `default_agent_effect` deciding a destructive apply.
+    // The same class as the maintenance-apply refusal shipped earlier: a
+    // gate that cannot establish what it is gating refuses, it does not
+    // gate on nothing. (#1262 made this reachable on healthy-but-deep
+    // projects: the walk's new failure modes — an unreadable subtree, the
+    // 64-level ceiling — fail compiles that previously never saw those
+    // directories at all.)
+    let result = match result {
+        Ok(r) => r,
+        // A project with NO models is a TRUE empty — replication-only
+        // estates legitimately gate maintenance applies with no model
+        // sidecars at all, and refusing them would break every such
+        // deployment. Only a failure over models that DO exist is a
+        // degradation.
+        Err(rocky_compiler::compile::CompileError::Project(
+            rocky_compiler::project::ProjectError::NoModels { .. },
+        )) => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(format!("model attributes could not be established: {e}"));
+        }
     };
 
     let mut out = BTreeMap::new();
@@ -896,7 +918,7 @@ fn model_attributes(
             },
         );
     }
-    out
+    Ok(out)
 }
 
 /// Resolve the `[state]` backend for a governed apply seam, returning the config
@@ -1452,7 +1474,19 @@ fn resolve_policy_and_attrs(
     if touched.is_empty() {
         return Err(PolicyGate::Allow);
     }
-    Ok((policy.clone(), model_attributes(models_dir, models_glob)))
+    let attrs = match model_attributes(models_dir, models_glob) {
+        Ok(attrs) => attrs,
+        // Fail CLOSED: a gate that cannot establish model attributes refuses,
+        // it does not evaluate attribute-scoped rules against defaults.
+        Err(reason) => {
+            return Err(PolicyGate::Deny {
+                model: "*".to_string(),
+                rule_id: None,
+                reason,
+            });
+        }
+    };
+    Ok((policy.clone(), attrs))
 }
 
 /// The per-model evaluation loop shared by [`evaluate_apply_policy`] and
@@ -2701,7 +2735,13 @@ fn required_verify_after(
     let Some(policy) = policy else {
         return Vec::new();
     };
-    let attrs_map = model_attributes(models_dir, models_glob);
+    let attrs_map = match model_attributes(models_dir, models_glob) {
+        Ok(attrs) => attrs,
+        // Fail SAFE for verification selection: if attributes cannot be
+        // established, verify every touched model rather than silently
+        // verifying only the default-attribute matches.
+        Err(_) => return touched.keys().cloned().collect(),
+    };
     let mut names: BTreeSet<String> = BTreeSet::new();
     for (model, capability) in touched {
         let owned;
@@ -4952,6 +4992,59 @@ effect = "deny"
         assert!(
             matches!(gate_none, PolicyGate::NotConfigured),
             "no policy passed ⇒ NotConfigured (no disk reload); got {gate_none:?}"
+        );
+        Ok(())
+    }
+
+    /// The #1328 review's F2 (CONFIRMED): a models dir whose compile FAILS —
+    /// here a malformed sidecar, in the review's scenario the walk's new
+    /// depth-ceiling error from an irrelevant deep subtree — used to degrade
+    /// `model_attributes` to an EMPTY map, so an attribute-scoped deny
+    /// (`layer = "gold"`) stopped matching and `default_agent_effect` decided
+    /// a destructive apply. The gate must REFUSE when it cannot establish
+    /// what it is gating. (A truly model-less project stays a true empty —
+    /// pinned separately by the replication-estate tests above.)
+    #[test]
+    fn evaluate_apply_policy_refuses_when_attributes_cannot_be_established() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { layer = "gold" }
+effect = "deny"
+"#,
+        )?;
+        // Models EXIST but the compile fails: a malformed sidecar.
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models)?;
+        std::fs::write(
+            models.join("m.sql"),
+            "SELECT 1 AS id
+",
+        )?;
+        std::fs::write(
+            models.join("m.toml"),
+            "name = [
+",
+        )?;
+
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::Apply);
+        let gate = super::evaluate_apply_policy(
+            &config,
+            "plan_x",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &dir.path().join("state.redb"),
+            &[],
+        );
+        assert!(
+            matches!(gate, PolicyGate::Deny { .. }),
+            "a gate that cannot establish attributes must refuse, got {gate:?}"
         );
         Ok(())
     }
