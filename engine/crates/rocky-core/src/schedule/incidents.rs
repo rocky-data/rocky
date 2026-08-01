@@ -140,14 +140,38 @@ pub fn write_incident(rocky_dir: &Path, bundle: &IncidentBundle) -> io::Result<P
     let name = format!(
         "{}-{}-{}.json",
         bundle.recorded_at.format("%Y%m%dT%H%M%SZ"),
-        normalize_segment(sanitize(&bundle.pipeline)),
-        normalize_segment(short_id)
+        normalize_segment(&sanitize(&bundle.pipeline)),
+        normalize_segment(&short_id)
     );
     debug_assert!(is_bundle_name(&name), "{name}");
-    let path = dir.join(name);
     let json = serde_json::to_vec_pretty(bundle)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    std::fs::write(&path, json)?;
+    // Collision-safe: sanitize/normalize are lossy, so two DISTINCT incidents
+    // can land on the same name in the same second — create_new + a numbered
+    // variant keeps both instead of silently overwriting the first.
+    let stem = name.strip_suffix(".json").expect("constructed with .json");
+    let mut path = dir.join(&name);
+    let mut k = 1;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                f.write_all(&json)?;
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists && k < 100 => {
+                k += 1;
+                let variant = format!("{stem}-{k}.json");
+                debug_assert!(is_bundle_name(&variant), "{variant}");
+                path = dir.join(variant);
+            }
+            Err(e) => return Err(e),
+        }
+    }
     sweep(&dir)?;
     Ok(path)
 }
@@ -194,7 +218,7 @@ fn sweep(dir: &Path) -> io::Result<()> {
 /// own. Empty becomes `_`; boundary hyphens become `_`. Lossy on purpose:
 /// the bundle JSON carries the exact names, the filename only has to be
 /// unambiguous.
-fn normalize_segment(s: String) -> String {
+fn normalize_segment(s: &str) -> String {
     if s.is_empty() {
         return "_".to_string();
     }
@@ -356,6 +380,26 @@ mod tests {
         }
         // A real leap day is a real instant.
         assert!(is_bundle_name("20280229T120000Z-orders-x.json"));
+    }
+
+    /// Two DISTINCT incidents that collide on (second, pipeline segment,
+    /// id prefix) — here via sanitize's lossiness — must both survive; a
+    /// silent overwrite would lose one incident's facts.
+    #[test]
+    fn colliding_bundle_names_never_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let at = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let p1 = write_incident(tmp.path(), &bundle("a/b", at)).unwrap();
+        let p2 = write_incident(tmp.path(), &bundle("a_b", at)).unwrap();
+        assert_ne!(p1, p2, "the second write must pick a variant name");
+        assert!(p1.exists() && p2.exists(), "both incidents survive");
+        let n2 = p2.file_name().unwrap().to_str().unwrap();
+        assert!(
+            is_bundle_name(n2),
+            "the variant is still a bundle name: {n2}"
+        );
     }
 
     /// Writer↔matcher agreement by construction: for ANY pipeline name and
