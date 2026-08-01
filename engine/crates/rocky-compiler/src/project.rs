@@ -63,6 +63,13 @@ pub struct TargetCollision {
 
 /// Group models by the physical object their target names.
 ///
+/// Public because `Project::from_models` is not the only consumer that needs
+/// this answer. A destructive verb operating on a RAW model set — `branch
+/// promote` plans one `CREATE OR REPLACE` per model without ever compiling —
+/// must be able to ask the same question without paying for full dependency
+/// resolution, which would additionally fail on unrelated unparseable SQL
+/// (#1310).
+///
 /// Identity is [`rocky_sql::defer::CollisionIdentity`], which ASCII-lowercases
 /// every component and deliberately takes no dialect rules: answering
 /// "different" for two spellings that are one object would let both models
@@ -83,7 +90,7 @@ pub struct TargetCollision {
 /// `Ephemeral` models are excluded: they carry a fully populated but phantom
 /// target and are never materialized, so two of them — or one beside a real
 /// model — are not two writers to one table.
-fn collide_on_target(models: &[Model]) -> Vec<TargetCollision> {
+pub fn collide_on_target(models: &[Model]) -> Vec<TargetCollision> {
     let mut by_identity: std::collections::BTreeMap<String, (String, Vec<String>)> =
         std::collections::BTreeMap::new();
 

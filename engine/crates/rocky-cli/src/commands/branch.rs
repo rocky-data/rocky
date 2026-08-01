@@ -1131,6 +1131,7 @@ fn discover_transformation_branch_targets(
     };
 
     let mut planned = Vec::new();
+    let mut selected: Vec<rocky_core::models::Model> = Vec::new();
     for model in &all_models {
         // Skip ephemeral models — they have no physical table to promote.
         // Mirrors how `rocky run` skips ephemeral materializations during
@@ -1165,7 +1166,35 @@ fn discover_transformation_branch_targets(
             prod,
             branch_source,
         });
+        selected.push(model.clone());
     }
+
+    // #1310: refuse before planning any `CREATE OR REPLACE` when two models
+    // this promote would execute resolve to the same physical table.
+    //
+    // Promote never compiles for discovery, so the E036 diagnostic that
+    // `rocky compile` reports for exactly this shape is not merely unread here
+    // — it is never produced. Without this the steps run back to back and the
+    // later `CREATE OR REPLACE` silently overwrites the earlier, deciding a
+    // production table's contents by loader order, with exit 0.
+    //
+    // Scoped to the SELECTED set, matching the run path: a `--filter` that
+    // picks one of a colliding pair leaves no second writer, and refusing it
+    // would block the very command an operator would use to work around the
+    // collision.
+    let collisions = rocky_compiler::project::collide_on_target(&selected);
+    anyhow::ensure!(
+        collisions.is_empty(),
+        "refusing to promote: {} model group(s) resolve to the same physical table, so the \
+         promoted contents would depend on execution order — {}. Give each model its own \
+         `[target] table`, or select one with `--filter model=<name>`.",
+        collisions.len(),
+        collisions
+            .iter()
+            .map(|c| format!("[{}] -> {}", c.models.join(", "), c.target))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
 
     Ok(planned)
 }
@@ -2780,6 +2809,124 @@ mod tests {
     ///
     /// Pure enumeration test — exercises `discover_branch_targets` against
     /// a transformation pipeline without touching the warehouse.
+    /// #1310: promote refuses when two models it would execute resolve to the
+    /// same physical table.
+    ///
+    /// Promote never compiles for discovery, so the E036 diagnostic `rocky
+    /// compile` reports for this shape is not merely unread here — it is never
+    /// produced. Without the guard both models plan a `CREATE OR REPLACE`
+    /// against one table and run back to back, so a production table's
+    /// contents are decided by loader order, with exit 0.
+    #[tokio::test]
+    async fn promote_refuses_two_models_targeting_one_table() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+"#,
+        )
+        .unwrap();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        // Two DIFFERENT models — duplicate *names* are already rejected — both
+        // pointed at one physical table.
+        write_transformation_model(
+            &models_dir,
+            "current",
+            "wh",
+            "main",
+            "orders",
+            "SELECT 1 AS id",
+        );
+        write_transformation_model(
+            &models_dir,
+            "replacement",
+            "wh",
+            "main",
+            "orders",
+            "SELECT 2 AS id",
+        );
+
+        let record = sample_record("fix-1310");
+        let err = discover_branch_targets(&config_path, &record, None, None)
+            .await
+            .expect_err("two models promoting to one table must be refused");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to promote"),
+            "the refusal must be explicit: {msg}"
+        );
+        assert!(
+            msg.contains("current") && msg.contains("replacement"),
+            "it must name both colliding models: {msg}"
+        );
+        assert!(
+            msg.contains("wh.main.orders"),
+            "and the shared target: {msg}"
+        );
+    }
+
+    /// The refusal is scoped to the SELECTED set: `--filter` picking one side
+    /// of a collision leaves no second writer, and blocking it would break the
+    /// very command the error message tells the operator to use.
+    #[tokio::test]
+    async fn promote_allows_a_filter_that_selects_one_side_of_a_collision() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"[adapter]
+type = "duckdb"
+path = ":memory:"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "default"
+"#,
+        )
+        .unwrap();
+        let models_dir = dir.join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        write_transformation_model(
+            &models_dir,
+            "current",
+            "wh",
+            "main",
+            "orders",
+            "SELECT 1 AS id",
+        );
+        write_transformation_model(
+            &models_dir,
+            "replacement",
+            "wh",
+            "main",
+            "orders",
+            "SELECT 2 AS id",
+        );
+
+        let record = sample_record("fix-1310");
+        let planned =
+            discover_branch_targets(&config_path, &record, Some("model=replacement"), None)
+                .await
+                .expect("selecting one side of a collision leaves no second writer");
+        assert_eq!(planned.len(), 1, "exactly the selected model is planned");
+    }
+
     #[tokio::test]
     async fn discover_branch_targets_walks_transformation_models() {
         let tmp = TempDir::new().unwrap();
