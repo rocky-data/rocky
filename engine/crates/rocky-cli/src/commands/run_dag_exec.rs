@@ -51,6 +51,54 @@ type SubRunner = Arc<
         + Sync,
 >;
 
+/// Grants each pipeline-bound sub-run an exclusive turn on its state file
+/// (#1312).
+///
+/// Every sub-run drives [`super::run::run`], which holds the state store's
+/// exclusive writer flock for its **whole duration**, and the executor
+/// dispatches a layer's nodes concurrently with no bound. Without a turnstile
+/// the first sub-run to open the store wins and every same-layer sibling
+/// sharing the state file dies on `LockHeldByOther` — deterministically, for a
+/// project as small as two independent `SELECT 1` models. The flock-side retry
+/// (#1234/#1314) cannot absorb this: its budget is milliseconds, and the
+/// winner legitimately holds the lock for as long as its models take.
+///
+/// So sub-runs sharing a state file take turns instead of racing. The map is
+/// keyed by the state path because *that* is the invariant — one writer per
+/// state file — not "one sub-run at a time": nodes writing genuinely distinct
+/// state files still overlap, and a test pins that so this can never quietly
+/// become a global serializer. Today [`CliDispatcher`] threads one canonical
+/// path to every pipeline-bound node, so in practice the map holds one entry
+/// and the DAG's pipeline-bound nodes execute one at a time — which is
+/// strictly better than what it replaces: before this gate, "concurrency"
+/// between such nodes meant one ran and the rest crashed.
+///
+/// Seed nodes bypass the turnstile: [`super::seed::run_seed`] never opens the
+/// state store, so serializing seeds would forfeit real parallelism for no
+/// soundness gain.
+struct StateTurnstile {
+    turns: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl StateTurnstile {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            turns: std::sync::Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Wait for, and take, the exclusive turn for `path`. The turn is released
+    /// when the returned guard drops — callers hold it across the whole
+    /// sub-run, because that is exactly how long `run()` holds the flock.
+    async fn turn(&self, path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut turns = self.turns.lock().expect("state turnstile poisoned");
+            Arc::clone(turns.entry(path.to_path_buf()).or_default())
+        };
+        gate.lock_owned().await
+    }
+}
+
 /// The production [`SubRunner`]: drives one pipeline through [`super::run::run`]
 /// with the DAG sub-run's fixed arguments (no `--defer`/`--var`, config-derived
 /// TTL, no idempotency key). Only `config`, `loaded`, `state`, `pipeline`,
@@ -293,6 +341,7 @@ pub async fn run_with_dag(
         skip_opts: *skip_opts,
         shadow_config: shadow_config.cloned(),
         sub_runner: default_sub_runner(),
+        state_turns: StateTurnstile::new(),
     };
     let executor = DagExecutor::new(dispatcher);
     let result = executor
@@ -525,6 +574,10 @@ struct CliDispatcher {
     /// The injected sub-run driver. Production is [`default_sub_runner`]; tests
     /// substitute a recorder to observe the `skip_opts` each sub-run receives.
     sub_runner: SubRunner,
+    /// Serializes pipeline-bound sub-runs per state file — see
+    /// [`StateTurnstile`] (#1312). One turnstile per DAG run, shared by every
+    /// node the dispatcher creates.
+    state_turns: Arc<StateTurnstile>,
 }
 
 /// The partition options one DAG sub-run receives: the caller's **selection**,
@@ -647,7 +700,14 @@ impl NodeDispatcher for CliDispatcher {
                 // partition selection and the build-escape-hatch options so
                 // they are honored per sub-run rather than dropped at the DAG
                 // boundary.
+                let state_turns = Arc::clone(&self.state_turns);
                 Some(Box::pin(async move {
+                    // Take the exclusive turn for this state file BEFORE the
+                    // sub-run opens the store, and hold it until the sub-run
+                    // finishes — `run()` holds the writer flock for exactly
+                    // that long (#1312). Waiting here pends the node future;
+                    // the executor's other layers of work are unaffected.
+                    let _turn = state_turns.turn(&state_path).await;
                     (sub_runner)(
                         config_path,
                         loaded,
@@ -675,7 +735,7 @@ mod run_opts_threading_tests {
     use rocky_core::unified_dag::{NodeId, NodeKind};
 
     use super::super::run::{PartitionRunOptions, SkipRunOptions};
-    use super::{CliDispatcher, SubRunner};
+    use super::{CliDispatcher, StateTurnstile, SubRunner};
 
     type RecordedSubRun = (Option<String>, PartitionRunOptions, SkipRunOptions);
 
@@ -715,7 +775,7 @@ mod run_opts_threading_tests {
 
     /// A loaded snapshot for dispatcher tests, built through the real
     /// fingerprinted loader over a minimal temp config.
-    fn test_loaded_config() -> Arc<LoadedConfig> {
+    pub(super) fn test_loaded_config() -> Arc<LoadedConfig> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rocky.toml");
         std::fs::write(
@@ -754,6 +814,7 @@ mod run_opts_threading_tests {
             skip_opts,
             shadow_config,
             sub_runner: recorder,
+            state_turns: StateTurnstile::new(),
         };
         (dispatcher, node_ids)
     }
@@ -1003,6 +1064,146 @@ mod run_opts_threading_tests {
     }
 }
 
+#[cfg(test)]
+mod state_turnstile_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use rocky_core::config::LoadedConfig;
+    use rocky_core::dag_executor::NodeDispatcher;
+    use rocky_core::unified_dag::{NodeId, NodeKind};
+
+    use super::super::run::{PartitionRunOptions, SkipRunOptions};
+    use super::{CliDispatcher, StateTurnstile, SubRunner};
+
+    /// A dispatcher over `n` transformation nodes with an explicit state path
+    /// and a caller-supplied turnstile — the two knobs these tests turn.
+    fn dispatcher(
+        loaded: Arc<LoadedConfig>,
+        runner: SubRunner,
+        state_turns: Arc<StateTurnstile>,
+        state_path: &str,
+        n: usize,
+    ) -> (CliDispatcher, Vec<NodeId>) {
+        let mut node_pipelines = HashMap::new();
+        let node_ids: Vec<NodeId> = (0..n)
+            .map(|i| {
+                let id = NodeId::new("transformation", &format!("m{i}"));
+                node_pipelines.insert(id.clone(), "analytics".to_string());
+                id
+            })
+            .collect();
+        let dispatcher = CliDispatcher {
+            config_path: std::path::PathBuf::from("rocky.toml"),
+            loaded,
+            state_path: std::path::PathBuf::from(state_path),
+            seeds_dir: std::path::PathBuf::from("seeds"),
+            node_pipelines,
+            partition_opts: PartitionRunOptions::default(),
+            skip_opts: SkipRunOptions::default(),
+            shadow_config: None,
+            sub_runner: runner,
+            state_turns,
+        };
+        (dispatcher, node_ids)
+    }
+
+    /// The #1312 invariant at the dispatch seam: two nodes naming the SAME
+    /// state file never run concurrently.
+    ///
+    /// The probe holds each "run" open for 40ms while recording the in-flight
+    /// high-water mark; `tokio::join!` polls both futures together, so without
+    /// the turnstile both enter the window and the mark reads 2 (verified by
+    /// neutering the `turn()` acquisition — this assertion goes red). With it,
+    /// the mark cannot exceed 1: the second future pends on the turn until the
+    /// first guard drops.
+    #[tokio::test]
+    async fn same_state_file_sub_runs_take_turns() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let (inf, maxs) = (in_flight.clone(), max_seen.clone());
+        let runner: SubRunner = Arc::new(move |_c, _l, _s, _p, _m, _po, _so, _sh| {
+            let (inf, maxs) = (inf.clone(), maxs.clone());
+            Box::pin(async move {
+                let now = inf.fetch_add(1, Ordering::SeqCst) + 1;
+                maxs.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                inf.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let loaded = super::run_opts_threading_tests::test_loaded_config();
+        let (dispatcher, ids) = dispatcher(
+            loaded,
+            runner,
+            StateTurnstile::new(),
+            ".rocky-state.redb",
+            2,
+        );
+        let f0 = dispatcher
+            .dispatch(&ids[0], NodeKind::Transformation, "m0")
+            .expect("transformation node must dispatch");
+        let f1 = dispatcher
+            .dispatch(&ids[1], NodeKind::Transformation, "m1")
+            .expect("transformation node must dispatch");
+        let (r0, r1) = tokio::join!(f0, f1);
+        r0.expect("first sub-run must succeed");
+        r1.expect("second sub-run must succeed");
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "sub-runs sharing a state file must take turns, not race the \
+             writer flock"
+        );
+    }
+
+    /// The over-serialization guard: nodes naming DISTINCT state files still
+    /// overlap. Each sub-run waits at a two-party barrier that only releases
+    /// when both are inside a run simultaneously — if the turnstile ever
+    /// collapsed into a global serializer, the second sub-run could not start
+    /// while the first waited, the rendezvous would never complete, and the
+    /// timeout turns that hang into a failure.
+    #[tokio::test]
+    async fn distinct_state_files_still_run_concurrently() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let b = barrier.clone();
+        let runner: SubRunner = Arc::new(move |_c, _l, _s, _p, _m, _po, _so, _sh| {
+            let b = b.clone();
+            Box::pin(async move {
+                b.wait().await;
+                Ok(())
+            })
+        });
+        let loaded = super::run_opts_threading_tests::test_loaded_config();
+        let turns = StateTurnstile::new();
+        let (d_a, ids_a) = dispatcher(
+            loaded.clone(),
+            runner.clone(),
+            Arc::clone(&turns),
+            "a-state.redb",
+            1,
+        );
+        let (d_b, ids_b) = dispatcher(loaded, runner, turns, "b-state.redb", 1);
+        let f_a = d_a
+            .dispatch(&ids_a[0], NodeKind::Transformation, "m0")
+            .expect("transformation node must dispatch");
+        let f_b = d_b
+            .dispatch(&ids_b[0], NodeKind::Transformation, "m0")
+            .expect("transformation node must dispatch");
+        let (r_a, r_b) =
+            tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(f_a, f_b) })
+                .await
+                .expect(
+                    "distinct state files must run concurrently — cross-path \
+             serialization would deadlock this rendezvous",
+                );
+        r_a.expect("sub-run a must succeed");
+        r_b.expect("sub-run b must succeed");
+    }
+}
+
 #[cfg(all(test, feature = "duckdb"))]
 mod tests {
     use super::*;
@@ -1097,6 +1298,7 @@ mod tests {
             skip_opts: SkipRunOptions::default(),
             shadow_config: None,
             sub_runner: default_sub_runner(),
+            state_turns: StateTurnstile::new(),
         };
         let id = NodeId::new("seed", "countries");
         let fut = dispatcher

@@ -66,7 +66,7 @@ export interface DagRunNodeOutput {
    */
   label: string;
   /**
-   * Layer index (0-based; nodes in the same layer ran concurrently).
+   * Layer index (0-based): the node's ordering position in the DAG. Same-layer nodes are dispatched together, but nodes that share a state file execute one at a time — so a shared layer bounds ordering, not wall-clock overlap. Seed nodes and nodes writing distinct state files do run concurrently.
    */
   layer: number;
   /**

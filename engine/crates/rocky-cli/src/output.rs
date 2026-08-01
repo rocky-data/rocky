@@ -5292,7 +5292,11 @@ pub struct DagRunNodeOutput {
     pub kind: String,
     /// Human-readable label (usually the pipeline or model name).
     pub label: String,
-    /// Layer index (0-based; nodes in the same layer ran concurrently).
+    /// Layer index (0-based): the node's ordering position in the DAG.
+    /// Same-layer nodes are dispatched together, but nodes that share a
+    /// state file execute one at a time — so a shared layer bounds
+    /// ordering, not wall-clock overlap. Seed nodes and nodes writing
+    /// distinct state files do run concurrently.
     pub layer: usize,
     /// Status: `pending`, `running`, `completed`, `failed`, `skipped`.
     pub status: String,
