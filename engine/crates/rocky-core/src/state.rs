@@ -625,6 +625,12 @@ fn acquire_writer_lock_with_retry(path: &Path) -> Result<StateWriterLock, StateE
             Ok(()) => return Ok(StateWriterLock { _file: file }),
             // Only a *contended* lock is retryable; an I/O error is terminal.
             Err(e @ StateError::LockHeldByOther { .. }) => {
+                #[cfg(test)]
+                LOCK_RETRY_OBSERVER.with(|o| {
+                    if let Some(counter) = o.borrow().as_ref() {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
                 if attempt + 1 == REDB_OPEN_RETRY_ATTEMPTS {
                     return Err(e);
                 }
@@ -1439,6 +1445,13 @@ thread_local! {
     /// entered, instead of sleeping a fixed duration and racing the retry
     /// budget — see `open_read_only_retries_and_succeeds_after_brief_hold`.
     static REDB_RETRY_OBSERVER: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// The same hook for the ADVISORY-LOCK retry in
+    /// [`acquire_writer_lock_with_retry`], for the same reason: a test that
+    /// sleeps a fixed duration and hopes the release lands inside the budget
+    /// is itself load-sensitive — which is the defect class #1234 is about.
+    static LOCK_RETRY_OBSERVER: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -7786,6 +7799,66 @@ mod tests {
         assert!(
             super::try_acquire_writer_lock(&path).is_ok(),
             "the guard must release the lock on drop"
+        );
+    }
+
+    /// #1234: `StateStore::open`'s ADVISORY-LOCK acquire retries a transient
+    /// holder instead of failing on the first attempt.
+    ///
+    /// The acquire made exactly one attempt while the redb open immediately
+    /// below it already retried, so any momentary holder became a hard
+    /// `LockHeldByOther`. In production that silently skipped the end-of-run
+    /// retention sweep, which swallows the error as a warning.
+    ///
+    /// Deterministic on purpose. The holder releases the moment it observes
+    /// the opener has entered the retry loop, rather than sleeping a fixed
+    /// duration and racing the 5x50ms budget — a timing-raced test would
+    /// itself be load-sensitive, which is the very defect class this fixes.
+    #[test]
+    fn open_retries_the_advisory_lock_and_succeeds_after_brief_hold() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+
+        let lock_acquired = Arc::new(Barrier::new(2));
+        let retries = Arc::new(AtomicUsize::new(0));
+
+        let holder = {
+            let path = path.clone();
+            let lock_acquired = Arc::clone(&lock_acquired);
+            let retries = Arc::clone(&retries);
+            thread::spawn(move || {
+                // Take the advisory lock directly — the same thing a second
+                // writer process does.
+                let guard = try_acquire_writer_lock(&path).unwrap();
+                lock_acquired.wait();
+                let mut waited = Duration::ZERO;
+                while retries.load(Ordering::SeqCst) == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                    waited += Duration::from_millis(1);
+                    assert!(
+                        waited < Duration::from_secs(5),
+                        "opener never hit lock contention — it did not retry"
+                    );
+                }
+                drop(guard);
+            })
+        };
+
+        lock_acquired.wait();
+        LOCK_RETRY_OBSERVER.with(|o| *o.borrow_mut() = Some(Arc::clone(&retries)));
+        let opened = StateStore::open(&path);
+        LOCK_RETRY_OBSERVER.with(|o| *o.borrow_mut() = None);
+        holder.join().unwrap();
+
+        opened.expect("a holder released inside the retry budget must be waited out");
+        assert!(
+            retries.load(Ordering::SeqCst) > 0,
+            "the test must have exercised the retry path, not raced past it"
         );
     }
 
