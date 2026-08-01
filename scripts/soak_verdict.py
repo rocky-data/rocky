@@ -140,13 +140,21 @@ def window(samples: list[dict], key: str, lo: float, hi: float) -> list[float]:
 #
 #   * every recorded row in the window must be alive and carry an RSS reading,
 #     which forecloses selection by nulling the reading; and
-#   * no gap may exceed 1.5x the declared sampling interval, which forecloses
-#     selection by omitting the whole row — at a declared 30s cadence a 60s gap
-#     means a scheduled sample is missing, whatever the reason.
+#   * every spacing must sit within 25% of the declared sampling interval, which
+#     forecloses selection by omitting the whole row. A maximum-gap rule is not
+#     enough on its own: a series can switch phase using one short catch-up gap
+#     and stay under any cap. Requiring UNIFORM spacing is what pins the fitted
+#     points to the grid the harness actually scheduled, since a phase switch
+#     costs a spacing that is too short exactly where a dropped slot costs one
+#     that is too long.
 #
-# Both reference runs are complete — 720 of 720 readings in the final quarter,
-# worst gap 31s — so neither rule costs anything that has ever been observed,
-# and an INVALID here means re-run, not "leaking".
+# The scan starts one interval BEFORE the window so that a slot omitted right at
+# the boundary shows up as a double spacing rather than as a short run-in.
+#
+# Both reference runs are rigid grids: spacings of 28-31s at a declared 30s
+# interval, never more than 2s off a perfect grid across 24h, 720 of 720
+# readings present in the final quarter. So none of this costs anything that has
+# ever been observed, and an INVALID here means re-run, not "leaking".
 #
 # The gap is ALSO capped absolutely at 90s, never inferred from the declared
 # interval alone, because `SAMPLE_SECONDS` is a harness knob a coarse run could
@@ -173,7 +181,7 @@ def window(samples: list[dict], key: str, lo: float, hi: float) -> list[float]:
 FINAL_QUARTER_SLOPE_MAX_KB_H = 200.0
 FINAL_QUARTER_MIN_SPAN_S = 4 * 3600
 FINAL_QUARTER_MAX_GAP_S = 90
-FINAL_QUARTER_GAP_INTERVALS = 1.5
+FINAL_QUARTER_GRID_TOLERANCE = 0.25
 
 
 # --------------------------------------------------------------------------
@@ -194,6 +202,22 @@ def gate_completeness(run: dict) -> list[dict]:
                 "status": "INCOMPLETE",
                 "detail": "no DONE sentinel — the harness did not reach its planned end",
                 "serve_exit": exitinfo,
+            }
+        )
+
+    # `alive` is a two-valued liveness flag. Anything else is a malformed row,
+    # and it must not be quietly dropped: every later gate filters on
+    # ``alive == 1``, so an unrecognised value would silently shorten the
+    # timeline those gates believe they judged.
+    odd = [s for s in samples if s.get("alive") not in (0, 1)]
+    if odd:
+        findings.append(
+            {
+                "gate": "G0",
+                "status": "INVALID",
+                "detail": f"{len(odd)} sample(s) carry an alive flag that is neither 0 nor 1 "
+                f"(first {odd[0].get('alive')!r} at epoch {odd[0]['t']}) — the liveness signal "
+                "cannot be read, so no later gate's timeline can be trusted",
             }
         )
 
@@ -479,39 +503,40 @@ def gate_resources(run: dict) -> list[dict]:
     # to shrink its own final quarter down to nothing and out of the gate.
     quarter_lo = max(t_end - (t_end - t_start) * 0.25, warm)
     quarter_h = (t_end - quarter_lo) / 3600.0
+    interval = run["meta"].get("sample_interval") or 30
+    tight, loose = (
+        interval * (1 - FINAL_QUARTER_GRID_TOLERANCE),
+        interval * (1 + FINAL_QUARTER_GRID_TOLERANCE),
+    )
+    # Scan from one interval before the window; fit only from the window itself.
+    scan = [s for s in run["samples"] if quarter_lo - loose <= s["t"] <= t_end]
     # Counted over EVERY recorded row in the window, not the alive-filtered
     # view: a row that is not alive, or carries no reading, is a hole either way.
-    rows = [s for s in run["samples"] if quarter_lo <= s["t"] <= t_end]
+    rows = [s for s in scan if s["t"] >= quarter_lo]
     quarter = [
         (s["t"], float(s["rss_kb"]))
         for s in rows
         if s.get("alive") == 1 and s.get("rss_kb") is not None
     ]
     dropped = len(rows) - len(quarter)
-    gap_cap = min(
-        FINAL_QUARTER_MAX_GAP_S,
-        FINAL_QUARTER_GAP_INTERVALS * run["meta"].get("sample_interval", 30),
-    )
-    # Worst blind stretch inside the window, counting both edges: a series that
-    # starts late or stops early leaves the same hole as one that skips.
-    if quarter:
-        blind = max(
-            [quarter[0][0] - quarter_lo, t_end - quarter[-1][0]]
-            + [b[0] - a[0] for a, b in zip(quarter, quarter[1:])]
-        )
-    else:
-        blind = t_end - quarter_lo
+    spacings = [b["t"] - a["t"] for a, b in zip(scan, scan[1:])]
+    if scan:
+        spacings.append(t_end - scan[-1]["t"])
+    off_grid = [g for g in spacings if not tight <= g <= loose and g > 0]
+    widest = max(spacings) if spacings else (t_end - quarter_lo)
     fq = run["metrics"].setdefault("rss", {})
     fq["final_quarter"] = {
         "from_epoch": quarter_lo,
         "window_h": round(quarter_h, 2),
         "samples": len(quarter),
         "dropped_readings": dropped,
-        "worst_blind_gap_s": round(blind),
+        "grid_interval_s": interval,
+        "off_grid_spacings": len(off_grid),
+        "worst_spacing_s": round(widest),
         "slope_kb_per_h": None,
         "threshold_kb_per_h": FINAL_QUARTER_SLOPE_MAX_KB_H,
         "min_window_h": FINAL_QUARTER_MIN_SPAN_S / 3600.0,
-        "max_gap_s": gap_cap,
+        "max_gap_s": FINAL_QUARTER_MAX_GAP_S,
     }
 
     if t_end - quarter_lo < FINAL_QUARTER_MIN_SPAN_S:
@@ -528,7 +553,7 @@ def gate_resources(run: dict) -> list[dict]:
                 "evidence that RSS is flat.",
             }
         )
-    elif dropped or blind > gap_cap:
+    elif dropped or off_grid or widest > FINAL_QUARTER_MAX_GAP_S:
         # Long enough to judge, so the evidence is owed. Default-deny: a fitted
         # line through a series that does not cover the window is not a
         # measurement of that window.
@@ -536,20 +561,25 @@ def gate_resources(run: dict) -> list[dict]:
         if dropped:
             why.append(f"{dropped} of {len(rows)} recorded sample(s) are not live or carry no "
                        "RSS reading")
-        if blind > gap_cap:
+        if off_grid:
             why.append(
-                f"the worst unobserved stretch is {blind:.0f}s against a {gap_cap:.0f}s cap"
+                f"{len(off_grid)} spacing(s) are off the declared {interval}s grid "
+                f"(worst {max(off_grid):.0f}s, band {tight:.0f}-{loose:.0f}s)"
+            )
+        if widest > FINAL_QUARTER_MAX_GAP_S:
+            why.append(
+                f"the widest spacing is {widest:.0f}s, past the {FINAL_QUARTER_MAX_GAP_S}s "
+                "cadence the threshold is calibrated for"
             )
         findings.append(
             {
                 "gate": "G3b",
                 "status": "INVALID",
                 "detail": f"the final quarter is {quarter_h:.2f}h — long enough to judge — but the "
-                f"RSS series does not cover it: {'; '.join(why)}. A slope fitted through this "
-                "cannot see a leak hiding in the stretch it never looked at, is fitted at a "
-                "cadence the threshold is not calibrated for, and — where readings are missing "
-                "rather than merely coarse — is fitted to a subset that was not chosen "
-                "independently of the values it contains.",
+                f"RSS series is not the grid the harness scheduled: {'; '.join(why)}. A slope "
+                "fitted to a subset cannot see a leak hiding in what it skipped, and a subset "
+                "that was not chosen independently of the values it contains can invert the sign "
+                "of a real one.",
             }
         )
     else:
@@ -1029,14 +1059,39 @@ def self_test() -> int:
         analyse(synth(day, rss=lambda s: None if s == last_out else 50_000))["verdict"],
         "PASS",
     )
-    # Omitting the row entirely leaves no null to count, so the gap rule is what
-    # catches it: at a declared 30s cadence a 90s spacing means samples are
-    # missing, and that is exactly the spacing the phase-switch attack needs.
+    # Omitting the row entirely leaves no null to count, so the grid rule is
+    # what catches it: at a declared 30s cadence a 90s spacing means scheduled
+    # samples are missing, and that is the spacing a phase-switch attack needs.
     check(
         "whole sample rows omitted from the final quarter is INVALID",
         analyse(synth(day, omit=lambda s: s > last_out and s % 90 != 0))["verdict"],
         "INVALID",
     )
+    check(
+        "...including a single row at the window's leading edge",
+        analyse(synth(day, omit=lambda s: s == last_out + 30))["verdict"],
+        "INVALID",
+    )
+    # The attack a maximum-gap rule cannot see: switch sampling phase using ONE
+    # short catch-up spacing, and every gap stays under any cap while the fitted
+    # subset correlates with a periodic component of the values. Uniform spacing
+    # is what rejects it — the catch-up spacing is too SHORT for the grid.
+    def phase_switch(s: int) -> bool:
+        if s <= last_out:
+            return False
+        return (s % 90 != 30) if s < last_out + 8100 else (s % 90 != 0)
+
+    check(
+        "a mid-window sampling phase switch is INVALID",
+        analyse(synth(day, interval=30, omit=phase_switch))["verdict"],
+        "INVALID",
+    )
+    # An unreadable liveness flag must not silently shorten the timeline every
+    # later gate believes it judged.
+    odd_alive = synth(day)
+    for s in odd_alive["samples"][2200:]:
+        s["alive"] = 2
+    check("an alive flag that is neither 0 nor 1 is INVALID", analyse(odd_alive)["verdict"], "INVALID")
 
     # One late fire in a long run is noise and must not throw away 24h of data;
     # a systematic drift toward the 60s misattribution cliff must.
