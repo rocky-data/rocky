@@ -39,6 +39,26 @@ pub enum TableRefKind {
 pub enum ResolveError {
     #[error("failed to extract lineage from model '{model}': {reason}")]
     LineageExtraction { model: String, reason: String },
+
+    /// Every model whose SQL could not be parsed, not just the first.
+    ///
+    /// Resolution still fails as a whole — a project Rocky cannot parse is a
+    /// project it cannot reason about, and that contract is unchanged. What
+    /// changed is that it stops reporting one model per compile. A single
+    /// unsupported construct can account for most of a project's parse
+    /// failures (#1224), and fixing them one recompile at a time hides the
+    /// scale: the user sees "1 model failed" repeatedly instead of "112 models
+    /// failed, all on the same syntax".
+    #[error(
+        "{} model(s) failed to parse:\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .map(|(model, reason)| format!("  - {model}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )]
+    LineageExtractionMany { failures: Vec<(String, String)> },
 }
 
 /// Classify a table reference name based on its structure and known models.
@@ -85,6 +105,24 @@ pub fn resolve_dependencies(models: &[Model]) -> Result<ResolveOutput, ResolveEr
     let mut dag_nodes = Vec::with_capacity(models.len());
     let mut lineage_cache = HashMap::with_capacity(models.len());
     let mut diagnostics = Vec::new();
+
+    // Collect EVERY parse failure before returning, rather than propagating the
+    // first (#1224). Resolution still fails; the difference is that the user
+    // sees the whole set in one pass.
+    let mut parse_failures: Vec<(String, String)> = Vec::new();
+    for model in models {
+        if let Err(reason) = lineage::extract_lineage(&model.sql) {
+            parse_failures.push((model.config.name.clone(), reason));
+        }
+    }
+    if !parse_failures.is_empty() {
+        // Deterministic order: the same project must produce the same message
+        // twice, and a set that changes order between runs is unreadable in CI.
+        parse_failures.sort();
+        return Err(ResolveError::LineageExtractionMany {
+            failures: parse_failures,
+        });
+    }
 
     for model in models {
         let lineage_result = lineage::extract_lineage(&model.sql).map_err(|reason| {
@@ -216,6 +254,46 @@ mod tests {
             file_path: format!("models/{name}.sql"),
             contract_path: None,
         }
+    }
+
+    /// #1224: every unparseable model is reported, not just the first.
+    ///
+    /// Resolution still fails as a whole — that contract is unchanged. But a
+    /// single unsupported construct can account for most of a real project's
+    /// parse failures, and reporting one per compile hides the scale: the user
+    /// fixes one, recompiles, and meets the next.
+    #[test]
+    fn every_unparseable_model_is_reported_not_just_the_first() {
+        // `SELECT * EXCEPT (...)` is the construct #1224 is about; any SQL the
+        // parser rejects exercises the same path.
+        let models = vec![
+            make_model("a", "SELECT * EXCEPT (x) FROM raw.t"),
+            make_model("ok", "SELECT 1 AS id"),
+            make_model("b", "SELECT * EXCEPT (y) FROM raw.t"),
+        ];
+
+        let err = resolve_dependencies(&models).expect_err("unparseable SQL must fail resolution");
+        let ResolveError::LineageExtractionMany { failures } = &err else {
+            panic!("expected the multi-failure variant, got {err:?}");
+        };
+
+        let names: Vec<&str> = failures.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["a", "b"],
+            "both failures reported, sorted for a deterministic message; the \
+             parseable model contributes nothing"
+        );
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("2 model(s) failed to parse"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- a:") && rendered.contains("- b:"),
+            "{rendered}"
+        );
     }
 
     fn make_model_with_deps(name: &str, sql: &str, deps: Vec<&str>) -> Model {
