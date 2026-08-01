@@ -236,6 +236,10 @@ pub enum TickSkipReason {
     NotDue,
     /// The schedule is disabled (`enabled = false`).
     Disabled,
+    /// The pipeline is paused at runtime (`ScheduleStateRecord.paused`) —
+    /// the state-level hold that reaches a RUNNING scheduler, unlike a
+    /// config edit. Recorded every tick until resumed.
+    Paused,
     /// A claim is `submitted` for this key (a run is in flight, or its crashed
     /// owner is still within the recovery grace) — do not spawn over it.
     InFlight,
@@ -861,6 +865,7 @@ fn map_skip(pipeline: &str, skip: &SourceSkip) -> Option<SkippedDemand> {
     let reason = match &skip.reason {
         SkipReason::NotDue | SkipReason::Superseded => return None,
         SkipReason::Disabled => TickSkipReason::Disabled,
+        SkipReason::Paused => TickSkipReason::Paused,
         SkipReason::CatchupSkipped { missed } => TickSkipReason::CatchupSkipped { missed: *missed },
         SkipReason::FailureBackoff { resume_at } => TickSkipReason::FailureBackoff {
             resume_at: *resume_at,

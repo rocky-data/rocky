@@ -175,6 +175,7 @@ pub const SCHEDULER_OUTCOMES: &[&str] = &[
 pub const SCHEDULER_SKIP_REASONS: &[&str] = &[
     "not_due",
     "disabled",
+    "paused",
     "in_flight",
     "catchup_skipped",
     "failure_backoff",

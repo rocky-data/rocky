@@ -41,6 +41,14 @@ pub struct ScheduleStateRecord {
     /// consulted by the outcome-aware throttle.
     #[serde(default)]
     pub last_attempt_outcome: Option<String>,
+    /// Runtime hold: `true` suppresses every demand source for this pipeline
+    /// until resumed, with a `paused` skip recorded each tick. Durable — it
+    /// survives scheduler restarts — and deliberately state-level, not config:
+    /// a running `serve --scheduler` holds ONE fingerprinted config snapshot,
+    /// so a config edit cannot reach it, while this flag can. The config-level
+    /// sibling is `[schedule] enabled = false` (a different skip reason).
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// The cross-tick backoff ceiling: failure backoff never exceeds this.

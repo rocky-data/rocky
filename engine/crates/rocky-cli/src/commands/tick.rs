@@ -378,6 +378,7 @@ fn map_source_skip(skip: &SourceSkip) -> SourceEvaluation {
     let (reason, resume_at, missed) = match &skip.reason {
         SkipReason::NotDue => ("not_due", None, None),
         SkipReason::Disabled => ("disabled", None, None),
+        SkipReason::Paused => ("paused", None, None),
         SkipReason::CatchupSkipped { missed } => ("catchup_skipped", None, Some(*missed)),
         SkipReason::FailureBackoff { resume_at } => ("failure_backoff", Some(*resume_at), None),
         SkipReason::PartialBackoff { resume_at } => ("partial_backoff", Some(*resume_at), None),
@@ -399,6 +400,7 @@ fn map_tick_skip_reason(
     match reason {
         TickSkipReason::NotDue => ("not_due", None, None),
         TickSkipReason::Disabled => ("disabled", None, None),
+        TickSkipReason::Paused => ("paused", None, None),
         TickSkipReason::InFlight => ("in_flight", None, None),
         TickSkipReason::CatchupSkipped { missed } => ("catchup_skipped", None, Some(*missed)),
         TickSkipReason::FailureBackoff { resume_at } => ("failure_backoff", Some(*resume_at), None),

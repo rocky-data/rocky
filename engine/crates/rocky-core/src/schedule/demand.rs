@@ -194,6 +194,8 @@ pub enum SkipReason {
     NotDue,
     /// The schedule is disabled (`enabled = false`).
     Disabled,
+    /// The pipeline is paused at runtime (`ScheduleStateRecord.paused`).
+    Paused,
     /// More than one cron occurrence elapsed and `catchup = "skip"`: the anchor
     /// advanced, nothing ran.
     CatchupSkipped {
@@ -506,6 +508,18 @@ pub fn evaluate_one(
     }
 
     let cursor = state.get(&schedule.pipeline);
+
+    // Runtime hold — the state-level sibling of `enabled = false`, checked
+    // after the cursor fetch because that is where it lives. Suppresses every
+    // demand source, is recorded every tick (a paused pipeline must never be
+    // metrically identical to a healthy-idle one), and holds until resumed.
+    if cursor.paused {
+        out.skips.push(SourceSkip {
+            source: DemandKind::Cron,
+            reason: SkipReason::Paused,
+        });
+        return out;
+    }
 
     // --- cron (highest priority) --------------------------------------------
     if let Some((expr, tz)) = &schedule.cron {
@@ -1153,6 +1167,57 @@ mod tests {
         let e = evaluate_one(&s, &states, &History::default(), ts(2026, 6, 1, 4, 0));
         assert!(e.due.is_none());
         assert!(e.skips.iter().any(|k| k.reason == SkipReason::Disabled));
+    }
+
+    /// The runtime hold: a paused cursor suppresses every demand source and
+    /// records a `Paused` skip — a paused pipeline is never metrically
+    /// identical to a healthy-idle one.
+    #[test]
+    fn paused_schedule_produces_no_demand_and_records_the_skip() {
+        let s = cron_schedule("raw", Catchup::Latest);
+        let mut states = States::default();
+        states.0.insert(
+            "raw".into(),
+            ScheduleStateRecord {
+                last_fire_logical_ts: Some(ts(2026, 5, 1, 3, 0).to_rfc3339()),
+                paused: true,
+                ..Default::default()
+            },
+        );
+        let e = evaluate_one(&s, &states, &History::default(), ts(2026, 6, 1, 4, 0));
+        assert!(e.due.is_none(), "a paused pipeline must produce no demand");
+        assert!(e.skips.iter().any(|k| k.reason == SkipReason::Paused));
+    }
+
+    /// The hold releases: the identical evaluation with `paused` cleared is
+    /// due again — proving the skip came from the flag, nothing else.
+    #[test]
+    fn resuming_a_paused_schedule_restores_demand() {
+        let s = cron_schedule("raw", Catchup::Latest);
+        let record = ScheduleStateRecord {
+            last_fire_logical_ts: Some(ts(2026, 5, 1, 3, 0).to_rfc3339()),
+            paused: true,
+            ..Default::default()
+        };
+        let mut paused_states = States::default();
+        paused_states.0.insert("raw".into(), record.clone());
+        let when = ts(2026, 6, 1, 4, 0);
+        let held = evaluate_one(&s, &paused_states, &History::default(), when);
+        assert!(held.due.is_none());
+
+        let mut resumed_states = States::default();
+        resumed_states.0.insert(
+            "raw".into(),
+            ScheduleStateRecord {
+                paused: false,
+                ..record
+            },
+        );
+        let released = evaluate_one(&s, &resumed_states, &History::default(), when);
+        assert!(
+            released.due.is_some(),
+            "clearing paused must restore the overdue demand"
+        );
     }
 
     // --- freshness budget resolution ----------------------------------------

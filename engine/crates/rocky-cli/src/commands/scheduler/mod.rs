@@ -477,6 +477,7 @@ fn skip_reason_label(reason: &TickSkipReason) -> &'static str {
     match reason {
         TickSkipReason::NotDue => "not_due",
         TickSkipReason::Disabled => "disabled",
+        TickSkipReason::Paused => "paused",
         TickSkipReason::InFlight => "in_flight",
         TickSkipReason::CatchupSkipped { .. } => "catchup_skipped",
         TickSkipReason::FailureBackoff { .. } => "failure_backoff",
@@ -1020,6 +1021,7 @@ cron = "* * * * *"
             TickSkipReason::ConfigError,
             TickSkipReason::HistoryUnavailable,
             TickSkipReason::StateBusy,
+            TickSkipReason::Paused,
         ];
         for reason in &all {
             // Exhaustiveness guard: a new variant fails to compile here.
@@ -1033,7 +1035,8 @@ cron = "* * * * *"
                 | TickSkipReason::Dedup
                 | TickSkipReason::ConfigError
                 | TickSkipReason::HistoryUnavailable
-                | TickSkipReason::StateBusy => {}
+                | TickSkipReason::StateBusy
+                | TickSkipReason::Paused => {}
             }
             let label = skip_reason_label(reason);
             assert!(
