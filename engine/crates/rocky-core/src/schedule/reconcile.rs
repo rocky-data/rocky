@@ -2866,7 +2866,7 @@ adapter = "db"
         // facts — pipeline, source, exit — and pointer commands, no prose.
         let bundles: Vec<_> = std::fs::read_dir(opts.rocky_dir.join("incidents"))
             .expect("incidents dir exists after a failure")
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .collect();
         assert_eq!(bundles.len(), 1, "exactly one incident for one failure");
         let bundle: crate::schedule::incidents::IncidentBundle =

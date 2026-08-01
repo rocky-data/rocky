@@ -7592,6 +7592,48 @@ pub struct BriefOutput {
     /// Autonomy-budget degradations and active policy freezes — the dynamic
     /// tightening currently in force across the estate.
     pub autonomy: BriefAutonomySection,
+    /// The resident scheduler: runtime holds, consecutive failures,
+    /// scheduler-triggered runs in the window, and incident bundles.
+    pub scheduler: BriefSchedulerSection,
+}
+
+/// Scheduler section — a *current-state* projection over the schedule cursors
+/// plus the window's scheduler-triggered runs and the incident directory.
+///
+/// Fails closed: `unavailable` when the state store or incidents directory
+/// cannot be read, `no_data` when nothing is scheduled. Never a smoothed
+/// narrative — a paused pipeline or a climbing failure count is the point.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefSchedulerSection {
+    pub availability: SectionAvailability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Pipelines carrying a schedule cursor.
+    pub scheduled_pipelines: u64,
+    /// Pipelines under a runtime hold (`rocky state schedule pause`), by name.
+    pub paused: Vec<String>,
+    /// Pipelines with a nonzero consecutive-failure count, worst first.
+    pub consecutive_failures: Vec<BriefSchedulerFailureEntry>,
+    /// Scheduler-spawned runs inside the digest window (trigger `schedule`
+    /// or `webhook` — both flow through the resident scheduler's claim
+    /// machine).
+    pub runs_in_window: u64,
+    /// ...of which failed.
+    pub failed_in_window: u64,
+    /// Incident bundles currently retained on disk.
+    pub incident_count: u64,
+    /// The newest incident bundle, as a project-relative path
+    /// (`.rocky/incidents/<name>`), when any exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_incident: Option<String>,
+}
+
+/// One pipeline's consecutive-failure standing inside
+/// [`BriefSchedulerSection`].
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct BriefSchedulerFailureEntry {
+    pub pipeline: String,
+    pub consecutive_failures: u32,
 }
 
 /// Autonomy section — rules whose autonomy budget is currently exhausted

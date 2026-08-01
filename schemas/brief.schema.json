@@ -684,6 +684,93 @@
       ],
       "type": "object"
     },
+    "BriefSchedulerFailureEntry": {
+      "description": "One pipeline's consecutive-failure standing inside [`BriefSchedulerSection`].",
+      "properties": {
+        "consecutive_failures": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "pipeline": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "consecutive_failures",
+        "pipeline"
+      ],
+      "type": "object"
+    },
+    "BriefSchedulerSection": {
+      "description": "Scheduler section — a *current-state* projection over the schedule cursors plus the window's scheduler-triggered runs and the incident directory.\n\nFails closed: `unavailable` when the state store or incidents directory cannot be read, `no_data` when nothing is scheduled. Never a smoothed narrative — a paused pipeline or a climbing failure count is the point.",
+      "properties": {
+        "availability": {
+          "$ref": "#/definitions/SectionAvailability"
+        },
+        "consecutive_failures": {
+          "description": "Pipelines with a nonzero consecutive-failure count, worst first.",
+          "items": {
+            "$ref": "#/definitions/BriefSchedulerFailureEntry"
+          },
+          "type": "array"
+        },
+        "failed_in_window": {
+          "description": "...of which failed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "incident_count": {
+          "description": "Incident bundles currently retained on disk.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "latest_incident": {
+          "description": "The newest incident bundle, as a project-relative path (`.rocky/incidents/<name>`), when any exist.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paused": {
+          "description": "Pipelines under a runtime hold (`rocky state schedule pause`), by name.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "runs_in_window": {
+          "description": "Scheduler-spawned runs inside the digest window (trigger `schedule` or `webhook` — both flow through the resident scheduler's claim machine).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "scheduled_pipelines": {
+          "description": "Pipelines carrying a schedule cursor.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "availability",
+        "consecutive_failures",
+        "failed_in_window",
+        "incident_count",
+        "paused",
+        "runs_in_window",
+        "scheduled_pipelines"
+      ],
+      "type": "object"
+    },
     "BriefSinceMode": {
       "description": "How the digest window was resolved.",
       "oneOf": [
@@ -944,6 +1031,14 @@
       ],
       "description": "Pipeline runs in the window, with the ones needing attention listed."
     },
+    "scheduler": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/BriefSchedulerSection"
+        }
+      ],
+      "description": "The resident scheduler: runtime holds, consecutive failures, scheduler-triggered runs in the window, and incident bundles."
+    },
     "since_mode": {
       "allOf": [
         {
@@ -974,6 +1069,7 @@
     "generated_at",
     "quality",
     "runs",
+    "scheduler",
     "since_mode",
     "version"
   ],

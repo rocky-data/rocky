@@ -76,7 +76,7 @@ pub fn write_incident(rocky_dir: &Path, bundle: &IncidentBundle) -> io::Result<P
 /// Keep the newest [`INCIDENTS_KEPT`] bundles; names sort chronologically.
 fn sweep(dir: &Path) -> io::Result<()> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
+        .filter_map(Result::ok)
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("json"))
         .collect();
@@ -147,7 +147,7 @@ mod tests {
         }
         let files: Vec<_> = std::fs::read_dir(tmp.path().join("incidents"))
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(Result::ok)
             .collect();
         assert_eq!(files.len(), INCIDENTS_KEPT);
     }

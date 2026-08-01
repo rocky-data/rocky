@@ -90,6 +90,10 @@ export interface BriefOutput {
    */
   runs: BriefRunsSection;
   /**
+   * The resident scheduler: runtime holds, consecutive failures, scheduler-triggered runs in the window, and incident bundles.
+   */
+  scheduler: BriefSchedulerSection;
+  /**
    * How the window was resolved.
    */
   since_mode: BriefSinceMode;
@@ -413,5 +417,51 @@ export interface BriefRunEntry {
 export interface BriefFailedModel {
   model_name: string;
   status: string;
+  [k: string]: unknown;
+}
+/**
+ * Scheduler section — a *current-state* projection over the schedule cursors plus the window's scheduler-triggered runs and the incident directory.
+ *
+ * Fails closed: `unavailable` when the state store or incidents directory cannot be read, `no_data` when nothing is scheduled. Never a smoothed narrative — a paused pipeline or a climbing failure count is the point.
+ */
+export interface BriefSchedulerSection {
+  availability: SectionAvailability;
+  /**
+   * Pipelines with a nonzero consecutive-failure count, worst first.
+   */
+  consecutive_failures: BriefSchedulerFailureEntry[];
+  /**
+   * ...of which failed.
+   */
+  failed_in_window: number;
+  /**
+   * Incident bundles currently retained on disk.
+   */
+  incident_count: number;
+  /**
+   * The newest incident bundle, as a project-relative path (`.rocky/incidents/<name>`), when any exist.
+   */
+  latest_incident?: string | null;
+  note?: string | null;
+  /**
+   * Pipelines under a runtime hold (`rocky state schedule pause`), by name.
+   */
+  paused: string[];
+  /**
+   * Scheduler-spawned runs inside the digest window (trigger `schedule` or `webhook` — both flow through the resident scheduler's claim machine).
+   */
+  runs_in_window: number;
+  /**
+   * Pipelines carrying a schedule cursor.
+   */
+  scheduled_pipelines: number;
+  [k: string]: unknown;
+}
+/**
+ * One pipeline's consecutive-failure standing inside [`BriefSchedulerSection`].
+ */
+export interface BriefSchedulerFailureEntry {
+  consecutive_failures: number;
+  pipeline: string;
   [k: string]: unknown;
 }

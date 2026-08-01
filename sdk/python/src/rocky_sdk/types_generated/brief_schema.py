@@ -132,6 +132,15 @@ class BriefRunEntry(BaseModel):
     trigger: str
 
 
+class BriefSchedulerFailureEntry(BaseModel):
+    """
+    One pipeline's consecutive-failure standing inside [`BriefSchedulerSection`].
+    """
+
+    consecutive_failures: conint(ge=0)
+    pipeline: str
+
+
 class BriefSinceMode1(StrEnum):
     """
     Everything recorded since the previous `--since last` digest (the stored cursor). Advances the cursor on success.
@@ -578,6 +587,50 @@ class BriefRunsSection(BaseModel):
     total: conint(ge=0)
 
 
+class BriefSchedulerSection(BaseModel):
+    """
+    Scheduler section — a *current-state* projection over the schedule cursors plus the window's scheduler-triggered runs and the incident directory.
+
+    Fails closed: `unavailable` when the state store or incidents directory cannot be read, `no_data` when nothing is scheduled. Never a smoothed narrative — a paused pipeline or a climbing failure count is the point.
+    """
+
+    availability: SectionAvailability7 | SectionAvailability8 | SectionAvailability9
+    """
+    Whether a brief section's underlying query succeeded and had data.
+
+    The digest is composed section-by-section from independent typed queries over the state store and the decision ledger. Each section fails closed: a query that returns nothing renders as [`SectionAvailability::NoData`], and a source that is not wired into the state store at all renders as [`SectionAvailability::Unavailable`] with a note — never as a smoothed-over "all clear". A brief that claims more than the ledger holds poisons the whole surface, so the marker is machine-readable, not prose.
+    """
+    consecutive_failures: list[BriefSchedulerFailureEntry]
+    """
+    Pipelines with a nonzero consecutive-failure count, worst first.
+    """
+    failed_in_window: conint(ge=0)
+    """
+    ...of which failed.
+    """
+    incident_count: conint(ge=0)
+    """
+    Incident bundles currently retained on disk.
+    """
+    latest_incident: str | None = None
+    """
+    The newest incident bundle, as a project-relative path (`.rocky/incidents/<name>`), when any exist.
+    """
+    note: str | None = None
+    paused: list[str]
+    """
+    Pipelines under a runtime hold (`rocky state schedule pause`), by name.
+    """
+    runs_in_window: conint(ge=0)
+    """
+    Scheduler-spawned runs inside the digest window (trigger `schedule` or `webhook` — both flow through the resident scheduler's claim machine).
+    """
+    scheduled_pipelines: conint(ge=0)
+    """
+    Pipelines carrying a schedule cursor.
+    """
+
+
 class BriefAgentActivitySection(BaseModel):
     """
     Agent-activity section — the policy-decision ledger rolled up by principal.
@@ -647,6 +700,10 @@ class BriefOutput(BaseModel):
     runs: BriefRunsSection
     """
     Pipeline runs in the window, with the ones needing attention listed.
+    """
+    scheduler: BriefSchedulerSection
+    """
+    The resident scheduler: runtime holds, consecutive failures, scheduler-triggered runs in the window, and incident bundles.
     """
     since_mode: BriefSinceMode1 | BriefSinceMode2 | BriefSinceMode3
     """

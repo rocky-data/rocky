@@ -221,7 +221,7 @@ The `preset` gives you a service-shaped body (Slack Block Kit here) for free; se
 
 ### A richer digest with rocky brief
 
-For an email or Slack message that carries more than "it failed" (recent runs, drift, freshness, quality, and cost), use a command hook that renders [`rocky brief`](/reference/commands/administration/) and delivers it. `brief --output md` produces a Slack- and email-ready Markdown document:
+For an email or Slack message that carries more than "it failed" (recent runs, drift, freshness, quality, cost, and — when the scheduler is in use — holds, failure streaks, and incidents), use a command hook that renders [`rocky brief`](/reference/commands/administration/) and delivers it. `brief --output md` produces a Slack- and email-ready Markdown document:
 
 ```toml
 # rocky.toml
@@ -466,6 +466,12 @@ rocky tick --dry-run --now 2026-05-02T03:00:00Z --output json
 One honesty note worth internalizing: **exit `0` does not mean the estate is healthy.** After the tick that first observes a failure, a broken pipeline goes into `failure_backoff` — subsequent ticks correctly *skip* it (so they do not hammer it every minute) and therefore exit `0`. The ongoing problem lives in the tick's JSON, not its exit code: each suppressed demand appears in `skipped[]` with a reason (`failure_backoff`, `partial_backoff`) and a `resume_at`, and `counts` plus the `consecutive_failures` metric carry the running total. Alert on those, and on the [scheduler metrics](/guides/observability/), not on exit codes alone.
 
 A tick can also come back exit `0` having done nothing because another `rocky` process — a manual `rocky run`, or its own child from a still-running prior tick — held the state store when it tried to open it. That shows up as a single `state_busy` entry in `skipped[]`. One is normal contention and self-heals on the next tick; a `state_busy` on every tick for many minutes means a wedged writer holding the store, and is worth an alert.
+
+### Incident bundles
+
+When a scheduled run finalizes as a failure, the reconciler writes one JSON file under `.rocky/incidents/` — the structured facts of that incident, no narration: the pipeline, the demand source (`cron`, `after`, `freshness`, `webhook`), the occurrence it was for, the submission id, the exit code, the attempt count, the consecutive-failure count after this failure, and a list of retrieval commands (`rocky history`, `rocky trace`) that pull the full context. Drain-time interruptions do not produce bundles — a graceful shutdown is not an incident. The newest 50 are kept; older files are swept on each write.
+
+The point of the format is that whoever picks up the page — a human or an agent — starts from citations instead of re-deriving what happened. `rocky brief` surfaces the count and the newest bundle's path in its Scheduler section, so the digest a failure hook posts already points at the file to open.
 
 ## Where to go next
 
