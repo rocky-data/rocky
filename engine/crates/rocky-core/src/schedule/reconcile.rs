@@ -635,6 +635,30 @@ async fn consume_webhook_demands(
             continue;
         }
 
+        // The runtime hold gates webhooks too — a paused pipeline DEFERS its
+        // spooled demands rather than executing them (the bypass the #1334
+        // red team confirmed) and rather than dropping them: the file stays
+        // PENDING, unconsumed, so an accepted (202'd) delivery fires on
+        // resume instead of vanishing. Recorded as a skip each tick, like
+        // every other suppressed source. A cursor read failure falls through
+        // to normal consumption — fail-open on the READ here would hold every
+        // webhook hostage to a transient store error, and the pause check
+        // re-runs next tick.
+        let paused = phase
+            .store()
+            .get_schedule_state(&demand_record.pipeline)
+            .ok()
+            .flatten()
+            .is_some_and(|cursor| cursor.paused);
+        if paused {
+            report.skipped.push(SkippedDemand {
+                pipeline: demand_record.pipeline.clone(),
+                source: Some(DemandKind::Webhook),
+                reason: TickSkipReason::Paused,
+            });
+            continue;
+        }
+
         // Id-dedup authority: a tombstone means this delivery id already ran.
         // Drop the (duplicate) pending file without running.
         if demand_record.kind == WebhookKind::Id && spool::is_tombstoned(&path) {
@@ -2634,6 +2658,66 @@ adapter = "db"
             crate::schedule::spool::AcceptOutcome::Created(uid) => uid,
             crate::schedule::spool::AcceptOutcome::Duplicate => panic!("expected a fresh accept"),
         }
+    }
+
+    /// The #1334 red team's confirmed bypass, pinned at the tick level: a
+    /// paused pipeline must DEFER its spooled webhook demands — no execution,
+    /// the pending file untouched (an accepted 202'd delivery is never
+    /// dropped), a `paused` skip recorded — and resuming fires exactly the
+    /// deferred demand. The demand-level pause tests structurally cannot
+    /// catch this: webhook consumption constructs its demand outside
+    /// `evaluate_one`'s gate.
+    #[test]
+    fn a_paused_pipeline_defers_spooled_webhooks_and_resume_fires_them() {
+        let (state_path, _dir, opts) = temp_env();
+        let config = cfg(WEBHOOK_TARGETS);
+        accept_and_read_uid(&opts.rocky_dir, "raw", spool::WebhookKind::Id, "evt-hold");
+        with_store(&state_path, |store| {
+            store.set_schedule_paused("raw", true).unwrap();
+        });
+
+        let spawner = CapturingSpawner::new(0);
+        let report = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                webhook_now(),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+
+        assert_eq!(spawner.run_count(), 0, "a paused pipeline must not fire");
+        assert!(report.executed.is_empty());
+        assert!(
+            report.skipped.iter().any(|s| s.pipeline == "raw"
+                && s.source == Some(DemandKind::Webhook)
+                && s.reason == TickSkipReason::Paused),
+            "the deferral must be recorded, not silent: {:?}",
+            report.skipped
+        );
+        assert_eq!(
+            spool::list_pending_files(&opts.rocky_dir).unwrap().len(),
+            1,
+            "the accepted delivery must stay PENDING — deferred, never dropped"
+        );
+
+        // Resume → the deferred demand fires exactly once.
+        with_store(&state_path, |store| {
+            store.set_schedule_paused("raw", false).unwrap();
+        });
+        let report2 = rt()
+            .block_on(tick_once(
+                &config,
+                &state_path,
+                webhook_now(),
+                &spawner,
+                &opts,
+            ))
+            .unwrap();
+        assert_eq!(spawner.run_count(), 1, "resume fires the deferred demand");
+        assert_eq!(report2.executed.len(), 1);
+        assert_eq!(report2.executed[0].source, DemandKind::Webhook);
     }
 
     /// A spooled webhook demand fires its pipeline exactly once and disposes the

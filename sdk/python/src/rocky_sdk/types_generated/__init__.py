@@ -299,6 +299,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "ScheduleLockStatus": ("schedule_status_schema", "ScheduleLockStatus"),
     "SchedulePipelineStatus": ("schedule_status_schema", "SchedulePipelineStatus"),
     "ScheduleStatusCounts": ("schedule_status_schema", "ScheduleStatusCounts"),
+    "ScheduleHoldOutput": ("state_schedule_hold_schema", "ScheduleHoldOutput"),
     "ScheduleStatusOutput": ("schedule_status_schema", "ScheduleStatusOutput"),
     "ScheduleThrottleStatus": ("schedule_status_schema", "ScheduleThrottleStatus"),
     "ScorecardGroup": ("audit_scorecard_schema", "ScorecardGroup"),
@@ -727,6 +728,9 @@ if TYPE_CHECKING:
         SeedOutput,
         SeedTableOutput,
     )
+    from .state_schedule_hold_schema import (
+        ScheduleHoldOutput,
+    )
     from .load_schema import (
         ContractResult,
         ContractViolation,
@@ -996,6 +1000,7 @@ __all__ = [
     "ScheduleLockStatus",
     "SchedulePipelineStatus",
     "ScheduleStatusCounts",
+    "ScheduleHoldOutput",
     "ScheduleStatusOutput",
     "ScheduleThrottleStatus",
     "ScorecardGroup",
