@@ -2011,6 +2011,90 @@ mod tests {
         assert!(out.column_lineage.is_empty());
     }
 
+    /// #1320: a compile failure must be distinguishable from "no lineage".
+    ///
+    /// The tolerance is deliberate and stays — a lineage-only problem must not
+    /// break `rocky dag` itself. What it may not do is report the failure as
+    /// an *answer*: a consumer reading zero edges off a project Rocky cannot
+    /// parse would conclude there is nothing to trace.
+    #[tokio::test]
+    async fn dag_column_lineage_says_so_when_the_compile_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("transforms");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Valid sidecar, SQL the parser cannot read.
+        std::fs::write(root.join("broken.sql"), "this is not sql at all ;;; ((").unwrap();
+        std::fs::write(
+            root.join("broken.toml"),
+            "name = \"broken\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"broken\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let state_path = pinned_state_path(dir.path());
+
+        let out = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("a lineage-only compile failure must not fail `rocky dag`");
+
+        assert!(out.column_lineage.is_empty());
+        assert!(
+            out.column_lineage_unavailable.is_some(),
+            "an unparseable project must not report zero edges as an answer"
+        );
+
+        // And `rocky dag` without `--column-lineage` is untouched: the
+        // tolerance this guards is that a lineage problem cannot break the DAG.
+        let plain = dag_output(&config_path, &state_path, None, None, None, false, None)
+            .expect("the DAG itself must still build");
+        assert!(
+            plain.column_lineage_unavailable.is_none(),
+            "not asking for lineage is not the same as lineage being unavailable"
+        );
+    }
+
+    /// The control: a project that genuinely has no lineage says nothing is
+    /// wrong, so the flag above means what it claims.
+    #[tokio::test]
+    async fn dag_column_lineage_reports_available_when_it_really_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("transforms");
+        std::fs::create_dir_all(&root).unwrap();
+        // One model, no upstream — compiles fine, produces no lineage edge.
+        std::fs::write(root.join("solo.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            root.join("solo.toml"),
+            "name = \"solo\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"solo\"\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter]\ntype = \"duckdb\"\npath = \"test.duckdb\"\n\n\
+             [pipeline.p]\ntype = \"transformation\"\nmodels = \"transforms/**\"\n\n\
+             [pipeline.p.target.governance]\nauto_create_schemas = true\n",
+        )
+        .unwrap();
+        let state_path = pinned_state_path(dir.path());
+
+        let out = dag_output(&config_path, &state_path, None, None, None, true, None)
+            .expect("a healthy project must compile");
+        assert!(
+            out.column_lineage_unavailable.is_none(),
+            "a compile that succeeded must report its empty lineage as an answer"
+        );
+    }
+
     /// `--column-lineage` must not fail on the ordinary nested layout: staging
     /// models one level down feeding marts at the root.
     ///
@@ -2145,22 +2229,36 @@ mod tests {
         (dir, config_path)
     }
 
-    /// Split model roots yield no column lineage, and must not fail the command.
+    /// Split model roots now yield real column lineage.
     ///
-    /// The compiler reads one root (#1262) and there is no root covering both,
-    /// so there are no edges to report. An earlier revision raised a hard error
-    /// here; that broke projects which previously succeeded, and recommended a
-    /// `--models <dir>` workaround that is itself refused for exactly these
-    /// projects. Correctness belongs in #1262 — compiling the DAG's own model
-    /// set instead of re-reading one directory — not in a refusal here.
+    /// This used to assert *empty*, on the reasoning that the compiler reads
+    /// one root and none covers both. That reasoning expired: lineage compiles
+    /// the DAG's own model set rather than re-reading a directory, so a set
+    /// spanning several roots is as compilable as one from a single root. The
+    /// old behaviour deferred correctness to #1262, which has since closed —
+    /// leaving cross-pipeline lineage silently dropped for no live reason.
+    ///
+    /// The fixture is built for exactly this: `fct` in the gold root reads
+    /// `stg` from the silver root.
     #[tokio::test]
-    async fn dag_column_lineage_is_empty_across_split_model_roots() {
+    async fn dag_column_lineage_spans_split_model_roots() {
         let (dir, config_path) = split_root_dag_project();
         let state_path = pinned_state_path(dir.path());
 
         let out = dag_output(&config_path, &state_path, None, None, None, true, None)
             .expect("split model roots must not fail `--column-lineage`");
-        assert!(out.column_lineage.is_empty());
+        assert!(
+            out.column_lineage_unavailable.is_none(),
+            "several roots is no longer a reason lineage cannot be computed: {:?}",
+            out.column_lineage_unavailable
+        );
+        assert!(
+            out.column_lineage
+                .iter()
+                .any(|e| e.source.model == "stg" && e.target.model == "fct"),
+            "the cross-ROOT column edge must be reported, not dropped: {:?}",
+            out.column_lineage
+        );
 
         // The DAG itself — the thing #1261 is actually about — is complete, with
         // a node from each root and the cross-pipeline edge between them.

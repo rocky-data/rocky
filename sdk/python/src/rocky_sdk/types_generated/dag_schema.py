@@ -385,6 +385,16 @@ class DagOutput(BaseModel):
     """
     Column-level lineage edges across all models. Only populated when `--column-lineage` is passed; empty otherwise.
     """
+    column_lineage_unavailable: str | None = None
+    """
+    Why `column_lineage` is **not** an answer, when it is not one.
+
+    An empty `column_lineage` used to mean two different things with no way to tell them apart: a project that genuinely has no column-level lineage, and a project whose lineage could not be computed. A consumer reading zero edges off a project Rocky failed to parse would conclude there is nothing to trace (#1320).
+
+    `None` means the list is authoritative **for a run that asked for lineage** — including when it is empty, which is the complete answer for a project with no transformation models. `Some` carries a human-readable reason and means the list must not be read as "no lineage".
+
+    Without `--column-lineage` this stays `None` and the list stays empty, because nothing was computed and nothing failed. A consumer that did not request lineage cannot conclude anything from either field — it knows whether it passed the flag.
+    """
     command: str
     edges: list[DagEdgeOutput]
     """
