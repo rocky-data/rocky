@@ -484,7 +484,32 @@ def gate_resources(run: dict) -> list[dict]:
     rss_slope = ols_slope_per_hour(
         [(s["t"], float(s["rss_kb"])) for s in samples if s.get("rss_kb") is not None and s["t"] >= warm]
     )
-    if base_rss and tail_rss:
+    # `is not None`, not truthiness — and an explicit INVALID when a window is
+    # empty, matching what G4 does. A missing RSS reading is not a small RSS
+    # reading: `median` returns None for an empty window, so the truthiness
+    # form let a run with no baseline or no final-hour readings skip this gate
+    # in silence and still report PASS. G3b guards its own window the same way;
+    # G3a was the last gate that could quietly not run.
+    if base_rss is None or tail_rss is None:
+        missing = [
+            label
+            for label, value in (
+                ("baseline (first hour after warmup)", base_rss),
+                ("final hour", tail_rss),
+            )
+            if value is None
+        ]
+        findings.append(
+            {
+                "gate": "G3a",
+                "status": "INVALID",
+                "detail": "RSS growth gate could not evaluate — no rss_kb readings "
+                f"in the {' or the '.join(missing)} window; sampling stopped or "
+                "the process was not observable. A verdict that never weighed "
+                "the RSS gate is not a soak PASS.",
+            }
+        )
+    else:
         growth_pct = (tail_rss - base_rss) / base_rss * 100.0
         delta_mb = (tail_rss - base_rss) / 1024.0
         run["metrics"]["rss"] = {
@@ -984,6 +1009,17 @@ def self_test() -> int:
     # The control guards the check above against passing for an unrelated
     # reason: the same 24h fixture with fd intact must still PASS outright.
     check("the 24h fixture itself passes with fd intact", analyse(synth(1440))["verdict"], "PASS")
+
+    # Same shape for RSS: G3a used truthiness, not `is not None`, so an empty
+    # window made it skip in silence while the run still reported PASS. That is
+    # the asymmetry the fd gate above already closed — a verdict that never
+    # weighed the RSS growth gate is not a soak PASS.
+    rss_outage = synth(1440)
+    rss_lo = rss_outage["samples"][-1]["t"] - 3600
+    for s in rss_outage["samples"]:
+        if s["t"] >= rss_lo:
+            s["rss_kb"] = None
+    check("rss outage across the tail window is INVALID", analyse(rss_outage)["verdict"], "INVALID")
 
     # The regression this guards: a two-sided G6 equality would FAIL here, on a
     # path the reconciler documents as benign and the harness itself induces.
