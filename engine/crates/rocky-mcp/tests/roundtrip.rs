@@ -98,6 +98,7 @@ async fn tools_list_returns_expected_set() {
             "list",
             "metrics",
             "optimize",
+            "pause_schedule",
             "plan_preview",
             "profile_column",
             "propose",

@@ -3316,6 +3316,36 @@ impl StateStore {
         Ok(())
     }
 
+    /// Set the runtime hold for a pipeline's schedule, atomically.
+    ///
+    /// A single write transaction reads the current cursor, flips `paused`,
+    /// and writes it back — a caller-side get-then-put would race the
+    /// reconciler's own cursor advances and could resurrect a stale record.
+    /// Creates the cursor if absent (pausing a pipeline that has never ticked
+    /// is legitimate: the hold must be in place before the first fire).
+    ///
+    /// Returns `true` when the flag actually changed, `false` when it already
+    /// held the requested value — callers surface that distinction so a
+    /// repeated pause reads as idempotent, not as a second action.
+    pub fn set_schedule_paused(&self, pipeline: &str, paused: bool) -> Result<bool, StateError> {
+        let txn = self.db.begin_write()?;
+        let changed;
+        {
+            let mut table = txn.open_table(SCHEDULE_STATE)?;
+            let mut record: crate::schedule::record::ScheduleStateRecord =
+                match table.get(pipeline)? {
+                    Some(value) => serde_json::from_slice(value.value())?,
+                    None => Default::default(),
+                };
+            changed = record.paused != paused;
+            record.paused = paused;
+            let bytes = serde_json::to_vec(&record)?;
+            table.insert(pipeline, bytes.as_slice())?;
+        }
+        self.commit_write(txn)?;
+        Ok(changed)
+    }
+
     /// Stamp `last_evaluated_at = now` for a pipeline (monotonically), creating
     /// the cursor if absent. Called for every evaluated pipeline — due or not —
     /// so `doctor` can detect a dead timer. `now` is injected; this method never

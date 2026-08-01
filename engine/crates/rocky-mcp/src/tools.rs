@@ -171,6 +171,17 @@ pub struct HistoryArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PauseScheduleArgs {
+    /// The pipeline whose schedule to pause. Must carry a `[schedule]` block.
+    pub pipeline: String,
+    /// Explicit confirmation. Pausing suppresses every demand source for the
+    /// pipeline until a human resumes it; the tool refuses without
+    /// `confirm: true`.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct MetricsArgs {
     /// The model whose quality metrics to read.
     pub model: String,
@@ -2688,6 +2699,78 @@ impl RockyMcpServer {
             )
         })?;
         Ok(Json(value))
+    }
+
+    #[tool(
+        description = "Pause a pipeline's schedule at runtime (MUTATING, safe-direction). Sets \
+         a durable hold that suppresses every demand source — cron, after, freshness, webhook — \
+         until resumed, recording a `paused` skip each tick. Requires `confirm: true`. Reaches a \
+         RUNNING scheduler immediately (unlike a config edit, which a resident `serve \
+         --scheduler` cannot see until restart). Resume is deliberately not exposed to agents: \
+         a human runs `rocky state schedule resume <pipeline>`. Reads/writes the project's \
+         canonical state path — a scheduler on an explicit `--state-path` override is not \
+         reachable from this tool."
+    )]
+    async fn pause_schedule(
+        &self,
+        params: Parameters<PauseScheduleArgs>,
+    ) -> ToolResult<serde_json::Value> {
+        let args = params.0;
+        if !args.confirm {
+            return Err(ToolError::invalid_argument(
+                "pause_schedule requires confirm: true".to_string(),
+                "Pausing is a durable mutation: the pipeline stops firing until a human resumes \
+                 it. Pass confirm: true to proceed.",
+            ));
+        }
+        // Refuse unknown pipelines rather than writing a stray cursor: the
+        // hold must attach to something the reconciler will actually consult.
+        let config = rocky_core::config::load_rocky_config(&self.config_path).map_err(|e| {
+            ToolError::internal(
+                format!("could not load the project config: {e}"),
+                "Fix the config parse error, then retry.",
+            )
+        })?;
+        let known = config
+            .pipelines
+            .get(&args.pipeline)
+            .map(|p| p.schedule().is_some())
+            .unwrap_or(false);
+        if !known {
+            return Err(ToolError::invalid_argument(
+                format!(
+                    "pipeline '{}' has no [schedule] block (or does not exist)",
+                    args.pipeline
+                ),
+                "Pass a pipeline name that carries a [schedule] block; see schedule_status for \
+                 the scheduled set.",
+            ));
+        }
+        let state_path = self.state_path();
+        let pipeline = args.pipeline.clone();
+        let changed = tokio::task::spawn_blocking(move || {
+            let store = rocky_core::state::StateStore::open(&state_path)?;
+            store.set_schedule_paused(&pipeline, true)
+        })
+        .await
+        .map_err(|e| {
+            ToolError::internal(
+                format!("pause task failed: {e}"),
+                "Retry; if it persists this is an internal join error.",
+            )
+        })?
+        .map_err(|e| {
+            ToolError::internal(
+                format!("could not persist the pause: {e}"),
+                "The state store may be held by a writer; retry shortly.",
+            )
+        })?;
+        Ok(Json(serde_json::json!({
+            "pipeline": args.pipeline,
+            "paused": true,
+            "changed": changed,
+            "resume": "rocky state schedule resume <pipeline> (human CLI)",
+        })))
     }
 
     #[tool(
