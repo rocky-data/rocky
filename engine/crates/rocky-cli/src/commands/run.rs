@@ -6492,6 +6492,40 @@ fn apply_shadow_rewrite(
 /// having detected it. This holds for BOTH a governed agent apply and a bare
 /// `rocky run` (governance is skipped on a partial failure either way). It is the
 /// exact condition the run-path evaluates at the replication `--all` site.
+/// The (catalog, schema) pairs an invocation may pre-create under
+/// `auto_create_schemas` — exactly the models it will ACTUALLY BUILD.
+///
+/// Three exclusions, each load-bearing:
+/// - the `--model` filter and the model set: pre-creating a schema for a
+///   filtered-out model is wasted work in an ordinary run, and under
+///   `--shadow` it is an isolation break (the unselected model still
+///   carries its PRODUCTION target);
+/// - models that FAILED COMPILATION: they are recorded as failed and
+///   excluded from execution, so a run that will not build them must not
+///   mutate the warehouse on their behalf either — schema DDL for a model
+///   that cannot execute is #1359's defect.
+fn collect_auto_create_targets(
+    models: &[rocky_core::models::Model],
+    model_name_filter: Option<&str>,
+    model_set: Option<&std::collections::BTreeSet<String>>,
+    compile_failed: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<(String, String)> {
+    let mut targets = std::collections::BTreeSet::new();
+    for model in models {
+        if model_name_filter.is_some_and(|selected| selected != model.config.name)
+            || model_set.is_some_and(|set| !set.contains(&model.config.name))
+            || compile_failed.contains(&model.config.name)
+        {
+            continue;
+        }
+        targets.insert((
+            model.config.target.catalog.clone(),
+            model.config.target.schema.clone(),
+        ));
+    }
+    targets
+}
+
 pub(crate) fn model_phase_ok<T>(
     exec_result: &anyhow::Result<T>,
     failures_before: usize,
@@ -7540,24 +7574,12 @@ pub(crate) async fn execute_models(
     // this, transformation models targeting a non-existent schema fail at
     // execute time with "Schema with name X does not exist".
     if auto_create_schemas {
-        let mut targets: std::collections::BTreeSet<(String, String)> =
-            std::collections::BTreeSet::new();
-        for model in &compile_result.project.models {
-            // Only models this invocation will actually build. Pre-creating a
-            // schema for a model that is filtered out is wasted work in an
-            // ordinary run, and under `--shadow` it is an isolation break: the
-            // unselected model still carries its PRODUCTION target, so a shadow
-            // run would create production schemas.
-            if model_name_filter.is_some_and(|selected| selected != model.config.name)
-                || model_set.is_some_and(|set| !set.contains(&model.config.name))
-            {
-                continue;
-            }
-            targets.insert((
-                model.config.target.catalog.clone(),
-                model.config.target.schema.clone(),
-            ));
-        }
+        let targets = collect_auto_create_targets(
+            &compile_result.project.models,
+            model_name_filter,
+            model_set,
+            &compile_failed_models,
+        );
         for (catalog, schema) in &targets {
             if let Some(sql_result) = dialect.create_schema_sql(catalog, schema) {
                 let sql = sql_result.map_err(anyhow::Error::from)?;
@@ -17162,6 +17184,47 @@ timestamp_column = "ts"
             warnings[0].contains("would close a dependency cycle"),
             "{warnings:?}"
         );
+    }
+
+    /// #1359: schema pre-creation covers exactly the models the run will
+    /// BUILD — a compile-failed model must not cause warehouse DDL, and the
+    /// selection filters exclude as before.
+    #[test]
+    fn auto_create_targets_exclude_compile_failed_and_filtered_models() {
+        use rocky_core::models::Model;
+        let mk = |name: &str, schema: &str| -> Model {
+            let toml = format!(
+                "name = \"{name}\"\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"cat\"\nschema = \"{schema}\"\ntable = \"{name}\"\n"
+            );
+            Model {
+                config: toml::from_str(&toml).expect("model config"),
+                sql: "SELECT 1".into(),
+                file_path: String::new(),
+                contract_path: None,
+            }
+        };
+        let models = vec![
+            mk("good", "s_good"),
+            mk("broken", "s_broken"),
+            mk("other", "s_other"),
+        ];
+        let failed: std::collections::BTreeSet<String> = ["broken".to_string()].into();
+
+        let targets = super::collect_auto_create_targets(&models, None, None, &failed);
+        assert!(
+            targets.contains(&("cat".to_string(), "s_good".to_string()))
+                && targets.contains(&("cat".to_string(), "s_other".to_string())),
+            "{targets:?}"
+        );
+        assert!(
+            !targets.contains(&("cat".to_string(), "s_broken".to_string())),
+            "a compile-failed model must not cause schema DDL: {targets:?}"
+        );
+
+        // The name filter still confines the set.
+        let filtered = super::collect_auto_create_targets(&models, Some("good"), None, &failed);
+        assert_eq!(filtered.len(), 1, "{filtered:?}");
+        assert!(filtered.contains(&("cat".to_string(), "s_good".to_string())));
     }
 
     /// Two selected models whose targets differ only by case are refused on
