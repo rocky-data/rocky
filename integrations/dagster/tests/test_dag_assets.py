@@ -524,6 +524,74 @@ def _materialize_dag(dag: DagResult, run_result, translator=None):
     return dg.materialize(assets, raise_on_error=False)
 
 
+def test_transformation_materializes_against_its_own_pipeline():
+    """#1292: each transformation asset must run under the pipeline that owns it.
+
+    `dagster_rocky` passed only the bare model name, and the engine's model-only
+    fallback then resolves the target adapter as the FIRST transformation
+    pipeline in `rocky.toml` (an `IndexMap`, so declaration order). A silver/gold
+    project therefore built *every* model into whichever pipeline came first —
+    `gold`'s models landing in `silver`'s warehouse.
+
+    Two models from two pipelines, materialized together, is what makes this
+    binding: a single-pipeline fixture cannot tell "passes the right pipeline"
+    apart from "passes a constant".
+
+    Mutation that must turn this red: drop `pipeline=node.pipeline` from the
+    `run_model` call in `dag_assets.py`.
+    """
+    dag = _make_dag_result(
+        nodes=[
+            {
+                "id": "transformation:silver_orders",
+                "kind": "transformation",
+                "label": "silver_orders",
+                "pipeline": "silver",
+                "target": {"catalog": "w", "schema": "s", "table": "silver_orders"},
+            },
+            {
+                "id": "transformation:gold_orders",
+                "kind": "transformation",
+                "label": "gold_orders",
+                "pipeline": "gold",
+                "target": {"catalog": "w", "schema": "g", "table": "gold_orders"},
+            },
+        ]
+    )
+    from unittest.mock import MagicMock
+
+    mock_rocky = MagicMock()
+    mock_rocky.run_model.return_value = _dag_run_result()
+    assets = build_dag_multi_assets(dag, rocky=mock_rocky, translator=RockyDagsterTranslator())
+    dg.materialize(assets, raise_on_error=False)
+
+    by_model = {
+        call.args[0]: call.kwargs.get("pipeline") for call in mock_rocky.run_model.call_args_list
+    }
+    assert by_model == {"silver_orders": "silver", "gold_orders": "gold"}
+
+
+def test_transformation_without_a_pipeline_field_still_runs():
+    """The control, and the back-compat guarantee. A DAG payload from an engine
+    that predates the `pipeline` field must still materialize — passing
+    `pipeline=None` keeps the engine's pre-existing fallback rather than
+    inventing a name. Without this, the assertion above could be satisfied by
+    refusing to run anything that lacks a pipeline."""
+    from unittest.mock import MagicMock
+
+    mock_rocky = MagicMock()
+    mock_rocky.run_model.return_value = _dag_run_result()
+    assets = build_dag_multi_assets(
+        _single_transformation_dag(),
+        rocky=mock_rocky,
+        translator=RockyDagsterTranslator(),
+    )
+    result = dg.materialize(assets, raise_on_error=False)
+
+    assert result.success
+    assert mock_rocky.run_model.call_args.kwargs.get("pipeline") is None
+
+
 def test_dag_transformation_failed_model_raises_failure_not_green():
     """A model run that came back with itemised errors (run_model allows
     partial failure) must FAIL the op with the engine's error — not yield the

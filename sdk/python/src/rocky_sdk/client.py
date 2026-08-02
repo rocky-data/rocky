@@ -956,6 +956,7 @@ class RockyClient:
         self,
         model_name: str,
         *,
+        pipeline: str | None = None,
         filter: str | None = None,
         partition: str | None = None,
         partition_from: str | None = None,
@@ -968,8 +969,32 @@ class RockyClient:
         """Run ``rocky run --model <name>`` for a single compiled model.
 
         ``--model`` skips the replication phase and executes only the named model.
+
+        ``pipeline`` names the transformation pipeline that owns the model. Pass
+        it whenever the project has more than one: without it the engine falls
+        back to the *first* transformation pipeline declared in ``rocky.toml``,
+        so a model belonging to any other one is built into the wrong warehouse.
+
+        ``--models`` is still sent alongside it, and that pairing is deliberate.
+        The engine treats an explicit ``--models`` as an override of the named
+        pipeline's own ``models`` selection, so omitting it would execute from a
+        *different* root than the one this client discovered the model in — and
+        the two must agree. :meth:`dag` enumerates nodes from ``models_dir``, so
+        a caller that discovered ``preview_models/orders`` and then executed the
+        pipeline-configured ``models/orders`` would build different SQL than the
+        node it was asked to materialize, or fail "model not found" outright.
+
+        The consequence is that **no** project with two or more transformation
+        pipelines can be served by this client today — not only ones whose
+        pipelines live in separate directories. :meth:`dag` always sends
+        ``--models``, which the engine reads as a whole-project override and
+        clones into every transformation pipeline, so every model ends up
+        claimed more than once and DAG build refuses (#1348). Discovery has to
+        learn per-pipeline roots first; this call must follow it, not lead it.
         """
         args = ["run", "--model", model_name, "--models", self.models_dir]
+        if pipeline is not None:
+            args.extend(["--pipeline", pipeline])
         if filter is not None:
             args.extend(["--filter", filter])
         if partition is not None:

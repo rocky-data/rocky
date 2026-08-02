@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A transformation asset now materializes under the pipeline that owns it.** `dagster_rocky` passed only the bare model name to `rocky run --model`, and the engine's model-only fallback resolves the target adapter as the *first transformation pipeline declared in `rocky.toml`*. With one transformation pipeline that is always right; with two — the standard silver/gold layering — every asset built into whichever pipeline came first, so `gold`'s models were written into `silver`'s warehouse. The node's `pipeline` is already in the DAG payload and is now passed through; `--models` is unchanged, so the root a node was discovered in stays the root it is built from. A payload with no `pipeline` (an older engine) keeps the previous fallback rather than inventing a name. This fixes adapter routing for pipelines that *share* a models root; pipelines with separate roots are still blocked earlier, in DAG discovery (#1348). (#1292)
+
+  **This also makes `[target.governance] auto_create_schemas` take effect for Dagster materializations, including single-pipeline projects.** Naming a pipeline selects the engine's explicit-pipeline branch, which reads that setting from the pipeline; the unnamed fallback hardcoded it off. So a project configured `auto_create_schemas = true` whose asset targets a missing schema previously failed with "Schema with name X does not exist" and now creates the schema — which is what `rocky run` has always done for the same config, and what the setting asks for. If you do **not** want Dagster creating schemas, set `auto_create_schemas = false` on that pipeline's target. (#1292, #1350)
+
 ## [1.61.1] — 2026-07-19
 
 ### Changed
