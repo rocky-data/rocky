@@ -568,8 +568,13 @@ impl SnowflakeConnector {
 ///
 /// Counts semicolons that terminate distinct statements, then adds 1 for the
 /// final un-terminated statement. Skips semicolons inside SQL string literals
-/// (`'...'`) and single-line comments (`-- ...`). Rocky-generated SQL never
-/// embeds semicolons in identifiers, so identifier-quoting is not considered.
+/// (`'...'`), single-line comments (`-- ...` and `// ...` — Snowflake accepts
+/// both), and `/* ... */` block comments (flat scan: Snowflake's lexer ends a
+/// block comment at the FIRST `*/`; an inner `/*` is inert text —
+/// live-verified). A miscount here is not cosmetic: Snowflake rejects a
+/// submission whose real statement count differs from `MULTI_STATEMENT_COUNT`
+/// (#1365). Rocky-generated SQL never embeds semicolons in identifiers, so
+/// identifier-quoting is not considered.
 ///
 /// Trailing-only whitespace after the last semicolon counts the same as a
 /// terminator (one fewer statement). Empty / whitespace-only input returns 0.
@@ -602,6 +607,26 @@ fn count_statements(sql: &str) -> usize {
                     if nc == '\n' {
                         break;
                     }
+                }
+            }
+            '/' if chars.peek() == Some(&'/') => {
+                // Skip to end of line.
+                for nc in chars.by_ref() {
+                    if nc == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                // Skip to the first `*/` (flat — see the doc comment);
+                // unterminated swallows the rest, matching the lexer.
+                chars.next();
+                let mut prev = ' ';
+                for nc in chars.by_ref() {
+                    if prev == '*' && nc == '/' {
+                        break;
+                    }
+                    prev = nc;
                 }
             }
             ';' => {
@@ -640,11 +665,16 @@ fn classify_statement_kind(sql: &str) -> &'static str {
 fn strip_leading_sql_comments_and_whitespace(mut sql: &str) -> &str {
     loop {
         let trimmed = sql.trim_start();
-        // `--` line comments AND `/* … */` block comments — a statement led
-        // by either must still classify by its first keyword (#1363; the
-        // BigQuery connector strips the same forms plus its dialect-specific
-        // `#`).
-        if let Some(body) = trimmed.strip_prefix("--") {
+        // `--` AND `//` line comments AND `/* … */` block comments — a
+        // statement led by any of them must still classify by its first
+        // keyword (#1363; the BigQuery connector strips `--`/`/* */` plus
+        // its dialect-specific `#`). `//` is Snowflake-specific too:
+        // live-verified accepted by the SQL API, and neither Spark SQL nor
+        // GoogleSQL documents it.
+        if let Some(body) = trimmed
+            .strip_prefix("--")
+            .or_else(|| trimmed.strip_prefix("//"))
+        {
             sql = match body.find('\n') {
                 Some(line_end) => &body[line_end + 1..],
                 None => "",
@@ -912,6 +942,42 @@ mod tests {
     fn test_count_statements_ignores_semicolon_in_line_comment() {
         let sql = "-- here; is; a; comment\nSELECT 1; SELECT 2";
         assert_eq!(count_statements(sql), 2);
+        let sql = "// here; too\nSELECT 1; SELECT 2";
+        assert_eq!(count_statements(sql), 2);
+        // The comment swallows the terminator; the statement still counts
+        // once via the trailing non-terminated arm.
+        assert_eq!(count_statements("SELECT 1 // trail;"), 1);
+    }
+
+    #[test]
+    fn test_count_statements_ignores_semicolon_in_block_comment() {
+        // The motivating #1365 shape: a semicolon inside a block comment
+        // over-counted, so MULTI_STATEMENT_COUNT overshot the real count
+        // and Snowflake rejected the whole submission.
+        assert_eq!(count_statements("/* note; kept */ SELECT 1"), 1);
+        assert_eq!(count_statements("/* a; */ SELECT 1; /* b; */ SELECT 2"), 2);
+        // Multi-line block with internal stars.
+        assert_eq!(count_statements("/* l1;\n * l2;\n */ SELECT 1"), 1);
+        // Flat close: the FIRST */ ends the comment (live-verified — an
+        // inner /* is inert), so the semicolon after it is real again.
+        assert_eq!(count_statements("/* a /* b */ SELECT 1; SELECT 2"), 2);
+        // Unterminated block swallows everything after it.
+        assert_eq!(count_statements("/* a; b; c"), 0);
+        assert_eq!(count_statements("SELECT 1; /* tail; never closes"), 1);
+        // A comment-lookalike inside a string literal is still literal text.
+        assert_eq!(count_statements("SELECT '/* not; a comment */'"), 1);
+    }
+
+    #[test]
+    fn test_classify_statement_kind_skips_slash_line_comments() {
+        // Snowflake accepts `//` line comments (live-verified via the SQL
+        // API); a statement led by one must classify by its real keyword.
+        assert_eq!(classify_statement_kind("// note\nSELECT 1"), "query");
+        assert_eq!(
+            classify_statement_kind("// a\n-- b\n/* c */ INSERT INTO t VALUES (1)"),
+            "dml"
+        );
+        assert_eq!(classify_statement_kind("// only a comment"), "other");
     }
 
     #[test]
