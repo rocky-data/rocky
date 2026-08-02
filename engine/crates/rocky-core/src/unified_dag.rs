@@ -918,10 +918,16 @@ fn format_test_label(model_name: &str, test: &crate::tests::TestDecl, index: usi
 /// Augment a DAG with edges inferred from model SQL `FROM` references.
 ///
 /// `build_unified_dag` resolves only edges from explicit `depends_on` config.
-/// This pass parses each model's SQL, extracts the tables it references, and
-/// adds [`EdgeType::DataDependency`] edges from the producing nodes (other
-/// transformations, seeds, replication loads) to the consuming model — even
-/// when no explicit `depends_on` is declared.
+/// This pass parses each model's SQL, extracts the tables it references by
+/// bare name, and adds an [`EdgeType::DataDependency`] edge from ONE
+/// producing node per referenced label — the last claimant in build order,
+/// byte-for-byte the single-slot heuristic's graph — to the consuming model.
+/// When several nodes claim one label, the OTHERS are deliberately not
+/// ordered: every scheme for ordering them was shown to be able to suppress
+/// exact physical-pass evidence until the cross-pass provenance contract
+/// exists (#1357). The collision is reported instead, alongside models
+/// whose SQL could not be parsed, via the returned
+/// [`LabelInferenceReport`].
 ///
 /// `model_sql_by_name` maps model name → compiled SQL text. The caller is
 /// responsible for compiling models first; this function does no IO.
