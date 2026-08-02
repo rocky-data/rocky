@@ -44,6 +44,8 @@ Layer 2: fct_orders                     (depends on stg_orders + dim_customers)
 
 Rocky executes all models in Layer 0 concurrently, waits for them to finish, then executes Layer 1, and so on.
 
+`--parallel N` bounds how many run at once. On `rocky run` it defaults to 4. Under `rocky run --dag` it applies **only when you pass it** — leave it off and a layer's nodes all run concurrently, as they always have. A `--dag` sub-run executes one partition at a time, so the node count is the number of concurrent warehouse queries and `--parallel` is a ceiling on exactly that, the same quantity it bounds without `--dag`. `--parallel 1` makes either path fully serial.
+
 ## Validation
 
 Rocky validates the DAG at `rocky validate` time, catching problems before any SQL is executed.

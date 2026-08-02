@@ -638,8 +638,8 @@ async fn execute_run_plan(
     // is not a missing convenience but a wrong answer: the time-interval runner
     // reads an empty selection as `--latest`, so a reviewed historical
     // partition applied clean while rebuilding the current one (#1283). It is
-    // replayed below; `--parallel` deliberately is not (see
-    // `run_dag_exec::sub_run_partition_opts` and #1288).
+    // replayed below; `--parallel` deliberately is not — a persisted plan never
+    // captured it, so there is nothing to replay (see below and #1288).
     if run_plan.dag {
         // Fail-closed (D): the DAG runner dispatches sub-runs with NO governance
         // context, so a governed (agent) DAG apply would execute every pipeline
@@ -676,6 +676,17 @@ async fn execute_run_plan(
             // would write production while reporting success. The non-DAG path
             // below passes the same value.
             shadow_config.as_ref(),
+            // No node-fan-out bound on a replay, because a persisted plan does
+            // not capture `--parallel` — it is a resource knob, not part of the
+            // plan's contract, in the same way `--force-rebuild` is not.
+            //
+            // The consequence is worth naming rather than leaving implicit:
+            // `rocky plan --dag` then `rocky apply` runs unbounded even if the
+            // planning invocation asked for a bound, so plan-time intent and
+            // apply-time behaviour differ here. Making them agree means adding
+            // `parallel` to the stored plan, which changes the plan's contract
+            // and its `plan_id` hash — deliberately out of scope for #1288.
+            None,
         )
         .await
         .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));
