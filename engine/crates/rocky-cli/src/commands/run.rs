@@ -6492,7 +6492,6 @@ fn apply_shadow_rewrite(
 /// having detected it. This holds for BOTH a governed agent apply and a bare
 /// `rocky run` (governance is skipped on a partial failure either way). It is the
 /// exact condition the run-path evaluates at the replication `--all` site.
-
 pub(crate) fn model_phase_ok<T>(
     exec_result: &anyhow::Result<T>,
     failures_before: usize,
