@@ -620,7 +620,14 @@ fn count_statements(sql: &str) -> usize {
             continue;
         }
         if in_string {
-            if c == '\'' {
+            if c == '\\' {
+                // Snowflake string constants also escape with backslash
+                // (`\'`, `\\`, …) — the next char is literal, so `\'` must
+                // not close the string (live-verified: `'a\'$$; x'` is ONE
+                // string; before this arm the dollar opener fired inside it
+                // and swallowed the real terminator).
+                chars.next();
+            } else if c == '\'' {
                 // Snowflake doubles single quotes to escape (`''`); treat as
                 // staying inside the literal.
                 if chars.peek() == Some(&'\'') {
@@ -1066,6 +1073,27 @@ mod tests {
         // (live-verified: SELECT 1 AS "/*x*/" executes).
         assert_eq!(count_statements(r#"SELECT 1 AS "/*"; SELECT 2"#), 2);
         assert_eq!(count_statements(r#"SELECT 1 AS "//"; SELECT 2"#), 2);
+        // Backslash is LITERAL in a quoted identifier — no escape forms
+        // there, only `""` (live-verified: SELECT 1 AS "a\" executes, the
+        // quote after the backslash closes it).
+        assert_eq!(count_statements(r#"SELECT 1 AS "a"; SELECT 2"#), 2);
+    }
+
+    #[test]
+    fn test_count_statements_backslash_escapes_in_strings() {
+        // Snowflake strings escape with backslash as well as `''`
+        // (live-verified: SELECT 'a\'$$; still string' executes as ONE
+        // string). `\'` must not close the string, or the following $$
+        // opens a phantom dollar-quote and swallows the real terminator.
+        assert_eq!(
+            count_statements("SELECT 'a\\'$$; still string'; SELECT 2"),
+            2
+        );
+        // Escaped backslash then a REAL close (live-verified: 'a\\').
+        assert_eq!(count_statements("SELECT 'a\\\\'; SELECT 2"), 2);
+        // A backslash-escaped semicolon shape: the string stays open
+        // across the escape, so the inner `;` is literal.
+        assert_eq!(count_statements("SELECT 'a\\' ; '; SELECT 2"), 2);
     }
 
     #[test]

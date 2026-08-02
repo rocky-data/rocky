@@ -116,6 +116,53 @@ async fn test_happy_path_inline_result() {
     assert_eq!(result.total_row_count, Some(2));
 }
 
+/// The `MULTI_STATEMENT_COUNT` actually sent on the wire must reflect
+/// protected lexical regions (#1365): strings with backslash escapes,
+/// dollar-quoted bodies, and quoted identifiers are all opaque to the
+/// statement counter, and the `ALTER SESSION` wrapper adds exactly one.
+#[tokio::test]
+async fn test_multi_statement_count_on_wire_with_protected_regions() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/v2/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "statementHandle": "sf-stmt-multi",
+            "code": "00000",
+            "message": "Statement executed successfully.",
+            "statementStatusUrl": "",
+            "resultSetMetaData": {
+                "numRows": 0,
+                "rowType": []
+            },
+            "data": []
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let connector = test_connector(&server);
+    // Three statements, each carrying a counter trap: a backslash-escaped
+    // quote before a phantom `$$`, a dollar-quoted body plus a quoted
+    // identifier, and an unterminated final statement.
+    let sql = "SELECT 'a\\'$$; still string';\nSELECT $$ x; -- y $$ AS \"a;b\";\nSELECT 2";
+    connector.execute_sql(sql).await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["parameters"]["MULTI_STATEMENT_COUNT"], "4");
+    let statement = body["statement"].as_str().unwrap();
+    assert!(
+        statement.starts_with("ALTER SESSION SET TRANSACTION_ABORT_ON_ERROR = TRUE;\n"),
+        "wrapper prefix missing: {statement}"
+    );
+    assert!(
+        statement.ends_with("SELECT 2"),
+        "body tail changed: {statement}"
+    );
+}
+
 /// Happy path: statement needs polling before completing.
 #[tokio::test]
 async fn test_happy_path_with_polling() {
