@@ -2226,14 +2226,28 @@ fn classify_statement_kind(sql: &str) -> &'static str {
 fn strip_leading_sql_comments_and_whitespace(mut sql: &str) -> &str {
     loop {
         let trimmed = sql.trim_start();
-        let Some(comment_body) = trimmed.strip_prefix("--") else {
-            return trimmed;
-        };
-
-        sql = match comment_body.find('\n') {
-            Some(line_end) => &comment_body[line_end + 1..],
-            None => "",
-        };
+        // BigQuery accepts `--` AND `#` line comments plus `/* … */` blocks
+        // (GoogleSQL lexical rules) — a statement led by any of them must
+        // still classify by its first keyword.
+        if let Some(body) = trimmed
+            .strip_prefix("--")
+            .or_else(|| trimmed.strip_prefix('#'))
+        {
+            sql = match body.find('\n') {
+                Some(line_end) => &body[line_end + 1..],
+                None => "",
+            };
+            continue;
+        }
+        if let Some(body) = trimmed.strip_prefix("/*") {
+            sql = match body.find("*/") {
+                Some(end) => &body[end + 2..],
+                // Unterminated block comment: nothing classifiable follows.
+                None => "",
+            };
+            continue;
+        }
+        return trimmed;
     }
 }
 
@@ -2265,6 +2279,20 @@ mod statement_kind_tests {
             classify_statement_kind("-- provisioning\n-- second line\nCREATE TABLE t (id INT64)"),
             "ddl"
         );
+        // BigQuery-specific `#` line comments and `/* */` blocks.
+        assert_eq!(
+            classify_statement_kind("# provisioning\nINSERT INTO t VALUES (1)"),
+            "dml"
+        );
+        assert_eq!(
+            classify_statement_kind("/* multi\nline */ SELECT 1"),
+            "query"
+        );
+        assert_eq!(
+            classify_statement_kind("/* a */ -- b\n# c\nDROP TABLE t"),
+            "ddl"
+        );
         assert_eq!(classify_statement_kind("-- only a comment"), "other");
+        assert_eq!(classify_statement_kind("/* unterminated"), "other");
     }
 }
