@@ -1529,7 +1529,7 @@ mod tests {
                 &state_path,
                 PolicyPrincipal::Human,
                 true,
-                &AlwaysReclaim,
+                std::sync::Arc::new(AlwaysReclaim),
             )
             .await
             .unwrap();

@@ -68,6 +68,13 @@ pub enum StateSyncError {
     #[error("state retry budget exhausted (limit {limit}); aborting remaining retries")]
     RetryBudgetExhausted { limit: u32 },
 
+    #[error("ledger-seam transition failed: {0}")]
+    /// A [`LedgerSeamSession`] caller's transition closure failed for a
+    /// domain reason (authorization refused, proof no longer holds, execution
+    /// error). The session aborts WITHOUT publishing — the remote winner is
+    /// untouched — and the caller re-wraps this into its own error context.
+    SeamTransition(String),
+
     #[error(
         "state compare-and-swap conflict on '{key}': another writer committed since this run \
          downloaded state; refusing to overwrite the winner (fail-closed)"
@@ -3522,7 +3529,10 @@ fn is_transient(err: &StateSyncError) -> bool {
         // the same stale base would just conflict again and burn the budget.
         // Fail closed immediately.
         | StateSyncError::CasConflict { .. }
-        | StateSyncError::LedgerSeamConflict { .. } => false,
+        | StateSyncError::LedgerSeamConflict { .. }
+        // A seam-transition failure is a domain refusal from the caller's
+        // closure, not a transport fault — retrying cannot change it.
+        | StateSyncError::SeamTransition(_) => false,
     }
 }
 

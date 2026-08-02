@@ -1493,6 +1493,45 @@ pub(crate) fn gc_models_dir(
 /// Once cleared, [`execute_gc_apply`] re-verifies each planned eviction against
 /// the live ledger before evicting anything (tombstone + retired ledger row;
 /// no physical byte deletion follows).
+/// Per-attempt freeze-marker fence for the gc CAS seam (#1242).
+///
+/// Markers live under their own object keys, so the blob CAS cannot detect
+/// one landing mid-seam. The pre-gate LIST fed the policy gate its marker
+/// set; this fence re-LISTs on every seam attempt (and again right before
+/// publish) and REFUSES on any marker absent from that already-gated set —
+/// over-enforcement is the monotone-safe direction, and refusing avoids
+/// re-running the full gate against a store the session already holds open.
+/// A LIST failure refuses too (fail-closed), matching the pre-gate LIST.
+async fn gc_seam_marker_fence(
+    cfg: Option<&rocky_core::config::RockyConfig>,
+    touched: &BTreeMap<String, PolicyCapability>,
+    gated_marker_ids: &std::collections::BTreeSet<String>,
+    stage: &str,
+) -> Result<(), rocky_core::state_sync::StateSyncError> {
+    let Some(cfg) = cfg else {
+        return Ok(());
+    };
+    let fresh = crate::commands::apply::marker_freezes_before_gate(cfg, touched)
+        .await
+        .map_err(|e| {
+            rocky_core::state_sync::StateSyncError::SeamTransition(format!(
+                "freeze-marker fence LIST failed {stage} (fail-closed): {e:#}"
+            ))
+        })?;
+    if let Some(new) = fresh
+        .iter()
+        .find(|m| !gated_marker_ids.contains(&m.freeze_id))
+    {
+        return Err(rocky_core::state_sync::StateSyncError::SeamTransition(
+            format!(
+                "durable freeze marker '{}' (scope '{}') landed {stage}; refusing to publish                  this gc apply — re-run `rocky apply` so the policy gate evaluates it",
+                new.freeze_id, new.scope
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_gc_apply_in(
     root: &Path,
     config_path: &Path,
@@ -1512,7 +1551,7 @@ pub(crate) async fn run_gc_apply_in(
         state_path,
         runtime_principal,
         json,
-        &ManifestLivenessOracle,
+        std::sync::Arc::new(ManifestLivenessOracle),
     )
     .await
 }
@@ -1526,7 +1565,7 @@ pub(crate) async fn run_gc_apply_in_with(
     state_path: &Path,
     runtime_principal: rocky_core::config::PolicyPrincipal,
     json: bool,
-    oracle: &dyn LivenessOracle,
+    oracle: std::sync::Arc<dyn LivenessOracle>,
 ) -> Result<()> {
     let plan_record =
         read_plan(root, plan_id).with_context(|| format!("failed to read gc plan '{plan_id}'"))?;
@@ -1700,27 +1739,92 @@ pub(crate) async fn run_gc_apply_in_with(
         );
     }
 
-    let store = StateStore::open(state_path)
-        .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let output = execute_gc_apply(&store, oracle, plan_id, &plan, Utc::now()).await?;
-    // Drop the store to release the advisory lock / flush the file before upload.
-    drop(store);
+    let seam_cas = remote_state && rocky_core::state_sync::cas_effective(&state_cfg);
+    let output = if seam_cas {
+        // CAS ledger seam (#1242; ADR-CONCURRENCY D1 seam class = RETRY): the
+        // whole transition replays per attempt against the freshly downloaded
+        // winner. `execute_gc_apply` re-derives candidates, refcounts, and
+        // both liveness reads from that fresh store — a winner that re-added
+        // the Delta path legitimately flips this attempt's eviction into a
+        // refusal — and the freeze-marker fence runs at attempt start AND
+        // again after the transition, so the unfenced window shrinks to the
+        // CAS upload itself. gc's mutations are redb rows inside the blob
+        // being CAS-published (`physical_delete = true` was refused above),
+        // so no per-candidate side effect outlives a discarded attempt.
+        let gated_marker_ids: std::collections::BTreeSet<String> =
+            marker_freezes.iter().map(|m| m.freeze_id.clone()).collect();
+        let session = rocky_core::state_sync::LedgerSeamSession::new(&state_cfg, state_path);
+        // The attempt future must OWN everything it touches (the session's
+        // `for<'a>` bound): master copies move into the closure, and each
+        // attempt clones what its future needs.
+        let seam_cfg = loaded_cfg.clone();
+        let seam_touched = touched.clone();
+        let seam_plan = plan.clone();
+        let seam_plan_id = plan_id.to_string();
+        let seam_oracle = std::sync::Arc::clone(&oracle);
+        session
+            .execute(move |fresh_store, _fresh_base| {
+                let cfg = seam_cfg.clone();
+                let touched = seam_touched.clone();
+                let gated = gated_marker_ids.clone();
+                let plan = seam_plan.clone();
+                let plan_id = seam_plan_id.clone();
+                let oracle = std::sync::Arc::clone(&seam_oracle);
+                Box::pin(async move {
+                    gc_seam_marker_fence(cfg.as_ref(), &touched, &gated, "during this gc apply")
+                        .await?;
+                    let out = execute_gc_apply(
+                        fresh_store,
+                        oracle.as_ref(),
+                        &plan_id,
+                        &plan,
+                        Utc::now(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        rocky_core::state_sync::StateSyncError::SeamTransition(format!("{e:#}"))
+                    })?;
+                    gc_seam_marker_fence(
+                        cfg.as_ref(),
+                        &touched,
+                        &gated,
+                        "after eviction, before publish",
+                    )
+                    .await?;
+                    Ok(out)
+                })
+            })
+            .await
+            .with_context(|| {
+                format!("failed to commit gc apply '{plan_id}' to shared remote state")
+            })?
+    } else {
+        let store = StateStore::open(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        let output =
+            execute_gc_apply(&store, oracle.as_ref(), plan_id, &plan, Utc::now()).await?;
+        // Drop the store to release the advisory lock / flush the file before upload.
+        drop(store);
 
-    // SEAM-SCOPED SYNC — upload half, FAIL-CLOSED. Durability is the whole point
-    // of the seam: an eviction that commits locally but never reaches the remote
-    // would be silently reverted by the next run's start-download while this
-    // command reported success. So the upload is forced to `Fail` regardless of
-    // the configured `on_upload_failure` (default `skip`) — a failed upload
-    // aborts (finding 5).
-    if remote_state {
-        // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
-        // policy (previously a local `StateConfig` clone here).
-        rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
-            &state_cfg, state_path, "gc apply",
-        )
-        .await
-        .with_context(|| "failed to upload remote state after gc apply")?;
-    }
+        // SEAM-SCOPED SYNC — upload half, FAIL-CLOSED. Durability is the whole
+        // point of the seam: an eviction that commits locally but never reaches
+        // the remote would be silently reverted by the next run's start-download
+        // while this command reported success. So the upload is forced to `Fail`
+        // regardless of the configured `on_upload_failure` (default `skip`) — a
+        // failed upload aborts (finding 5). Without effective CAS this remains
+        // the legacy last-writer-wins half-seam (#1228's residual exposure —
+        // keep one writer per `[state]` prefix).
+        if remote_state {
+            // WP-01 PR-B (2b): the half-seam owns the forced-`Fail` durability
+            // policy (previously a local `StateConfig` clone here).
+            rocky_core::state_sync::RemoteStateSession::upload_only_fail_closed(
+                &state_cfg, state_path, "gc apply",
+            )
+            .await
+            .with_context(|| "failed to upload remote state after gc apply")?;
+        }
+        output
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -2793,7 +2897,8 @@ auto_create_schemas = true
         // review/policy gate + eviction wiring are exercised without a live
         // Delta log (the real `ManifestLivenessOracle` would hold everything
         // creds-free — correct, but it would mask the review-gate assertion).
-        let oracle = FixedLivenessOracle::reclaimable();
+        let oracle: std::sync::Arc<dyn LivenessOracle> =
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable());
 
         // No marker → refuse.
         let err = run_gc_apply_in_with(
@@ -2803,7 +2908,7 @@ auto_create_schemas = true
             &state_path,
             PolicyPrincipal::Human,
             true,
-            &oracle,
+            oracle.clone(),
         )
         .await
         .expect_err("apply must refuse an unreviewed gc plan");
@@ -2827,7 +2932,7 @@ auto_create_schemas = true
             &state_path,
             PolicyPrincipal::Human,
             true,
-            &oracle,
+            oracle.clone(),
         )
         .await
         .unwrap();
@@ -2868,7 +2973,8 @@ auto_create_schemas = true
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, "{}").unwrap();
 
-        let oracle = FixedLivenessOracle::reclaimable();
+        let oracle: std::sync::Arc<dyn LivenessOracle> =
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable());
         let err = run_gc_apply_in_with(
             dir.path(),
             &config,
@@ -2876,7 +2982,7 @@ auto_create_schemas = true
             &state_path,
             PolicyPrincipal::Human,
             true,
-            &oracle,
+            oracle.clone(),
         )
         .await
         .expect_err("a remote-backend gc apply must abort when the state backend is unreachable");
