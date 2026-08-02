@@ -101,9 +101,9 @@ pub const WAREHOUSE_TABLE_REF: &str = "rocky.warehouse.table_ref";
 
 /// Statement classification (`ddl`, `dml`, `query`, `merge`, ...).
 /// Adapters classify via `rocky_sql` where possible; BigQuery's
-/// `jobs.query` endpoint routes every kind through the same path and
-/// today emits the literal `"query"` until upstream classification
-/// lands.
+/// `jobs.query` endpoint routes every kind through the same path, so
+/// the BigQuery connector classifies the kind from the SQL text — the
+/// same keyword matcher Snowflake and Databricks use (#897).
 ///
 /// **Canonical replacement** for the bespoke `statement.kind`
 /// attribute emitted pre-unification.

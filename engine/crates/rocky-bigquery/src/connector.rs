@@ -2207,7 +2207,10 @@ mod tests {
 /// Classify a SQL statement for the `statement.kind` span attribute —
 /// `query` / `dml` / `ddl` / `other`. Mirrors the Snowflake and Databricks
 /// connectors' matcher so dashboards filter uniformly across adapters
-/// (#897).
+/// (#897). Divergence, on purpose: this stripper also handles BigQuery's
+/// `#` line comments and `/* */` blocks; the sibling strippers handle only
+/// `--` and share the `/* */` gap — tracked separately so the parity story
+/// stays explicit rather than silently uneven.
 fn classify_statement_kind(sql: &str) -> &'static str {
     let sql = strip_leading_sql_comments_and_whitespace(sql);
     let keyword = sql
