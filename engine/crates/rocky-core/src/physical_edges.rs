@@ -139,13 +139,6 @@ pub fn derive_physical_edges(
         }
     }
 
-    // Existing relation as a set + adjacency for the cycle guard.
-    let mut edge_set: HashSet<(String, String)> = existing.iter().cloned().collect();
-    let mut depends_on: HashMap<String, HashSet<String>> = HashMap::new();
-    for (c, p) in existing {
-        depends_on.entry(c.clone()).or_default().insert(p.clone());
-    }
-
     // `consumer` transitively depends on `target`?
     fn reaches(depends_on: &HashMap<String, HashSet<String>>, from: &str, to: &str) -> bool {
         let mut seen: HashSet<&str> = HashSet::new();
@@ -204,47 +197,65 @@ pub fn derive_physical_edges(
         }
     }
 
-    // Dedup across tiers: the same (consumer, producer) pair reachable at
-    // two specificities is processed once, at the most specific.
-    let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
-    let mut accepted_tier: HashMap<(String, String), u8> = HashMap::new();
-    for (tier, consumer, producer) in candidates {
-        if !seen_pairs.insert((consumer.clone(), producer.clone())) {
-            continue;
+    // Decision loop, run to a FIXPOINT. A bare↔bare contradiction WITHDRAWS
+    // an already-accepted edge, which can invalidate every skip decided
+    // while that edge was in the graph (a three-way bare chain skips a safe
+    // edge through the soon-withdrawn one). Each withdrawal moves one pair
+    // into the ambiguous set — monotone, so restarting the pass terminates
+    // in at most one restart per contradicting pair. Restart-from-scratch
+    // keeps every decision derived from a consistent graph.
+    let mut ambiguous: HashSet<(String, String)> = HashSet::new();
+    'fixpoint: loop {
+        out.edges.clear();
+        out.skipped_cycle_edges.clear();
+        let mut edge_set: HashSet<(String, String)> = existing.iter().cloned().collect();
+        let mut depends_on: HashMap<String, HashSet<String>> = HashMap::new();
+        for (c, p) in existing {
+            depends_on.entry(c.clone()).or_default().insert(p.clone());
         }
-        if edge_set.contains(&(consumer.clone(), producer.clone())) {
-            continue;
-        }
-        // Adding consumer→producer closes a cycle iff producer already
-        // (transitively) depends on consumer.
-        if reaches(&depends_on, &producer, &consumer) {
-            // A bare candidate blocked by an ACCEPTED bare opposite is not a
-            // cycle to serialize — it is two guesses contradicting each
-            // other. Name order must not pick the winner: a wrong pick
-            // deterministically reverses the real producer edge, which is
-            // WORSE than today's undefined order. Withdraw the accepted
-            // guess and derive nothing for the pair.
-            if tier == 2 && accepted_tier.get(&(producer.clone(), consumer.clone())) == Some(&2) {
-                out.edges
-                    .retain(|(c, p)| !(c == &producer && p == &consumer));
-                edge_set.remove(&(producer.clone(), consumer.clone()));
-                if let Some(deps) = depends_on.get_mut(&producer) {
-                    deps.remove(&consumer);
-                }
-                accepted_tier.remove(&(producer.clone(), consumer.clone()));
-                out.ambiguous_bare_pairs.push((consumer, producer));
+        let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+        let mut accepted_tier: HashMap<(String, String), u8> = HashMap::new();
+        for (tier, consumer, producer) in &candidates {
+            let (tier, consumer, producer) = (*tier, consumer.clone(), producer.clone());
+            if ambiguous.contains(&(consumer.clone(), producer.clone()))
+                || ambiguous.contains(&(producer.clone(), consumer.clone()))
+            {
                 continue;
             }
-            out.skipped_cycle_edges.push((consumer, producer));
-            continue;
+            if !seen_pairs.insert((consumer.clone(), producer.clone())) {
+                continue;
+            }
+            if edge_set.contains(&(consumer.clone(), producer.clone())) {
+                continue;
+            }
+            // Adding consumer→producer closes a cycle iff producer already
+            // (transitively) depends on consumer.
+            if reaches(&depends_on, &producer, &consumer) {
+                // A bare candidate blocked by an ACCEPTED bare opposite is
+                // not a cycle to serialize — it is two guesses contradicting
+                // each other. Name order must not pick the winner: a wrong
+                // pick deterministically reverses the real producer edge,
+                // WORSE than the undefined order it replaces. Mark the pair
+                // ambiguous and restart so no decision keeps depending on
+                // the withdrawn guess.
+                if tier == 2 && accepted_tier.get(&(producer.clone(), consumer.clone())) == Some(&2)
+                {
+                    ambiguous.insert((consumer.clone(), producer.clone()));
+                    out.ambiguous_bare_pairs.push((consumer, producer));
+                    continue 'fixpoint;
+                }
+                out.skipped_cycle_edges.push((consumer, producer));
+                continue;
+            }
+            edge_set.insert((consumer.clone(), producer.clone()));
+            depends_on
+                .entry(consumer.clone())
+                .or_default()
+                .insert(producer.clone());
+            accepted_tier.insert((consumer.clone(), producer.clone()), tier);
+            out.edges.push((consumer, producer));
         }
-        edge_set.insert((consumer.clone(), producer.clone()));
-        depends_on
-            .entry(consumer.clone())
-            .or_default()
-            .insert(producer.clone());
-        accepted_tier.insert((consumer.clone(), producer.clone()), tier);
-        out.edges.push((consumer, producer));
+        break;
     }
 
     out
@@ -493,6 +504,39 @@ mod tests {
         ];
         let d = derive_physical_edges(&models, &[]);
         assert!(d.edges.is_empty(), "{:?}", d.edges);
+    }
+
+    /// The reviewer's three-way chain: a bare candidate skipped BECAUSE OF
+    /// an edge that a later bare-bare withdrawal removes must be
+    /// re-evaluated — the fixpoint restart derives it after the ambiguous
+    /// pair is excluded.
+    #[test]
+    fn a_withdrawal_reopens_decisions_that_depended_on_the_withdrawn_edge() {
+        // Candidate order (name-sorted within the bare tier):
+        //   ("a","b")   accepted first (a depends on b),
+        //   ("ab","d")  skipped through d→a→b→ab (uses the accepted edge),
+        //   ("b","a")   contradicts → withdrawal → restart.
+        // After the restart with (a,b)/(b,a) ambiguous, ("ab","d") is safe.
+        let models = [
+            m("a", "db", "main", "t_a", "SELECT x FROM t_b"),
+            m("b", "db", "main", "t_b", "SELECT y FROM t_a"),
+            m("ab", "db", "main", "t_ab", "SELECT z FROM t_d"),
+            m("d", "db", "main", "t_d", "SELECT 1 AS q"),
+        ];
+        let existing = vec![
+            ("d".to_string(), "a".to_string()),
+            ("b".to_string(), "ab".to_string()),
+        ];
+        let d = derive_physical_edges(&models, &existing);
+        assert_eq!(d.ambiguous_bare_pairs.len(), 1, "{d:?}");
+        assert!(
+            d.edges.contains(&("ab".to_string(), "d".to_string())),
+            "the stale skip must be re-evaluated after the withdrawal: {d:?}"
+        );
+        assert!(
+            d.skipped_cycle_edges.is_empty(),
+            "nothing blocks ab→d once the guess is gone: {d:?}"
+        );
     }
 
     /// Reciprocal BARE reads are two contradicting guesses: name order must
