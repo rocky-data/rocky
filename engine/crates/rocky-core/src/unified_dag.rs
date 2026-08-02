@@ -979,27 +979,6 @@ pub fn infer_runtime_dependencies(
     // must not silently become a stale-read success. Only the edges this
     // change ADDS (claimants the old code dropped) are guarded: they must
     // never introduce a refusal the old behavior did not have.
-    let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-    for e in &dag.edges {
-        adj.entry(e.from.clone()).or_default().push(e.to.clone());
-    }
-    fn label_reaches(adj: &HashMap<NodeId, Vec<NodeId>>, from: &NodeId, to: &NodeId) -> bool {
-        let mut seen: HashSet<&NodeId> = HashSet::new();
-        let mut stack = vec![from];
-        while let Some(cur) = stack.pop() {
-            if cur == to {
-                return true;
-            }
-            if !seen.insert(cur) {
-                continue;
-            }
-            if let Some(next) = adj.get(cur) {
-                stack.extend(next.iter());
-            }
-        }
-        false
-    }
-
     let mut new_edges = Vec::new();
 
     // Resolve every reader's candidates once, splitting legacy from fan-out.
@@ -1010,7 +989,6 @@ pub fn infer_runtime_dependencies(
     // edge make a later reader's unguarded legacy edge closing — a refusal
     // the old behavior never had.
     let mut legacy_candidates: Vec<(NodeId, String, NodeId)> = Vec::new();
-    let mut fanout_candidates: Vec<(NodeId, String, NodeId)> = Vec::new();
     for node in &dag.nodes {
         if node.kind != NodeKind::Transformation {
             continue;
@@ -1038,25 +1016,24 @@ pub fn infer_runtime_dependencies(
             let Some(claimants) = producers.get(&bare) else {
                 continue;
             };
-            // EVERY claimant of the label gets the edge: which one the
-            // reader actually depends on is unknowable from the label alone,
-            // and an extra ordering constraint is the safe direction.
-            for (producer_id, producer_kind) in claimants {
+            // ONLY the legacy winner's edge is derived — byte-for-byte the
+            // single-slot heuristic's graph. Ordering readers after the
+            // OTHER claimants was tried and reverted four review rounds
+            // running: any edge added beyond main's graph can suppress an
+            // exact physical dependency through the shared cycle guards
+            // until the cross-pass provenance contract exists (#1357). The
+            // collision is REPORTED so the un-ordered claimants are visible
+            // instead of silent.
+            for (producer_id, _kind) in claimants {
                 if *producer_id == node.id {
                     continue;
                 }
-                let entry = (node.id.clone(), node.label.clone(), producer_id.clone());
                 if legacy_winner.get(bare.as_str()) == Some(producer_id) {
-                    legacy_candidates.push(entry);
-                } else if *producer_kind != NodeKind::Transformation {
-                    // Fan-out is restricted to NON-transformation claimants.
-                    // A transformation claimant's ordering belongs to the
-                    // target-aware physical pass: its edges never enter that
-                    // pass's transformation-pair existing-projection, so a
-                    // fan-out edge here could suppress an exact physical
-                    // dependency (review round-4 construction) — while
-                    // seed/load/replication edges structurally cannot.
-                    fanout_candidates.push(entry);
+                    legacy_candidates.push((
+                        node.id.clone(),
+                        node.label.clone(),
+                        producer_id.clone(),
+                    ));
                 }
             }
         }
@@ -1069,32 +1046,6 @@ pub fn infer_runtime_dependencies(
         if !existing.insert(key) {
             continue;
         }
-        adj.entry(producer_id.clone())
-            .or_default()
-            .push(reader_id.clone());
-        new_edges.push(UnifiedEdge {
-            from: producer_id,
-            to: reader_id,
-            edge_type: EdgeType::DataDependency,
-        });
-    }
-    // Phase 2 — fan-out additions, guarded against the complete graph: they
-    // must never introduce a refusal the old behavior did not have.
-    for (reader_id, reader_label, producer_id) in fanout_candidates {
-        let key = (producer_id.clone(), reader_id.clone());
-        if existing.contains(&key) {
-            continue;
-        }
-        if label_reaches(&adj, &reader_id, &producer_id) {
-            report
-                .skipped_cycle_edges
-                .push((reader_label, producer_id.0.clone()));
-            continue;
-        }
-        existing.insert(key);
-        adj.entry(producer_id.clone())
-            .or_default()
-            .push(reader_id.clone());
         new_edges.push(UnifiedEdge {
             from: producer_id,
             to: reader_id,
@@ -1104,7 +1055,6 @@ pub fn infer_runtime_dependencies(
 
     dag.edges.extend(new_edges);
     report.unparsed.sort();
-    report.skipped_cycle_edges.sort();
     report
 }
 
@@ -1119,10 +1069,6 @@ pub struct LabelInferenceReport {
     pub label_collisions: Vec<(String, usize)>,
     /// Transformation labels whose SQL failed table-reference extraction.
     pub unparsed: Vec<String>,
-    /// (reader label, producer node id) pairs whose inferred edge would
-    /// close a dependency cycle and was skipped — the pair executes in the
-    /// already-established order.
-    pub skipped_cycle_edges: Vec<(String, String)>,
 }
 
 impl LabelInferenceReport {
@@ -1132,23 +1078,16 @@ impl LabelInferenceReport {
         let mut w = Vec::new();
         for (label, n) in &self.label_collisions {
             w.push(format!(
-                "label '{label}' is produced by {n} nodes — readers are ordered after the \
-                 claimants label inference admitted (the legacy winner plus non-transformation \
-                 claimants the cycle guard allowed); rename one if that over-constrains the \
-                 schedule"
+                "label '{label}' is produced by {n} nodes — label inference orders readers \
+                 after ONE of them (the last in build order); the others are NOT ordered. \
+                 Declare depends_on to state the real dependency, or rename the colliding \
+                 producers"
             ));
         }
         for m in &self.unparsed {
             w.push(format!(
                 "model '{m}': SQL could not be parsed for table references — label-based \
                  ordering could not be derived for it"
-            ));
-        }
-        for (reader, producer) in &self.skipped_cycle_edges {
-            w.push(format!(
-                "label-based ordering: the inferred edge '{reader}' -> '{producer}' would \
-                 close a dependency cycle and was skipped; declare depends_on to state the \
-                 real direction"
             ));
         }
         w
@@ -3237,47 +3176,6 @@ mod tests {
         assert!(pos("a") < pos("b"), "consistent with the intermediate path");
     }
 
-    /// #1351: two producers sharing a lowercased label must BOTH order the
-    /// reader — the single-slot map silently dropped one and the reader
-    /// raced it.
-    #[test]
-    fn colliding_labels_order_the_reader_after_all_claimants() {
-        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
-        let mut reader = model("reader", vec![], vec![]);
-        reader.sql = "SELECT x FROM shared".into();
-        let by_pipeline = owned_by_sole_transformation(&config, vec![reader.clone()]);
-        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
-        // Two non-transformation producers wearing the same label.
-        for (i, kind) in [(0u8, NodeKind::Seed), (1u8, NodeKind::Load)] {
-            dag.nodes.push(UnifiedNode {
-                id: NodeId(format!("p{i}:shared")),
-                kind,
-                label: "shared".into(),
-                pipeline: Some("t".into()),
-            });
-        }
-        let sql: HashMap<String, String> =
-            HashMap::from([("reader".to_string(), reader.sql.clone())]);
-        let report = infer_runtime_dependencies(&mut dag, &sql);
-        assert_eq!(report.label_collisions, vec![("shared".to_string(), 2)]);
-        let reader_id = dag
-            .nodes
-            .iter()
-            .find(|n| n.label == "reader" && n.kind == NodeKind::Transformation)
-            .unwrap()
-            .id
-            .clone();
-        let producer_edges = dag
-            .edges
-            .iter()
-            .filter(|e| e.to == reader_id && e.from.0.starts_with('p'))
-            .count();
-        assert_eq!(
-            producer_edges, 2,
-            "the reader is ordered after BOTH claimants"
-        );
-    }
-
     /// #1351: a transformation whose SQL cannot be parsed is REPORTED, not
     /// silently skipped.
     #[test]
@@ -3292,6 +3190,51 @@ mod tests {
         let report = infer_runtime_dependencies(&mut dag, &sql);
         assert_eq!(report.unparsed, vec!["broken".to_string()]);
         assert!(!report.warnings().is_empty());
+    }
+
+    /// #1351 observability: a label collision derives ONLY the legacy
+    /// winner's edge (byte-for-byte main's graph — no new edges until the
+    /// #1357 provenance contract exists) and REPORTS the collision so the
+    /// un-ordered claimants are visible instead of silent.
+    #[test]
+    fn label_collisions_are_reported_and_only_the_legacy_edge_derives() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut reader = model("reader", vec![], vec![]);
+        reader.sql = "SELECT x FROM shared".into();
+        let by_pipeline = owned_by_sole_transformation(&config, vec![reader.clone()]);
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        let p0 = NodeId("p0:shared".to_string());
+        let p1 = NodeId("p1:shared".to_string());
+        dag.nodes.push(UnifiedNode {
+            id: p0.clone(),
+            kind: NodeKind::Seed,
+            label: "shared".into(),
+            pipeline: Some("t".into()),
+        });
+        dag.nodes.push(UnifiedNode {
+            id: p1.clone(),
+            kind: NodeKind::Load,
+            label: "shared".into(),
+            pipeline: Some("t".into()),
+        });
+        let sql: HashMap<String, String> =
+            HashMap::from([("reader".to_string(), reader.sql.clone())]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(report.label_collisions, vec![("shared".to_string(), 2)]);
+        assert!(!report.warnings().is_empty());
+        let reader_id = dag
+            .nodes
+            .iter()
+            .find(|n| n.label == "reader" && n.kind == NodeKind::Transformation)
+            .unwrap()
+            .id
+            .clone();
+        let from_p0 = dag.edges.iter().any(|e| e.from == p0 && e.to == reader_id);
+        let from_p1 = dag.edges.iter().any(|e| e.from == p1 && e.to == reader_id);
+        assert!(
+            !from_p0 && from_p1,
+            "exactly the legacy (last) claimant's edge — main's graph"
+        );
     }
 
     /// Status quo pinned: genuinely reciprocal label reads REFUSE loudly
@@ -3312,189 +3255,9 @@ mod tests {
             ("b".to_string(), b.sql.clone()),
         ]);
         let report = infer_runtime_dependencies(&mut dag, &sql);
-        assert!(report.skipped_cycle_edges.is_empty(), "{report:?}");
         assert!(
             execution_phases(&dag).is_err(),
             "a genuine SQL cycle keeps its loud refusal"
         );
-    }
-
-    /// The guard applies exactly to the edges the fan-out ADDS: a non-legacy
-    /// claimant edge that would close a cycle is skipped (warned) — the old
-    /// single-slot behavior had no such edge, so no refusal may appear.
-    #[test]
-    fn a_fanout_claimant_edge_never_introduces_a_new_refusal() {
-        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
-        let mut reader = model("reader", vec![], vec![]);
-        reader.sql = "SELECT x FROM shared".into();
-        let by_pipeline = owned_by_sole_transformation(&config, vec![reader.clone()]);
-        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
-        let reader_id = dag
-            .nodes
-            .iter()
-            .find(|n| n.label == "reader" && n.kind == NodeKind::Transformation)
-            .unwrap()
-            .id
-            .clone();
-        // Two claimants; the FIRST (non-legacy under last-wins) already
-        // depends on the reader through an existing edge, so its fan-out
-        // edge would close a cycle.
-        let p0 = NodeId("p0:shared".to_string());
-        let p1 = NodeId("p1:shared".to_string());
-        dag.nodes.push(UnifiedNode {
-            id: p0.clone(),
-            kind: NodeKind::Seed,
-            label: "shared".into(),
-            pipeline: Some("t".into()),
-        });
-        dag.nodes.push(UnifiedNode {
-            id: p1.clone(),
-            kind: NodeKind::Load,
-            label: "shared".into(),
-            pipeline: Some("t".into()),
-        });
-        dag.edges.push(UnifiedEdge {
-            from: reader_id.clone(),
-            to: p0.clone(),
-            edge_type: EdgeType::DataDependency,
-        });
-        let sql: HashMap<String, String> =
-            HashMap::from([("reader".to_string(), reader.sql.clone())]);
-        let report = infer_runtime_dependencies(&mut dag, &sql);
-        assert_eq!(report.skipped_cycle_edges.len(), 1, "{report:?}");
-        execution_phases(&dag).expect("the fan-out edge skips; nothing refuses");
-    }
-
-    /// Two-phase insertion pinned: an earlier reader's guarded FAN-OUT edge
-    /// must not make a later reader's unguarded LEGACY edge closing — that
-    /// would refuse a DAG the single-slot heuristic ran. Legacy edges land
-    /// first (the status-quo graph), fan-out edges are then guarded against
-    /// the complete graph.
-    #[test]
-    fn a_fanout_edge_cannot_make_a_later_legacy_edge_closing() {
-        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
-        let mut t1 = model("t1", vec![], vec![]);
-        t1.sql = "SELECT x FROM s".into();
-        let mut t2 = model("t2", vec![], vec![]);
-        t2.sql = "SELECT y FROM t1".into();
-        let models = vec![t1.clone(), t2.clone()];
-        let by_pipeline = owned_by_sole_transformation(&config, models);
-        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
-        let t2_id = dag
-            .nodes
-            .iter()
-            .find(|n| n.label == "t2" && n.kind == NodeKind::Transformation)
-            .unwrap()
-            .id
-            .clone();
-        // Label "s": P first (fan-out under last-wins), L last (legacy).
-        let p = NodeId("p:s".to_string());
-        let l = NodeId("l:s".to_string());
-        dag.nodes.push(UnifiedNode {
-            id: p.clone(),
-            kind: NodeKind::Seed,
-            label: "s".into(),
-            pipeline: Some("t".into()),
-        });
-        dag.nodes.push(UnifiedNode {
-            id: l.clone(),
-            kind: NodeKind::Load,
-            label: "s".into(),
-            pipeline: Some("t".into()),
-        });
-        // P depends on T2 (existing edge T2 -> P): with interleaved insertion
-        // the fan-out edge P -> T1 lands before T2's legacy edge T1 -> T2 and
-        // closes the cycle T2 -> P -> T1 -> T2. The old single-slot graph had
-        // no P edge at all and RAN.
-        dag.edges.push(UnifiedEdge {
-            from: t2_id,
-            to: p.clone(),
-            edge_type: EdgeType::DataDependency,
-        });
-        let sql: HashMap<String, String> = HashMap::from([
-            ("t1".to_string(), t1.sql.clone()),
-            ("t2".to_string(), t2.sql.clone()),
-        ]);
-        let report = infer_runtime_dependencies(&mut dag, &sql);
-        execution_phases(&dag)
-            .expect("the fan-out edge must be the one skipped; nothing may refuse");
-        assert!(
-            report
-                .skipped_cycle_edges
-                .iter()
-                .any(|(r, pid)| r == "t1" && pid == "p:s"),
-            "{report:?}"
-        );
-    }
-
-    /// Round-4 construction pinned: when a TRANSFORMATION claimant loses
-    /// last-wins, no fan-out edge is added for it — its ordering belongs to
-    /// the physical pass, whose exact edge must survive and order the pair.
-    /// (A fan-out label edge to a transformation could suppress that exact
-    /// edge; seed/load claimants structurally cannot.)
-    #[test]
-    fn no_fanout_to_transformation_claimants_so_physical_evidence_survives() {
-        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
-        // Model "A" (upper) and a Load labeled "a": reader r bare-reads "a";
-        // A reads r's exact target. Lowercased label "a" has claimants
-        // [A(transformation), load:a] — last-wins → load is legacy, A is the
-        // would-be fan-out claimant and must be excluded.
-        let mut big_a = model("A", vec![], vec![]);
-        big_a.sql = "SELECT y FROM warehouse.silver.r_out".into();
-        let mut r = model("r", vec![], vec![]);
-        r.config.target.table = "r_out".into();
-        r.sql = "SELECT x FROM a".into();
-        let models = vec![big_a.clone(), r.clone()];
-        let by_pipeline = owned_by_sole_transformation(&config, models.clone());
-        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
-        dag.nodes.push(UnifiedNode {
-            id: NodeId("load:a".to_string()),
-            kind: NodeKind::Load,
-            label: "a".into(),
-            pipeline: Some("t".into()),
-        });
-
-        // Caller order: label pass first, then physical.
-        let sql: HashMap<String, String> = HashMap::from([
-            ("A".to_string(), big_a.sql.clone()),
-            ("r".to_string(), r.sql.clone()),
-        ]);
-        let report = infer_runtime_dependencies(&mut dag, &sql);
-        // No fan-out edge to the transformation claimant A.
-        let a_id = dag
-            .nodes
-            .iter()
-            .find(|n| n.label == "A" && n.kind == NodeKind::Transformation)
-            .unwrap()
-            .id
-            .clone();
-        let r_id = dag
-            .nodes
-            .iter()
-            .find(|n| n.label == "r" && n.kind == NodeKind::Transformation)
-            .unwrap()
-            .id
-            .clone();
-        assert!(
-            !dag.edges.iter().any(|e| e.from == a_id && e.to == r_id),
-            "no label fan-out edge may target a transformation claimant: {report:?}"
-        );
-
-        let inputs: Vec<crate::physical_edges::PhysicalEdgeModel<'_>> = models
-            .iter()
-            .map(crate::physical_edges::PhysicalEdgeModel::from_model)
-            .collect();
-        let derived = infer_physical_dependencies(&mut dag, &inputs);
-        assert_eq!(derived.edges.len(), 1, "{derived:?}");
-        // The spurious bare candidate (r bare-reading a name that folds to
-        // A's table) is correctly the one skipped — specificity at work.
-        let phases = execution_phases(&dag).expect("no refusal");
-        let pos = |id: &NodeId| {
-            phases
-                .iter()
-                .position(|l| l.iter().any(|n| &n.id == id))
-                .unwrap()
-        };
-        assert!(pos(&r_id) < pos(&a_id), "the exact physical order wins");
     }
 }
