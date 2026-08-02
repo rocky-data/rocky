@@ -1370,31 +1370,29 @@ fn strip_leading_sql_comments_and_whitespace(mut sql: &str) -> &str {
             // BigQuery's, where a nested opener is a syntax error) — track
             // depth so `/* outer /* inner */ still-comment */ SELECT 1`
             // classifies by its real first keyword.
+            // Single pass over bytes, O(n): a rescan-from-start loop is
+            // quadratic on adversarial comment content, and generated SQL
+            // can be large enough for that to stall before submission.
+            let bytes = body.as_bytes();
             let mut depth: usize = 1;
-            let mut rest = body;
-            loop {
-                let next_close = rest.find("*/");
-                let next_open = rest.find("/*");
-                match (next_open, next_close) {
-                    (Some(o), Some(c)) if o < c => {
+            let mut i = 0usize;
+            while i + 1 < bytes.len() {
+                match &bytes[i..i + 2] {
+                    b"/*" => {
                         depth += 1;
-                        rest = &rest[o + 2..];
+                        i += 2;
                     }
-                    (_, Some(c)) => {
+                    b"*/" => {
                         depth -= 1;
-                        rest = &rest[c + 2..];
+                        i += 2;
                         if depth == 0 {
                             break;
                         }
                     }
-                    // Unterminated at some depth: nothing classifiable.
-                    (_, None) => {
-                        rest = "";
-                        break;
-                    }
+                    _ => i += 1,
                 }
             }
-            sql = rest;
+            sql = if depth == 0 { &body[i..] } else { "" };
             continue;
         }
         return trimmed;
