@@ -6492,8 +6492,20 @@ fn apply_shadow_rewrite(
 /// having detected it. This holds for BOTH a governed agent apply and a bare
 /// `rocky run` (governance is skipped on a partial failure either way). It is the
 /// exact condition the run-path evaluates at the replication `--all` site.
+
+pub(crate) fn model_phase_ok<T>(
+    exec_result: &anyhow::Result<T>,
+    failures_before: usize,
+    failures_after: usize,
+) -> bool {
+    exec_result.is_ok() && failures_after == failures_before
+}
+
 /// The (catalog, schema) pairs an invocation may pre-create under
-/// `auto_create_schemas` — exactly the models it will ACTUALLY BUILD.
+/// `auto_create_schemas` — the models the selection will attempt to build.
+/// (Runtime exclusions decided later — containment poisoning, skip gates —
+/// are not known here; pre-creating for a model those later skip is
+/// idempotent preflight, unlike compile failure, which is known NOW.)
 ///
 /// Three exclusions, each load-bearing:
 /// - the `--model` filter and the model set: pre-creating a schema for a
@@ -6524,14 +6536,6 @@ fn collect_auto_create_targets(
         ));
     }
     targets
-}
-
-pub(crate) fn model_phase_ok<T>(
-    exec_result: &anyhow::Result<T>,
-    failures_before: usize,
-    failures_after: usize,
-) -> bool {
-    exec_result.is_ok() && failures_after == failures_before
 }
 
 /// Record a model's runtime failure as a *contained cause*: bump the failure
@@ -17225,6 +17229,12 @@ timestamp_column = "ts"
         let filtered = super::collect_auto_create_targets(&models, Some("good"), None, &failed);
         assert_eq!(filtered.len(), 1, "{filtered:?}");
         assert!(filtered.contains(&("cat".to_string(), "s_good".to_string())));
+
+        // And the model set does too.
+        let set: std::collections::BTreeSet<String> = ["other".to_string()].into();
+        let by_set = super::collect_auto_create_targets(&models, None, Some(&set), &failed);
+        assert_eq!(by_set.len(), 1, "{by_set:?}");
+        assert!(by_set.contains(&("cat".to_string(), "s_other".to_string())));
     }
 
     /// Two selected models whose targets differ only by case are refused on
