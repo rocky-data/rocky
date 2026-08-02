@@ -938,7 +938,7 @@ pub fn infer_runtime_dependencies(
     // of claimants: two nodes sharing a lowercased label must both receive
     // reader edges — a single-slot map silently dropped one of them, and the
     // reader raced whichever producer lost the insert (#1351).
-    let mut producers: HashMap<String, Vec<NodeId>> = HashMap::new();
+    let mut producers: HashMap<String, Vec<(NodeId, NodeKind)>> = HashMap::new();
     for node in &dag.nodes {
         match node.kind {
             NodeKind::Transformation | NodeKind::Seed | NodeKind::Load | NodeKind::Replication => {
@@ -946,7 +946,7 @@ pub fn infer_runtime_dependencies(
                 producers
                     .entry(node.label.to_lowercase())
                     .or_default()
-                    .push(node.id.clone());
+                    .push((node.id.clone(), node.kind));
             }
             _ => {}
         }
@@ -960,7 +960,7 @@ pub fn infer_runtime_dependencies(
         }
         // The single-slot map's insert order made the LAST claimant the one
         // whose edges the old code produced.
-        if let Some(last) = claimants.last() {
+        if let Some((last, _)) = claimants.last() {
             legacy_winner.insert(label.as_str(), last.clone());
         }
     }
@@ -1041,14 +1041,21 @@ pub fn infer_runtime_dependencies(
             // EVERY claimant of the label gets the edge: which one the
             // reader actually depends on is unknowable from the label alone,
             // and an extra ordering constraint is the safe direction.
-            for producer_id in claimants {
+            for (producer_id, producer_kind) in claimants {
                 if *producer_id == node.id {
                     continue;
                 }
                 let entry = (node.id.clone(), node.label.clone(), producer_id.clone());
                 if legacy_winner.get(bare.as_str()) == Some(producer_id) {
                     legacy_candidates.push(entry);
-                } else {
+                } else if *producer_kind != NodeKind::Transformation {
+                    // Fan-out is restricted to NON-transformation claimants.
+                    // A transformation claimant's ordering belongs to the
+                    // target-aware physical pass: its edges never enter that
+                    // pass's transformation-pair existing-projection, so a
+                    // fan-out edge here could suppress an exact physical
+                    // dependency (review round-4 construction) — while
+                    // seed/load/replication edges structurally cannot.
                     fanout_candidates.push(entry);
                 }
             }
@@ -1125,8 +1132,10 @@ impl LabelInferenceReport {
         let mut w = Vec::new();
         for (label, n) in &self.label_collisions {
             w.push(format!(
-                "label '{label}' is produced by {n} nodes — readers are ordered after ALL of \
-                 them; rename one if that over-constrains the schedule"
+                "label '{label}' is produced by {n} nodes — readers are ordered after the \
+                 claimants label inference admitted (the legacy winner plus non-transformation \
+                 claimants the cycle guard allowed); rename one if that over-constrains the \
+                 schedule"
             ));
         }
         for m in &self.unparsed {
@@ -3416,5 +3425,76 @@ mod tests {
                 .any(|(r, pid)| r == "t1" && pid == "p:s"),
             "{report:?}"
         );
+    }
+
+    /// Round-4 construction pinned: when a TRANSFORMATION claimant loses
+    /// last-wins, no fan-out edge is added for it — its ordering belongs to
+    /// the physical pass, whose exact edge must survive and order the pair.
+    /// (A fan-out label edge to a transformation could suppress that exact
+    /// edge; seed/load claimants structurally cannot.)
+    #[test]
+    fn no_fanout_to_transformation_claimants_so_physical_evidence_survives() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        // Model "A" (upper) and a Load labeled "a": reader r bare-reads "a";
+        // A reads r's exact target. Lowercased label "a" has claimants
+        // [A(transformation), load:a] — last-wins → load is legacy, A is the
+        // would-be fan-out claimant and must be excluded.
+        let mut big_a = model("A", vec![], vec![]);
+        big_a.sql = "SELECT y FROM warehouse.silver.r_out".into();
+        let mut r = model("r", vec![], vec![]);
+        r.config.target.table = "r_out".into();
+        r.sql = "SELECT x FROM a".into();
+        let models = vec![big_a.clone(), r.clone()];
+        let by_pipeline = owned_by_sole_transformation(&config, models.clone());
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        dag.nodes.push(UnifiedNode {
+            id: NodeId("load:a".to_string()),
+            kind: NodeKind::Load,
+            label: "a".into(),
+            pipeline: Some("t".into()),
+        });
+
+        // Caller order: label pass first, then physical.
+        let sql: HashMap<String, String> = HashMap::from([
+            ("A".to_string(), big_a.sql.clone()),
+            ("r".to_string(), r.sql.clone()),
+        ]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
+        // No fan-out edge to the transformation claimant A.
+        let a_id = dag
+            .nodes
+            .iter()
+            .find(|n| n.label == "A" && n.kind == NodeKind::Transformation)
+            .unwrap()
+            .id
+            .clone();
+        let r_id = dag
+            .nodes
+            .iter()
+            .find(|n| n.label == "r" && n.kind == NodeKind::Transformation)
+            .unwrap()
+            .id
+            .clone();
+        assert!(
+            !dag.edges.iter().any(|e| e.from == a_id && e.to == r_id),
+            "no label fan-out edge may target a transformation claimant: {report:?}"
+        );
+
+        let inputs: Vec<crate::physical_edges::PhysicalEdgeModel<'_>> = models
+            .iter()
+            .map(crate::physical_edges::PhysicalEdgeModel::from_model)
+            .collect();
+        let derived = infer_physical_dependencies(&mut dag, &inputs);
+        assert_eq!(derived.edges.len(), 1, "{derived:?}");
+        // The spurious bare candidate (r bare-reading a name that folds to
+        // A's table) is correctly the one skipped — specificity at work.
+        let phases = execution_phases(&dag).expect("no refusal");
+        let pos = |id: &NodeId| {
+            phases
+                .iter()
+                .position(|l| l.iter().any(|n| &n.id == id))
+                .unwrap()
+        };
+        assert!(pos(&r_id) < pos(&a_id), "the exact physical order wins");
     }
 }
