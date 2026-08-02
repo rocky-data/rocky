@@ -269,19 +269,52 @@ pub enum PreviewDiffAlgorithmSelector {
 fn newest_branch_and_base_runs(
     store: &rocky_core::state::StateStore,
     branch_name: &str,
+    base_ref: Option<&str>,
 ) -> Result<(
     Option<rocky_core::state::RunRecord>,
     Option<rocky_core::state::RunRecord>,
+    Option<String>,
 )> {
     let branch_run = store
         .list_runs_matching(1, |r| r.git_branch.as_deref() == Some(branch_name))?
         .into_iter()
         .next();
-    let base_run = store
-        .list_runs_matching(1, |r| r.git_branch.as_deref() != Some(branch_name))?
+    // Select the base run from the ref the caller NAMED (#1345) — the old
+    // "newest run that isn't this branch" happily paired against an
+    // unrelated third branch, or a detached-HEAD run with no branch at all,
+    // while the output labeled the result as `base_ref`. The cost preview
+    // has no named base and goes straight to the fallback.
+    if let Some(base_ref) = base_ref {
+        let named_base = store
+            .list_runs_matching(1, |r| r.git_branch.as_deref() == Some(base_ref))?
+            .into_iter()
+            .next();
+        if let Some(run) = named_base {
+            return Ok((branch_run, Some(run), None));
+        }
+    }
+    // No recorded run on the named ref — either it is a sha/tag (run records
+    // store branch names) or the base branch has never run here. Fall back
+    // to the newest run on any OTHER named branch, and SAY SO: a diff
+    // against an unnamed stand-in must never wear the base's name silently.
+    // Detached/no-branch runs are not eligible — "not a branch, and
+    // certainly not the base".
+    let fallback = store
+        .list_runs_matching(1, |r| {
+            r.git_branch.is_some() && r.git_branch.as_deref() != Some(branch_name)
+        })?
         .into_iter()
         .next();
-    Ok((branch_run, base_run))
+    let note = match (base_ref, fallback.as_ref()) {
+        (Some(base_ref), Some(r)) => Some(format!(
+            "no recorded run on '{base_ref}'; compared against the newest run on '{}' \
+             ({}) instead",
+            r.git_branch.as_deref().unwrap_or("<unknown>"),
+            r.run_id
+        )),
+        _ => None,
+    };
+    Ok((branch_run, fallback, note))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -303,7 +336,8 @@ pub async fn run_preview_diff(
     // Tighter branch-vs-main partitioning lands when `git_branch` is plumbed
     // through the state-store branch record (today the audit trail records
     // `git_branch` on the RunRecord directly).
-    let (branch_run, base_run) = newest_branch_and_base_runs(&store, branch_name)?;
+    let (branch_run, base_run, base_note) =
+        newest_branch_and_base_runs(&store, branch_name, Some(base_ref))?;
 
     let (mut summary, mut models) = match (branch_run.as_ref(), base_run.as_ref()) {
         (Some(b), Some(p)) => build_preview_diff(b, p),
@@ -338,11 +372,18 @@ pub async fn run_preview_diff(
         }
     }
 
-    let markdown = render_preview_diff_markdown(branch_name, base_ref, &summary, &models);
+    let markdown = render_preview_diff_markdown(
+        branch_name,
+        base_ref,
+        base_note.as_deref(),
+        &summary,
+        &models,
+    );
 
     let out = PreviewDiffOutput::new(
         branch_name.to_string(),
         base_ref.to_string(),
+        base_note,
         summary,
         models,
         markdown,
@@ -828,6 +869,7 @@ fn build_preview_diff(
 fn render_preview_diff_markdown(
     branch_name: &str,
     base_ref: &str,
+    base_note: Option<&str>,
     summary: &crate::output::PreviewDiffSummary,
     models: &[crate::output::PreviewModelDiff],
 ) -> String {
@@ -854,6 +896,9 @@ fn render_preview_diff_markdown(
         summary.total_rows_added,
         summary.total_rows_removed,
     ));
+    if let Some(note) = base_note {
+        out.push_str(&format!("> ⚠️ {note}\n\n"));
+    }
 
     if any_bisection {
         // Wider table — bisection rows have ~rows + chunks_examined +
@@ -976,7 +1021,8 @@ pub async fn run_preview_cost(
     let store = rocky_core::state::StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
 
-    let (branch_run, base_run) = newest_branch_and_base_runs(&store, branch_name)?;
+    let (branch_run, base_run, _base_note) =
+        newest_branch_and_base_runs(&store, branch_name, None)?;
 
     // Resolve adapter cost params + project-level budget best-effort.
     // A missing or malformed config silently skips both projections —
@@ -2008,18 +2054,19 @@ mod tests {
         }
 
         let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
-        let (branch_run, base_run) =
-            newest_branch_and_base_runs(&store, "feature_x").expect("selection must succeed");
+        let (branch_run, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature_x", Some("main"))
+                .expect("selection must succeed");
 
         let branch_run = branch_run.expect("the branch's run is found regardless of its rank");
         assert_eq!(branch_run.run_id, "run-00000");
-        // And the base side is still the newest non-branch run, so ordering
-        // within each half is unchanged.
+        // The named base's newest run, with no fallback note.
         assert_eq!(
             base_run.expect("a base run exists").run_id,
             "run-00080",
-            "base is the NEWEST run not on the branch"
+            "base is the NEWEST run on the NAMED base"
         );
+        assert!(note.is_none());
     }
 
     /// A branch with no runs at all reports none — so the test above is
@@ -2035,9 +2082,74 @@ mod tests {
             store.record_run(&r).unwrap();
         }
         let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
-        let (branch_run, base_run) = newest_branch_and_base_runs(&store, "never_used").unwrap();
+        let (branch_run, base_run, _note) =
+            newest_branch_and_base_runs(&store, "never_used", Some("main")).unwrap();
         assert!(branch_run.is_none());
         assert!(base_run.is_some(), "the main run is still a valid base");
+    }
+
+    /// #1345's exact repro: newest-last `t1` on main, `t2` detached, `t3` on
+    /// feature. `--base main` must pair `t3` with `t1` — not the newer
+    /// detached run — and carry no fallback note.
+    #[test]
+    fn the_named_base_beats_newer_unrelated_and_detached_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut t1 = sample_run("t1", base);
+            t1.git_branch = Some("main".to_string());
+            store.record_run(&t1).unwrap();
+            let mut t2 = sample_run("t2", base + chrono::Duration::minutes(1));
+            t2.git_branch = None; // detached HEAD
+            store.record_run(&t2).unwrap();
+            let mut t3 = sample_run("t3", base + chrono::Duration::minutes(2));
+            t3.git_branch = Some("feature".to_string());
+            store.record_run(&t3).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (branch_run, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some("main")).unwrap();
+        assert_eq!(branch_run.unwrap().run_id, "t3");
+        assert_eq!(
+            base_run.unwrap().run_id,
+            "t1",
+            "the NAMED base, not the newer detached run"
+        );
+        assert!(note.is_none());
+    }
+
+    /// A base with no recorded run falls back to the newest OTHER NAMED
+    /// branch — never a detached run — and says so in the note.
+    #[test]
+    fn a_missing_base_falls_back_to_a_named_branch_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut other = sample_run("other-1", base);
+            other.git_branch = Some("develop".to_string());
+            store.record_run(&other).unwrap();
+            let mut detached = sample_run("detached-1", base + chrono::Duration::minutes(1));
+            detached.git_branch = None;
+            store.record_run(&detached).unwrap();
+            let mut feat = sample_run("feat-1", base + chrono::Duration::minutes(2));
+            feat.git_branch = Some("feature".to_string());
+            store.record_run(&feat).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some("main")).unwrap();
+        assert_eq!(
+            base_run.unwrap().run_id,
+            "other-1",
+            "fallback skips the newer detached run"
+        );
+        let note = note.expect("the stand-in must be named");
+        assert!(note.contains("no recorded run on 'main'"), "{note}");
+        assert!(note.contains("develop"), "{note}");
     }
 
     /// A populated preview output renders the counts and the run id.
@@ -2596,7 +2708,7 @@ mod tests {
             None,
         );
         let (summary, models) = build_preview_diff(&branch, &base);
-        let md = render_preview_diff_markdown("feature_x", "main", &summary, &models);
+        let md = render_preview_diff_markdown("feature_x", "main", None, &summary, &models);
         assert!(md.contains("**Preview diff**"));
         assert!(md.contains("`feature_x`"));
         assert!(md.contains("vs `main`"));
@@ -2613,7 +2725,7 @@ mod tests {
     #[test]
     fn diff_markdown_empty_path_explains_setup() {
         let summary = empty_diff_summary();
-        let md = render_preview_diff_markdown("feature_x", "main", &summary, &[]);
+        let md = render_preview_diff_markdown("feature_x", "main", None, &summary, &[]);
         assert!(md.contains("No paired runs"));
         assert!(md.contains("rocky run --branch feature_x"));
     }

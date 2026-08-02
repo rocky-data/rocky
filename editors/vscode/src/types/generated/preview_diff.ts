@@ -30,6 +30,10 @@ export type PreviewModelDiffAlgorithm =
  * **Sampled correctness ceiling.** The sampled algorithm reads `LIMIT N` rows ordered by primary key (or first column). Changes outside that window appear as no-change unless the row count itself differs; `sampling_window.coverage_warning = true` flags that risk. **Bisection** walks the chunk lattice exhaustively over a single-column primary key; `bisection_stats.depth_capped = true` flags the rare case where the recursion bottomed out at the depth cap before reaching leaf size. `summary.any_coverage_warning` rolls both signals up.
  */
 export interface PreviewDiffOutput {
+  /**
+   * Present when no run was recorded on `base_ref` and the diff fell back to the newest run on another named branch — names the stand-in so the diff never silently wears the base's name (#1345).
+   */
+  base_note?: string | null;
   base_ref: string;
   branch_name: string;
   command: string;

@@ -9126,6 +9126,11 @@ pub struct PreviewDiffOutput {
     pub command: String,
     pub branch_name: String,
     pub base_ref: String,
+    /// Present when no run was recorded on `base_ref` and the diff fell back
+    /// to the newest run on another named branch — names the stand-in so the
+    /// diff never silently wears the base's name (#1345).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_note: Option<String>,
     pub summary: PreviewDiffSummary,
     pub models: Vec<PreviewModelDiff>,
     /// Pre-rendered Markdown suitable for posting as a GitHub PR comment.
@@ -9468,6 +9473,7 @@ impl PreviewDiffOutput {
     pub fn new(
         branch_name: String,
         base_ref: String,
+        base_note: Option<String>,
         summary: PreviewDiffSummary,
         models: Vec<PreviewModelDiff>,
         markdown: String,
@@ -9477,6 +9483,7 @@ impl PreviewDiffOutput {
             command: "preview-diff".to_string(),
             branch_name,
             base_ref,
+            base_note,
             summary,
             models,
             markdown,
