@@ -315,6 +315,12 @@ pub struct RunOutput {
     /// `on_budget_breach` hook so subscribers see them live.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub budget_breaches: Vec<BudgetBreachOutput>,
+    /// Scheduling warnings from physical-read edge derivation (#1275):
+    /// mutual physical reads serialized by a deterministic order, models
+    /// whose SQL could not be parsed for table references, and colliding
+    /// targets. Empty (and omitted) when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scheduling_warnings: Vec<String>,
     /// Soft warnings raised by the per-table override resolver — one
     /// entry per `[[table_overrides]]` rule that matched zero
     /// `(connector, table)` pairs this run, or whose connector half
@@ -4703,6 +4709,7 @@ impl RunOutput {
             skipped_by_run_id: None,
             idempotency_key: None,
             pipeline_type: Some("replication".to_string()),
+            scheduling_warnings: Vec::new(),
             filter,
             duration_ms,
             tables_copied: 0,
@@ -5321,6 +5328,11 @@ pub struct DagSummaryOutput {
 pub struct DagRunOutput {
     pub version: String,
     pub command: String,
+    /// Scheduling warnings from physical-read edge derivation: mutual reads
+    /// serialized by a deterministic order, models whose SQL could not be
+    /// parsed for reads, and colliding targets. Empty when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     /// Total nodes across all layers.
     pub total_nodes: usize,
     /// Number of execution layers (Kahn topological depth).

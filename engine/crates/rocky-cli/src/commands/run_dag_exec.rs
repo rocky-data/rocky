@@ -271,6 +271,25 @@ pub async fn run_with_dag(
         .collect();
     unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name);
 
+    // Physical-read ordering (#1275): the label heuristic above is blind to
+    // configured `[target]`s — a model reading another model's physical
+    // `schema.table` needs its edge derived from rendered target components,
+    // or the two race in one executor phase. Shared derivation with the
+    // plain-run layer computation; cycle-closing candidates are skipped
+    // deterministically inside (the executor refuses cyclic graphs, and a
+    // derived edge must never make a runnable project un-runnable).
+    let physical_inputs: Vec<rocky_core::physical_edges::PhysicalEdgeModel<'_>> =
+        models_by_pipeline
+            .values()
+            .flatten()
+            .map(rocky_core::physical_edges::PhysicalEdgeModel::from_model)
+            .collect();
+    let derived = unified_dag::infer_physical_dependencies(&mut dag, &physical_inputs);
+    let physical_edge_warnings = rocky_core::physical_edges::derivation_warnings(&derived);
+    for w in &physical_edge_warnings {
+        tracing::warn!("{w}");
+    }
+
     // `--dag` cannot isolate a run, so it refuses to pretend it can.
     //
     // #1272 was filed because `--dag --shadow` silently wrote production. The
@@ -353,6 +372,7 @@ pub async fn run_with_dag(
         let output = DagRunOutput {
             version: VERSION.into(),
             command: "run --dag".into(),
+            warnings: physical_edge_warnings.clone(),
             total_nodes: result.total_nodes,
             total_layers: result.total_layers,
             completed: result.completed,

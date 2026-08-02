@@ -35,6 +35,7 @@ pub mod model_walk;
 pub mod models;
 pub mod object_store;
 pub mod optimize;
+pub mod physical_edges;
 pub mod plan_partition;
 pub mod policy;
 pub mod preview;

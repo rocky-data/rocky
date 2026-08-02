@@ -1004,6 +1004,80 @@ pub fn infer_runtime_dependencies(
 /// [`rocky_ir::dag::execution_layers`].
 ///
 /// Returns an error if the DAG contains a cycle.
+/// Target-aware physical-read edges for transformation nodes (#1275).
+///
+/// [`infer_runtime_dependencies`] matches reads against node LABELS — it
+/// orders a model after a seed/load it reads by name, but is blind to
+/// configured `[target]`s: a model reading another model's physical
+/// `schema.table` derives nothing there unless the table happens to equal
+/// the model name. This pass derives those edges from rendered target
+/// components via [`crate::physical_edges::derive_physical_edges`] — the
+/// same derivation the plain-run layer computation uses, so both
+/// schedulers order the same pairs.
+///
+/// Cycle-closing candidates are skipped deterministically inside the
+/// derivation (the executor's `execution_phases` hard-errors on cycles, and
+/// a derived edge must never turn a runnable project into a refused one).
+/// Returns the derivation so the caller can surface its warnings.
+pub fn infer_physical_dependencies(
+    dag: &mut UnifiedDag,
+    models: &[crate::physical_edges::PhysicalEdgeModel<'_>],
+) -> crate::physical_edges::DerivedPhysicalEdges {
+    use std::collections::HashMap as Map;
+    // Transformation-node index by label (label == model name for
+    // transformation nodes — the same contract infer_runtime_dependencies
+    // relies on for SQL lookup).
+    let by_label: Map<&str, NodeId> = dag
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Transformation)
+        .map(|n| (n.label.as_str(), n.id.clone()))
+        .collect();
+    let id_to_label: Map<&NodeId, &str> = dag
+        .nodes
+        .iter()
+        .filter(|n| n.kind == NodeKind::Transformation)
+        .map(|n| (&n.id, n.label.as_str()))
+        .collect();
+
+    // Existing name-level relation among transformation nodes: consumer
+    // (edge.to) depends on producer (edge.from).
+    let existing: Vec<(String, String)> = dag
+        .edges
+        .iter()
+        .filter_map(|e| {
+            let from = id_to_label.get(&e.from)?;
+            let to = id_to_label.get(&e.to)?;
+            Some(((*to).to_string(), (*from).to_string()))
+        })
+        .collect();
+
+    let derived = crate::physical_edges::derive_physical_edges(models, &existing);
+
+    let edge_set: std::collections::HashSet<(NodeId, NodeId)> = dag
+        .edges
+        .iter()
+        .map(|e| (e.from.clone(), e.to.clone()))
+        .collect();
+    for (consumer, producer) in &derived.edges {
+        let (Some(cid), Some(pid)) = (
+            by_label.get(consumer.as_str()),
+            by_label.get(producer.as_str()),
+        ) else {
+            continue;
+        };
+        if edge_set.contains(&(pid.clone(), cid.clone())) {
+            continue;
+        }
+        dag.edges.push(UnifiedEdge {
+            from: pid.clone(),
+            to: cid.clone(),
+            edge_type: EdgeType::DataDependency,
+        });
+    }
+    derived
+}
+
 pub fn execution_phases(dag: &UnifiedDag) -> Result<Vec<Vec<&UnifiedNode>>, UnifiedDagError> {
     // Build adjacency structures keyed by NodeId.
     let node_map: HashMap<&NodeId, &UnifiedNode> = dag.nodes.iter().map(|n| (&n.id, n)).collect();
@@ -2709,5 +2783,77 @@ mod tests {
         // Should not panic; invalid SQL just yields no inferred edges.
         infer_runtime_dependencies(&mut dag, &sql);
         assert_eq!(dag.edges.len(), 0);
+    }
+
+    /// #1275: a transformation reading another transformation's PHYSICAL
+    /// target — with a table name ≠ model name, so the label heuristic
+    /// cannot see it — derives an edge and the executor phases order them.
+    #[test]
+    fn physical_reads_order_transformation_phases() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut producer = model("orders_model", vec![], vec![]);
+        producer.config.target.table = "orders_v2".into();
+        producer.sql = "SELECT 1 AS id".into();
+        let mut consumer = model("mart", vec![], vec![]);
+        consumer.sql = "SELECT id FROM silver.orders_v2".into();
+
+        let models = vec![producer, consumer];
+        let by_pipeline = owned_by_sole_transformation(&config, models.clone());
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+
+        // Precondition: label inference alone leaves them co-phased.
+        let sql_by_name: std::collections::HashMap<String, String> = models
+            .iter()
+            .map(|m| (m.config.name.clone(), m.sql.clone()))
+            .collect();
+        infer_runtime_dependencies(&mut dag, &sql_by_name);
+        let phases = execution_phases(&dag).expect("phases");
+        let phase_of = |label: &str, phases: &Vec<Vec<&UnifiedNode>>| -> usize {
+            phases
+                .iter()
+                .position(|l| l.iter().any(|n| n.label == label))
+                .unwrap()
+        };
+        assert_eq!(
+            phase_of("orders_model", &phases),
+            phase_of("mart", &phases),
+            "precondition: the label heuristic is blind to the renamed target"
+        );
+
+        let inputs: Vec<crate::physical_edges::PhysicalEdgeModel<'_>> = models
+            .iter()
+            .map(crate::physical_edges::PhysicalEdgeModel::from_model)
+            .collect();
+        let derived = infer_physical_dependencies(&mut dag, &inputs);
+        assert_eq!(derived.edges.len(), 1, "{derived:?}");
+        let phases = execution_phases(&dag).expect("phases after augmentation");
+        assert!(
+            phase_of("orders_model", &phases) < phase_of("mart", &phases),
+            "producer must phase strictly before its physical reader"
+        );
+    }
+
+    /// #1275 cycle policy inside the unified DAG: mutual physical reads must
+    /// not make `execution_phases` refuse — one direction is applied, the
+    /// closer is skipped and reported.
+    #[test]
+    fn mutual_physical_reads_do_not_make_the_executor_refuse() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut a = model("a", vec![], vec![]);
+        a.sql = "SELECT x FROM silver.b".into();
+        let mut b = model("b", vec![], vec![]);
+        b.sql = "SELECT y FROM silver.a".into();
+        let models = vec![a, b];
+        let by_pipeline = owned_by_sole_transformation(&config, models.clone());
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+
+        let inputs: Vec<crate::physical_edges::PhysicalEdgeModel<'_>> = models
+            .iter()
+            .map(crate::physical_edges::PhysicalEdgeModel::from_model)
+            .collect();
+        let derived = infer_physical_dependencies(&mut dag, &inputs);
+        assert_eq!(derived.edges.len(), 1);
+        assert_eq!(derived.skipped_cycle_edges.len(), 1);
+        execution_phases(&dag).expect("phases must still compute — no cycle may be introduced");
     }
 }

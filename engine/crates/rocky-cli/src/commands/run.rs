@@ -5993,6 +5993,82 @@ pub(crate) fn dialect_case_rules(
 /// Route the models built by this invocation and their in-run dependency reads
 /// to shadow targets. Deferred or otherwise unselected upstreams stay on their
 /// production targets.
+/// Physical-read ordering for NON-shadow runs (#1275): a model that reads
+/// another in-run model's rendered target by physical name has no
+/// compile-time edge (multi-part refs are external to `classify_table_ref`),
+/// so the pair can share an execution layer and race under `--parallel`.
+/// Derive the missing edges from target components (shared derivation with
+/// the `run --dag` scheduler), apply them to the runtime DAG copy, and
+/// recompute the plan — the compile-time graph, `E001` surface, and
+/// `rocky dag` export stay untouched. Shadow runs are excluded: shadow's own
+/// rewrite derives edges for every redirected read and refuses the unsafe
+/// remainder.
+///
+/// Cycle-closing candidates never leave the derivation (skipped
+/// deterministically, reported as warnings), so this recompute cannot turn
+/// a compiling project into a refused one.
+fn augment_physical_read_edges(
+    compile_result: &mut rocky_compiler::compile::CompileResult,
+    contain_failures: bool,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let inputs: Vec<rocky_core::physical_edges::PhysicalEdgeModel<'_>> = compile_result
+        .project
+        .models
+        .iter()
+        .map(rocky_core::physical_edges::PhysicalEdgeModel::from_model)
+        .collect();
+    let existing: Vec<(String, String)> = compile_result
+        .project
+        .dag_nodes
+        .iter()
+        .flat_map(|n| {
+            n.depends_on
+                .iter()
+                .map(|p| (n.name.clone(), p.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let derived = rocky_core::physical_edges::derive_physical_edges(&inputs, &existing);
+    warnings.extend(rocky_core::physical_edges::derivation_warnings(&derived));
+    if derived.edges.is_empty() {
+        return Ok(());
+    }
+    let mut added = 0usize;
+    for (consumer, producer) in &derived.edges {
+        let Some(node) = compile_result
+            .project
+            .dag_nodes
+            .iter_mut()
+            .find(|n| &n.name == consumer)
+        else {
+            continue;
+        };
+        if !node.depends_on.contains(producer) {
+            node.depends_on.push(producer.clone());
+            added += 1;
+        }
+    }
+    // Same recompute contract as the shadow rewrite: under
+    // `[resilience] contain_failures` execution follows the containment
+    // ledger's own augmented layering (which already orders physical
+    // readers), so recomputing here would be ignored.
+    if added > 0 && !contain_failures {
+        let nodes = &compile_result.project.dag_nodes;
+        let execution_order = rocky_ir::dag::topological_sort(nodes).with_context(|| {
+            "physical-read ordering introduced a dependency the models cannot satisfy; \
+             declare the dependencies via depends_on"
+        })?;
+        let layers = rocky_ir::dag::execution_layers(nodes).with_context(|| {
+            "physical-read ordering introduced a dependency the models cannot satisfy; \
+             declare the dependencies via depends_on"
+        })?;
+        compile_result.project.execution_order = execution_order;
+        compile_result.project.layers = layers;
+    }
+    Ok(())
+}
+
 fn apply_shadow_rewrite(
     compile_result: &mut rocky_compiler::compile::CompileResult,
     model_name_filter: Option<&str>,
@@ -7366,6 +7442,12 @@ pub(crate) async fn execute_models(
             resilience.contain_failures,
         )?;
         output.shadow = true;
+    } else {
+        augment_physical_read_edges(
+            &mut compile_result,
+            resilience.contain_failures,
+            &mut output.scheduling_warnings,
+        )?;
     }
 
     // #1093: capture governance from the same in-memory model set the
@@ -12182,6 +12264,7 @@ mod tests {
         let output = RunOutput {
             version: "1.0.2".into(),
             command: "run".into(),
+            scheduling_warnings: Vec::new(),
             status: rocky_core::state::RunStatus::Success,
             skipped_by_run_id: None,
             idempotency_key: None,
@@ -17002,6 +17085,83 @@ timestamp_column = "ts"
             ),
         )
         .expect("write model toml");
+    }
+
+    /// #1275: a physical `schema.table` read of another in-run model's
+    /// target derives a run-time ordering edge and re-layers, so the pair is
+    /// never co-scheduled — while the compile-time graph stays untouched.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn a_physical_read_orders_consumer_after_producer() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(
+            &models_dir,
+            "mart_qualified",
+            "SELECT id FROM main.orders",
+            "main",
+            "mart_qualified",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+        // The compile-time plan co-schedules them (the bug's precondition).
+        assert_eq!(
+            compiled.project.layers.len(),
+            1,
+            "precondition: compile sees no edge — {:?}",
+            compiled.project.layers
+        );
+
+        let mut warnings = Vec::new();
+        super::augment_physical_read_edges(&mut compiled, false, &mut warnings)
+            .expect("augmentation");
+        assert_eq!(
+            compiled.project.layers,
+            vec![
+                vec!["orders".to_string()],
+                vec!["mart_qualified".to_string()]
+            ],
+            "producer layers strictly before its physical reader"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// #1275 cycle policy: mutual physical reads serialize deterministically
+    /// with a warning — the run is never refused.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn mutual_physical_reads_serialize_with_a_warning_not_a_refusal() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "a", "SELECT x FROM main.b", "main", "a");
+        write_model_with_target(&models_dir, "b", "SELECT y FROM main.a", "main", "b");
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        let mut warnings = Vec::new();
+        super::augment_physical_read_edges(&mut compiled, false, &mut warnings)
+            .expect("mutual reads must not refuse the run");
+        assert_eq!(
+            compiled.project.layers,
+            vec![vec!["b".to_string()], vec!["a".to_string()]],
+            "one deterministic direction is applied"
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("mutual physical reads"),
+            "{warnings:?}"
+        );
     }
 
     /// Two selected models whose targets differ only by case are refused on
