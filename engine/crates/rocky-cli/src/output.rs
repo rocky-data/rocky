@@ -9126,9 +9126,9 @@ pub struct PreviewDiffOutput {
     pub command: String,
     pub branch_name: String,
     pub base_ref: String,
-    /// Present when no run was recorded on `base_ref` and the diff fell back
-    /// to the newest run on another named branch — names the stand-in so the
-    /// diff never silently wears the base's name (#1345).
+    /// Present when no run was recorded on `base_ref`: the diff is NOT
+    /// computed against any stand-in (an empty summary is returned) and this
+    /// note explains the absence and the remedy (#1345).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_note: Option<String>,
     pub summary: PreviewDiffSummary,

@@ -292,29 +292,30 @@ fn newest_branch_and_base_runs(
         if let Some(run) = named_base {
             return Ok((branch_run, Some(run), None));
         }
+        // No recorded run on the named base: the diff that was asked for
+        // cannot be computed, and a diff against ANY stand-in — however
+        // clearly labeled — is a different diff that a CI comment would
+        // publish under the base's name. Report the absence instead.
+        return Ok((
+            branch_run,
+            None,
+            Some(format!(
+                "no run recorded on '{base_ref}' in this state store — the diff against it \
+                 cannot be computed. Run the base branch against this store, or pass a \
+                 --base that has run history here"
+            )),
+        ));
     }
-    // No recorded run on the named ref — either it is a sha/tag (run records
-    // store branch names) or the base branch has never run here. Fall back
-    // to the newest run on any OTHER named branch, and SAY SO: a diff
-    // against an unnamed stand-in must never wear the base's name silently.
-    // Detached/no-branch runs are not eligible — "not a branch, and
-    // certainly not the base".
+    // Unnamed selection (the cost preview): newest run on any OTHER named
+    // branch. Detached/no-branch runs are not eligible — "not a branch, and
+    // certainly not a base".
     let fallback = store
         .list_runs_matching(1, |r| {
             r.git_branch.is_some() && r.git_branch.as_deref() != Some(branch_name)
         })?
         .into_iter()
         .next();
-    let note = match (base_ref, fallback.as_ref()) {
-        (Some(base_ref), Some(r)) => Some(format!(
-            "no recorded run on '{base_ref}'; compared against the newest run on '{}' \
-             ({}) instead",
-            r.git_branch.as_deref().unwrap_or("<unknown>"),
-            r.run_id
-        )),
-        _ => None,
-    };
-    Ok((branch_run, fallback, note))
+    Ok((branch_run, fallback, None))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -876,11 +877,16 @@ fn render_preview_diff_markdown(
     use crate::output::PreviewModelDiffAlgorithm;
 
     if models.is_empty() {
-        return format!(
-            "**Preview diff** — branch `{branch_name}` vs `{base_ref}`\n\n\
-             _No paired runs in the state store. Run `rocky run --branch {branch_name}` \
-             on the prune set, then re-invoke `rocky preview diff`._\n"
+        let why = base_note.map_or_else(
+            || {
+                format!(
+                    "No paired runs in the state store. Run `rocky run --branch \
+                     {branch_name}` on the prune set, then re-invoke `rocky preview diff`."
+                )
+            },
+            str::to_string,
         );
+        return format!("**Preview diff** — branch `{branch_name}` vs `{base_ref}`\n\n_{why}_\n");
     }
 
     let any_bisection = models
@@ -2120,10 +2126,11 @@ mod tests {
         assert!(note.is_none());
     }
 
-    /// A base with no recorded run falls back to the newest OTHER NAMED
-    /// branch — never a detached run — and says so in the note.
+    /// A base with no recorded run REFUSES the comparison — a labeled
+    /// stand-in is still a different diff that a CI comment would publish
+    /// under the base's name — and the note says what to do.
     #[test]
-    fn a_missing_base_falls_back_to_a_named_branch_with_a_note() {
+    fn a_missing_base_reports_absence_instead_of_a_stand_in() {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.redb");
         let base = chrono::Utc::now();
@@ -2142,14 +2149,23 @@ mod tests {
         let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
         let (_b, base_run, note) =
             newest_branch_and_base_runs(&store, "feature", Some("main")).unwrap();
-        assert_eq!(
-            base_run.unwrap().run_id,
-            "other-1",
-            "fallback skips the newer detached run"
+        assert!(
+            base_run.is_none(),
+            "no stand-in comparison for a named base"
         );
-        let note = note.expect("the stand-in must be named");
-        assert!(note.contains("no recorded run on 'main'"), "{note}");
-        assert!(note.contains("develop"), "{note}");
+        let note = note.expect("the absence must be explained");
+        assert!(note.contains("no run recorded on 'main'"), "{note}");
+
+        // The UNNAMED selection (cost preview) still picks the newest other
+        // NAMED branch and never a detached run.
+        let (_b2, cost_base, cost_note) =
+            newest_branch_and_base_runs(&store, "feature", None).unwrap();
+        assert_eq!(
+            cost_base.unwrap().run_id,
+            "other-1",
+            "unnamed selection skips the newer detached run"
+        );
+        assert!(cost_note.is_none());
     }
 
     /// A populated preview output renders the counts and the run id.
