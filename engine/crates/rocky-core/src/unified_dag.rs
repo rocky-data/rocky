@@ -1065,12 +1065,15 @@ pub fn infer_physical_dependencies(
     // invisible to it, and `execution_phases` hard-errors on cycles, so every
     // insertion is re-checked against the whole graph: a derived edge must
     // never make a runnable project refuse.
-    fn reaches_node(dag: &UnifiedDag, from: &NodeId, to: &NodeId) -> bool {
-        let mut adj: std::collections::HashMap<&NodeId, Vec<&NodeId>> =
-            std::collections::HashMap::new();
-        for e in &dag.edges {
-            adj.entry(&e.from).or_default().push(&e.to);
-        }
+    // O(V+E) per query over an adjacency map rebuilt only when edges were
+    // added since the last build — not per candidate (the review measured
+    // the rebuild-per-candidate shape at hundreds of millions of visits on
+    // pathological projects).
+    fn reaches_node(
+        adj: &std::collections::HashMap<NodeId, Vec<NodeId>>,
+        from: &NodeId,
+        to: &NodeId,
+    ) -> bool {
         let mut seen: std::collections::HashSet<&NodeId> = std::collections::HashSet::new();
         let mut stack = vec![from];
         while let Some(cur) = stack.pop() {
@@ -1081,11 +1084,20 @@ pub fn infer_physical_dependencies(
                 continue;
             }
             if let Some(next) = adj.get(cur) {
-                stack.extend(next.iter().copied());
+                stack.extend(next.iter());
             }
         }
         false
     }
+    fn build_adj(dag: &UnifiedDag) -> std::collections::HashMap<NodeId, Vec<NodeId>> {
+        let mut adj: std::collections::HashMap<NodeId, Vec<NodeId>> =
+            std::collections::HashMap::new();
+        for e in &dag.edges {
+            adj.entry(e.from.clone()).or_default().push(e.to.clone());
+        }
+        adj
+    }
+    let mut adj = build_adj(dag);
     for (consumer, producer) in derived.edges.clone() {
         let (Some(cid), Some(pid)) = (
             by_label.get(consumer.as_str()),
@@ -1098,7 +1110,7 @@ pub fn infer_physical_dependencies(
         }
         // Inserting producer→consumer closes a cycle iff the consumer's node
         // already reaches the producer's node through the FULL graph.
-        if reaches_node(dag, cid, pid) {
+        if reaches_node(&adj, cid, pid) {
             derived
                 .edges
                 .retain(|(c, p)| !(c == &consumer && p == &producer));
@@ -1110,6 +1122,7 @@ pub fn infer_physical_dependencies(
             to: cid.clone(),
             edge_type: EdgeType::DataDependency,
         });
+        adj.entry(pid.clone()).or_default().push(cid.clone());
     }
     // Second pass: a name-level skip's premise is "the opposite direction
     // was accepted". If insertion REJECTED that opposite edge (a real cycle
@@ -1127,7 +1140,7 @@ pub fn infer_physical_dependencies(
         if edge_set.contains(&(pid.clone(), cid.clone())) {
             continue;
         }
-        if reaches_node(dag, cid, pid) {
+        if reaches_node(&adj, cid, pid) {
             continue;
         }
         derived
@@ -1139,6 +1152,7 @@ pub fn infer_physical_dependencies(
             to: cid.clone(),
             edge_type: EdgeType::DataDependency,
         });
+        adj.entry(pid.clone()).or_default().push(cid.clone());
     }
     derived
 }

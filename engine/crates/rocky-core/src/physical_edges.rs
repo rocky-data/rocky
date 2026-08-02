@@ -37,6 +37,14 @@ pub struct PhysicalEdgeModel<'a> {
     pub schema: &'a str,
     pub table: &'a str,
     pub sql: &'a str,
+    /// Whether this model actually writes its configured target. An
+    /// ephemeral model (inlined as a CTE, no table created) must never be
+    /// indexed as a PRODUCER: its configured target does not exist, so a
+    /// physical read of that name is a read of something else — deriving an
+    /// edge to the phantom would order the reader after a producer that
+    /// produces nothing, and could suppress the reader's true edges via the
+    /// cycle guard.
+    pub materializes: bool,
 }
 
 impl<'a> PhysicalEdgeModel<'a> {
@@ -50,6 +58,7 @@ impl<'a> PhysicalEdgeModel<'a> {
             schema: &m.config.target.schema,
             table: &m.config.target.table,
             sql: &m.sql,
+            materializes: !matches!(m.config.strategy, crate::models::StrategyConfig::Ephemeral),
         }
     }
 }
@@ -104,9 +113,14 @@ pub fn derive_physical_edges(
     // producer (the label-heuristic HashMap overwrite bug class).
     let mut by_three: BTreeMap<(String, String, String), Vec<&str>> = BTreeMap::new();
     let mut by_two: BTreeMap<(String, String), Vec<&str>> = BTreeMap::new();
+    let mut by_table: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for m in models {
+        if !m.materializes {
+            continue;
+        }
         let key3 = (fold(m.catalog), fold(m.schema), fold(m.table));
         let key2 = (key3.1.clone(), key3.2.clone());
+        by_table.entry(key3.2.clone()).or_default().push(m.name);
         by_three.entry(key3).or_default().push(m.name);
         by_two.entry(key2).or_default().push(m.name);
     }
@@ -144,9 +158,13 @@ pub fn derive_physical_edges(
         false
     }
 
-    // Candidate edges in deterministic order (BTreeSet), so the accepted
-    // direction of a mutual pair never depends on iteration order.
-    let mut candidates: BTreeSet<(String, String)> = BTreeSet::new();
+    // Candidate edges in deterministic order, MOST SPECIFIC FIRST: an exact
+    // three-part match is accepted before a two-part match, which is
+    // accepted before a bare table-component match. A loose (possibly
+    // spurious) candidate must never occupy the graph first and cause the
+    // cycle guard to discard a more specific true edge. Within a
+    // specificity tier, name order keeps mutual pairs deterministic.
+    let mut candidates: BTreeSet<(u8, String, String)> = BTreeSet::new();
     for m in models {
         let refs = match rocky_sql::lineage::referenced_tables(m.sql) {
             Ok(refs) => refs,
@@ -157,24 +175,36 @@ pub fn derive_physical_edges(
         };
         for r in refs {
             let parts: Vec<String> = r.split('.').map(fold).collect();
-            let producers: Option<&Vec<&str>> = match parts.len() {
-                // Bare names are the compiler's business (ModelRef) — a bare
-                // read matching a model name already has its edge; a bare
-                // read of a physical table is external.
-                3 => by_three.get(&(parts[0].clone(), parts[1].clone(), parts[2].clone())),
-                2 => by_two.get(&(parts[0].clone(), parts[1].clone())),
-                _ => None,
+            let (tier, producers): (u8, Option<&Vec<&str>>) = match parts.len() {
+                3 => (
+                    0,
+                    by_three.get(&(parts[0].clone(), parts[1].clone(), parts[2].clone())),
+                ),
+                2 => (1, by_two.get(&(parts[0].clone(), parts[1].clone()))),
+                // A bare read resolves through connection state (search path /
+                // current schema) Rocky cannot observe. A bare MODEL-name
+                // read already has its compile-time edge; a bare read that
+                // matches an in-run model's TABLE component may be that very
+                // table — match on the table alone, in the loosest tier.
+                1 => (2, by_table.get(&parts[0])),
+                _ => (3, None),
             };
             let Some(producers) = producers else { continue };
             for p in producers {
                 if *p != m.name {
-                    candidates.insert((m.name.to_string(), (*p).to_string()));
+                    candidates.insert((tier, m.name.to_string(), (*p).to_string()));
                 }
             }
         }
     }
 
-    for (consumer, producer) in candidates {
+    // Dedup across tiers: the same (consumer, producer) pair reachable at
+    // two specificities is processed once, at the most specific.
+    let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
+    for (_tier, consumer, producer) in candidates {
+        if !seen_pairs.insert((consumer.clone(), producer.clone())) {
+            continue;
+        }
         if edge_set.contains(&(consumer.clone(), producer.clone())) {
             continue;
         }
@@ -203,8 +233,9 @@ pub fn derivation_warnings(derived: &DerivedPhysicalEdges) -> Vec<String> {
     let mut w = Vec::new();
     for (a, b) in &derived.skipped_cycle_edges {
         w.push(format!(
-            "mutual physical reads between '{a}' and '{b}': ordered by the derived edge that \
-             was accepted first; declare depends_on to choose the order explicitly"
+            "physical-read ordering: the derived edge '{a}' -> '{b}' would close a dependency \
+             cycle and was skipped; the pair executes in the already-established order. \
+             Declare depends_on to choose the order explicitly"
         ));
     }
     for m in &derived.unparsed {
@@ -240,6 +271,7 @@ mod tests {
             schema,
             table,
             sql,
+            materializes: true,
         }
     }
 
@@ -378,15 +410,94 @@ mod tests {
         assert_eq!(producers, vec!["first", "second"]);
     }
 
-    /// A bare single-part read never derives an edge here — that is the
-    /// compiler's surface, and matching table-only would be far too loose.
+    /// A bare read matching an in-run model's TABLE component derives the
+    /// edge: bare names resolve through connection search-path state Rocky
+    /// cannot observe, and `FROM orders_v2` may be exactly the producer's
+    /// table. (A bare read matching a MODEL name dedups against the
+    /// compile-time edge.)
     #[test]
-    fn bare_reads_are_left_to_the_compiler() {
+    fn a_bare_read_of_a_renamed_target_table_derives_the_edge() {
+        let models = [
+            m("orders_model", "db", "main", "orders_v2", "SELECT 1 AS id"),
+            m("mart", "db", "main", "mart", "SELECT id FROM orders_v2"),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert_eq!(
+            d.edges,
+            vec![("mart".to_string(), "orders_model".to_string())]
+        );
+    }
+
+    /// A bare read matching a model NAME whose compile-time edge already
+    /// exists adds nothing (dedup against `existing`).
+    #[test]
+    fn bare_model_name_reads_dedup_against_compile_edges() {
         let models = [
             m("orders", "db", "main", "orders", "SELECT 1 AS id"),
             m("mart", "db", "main", "mart", "SELECT id FROM orders"),
         ];
+        let existing = vec![("mart".to_string(), "orders".to_string())];
+        let d = derive_physical_edges(&models, &existing);
+        assert!(d.edges.is_empty(), "{:?}", d.edges);
+    }
+
+    /// An ephemeral model produces no table: it must never be indexed as a
+    /// producer, or a read of an EXTERNAL table sharing its configured name
+    /// would derive an edge to a phantom — and could suppress a true edge
+    /// through the cycle guard.
+    #[test]
+    fn ephemeral_models_are_not_physical_producers() {
+        let mut phantom = m("phantom", "db", "main", "phantom_out", "SELECT 1 AS x");
+        phantom.materializes = false;
+        let models = [
+            phantom,
+            m(
+                "reader",
+                "db",
+                "main",
+                "reader",
+                "SELECT x FROM main.phantom_out",
+            ),
+        ];
         let d = derive_physical_edges(&models, &[]);
-        assert!(d.edges.is_empty());
+        assert!(d.edges.is_empty(), "{:?}", d.edges);
+    }
+
+    /// Specificity ordering: when a loose bare-name candidate and an exact
+    /// three-part candidate form a mutual pair, the EXACT edge is accepted
+    /// and the loose one is the skipped closer — never the reverse.
+    #[test]
+    fn exact_matches_win_over_loose_ones_in_cycle_resolution() {
+        // z bare-reads "a_out" (loose match to model a's table) while a
+        // exactly reads z's full target — mutual candidates at different
+        // tiers. Sorted purely by name, ("a","z") would be accepted and the
+        // loose ("z","a") skipped — which happens to agree; so construct the
+        // adversarial order: name order favors the LOOSE edge.
+        let models = [
+            m("a_reader", "db", "main", "a_out", "SELECT 1 AS x"),
+            m(
+                "z_exact",
+                "db",
+                "main",
+                "z_out",
+                "SELECT x FROM db.main.a_out",
+            ),
+        ];
+        // Manufacture mutuality: a_reader bare-reads z_out.
+        let models = [
+            m("a_reader", "db", "main", "a_out", "SELECT x FROM z_out"),
+            models[1].clone(),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        // Exact tier processed first: z_exact→a_reader accepted; the loose
+        // bare closer a_reader→z_exact is skipped.
+        assert_eq!(
+            d.edges,
+            vec![("z_exact".to_string(), "a_reader".to_string())]
+        );
+        assert_eq!(
+            d.skipped_cycle_edges,
+            vec![("a_reader".to_string(), "z_exact".to_string())]
+        );
     }
 }

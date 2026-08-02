@@ -17159,7 +17159,7 @@ timestamp_column = "ts"
         );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
-            warnings[0].contains("mutual physical reads"),
+            warnings[0].contains("would close a dependency cycle"),
             "{warnings:?}"
         );
     }
