@@ -774,6 +774,10 @@ class RunOutput(BaseModel):
     Row-quarantine outcomes — one entry per table the quality pipeline quarantined. Empty for runs that did not use `[pipeline.x.checks.quarantine]`.
     """
     resumed_from: str | None = None
+    scheduling_warnings: list[str] | None = None
+    """
+    Scheduling warnings from physical-read edge derivation (#1275): mutual physical reads serialized by a deterministic order, models whose SQL could not be parsed for table references, and colliding targets. Empty (and omitted) when none.
+    """
     shadow: bool | None = None
     """
     True when running in shadow mode (targets rewritten).

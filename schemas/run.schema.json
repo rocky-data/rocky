@@ -1315,6 +1315,13 @@
         "null"
       ]
     },
+    "scheduling_warnings": {
+      "description": "Scheduling warnings from physical-read edge derivation (#1275): mutual physical reads serialized by a deterministic order, models whose SQL could not be parsed for table references, and colliding targets. Empty (and omitted) when none.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
     "shadow": {
       "description": "True when running in shadow mode (targets rewritten).",
       "type": "boolean"

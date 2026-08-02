@@ -39,6 +39,10 @@ export interface DagRunOutput {
    */
   total_nodes: number;
   version: string;
+  /**
+   * Scheduling warnings from physical-read edge derivation: mutual reads serialized by a deterministic order, models whose SQL could not be parsed for reads, and colliding targets. Empty when none.
+   */
+  warnings?: string[];
   [k: string]: unknown;
 }
 /**

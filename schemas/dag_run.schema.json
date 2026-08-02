@@ -101,6 +101,13 @@
     },
     "version": {
       "type": "string"
+    },
+    "warnings": {
+      "description": "Scheduling warnings from physical-read edge derivation: mutual reads serialized by a deterministic order, models whose SQL could not be parsed for reads, and colliding targets. Empty when none.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
     }
   },
   "required": [

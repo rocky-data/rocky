@@ -76,3 +76,7 @@ class DagRunOutput(BaseModel):
     Total nodes across all layers.
     """
     version: str
+    warnings: list[str] | None = None
+    """
+    Scheduling warnings from physical-read edge derivation: mutual reads serialized by a deterministic order, models whose SQL could not be parsed for reads, and colliding targets. Empty when none.
+    """

@@ -167,6 +167,10 @@ export interface RunOutput {
   quarantine?: QuarantineOutput[];
   resumed_from?: string | null;
   /**
+   * Scheduling warnings from physical-read edge derivation (#1275): mutual physical reads serialized by a deterministic order, models whose SQL could not be parsed for table references, and colliding targets. Empty (and omitted) when none.
+   */
+  scheduling_warnings?: string[];
+  /**
    * True when running in shadow mode (targets rewritten).
    */
   shadow?: boolean;
