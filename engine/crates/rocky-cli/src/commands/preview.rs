@@ -285,10 +285,20 @@ fn newest_branch_and_base_runs(
     // while the output labeled the result as `base_ref`. The cost preview
     // has no named base and goes straight to the fallback.
     if let Some(base_ref) = base_ref {
-        let named_base = store
-            .list_runs_matching(1, |r| r.git_branch.as_deref() == Some(base_ref))?
-            .into_iter()
-            .next();
+        // A base can be named as a branch OR a commit (Rocky's own preview
+        // workflow passes `github.event.pull_request.base.sha`). Records
+        // store both: match the branch name exactly, or the recorded commit
+        // exactly / by unambiguous hex prefix (git's own convention, ≥7).
+        let matches_ref = |r: &rocky_core::state::RunRecord| {
+            r.git_branch.as_deref() == Some(base_ref)
+                || r.git_commit.as_deref().is_some_and(|c| {
+                    c == base_ref
+                        || (base_ref.len() >= 7
+                            && base_ref.chars().all(|ch| ch.is_ascii_hexdigit())
+                            && c.starts_with(base_ref))
+                })
+        };
+        let named_base = store.list_runs_matching(1, matches_ref)?.into_iter().next();
         if let Some(run) = named_base {
             return Ok((branch_run, Some(run), None));
         }
@@ -300,19 +310,20 @@ fn newest_branch_and_base_runs(
             branch_run,
             None,
             Some(format!(
-                "no run recorded on '{base_ref}' in this state store — the diff against it \
-                 cannot be computed. Run the base branch against this store, or pass a \
-                 --base that has run history here"
+                "no run recorded for '{base_ref}' in this state store (matched against \
+                 recorded branch names and commit shas) — the diff against it cannot be \
+                 computed. Run the base against this store first, or pass a --base whose \
+                 branch or commit has run history here"
             )),
         ));
     }
-    // Unnamed selection (the cost preview): newest run on any OTHER named
-    // branch. Detached/no-branch runs are not eligible — "not a branch, and
-    // certainly not a base".
+    // Unnamed selection (the cost preview): newest run not on this branch —
+    // byte-for-byte main's behavior, detached runs included. Cost baselines
+    // from detached CI runs are deliberate (`run_audit` records
+    // `git_branch: None` there), and excluding them yielded an empty cost
+    // report mislabeled "No branch run yet".
     let fallback = store
-        .list_runs_matching(1, |r| {
-            r.git_branch.is_some() && r.git_branch.as_deref() != Some(branch_name)
-        })?
+        .list_runs_matching(1, |r| r.git_branch.as_deref() != Some(branch_name))?
         .into_iter()
         .next();
     Ok((branch_run, fallback, None))
@@ -337,6 +348,13 @@ pub async fn run_preview_diff(
     // Tighter branch-vs-main partitioning lands when `git_branch` is plumbed
     // through the state-store branch record (today the audit trail records
     // `git_branch` on the RunRecord directly).
+    // `--name X --base X` would select the same run for both sides and
+    // subtract every execution from itself — a false-clean diff.
+    anyhow::ensure!(
+        branch_name != base_ref,
+        "--name and --base are both '{branch_name}': a branch cannot be diffed against \
+         itself; name the base branch (or its commit) the comparison should run against"
+    );
     let (branch_run, base_run, base_note) =
         newest_branch_and_base_runs(&store, branch_name, Some(base_ref))?;
 
@@ -352,7 +370,11 @@ pub async fn run_preview_diff(
     // placeholder. This must happen before markdown rendering and JSON
     // serialization so both surface the chosen algorithm.
     if matches!(algorithm, PreviewDiffAlgorithmSelector::Bisection) {
-        if let Some(branch_run) = branch_run.as_ref() {
+        // Gate on BOTH runs: a refused/missing base means there is nothing
+        // to bisect against, and the kernel setup below opens adapters and
+        // queries the warehouse — a refusal must stay a zero-exit no-op,
+        // not become an adapter error.
+        if let (Some(branch_run), Some(_base)) = (branch_run.as_ref(), base_run.as_ref()) {
             apply_bisection_to_models(
                 config_path,
                 models_dir,
@@ -877,16 +899,18 @@ fn render_preview_diff_markdown(
     use crate::output::PreviewModelDiffAlgorithm;
 
     if models.is_empty() {
-        let why = base_note.map_or_else(
-            || {
-                format!(
-                    "No paired runs in the state store. Run `rocky run --branch \
-                     {branch_name}` on the prune set, then re-invoke `rocky preview diff`."
-                )
-            },
-            str::to_string,
-        );
-        return format!("**Preview diff** — branch `{branch_name}` vs `{base_ref}`\n\n_{why}_\n");
+        return match base_note {
+            // A refusal renders as the promised warning callout, so a CI
+            // comment posting this markdown shows the absence prominently.
+            Some(note) => format!(
+                "**Preview diff** — branch `{branch_name}` vs `{base_ref}`\n\n> ⚠️ {note}\n"
+            ),
+            None => format!(
+                "**Preview diff** — branch `{branch_name}` vs `{base_ref}`\n\n\
+                 _No paired runs in the state store. Run `rocky run --branch {branch_name}` \
+                 on the prune set, then re-invoke `rocky preview diff`._\n"
+            ),
+        };
     }
 
     let any_bisection = models
@@ -2154,18 +2178,77 @@ mod tests {
             "no stand-in comparison for a named base"
         );
         let note = note.expect("the absence must be explained");
-        assert!(note.contains("no run recorded on 'main'"), "{note}");
+        assert!(note.contains("no run recorded for 'main'"), "{note}");
 
-        // The UNNAMED selection (cost preview) still picks the newest other
-        // NAMED branch and never a detached run.
+        // The UNNAMED selection (cost preview) is byte-for-byte main's:
+        // newest run not on this branch, detached INCLUDED (detached CI cost
+        // baselines are deliberate).
         let (_b2, cost_base, cost_note) =
             newest_branch_and_base_runs(&store, "feature", None).unwrap();
         assert_eq!(
             cost_base.unwrap().run_id,
-            "other-1",
-            "unnamed selection skips the newer detached run"
+            "detached-1",
+            "cost keeps main's semantics, detached eligible"
         );
         assert!(cost_note.is_none());
+    }
+
+    /// `--name X --base X` refuses up front — the same run diffed against
+    /// itself reports every model unchanged, a false clean.
+    #[tokio::test]
+    async fn a_branch_diffed_against_itself_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        let err = run_preview_diff(
+            std::path::Path::new("rocky.toml"),
+            &state_path,
+            std::path::Path::new("models"),
+            "main",
+            "main",
+            0,
+            PreviewDiffAlgorithmSelector::Sampled,
+            true,
+        )
+        .await
+        .expect_err("self-comparison must refuse");
+        assert!(
+            format!("{err:#}").contains("cannot be diffed against itself"),
+            "{err:#}"
+        );
+    }
+
+    /// The production preview workflow passes the base COMMIT SHA — records
+    /// store it in `git_commit`, and the primary match must find it (exact
+    /// or git-style hex prefix ≥7).
+    #[test]
+    fn a_sha_base_matches_the_recorded_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut main_run = sample_run("m1", base);
+            main_run.git_branch = Some("main".to_string());
+            main_run.git_commit = Some("0123abcd0123abcd0123abcd0123abcd0123abcd".to_string());
+            store.record_run(&main_run).unwrap();
+            let mut feat = sample_run("f1", base + chrono::Duration::minutes(1));
+            feat.git_branch = Some("feature".to_string());
+            store.record_run(&feat).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, by_full, note_full) = newest_branch_and_base_runs(
+            &store,
+            "feature",
+            Some("0123abcd0123abcd0123abcd0123abcd0123abcd"),
+        )
+        .unwrap();
+        assert_eq!(by_full.unwrap().run_id, "m1");
+        assert!(note_full.is_none());
+        let (_b, by_prefix, note_prefix) =
+            newest_branch_and_base_runs(&store, "feature", Some("0123abcd")).unwrap();
+        assert_eq!(by_prefix.unwrap().run_id, "m1", "hex prefix ≥7 matches");
+        assert!(note_prefix.is_none());
     }
 
     /// A populated preview output renders the counts and the run id.

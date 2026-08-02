@@ -83,7 +83,11 @@ export async function previewDiff(): Promise<void> {
     const summary = result.summary;
     const message = `Rocky preview diff: ${summary?.models_with_changes ?? 0} changed, ${summary?.models_unchanged ?? 0} unchanged, +${summary?.total_rows_added ?? 0}/-${summary?.total_rows_removed ?? 0}/~${summary?.total_rows_changed ?? 0} rows`;
 
-    if (summary?.any_coverage_warning) {
+    if (result.base_note) {
+      // A refused comparison (no run recorded for the named base) must not
+      // read as a clean zero diff (#1345).
+      vscode.window.showWarningMessage(`Rocky preview diff: ${result.base_note}`);
+    } else if (summary?.any_coverage_warning) {
       vscode.window.showWarningMessage(`${message} (coverage warning)`);
     } else {
       vscode.window.showInformationMessage(message);
