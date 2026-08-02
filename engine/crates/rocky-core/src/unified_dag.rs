@@ -966,6 +966,31 @@ pub fn infer_runtime_dependencies(
         .iter()
         .map(|e| (e.from.clone(), e.to.clone()))
         .collect();
+    // Insertion-time cycle guard, same contract as the physical pass: an
+    // inferred edge must never make `execution_phases` refuse a DAG that
+    // runs today. (The pre-guard heuristic could already refuse on mutual
+    // label reads; the all-claimant fan-out widens that exposure, so the
+    // guard lands with it.)
+    let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for e in &dag.edges {
+        adj.entry(e.from.clone()).or_default().push(e.to.clone());
+    }
+    fn label_reaches(adj: &HashMap<NodeId, Vec<NodeId>>, from: &NodeId, to: &NodeId) -> bool {
+        let mut seen: HashSet<&NodeId> = HashSet::new();
+        let mut stack = vec![from];
+        while let Some(cur) = stack.pop() {
+            if cur == to {
+                return true;
+            }
+            if !seen.insert(cur) {
+                continue;
+            }
+            if let Some(next) = adj.get(cur) {
+                stack.extend(next.iter());
+            }
+        }
+        false
+    }
 
     let mut new_edges = Vec::new();
 
@@ -1005,13 +1030,25 @@ pub fn infer_runtime_dependencies(
                     continue;
                 }
                 let key = (producer_id.clone(), node.id.clone());
-                if existing.insert(key) {
-                    new_edges.push(UnifiedEdge {
-                        from: producer_id.clone(),
-                        to: node.id.clone(),
-                        edge_type: EdgeType::DataDependency,
-                    });
+                if existing.contains(&key) {
+                    continue;
                 }
+                // Closing iff the reader already reaches the producer.
+                if label_reaches(&adj, &node.id, producer_id) {
+                    report
+                        .skipped_cycle_edges
+                        .push((node.label.clone(), producer_id.0.clone()));
+                    continue;
+                }
+                existing.insert(key);
+                adj.entry(producer_id.clone())
+                    .or_default()
+                    .push(node.id.clone());
+                new_edges.push(UnifiedEdge {
+                    from: producer_id.clone(),
+                    to: node.id.clone(),
+                    edge_type: EdgeType::DataDependency,
+                });
             }
         }
     }
@@ -1032,6 +1069,10 @@ pub struct LabelInferenceReport {
     pub label_collisions: Vec<(String, usize)>,
     /// Transformation labels whose SQL failed table-reference extraction.
     pub unparsed: Vec<String>,
+    /// (reader label, producer node id) pairs whose inferred edge would
+    /// close a dependency cycle and was skipped — the pair executes in the
+    /// already-established order.
+    pub skipped_cycle_edges: Vec<(String, String)>,
 }
 
 impl LabelInferenceReport {
@@ -1049,6 +1090,13 @@ impl LabelInferenceReport {
             w.push(format!(
                 "model '{m}': SQL could not be parsed for table references — label-based \
                  ordering could not be derived for it"
+            ));
+        }
+        for (reader, producer) in &self.skipped_cycle_edges {
+            w.push(format!(
+                "label-based ordering: the inferred edge '{reader}' -> '{producer}' would \
+                 close a dependency cycle and was skipped; declare depends_on to state the \
+                 real direction"
             ));
         }
         w
@@ -3192,5 +3240,27 @@ mod tests {
         let report = infer_runtime_dependencies(&mut dag, &sql);
         assert_eq!(report.unparsed, vec!["broken".to_string()]);
         assert!(!report.warnings().is_empty());
+    }
+
+    /// The label pass must never refuse a runnable DAG: mutual label reads
+    /// (each model reading the other's label) skip one direction with a
+    /// warning and `execution_phases` still computes.
+    #[test]
+    fn mutual_label_reads_do_not_refuse_the_dag() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut a = model("a", vec![], vec![]);
+        a.sql = "SELECT x FROM b".into();
+        let mut b = model("b", vec![], vec![]);
+        b.sql = "SELECT y FROM a".into();
+        let models = vec![a.clone(), b.clone()];
+        let by_pipeline = owned_by_sole_transformation(&config, models);
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        let sql: HashMap<String, String> = HashMap::from([
+            ("a".to_string(), a.sql.clone()),
+            ("b".to_string(), b.sql.clone()),
+        ]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(report.skipped_cycle_edges.len(), 1, "{report:?}");
+        execution_phases(&dag).expect("one direction applies; the closer skips");
     }
 }
