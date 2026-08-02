@@ -266,6 +266,32 @@ pub enum PreviewDiffAlgorithmSelector {
 /// Ordering by time is still what makes each half meaningful: within the runs
 /// that match, `list_runs_matching` returns the newest. Only the *cap* had to
 /// stop being shared between two questions it could not both answer.
+/// Finalize a NAMED base selection: refuse when the base resolves to the
+/// branch's own run (a sha alias of `--name` passes the string-inequality
+/// guard but would diff a run against itself and report a false clean).
+fn finish_named(
+    branch_run: Option<rocky_core::state::RunRecord>,
+    base: rocky_core::state::RunRecord,
+    base_ref: &str,
+) -> Result<(
+    Option<rocky_core::state::RunRecord>,
+    Option<rocky_core::state::RunRecord>,
+    Option<String>,
+)> {
+    if branch_run.as_ref().is_some_and(|b| b.run_id == base.run_id) {
+        return Ok((
+            branch_run,
+            None,
+            Some(format!(
+                "the named base '{base_ref}' resolves to the branch's own newest run — a \
+                 branch cannot be diffed against itself; name the base the comparison \
+                 should run against"
+            )),
+        ));
+    }
+    Ok((branch_run, Some(base), None))
+}
+
 fn newest_branch_and_base_runs(
     store: &rocky_core::state::StateStore,
     branch_name: &str,
@@ -286,21 +312,60 @@ fn newest_branch_and_base_runs(
     // has no named base and goes straight to the fallback.
     if let Some(base_ref) = base_ref {
         // A base can be named as a branch OR a commit (Rocky's own preview
-        // workflow passes `github.event.pull_request.base.sha`). Records
-        // store both: match the branch name exactly, or the recorded commit
-        // exactly / by unambiguous hex prefix (git's own convention, ≥7).
-        let matches_ref = |r: &rocky_core::state::RunRecord| {
-            r.git_branch.as_deref() == Some(base_ref)
-                || r.git_commit.as_deref().is_some_and(|c| {
-                    c == base_ref
-                        || (base_ref.len() >= 7
-                            && base_ref.chars().all(|ch| ch.is_ascii_hexdigit())
-                            && c.starts_with(base_ref))
-                })
-        };
-        let named_base = store.list_runs_matching(1, matches_ref)?.into_iter().next();
-        if let Some(run) = named_base {
-            return Ok((branch_run, Some(run), None));
+        // workflow passes `github.event.pull_request.base.sha`). Identity
+        // precedence is staged — a BRANCH-NAME match always wins over a
+        // commit match (a branch literally named like a hex string must not
+        // lose to a newer commit-prefix match), then an exact commit, then a
+        // git-style hex prefix (≥7) with AMBIGUITY REFUSED rather than
+        // silently resolved to the newest.
+        let by_branch = store
+            .list_runs_matching(1, |r| r.git_branch.as_deref() == Some(base_ref))?
+            .into_iter()
+            .next();
+        if let Some(run) = by_branch {
+            return finish_named(branch_run, run, base_ref);
+        }
+        let base_lower = base_ref.to_ascii_lowercase();
+        let by_exact_commit = store
+            .list_runs_matching(1, |r| {
+                r.git_commit
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(&base_lower))
+            })?
+            .into_iter()
+            .next();
+        if let Some(run) = by_exact_commit {
+            return finish_named(branch_run, run, base_ref);
+        }
+        if base_lower.len() >= 7 && base_lower.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            let by_prefix = store.list_runs_matching(64, |r| {
+                r.git_commit
+                    .as_deref()
+                    .is_some_and(|c| c.to_ascii_lowercase().starts_with(&base_lower))
+            })?;
+            let mut distinct: Vec<&str> = by_prefix
+                .iter()
+                .filter_map(|r| r.git_commit.as_deref())
+                .collect();
+            distinct.sort_unstable_by_key(|c| c.to_ascii_lowercase());
+            distinct.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+            match distinct.len() {
+                0 => {}
+                1 => {
+                    let run = by_prefix.into_iter().next().expect("nonempty");
+                    return finish_named(branch_run, run, base_ref);
+                }
+                n => {
+                    return Ok((
+                        branch_run,
+                        None,
+                        Some(format!(
+                            "the base prefix '{base_ref}' matches {n} distinct recorded \
+                             commits — give more characters to disambiguate"
+                        )),
+                    ));
+                }
+            }
         }
         // No recorded run on the named base: the diff that was asked for
         // cannot be computed, and a diff against ANY stand-in — however
@@ -389,7 +454,7 @@ pub async fn run_preview_diff(
             summary.any_coverage_warning = compute_any_coverage_warning(&models);
         } else {
             info!(
-                "preview diff '{branch_name}': no branch run found in state store; \
+                "preview diff '{branch_name}': no branch or base run available; \
                  nothing to bisect"
             );
         }
@@ -2215,6 +2280,94 @@ mod tests {
         assert!(
             format!("{err:#}").contains("cannot be diffed against itself"),
             "{err:#}"
+        );
+    }
+
+    /// Identity precedence: a branch literally named like a hex string wins
+    /// over a NEWER run whose commit matches the same string as a prefix.
+    #[test]
+    fn a_hex_branch_name_wins_over_a_commit_prefix_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut named = sample_run("branch-run", base);
+            named.git_branch = Some("deadbee1".to_string());
+            store.record_run(&named).unwrap();
+            let mut newer = sample_run("commit-run", base + chrono::Duration::minutes(1));
+            newer.git_branch = Some("other".to_string());
+            newer.git_commit = Some("deadbee1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string());
+            store.record_run(&newer).unwrap();
+            let mut feat = sample_run("f1", base + chrono::Duration::minutes(2));
+            feat.git_branch = Some("feature".to_string());
+            store.record_run(&feat).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some("deadbee1")).unwrap();
+        assert_eq!(
+            base_run.unwrap().run_id,
+            "branch-run",
+            "branch identity wins"
+        );
+        assert!(note.is_none());
+    }
+
+    /// An ambiguous hex prefix (two distinct recorded commits) refuses with
+    /// a disambiguation note instead of silently picking the newest.
+    #[test]
+    fn an_ambiguous_sha_prefix_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            for (id, sha, mins) in [
+                ("c1", "abc1234aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 0),
+                ("c2", "abc1234bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 1),
+            ] {
+                let mut r = sample_run(id, base + chrono::Duration::minutes(mins));
+                r.git_branch = Some("main".to_string());
+                r.git_commit = Some(sha.to_string());
+                store.record_run(&r).unwrap();
+            }
+            let mut feat = sample_run("f1", base + chrono::Duration::minutes(2));
+            feat.git_branch = Some("feature".to_string());
+            store.record_run(&feat).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some("abc1234")).unwrap();
+        assert!(base_run.is_none());
+        assert!(
+            note.unwrap().contains("2 distinct recorded commits"),
+            "ambiguity must be refused, not resolved silently"
+        );
+    }
+
+    /// A base sha that ALIASES the branch's own newest run refuses — the
+    /// string-inequality guard cannot see through a sha, so the selection
+    /// itself must.
+    #[test]
+    fn a_sha_alias_of_the_branch_run_refuses_self_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut feat = sample_run("f1", base);
+            feat.git_branch = Some("feature".to_string());
+            feat.git_commit = Some("feedface00000000000000000000000000000000".to_string());
+            store.record_run(&feat).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some("feedface")).unwrap();
+        assert!(base_run.is_none(), "no self-diff through a sha alias");
+        assert!(
+            note.unwrap().contains("branch's own newest run"),
+            "the alias must be named"
         );
     }
 
