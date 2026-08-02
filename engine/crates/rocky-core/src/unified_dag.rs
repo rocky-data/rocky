@@ -935,9 +935,10 @@ pub fn infer_runtime_dependencies(
     let mut report = LabelInferenceReport::default();
     // Build a set of producing node names (everything that creates a table:
     // transformations, seeds, loads). Maps logical table name → the FULL set
-    // of claimants: two nodes sharing a lowercased label must both receive
-    // reader edges — a single-slot map silently dropped one of them, and the
-    // reader raced whichever producer lost the insert (#1351).
+    // of claimants — used as a COLLISION DETECTOR only: edges derive solely
+    // from the legacy winner (last in build order, identical to the old
+    // single-slot map), and colliding claimants are reported, not ordered
+    // (#1351 observability; ordering them awaits #1357).
     let mut producers: HashMap<String, Vec<(NodeId, NodeKind)>> = HashMap::new();
     for node in &dag.nodes {
         match node.kind {
@@ -972,13 +973,9 @@ pub fn infer_runtime_dependencies(
         .iter()
         .map(|e| (e.from.clone(), e.to.clone()))
         .collect();
-    // Insertion-time cycle guard for the FAN-OUT edges only. The single-slot
-    // heuristic kept exactly one claimant per label (HashMap insert order:
-    // the LAST node won) and inserted its edges unguarded — genuinely
-    // reciprocal label reads therefore REFUSED loudly, and that status quo
-    // must not silently become a stale-read success. Only the edges this
-    // change ADDS (claimants the old code dropped) are guarded: they must
-    // never introduce a refusal the old behavior did not have.
+    // The graph below is byte-for-byte the single-slot heuristic's: only the
+    // legacy winner's edges derive, unguarded, so genuine reciprocal label
+    // reads keep their loud refusal exactly as before.
     let mut new_edges = Vec::new();
 
     // Resolve every reader's candidates once, splitting legacy from fan-out.
@@ -1064,8 +1061,10 @@ pub fn infer_runtime_dependencies(
 #[derive(Debug, Default)]
 pub struct LabelInferenceReport {
     /// Lowercased labels claimed by more than one producing node, with the
-    /// claimant count. Readers of such a label are ordered after ALL
-    /// claimants.
+    /// claimant count. Readers of such a label are ordered after ONE of
+    /// them (the last in build order); the rest are NOT ordered — the
+    /// collision is surfaced so the ambiguity is visible (#1357 owns
+    /// actually ordering them).
     pub label_collisions: Vec<(String, usize)>,
     /// Transformation labels whose SQL failed table-reference extraction.
     pub unparsed: Vec<String>,

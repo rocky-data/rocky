@@ -40,7 +40,7 @@ export interface DagRunOutput {
   total_nodes: number;
   version: string;
   /**
-   * Scheduling warnings from physical-read edge derivation: mutual reads serialized by a deterministic order, models whose SQL could not be parsed for reads, and colliding targets. Empty when none.
+   * Scheduling warnings from dependency inference — physical-read derivation (mutual reads serialized deterministically, unparseable models, colliding targets) and label inference (label collisions where only one claimant orders the reader, unparseable models). Empty when none.
    */
   warnings?: string[];
   [k: string]: unknown;
