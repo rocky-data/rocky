@@ -1076,7 +1076,7 @@ mod tests {
         // Backslash is LITERAL in a quoted identifier — no escape forms
         // there, only `""` (live-verified: SELECT 1 AS "a\" executes, the
         // quote after the backslash closes it).
-        assert_eq!(count_statements(r#"SELECT 1 AS "a"; SELECT 2"#), 2);
+        assert_eq!(count_statements(r#"SELECT 1 AS "a\"; SELECT 2"#), 2);
     }
 
     #[test]
