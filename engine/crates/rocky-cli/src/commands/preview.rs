@@ -318,6 +318,27 @@ fn newest_branch_and_base_runs(
         // lose to a newer commit-prefix match), then an exact commit, then a
         // git-style hex prefix (≥7) with AMBIGUITY REFUSED rather than
         // silently resolved to the newest.
+        let base_lower = base_ref.to_ascii_lowercase();
+        let is_full_sha =
+            base_lower.len() == 40 && base_lower.chars().all(|ch| ch.is_ascii_hexdigit());
+        // A full 40-hex ref states COMMIT intent (the production workflow
+        // passes `base.sha` verbatim): resolve it as a commit before any
+        // branch that happens to wear the same 40-hex name could hijack it.
+        // Shorter refs resolve as branches first — branch names are
+        // human-chosen and must not lose to a commit-prefix coincidence.
+        if is_full_sha {
+            let by_exact = store
+                .list_runs_matching(1, |r| {
+                    r.git_commit
+                        .as_deref()
+                        .is_some_and(|c| c.eq_ignore_ascii_case(&base_lower))
+                })?
+                .into_iter()
+                .next();
+            if let Some(run) = by_exact {
+                return finish_named(branch_run, run, base_ref);
+            }
+        }
         let by_branch = store
             .list_runs_matching(1, |r| r.git_branch.as_deref() == Some(base_ref))?
             .into_iter()
@@ -325,7 +346,6 @@ fn newest_branch_and_base_runs(
         if let Some(run) = by_branch {
             return finish_named(branch_run, run, base_ref);
         }
-        let base_lower = base_ref.to_ascii_lowercase();
         let by_exact_commit = store
             .list_runs_matching(1, |r| {
                 r.git_commit
@@ -338,7 +358,7 @@ fn newest_branch_and_base_runs(
             return finish_named(branch_run, run, base_ref);
         }
         if base_lower.len() >= 7 && base_lower.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            let by_prefix = store.list_runs_matching(64, |r| {
+            let by_prefix = store.list_runs_matching(usize::MAX, |r| {
                 r.git_commit
                     .as_deref()
                     .is_some_and(|c| c.to_ascii_lowercase().starts_with(&base_lower))
@@ -2281,6 +2301,106 @@ mod tests {
             format!("{err:#}").contains("cannot be diffed against itself"),
             "{err:#}"
         );
+    }
+
+    /// A FULL 40-hex ref states commit intent: a branch that happens to
+    /// wear the same 40-hex name must not hijack it.
+    #[test]
+    fn a_full_sha_resolves_as_a_commit_before_a_samename_branch() {
+        let sha = "aaaabbbbccccddddeeeeffff0000111122223333";
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut commit_run = sample_run("commit-run", base);
+            commit_run.git_branch = Some("main".to_string());
+            commit_run.git_commit = Some(sha.to_string());
+            store.record_run(&commit_run).unwrap();
+            // NEWER run on a branch literally named as the sha.
+            let mut hijack = sample_run("hijack-run", base + chrono::Duration::minutes(1));
+            hijack.git_branch = Some(sha.to_string());
+            store.record_run(&hijack).unwrap();
+            let mut feat = sample_run("f1", base + chrono::Duration::minutes(2));
+            feat.git_branch = Some("feature".to_string());
+            store.record_run(&feat).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some(sha)).unwrap();
+        assert_eq!(
+            base_run.unwrap().run_id,
+            "commit-run",
+            "commit intent wins over the same-name branch"
+        );
+        assert!(note.is_none());
+    }
+
+    /// Prefix uniqueness is proven over ALL matching runs: many newer runs
+    /// of one commit must not hide an older distinct commit sharing the
+    /// prefix — that concealment previously produced a silent false-unique.
+    #[test]
+    fn prefix_ambiguity_is_detected_past_many_runs_of_one_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            // The OLD distinct commit, oldest of all.
+            let mut old = sample_run("old-distinct", base);
+            old.git_branch = Some("main".to_string());
+            old.git_commit = Some("abc9999f0000000000000000000000000000dead".to_string());
+            store.record_run(&old).unwrap();
+            // 70 newer runs all of ONE other commit sharing the prefix.
+            for i in 0..70u32 {
+                let mut r = sample_run(
+                    &format!("same-{i}"),
+                    base + chrono::Duration::minutes(i64::from(i) + 1),
+                );
+                r.git_branch = Some("main".to_string());
+                r.git_commit = Some("abc9999a1111111111111111111111111111beef".to_string());
+                store.record_run(&r).unwrap();
+            }
+            let mut feat = sample_run("f1", base + chrono::Duration::minutes(100));
+            feat.git_branch = Some("feature".to_string());
+            store.record_run(&feat).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some("abc9999")).unwrap();
+        assert!(
+            base_run.is_none(),
+            "the concealed distinct commit must refuse"
+        );
+        assert!(note.unwrap().contains("distinct recorded commits"));
+    }
+
+    /// Exact commit matching is case-insensitive (git accepts uppercase sha
+    /// input; records store lowercase).
+    #[test]
+    fn an_uppercase_full_sha_matches_the_recorded_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            let mut main_run = sample_run("m1", base);
+            main_run.git_branch = Some("main".to_string());
+            main_run.git_commit = Some("0123abcd0123abcd0123abcd0123abcd0123abcd".to_string());
+            store.record_run(&main_run).unwrap();
+            let mut feat = sample_run("f1", base + chrono::Duration::minutes(1));
+            feat.git_branch = Some("feature".to_string());
+            store.record_run(&feat).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) = newest_branch_and_base_runs(
+            &store,
+            "feature",
+            Some("0123ABCD0123ABCD0123ABCD0123ABCD0123ABCD"),
+        )
+        .unwrap();
+        assert_eq!(base_run.unwrap().run_id, "m1");
+        assert!(note.is_none());
     }
 
     /// Identity precedence: a branch literally named like a hex string wins
