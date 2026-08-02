@@ -3926,13 +3926,31 @@ auto_create_schemas = true
         eprintln!("seeded demo ledger at {path}");
     }
 
-    /// #1242 seam semantics: a run writer commits to remote BEFORE the gc
-    /// seam publishes. The seam's fresh download carries the winner's rows,
-    /// `execute_gc_apply` re-derives on top of them, and the published blob
-    /// holds BOTH effects — the winner's artifact survives, the candidate is
-    /// tombstoned. (The legacy half-seam erased the winner here: #1228.)
-    #[tokio::test]
-    async fn gc_cas_seam_preserves_a_run_writer_committed_before_publish() {
+    /// #1242's exact loss scenario, interleaved for real: the run winner
+    /// commits AFTER the gc seam's first download and BEFORE its publish.
+    /// One armed conflict rejects gc's first CAS put; a watcher task keyed on
+    /// that put count (an event, not wall-clock) then publishes the winner,
+    /// so the seam's replay downloads it and re-derives on top — the counting
+    /// oracle pins the per-attempt liveness re-reads. The final published
+    /// blob holds BOTH effects. Under the legacy half-seam this exact
+    /// schedule silently erased the winner (#1228): forcing
+    /// `seam_cas = false` makes this test fail fast on the watcher-fired
+    /// assertion (the deadline-bounded watcher never sees a CAS put).
+    ///
+    /// Determinism: the watcher loses only if its in-memory seed+upload
+    /// (microseconds) outlasts the session's ≥20ms conflict backoff — and a
+    /// lost race fails the tombstone assertion loudly, never a false green.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gc_cas_seam_preserves_a_run_writer_landing_mid_seam() {
+        struct CountingOracle(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl LivenessOracle for CountingOracle {
+            async fn reclaim_verdict(&self, _sp: &str, _fp: &str, _cv: u64) -> ReclaimVerdict {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ReclaimVerdict::Reclaimable { head_version: 0 }
+            }
+        }
+
         let _serial = rocky_core::state_sync::remote_testing::serial_guard();
         let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
         let root = TempDir::new().unwrap();
@@ -3955,30 +3973,54 @@ auto_create_schemas = true
             .await
             .unwrap();
 
-        // The run winner: fresh download on pod_a, adds its own artifact, and
-        // publishes a NEWER generation before the gc seam runs.
-        let _authority =
-            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        harness.faults.arm_precondition_failures(&object_key, 1);
+
+        // The mid-seam run winner: fires the moment gc's first CAS put is
+        // observed (the armed conflict), inside the session's backoff window.
+        // Deadline-bounded so a code path that never issues a CAS put (the
+        // legacy half-seam) turns this test into a fast red instead of a
+        // hang.
+        let faults = harness.faults.clone();
+        let winner_cfg = harness.pod_a.cfg.clone();
+        let winner_path = harness.pod_a.state_path.clone();
+        let key_for_watcher = object_key.clone();
+        let watcher = tokio::spawn(async move {
+            use rocky_core::fault_store::PutKind;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while faults.put_count(&key_for_watcher, PutKind::Update) < 1 {
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let _authority = rocky_core::state_sync::download_state(&winner_cfg, &winner_path)
                 .await
                 .unwrap();
-        {
-            let store = StateStore::open(&harness.pod_a.state_path).unwrap();
-            seed(
-                &store,
-                "r-winner",
-                "winner_model",
-                "SELECT 2 AS id",
-                &[],
-                HB,
-                700,
-                Utc::now(),
-            );
-            record_run(&store, "r-winner", "winner_model");
-        }
-        rocky_core::state_sync::upload_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
-            .await
-            .unwrap();
+            {
+                let store = StateStore::open(&winner_path).unwrap();
+                seed(
+                    &store,
+                    "r-winner",
+                    "winner_model",
+                    "SELECT 2 AS id",
+                    &[],
+                    HB,
+                    700,
+                    Utc::now(),
+                );
+                record_run(&store, "r-winner", "winner_model");
+            }
+            rocky_core::state_sync::upload_state(&winner_cfg, &winner_path)
+                .await
+                .unwrap();
+            true
+        });
 
+        let oracle = std::sync::Arc::new(CountingOracle(std::sync::atomic::AtomicUsize::new(0)));
         let config = write_cas_config(root.path());
         run_gc_apply_in_with(
             root.path(),
@@ -3987,12 +4029,29 @@ auto_create_schemas = true
             &harness.pod_b.state_path,
             PolicyPrincipal::Human,
             true,
-            std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
+            oracle.clone(),
         )
         .await
-        .expect("gc seam must commit on top of the winner");
+        .expect("the replay on the winner must commit");
+        let fired = watcher.await.expect("the winner task must not panic");
+        assert!(
+            fired,
+            "the winner task never saw a CAS put — the seam did not go through the CAS session"
+        );
 
-        // Read back the PUBLISHED blob (pod_a re-download), not local files.
+        // 3 oracle reads per attempt today (eligibility re-derivation plus
+        // the paired pre/post liveness proofs) × 2 attempts. The invariant
+        // pinned is PER-ATTEMPT re-reads — if execute_gc_apply's read count
+        // legitimately changes, update the constant; if this fails with the
+        // single-attempt count (3), the replay re-published without
+        // re-deriving, which is the #1242 defect.
+        assert_eq!(
+            oracle.0.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "the replay must re-derive on the winner, not re-publish attempt 1's rows"
+        );
+
+        // Read back the PUBLISHED blob (fresh pod_a download), not local files.
         let _authority =
             rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
                 .await
@@ -4004,7 +4063,7 @@ auto_create_schemas = true
         assert_eq!(
             published.refcount_for_hash(HB).unwrap(),
             1,
-            "the run winner's artifact must survive the gc publish (#1228)"
+            "the mid-seam run winner's artifact must survive the gc publish (#1228)"
         );
     }
 
