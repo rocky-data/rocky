@@ -3256,6 +3256,10 @@ mod tests {
         ]);
         let report = infer_runtime_dependencies(&mut dag, &sql);
         assert!(
+            report.label_collisions.is_empty() && report.unparsed.is_empty(),
+            "nothing to report for a clean mutual pair: {report:?}"
+        );
+        assert!(
             execution_phases(&dag).is_err(),
             "a genuine SQL cycle keeps its loud refusal"
         );
