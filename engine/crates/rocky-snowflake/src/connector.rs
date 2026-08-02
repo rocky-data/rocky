@@ -573,7 +573,10 @@ impl SnowflakeConnector {
 /// block comment at the FIRST `*/`; an inner `/*` is inert text —
 /// live-verified). A miscount here is not cosmetic: Snowflake rejects a
 /// submission whose real statement count differs from `MULTI_STATEMENT_COUNT`
-/// (#1365). Rocky-generated SQL never embeds semicolons in identifiers, so
+/// (#1365). Dollar-quoted string constants (`$$ ... $$` — Snowflake supports
+/// only the bare form; a `$tag$` opener is a syntax error, live-verified) are
+/// opaque: comment markers, quotes, and semicolons inside them are literal
+/// text. Rocky-generated SQL never embeds semicolons in identifiers, so
 /// identifier-quoting is not considered.
 ///
 /// Trailing-only whitespace after the last semicolon counts the same as a
@@ -582,8 +585,16 @@ fn count_statements(sql: &str) -> usize {
     let mut count = 0usize;
     let mut chars = sql.chars().peekable();
     let mut in_string = false;
+    let mut in_dollar = false;
     let mut saw_non_ws_since_terminator = false;
     while let Some(c) = chars.next() {
+        if in_dollar {
+            if c == '$' && chars.peek() == Some(&'$') {
+                chars.next();
+                in_dollar = false;
+            }
+            continue;
+        }
         if in_string {
             if c == '\'' {
                 // Snowflake doubles single quotes to escape (`''`); treat as
@@ -599,6 +610,11 @@ fn count_statements(sql: &str) -> usize {
         match c {
             '\'' => {
                 in_string = true;
+                saw_non_ws_since_terminator = true;
+            }
+            '$' if chars.peek() == Some(&'$') => {
+                chars.next();
+                in_dollar = true;
                 saw_non_ws_since_terminator = true;
             }
             '-' if chars.peek() == Some(&'-') => {
@@ -947,6 +963,24 @@ mod tests {
         // The comment swallows the terminator; the statement still counts
         // once via the trailing non-terminated arm.
         assert_eq!(count_statements("SELECT 1 // trail;"), 1);
+    }
+
+    #[test]
+    fn test_count_statements_dollar_quoted_bodies_are_opaque() {
+        // Everything inside bare $$ ... $$ is literal text (live-verified:
+        // each of these executes; if the server commented inside them the
+        // closer would be swallowed and the statement would fail).
+        assert_eq!(count_statements("SELECT $$ a -- b $$ AS c"), 1);
+        assert_eq!(count_statements("SELECT $$ x; // y /* z; */ $$ AS c"), 1);
+        assert_eq!(count_statements("SELECT $$ a // b $$; SELECT 2"), 2);
+        assert_eq!(count_statements("SELECT $$ don't $$ AS c"), 1);
+        // $$ inside a normal string is just characters.
+        assert_eq!(count_statements("SELECT '$$'; SELECT 2"), 2);
+        // Empty dollar string; adjacent openers/closers pair in order.
+        assert_eq!(count_statements("SELECT $$$$ AS e"), 1);
+        // Unterminated dollar string swallows the rest (the server errors
+        // on the statement itself; we still declare the one statement).
+        assert_eq!(count_statements("SELECT $$ a; "), 1);
     }
 
     #[test]
