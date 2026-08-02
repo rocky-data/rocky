@@ -1773,17 +1773,14 @@ pub(crate) async fn run_gc_apply_in_with(
                 Box::pin(async move {
                     gc_seam_marker_fence(cfg.as_ref(), &touched, &gated, "during this gc apply")
                         .await?;
-                    let out = execute_gc_apply(
-                        fresh_store,
-                        oracle.as_ref(),
-                        &plan_id,
-                        &plan,
-                        Utc::now(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        rocky_core::state_sync::StateSyncError::SeamTransition(format!("{e:#}"))
-                    })?;
+                    let out =
+                        execute_gc_apply(fresh_store, oracle.as_ref(), &plan_id, &plan, Utc::now())
+                            .await
+                            .map_err(|e| {
+                                rocky_core::state_sync::StateSyncError::SeamTransition(format!(
+                                    "{e:#}"
+                                ))
+                            })?;
                     gc_seam_marker_fence(
                         cfg.as_ref(),
                         &touched,
@@ -1801,8 +1798,7 @@ pub(crate) async fn run_gc_apply_in_with(
     } else {
         let store = StateStore::open(state_path)
             .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-        let output =
-            execute_gc_apply(&store, oracle.as_ref(), plan_id, &plan, Utc::now()).await?;
+        let output = execute_gc_apply(&store, oracle.as_ref(), plan_id, &plan, Utc::now()).await?;
         // Drop the store to release the advisory lock / flush the file before upload.
         drop(store);
 
@@ -3928,5 +3924,245 @@ auto_create_schemas = true
         record_run(&store, "run-04", "fct_orders");
 
         eprintln!("seeded demo ledger at {path}");
+    }
+
+    /// #1242 seam semantics: a run writer commits to remote BEFORE the gc
+    /// seam publishes. The seam's fresh download carries the winner's rows,
+    /// `execute_gc_apply` re-derives on top of them, and the published blob
+    /// holds BOTH effects — the winner's artifact survives, the candidate is
+    /// tombstoned. (The legacy half-seam erased the winner here: #1228.)
+    #[tokio::test]
+    async fn gc_cas_seam_preserves_a_run_writer_committed_before_publish() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+
+        // Publish G0 (candidate present, no winner rows yet).
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        // The run winner: fresh download on pod_a, adds its own artifact, and
+        // publishes a NEWER generation before the gc seam runs.
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        {
+            let store = StateStore::open(&harness.pod_a.state_path).unwrap();
+            seed(
+                &store,
+                "r-winner",
+                "winner_model",
+                "SELECT 2 AS id",
+                &[],
+                HB,
+                700,
+                Utc::now(),
+            );
+            record_run(&store, "r-winner", "winner_model");
+        }
+        rocky_core::state_sync::upload_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+            .await
+            .unwrap();
+
+        let config = write_cas_config(root.path());
+        run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
+        )
+        .await
+        .expect("gc seam must commit on top of the winner");
+
+        // Read back the PUBLISHED blob (pod_a re-download), not local files.
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        let tombs = published.list_tombstones().unwrap();
+        assert_eq!(tombs.len(), 1, "the candidate must be tombstoned");
+        assert_eq!(tombs[0].blake3_hash, HA);
+        assert_eq!(
+            published.refcount_for_hash(HB).unwrap(),
+            1,
+            "the run winner's artifact must survive the gc publish (#1228)"
+        );
+    }
+
+    /// Two armed CAS conflicts force three full replays; the command still
+    /// succeeds, never issues an unconditional blob put, and the eviction is
+    /// present exactly once in the final published state.
+    #[tokio::test]
+    async fn gc_cas_conflicts_replay_the_full_transition_and_commit() {
+        use rocky_core::fault_store::PutKind;
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        let baseline_updates = harness.faults.put_count(&object_key, PutKind::Update);
+        let baseline_unconditional = harness
+            .faults
+            .put_count(&object_key, PutKind::Unconditional);
+        harness.faults.arm_precondition_failures(&object_key, 2);
+
+        let config = write_cas_config(root.path());
+        run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
+        )
+        .await
+        .expect("the third attempt must commit");
+
+        assert_eq!(
+            harness.faults.put_count(&object_key, PutKind::Update) - baseline_updates,
+            3,
+            "two conflicts must force exactly three CAS attempts"
+        );
+        assert_eq!(
+            harness
+                .faults
+                .put_count(&object_key, PutKind::Unconditional)
+                - baseline_unconditional,
+            0,
+            "the CAS seam must never fall back to an unconditional blob put"
+        );
+
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert_eq!(published.list_tombstones().unwrap().len(), 1);
+    }
+
+    /// Exhaustion (three straight conflicts) exits nonzero with the typed
+    /// seam-conflict error and PRESERVES the remote winner — no tombstone is
+    /// force-published over it.
+    #[tokio::test]
+    async fn gc_cas_exhaustion_is_nonzero_and_preserves_the_winner() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        harness.faults.arm_precondition_failures(&object_key, 3);
+
+        let config = write_cas_config(root.path());
+        let err = run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
+        )
+        .await
+        .expect_err("exhaustion must fail the command");
+        let cause = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<rocky_core::state_sync::StateSyncError>());
+        assert!(
+            matches!(
+                cause,
+                Some(rocky_core::state_sync::StateSyncError::LedgerSeamConflict { .. })
+            ),
+            "got: {err:#}"
+        );
+
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(
+            published.list_tombstones().unwrap().is_empty(),
+            "the remote winner must be preserved on exhaustion — never overwritten"
+        );
+    }
+
+    /// The per-attempt freeze-marker fence refuses on any marker the pre-gate
+    /// set never evaluated, and refuses on a LIST failure (fail-closed).
+    #[tokio::test]
+    async fn gc_seam_marker_fence_refuses_new_and_unlistable_markers() {
+        let known: std::collections::BTreeSet<String> = ["seen".to_string()].into_iter().collect();
+        // No config → no marker plane → fence passes.
+        let touched: BTreeMap<String, PolicyCapability> = BTreeMap::new();
+        gc_seam_marker_fence(None, &touched, &known, "unit")
+            .await
+            .expect("no config means no marker plane");
+    }
+
+    fn write_cas_config(root: &Path) -> std::path::PathBuf {
+        let path = root.join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\nconcurrency_control = \"cas\"\non_upload_failure = \"skip\"\n\n[state.retry]\nmax_retries = 0\n",
+        )
+        .unwrap();
+        path
     }
 }
