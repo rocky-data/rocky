@@ -931,19 +931,34 @@ fn format_test_label(model_name: &str, test: &crate::tests::TestDecl, index: usi
 pub fn infer_runtime_dependencies(
     dag: &mut UnifiedDag,
     model_sql_by_name: &HashMap<String, String>,
-) {
+) -> LabelInferenceReport {
+    let mut report = LabelInferenceReport::default();
     // Build a set of producing node names (everything that creates a table:
-    // transformations, seeds, loads). Maps logical table name → NodeId.
-    let mut producers: HashMap<String, NodeId> = HashMap::new();
+    // transformations, seeds, loads). Maps logical table name → the FULL set
+    // of claimants: two nodes sharing a lowercased label must both receive
+    // reader edges — a single-slot map silently dropped one of them, and the
+    // reader raced whichever producer lost the insert (#1351).
+    let mut producers: HashMap<String, Vec<NodeId>> = HashMap::new();
     for node in &dag.nodes {
         match node.kind {
             NodeKind::Transformation | NodeKind::Seed | NodeKind::Load | NodeKind::Replication => {
                 // Index by lowercase label so case-insensitive SQL refs match.
-                producers.insert(node.label.to_lowercase(), node.id.clone());
+                producers
+                    .entry(node.label.to_lowercase())
+                    .or_default()
+                    .push(node.id.clone());
             }
             _ => {}
         }
     }
+    for (label, claimants) in &producers {
+        if claimants.len() > 1 {
+            report
+                .label_collisions
+                .push((label.clone(), claimants.len()));
+        }
+    }
+    report.label_collisions.sort();
 
     // Existing edges as a set so we don't double-add.
     let mut existing: HashSet<(NodeId, NodeId)> = dag
@@ -961,8 +976,15 @@ pub fn infer_runtime_dependencies(
         let Some(sql) = model_sql_by_name.get(&node.label) else {
             continue;
         };
-        let Ok(refs) = rocky_sql::lineage::referenced_tables(sql) else {
-            continue;
+        let refs = match rocky_sql::lineage::referenced_tables(sql) {
+            Ok(refs) => refs,
+            // A model whose reads cannot be extracted derives no edges here —
+            // it may be co-scheduled with an unordered upstream. Surfaced,
+            // never silent (#1351).
+            Err(_) => {
+                report.unparsed.push(node.label.clone());
+                continue;
+            }
         };
         for table_name in refs {
             // Match by the bare table name (last segment of any qualified ref).
@@ -971,25 +993,66 @@ pub fn infer_runtime_dependencies(
                 .next()
                 .unwrap_or(&table_name)
                 .to_lowercase();
-            let Some(producer_id) = producers.get(&bare) else {
+            let Some(claimants) = producers.get(&bare) else {
                 continue;
             };
-            // Skip self-references and already-known edges.
-            if *producer_id == node.id {
-                continue;
-            }
-            let key = (producer_id.clone(), node.id.clone());
-            if existing.insert(key) {
-                new_edges.push(UnifiedEdge {
-                    from: producer_id.clone(),
-                    to: node.id.clone(),
-                    edge_type: EdgeType::DataDependency,
-                });
+            // EVERY claimant of the label gets the edge: which one the
+            // reader actually depends on is unknowable from the label alone,
+            // and an extra ordering constraint is the safe direction.
+            for producer_id in claimants {
+                // Skip self-references and already-known edges.
+                if *producer_id == node.id {
+                    continue;
+                }
+                let key = (producer_id.clone(), node.id.clone());
+                if existing.insert(key) {
+                    new_edges.push(UnifiedEdge {
+                        from: producer_id.clone(),
+                        to: node.id.clone(),
+                        edge_type: EdgeType::DataDependency,
+                    });
+                }
             }
         }
     }
 
     dag.edges.extend(new_edges);
+    report.unparsed.sort();
+    report
+}
+
+/// What [`infer_runtime_dependencies`] could not resolve — surfaced by the
+/// `run --dag` caller as scheduling warnings instead of silently dropping
+/// edges (#1351).
+#[derive(Debug, Default)]
+pub struct LabelInferenceReport {
+    /// Lowercased labels claimed by more than one producing node, with the
+    /// claimant count. Readers of such a label are ordered after ALL
+    /// claimants.
+    pub label_collisions: Vec<(String, usize)>,
+    /// Transformation labels whose SQL failed table-reference extraction.
+    pub unparsed: Vec<String>,
+}
+
+impl LabelInferenceReport {
+    /// Render operator-facing warnings; empty when nothing was unresolved.
+    #[must_use]
+    pub fn warnings(&self) -> Vec<String> {
+        let mut w = Vec::new();
+        for (label, n) in &self.label_collisions {
+            w.push(format!(
+                "label '{label}' is produced by {n} nodes — readers are ordered after ALL of \
+                 them; rename one if that over-constrains the schedule"
+            ));
+        }
+        for m in &self.unparsed {
+            w.push(format!(
+                "model '{m}': SQL could not be parsed for table references — label-based \
+                 ordering could not be derived for it"
+            ));
+        }
+        w
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3072,5 +3135,62 @@ mod tests {
                 .unwrap()
         };
         assert!(pos("a") < pos("b"), "consistent with the intermediate path");
+    }
+
+    /// #1351: two producers sharing a lowercased label must BOTH order the
+    /// reader — the single-slot map silently dropped one and the reader
+    /// raced it.
+    #[test]
+    fn colliding_labels_order_the_reader_after_all_claimants() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut reader = model("reader", vec![], vec![]);
+        reader.sql = "SELECT x FROM shared".into();
+        let by_pipeline = owned_by_sole_transformation(&config, vec![reader.clone()]);
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        // Two non-transformation producers wearing the same label.
+        for (i, kind) in [(0u8, NodeKind::Seed), (1u8, NodeKind::Load)] {
+            dag.nodes.push(UnifiedNode {
+                id: NodeId(format!("p{i}:shared")),
+                kind,
+                label: "shared".into(),
+                pipeline: Some("t".into()),
+            });
+        }
+        let sql: HashMap<String, String> =
+            HashMap::from([("reader".to_string(), reader.sql.clone())]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(report.label_collisions, vec![("shared".to_string(), 2)]);
+        let reader_id = dag
+            .nodes
+            .iter()
+            .find(|n| n.label == "reader" && n.kind == NodeKind::Transformation)
+            .unwrap()
+            .id
+            .clone();
+        let producer_edges = dag
+            .edges
+            .iter()
+            .filter(|e| e.to == reader_id && e.from.0.starts_with('p'))
+            .count();
+        assert_eq!(
+            producer_edges, 2,
+            "the reader is ordered after BOTH claimants"
+        );
+    }
+
+    /// #1351: a transformation whose SQL cannot be parsed is REPORTED, not
+    /// silently skipped.
+    #[test]
+    fn unparseable_sql_is_reported_by_label_inference() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut broken = model("broken", vec![], vec![]);
+        broken.sql = "SELEC x FRM (".into();
+        let by_pipeline = owned_by_sole_transformation(&config, vec![broken.clone()]);
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        let sql: HashMap<String, String> =
+            HashMap::from([("broken".to_string(), broken.sql.clone())]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
+        assert_eq!(report.unparsed, vec!["broken".to_string()]);
+        assert!(!report.warnings().is_empty());
     }
 }

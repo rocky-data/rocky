@@ -269,7 +269,7 @@ pub async fn run_with_dag(
         .flatten()
         .map(|m| (m.config.name.clone(), m.sql.clone()))
         .collect();
-    unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name);
+    let label_report = unified_dag::infer_runtime_dependencies(&mut dag, &sql_by_name);
 
     // Physical-read ordering (#1275): the label heuristic above is blind to
     // configured `[target]`s — a model reading another model's physical
@@ -285,7 +285,8 @@ pub async fn run_with_dag(
             .map(rocky_core::physical_edges::PhysicalEdgeModel::from_model)
             .collect();
     let derived = unified_dag::infer_physical_dependencies(&mut dag, &physical_inputs);
-    let physical_edge_warnings = rocky_core::physical_edges::derivation_warnings(&derived);
+    let mut physical_edge_warnings = label_report.warnings();
+    physical_edge_warnings.extend(rocky_core::physical_edges::derivation_warnings(&derived));
     for w in &physical_edge_warnings {
         tracing::warn!("{w}");
     }
