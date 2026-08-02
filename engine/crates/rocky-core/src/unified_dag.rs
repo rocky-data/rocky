@@ -1002,6 +1002,15 @@ pub fn infer_runtime_dependencies(
 
     let mut new_edges = Vec::new();
 
+    // Resolve every reader's candidates once, splitting legacy from fan-out.
+    // TWO-PHASE insertion: all legacy edges first (unguarded — byte-for-byte
+    // the graph the single-slot heuristic produced, so refusals are exactly
+    // the old refusals), THEN the fan-out additions guarded against the
+    // COMPLETE graph. Interleaving would let an earlier reader's fan-out
+    // edge make a later reader's unguarded legacy edge closing — a refusal
+    // the old behavior never had.
+    let mut legacy_candidates: Vec<(NodeId, String, NodeId)> = Vec::new();
+    let mut fanout_candidates: Vec<(NodeId, String, NodeId)> = Vec::new();
     for node in &dag.nodes {
         if node.kind != NodeKind::Transformation {
             continue;
@@ -1033,39 +1042,62 @@ pub fn infer_runtime_dependencies(
             // reader actually depends on is unknowable from the label alone,
             // and an extra ordering constraint is the safe direction.
             for producer_id in claimants {
-                // Skip self-references and already-known edges.
                 if *producer_id == node.id {
                     continue;
                 }
-                let key = (producer_id.clone(), node.id.clone());
-                if existing.contains(&key) {
-                    continue;
+                let entry = (node.id.clone(), node.label.clone(), producer_id.clone());
+                if legacy_winner.get(bare.as_str()) == Some(producer_id) {
+                    legacy_candidates.push(entry);
+                } else {
+                    fanout_candidates.push(entry);
                 }
-                // Guard only the fan-out additions; the legacy winner's edge
-                // inserts unguarded so genuine reciprocal reads keep their
-                // loud refusal (status quo).
-                let is_legacy = legacy_winner.get(bare.as_str()) == Some(producer_id);
-                if !is_legacy && label_reaches(&adj, &node.id, producer_id) {
-                    report
-                        .skipped_cycle_edges
-                        .push((node.label.clone(), producer_id.0.clone()));
-                    continue;
-                }
-                existing.insert(key);
-                adj.entry(producer_id.clone())
-                    .or_default()
-                    .push(node.id.clone());
-                new_edges.push(UnifiedEdge {
-                    from: producer_id.clone(),
-                    to: node.id.clone(),
-                    edge_type: EdgeType::DataDependency,
-                });
             }
         }
     }
 
+    // Phase 1 — legacy edges, unguarded (status-quo graph; genuine SQL
+    // cycles keep their loud refusal).
+    for (reader_id, _label, producer_id) in legacy_candidates {
+        let key = (producer_id.clone(), reader_id.clone());
+        if !existing.insert(key) {
+            continue;
+        }
+        adj.entry(producer_id.clone())
+            .or_default()
+            .push(reader_id.clone());
+        new_edges.push(UnifiedEdge {
+            from: producer_id,
+            to: reader_id,
+            edge_type: EdgeType::DataDependency,
+        });
+    }
+    // Phase 2 — fan-out additions, guarded against the complete graph: they
+    // must never introduce a refusal the old behavior did not have.
+    for (reader_id, reader_label, producer_id) in fanout_candidates {
+        let key = (producer_id.clone(), reader_id.clone());
+        if existing.contains(&key) {
+            continue;
+        }
+        if label_reaches(&adj, &reader_id, &producer_id) {
+            report
+                .skipped_cycle_edges
+                .push((reader_label, producer_id.0.clone()));
+            continue;
+        }
+        existing.insert(key);
+        adj.entry(producer_id.clone())
+            .or_default()
+            .push(reader_id.clone());
+        new_edges.push(UnifiedEdge {
+            from: producer_id,
+            to: reader_id,
+            edge_type: EdgeType::DataDependency,
+        });
+    }
+
     dag.edges.extend(new_edges);
     report.unparsed.sort();
+    report.skipped_cycle_edges.sort();
     report
 }
 
@@ -3322,5 +3354,67 @@ mod tests {
         let report = infer_runtime_dependencies(&mut dag, &sql);
         assert_eq!(report.skipped_cycle_edges.len(), 1, "{report:?}");
         execution_phases(&dag).expect("the fan-out edge skips; nothing refuses");
+    }
+
+    /// Two-phase insertion pinned: an earlier reader's guarded FAN-OUT edge
+    /// must not make a later reader's unguarded LEGACY edge closing — that
+    /// would refuse a DAG the single-slot heuristic ran. Legacy edges land
+    /// first (the status-quo graph), fan-out edges are then guarded against
+    /// the complete graph.
+    #[test]
+    fn a_fanout_edge_cannot_make_a_later_legacy_edge_closing() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut t1 = model("t1", vec![], vec![]);
+        t1.sql = "SELECT x FROM s".into();
+        let mut t2 = model("t2", vec![], vec![]);
+        t2.sql = "SELECT y FROM t1".into();
+        let models = vec![t1.clone(), t2.clone()];
+        let by_pipeline = owned_by_sole_transformation(&config, models);
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        let t2_id = dag
+            .nodes
+            .iter()
+            .find(|n| n.label == "t2" && n.kind == NodeKind::Transformation)
+            .unwrap()
+            .id
+            .clone();
+        // Label "s": P first (fan-out under last-wins), L last (legacy).
+        let p = NodeId("p:s".to_string());
+        let l = NodeId("l:s".to_string());
+        dag.nodes.push(UnifiedNode {
+            id: p.clone(),
+            kind: NodeKind::Seed,
+            label: "s".into(),
+            pipeline: Some("t".into()),
+        });
+        dag.nodes.push(UnifiedNode {
+            id: l.clone(),
+            kind: NodeKind::Load,
+            label: "s".into(),
+            pipeline: Some("t".into()),
+        });
+        // P depends on T2 (existing edge T2 -> P): with interleaved insertion
+        // the fan-out edge P -> T1 lands before T2's legacy edge T1 -> T2 and
+        // closes the cycle T2 -> P -> T1 -> T2. The old single-slot graph had
+        // no P edge at all and RAN.
+        dag.edges.push(UnifiedEdge {
+            from: t2_id,
+            to: p.clone(),
+            edge_type: EdgeType::DataDependency,
+        });
+        let sql: HashMap<String, String> = HashMap::from([
+            ("t1".to_string(), t1.sql.clone()),
+            ("t2".to_string(), t2.sql.clone()),
+        ]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
+        execution_phases(&dag)
+            .expect("the fan-out edge must be the one skipped; nothing may refuse");
+        assert!(
+            report
+                .skipped_cycle_edges
+                .iter()
+                .any(|(r, pid)| r == "t1" && pid == "p:s"),
+            "{report:?}"
+        );
     }
 }
