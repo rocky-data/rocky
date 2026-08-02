@@ -1046,6 +1046,13 @@ mod tests {
         assert_eq!(count_statements("SELECT 1$$ a; $$"), 1);
         // Token boundaries that DO open: whitespace and punctuation.
         assert_eq!(count_statements("SELECT ($$x; $$); SELECT 2"), 2);
+        // Session variables do NOT absorb a following $$ — the server
+        // opens a string there (live-verified: `SELECT $a$$ x $$` fails
+        // with "unexpected '$$ x $$'", i.e. `$a` + a lexed string; and
+        // `SELECT $a$$b` is an unterminated-string parse error). The
+        // scanner mirrors both, so declared counts match the lexer.
+        assert_eq!(count_statements("SELECT $a$$ x; $$; SELECT 2"), 2);
+        assert_eq!(count_statements("SELECT $a$$b; swallowed"), 1);
     }
 
     #[test]
