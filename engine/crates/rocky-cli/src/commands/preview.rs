@@ -313,11 +313,12 @@ fn newest_branch_and_base_runs(
     if let Some(base_ref) = base_ref {
         // A base can be named as a branch OR a commit (Rocky's own preview
         // workflow passes `github.event.pull_request.base.sha`). Identity
-        // precedence is staged — a BRANCH-NAME match always wins over a
-        // commit match (a branch literally named like a hex string must not
-        // lose to a newer commit-prefix match), then an exact commit, then a
-        // git-style hex prefix (≥7) with AMBIGUITY REFUSED rather than
-        // silently resolved to the newest.
+        // precedence is staged: a FULL 40-hex ref states commit intent and
+        // resolves (or refuses) as a commit first; for shorter refs a
+        // BRANCH-NAME match wins over a commit match (a branch named like a
+        // hex string must not lose to a prefix coincidence), then an exact
+        // commit, then a git-style hex prefix (≥7) with AMBIGUITY REFUSED
+        // rather than silently resolved to the newest.
         let base_lower = base_ref.to_ascii_lowercase();
         let is_full_sha =
             base_lower.len() == 40 && base_lower.chars().all(|ch| ch.is_ascii_hexdigit());
@@ -370,33 +371,45 @@ fn newest_branch_and_base_runs(
             return finish_named(branch_run, run, base_ref);
         }
         if base_lower.len() >= 7 && base_lower.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            let by_prefix = store.list_runs_matching(usize::MAX, |r| {
-                r.git_commit
+            // Prove prefix uniqueness WITHOUT materializing history: probe
+            // the newest match, then probe for any SECOND DISTINCT sha under
+            // the same prefix. Two limit-1 scans — exhaustive over the whole
+            // table (the store iterates it regardless) with O(1) kept rows,
+            // so unbounded run retention cannot balloon this path.
+            let first = store
+                .list_runs_matching(1, |r| {
+                    r.git_commit
+                        .as_deref()
+                        .is_some_and(|c| c.to_ascii_lowercase().starts_with(&base_lower))
+                })?
+                .into_iter()
+                .next();
+            if let Some(run) = first {
+                let first_sha = run
+                    .git_commit
                     .as_deref()
-                    .is_some_and(|c| c.to_ascii_lowercase().starts_with(&base_lower))
-            })?;
-            let mut distinct: Vec<&str> = by_prefix
-                .iter()
-                .filter_map(|r| r.git_commit.as_deref())
-                .collect();
-            distinct.sort_unstable_by_key(|c| c.to_ascii_lowercase());
-            distinct.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-            match distinct.len() {
-                0 => {}
-                1 => {
-                    let run = by_prefix.into_iter().next().expect("nonempty");
-                    return finish_named(branch_run, run, base_ref);
-                }
-                n => {
+                    .expect("matched on git_commit")
+                    .to_ascii_lowercase();
+                let second_distinct = store
+                    .list_runs_matching(1, |r| {
+                        r.git_commit.as_deref().is_some_and(|c| {
+                            let lower = c.to_ascii_lowercase();
+                            lower.starts_with(&base_lower) && lower != first_sha
+                        })
+                    })?
+                    .into_iter()
+                    .next();
+                if second_distinct.is_some() {
                     return Ok((
                         branch_run,
                         None,
                         Some(format!(
-                            "the base prefix '{base_ref}' matches {n} distinct recorded \
-                             commits — give more characters to disambiguate"
+                            "the base prefix '{base_ref}' matches more than one distinct \
+                             recorded commit — give more characters to disambiguate"
                         )),
                     ));
                 }
+                return finish_named(branch_run, run, base_ref);
             }
         }
         // No recorded run on the named base: the diff that was asked for
@@ -2417,7 +2430,7 @@ mod tests {
             base_run.is_none(),
             "the concealed distinct commit must refuse"
         );
-        assert!(note.unwrap().contains("distinct recorded commits"));
+        assert!(note.unwrap().contains("more than one distinct"));
     }
 
     /// Exact commit matching is case-insensitive (git accepts uppercase sha
@@ -2506,7 +2519,7 @@ mod tests {
             newest_branch_and_base_runs(&store, "feature", Some("abc1234")).unwrap();
         assert!(base_run.is_none());
         assert!(
-            note.unwrap().contains("2 distinct recorded commits"),
+            note.unwrap().contains("more than one distinct"),
             "ambiguity must be refused, not resolved silently"
         );
     }
