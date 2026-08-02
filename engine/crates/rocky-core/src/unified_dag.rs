@@ -1111,6 +1111,35 @@ pub fn infer_physical_dependencies(
             edge_type: EdgeType::DataDependency,
         });
     }
+    // Second pass: a name-level skip's premise is "the opposite direction
+    // was accepted". If insertion REJECTED that opposite edge (a real cycle
+    // through an intermediate), the skipped direction may now be safe — and
+    // without it the pair would end up with NO edge at all, silently
+    // co-scheduled. Reconsider every name-level skip against the live graph.
+    let skipped_snapshot = derived.skipped_cycle_edges.clone();
+    for (consumer, producer) in skipped_snapshot {
+        let (Some(cid), Some(pid)) = (
+            by_label.get(consumer.as_str()),
+            by_label.get(producer.as_str()),
+        ) else {
+            continue;
+        };
+        if edge_set.contains(&(pid.clone(), cid.clone())) {
+            continue;
+        }
+        if reaches_node(dag, cid, pid) {
+            continue;
+        }
+        derived
+            .skipped_cycle_edges
+            .retain(|(c, p)| !(c == &consumer && p == &producer));
+        derived.edges.push((consumer, producer));
+        dag.edges.push(UnifiedEdge {
+            from: pid.clone(),
+            to: cid.clone(),
+            edge_type: EdgeType::DataDependency,
+        });
+    }
     derived
 }
 
@@ -2952,5 +2981,82 @@ mod tests {
         );
         assert_eq!(derived.skipped_cycle_edges.len(), 1);
         execution_phases(&dag).expect("a derived edge must never make a runnable project refuse");
+    }
+
+    /// #1275 second-order guard: when insertion rejects the name-accepted
+    /// direction of a mutual pair (a real cycle through an intermediate),
+    /// the name-level-skipped direction must be reconsidered — otherwise the
+    /// pair ends up with NO edge and silently co-schedules.
+    #[test]
+    fn a_rejected_direction_reinstates_the_skipped_one() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        // Mutual physical reads: candidates ("a","b") then ("b","a") in
+        // deterministic order; the derivation accepts ("a","b") and skips
+        // ("b","a").
+        let mut a = model("a", vec![], vec![]);
+        a.sql = "SELECT x FROM silver.b".into();
+        let mut b = model("b", vec![], vec![]);
+        b.sql = "SELECT y FROM silver.a".into();
+        let models = vec![a, b];
+        let by_pipeline = owned_by_sole_transformation(&config, models.clone());
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+
+        // Pre-existing intermediate path a → gate → b, so inserting the
+        // accepted ("a","b") edge (b before a) would close a cycle at the
+        // NodeId level and gets rejected there.
+        let a_id = dag
+            .nodes
+            .iter()
+            .find(|n| n.label == "a" && n.kind == NodeKind::Transformation)
+            .unwrap()
+            .id
+            .clone();
+        let b_id = dag
+            .nodes
+            .iter()
+            .find(|n| n.label == "b" && n.kind == NodeKind::Transformation)
+            .unwrap()
+            .id
+            .clone();
+        let gate_id = NodeId("check:gate".to_string());
+        dag.nodes.push(UnifiedNode {
+            id: gate_id.clone(),
+            kind: NodeKind::Quality,
+            label: "gate".into(),
+            pipeline: Some("t".into()),
+        });
+        dag.edges.push(UnifiedEdge {
+            from: a_id.clone(),
+            to: gate_id.clone(),
+            edge_type: EdgeType::CheckDependency,
+        });
+        dag.edges.push(UnifiedEdge {
+            from: gate_id,
+            to: b_id.clone(),
+            edge_type: EdgeType::CheckDependency,
+        });
+
+        let inputs: Vec<crate::physical_edges::PhysicalEdgeModel<'_>> = models
+            .iter()
+            .map(crate::physical_edges::PhysicalEdgeModel::from_model)
+            .collect();
+        let derived = infer_physical_dependencies(&mut dag, &inputs);
+        assert_eq!(
+            derived.edges,
+            vec![("b".to_string(), "a".to_string())],
+            "the skipped direction must be reinstated: {derived:?}"
+        );
+        assert_eq!(
+            derived.skipped_cycle_edges,
+            vec![("a".to_string(), "b".to_string())]
+        );
+        let phases = execution_phases(&dag).expect("no cycle");
+        let pos = |label: &str| {
+            phases
+                .iter()
+                .position(|l| l.iter().any(|n| n.label == label))
+                .unwrap()
+        };
+        assert!(pos("a") < pos("b"), "consistent with the intermediate path");
     }
 }
