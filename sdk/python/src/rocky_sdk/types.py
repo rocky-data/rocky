@@ -475,6 +475,10 @@ class RunResult(BaseModel):
     #: Budget breaches detected at end of run. Empty when no ``[budget]`` block
     #: is configured or all limits were respected.
     budget_breaches: list[BudgetBreachOutput] = Field(default_factory=list)
+    #: Scheduling warnings from physical-read edge derivation: mutual
+    #: physical reads serialized by a deterministic order, models whose SQL
+    #: could not be parsed for table references, and colliding targets.
+    scheduling_warnings: list[str] = Field(default_factory=list)
     #: Soft warnings from the per-table override resolver — one entry per
     #: ``[[table_overrides]]`` rule that matched nothing. Empty when no
     #: overrides are declared.
