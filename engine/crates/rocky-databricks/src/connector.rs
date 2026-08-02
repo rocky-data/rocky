@@ -1440,6 +1440,14 @@ mod statement_kind_tests {
             classify_statement_kind("/* outer /* inner */ SELECT 1"),
             "other"
         );
+        // Overlap pins: each delimiter consumes BOTH its bytes. If the
+        // opener consumed one, `/*/` would double as open+close and the
+        // outer block would look terminated (→ "query"); if the closer
+        // consumed one, its trailing `/` would fuse with the next `*`
+        // into a phantom opener and the run of closers would look
+        // unterminated (→ "other").
+        assert_eq!(classify_statement_kind("/* /*/ */ SELECT 1"), "other");
+        assert_eq!(classify_statement_kind("/* /* */*/ SELECT 1"), "query");
     }
 }
 
