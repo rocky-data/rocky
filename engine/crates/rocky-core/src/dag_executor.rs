@@ -140,6 +140,16 @@ impl<D: NodeDispatcher + 'static> DagExecutor<D> {
         self
     }
 
+    /// The configured node-fan-out bound, or `None` for unbounded.
+    ///
+    /// Exists so a caller's *wiring* can be asserted without executing a DAG:
+    /// `run_with_dag` deciding not to apply a bound is invisible to any test
+    /// that only drives execution, since unbounded and
+    /// bounded-above-the-node-count behave identically (#1288).
+    pub fn max_concurrency(&self) -> Option<usize> {
+        self.max_concurrency
+    }
+
     /// Execute the entire DAG, layer by layer.
     ///
     /// Layers respect topological dependencies (Kahn's algorithm). Nodes

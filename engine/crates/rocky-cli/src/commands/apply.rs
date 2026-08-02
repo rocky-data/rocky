@@ -676,16 +676,23 @@ async fn execute_run_plan(
             // would write production while reporting success. The non-DAG path
             // below passes the same value.
             shadow_config.as_ref(),
-            // No node-fan-out bound on a replay, because a persisted plan does
-            // not capture `--parallel` — it is a resource knob, not part of the
-            // plan's contract, in the same way `--force-rebuild` is not.
+            // No node-fan-out bound on a replay. A stored plan DOES carry
+            // `parallel` (`RunPlan::parallel`, reconstructed into
+            // `partition_opts` above), so this is a deliberate discard rather
+            // than a missing value — and the reason is the field's own shape.
             //
-            // The consequence is worth naming rather than leaving implicit:
-            // `rocky plan --dag` then `rocky apply` runs unbounded even if the
-            // planning invocation asked for a bound, so plan-time intent and
-            // apply-time behaviour differ here. Making them agree means adding
-            // `parallel` to the stored plan, which changes the plan's contract
-            // and its `plan_id` hash — deliberately out of scope for #1288.
+            // It is a plain `u32` with `#[serde(default = "default_parallel")]`
+            // returning **1**, so it cannot distinguish "the planner asked for
+            // 1" from "this plan predates the field". Honoring it would
+            // silently serialize every DAG plan stored before #1288 — a large
+            // slowdown applied to plans whose authors never chose it.
+            //
+            // The cost is that plan-time intent is not replayed: `rocky plan
+            // --dag --parallel 1` then `rocky apply` runs unbounded. This is
+            // byte-identical to pre-#1288 behaviour, not a new regression.
+            // Fixing it needs the stored field to become optional, which
+            // changes the plan's contract and its `plan_id` hash — out of
+            // scope here, and tracked separately.
             None,
         )
         .await

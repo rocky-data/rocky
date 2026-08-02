@@ -381,10 +381,7 @@ pub async fn run_with_dag(
         sub_runner: default_sub_runner(),
         state_turns: StateTurnstile::new(),
     };
-    let executor = match node_concurrency_limit(node_concurrency) {
-        Some(n) => DagExecutor::new(dispatcher).with_max_concurrency(n),
-        None => DagExecutor::new(dispatcher),
-    };
+    let executor = dag_executor_with_bound(dispatcher, node_concurrency);
     let result = executor
         .execute(&dag)
         .await
@@ -633,12 +630,12 @@ struct CliDispatcher {
 /// them is what made `rocky run --dag --partition 2020-01-01` rebuild the
 /// latest partition and exit 0 (#1283).
 ///
-/// `--parallel` chooses *how many* warehouse queries run at once, and the DAG
-/// already owns that dimension — it dispatches every node in a layer
-/// concurrently. Honoring the flag per sub-run on top of that would give
-/// node-fan-out × per-partition-fan-out, and `run_with_dag` builds its
-/// [`DagExecutor`] with no `max_concurrency`, so the left-hand factor is
-/// unbounded. `rocky run` refuses that multiplication by construction:
+/// `--parallel` chooses *how many* things run at once, and the DAG owns that
+/// dimension at the node level — [`run_with_dag`] now applies the flag there
+/// (#1288). Honoring it per sub-run *as well* would give node-fan-out ×
+/// per-partition-fan-out, so the narrowing below stays exactly as it was:
+/// applying one bound twice is what makes it a multiplication.
+/// `rocky run` refuses that multiplication by construction:
 /// `super::run::execute_models` excludes `time_interval` from concurrent model
 /// execution precisely because it "already self-parallelizes per-partition".
 /// The DAG must not reintroduce what the non-DAG path is careful to avoid, so
@@ -649,13 +646,33 @@ struct CliDispatcher {
 /// still where the DAG half is *refused*: the bound is applied once, to node
 /// fan-out, in [`run_with_dag`]. Threading it here as well is what would give
 /// node-fan-out x per-partition-fan-out (#1288).
+/// Build the DAG executor with the caller's node-fan-out bound applied.
+///
+/// Separate from [`run_with_dag`] so the wiring is assertable: dropping the
+/// bound here is invisible to any test that merely executes a DAG, because
+/// unbounded and bounded-above-the-node-count run identically.
+fn dag_executor_with_bound<D: rocky_core::dag_executor::NodeDispatcher + 'static>(
+    dispatcher: D,
+    node_concurrency: Option<u32>,
+) -> DagExecutor<D> {
+    match node_concurrency_limit(node_concurrency) {
+        Some(n) => DagExecutor::new(dispatcher).with_max_concurrency(n),
+        None => DagExecutor::new(dispatcher),
+    }
+}
+
 /// How many DAG nodes may execute at once, from `--parallel` as the caller
 /// spelled it.
 ///
 /// One bound, applied once. Each sub-run executes a single partition at a time
-/// ([`sub_run_partition_opts`] pins it to 1), so node fan-out *is* the count of
-/// concurrent warehouse queries — the same quantity `--parallel` bounds on the
-/// non-`--dag` path, rather than a second factor multiplying it.
+/// ([`sub_run_partition_opts`] pins it to 1), so this is a ceiling on *nodes*
+/// and the flag is not additionally multiplied inside each one.
+///
+/// It is **not** a ceiling on warehouse queries in general, and the difference
+/// matters for a replication node: `run` builds its own table-level semaphore
+/// from `[execution] concurrency` (default 32), which `--parallel` has never
+/// governed on either path. So `--parallel 1` under `--dag` admits one node at
+/// a time; a replication Load node may still run many tables inside it.
 ///
 /// - `None` (flag absent) keeps the historical **unbounded** fan-out. Adopting
 ///   the non-`--dag` default of 4 here would silently cap a wide DAG that runs
@@ -972,11 +989,12 @@ mod run_opts_threading_tests {
         assert!(opts.missing);
         assert_eq!(opts.lookback, Some(2));
         // ...and concurrency does not. The dispatcher holds 3; the sub-run
-        // must see 1, because the DAG already fans out per node and does not
-        // cap that fan-out. Threading it wholesale makes this 3.
+        // must see 1, because the DAG applies the bound ONCE, at the node
+        // level (#1288). Threading it wholesale makes this 3 — the same bound
+        // applied twice, which is a multiplication.
         assert_eq!(
             opts.parallel, 1,
-            "--parallel must NOT reach the sub-run: the DAG owns node fan-out \
+            "--parallel must NOT reach the sub-run: the DAG bounds node fan-out \
              and does not bound it, so honoring it here multiplies (#1288)"
         );
         assert!(
@@ -1293,6 +1311,46 @@ mod tests {
         );
         assert_eq!(node_concurrency_limit(Some(1)), Some(1));
         assert_eq!(node_concurrency_limit(Some(8)), Some(8));
+    }
+
+    /// The bound reaches the executor `run_with_dag` actually builds.
+    ///
+    /// Review caught that `node_concurrency_limit` alone proves nothing about
+    /// production: deleting the `with_max_concurrency` call left every test
+    /// green, because a DAG executes identically whether it is unbounded or
+    /// bounded above its node count. This asserts the wiring itself.
+    ///
+    /// Mutation that must turn this red: drop the `Some(n) =>` arm of
+    /// `dag_executor_with_bound` so it always builds an unbounded executor.
+    #[test]
+    fn the_bound_reaches_the_executor_that_is_built() {
+        struct NoopDispatcher;
+        impl rocky_core::dag_executor::NodeDispatcher for NoopDispatcher {
+            fn dispatch(
+                &self,
+                _id: &rocky_core::unified_dag::NodeId,
+                _kind: rocky_core::unified_dag::NodeKind,
+                _label: &str,
+            ) -> Option<rocky_core::dag_executor::NodeFuture> {
+                None
+            }
+        }
+
+        assert_eq!(
+            dag_executor_with_bound(NoopDispatcher, Some(3)).max_concurrency(),
+            Some(3),
+            "an explicit --parallel must reach the executor"
+        );
+        assert_eq!(
+            dag_executor_with_bound(NoopDispatcher, Some(0)).max_concurrency(),
+            Some(1),
+            "--parallel 0 must reach it as 1, not as unbounded"
+        );
+        assert_eq!(
+            dag_executor_with_bound(NoopDispatcher, None).max_concurrency(),
+            None,
+            "an absent --parallel must leave the executor unbounded"
+        );
     }
 
     /// `--parallel 0` is one, never unbounded.

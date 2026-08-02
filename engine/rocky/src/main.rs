@@ -65,6 +65,17 @@ See `docs/reference/filters` for the full reference and more examples.
 /// difference before any handler sees it (#1288).
 const DEFAULT_PARALLEL: u32 = 4;
 
+/// `--parallel` as the non-`--dag` execution path sees it.
+///
+/// A named function rather than an inline `unwrap_or` so a test can assert the
+/// *production* default rather than restating it. Review caught that an
+/// assertion written as `parse(..).unwrap_or(DEFAULT_PARALLEL) == 4` proves
+/// nothing: it re-applies the default itself, so changing this one would leave
+/// it green.
+fn effective_parallel(flag: Option<u32>) -> u32 {
+    flag.unwrap_or(DEFAULT_PARALLEL)
+}
+
 #[derive(Parser)]
 #[command(name = "rocky", version, about = "Rust SQL transformation engine")]
 struct Cli {
@@ -935,10 +946,12 @@ enum Command {
         /// at each layer boundary. Warehouse-query parallelism only — state
         /// writes serialize through redb, and DuckDB always runs serial.
         ///
-        /// Under `--dag` it bounds how many NODES run at once, which is the
-        /// same ceiling on concurrent warehouse queries: each `--dag` sub-run
-        /// executes one partition at a time, so node fan-out is the only
-        /// factor. `--parallel 1` forces a `--dag` run fully serial (#1288).
+        /// Under `--dag` it bounds how many NODES run at once — each sub-run
+        /// executes one partition at a time, so the flag is not multiplied
+        /// inside a node. It is a ceiling on nodes, not on every warehouse
+        /// query: a replication node still uses its pipeline's `[execution]
+        /// concurrency` for table fan-out, which `--parallel` has never
+        /// governed on either path (#1288).
         ///
         /// Left unset, `--dag` keeps its historical UNBOUNDED node fan-out
         /// rather than adopting the default of 4 — capping a wide DAG that
@@ -3375,7 +3388,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 // tell "unset" from "explicitly 4", so the flag stays an
                 // `Option` up to here and the default is applied at its one
                 // consumer rather than by clap (#1288).
-                parallel: parallel.unwrap_or(DEFAULT_PARALLEL),
+                parallel: effective_parallel(parallel),
             };
 
             let defer_opts = rocky_cli::commands::DeferOptions {
@@ -5037,9 +5050,15 @@ mod tests {
              node fan-out only when it can see the flag was not passed"
         );
         assert_eq!(
-            run_parallel(&["rocky", "run"]).unwrap_or(DEFAULT_PARALLEL),
+            effective_parallel(run_parallel(&["rocky", "run"])),
             4,
-            "the EFFECTIVE non-dag default must still be 4"
+            "the EFFECTIVE non-dag default must still be 4 — asserted through \
+             the production fold, not by re-applying the default here"
+        );
+        assert_eq!(
+            effective_parallel(run_parallel(&["rocky", "run", "--parallel", "1"])),
+            1,
+            "an explicit value must survive the fold"
         );
         assert_eq!(
             run_parallel(&["rocky", "run", "--parallel", "1"]),
