@@ -1366,11 +1366,35 @@ fn strip_leading_sql_comments_and_whitespace(mut sql: &str) -> &str {
             continue;
         }
         if let Some(body) = trimmed.strip_prefix("/*") {
-            sql = match body.find("*/") {
-                Some(end) => &body[end + 2..],
-                // Unterminated block comment: nothing classifiable follows.
-                None => "",
-            };
+            // Spark SQL block comments NEST (unlike Snowflake's and
+            // BigQuery's, where a nested opener is a syntax error) — track
+            // depth so `/* outer /* inner */ still-comment */ SELECT 1`
+            // classifies by its real first keyword.
+            let mut depth: usize = 1;
+            let mut rest = body;
+            loop {
+                let next_close = rest.find("*/");
+                let next_open = rest.find("/*");
+                match (next_open, next_close) {
+                    (Some(o), Some(c)) if o < c => {
+                        depth += 1;
+                        rest = &rest[o + 2..];
+                    }
+                    (_, Some(c)) => {
+                        depth -= 1;
+                        rest = &rest[c + 2..];
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    // Unterminated at some depth: nothing classifiable.
+                    (_, None) => {
+                        rest = "";
+                        break;
+                    }
+                }
+            }
+            sql = rest;
             continue;
         }
         return trimmed;
@@ -1401,6 +1425,15 @@ mod statement_kind_tests {
             "dml"
         );
         assert_eq!(classify_statement_kind("/* unterminated"), "other");
+        // Spark SQL nests block comments.
+        assert_eq!(
+            classify_statement_kind("/* outer /* inner */ still-comment */ SELECT 1"),
+            "query"
+        );
+        assert_eq!(
+            classify_statement_kind("/* outer /* unterminated inner */"),
+            "other"
+        );
     }
 }
 
