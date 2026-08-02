@@ -568,16 +568,21 @@ impl SnowflakeConnector {
 ///
 /// Counts semicolons that terminate distinct statements, then adds 1 for the
 /// final un-terminated statement. Skips semicolons inside SQL string literals
-/// (`'...'`), single-line comments (`-- ...` and `// ...` — Snowflake accepts
-/// both), and `/* ... */` block comments (flat scan: Snowflake's lexer ends a
-/// block comment at the FIRST `*/`; an inner `/*` is inert text —
-/// live-verified). A miscount here is not cosmetic: Snowflake rejects a
-/// submission whose real statement count differs from `MULTI_STATEMENT_COUNT`
-/// (#1365). Dollar-quoted string constants (`$$ ... $$` — Snowflake supports
-/// only the bare form; a `$tag$` opener is a syntax error, live-verified) are
-/// opaque: comment markers, quotes, and semicolons inside them are literal
-/// text. Rocky-generated SQL never embeds semicolons in identifiers, so
-/// identifier-quoting is not considered.
+/// (`'...'`), double-quoted identifiers (`"..."`, `""` escape), single-line
+/// comments (`-- ...` and `// ...` — Snowflake accepts both), and `/* ... */`
+/// block comments (flat scan: Snowflake's lexer ends a block comment at the
+/// FIRST `*/`; an inner `/*` is inert text — live-verified). A miscount here
+/// is not cosmetic: Snowflake rejects a submission whose real statement count
+/// differs from `MULTI_STATEMENT_COUNT` (#1365).
+///
+/// Dollar-quoted string constants (`$$ ... $$` — bare form only; a `$tag$`
+/// opener is a syntax error, live-verified) are opaque: comment markers,
+/// quotes, and semicolons inside them are literal text. `$$` opens a string
+/// only at a TOKEN BOUNDARY: `$` is a valid identifier character, so
+/// `a$$b` and `a$$` are single identifiers (live-verified), while after a
+/// bare numeric token `1$$` the server DOES open a string (live-verified:
+/// unterminated parse error) — tracked via which character started the
+/// current word token.
 ///
 /// Trailing-only whitespace after the last semicolon counts the same as a
 /// terminator (one fewer statement). Empty / whitespace-only input returns 0.
@@ -585,13 +590,32 @@ fn count_statements(sql: &str) -> usize {
     let mut count = 0usize;
     let mut chars = sql.chars().peekable();
     let mut in_string = false;
+    let mut in_dquote = false;
     let mut in_dollar = false;
+    // `prev_word` — the previous char continues a word token (alnum/_/$);
+    // `word_absorbs_dollar` — that token began with a letter or `_`, so a
+    // following `$$` is identifier continuation, not a string opener.
+    let mut prev_word = false;
+    let mut word_absorbs_dollar = false;
     let mut saw_non_ws_since_terminator = false;
     while let Some(c) = chars.next() {
         if in_dollar {
             if c == '$' && chars.peek() == Some(&'$') {
                 chars.next();
                 in_dollar = false;
+                prev_word = false;
+            }
+            continue;
+        }
+        if in_dquote {
+            if c == '"' {
+                // `""` escapes a quote inside a quoted identifier.
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                } else {
+                    in_dquote = false;
+                    prev_word = false;
+                }
             }
             continue;
         }
@@ -611,11 +635,18 @@ fn count_statements(sql: &str) -> usize {
             '\'' => {
                 in_string = true;
                 saw_non_ws_since_terminator = true;
+                prev_word = false;
             }
-            '$' if chars.peek() == Some(&'$') => {
+            '"' => {
+                in_dquote = true;
+                saw_non_ws_since_terminator = true;
+                prev_word = false;
+            }
+            '$' if chars.peek() == Some(&'$') && !(prev_word && word_absorbs_dollar) => {
                 chars.next();
                 in_dollar = true;
                 saw_non_ws_since_terminator = true;
+                prev_word = false;
             }
             '-' if chars.peek() == Some(&'-') => {
                 // Skip to end of line.
@@ -624,6 +655,7 @@ fn count_statements(sql: &str) -> usize {
                         break;
                     }
                 }
+                prev_word = false;
             }
             '/' if chars.peek() == Some(&'/') => {
                 // Skip to end of line.
@@ -632,6 +664,7 @@ fn count_statements(sql: &str) -> usize {
                         break;
                     }
                 }
+                prev_word = false;
             }
             '/' if chars.peek() == Some(&'*') => {
                 // Skip to the first `*/` (flat — see the doc comment);
@@ -644,16 +677,30 @@ fn count_statements(sql: &str) -> usize {
                     }
                     prev = nc;
                 }
+                prev_word = false;
             }
             ';' => {
                 if saw_non_ws_since_terminator {
                     count += 1;
                 }
                 saw_non_ws_since_terminator = false;
+                prev_word = false;
             }
-            c if c.is_whitespace() => {}
+            c if c.is_whitespace() => {
+                prev_word = false;
+            }
             _ => {
                 saw_non_ws_since_terminator = true;
+                if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+                    if !prev_word {
+                        // A word token starts here; only letter/underscore
+                        // starts can absorb a later `$$`.
+                        word_absorbs_dollar = c.is_ascii_alphabetic() || c == '_';
+                    }
+                    prev_word = true;
+                } else {
+                    prev_word = false;
+                }
             }
         }
     }
@@ -981,6 +1028,33 @@ mod tests {
         // Unterminated dollar string swallows the rest (the server errors
         // on the statement itself; we still declare the one statement).
         assert_eq!(count_statements("SELECT $$ a; "), 1);
+    }
+
+    #[test]
+    fn test_count_statements_dollar_in_identifiers_not_a_string_opener() {
+        // `$` is a valid identifier character: `a$$b` and `a$$` are single
+        // identifiers (live-verified), so `$$` there must NOT open a
+        // string and swallow the real terminator.
+        assert_eq!(count_statements("SELECT 1 AS a$$b; SELECT 2"), 2);
+        assert_eq!(count_statements("SELECT 1 AS a$$; SELECT 2"), 2);
+        assert_eq!(count_statements("SELECT t.col$$x FROM t; SELECT 2"), 2);
+        // Positional reference: a lone `$` never opens anything.
+        assert_eq!(count_statements("SELECT $1; SELECT 2"), 2);
+        // After a bare numeric token the server DOES open a dollar string
+        // (live-verified: `1$$` is an unterminated-string parse error), so
+        // the counter opens too and the inner `;` stays inert.
+        assert_eq!(count_statements("SELECT 1$$ a; $$"), 1);
+        // Token boundaries that DO open: whitespace and punctuation.
+        assert_eq!(count_statements("SELECT ($$x; $$); SELECT 2"), 2);
+    }
+
+    #[test]
+    fn test_count_statements_quoted_identifiers_are_opaque() {
+        // Double-quoted identifiers may contain `;`, `$$`, and `""`-escaped
+        // quotes (live-verified: SELECT 1 AS "a;b$$c""d" executes).
+        assert_eq!(count_statements(r#"SELECT 1 AS "a;b"; SELECT 2"#), 2);
+        assert_eq!(count_statements(r#"SELECT 1 AS "a$$b"; SELECT 2"#), 2);
+        assert_eq!(count_statements(r#"SELECT 1 AS "a;b$$c""d"; SELECT 2"#), 2);
     }
 
     #[test]
