@@ -951,11 +951,17 @@ pub fn infer_runtime_dependencies(
             _ => {}
         }
     }
+    let mut legacy_winner: HashMap<&str, NodeId> = HashMap::new();
     for (label, claimants) in &producers {
         if claimants.len() > 1 {
             report
                 .label_collisions
                 .push((label.clone(), claimants.len()));
+        }
+        // The single-slot map's insert order made the LAST claimant the one
+        // whose edges the old code produced.
+        if let Some(last) = claimants.last() {
+            legacy_winner.insert(label.as_str(), last.clone());
         }
     }
     report.label_collisions.sort();
@@ -966,11 +972,13 @@ pub fn infer_runtime_dependencies(
         .iter()
         .map(|e| (e.from.clone(), e.to.clone()))
         .collect();
-    // Insertion-time cycle guard, same contract as the physical pass: an
-    // inferred edge must never make `execution_phases` refuse a DAG that
-    // runs today. (The pre-guard heuristic could already refuse on mutual
-    // label reads; the all-claimant fan-out widens that exposure, so the
-    // guard lands with it.)
+    // Insertion-time cycle guard for the FAN-OUT edges only. The single-slot
+    // heuristic kept exactly one claimant per label (HashMap insert order:
+    // the LAST node won) and inserted its edges unguarded — genuinely
+    // reciprocal label reads therefore REFUSED loudly, and that status quo
+    // must not silently become a stale-read success. Only the edges this
+    // change ADDS (claimants the old code dropped) are guarded: they must
+    // never introduce a refusal the old behavior did not have.
     let mut adj: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     for e in &dag.edges {
         adj.entry(e.from.clone()).or_default().push(e.to.clone());
@@ -1033,8 +1041,11 @@ pub fn infer_runtime_dependencies(
                 if existing.contains(&key) {
                     continue;
                 }
-                // Closing iff the reader already reaches the producer.
-                if label_reaches(&adj, &node.id, producer_id) {
+                // Guard only the fan-out additions; the legacy winner's edge
+                // inserts unguarded so genuine reciprocal reads keep their
+                // loud refusal (status quo).
+                let is_legacy = legacy_winner.get(bare.as_str()) == Some(producer_id);
+                if !is_legacy && label_reaches(&adj, &node.id, producer_id) {
                     report
                         .skipped_cycle_edges
                         .push((node.label.clone(), producer_id.0.clone()));
@@ -3242,11 +3253,11 @@ mod tests {
         assert!(!report.warnings().is_empty());
     }
 
-    /// The label pass must never refuse a runnable DAG: mutual label reads
-    /// (each model reading the other's label) skip one direction with a
-    /// warning and `execution_phases` still computes.
+    /// Status quo pinned: genuinely reciprocal label reads REFUSE loudly
+    /// (as the single-slot heuristic always did) — the guard must not
+    /// downgrade a real SQL cycle into a silent stale-read success.
     #[test]
-    fn mutual_label_reads_do_not_refuse_the_dag() {
+    fn mutual_label_reads_still_refuse_loudly() {
         let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
         let mut a = model("a", vec![], vec![]);
         a.sql = "SELECT x FROM b".into();
@@ -3260,7 +3271,56 @@ mod tests {
             ("b".to_string(), b.sql.clone()),
         ]);
         let report = infer_runtime_dependencies(&mut dag, &sql);
+        assert!(report.skipped_cycle_edges.is_empty(), "{report:?}");
+        assert!(
+            execution_phases(&dag).is_err(),
+            "a genuine SQL cycle keeps its loud refusal"
+        );
+    }
+
+    /// The guard applies exactly to the edges the fan-out ADDS: a non-legacy
+    /// claimant edge that would close a cycle is skipped (warned) — the old
+    /// single-slot behavior had no such edge, so no refusal may appear.
+    #[test]
+    fn a_fanout_claimant_edge_never_introduces_a_new_refusal() {
+        let config = config_with_pipelines(vec![("t", transform_pipeline(vec![]))]);
+        let mut reader = model("reader", vec![], vec![]);
+        reader.sql = "SELECT x FROM shared".into();
+        let by_pipeline = owned_by_sole_transformation(&config, vec![reader.clone()]);
+        let mut dag = build_unified_dag(&config, &by_pipeline, &[]).expect("build dag");
+        let reader_id = dag
+            .nodes
+            .iter()
+            .find(|n| n.label == "reader" && n.kind == NodeKind::Transformation)
+            .unwrap()
+            .id
+            .clone();
+        // Two claimants; the FIRST (non-legacy under last-wins) already
+        // depends on the reader through an existing edge, so its fan-out
+        // edge would close a cycle.
+        let p0 = NodeId("p0:shared".to_string());
+        let p1 = NodeId("p1:shared".to_string());
+        dag.nodes.push(UnifiedNode {
+            id: p0.clone(),
+            kind: NodeKind::Seed,
+            label: "shared".into(),
+            pipeline: Some("t".into()),
+        });
+        dag.nodes.push(UnifiedNode {
+            id: p1.clone(),
+            kind: NodeKind::Load,
+            label: "shared".into(),
+            pipeline: Some("t".into()),
+        });
+        dag.edges.push(UnifiedEdge {
+            from: reader_id.clone(),
+            to: p0.clone(),
+            edge_type: EdgeType::DataDependency,
+        });
+        let sql: HashMap<String, String> =
+            HashMap::from([("reader".to_string(), reader.sql.clone())]);
+        let report = infer_runtime_dependencies(&mut dag, &sql);
         assert_eq!(report.skipped_cycle_edges.len(), 1, "{report:?}");
-        execution_phases(&dag).expect("one direction applies; the closer skips");
+        execution_phases(&dag).expect("the fan-out edge skips; nothing refuses");
     }
 }
