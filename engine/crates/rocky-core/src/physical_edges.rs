@@ -81,6 +81,12 @@ pub struct DerivedPhysicalEdges {
     /// them is ill-defined; surfaced as a warning (writer refusal for the
     /// same-pipeline case is upstream's job).
     pub target_collisions: Vec<(String, String)>,
+    /// Mutual candidates where BOTH directions come from the loosest (bare
+    /// table-component) tier. Bare matches are guesses — accepting one
+    /// direction by name order could deterministically REVERSE a real
+    /// producer edge, which is worse than today's undefined order. Neither
+    /// edge is derived; the pair is surfaced for an explicit `depends_on`.
+    pub ambiguous_bare_pairs: Vec<(String, String)>,
 }
 
 /// `referenced_tables` already lowercases and unquotes what the parser
@@ -201,7 +207,8 @@ pub fn derive_physical_edges(
     // Dedup across tiers: the same (consumer, producer) pair reachable at
     // two specificities is processed once, at the most specific.
     let mut seen_pairs: HashSet<(String, String)> = HashSet::new();
-    for (_tier, consumer, producer) in candidates {
+    let mut accepted_tier: HashMap<(String, String), u8> = HashMap::new();
+    for (tier, consumer, producer) in candidates {
         if !seen_pairs.insert((consumer.clone(), producer.clone())) {
             continue;
         }
@@ -211,6 +218,23 @@ pub fn derive_physical_edges(
         // Adding consumer→producer closes a cycle iff producer already
         // (transitively) depends on consumer.
         if reaches(&depends_on, &producer, &consumer) {
+            // A bare candidate blocked by an ACCEPTED bare opposite is not a
+            // cycle to serialize — it is two guesses contradicting each
+            // other. Name order must not pick the winner: a wrong pick
+            // deterministically reverses the real producer edge, which is
+            // WORSE than today's undefined order. Withdraw the accepted
+            // guess and derive nothing for the pair.
+            if tier == 2 && accepted_tier.get(&(producer.clone(), consumer.clone())) == Some(&2) {
+                out.edges
+                    .retain(|(c, p)| !(c == &producer && p == &consumer));
+                edge_set.remove(&(producer.clone(), consumer.clone()));
+                if let Some(deps) = depends_on.get_mut(&producer) {
+                    deps.remove(&consumer);
+                }
+                accepted_tier.remove(&(producer.clone(), consumer.clone()));
+                out.ambiguous_bare_pairs.push((consumer, producer));
+                continue;
+            }
             out.skipped_cycle_edges.push((consumer, producer));
             continue;
         }
@@ -219,6 +243,7 @@ pub fn derive_physical_edges(
             .entry(consumer.clone())
             .or_default()
             .insert(producer.clone());
+        accepted_tier.insert((consumer.clone(), producer.clone()), tier);
         out.edges.push((consumer, producer));
     }
 
@@ -243,6 +268,13 @@ pub fn derivation_warnings(derived: &DerivedPhysicalEdges) -> Vec<String> {
             "model '{m}': SQL could not be parsed for table references — physical-read \
              ordering could not be derived for it; concurrent execution against its upstreams \
              is unproven"
+        ));
+    }
+    for (a, b) in &derived.ambiguous_bare_pairs {
+        w.push(format!(
+            "models '{a}' and '{b}' each bare-read a name matching the other's table — both \
+             matches are search-path guesses and contradict, so neither ordering was derived; \
+             declare depends_on to state the real direction"
         ));
     }
     for (a, b) in &derived.target_collisions {
@@ -461,6 +493,45 @@ mod tests {
         ];
         let d = derive_physical_edges(&models, &[]);
         assert!(d.edges.is_empty(), "{:?}", d.edges);
+    }
+
+    /// Reciprocal BARE reads are two contradicting guesses: name order must
+    /// not pick a winner (a wrong pick deterministically reverses the real
+    /// producer edge). Neither direction derives; the pair is surfaced.
+    #[test]
+    fn reciprocal_bare_reads_derive_nothing_and_are_surfaced() {
+        let models = [
+            m("alpha", "db", "main", "t_alpha", "SELECT x FROM t_beta"),
+            m("beta", "db", "main", "t_beta", "SELECT y FROM t_alpha"),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert!(d.edges.is_empty(), "{:?}", d.edges);
+        assert!(
+            d.skipped_cycle_edges.is_empty(),
+            "{:?}",
+            d.skipped_cycle_edges
+        );
+        assert_eq!(d.ambiguous_bare_pairs.len(), 1);
+    }
+
+    /// A bare guess contradicted by an EXACT read is not ambiguous — the
+    /// exact edge stands (specificity), the bare closer is skipped.
+    #[test]
+    fn an_exact_edge_survives_a_contradicting_bare_guess() {
+        let models = [
+            m("alpha", "db", "main", "t_alpha", "SELECT x FROM t_beta"),
+            m(
+                "beta",
+                "db",
+                "main",
+                "t_beta",
+                "SELECT y FROM db.main.t_alpha",
+            ),
+        ];
+        let d = derive_physical_edges(&models, &[]);
+        assert_eq!(d.edges, vec![("beta".to_string(), "alpha".to_string())]);
+        assert!(d.ambiguous_bare_pairs.is_empty());
+        assert_eq!(d.skipped_cycle_edges.len(), 1);
     }
 
     /// Specificity ordering: when a loose bare-name candidate and an exact
