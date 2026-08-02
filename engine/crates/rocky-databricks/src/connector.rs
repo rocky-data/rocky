@@ -1432,6 +1432,12 @@ mod statement_kind_tests {
             classify_statement_kind("/* outer /* unterminated inner */"),
             "other"
         );
+        // Inner block closes, outer never does: the trailing SELECT is
+        // still inside the comment — fail closed, not "query".
+        assert_eq!(
+            classify_statement_kind("/* outer /* inner */ SELECT 1"),
+            "other"
+        );
     }
 }
 
