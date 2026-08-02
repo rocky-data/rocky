@@ -1366,10 +1366,12 @@ fn strip_leading_sql_comments_and_whitespace(mut sql: &str) -> &str {
             continue;
         }
         if let Some(body) = trimmed.strip_prefix("/*") {
-            // Spark SQL block comments NEST (unlike Snowflake's and
-            // BigQuery's, where a nested opener is a syntax error) — track
-            // depth so `/* outer /* inner */ still-comment */ SELECT 1`
-            // classifies by its real first keyword.
+            // Spark SQL block comments NEST. Snowflake and BigQuery scan
+            // flat instead — there the comment ends at the FIRST `*/` and
+            // an inner `/*` is inert text (live-verified on both: the
+            // nested probe errors "unexpected 'still'", and
+            // `/* a /* b */ SELECT 1` parses clean) — so track depth here
+            // and only here.
             // Single pass over bytes, O(n): a rescan-from-start loop is
             // quadratic on adversarial comment content, and generated SQL
             // can be large enough for that to stall before submission.

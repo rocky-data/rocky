@@ -2210,7 +2210,9 @@ mod tests {
 /// (#897). Divergence, on purpose: this stripper also handles BigQuery's
 /// `#` line comments; all three handle `/* */` blocks, and only the
 /// Databricks stripper tracks nesting depth (Spark SQL block comments
-/// nest; here and on Snowflake a nested opener is a syntax error).
+/// nest; here and on Snowflake the scan is flat — the comment ends at
+/// the first `*/` and an inner `/*` is inert text, live-verified on
+/// both, so this flat find matches the server's own lexer).
 fn classify_statement_kind(sql: &str) -> &'static str {
     let sql = strip_leading_sql_comments_and_whitespace(sql);
     let keyword = sql
