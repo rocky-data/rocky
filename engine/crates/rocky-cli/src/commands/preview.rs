@@ -338,6 +338,18 @@ fn newest_branch_and_base_runs(
             if let Some(run) = by_exact {
                 return finish_named(branch_run, run, base_ref);
             }
+            // Commit intent holds on a MISS too: a full sha that matches no
+            // recorded commit must refuse — falling through to the branch
+            // stage would let a branch wearing the same 40-hex name (while
+            // recording different commits) hijack the base after all.
+            return Ok((
+                branch_run,
+                None,
+                Some(format!(
+                    "no run recorded for commit '{base_ref}' in this state store — the diff \
+                     against it cannot be computed. Run the base against this store first"
+                )),
+            ));
         }
         let by_branch = store
             .list_runs_matching(1, |r| r.git_branch.as_deref() == Some(base_ref))?
@@ -2334,6 +2346,39 @@ mod tests {
             "commit intent wins over the same-name branch"
         );
         assert!(note.is_none());
+    }
+
+    /// Commit intent holds on an exact MISS too: a full sha with no
+    /// recorded commit refuses — it must not fall through to a branch
+    /// wearing the same 40-hex name.
+    #[test]
+    fn a_full_sha_miss_refuses_instead_of_matching_a_samename_branch() {
+        let sha = "aaaabbbbccccddddeeeeffff0000111122223333";
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.redb");
+        let base = chrono::Utc::now();
+        {
+            let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+            // A branch NAMED as the sha, recording a DIFFERENT commit.
+            let mut hijack = sample_run("hijack-run", base);
+            hijack.git_branch = Some(sha.to_string());
+            hijack.git_commit = Some("1111111111111111111111111111111111111111".to_string());
+            store.record_run(&hijack).unwrap();
+            let mut feat = sample_run("f1", base + chrono::Duration::minutes(1));
+            feat.git_branch = Some("feature".to_string());
+            store.record_run(&feat).unwrap();
+        }
+        let store = rocky_core::state::StateStore::open_read_only(&state_path).unwrap();
+        let (_b, base_run, note) =
+            newest_branch_and_base_runs(&store, "feature", Some(sha)).unwrap();
+        assert!(
+            base_run.is_none(),
+            "the miss must refuse, not match the branch"
+        );
+        assert!(
+            note.unwrap().contains("no run recorded for commit"),
+            "commit-intent wording"
+        );
     }
 
     /// Prefix uniqueness is proven over ALL matching runs: many newer runs
