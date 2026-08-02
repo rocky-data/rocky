@@ -1062,6 +1062,24 @@ mod tests {
         assert_eq!(count_statements(r#"SELECT 1 AS "a;b"; SELECT 2"#), 2);
         assert_eq!(count_statements(r#"SELECT 1 AS "a$$b"; SELECT 2"#), 2);
         assert_eq!(count_statements(r#"SELECT 1 AS "a;b$$c""d"; SELECT 2"#), 2);
+        // Comment markers inside a quoted identifier are literal too
+        // (live-verified: SELECT 1 AS "/*x*/" executes).
+        assert_eq!(count_statements(r#"SELECT 1 AS "/*"; SELECT 2"#), 2);
+        assert_eq!(count_statements(r#"SELECT 1 AS "//"; SELECT 2"#), 2);
+    }
+
+    #[test]
+    fn test_count_statements_wrapped_transaction_with_protected_regions() {
+        // The submission path prepends ALTER SESSION … and RECOUNTS the
+        // wrapped SQL (see submit above): for a body whose statements
+        // carry protected lexical regions, the declared
+        // MULTI_STATEMENT_COUNT must be the real count + 1 — neither
+        // swallowed (comment arms firing inside $$/"…") nor inflated
+        // (semicolons inside them counted).
+        let body = "BEGIN;\nCREATE FUNCTION f() RETURNS INT AS $$ SELECT 1; -- x\n $$;\nSELECT 1 AS \"/*\";\nCOMMIT;";
+        assert_eq!(count_statements(body), 4);
+        let wrapped = format!("ALTER SESSION SET TRANSACTION_ABORT_ON_ERROR = TRUE;\n{body}");
+        assert_eq!(count_statements(&wrapped), 5);
     }
 
     #[test]
