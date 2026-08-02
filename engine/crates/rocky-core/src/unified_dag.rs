@@ -1080,8 +1080,8 @@ impl LabelInferenceReport {
             w.push(format!(
                 "label '{label}' is produced by {n} nodes — label inference orders readers \
                  after ONE of them (the last in build order); the others are NOT ordered. \
-                 Declare depends_on to state the real dependency, or rename the colliding \
-                 producers"
+                 Rename the colliding producers so each label is unique (depends_on cannot \
+                 order a model against a seed or load)"
             ));
         }
         for m in &self.unparsed {
