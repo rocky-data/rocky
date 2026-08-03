@@ -4204,15 +4204,77 @@ auto_create_schemas = true
     }
 
     /// The per-attempt freeze-marker fence refuses on any marker the pre-gate
-    /// set never evaluated, and refuses on a LIST failure (fail-closed).
+    /// set never evaluated, passes markers the gate already saw, and refuses
+    /// on a LIST failure (fail-closed).
     #[tokio::test]
     async fn gc_seam_marker_fence_refuses_new_and_unlistable_markers() {
-        let known: std::collections::BTreeSet<String> = ["seen".to_string()].into_iter().collect();
-        // No config → no marker plane → fence passes.
-        let touched: BTreeMap<String, PolicyCapability> = BTreeMap::new();
+        use rocky_core::fault_store::{FaultMode, FaultOp};
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+        let cfg_path = root.path().join("rocky.toml");
+        std::fs::write(
+            &cfg_path,
+            "[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\nconcurrency_control = \"cas\"\n\n[policy]\nversion = 1\n",
+        )
+        .unwrap();
+        let cfg = rocky_core::config::load_rocky_config(&cfg_path).unwrap();
+        let mut touched: BTreeMap<String, PolicyCapability> = BTreeMap::new();
+        touched.insert("orders".into(), PolicyCapability::Gc);
+        let known: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        // No config at all → no marker plane → pass.
         gc_seam_marker_fence(None, &touched, &known, "unit")
             .await
             .expect("no config means no marker plane");
+        // Config + policy plane, no markers → pass.
+        gc_seam_marker_fence(Some(&cfg), &touched, &known, "unit")
+            .await
+            .expect("no markers, nothing to refuse");
+
+        // A marker the pre-gate set never evaluated → refuse.
+        let marker = rocky_core::freeze_marker::FreezeMarker {
+            freeze_id: "mid-seam-freeze".to_string(),
+            principal: PolicyPrincipal::Human,
+            scope: "any".to_string(),
+            reason: "unit".to_string(),
+            created_at: Utc::now(),
+        };
+        rocky_core::freeze_marker::write_freeze_marker(&harness.provider, &marker)
+            .await
+            .unwrap();
+        let err = gc_seam_marker_fence(Some(&cfg), &touched, &known, "unit")
+            .await
+            .expect_err("a marker the gate never saw must refuse");
+        assert!(
+            matches!(
+                err,
+                rocky_core::state_sync::StateSyncError::SeamTransition(_)
+            ) && err.to_string().contains("mid-seam-freeze"),
+            "got: {err}"
+        );
+
+        // The same marker inside the gated set → pass (the gate evaluated it).
+        let gated: std::collections::BTreeSet<String> =
+            ["mid-seam-freeze".to_string()].into_iter().collect();
+        gc_seam_marker_fence(Some(&cfg), &touched, &gated, "unit")
+            .await
+            .expect("an already-gated marker is not new");
+
+        // LIST transport failure → fail-closed refusal, never an empty set.
+        harness.faults.arm(FaultOp::List, FaultMode::FailAll);
+        let err = gc_seam_marker_fence(Some(&cfg), &touched, &gated, "unit")
+            .await
+            .expect_err("a LIST failure must refuse, not read as no-markers");
+        assert!(
+            matches!(
+                err,
+                rocky_core::state_sync::StateSyncError::SeamTransition(_)
+            ),
+            "got: {err}"
+        );
+        harness.faults.clear();
     }
 
     fn write_cas_config(root: &Path) -> std::path::PathBuf {
