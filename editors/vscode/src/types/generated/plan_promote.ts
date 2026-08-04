@@ -166,6 +166,10 @@ export type AuditEventKind =
  *
  * - **Persisted**: branch name + refs, state hash at plan time, approval artifacts used/rejected, breaking-change findings, per-target SQL statements, and the plan-time audit events. - **Re-derived at apply time**: nothing related to approvals or breaking-change gate — those gates ran at plan time and their outcomes are captured here. The warehouse adapter is resolved at apply time (to call `execute_statement`), but discovery is NOT re-run.
  *
+ * Because discovery is not re-run, a safety check that lives *inside* discovery does not execute on this path — which is how the duplicate physical-target refusal was absent from `branch promote --plan <id>` and `rocky apply <promote-plan>` (#1310). Such checks belong at `run_promote_apply`, the seam all three entrypoints cross, and that is where the duplicate-target refusal now lives. "Discovery is not re-run" therefore means *this plan is the reviewed artifact*, not *nothing is checked at apply*.
+ *
+ * The general rule, from the #1325 audit across all nine `PlanKind`s: a guard over the plan **payload** replays by definition; a guard over **derived** state (discovery output, compiled models, live warehouse shape) is only re-established where that derivation repeats at apply. `Replication` re-runs discovery and so is unaffected; promote does not. When adding a plan-build-time check, ask which entrypoints reach the line rather than whether the check is correct.
+ *
  * ## Branch state drift at apply time
  *
  * `branch_state_hash` reflects the branch metadata + config bytes at plan time. If the branch's config or metadata changes between `rocky plan promote` and `rocky apply`, the persisted hash differs from the live hash. By default, `rocky apply` does **not** re-check the hash — the gates already ran at plan time, and that is the point of the plan/apply split. Operators who need a strict re-check can re-run `rocky plan promote` to produce a fresh plan.
