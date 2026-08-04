@@ -502,9 +502,18 @@ def _make_dag_group_asset(
                 continue
 
             if node.kind == "transformation":
-                context.log.info(f"Executing rocky run --model {node.label}")
+                # Scope the model to its OWNING pipeline. Without `--pipeline`
+                # the engine falls back to the first transformation pipeline
+                # declared in `rocky.toml`, so in a silver/gold project every
+                # asset builds into whichever one happens to come first (#1292).
+                # `pipeline` is always populated for transformation nodes; the
+                # `None` arm is for a payload from an older engine, which keeps
+                # the previous fallback rather than inventing a pipeline name.
+                pipeline_label = f" --pipeline {node.pipeline}" if node.pipeline else ""
+                context.log.info(f"Executing rocky run --model {node.label}{pipeline_label}")
                 result = rocky.run_model(
                     node.label,
+                    pipeline=node.pipeline,
                     **partition_kwargs,  # type: ignore[arg-type]
                 )
                 context.log.info(

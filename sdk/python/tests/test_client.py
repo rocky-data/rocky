@@ -104,6 +104,65 @@ def test_build_cmd_uses_state_namespace_when_set():
     assert "--state-path" not in cmd
 
 
+class _ArgvCapturedError(Exception):
+    """Raised by the stub below once it has recorded the argv.
+
+    The assertions here are about the command line the client BUILDS, so the
+    stub short-circuits instead of returning a fake payload. That keeps these
+    tests independent of ``RunResult``'s field set, which has its own drift
+    surface (#924) and would otherwise make an unrelated schema change look
+    like a regression in argv construction.
+    """
+
+    def __init__(self, argv: list[str]) -> None:
+        # NOT `self.args` — that is `BaseException.args`, which coerces to a
+        # tuple and would silently fail every list comparison below.
+        super().__init__()
+        self.argv = argv
+
+
+def _capture_argv(args, allow_partial=False):
+    raise _ArgvCapturedError(args)
+
+
+def _run_model_argv(client, *cargs, **ckwargs) -> list[str]:
+    with patch.object(type(client), "run_cli", staticmethod(_capture_argv)):
+        try:
+            client.run_model(*cargs, **ckwargs)
+        except _ArgvCapturedError as captured:
+            return captured.argv
+    raise AssertionError("run_model did not invoke the CLI")
+
+
+def test_run_model_scopes_to_its_pipeline_without_moving_the_models_root():
+    """#1292: a model-only run must name its owning transformation pipeline.
+
+    Without ``--pipeline`` the engine resolves the target adapter as the FIRST
+    transformation pipeline declared in ``rocky.toml``, so a silver/gold project
+    builds every model into whichever comes first.
+
+    ``--models`` must stay. An earlier revision of this fix dropped it whenever a
+    pipeline was named, reasoning that the pipeline's own configured selection is
+    more correct. That broke a working single-pipeline setup: ``dag()`` discovers
+    nodes from ``models_dir``, so executing from the pipeline's root instead can
+    silently build *different SQL* than the node being materialized, or fail
+    "model not found". The discovery root and the execution root have to agree,
+    and this is the assertion that pins them together.
+    """
+    args = _run_model_argv(_client(models_dir="preview_models"), "gold_orders", pipeline="gold")
+    assert args[:3] == ["run", "--model", "gold_orders"]
+    assert args[3:7] == ["--models", "preview_models", "--pipeline", "gold"]
+
+
+def test_run_model_without_a_pipeline_keeps_the_models_dir():
+    """The control. A single-pipeline project — or a DAG payload from an engine
+    that predates the ``pipeline`` field — is byte-identical to before, so the
+    test above is about the pipeline being added rather than anything moving."""
+    args = _run_model_argv(_client(models_dir="custom_models"), "orders")
+    assert args == ["run", "--model", "orders", "--models", "custom_models"]
+    assert "--pipeline" not in args
+
+
 def test_build_run_args_threads_every_flag():
     client = _client(models_dir="models")
     args = client._build_run_args(

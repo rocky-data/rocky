@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `RockyClient.run_model()` takes `pipeline=`, scoping a model-only run to its owning transformation pipeline. Without it the engine falls back to the first transformation pipeline declared in `rocky.toml`, which is wrong for any project with more than one. `--models` is still sent alongside it: the engine treats an explicit `--models` as an override of the pipeline's own selection, so dropping it would execute from a different root than `dag()` discovered the model in — different SQL for the same node, or a "model not found". Calls that pass no `pipeline` are byte-identical to before. (#1292)
+
 ## [0.10.0] — 2026-07-24
 
 ### Added

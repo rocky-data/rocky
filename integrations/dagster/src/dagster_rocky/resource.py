@@ -1240,6 +1240,7 @@ class RockyResource(dg.ConfigurableResource):
         self,
         model_name: str,
         *,
+        pipeline: str | None = None,
         filter: str | None = None,
         partition: str | None = None,
         partition_from: str | None = None,
@@ -1249,10 +1250,16 @@ class RockyResource(dg.ConfigurableResource):
         lookback: int | None = None,
         parallel: int | None = None,
     ) -> RunResult:
-        """Run ``rocky run --model <name>`` for a single compiled model."""
+        """Run ``rocky run --model <name>`` for a single compiled model.
+
+        ``pipeline`` scopes the model to its owning transformation pipeline.
+        ``--models`` is unaffected — see :meth:`rocky_sdk.RockyClient.run_model`
+        for why the discovery root and the execution root have to stay the same.
+        """
         with _translating():
             return self._get_client().run_model(
                 model_name,
+                pipeline=pipeline,
                 filter=filter,
                 partition=partition,
                 partition_from=partition_from,
