@@ -874,40 +874,56 @@ impl LedgerSeamSession {
 }
 
 impl LedgerSeamSession {
-    /// Best-effort re-download of the remote winner after a terminal seam
-    /// failure, so uncommitted local mutations never stay visible to
-    /// path-opening readers (audit / brief / `restore plan`). Failures are
-    /// logged, never masked — the caller's original error is what propagates.
-    ///
-    /// Failure contract: if the winner CANNOT be re-downloaded, the local
-    /// file is QUARANTINED (renamed aside with an `.unpublished-<pid>`
-    /// suffix) rather than left in place — a path-opening reader (audit,
-    /// brief, `restore plan`) must never observe rows that never committed.
-    /// Absence is the fail-closed shape: readers error on a missing store
-    /// instead of planning against ghosts, the evidence is preserved for
-    /// forensics, and the next command's start-download recreates the file.
+    /// Re-establish committed truth locally after a terminal seam failure,
+    /// closing the recovery window: the attempt's uncommitted local file is
+    /// QUARANTINED FIRST (an atomic rename — after this instant no
+    /// path-opening reader can observe rows that never committed), and only
+    /// then is the remote winner re-downloaded into a fresh file. On a
+    /// successful restore the quarantined copy is deleted; if the download
+    /// fails, it is kept for forensics and readers see absence (fail-closed
+    /// — audit, brief, and `restore plan` error on a missing store instead
+    /// of planning against ghosts; the next command's start-download
+    /// recreates the file). Failures are logged, never masked — the
+    /// caller's original error is what propagates.
     async fn restore_remote_winner(&self, context: &str) {
-        if let Err(error) = download_state(&self.cfg, &self.state_path).await {
-            let quarantine = self
-                .state_path
-                .with_extension(format!("redb.unpublished-{}", std::process::id()));
-            match std::fs::rename(&self.state_path, &quarantine) {
-                Ok(()) => warn!(
+        let quarantine = self
+            .state_path
+            .with_extension(format!("redb.unpublished-{}", std::process::id()));
+        let quarantined = match std::fs::rename(&self.state_path, &quarantine) {
+            Ok(()) => true,
+            Err(rename_error) => {
+                warn!(
+                    rename_error = %rename_error,
+                    context,
+                    "could not quarantine the uncommitted local ledger before \
+                     restoring the winner; a concurrent reader may observe \
+                     uncommitted rows until the re-download completes"
+                );
+                false
+            }
+        };
+        match download_state(&self.cfg, &self.state_path).await {
+            Ok(_) => {
+                if quarantined && let Err(remove_error) = std::fs::remove_file(&quarantine) {
+                    warn!(
+                        remove_error = %remove_error,
+                        quarantine = %quarantine.display(),
+                        "restored the remote winner but could not delete the \
+                         quarantined uncommitted copy"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
                     error = %error,
                     context,
                     quarantined_to = %quarantine.display(),
+                    quarantined,
                     "failed to restore the remote ledger winner after a terminal \
-                     ledger-seam failure; the local file held uncommitted rows and \
-                     was quarantined aside (fail-closed: readers see absence, not \
+                     ledger-seam failure; the uncommitted local file stays \
+                     quarantined aside (fail-closed: readers see absence, not \
                      ghosts)"
-                ),
-                Err(rename_error) => warn!(
-                    error = %error,
-                    rename_error = %rename_error,
-                    context,
-                    "failed to restore the remote ledger winner AND failed to \
-                     quarantine the local file; it may hold uncommitted rows"
-                ),
+                );
             }
         }
     }
