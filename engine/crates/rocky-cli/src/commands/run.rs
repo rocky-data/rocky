@@ -281,13 +281,54 @@ fn arm_hard_exit_on_second_signal() {
 }
 
 /// Input for a single table processing task.
+/// The two endpoints of one replication copy.
+///
+/// The one place `TableTask`'s two names genuinely differ (#1280): read the
+/// production table, write the (possibly shadow-suffixed) target. A single
+/// shared field made the copy read its own shadow target.
+///
+/// A named function rather than two inline literals so a test can assert the
+/// *production* mapping instead of restating it — a test that rebuilds the
+/// refs itself passes no matter which field `process_table` actually uses.
+fn copy_endpoints(task: &TableTask) -> (TableRef, TableRef) {
+    (
+        TableRef {
+            catalog: task.source_catalog.clone(),
+            schema: task.source_schema.clone(),
+            table: task.source_table_name.clone(),
+        },
+        TableRef {
+            catalog: task.target_catalog.clone(),
+            schema: task.target_schema.clone(),
+            table: task.target_table_name.clone(),
+        },
+    )
+}
+
 #[derive(Clone)]
 struct TableTask {
     source_catalog: String,
     source_schema: String,
     target_catalog: String,
     target_schema: String,
-    table_name: String,
+    /// The table as it exists at the SOURCE — always the production name.
+    ///
+    /// Split from the target name for #1280. A shadow *suffix* run writes
+    /// `<table><suffix>` while still reading `<table>`, and a single shared
+    /// field made the copy read its own shadow target: normally absent, so the
+    /// run failed with a misleading "table not found", and if a table by that
+    /// name did exist it silently copied the wrong one.
+    source_table_name: String,
+    /// The table being written, suffixed under shadow suffix mode.
+    ///
+    /// Every identity derived from this task — asset key, drift comparison,
+    /// checks, state and watermark keys — deliberately follows the TARGET,
+    /// matching what `apply_shadow_rewrite` already does for transformation
+    /// models: it rewrites `model.config.target` in place, so a shadow run
+    /// reports the object it actually wrote rather than the one it stands in
+    /// for. Keeping replication on the same convention is what stops shadow
+    /// and production sharing a watermark.
+    target_table_name: String,
     asset_key_prefix: Vec<String>,
     /// Tenant this table belongs to, lifted from the discover-time
     /// schema-pattern `{tenant}` component. `None` when the pipeline's
@@ -2235,36 +2276,21 @@ pub async fn run(
             }
         }
         rocky_core::config::PipelineConfig::Replication(_) => {
-            // Replication honours `--shadow` in SCHEMA-OVERRIDE mode only.
+            // Replication honours `--shadow` in BOTH modes since #1280.
             //
-            // In suffix mode it corrupts the SOURCE instead of routing the
-            // target: `TableTask` carries ONE `table_name` for both sides, the
-            // connector loop stores the SUFFIXED name in it, and `process_table`
-            // builds `source_table` and `target_table` from that same field. So
-            // a copy of `raw.orders` reads `raw.orders_rocky_shadow` — normally
-            // absent, so the run fails with a misleading "table not found", and
-            // if some table by that name does exist, it silently copies the
-            // wrong one. Schema-override mode is unaffected: no suffix is
-            // applied and only `target_schema` moves, so source and target
-            // legitimately share the table name.
+            // Suffix mode used to corrupt the SOURCE instead of routing the
+            // target: `TableTask` carried ONE `table_name` for both sides, the
+            // connector loop stored the SUFFIXED name in it, and `process_table`
+            // built `source_table` and `target_table` from that same field — so
+            // a copy of `raw.orders` READ `raw.orders_rocky_shadow`. Normally
+            // absent, so the run failed with a misleading "table not found";
+            // where such a table existed it silently copied the wrong one. That
+            // was refused rather than allowed to stand.
             //
-            // Refuse rather than let either outcome stand. The real fix is to
-            // give `TableTask` separate source and target names, which is a
-            // wider change than it looks — the field also feeds asset keys,
-            // drift comparison, checks and state/watermark keys. Tracked as
-            // #1280.
-            if let Some(cfg) = shadow_config
-                && cfg.schema_override.is_none()
-            {
-                anyhow::bail!(
-                    "--shadow / --branch suffix mode is not supported for replication pipelines: \
-                     the suffix is applied to the table name shared by the source read and the \
-                     target write, so the run would read '<source_schema>.<table>{}' instead of \
-                     writing a suffixed target. Use --shadow-schema <name> (or a branch, which \
-                     routes by schema) to isolate a replication run",
-                    cfg.suffix,
-                );
-            }
+            // The field is now split. Only the source read keeps the production
+            // name; every derived identity — asset key, drift, checks, state and
+            // watermark keys — follows the target, which is what keeps a shadow
+            // run's watermarks off production's.
         }
         rocky_core::config::PipelineConfig::Load(_) => {
             // `run_load` writes the configured target directly; nothing rewrites
@@ -3051,7 +3077,8 @@ pub async fn run(
                     source_schema: conn.schema.clone(),
                     target_catalog: target_catalog.clone(),
                     target_schema: target_schema.clone(),
-                    table_name: target_table_name,
+                    source_table_name: table.name.clone(),
+                    target_table_name,
                     asset_key_prefix: {
                         let mut prefix = vec![conn.source_type.clone()];
                         for v in components.values() {
@@ -3232,7 +3259,7 @@ pub async fn run(
         tables_to_process.retain(|task| {
             let key = format!(
                 "{}.{}.{}",
-                task.target_catalog, task.target_schema, task.table_name
+                task.target_catalog, task.target_schema, task.target_table_name
             );
             !completed_keys.contains(&key)
         });
@@ -3346,12 +3373,13 @@ pub async fn run(
             if let Some(src_map) =
                 prefetched.get(&(task.source_catalog.clone(), task.source_schema.clone()))
             {
-                task.prefetched_source_cols = src_map.get(&task.table_name.to_lowercase()).cloned();
+                task.prefetched_source_cols =
+                    src_map.get(&task.source_table_name.to_lowercase()).cloned();
             }
             if let Some(tgt_map) =
                 prefetched.get(&(task.target_catalog.clone(), task.target_schema.clone()))
             {
-                task.prefetched_target_cols = tgt_map.get(&task.table_name.to_lowercase()).cloned();
+                task.prefetched_target_cols = tgt_map.get(&task.target_table_name.to_lowercase()).cloned();
             }
         }
     }
@@ -3461,8 +3489,16 @@ pub async fn run(
     // withheld rather than spawned, recorded as a failure so the normal
     // drain/terminal path (stop-periodic, persist run record, session
     // finalize) still runs over the committed setup phase.
+    let fence_names: Vec<String> = tables_to_process
+        .iter()
+        .flat_map(|t| [t.source_table_name.clone(), t.target_table_name.clone()])
+        .collect();
     let freeze_withheld = freeze_fence
-        .check_withhold(tables_to_process.iter().map(|t| t.table_name.as_str()))
+        // Both identities, deliberately. A freeze is a safety control and this
+        // is a newly-reachable path (#1280) — outside shadow suffix mode the
+        // two names are equal, so matching both cannot loosen anything today
+        // and cannot under-gate a shadow run tomorrow.
+        .check_withhold(fence_names.iter().map(String::as_str))
         .await;
     if let Some(msg) = &freeze_withheld {
         table_errors.push(TableError {
@@ -3543,7 +3579,7 @@ pub async fn run(
         // so we don't need to move it into the spawned future.
         let table_ref = format!(
             "{}.{}.{}",
-            task.target_catalog, task.target_schema, task.table_name
+            task.target_catalog, task.target_schema, task.target_table_name
         );
         let _ = hook_registry
             .fire(&HookContext::before_materialize(
@@ -3719,7 +3755,7 @@ pub async fn run(
                 // chain for anything we don't recognise.
                 let target = tables_to_process
                     .get(idx)
-                    .map(|t| format!("{}.{}.{}", t.target_catalog, t.target_schema, t.table_name))
+                    .map(|t| format!("{}.{}.{}", t.target_catalog, t.target_schema, t.target_table_name))
                     .unwrap_or_default();
                 let msg = crate::output::frame_warehouse_anyhow_error(&e, &target)
                     .unwrap_or_else(|| raw.clone());
@@ -3744,7 +3780,7 @@ pub async fn run(
                     let task = tables_to_process.get(idx);
                     let table_key = task
                         .map(|t| {
-                            format!("{}.{}.{}", t.target_catalog, t.target_schema, t.table_name)
+                            format!("{}.{}.{}", t.target_catalog, t.target_schema, t.target_table_name)
                         })
                         .unwrap_or_default();
 
@@ -3897,11 +3933,11 @@ pub async fn run(
             for (idx, task) in tables_to_process.iter().enumerate() {
                 let key = format!(
                     "{}.{}.{}",
-                    task.target_catalog, task.target_schema, task.table_name
+                    task.target_catalog, task.target_schema, task.target_table_name
                 );
                 if !settled.contains(&key) {
                     let mut asset_key = task.asset_key_prefix.clone();
-                    asset_key.push(task.table_name.clone());
+                    asset_key.push(task.target_table_name.clone());
                     if let Err(e) = shared_state.record_table_progress(
                         &shared_run_id,
                         &rocky_core::state::TableProgress {
@@ -4017,7 +4053,7 @@ pub async fn run(
                 {
                     Ok(TableOutcome::Pruned(pruned)) => {
                         record_pruned(&mut output, pruned);
-                        info!(table = task.table_name.as_str(), "retry pruned as unchanged");
+                        info!(table = task.target_table_name.as_str(), "retry pruned as unchanged");
                     }
                     Ok(TableOutcome::Materialized(tr)) => {
                         let tr = *tr;
@@ -4041,14 +4077,14 @@ pub async fn run(
                         if let Some(wm) = tr.deferred_watermark {
                             deferred_watermarks.push(wm);
                         }
-                        info!(table = task.table_name.as_str(), "retry succeeded");
+                        info!(table = task.target_table_name.as_str(), "retry succeeded");
                     }
                     Err(e) => {
                         let (failure_kind, cooldown_seconds) =
                             classify_anyhow_error_with_cooldown(&e);
                         let msg = format!("{e:#}");
                         warn!(
-                            table = task.table_name.as_str(),
+                            table = task.target_table_name.as_str(),
                             error = msg,
                             "retry also failed"
                         );
@@ -10565,7 +10601,7 @@ async fn checkpoint_table_progress(
     }
 }
 
-#[tracing::instrument(skip_all, fields(table = %task.table_name))]
+#[tracing::instrument(skip_all, fields(table = %task.target_table_name))]
 async fn process_table(
     warehouse: &dyn WarehouseAdapter,
     state: &Arc<StateStore>,
@@ -10577,19 +10613,10 @@ async fn process_table(
     let table_started_at = Utc::now();
     let dialect = warehouse.dialect();
 
-    let source_table = TableRef {
-        catalog: task.source_catalog.clone(),
-        schema: task.source_schema.clone(),
-        table: task.table_name.clone(),
-    };
-    let target_table = TableRef {
-        catalog: task.target_catalog.clone(),
-        schema: task.target_schema.clone(),
-        table: task.table_name.clone(),
-    };
+    let (source_table, target_table) = copy_endpoints(task);
 
     let mut asset_key = task.asset_key_prefix.clone();
-    asset_key.push(task.table_name.clone());
+    asset_key.push(task.target_table_name.clone());
 
     // Resolve the strategy and any state it requires before pruning or drift
     // handling. A missing watermark means an incremental target cannot safely
@@ -10629,7 +10656,7 @@ async fn process_table(
             Ok(marker) => marker,
             Err(e) => {
                 tracing::warn!(
-                    table = %task.table_name,
+                    table = %task.target_table_name,
                     error = %e,
                     "source_change_marker failed; copying this table (no prune)"
                 );
@@ -10656,7 +10683,7 @@ async fn process_table(
             return Ok(TableOutcome::Pruned(PrunedTable {
                 asset_key,
                 source_schema: task.source_schema.clone(),
-                table_name: task.table_name.clone(),
+                table_name: task.target_table_name.clone(),
             }));
         }
     }
@@ -10881,13 +10908,13 @@ async fn process_table(
         TargetRef {
             catalog: task.target_catalog.clone(),
             schema: task.target_schema.clone(),
-            table: task.table_name.clone(),
+            table: task.target_table_name.clone(),
         },
         resolved_strategy.clone(),
         SourceRef {
             catalog: task.source_catalog.clone(),
             schema: task.source_schema.clone(),
-            table: task.table_name.clone(),
+            table: task.target_table_name.clone(),
         },
         ColumnSelection::All,
         task.metadata_columns.clone(),
@@ -11187,12 +11214,12 @@ async fn process_table(
         match recorded {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(
-                table = %task.table_name,
+                table = %task.target_table_name,
                 error = %e,
                 "failed to record source change-marker; table will re-copy next run"
             ),
             Err(e) => tracing::warn!(
-                table = %task.table_name,
+                table = %task.target_table_name,
                 error = %e,
                 "source change-marker write task panicked; table will re-copy next run"
             ),
@@ -11438,7 +11465,12 @@ async fn process_completed_result(
             {
                 let task = tables_to_process.get(idx);
                 let table_key = task
-                    .map(|t| format!("{}.{}.{}", t.target_catalog, t.target_schema, t.table_name))
+                    .map(|t| {
+                        format!(
+                            "{}.{}.{}",
+                            t.target_catalog, t.target_schema, t.target_table_name
+                        )
+                    })
                     .unwrap_or_default();
                 checkpoint_table_progress(
                     shared_state,
@@ -13715,6 +13747,61 @@ merge_keys = ["id"]
     /// replacement. Plain CREATE should reject the existing target and leave
     /// its rows untouched.
     #[cfg(feature = "duckdb")]
+    /// #1280: a shadow SUFFIX run reads production and writes the suffixed
+    /// target — the two names are no longer one field.
+    ///
+    /// Before the split, `TableTask` carried a single `table_name`, the
+    /// connector loop stored the SUFFIXED name in it, and `process_table` built
+    /// both refs from it: a copy of `raw.orders` read `raw.orders_rocky_shadow`.
+    /// Absent, that is a misleading "table not found"; present, it silently
+    /// copies the wrong table. Replication shadow-suffix runs were refused
+    /// outright rather than allowed to do either.
+    ///
+    /// Asserting the SOURCE side is the point. A test that only checked the
+    /// target would have passed throughout the bug's entire lifetime.
+    ///
+    /// Mutation that must turn this red: build `source_table` from
+    /// `task.target_table_name`.
+    #[test]
+    fn shadow_suffix_reads_production_and_writes_the_suffixed_target() {
+        let task = TableTask {
+            source_catalog: "cat".into(),
+            source_schema: "raw".into(),
+            target_catalog: "cat".into(),
+            target_schema: "raw".into(),
+            source_table_name: "orders".into(),
+            target_table_name: "orders_rocky_shadow".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            check_column_match: false,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude: vec![],
+            metadata_columns: vec![],
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        };
+
+        let (source_table, target_table) = super::copy_endpoints(&task);
+
+        assert_eq!(
+            source_table.table, "orders",
+            "the copy must READ the production table, not its own shadow target"
+        );
+        assert_eq!(target_table.table, "orders_rocky_shadow");
+
+        // And the derived state identity follows the TARGET, so a shadow run
+        // cannot advance production's watermark.
+        assert_ne!(
+            source_table.state_key(),
+            target_table.state_key(),
+            "shadow and production must not share a watermark key"
+        );
+    }
+
     #[tokio::test]
     async fn target_describe_failure_does_not_replace_existing_replication_target() {
         use chrono::TimeZone;
@@ -13762,7 +13849,8 @@ timestamp_column = "ts"
             source_schema: "src".into(),
             target_catalog: String::new(),
             target_schema: "tgt".into(),
-            table_name: "events".into(),
+            source_table_name: "events".into(),
+            target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
             check_column_match: false,
@@ -14381,7 +14469,8 @@ timestamp_column = "ts"
             source_schema: "src".into(),
             target_catalog: String::new(),
             target_schema: "tgt".into(),
-            table_name: "events".into(),
+            source_table_name: "events".into(),
+            target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
             check_column_match: false,
@@ -14517,7 +14606,8 @@ timestamp_column = "ts"
             source_schema: "src".into(),
             target_catalog: String::new(),
             target_schema: "tgt".into(),
-            table_name: "events".into(),
+            source_table_name: "events".into(),
+            target_table_name: "events".into(),
             asset_key_prefix: vec!["test".into()],
             tenant: None,
             check_column_match: false,
