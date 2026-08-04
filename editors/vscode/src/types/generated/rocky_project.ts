@@ -2181,6 +2181,16 @@ export interface RunConfig {
    * Master switch for the model-skip gate. `false` (default) ⇒ every selected model always builds, exactly as before. The `--skip-unchanged` CLI flag turns the gate on for a single invocation regardless of this value.
    */
   skip_unchanged?: boolean;
+  /**
+   * Turn physical-read scheduling warnings into a run refusal.
+   *
+   * `false` (default) keeps today's behaviour: #1352 derives ordering edges from physical `schema.table` reads and reports what it could NOT safely resolve — contradicting bare-read pairs, models whose reference extraction failed, colliding targets — as advisory warnings, and the run still exits 0. A consumer that ignores them can read a stale physical target and report success.
+   *
+   * `true` refuses instead, for estates that want fail-closed ordering. Opt in rather than default, because making warnings fatal changes run semantics for every existing project (#1355).
+   *
+   * Lives on `[run]` rather than `[execution]` deliberately: `[execution]` is per-pipeline, and `rocky run --dag` derives ordering ACROSS pipelines, so a per-pipeline switch would have no single answer on the path that most needs one.
+   */
+  strict_scheduling?: boolean;
 }
 /**
  * Project-level schedule defaults (`[schedule]`).
