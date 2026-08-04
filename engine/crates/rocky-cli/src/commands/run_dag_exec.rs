@@ -309,6 +309,11 @@ pub async fn run_with_dag(
     for w in &physical_edge_warnings {
         tracing::warn!("{w}");
     }
+    // Same refusal the plain path applies, through the same function — "strict"
+    // must not mean two different things depending on how the run started
+    // (#1355). Placed before the executor is built, so a refused run dispatches
+    // no nodes.
+    super::run::refuse_on_scheduling_warnings(cfg.run.strict_scheduling, &physical_edge_warnings)?;
 
     // `--dag` cannot isolate a run, so it refuses to pretend it can.
     //

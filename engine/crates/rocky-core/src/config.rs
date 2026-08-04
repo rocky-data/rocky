@@ -2693,6 +2693,26 @@ pub struct RunConfig {
     #[serde(default)]
     pub skip_rowcount_fallback: bool,
 
+    /// Turn physical-read scheduling warnings into a run refusal.
+    ///
+    /// `false` (default) keeps today's behaviour: #1352 derives ordering edges
+    /// from physical `schema.table` reads and reports what it could NOT safely
+    /// resolve — contradicting bare-read pairs, models whose reference
+    /// extraction failed, colliding targets — as advisory warnings, and the run
+    /// still exits 0. A consumer that ignores them can read a stale physical
+    /// target and report success.
+    ///
+    /// `true` refuses instead, for estates that want fail-closed ordering. Opt
+    /// in rather than default, because making warnings fatal changes run
+    /// semantics for every existing project (#1355).
+    ///
+    /// Lives on `[run]` rather than `[execution]` deliberately: `[execution]`
+    /// is per-pipeline, and `rocky run --dag` derives ordering ACROSS pipelines,
+    /// so a per-pipeline switch would have no single answer on the path that
+    /// most needs one.
+    #[serde(default)]
+    pub strict_scheduling: bool,
+
     /// Treat an upstream `MAX(ts)` that moved by fewer than this many seconds
     /// as unchanged for the B3 freshness comparison — the late-arriving-but-
     /// irrelevant micro-update analog of a freshness SLA threshold. Default

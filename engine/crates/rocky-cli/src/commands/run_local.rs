@@ -183,6 +183,7 @@ pub async fn run_transformation(
                 rocky_cfg.reuse.column_level && !no_reuse,
                 run_vars,
                 rocky_cfg.resilience.clone(),
+                rocky_cfg.run.strict_scheduling,
                 super::resilience::retry_policy_allows(rocky_cfg),
                 exec_fp_gate,
                 freeze_fence,

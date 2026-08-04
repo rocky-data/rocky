@@ -290,6 +290,34 @@ fn arm_hard_exit_on_second_signal() {
 /// A named function rather than two inline literals so a test can assert the
 /// *production* mapping instead of restating it — a test that rebuilds the
 /// refs itself passes no matter which field `process_table` actually uses.
+/// Refuse a run whose physical-read ordering could not be fully resolved.
+///
+/// #1352 derives ordering edges from physical `schema.table` reads and reports
+/// what it could not safely resolve as advisory warnings — the run still exits
+/// 0, so a consumer that ignores them can read a stale target and report
+/// success. `[run] strict_scheduling` (or `--strict-scheduling`) turns that into
+/// a refusal for estates that want fail-closed ordering (#1355).
+///
+/// Shared by the plain and `--dag` paths deliberately. Two copies would let
+/// "strict" come to mean different things depending on how the run was started,
+/// which is exactly the divergence `--parallel` had before #1288.
+pub(crate) fn refuse_on_scheduling_warnings(strict: bool, warnings: &[String]) -> Result<()> {
+    if !strict || warnings.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "strict scheduling is on and this run's physical-read ordering could not be fully \
+         resolved, so execution order is not guaranteed:\n{}\n\nDeclare each upstream in \
+         `depends_on` to resolve it, or unset `[run] strict_scheduling` / omit \
+         `--strict-scheduling` to run with these as advisory warnings.",
+        warnings
+            .iter()
+            .map(|w| format!("  - {w}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
 fn copy_endpoints(task: &TableTask) -> (TableRef, TableRef) {
     (
         TableRef {
@@ -1705,6 +1733,7 @@ pub async fn run(
             rocky_cfg.reuse.column_level && !skip_opts.no_reuse,
             run_vars,
             rocky_cfg.resilience.clone(),
+            rocky_cfg.run.strict_scheduling,
             super::resilience::retry_policy_allows(rocky_cfg),
             exec_fp_gate.as_ref(),
             Some(&freeze_fence),
@@ -4838,6 +4867,7 @@ pub async fn run(
                     rocky_cfg.reuse.column_level && !skip_opts.no_reuse,
                     run_vars,
                     rocky_cfg.resilience.clone(),
+            rocky_cfg.run.strict_scheduling,
                     super::resilience::retry_policy_allows(rocky_cfg),
                     exec_fp_gate.as_ref(),
                     Some(&freeze_fence),
@@ -6776,6 +6806,7 @@ pub(crate) async fn execute_backfill_set(
             column_level_enabled,
             &run_vars,
             rocky_cfg.resilience.clone(),
+            rocky_cfg.run.strict_scheduling,
             super::resilience::retry_policy_allows(rocky_cfg),
             exec_fp_gate,
             freeze_fence,
@@ -7171,6 +7202,9 @@ pub(crate) async fn execute_models(
     // retries. Passed by value (cheap `Clone`) so call sites don't juggle a
     // borrow of the `RockyConfig`.
     resilience: rocky_core::config::ResilienceConfig,
+    // `[run] strict_scheduling`, resolved by the caller the same way `skip_gate`
+    // is. Turns unresolved physical-read ordering into a refusal (#1355).
+    strict_scheduling: bool,
     // Whether the agent-policy plane permits the `retry` capability for this
     // run (allow-by-default; only an explicit `capability = "retry"` policy rule
     // gates it). Resolved once by the caller from `[policy]`.
@@ -7521,6 +7555,7 @@ pub(crate) async fn execute_models(
             resilience.contain_failures,
             &mut output.scheduling_warnings,
         )?;
+        refuse_on_scheduling_warnings(strict_scheduling, &output.scheduling_warnings)?;
     }
 
     // #1093: capture governance from the same in-memory model set the
@@ -13754,6 +13789,51 @@ merge_keys = ["id"]
     /// replacement. Plain CREATE should reject the existing target and leave
     /// its rows untouched.
     #[cfg(feature = "duckdb")]
+    /// #1355: `[run] strict_scheduling` turns unresolved physical-read ordering
+    /// into a refusal instead of an advisory warning.
+    ///
+    /// #1352 derives ordering edges from physical reads and reports what it
+    /// cannot safely resolve — contradicting bare-read pairs, extraction
+    /// failures, colliding targets — while still exiting 0. A consumer that
+    /// ignores those warnings can read a stale target and report success.
+    ///
+    /// Mutation that must turn this red: `if !strict || warnings.is_empty()`
+    /// → `if true`.
+    #[test]
+    fn strict_scheduling_refuses_a_run_with_unresolved_ordering() {
+        let warnings = vec![
+            "two models claim main.orders; ordering between them is a guess".to_string(),
+            "reference extraction failed for 'mart'".to_string(),
+        ];
+
+        let err = super::refuse_on_scheduling_warnings(true, &warnings)
+            .expect_err("strict mode must refuse a run it cannot order");
+        let msg = err.to_string();
+
+        // Every warning must reach the operator. A refusal that says "ordering
+        // is not guaranteed" without saying WHICH pairs sends them to the logs
+        // of a run that already refused.
+        assert!(msg.contains("main.orders"), "{msg}");
+        assert!(msg.contains("mart"), "{msg}");
+        // And it must say how to resolve or opt out.
+        assert!(msg.contains("depends_on"), "{msg}");
+        assert!(msg.contains("strict_scheduling"), "{msg}");
+    }
+
+    /// Two controls, because "refuses" must not become "refuses everything".
+    ///
+    /// Default-off is the whole reason this is opt-in: making warnings fatal
+    /// changes run semantics for every existing project.
+    #[test]
+    fn scheduling_warnings_are_advisory_unless_strict_and_present() {
+        let warnings = vec!["ordering between a and b is a guess".to_string()];
+
+        super::refuse_on_scheduling_warnings(false, &warnings)
+            .expect("default (opt-out) must keep warnings advisory");
+        super::refuse_on_scheduling_warnings(true, &[])
+            .expect("strict with a fully-resolved graph must not refuse");
+    }
+
     /// #1280: a shadow SUFFIX run reads production and writes the suffixed
     /// target — the two names are no longer one field.
     ///
@@ -15791,6 +15871,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
@@ -15870,6 +15951,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             Some(&gate),
             None, // freeze_fence (test)
@@ -15909,6 +15991,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             Some(&gate),
             None, // freeze_fence (test)
@@ -16098,6 +16181,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             Some(&gate),
             None, // freeze_fence (test)
@@ -16340,6 +16424,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             Some(&gate),
             None, // freeze_fence (test)
@@ -16429,6 +16514,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             Some(&gate),
             None, // freeze_fence (test)
@@ -16487,6 +16573,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             Some(&gate),
             None, // freeze_fence (test)
@@ -16677,6 +16764,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             resilience,
+            false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
@@ -16723,6 +16811,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             resilience,
+            false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
@@ -16775,6 +16864,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             resilience,
+            false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
@@ -18866,6 +18956,7 @@ timestamp_column = "ts"
             false,
             &run_vars,
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
@@ -18976,6 +19067,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
@@ -19101,6 +19193,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
@@ -19387,6 +19480,7 @@ timestamp_column = "ts"
                 false,
                 &rocky_core::run_vars::RunVars::new(),
                 rocky_core::config::ResilienceConfig::default(),
+                false, // strict_scheduling (#1355)
                 true,
                 None, // exec_fp_gate (test)
                 None, // freeze_fence (test)
@@ -19516,6 +19610,7 @@ timestamp_column = "ts"
             false,
             &rocky_core::run_vars::RunVars::new(),
             rocky_core::config::ResilienceConfig::default(),
+            false, // strict_scheduling (#1355)
             true,
             None, // exec_fp_gate (test)
             None, // freeze_fence (test)
@@ -20495,6 +20590,7 @@ timestamp_column = "ts"
                 false,
                 &rocky_core::run_vars::RunVars::new(),
                 rocky_core::config::ResilienceConfig::default(),
+                false, // strict_scheduling (#1355)
                 true,
                 None, // exec_fp_gate (test)
                 None, // freeze_fence (test)

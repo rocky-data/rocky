@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`[run] strict_scheduling` refuses a run whose physical-read ordering could not be fully resolved.** #1352 derives ordering edges from physical `schema.table` reads and reports what it cannot safely resolve — contradicting bare-read pairs, models whose reference extraction failed, colliding targets — as advisory warnings, and the run still exits 0. A consumer that ignores them can read a stale physical target and report success. Setting `strict_scheduling = true` turns any such warning into a refusal that names every unresolved pair and says how to fix it (declare the upstream in `depends_on`) or opt out.
+
+  Default `false`, because making warnings fatal changes run semantics for every existing project. It lives on `[run]` rather than `[execution]` deliberately: `[execution]` is per-pipeline and `rocky run --dag` derives ordering *across* pipelines, so a per-pipeline switch would have no single answer on the path that most needs one. Both the plain and `--dag` paths call the same refusal function, so "strict" cannot come to mean two different things depending on how the run was started — the divergence `--parallel` had before #1288. (#1355)
+
 ### Fixed
 
 - **`rocky run --shadow` (suffix mode) works for replication pipelines.** `TableTask` carried a single `table_name` used for both sides of a copy, and the connector loop stored the shadow-*suffixed* name in it — so a copy of `raw.orders` READ `raw.orders_rocky_shadow`. Normally that table is absent and the run failed with a misleading "table not found"; where such a table existed it silently copied the wrong one. Replication shadow-suffix runs were refused outright rather than allowed to do either. The field is now split into `source_table_name` and `target_table_name`, and only the source read keeps the production name.
