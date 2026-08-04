@@ -4641,7 +4641,7 @@ auto_create_schemas = true
         let parent = harness.pod_b.state_path.parent().unwrap();
         let quarantined: Vec<_> = std::fs::read_dir(parent)
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains("unpublished"))
             .collect();
         assert_eq!(quarantined.len(), 1, "exactly one quarantined copy");
