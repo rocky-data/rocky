@@ -878,14 +878,37 @@ impl LedgerSeamSession {
     /// failure, so uncommitted local mutations never stay visible to
     /// path-opening readers (audit / brief / `restore plan`). Failures are
     /// logged, never masked — the caller's original error is what propagates.
+    ///
+    /// Failure contract: if the winner CANNOT be re-downloaded, the local
+    /// file is QUARANTINED (renamed aside with an `.unpublished-<pid>`
+    /// suffix) rather than left in place — a path-opening reader (audit,
+    /// brief, `restore plan`) must never observe rows that never committed.
+    /// Absence is the fail-closed shape: readers error on a missing store
+    /// instead of planning against ghosts, the evidence is preserved for
+    /// forensics, and the next command's start-download recreates the file.
     async fn restore_remote_winner(&self, context: &str) {
         if let Err(error) = download_state(&self.cfg, &self.state_path).await {
-            warn!(
-                error = %error,
-                context,
-                "failed to restore the remote ledger winner after a terminal \
-                 ledger-seam failure; the local file may hold uncommitted rows"
-            );
+            let quarantine = self
+                .state_path
+                .with_extension(format!("redb.unpublished-{}", std::process::id()));
+            match std::fs::rename(&self.state_path, &quarantine) {
+                Ok(()) => warn!(
+                    error = %error,
+                    context,
+                    quarantined_to = %quarantine.display(),
+                    "failed to restore the remote ledger winner after a terminal \
+                     ledger-seam failure; the local file held uncommitted rows and \
+                     was quarantined aside (fail-closed: readers see absence, not \
+                     ghosts)"
+                ),
+                Err(rename_error) => warn!(
+                    error = %error,
+                    rename_error = %rename_error,
+                    context,
+                    "failed to restore the remote ledger winner AND failed to \
+                     quarantine the local file; it may hold uncommitted rows"
+                ),
+            }
         }
     }
 }
