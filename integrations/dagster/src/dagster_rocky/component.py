@@ -1037,6 +1037,10 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             #
             # `dag_status` is what tells them apart. It is absent only on states
             # written before this field existed.
+            # `in`, not `.get()` — a key present with a JSON null is corruption,
+            # not a legacy payload, and `.get()` cannot tell them apart. That
+            # collapse is the same ambiguity this change exists to remove.
+            has_status = "dag_status" in raw
             status = raw.get("dag_status")
 
             if status == "failed":
@@ -1070,8 +1074,25 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                     ),
                 )
 
-            # No `dag_status` at all: written before this field existed, so its
-            # cause genuinely cannot be recovered — "predates DAG support" and
+            if has_status:
+                # Present but not a value this writer emits. Either a newer
+                # version wrote it, or the state was hand-edited. Treating an
+                # unrecognised status as "no failure recorded" is the same
+                # unknown-reads-as-safe mistake this whole change exists to
+                # remove, so it fails closed and says what it saw.
+                raise dg.Failure(
+                    description=(
+                        "RockyComponent dag_mode=True: the cached state carries an "
+                        f"unrecognised dag_status ({status!r}). Expected 'success', "
+                        "'failed' or 'disabled'. Refusing rather than guessing that it "
+                        "means success — falling back would build the discover-based "
+                        "graph, which has different assets and dependencies. Rewrite "
+                        "the state with a matching version of this component."
+                    ),
+                )
+
+            # No `dag_status` key at all: written before this field existed, so
+            # its cause genuinely cannot be recovered — "predates DAG support" and
             # "the old writer swallowed a DAG failure" look identical on disk.
             #
             # `strict_build` adopters have opted into "fail rather than ship a

@@ -150,6 +150,34 @@ def test_strict_build_refuses_an_unprovenanced_legacy_state(discover_json: str, 
         component.build_defs_from_state(context=None, state_path=state_file)
 
 
+@pytest.mark.parametrize(
+    "status",
+    ["weird-value", 7, ["failed"], None],
+    ids=["unrecognised", "int", "list", "explicit-null"],
+)
+def test_an_unrecognised_dag_status_fails_closed(status, discover_json: str, tmp_path: Path):
+    """A `dag_status` this writer never emits must refuse, not fall back.
+
+    Treating an unknown value as "no failure recorded" is the same
+    unknown-reads-as-safe mistake the whole change exists to remove — it is how
+    a state written by a newer version, or hand-edited, would silently load the
+    discover graph.
+
+    `explicit-null` is the subtle one: `raw.get("dag_status")` cannot tell a key
+    present with a JSON null from a key that is absent, so the loader tests
+    membership instead. Found by enumerating state shapes against the running
+    loader, not by reading it.
+    """
+    state = {"discover": json.loads(discover_json), "dag_status": status}
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+
+    component = RockyComponent(config_path="rocky.toml", dag_mode=True)
+    with pytest.raises(dg.Failure) as excinfo:
+        component.build_defs_from_state(context=None, state_path=state_file)
+    assert "unrecognised dag_status" in str(excinfo.value.description)
+
+
 def test_a_malformed_dag_error_still_refuses(discover_json: str, tmp_path: Path):
     """A non-mapping `dag_error` must not crash with `AttributeError` on `.get`,
     and must not fall through either — the status is what decides."""
