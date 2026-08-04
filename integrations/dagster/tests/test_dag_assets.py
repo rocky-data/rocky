@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dagster as dg
+import pytest
 
 from dagster_rocky.dag_assets import (
     build_dag_multi_assets,
@@ -105,6 +106,91 @@ def test_build_dag_specs_transformation_uses_target_as_key():
     specs, node_map = build_dag_specs(dag, translator=RockyDagsterTranslator())
     assert len(specs) == 1
     assert specs[0].key == dg.AssetKey(["analytics", "marts", "fct_revenue"])
+
+
+def test_two_nodes_resolving_to_one_asset_key_are_refused():
+    """#1349: the engine permits what the default translator cannot represent.
+
+    `reject_duplicate_physical_targets` keys on `(adapter, target)`, so the same
+    `catalog.schema.table` on two different adapters is a legal project. The
+    default translator keys a transformation asset on the target triple alone,
+    and neither `DagNodeOutput` nor `TargetConfig` carries the adapter — so both
+    nodes reduce to one key.
+
+    Dagster does eventually raise, but only at repository build and with two raw
+    `AssetSpec` dumps naming neither the models nor their pipelines. This
+    refuses earlier and says which nodes collided and where they came from.
+
+    Mutation that must turn this red: drop the `collisions` check.
+    """
+    dag = _make_dag_result(
+        nodes=[
+            {
+                "id": "transformation:silver_orders",
+                "kind": "transformation",
+                "label": "silver_orders",
+                "pipeline": "silver",
+                "target": {"catalog": "w", "schema": "s", "table": "orders"},
+            },
+            {
+                "id": "transformation:gold_orders",
+                "kind": "transformation",
+                "label": "gold_orders",
+                "pipeline": "gold",
+                "target": {"catalog": "w", "schema": "s", "table": "orders"},
+            },
+        ]
+    )
+    with pytest.raises(dg.Failure) as excinfo:
+        build_dag_specs(dag, translator=RockyDagsterTranslator())
+
+    description = str(excinfo.value.description)
+    # Both node ids AND both pipelines — the point is that Dagster's own error
+    # names none of them.
+    assert "transformation:silver_orders" in description
+    assert "transformation:gold_orders" in description
+    assert "silver" in description and "gold" in description
+
+
+def test_a_custom_translator_that_disambiguates_is_not_refused():
+    """The control. The check runs AFTER the translator, keyed on what it
+    actually returned, so a project that already solved this its own way keeps
+    working. Without it, the test above would be satisfied by refusing any two
+    nodes sharing a target triple regardless of the keys actually in play."""
+
+    class QualifyingTranslator(RockyDagsterTranslator):
+        def get_dag_node_asset_key(self, node) -> dg.AssetKey:
+            if node.kind == "transformation" and node.target is not None:
+                return dg.AssetKey(
+                    [
+                        node.pipeline or "?",
+                        node.target.catalog,
+                        node.target.schema_,
+                        node.target.table,
+                    ]
+                )
+            return super().get_dag_node_asset_key(node)
+
+    dag = _make_dag_result(
+        nodes=[
+            {
+                "id": "transformation:silver_orders",
+                "kind": "transformation",
+                "label": "silver_orders",
+                "pipeline": "silver",
+                "target": {"catalog": "w", "schema": "s", "table": "orders"},
+            },
+            {
+                "id": "transformation:gold_orders",
+                "kind": "transformation",
+                "label": "gold_orders",
+                "pipeline": "gold",
+                "target": {"catalog": "w", "schema": "s", "table": "orders"},
+            },
+        ]
+    )
+    specs, _ = build_dag_specs(dag, translator=QualifyingTranslator())
+    assert len({s.key for s in specs}) == 2
 
 
 def test_build_dag_specs_test_nodes_excluded():

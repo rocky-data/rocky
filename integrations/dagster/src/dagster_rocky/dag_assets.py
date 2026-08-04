@@ -163,11 +163,60 @@ def build_dag_specs(
         edges_by_target_model[edge.target.model].append(edge)
 
     # First pass: compute all asset keys via the translator.
+    #
+    # Two nodes resolving to ONE key is refused here rather than left to
+    # Dagster. The engine deliberately permits the same `catalog.schema.table`
+    # on two different adapters — `reject_duplicate_physical_targets` keys on
+    # `(adapter, target)` — while the default translator reduces a
+    # transformation node to the target triple alone, and neither
+    # `DagNodeOutput` nor `TargetConfig` carries the adapter, so the collision
+    # is not representable in an asset key at all (#1349).
+    #
+    # Dagster does catch it, but late and unhelpfully: `Definitions` constructs
+    # fine and the repository build then raises `DagsterInvalidDefinitionError:
+    # Received conflicting AssetSpecs with the same key` followed by two raw
+    # spec dumps, naming neither the models, nor their pipelines, nor the
+    # adapters that make this legal upstream.
+    #
+    # It only raises because the specs DIFFER — `rocky/node_id` is stamped into
+    # every spec's metadata below, so two nodes can never produce byte-identical
+    # specs, and byte-identical specs merge silently with no error at all. That
+    # metadata is therefore load-bearing for safety, which is not obvious from
+    # reading it.
+    #
+    # Checked AFTER the translator has spoken, keyed on what it actually
+    # returned, so a project that already disambiguates with a custom
+    # `get_dag_node_asset_key` is not refused for a collision it does not have.
+    key_to_node_ids: dict[dg.AssetKey, list[str]] = defaultdict(list)
     for node in dag_result.nodes:
         if node.kind == "test":
             continue
         key = translator.get_dag_node_asset_key(node)
         node_id_to_key[node.id] = key
+        key_to_node_ids[key].append(node.id)
+
+    collisions = {key: ids for key, ids in key_to_node_ids.items() if len(ids) > 1}
+    if collisions:
+        pipeline_of = {n.id: n.pipeline for n in dag_result.nodes}
+        detail = "; ".join(
+            "{} <- {}".format(
+                key.to_user_string(),
+                ", ".join(f"{nid} (pipeline {pipeline_of.get(nid) or 'unknown'})" for nid in ids),
+            )
+            for key, ids in sorted(collisions.items(), key=lambda kv: kv[0].to_user_string())
+        )
+        raise dg.Failure(
+            description=(
+                "RockyComponent: two or more DAG nodes resolve to the same Dagster "
+                "asset key, so they cannot both be represented. This is legal in the "
+                "engine — the same catalog.schema.table on two different adapters is "
+                "permitted — but the default translator keys a transformation asset on "
+                "the target triple alone and the DAG payload does not carry the "
+                "adapter. Give the colliding models distinct targets, or supply a "
+                "translator whose get_dag_node_asset_key disambiguates them.\n\n"
+                f"Colliding keys: {detail}"
+            ),
+        )
 
     # Second pass: build specs with resolved dependencies.
     specs: list[dg.AssetSpec] = []
