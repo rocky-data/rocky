@@ -1522,43 +1522,8 @@ pub async fn run(
         // silently running against an unrelated adapter. Bare `rocky run --model
         // <X>` (no `--pipeline`) keeps the fallback via the `else` arm below.
         let (target_adapter_name, auto_create_schemas, configured_models_glob) =
-            if let Some(pipeline_name) = pipeline_name_arg {
-                match registry::resolve_pipeline(rocky_cfg, Some(pipeline_name))?.1 {
-                    rocky_core::config::PipelineConfig::Transformation(t) => (
-                        t.target.adapter.clone(),
-                        t.target.governance.auto_create_schemas,
-                        Some(t.models.as_str()),
-                    ),
-                    pipeline => anyhow::bail!(
-                        "pipeline '{pipeline_name}' is {}, not transformation (required for --model)",
-                        pipeline.pipeline_type_str()
-                    ),
-                }
-            } else {
-                // Without an explicit pipeline, preserve the model-only fallback:
-                // first transformation adapter, then first replication adapter.
-                if let Some(t) = rocky_cfg.pipelines.values().find_map(|p| match p {
-                    rocky_core::config::PipelineConfig::Transformation(t) => Some(t),
-                    _ => None,
-                }) {
-                    (t.target.adapter.clone(), false, Some(t.models.as_str()))
-                } else {
-                    (
-                        rocky_cfg
-                            .pipelines
-                            .values()
-                            .find_map(|p| match p {
-                                rocky_core::config::PipelineConfig::Replication(r) => {
-                                    Some(r.target.adapter.clone())
-                                }
-                                _ => None,
-                            })
-                            .unwrap_or_else(|| "default".to_string()),
-                        false,
-                        None,
-                    )
-                }
-            };
+            resolve_model_run_target(rocky_cfg, pipeline_name_arg)?;
+        let configured_models_glob = configured_models_glob.as_deref();
 
         // An explicit `--models` directory overrides the pipeline's configured
         // selection. Otherwise a model-scoped run must use the same confined
@@ -6564,6 +6529,81 @@ pub(crate) fn model_phase_ok<T>(
     failures_after: usize,
 ) -> bool {
     exec_result.is_ok() && failures_after == failures_before
+}
+
+/// Resolve the adapter, schema-creation governance, and models glob a
+/// `--model` invocation runs under.
+///
+/// With `--pipeline` the named transformation pipeline answers all three.
+/// Without it, the bare form commits to the project's SOLE transformation
+/// pipeline and honors its `auto_create_schemas`, so it answers identically
+/// to naming that pipeline (#1350 — the hardcoded `false` it replaces was a
+/// #1305 fossil: the fallback then captured only the adapter string, so the
+/// governance flag was not in scope to read).
+///
+/// With several transformation pipelines the bare form REFUSES. "The first
+/// one" is a guess, model→pipeline attribution can diverge from it
+/// (#1292/#1348), and the pipeline picked chooses the adapter the model
+/// MATERIALIZES on — so a wrong guess is wrong-adapter DDL, not a wrong flag.
+///
+/// A project with no transformation pipeline keeps its prior answer: the
+/// first replication adapter, governance off, no glob.
+pub(crate) fn resolve_model_run_target(
+    rocky_cfg: &rocky_core::config::RockyConfig,
+    pipeline_name_arg: Option<&str>,
+) -> Result<(String, bool, Option<String>)> {
+    if let Some(pipeline_name) = pipeline_name_arg {
+        match registry::resolve_pipeline(rocky_cfg, Some(pipeline_name))?.1 {
+            rocky_core::config::PipelineConfig::Transformation(t) => Ok((
+                t.target.adapter.clone(),
+                t.target.governance.auto_create_schemas,
+                Some(t.models.clone()),
+            )),
+            pipeline => anyhow::bail!(
+                "pipeline '{pipeline_name}' is {}, not transformation (required for --model)",
+                pipeline.pipeline_type_str()
+            ),
+        }
+    } else {
+        let mut transformations = rocky_cfg.pipelines.values().filter_map(|p| match p {
+            rocky_core::config::PipelineConfig::Transformation(t) => Some(t),
+            _ => None,
+        });
+        if let Some(t) = transformations.next() {
+            // With several transformation pipelines, "the first one" is a
+            // guess: model→pipeline attribution can diverge (#1292/#1348),
+            // and a guessed pipeline chooses the ADAPTER the model
+            // materializes on — wrong-adapter DDL, not just a wrong schema
+            // flag. Refuse loudly instead of executing on a guess; the
+            // sole-pipeline case (the overwhelmingly common shape) is
+            // unaffected.
+            anyhow::ensure!(
+                transformations.next().is_none(),
+                "this project has multiple transformation pipelines, so a bare --model run \
+                 cannot know which pipeline (and adapter) the model belongs to; pass \
+                 --pipeline <name> to state it"
+            );
+            return Ok((
+                t.target.adapter.clone(),
+                t.target.governance.auto_create_schemas,
+                Some(t.models.clone()),
+            ));
+        }
+        Ok((
+            rocky_cfg
+                .pipelines
+                .values()
+                .find_map(|p| match p {
+                    rocky_core::config::PipelineConfig::Replication(r) => {
+                        Some(r.target.adapter.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| "default".to_string()),
+            false,
+            None,
+        ))
+    }
 }
 
 /// The (catalog, schema) pairs an invocation may pre-create under
@@ -17297,6 +17337,117 @@ timestamp_column = "ts"
             ),
         )
         .expect("write model toml");
+    }
+
+    /// #1350: the model-only fallback answers identically to naming the
+    /// same pipeline explicitly — adapter, governance, and glob. The
+    /// hardcoded-false governance was a #1305 fossil.
+    #[test]
+    fn model_only_fallback_matches_the_explicit_pipeline_answer() {
+        let toml = r#"
+[adapter.db]
+type = "duckdb"
+
+[pipeline.t]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t.target]
+adapter = "db"
+
+[pipeline.t.target.governance]
+auto_create_schemas = true
+"#;
+        let cfg: rocky_core::config::RockyConfig = toml::from_str(toml).expect("config");
+        let explicit = super::resolve_model_run_target(&cfg, Some("t")).expect("explicit");
+        let fallback = super::resolve_model_run_target(&cfg, None).expect("fallback");
+        assert_eq!(explicit, fallback, "the fallback committed to pipeline t");
+        assert!(
+            explicit.1,
+            "governance came from the pipeline, not a literal"
+        );
+    }
+
+    /// #1350 scope guard: with SEVERAL transformation pipelines the fallback
+    /// REFUSES — attribution can diverge from "first" (#1292/#1348), and the
+    /// guessed pipeline chooses the adapter the model MATERIALIZES on, so
+    /// executing on a guess is wrong-adapter DDL. Naming the pipeline still
+    /// honors its governance.
+    #[test]
+    fn multi_transformation_fallback_refuses_instead_of_guessing() {
+        let toml = r#"
+[adapter.db]
+type = "duckdb"
+
+[pipeline.t1]
+type = "transformation"
+models = "models/**"
+
+[pipeline.t1.target]
+adapter = "db"
+
+[pipeline.t1.target.governance]
+auto_create_schemas = true
+
+[pipeline.t2]
+type = "transformation"
+models = "models2/**"
+
+[pipeline.t2.target]
+adapter = "db"
+
+[pipeline.t2.target.governance]
+auto_create_schemas = true
+"#;
+        let cfg: rocky_core::config::RockyConfig = toml::from_str(toml).expect("config");
+        let err = super::resolve_model_run_target(&cfg, None)
+            .expect_err("ambiguous attribution must refuse, not guess an adapter");
+        assert!(
+            format!("{err:#}").contains("multiple transformation pipelines"),
+            "{err:#}"
+        );
+        let explicit = super::resolve_model_run_target(&cfg, Some("t2")).expect("explicit");
+        assert!(explicit.1, "naming the pipeline honors its governance");
+    }
+
+    /// The third arm is unchanged by #1350: with no transformation pipeline
+    /// to attribute the model to, the fallback still answers with the first
+    /// replication adapter, governance OFF, and no glob. Extracting the
+    /// resolver rewrote this arm from an `or_else` chain into an `else`, so
+    /// "prior answer preserved" is pinned rather than asserted in prose.
+    #[test]
+    fn replication_only_fallback_keeps_the_adapter_with_governance_off() {
+        let toml = r#"
+[adapter.db]
+type = "duckdb"
+
+[pipeline.r]
+type = "replication"
+
+[pipeline.r.source]
+adapter = "db"
+
+[pipeline.r.source.schema_pattern]
+prefix = "src__"
+separator = "__"
+components = ["source"]
+
+[pipeline.r.target]
+adapter = "db"
+catalog_template = "wh"
+schema_template = "raw__{source}"
+
+[pipeline.r.target.governance]
+auto_create_schemas = true
+"#;
+        let cfg: rocky_core::config::RockyConfig = toml::from_str(toml).expect("config");
+        assert_eq!(
+            super::resolve_model_run_target(&cfg, None).expect("fallback"),
+            ("db".to_string(), false, None),
+            "no transformation pipeline: first replication adapter, governance off, no glob \
+             — and governance stays off even though the replication pipeline enables it, \
+             because there is no transformation pipeline whose grant it could be"
+        );
     }
 
     /// #1275: a physical `schema.table` read of another in-run model's
