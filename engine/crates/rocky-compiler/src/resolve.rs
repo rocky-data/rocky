@@ -275,12 +275,17 @@ mod tests {
     /// fixes one, recompiles, and meets the next.
     #[test]
     fn every_unparseable_model_is_reported_not_just_the_first() {
-        // `SELECT * EXCEPT (...)` is the construct #1224 is about; any SQL the
-        // parser rejects exercises the same path.
+        // Deliberately malformed SQL, not a merely-unsupported construct.
+        //
+        // This fixture used to be `SELECT * EXCEPT (...)`, which the parser
+        // rejected — until #1224 enabled `supports_select_wildcard_except` and
+        // it started parsing, silently emptying this test. A test that proves
+        // "every failure is reported" must not rest on a syntax gap someone
+        // will eventually close; unbalanced parens cannot become valid.
         let models = vec![
-            make_model("a", "SELECT * EXCEPT (x) FROM raw.t"),
+            make_model("a", "SELECT ((( FROM raw.t"),
             make_model("ok", "SELECT 1 AS id"),
-            make_model("b", "SELECT * EXCEPT (y) FROM raw.t"),
+            make_model("b", "SELECT )))"),
         ];
 
         let err = resolve_dependencies(&models).expect_err("unparseable SQL must fail resolution");
