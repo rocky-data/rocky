@@ -4548,6 +4548,97 @@ auto_create_schemas = true
         assert!(published.list_tombstones().unwrap().is_empty());
     }
 
+    /// Binds the session's restore-the-winner-on-terminal-failure arm: the
+    /// freeze marker lands MID-TRANSITION (written by the liveness oracle
+    /// itself, which runs between the attempt-start gate and the pre-publish
+    /// recheck — deterministic, no timing). The recheck denies AFTER the
+    /// eviction mutated the attempt's local store, so without the restore
+    /// the refused tombstone stays visible to path-opening readers
+    /// (`restore plan` would plan from a ghost eviction).
+    #[tokio::test]
+    async fn gc_cas_post_eviction_marker_denies_and_rolls_back_local() {
+        struct MarkerWritingOracle {
+            provider: rocky_core::object_store::ObjectStoreProvider,
+            wrote: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl LivenessOracle for MarkerWritingOracle {
+            async fn reclaim_verdict(&self, _sp: &str, _fp: &str, _cv: u64) -> ReclaimVerdict {
+                if !self.wrote.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    rocky_core::freeze_marker::write_freeze_marker(
+                        &self.provider,
+                        &rocky_core::freeze_marker::FreezeMarker {
+                            freeze_id: "mid-transition".to_string(),
+                            principal: PolicyPrincipal::Human,
+                            scope: "any".to_string(),
+                            reason: "landed during eviction".to_string(),
+                            created_at: Utc::now(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                ReclaimVerdict::Reclaimable { head_version: 0 }
+            }
+        }
+
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        let config = write_cas_policy_config(root.path());
+        let err = run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            std::sync::Arc::new(MarkerWritingOracle {
+                provider: harness.provider.clone(),
+                wrote: std::sync::atomic::AtomicBool::new(false),
+            }),
+        )
+        .await
+        .expect_err("the pre-publish recheck must refuse the mid-transition freeze");
+        assert!(
+            format!("{err:#}").contains("after eviction, before publish"),
+            "the deny must come from the PRE-PUBLISH recheck, not attempt start: {err:#}"
+        );
+
+        // The refused attempt HAD evicted locally; the session must have
+        // restored the winner — no ghost tombstone for path-opening readers.
+        let local = StateStore::open(&harness.pod_b.state_path).unwrap();
+        assert!(
+            local.list_tombstones().unwrap().is_empty(),
+            "a refused post-eviction attempt must not leave a local ghost tombstone"
+        );
+
+        // Remote untouched.
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(published.list_tombstones().unwrap().is_empty());
+    }
+
     fn write_cas_policy_config(root: &Path) -> std::path::PathBuf {
         let path = root.join("rocky.toml");
         std::fs::write(
