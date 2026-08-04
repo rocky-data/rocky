@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failing `rocky dag` no longer loads the legacy graph in its place.** `_dag_payload` caught every exception and omitted the DAG slot, and the loader read a missing slot as "this cache predates DAG mode" and fell back to the discover-based graph. That fallback is not a degraded version of the real graph — it has different assets and different dependencies — so a project whose DAG could not be built got a code location that loaded, looked plausible, and materialized a plan the project does not describe, behind a log warning. The write now records **why** the slot is absent, and the loader refuses only in that case; a payload genuinely written before `dag_mode` existed still falls back, because there was never a DAG to lose. Under `strict_build` the write re-raises instead, matching the discover slot — in `dag_mode` the DAG slot *is* the asset graph, not one of the best-effort augmentation slots. Reachable today for any project with two or more transformation pipelines, whose `rocky dag` exits non-zero (#1348). (#1341)
+
 ## [1.61.1] — 2026-07-19
 
 ### Changed

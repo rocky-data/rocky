@@ -872,10 +872,30 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
                 state["optimize"] = optimize_payload
 
         # DAG mode: cache the full unified DAG alongside discover/compile.
+        #
+        # In `dag_mode` the DAG slot IS the asset graph, so it belongs with
+        # `discover` rather than with the `compile`/`optimize` augmentation
+        # slots: a missing DAG here does not mean "less metadata", it means the
+        # graph this component is supposed to build could not be produced.
+        # `strict_build` therefore re-raises, exactly as the discover slot does.
+        #
+        # Without `strict_build`, the write still succeeds — persistence must
+        # not depend on the binary being reachable — but it records **why** the
+        # slot is absent. A payload that predates DAG support and a payload
+        # whose DAG genuinely failed are otherwise indistinguishable at load
+        # time, and only the first is safely recoverable (#1341).
         if self.dag_mode:
-            dag_payload = self._dag_payload(rocky)
-            if dag_payload is not None:
-                state["dag"] = dag_payload
+            try:
+                state["dag"] = self._dag_payload(rocky)
+            except Exception as exc:
+                if self.strict_build:
+                    raise
+                _log.warning(
+                    "rocky dag failed during state write — recording the failure "
+                    "so the load does not mistake it for a pre-DAG payload",
+                    exc_info=True,
+                )
+                state["dag_error"] = {"message": f"{type(exc).__name__}: {exc}"}
 
         state_path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write: serialise to a sibling ``.tmp`` file then ``os.replace``
@@ -969,20 +989,17 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
             )
             return None
 
-    def _dag_payload(self, rocky: RockyResource) -> dict | None:
-        """Return DAG JSON, or ``None`` if the DAG command fails.
+    def _dag_payload(self, rocky: RockyResource) -> dict:
+        """Return DAG JSON, raising if `rocky dag` fails.
 
-        Same best-effort semantics: a missing binary or config issue does
-        not block state persistence.
+        Deliberately **not** best-effort. The caller decides what a failure
+        means, because the two possible answers are not interchangeable: under
+        ``strict_build`` the deploy should fail, and otherwise the write should
+        still succeed but record that the DAG failed rather than leaving an
+        absence a later load would read as "this payload predates DAG support"
+        (#1341).
         """
-        try:
-            return json.loads(rocky.dag(column_lineage=True).model_dump_json(by_alias=True))
-        except Exception:
-            _log.warning(
-                "rocky dag failed during state write — slot omitted",
-                exc_info=True,
-            )
-            return None
+        return json.loads(rocky.dag(column_lineage=True).model_dump_json(by_alias=True))
 
     def _build_defs_from_dag(
         self,
@@ -998,6 +1015,28 @@ class RockyComponent(StateBackedComponent, dg.Model, dg.Resolvable):
 
         raw = json.loads(state_path.read_text(encoding="utf-8"))
         if "dag" not in raw:
+            # An absent DAG slot has two causes, and only one is recoverable.
+            #
+            # If the write recorded `dag_error`, `rocky dag` FAILED. Falling
+            # back would build a discover-based graph with different assets and
+            # different dependencies — a code location that loads, looks
+            # plausible, and materializes a plan the project does not describe.
+            # A log line is not proportionate to that, so it raises (#1341).
+            #
+            # A payload written before `dag_mode` existed carries no marker and
+            # is genuinely a fallback case: there was never a DAG to lose.
+            dag_error = raw.get("dag_error")
+            if dag_error is not None:
+                raise dg.Failure(
+                    description=(
+                        "RockyComponent dag_mode=True: the cached state records that "
+                        "`rocky dag` failed, so there is no DAG to build assets from. "
+                        "Refusing to fall back to the discover-based graph, which has "
+                        "different assets and dependencies than this project. Fix the "
+                        "underlying failure and rewrite the state.\n\n"
+                        f"Recorded failure: {dag_error.get('message', '(no message)')}"
+                    ),
+                )
             # Graceful fallback: re-enter the non-DAG path. Call the helper
             # directly rather than `build_defs_from_state` to avoid mutating
             # `self.dag_mode` — that would persist across code-server reloads
