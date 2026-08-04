@@ -1453,7 +1453,7 @@ pub(crate) fn evaluate_apply_policy_with_store(
 /// Given an ALREADY-RESOLVED `[policy]` block, compile the per-model attributes,
 /// or return an early [`PolicyGate`] — `NotConfigured` when there is no policy,
 /// `Allow` when `touched` is empty (a genuine no-op executes nothing).
-fn resolve_policy_and_attrs(
+pub(crate) fn resolve_policy_and_attrs(
     policy: Option<&rocky_core::config::PolicyConfig>,
     touched: &BTreeMap<String, PolicyCapability>,
     models_dir: &Path,
@@ -1494,7 +1494,7 @@ fn resolve_policy_and_attrs(
 /// supplied by the caller so the two variants differ only in how they reach the
 /// ledger (fresh open vs. a held handle).
 #[allow(clippy::too_many_arguments)]
-fn evaluate_apply_policy_core(
+pub(crate) fn evaluate_apply_policy_core(
     policy: &rocky_core::config::PolicyConfig,
     plan_id: &str,
     principal: PolicyPrincipal,

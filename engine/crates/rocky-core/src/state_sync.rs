@@ -818,7 +818,21 @@ impl LedgerSeamSession {
             let store = StateStore::open(&self.state_path)?;
             let result = attempt(&store, base.as_ref()).await;
             drop(store);
-            let output = result?;
+            let output = match result {
+                Ok(output) => output,
+                Err(e) => {
+                    // The attempt mutated the freshly downloaded LOCAL file
+                    // before failing (e.g. a post-transition fence refusal
+                    // after rows were written). Read-only consumers such as
+                    // audit, brief, and `restore plan` open the local file
+                    // without downloading, so a transition that never
+                    // committed must not remain locally visible — restore the
+                    // remote winner before propagating.
+                    self.restore_remote_winner("failed ledger-seam transition")
+                        .await;
+                    return Err(e);
+                }
+            };
 
             match upload_state_cas(&upload_cfg, &self.state_path, base.as_ref()).await {
                 Ok(()) => return Ok(output),
@@ -837,27 +851,42 @@ impl LedgerSeamSession {
                     tokio::time::sleep(backoff).await;
                 }
                 Err(StateSyncError::CasConflict { key }) => {
-                    // Read-only consumers such as audit and brief open the local file
-                    // without downloading, so a transition that never committed must not
-                    // remain locally visible.
-                    if let Err(error) = download_state(&self.cfg, &self.state_path).await {
-                        warn!(
-                            key = %key,
-                            error = %error,
-                            "failed to restore the remote ledger winner after ledger-seam \
-                             conflict exhaustion"
-                        );
-                    }
+                    // Same local-visibility rule at conflict exhaustion.
+                    self.restore_remote_winner("ledger-seam conflict exhaustion")
+                        .await;
                     return Err(StateSyncError::LedgerSeamConflict {
                         key,
                         attempts: LEDGER_SEAM_MAX_ATTEMPTS,
                     });
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // A non-conflict upload failure (transport) also leaves
+                    // the attempt's mutations local-only — same rule.
+                    self.restore_remote_winner("failed ledger-seam upload")
+                        .await;
+                    return Err(e);
+                }
             }
         }
 
         unreachable!("ledger-seam attempt loop always returns within the for body")
+    }
+}
+
+impl LedgerSeamSession {
+    /// Best-effort re-download of the remote winner after a terminal seam
+    /// failure, so uncommitted local mutations never stay visible to
+    /// path-opening readers (audit / brief / `restore plan`). Failures are
+    /// logged, never masked — the caller's original error is what propagates.
+    async fn restore_remote_winner(&self, context: &str) {
+        if let Err(error) = download_state(&self.cfg, &self.state_path).await {
+            warn!(
+                error = %error,
+                context,
+                "failed to restore the remote ledger winner after a terminal \
+                 ledger-seam failure; the local file may hold uncommitted rows"
+            );
+        }
     }
 }
 

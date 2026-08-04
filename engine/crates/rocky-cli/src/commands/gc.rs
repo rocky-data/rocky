@@ -1493,41 +1493,98 @@ pub(crate) fn gc_models_dir(
 /// Once cleared, [`execute_gc_apply`] re-verifies each planned eviction against
 /// the live ledger before evicting anything (tombstone + retired ledger row;
 /// no physical byte deletion follows).
-/// Per-attempt freeze-marker fence for the gc CAS seam (#1242).
+/// Per-attempt policy re-gate for the gc CAS seam (#1242).
 ///
-/// Markers live under their own object keys, so the blob CAS cannot detect
-/// one landing mid-seam. The pre-gate LIST fed the policy gate its marker
-/// set; this fence re-LISTs on every seam attempt (and again right before
-/// publish) and REFUSES on any marker absent from that already-gated set —
-/// over-enforcement is the monotone-safe direction, and refusing avoids
-/// re-running the full gate against a store the session already holds open.
-/// A LIST failure refuses too (fail-closed), matching the pre-gate LIST.
-async fn gc_seam_marker_fence(
+/// The session contract requires every dynamic authorization check to re-run
+/// per attempt. Markers live under their own object keys (blob CAS cannot see
+/// one landing mid-seam) and freeze/budget ROWS live in the ledger blob a
+/// conflict replay freshly downloads — and marker writes are OPTIONAL
+/// (default off), so a marker-only fence misses a ledger-only freeze. This
+/// re-runs the REAL gate: a fresh marker LIST plus
+/// [`evaluate_apply_policy_core`] over the fresh store's decision snapshot,
+/// with principal/scope matching intact (an unrelated marker no longer
+/// refuses). `record` publishes the attempt's decision rows into the fresh
+/// store, so the audit trail lands atomically with the winning attempt's
+/// evictions — the pre-seam gate's local rows are overwritten by each
+/// attempt's download and must not be the trail of record.
+///
+/// `prior_decisions` is the snapshot taken BEFORE this attempt recorded
+/// anything (the pre-publish recheck must not read the attempt's own rows
+/// back as budget history). A LIST failure refuses fail-closed.
+#[allow(clippy::too_many_arguments)]
+async fn gc_seam_regate(
     cfg: Option<&rocky_core::config::RockyConfig>,
+    plan_id: &str,
+    principal: rocky_core::config::PolicyPrincipal,
     touched: &BTreeMap<String, PolicyCapability>,
-    gated_marker_ids: &std::collections::BTreeSet<String>,
+    models_dir: &Path,
+    prior_decisions: &[rocky_core::state::PolicyDecisionRecord],
+    fresh_store: Option<&StateStore>,
     stage: &str,
 ) -> Result<(), rocky_core::state_sync::StateSyncError> {
+    use rocky_core::state_sync::StateSyncError;
     let Some(cfg) = cfg else {
         return Ok(());
     };
-    let fresh = crate::commands::apply::marker_freezes_before_gate(cfg, touched)
+    let Some(policy) = cfg.policy.as_ref() else {
+        return Ok(());
+    };
+    let fresh_markers = crate::commands::apply::marker_freezes_before_gate(cfg, touched)
         .await
         .map_err(|e| {
-            rocky_core::state_sync::StateSyncError::SeamTransition(format!(
-                "freeze-marker fence LIST failed {stage} (fail-closed): {e:#}"
+            StateSyncError::SeamTransition(format!(
+                "freeze-marker LIST failed {stage} (fail-closed): {e:#}"
             ))
         })?;
-    if let Some(new) = fresh
-        .iter()
-        .find(|m| !gated_marker_ids.contains(&m.freeze_id))
+    let (policy, attrs_map) = match crate::commands::apply::resolve_policy_and_attrs(
+        Some(policy),
+        touched,
+        models_dir,
+        None,
+    ) {
+        Ok(pair) => pair,
+        // The resolver's error IS a gate outcome. Mirror the pre-seam
+        // treatment: only a Deny blocks gc (require_review is satisfied by
+        // the hard review gate the command already passed).
+        Err(PolicyGate::Deny {
+            model,
+            rule_id,
+            reason,
+        }) => {
+            let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+            return Err(StateSyncError::SeamTransition(format!(
+                "policy DENIES gc plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
+            )));
+        }
+        Err(_) => return Ok(()),
+    };
+    let gate = crate::commands::apply::evaluate_apply_policy_core(
+        &policy,
+        plan_id,
+        principal,
+        touched,
+        &attrs_map,
+        prior_decisions,
+        &fresh_markers,
+        false,
+        |record| {
+            if let Some(store) = fresh_store {
+                // Best-effort audit into the attempt's store — the gate below
+                // is the safety boundary; gc has no budget-paired custody row.
+                let _ = store.record_policy_decision(record);
+            }
+        },
+    );
+    if let PolicyGate::Deny {
+        model,
+        rule_id,
+        reason,
+    } = gate
     {
-        return Err(rocky_core::state_sync::StateSyncError::SeamTransition(
-            format!(
-                "durable freeze marker '{}' (scope '{}') landed {stage}; refusing to publish                  this gc apply — re-run `rocky apply` so the policy gate evaluates it",
-                new.freeze_id, new.scope
-            ),
-        ));
+        let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+        return Err(StateSyncError::SeamTransition(format!(
+            "policy DENIES gc plan '{plan_id}' {stage}: model '{model}'{rule} — {reason}"
+        )));
     }
     Ok(())
 }
@@ -1746,19 +1803,24 @@ pub(crate) async fn run_gc_apply_in_with(
         // winner. `execute_gc_apply` re-derives candidates, refcounts, and
         // both liveness reads from that fresh store — a winner that re-added
         // the Delta path legitimately flips this attempt's eviction into a
-        // refusal — and the freeze-marker fence runs at attempt start AND
-        // again after the transition, so the unfenced window shrinks to the
-        // CAS upload itself. gc's mutations are redb rows inside the blob
-        // being CAS-published (`physical_delete = true` was refused above),
-        // so no per-candidate side effect outlives a discarded attempt.
-        let gated_marker_ids: std::collections::BTreeSet<String> =
-            marker_freezes.iter().map(|m| m.freeze_id.clone()).collect();
+        // refusal — and the FULL policy gate re-runs per attempt (fresh
+        // marker LIST + the fresh store's freeze/budget rows; marker writes
+        // are optional, so a marker-only fence would miss a ledger-only
+        // freeze) with an enforcement-only recheck after the transition, so
+        // the ungated window shrinks to the CAS upload itself. gc's
+        // mutations are redb rows inside the blob being CAS-published
+        // (`physical_delete = true` was refused above); a refused or failed
+        // attempt's local rows are rolled back by the session's
+        // restore-the-winner-on-terminal-failure rule, so no side effect
+        // outlives a discarded attempt, remotely OR locally.
         let session = rocky_core::state_sync::LedgerSeamSession::new(&state_cfg, state_path);
         // The attempt future must OWN everything it touches (the session's
         // `for<'a>` bound): master copies move into the closure, and each
         // attempt clones what its future needs.
         let seam_cfg = loaded_cfg.clone();
         let seam_touched = touched.clone();
+        let seam_models_dir = models_dir.clone();
+        let seam_principal = plan_record.enforcement_principal(runtime_principal);
         let seam_plan = plan.clone();
         let seam_plan_id = plan_id.to_string();
         let seam_oracle = std::sync::Arc::clone(&oracle);
@@ -1766,13 +1828,31 @@ pub(crate) async fn run_gc_apply_in_with(
             .execute(move |fresh_store, _fresh_base| {
                 let cfg = seam_cfg.clone();
                 let touched = seam_touched.clone();
-                let gated = gated_marker_ids.clone();
+                let models_dir = seam_models_dir.clone();
+                let principal = seam_principal;
                 let plan = seam_plan.clone();
                 let plan_id = seam_plan_id.clone();
                 let oracle = std::sync::Arc::clone(&seam_oracle);
                 Box::pin(async move {
-                    gc_seam_marker_fence(cfg.as_ref(), &touched, &gated, "during this gc apply")
-                        .await?;
+                    // Snapshot BEFORE this attempt records anything: the
+                    // pre-publish recheck must not read the attempt's own
+                    // rows back as budget/freeze history.
+                    let prior_decisions = fresh_store.list_policy_decisions().map_err(|e| {
+                        rocky_core::state_sync::StateSyncError::SeamTransition(format!(
+                            "could not snapshot the fresh decision ledger: {e:#}"
+                        ))
+                    })?;
+                    gc_seam_regate(
+                        cfg.as_ref(),
+                        &plan_id,
+                        principal,
+                        &touched,
+                        &models_dir,
+                        &prior_decisions,
+                        Some(fresh_store),
+                        "during this gc apply",
+                    )
+                    .await?;
                     let out =
                         execute_gc_apply(fresh_store, oracle.as_ref(), &plan_id, &plan, Utc::now())
                             .await
@@ -1781,10 +1861,17 @@ pub(crate) async fn run_gc_apply_in_with(
                                     "{e:#}"
                                 ))
                             })?;
-                    gc_seam_marker_fence(
+                    // Pre-publish recheck: markers may have moved during the
+                    // eviction work; enforcement-only (no re-record), same
+                    // pre-attempt snapshot.
+                    gc_seam_regate(
                         cfg.as_ref(),
+                        &plan_id,
+                        principal,
                         &touched,
-                        &gated,
+                        &models_dir,
+                        &prior_decisions,
+                        None,
                         "after eviction, before publish",
                     )
                     .await?;
@@ -3938,8 +4025,9 @@ auto_create_schemas = true
     /// assertion (the deadline-bounded watcher never sees a CAS put).
     ///
     /// Determinism: the watcher loses only if its in-memory seed+upload
-    /// (microseconds) outlasts the session's ≥20ms conflict backoff — and a
-    /// lost race fails the tombstone assertion loudly, never a false green.
+    /// (microseconds) outlasts the session's jittered ~20ms (18–22ms)
+    /// conflict backoff — and a lost race fails the tombstone assertion
+    /// loudly, never a false green.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gc_cas_seam_preserves_a_run_writer_landing_mid_seam() {
         struct CountingOracle(std::sync::atomic::AtomicUsize);
@@ -4039,12 +4127,21 @@ auto_create_schemas = true
             "the winner task never saw a CAS put — the seam did not go through the CAS session"
         );
 
-        // 3 oracle reads per attempt today (eligibility re-derivation plus
-        // the paired pre/post liveness proofs) × 2 attempts. The invariant
-        // pinned is PER-ATTEMPT re-reads — if execute_gc_apply's read count
-        // legitimately changes, update the constant; if this fails with the
-        // single-attempt count (3), the replay re-published without
-        // re-deriving, which is the #1242 defect.
+        // 2 oracle reads per attempt (the paired pre/post liveness proofs —
+        // probed empirically at a single attempt) × THREE attempts: the armed
+        // conflict rejects attempt 1; the winner's upload lands inside
+        // attempt 2's window, so its CAS put loses a GENUINE race; attempt 3
+        // replays on the winner and commits. The schedule exercises both
+        // conflict kinds. If this fails with 2, the replay re-published
+        // without re-deriving — the #1242 defect; if the per-attempt read
+        // count legitimately changes, update both constants.
+        assert_eq!(
+            harness
+                .faults
+                .put_count(&object_key, rocky_core::fault_store::PutKind::Update),
+            3,
+            "armed + genuine conflict must force exactly three CAS attempts"
+        );
         assert_eq!(
             oracle.0.load(std::sync::atomic::Ordering::SeqCst),
             6,
@@ -4203,11 +4300,13 @@ auto_create_schemas = true
         );
     }
 
-    /// The per-attempt freeze-marker fence refuses on any marker the pre-gate
-    /// set never evaluated, passes markers the gate already saw, and refuses
-    /// on a LIST failure (fail-closed).
+    /// The per-attempt re-gate evaluates the REAL policy gate: a ledger-only
+    /// freeze row (marker writes are optional and default off) denies; a
+    /// marker scoped to the OTHER principal passes (principal/scope matching
+    /// — an unrelated marker no longer refuses); a matching marker denies;
+    /// a LIST transport failure refuses fail-closed.
     #[tokio::test]
-    async fn gc_seam_marker_fence_refuses_new_and_unlistable_markers() {
+    async fn gc_seam_regate_denies_ledger_freezes_and_matches_marker_scope() {
         use rocky_core::fault_store::{FaultMode, FaultOp};
 
         let _serial = rocky_core::state_sync::remote_testing::serial_guard();
@@ -4222,59 +4321,241 @@ auto_create_schemas = true
         let cfg = rocky_core::config::load_rocky_config(&cfg_path).unwrap();
         let mut touched: BTreeMap<String, PolicyCapability> = BTreeMap::new();
         touched.insert("orders".into(), PolicyCapability::Gc);
-        let known: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let models_dir = root.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
 
-        // No config at all → no marker plane → pass.
-        gc_seam_marker_fence(None, &touched, &known, "unit")
-            .await
-            .expect("no config means no marker plane");
-        // Config + policy plane, no markers → pass.
-        gc_seam_marker_fence(Some(&cfg), &touched, &known, "unit")
-            .await
-            .expect("no markers, nothing to refuse");
+        // No freezes anywhere → pass.
+        gc_seam_regate(
+            Some(&cfg),
+            "plan-x",
+            PolicyPrincipal::Human,
+            &touched,
+            &models_dir,
+            &[],
+            None,
+            "unit",
+        )
+        .await
+        .expect("nothing to deny");
 
-        // A marker the pre-gate set never evaluated → refuse.
-        let marker = rocky_core::freeze_marker::FreezeMarker {
-            freeze_id: "mid-seam-freeze".to_string(),
+        // A ledger-only freeze row for THIS principal → deny. This is the
+        // marker-blind bypass the review caught: no marker exists at all.
+        let freeze = rocky_core::state::PolicyDecisionRecord {
+            timestamp: Utc::now(),
+            plan_id: "freeze:unit".to_string(),
+            principal: PolicyPrincipal::Human,
+            capability: PolicyCapability::Apply,
+            model: "any".to_string(),
+            effect: rocky_core::config::PolicyEffect::Deny,
+            rule_id: None,
+            reason: "unit ledger-only freeze".to_string(),
+            verify_after: Vec::new(),
+            auto_apply: None,
+        };
+        let err = gc_seam_regate(
+            Some(&cfg),
+            "plan-x",
+            PolicyPrincipal::Human,
+            &touched,
+            &models_dir,
+            std::slice::from_ref(&freeze),
+            None,
+            "unit",
+        )
+        .await
+        .expect_err("a ledger-only freeze must deny the replay");
+        assert!(err.to_string().contains("DENIES"), "got: {err}");
+
+        // A durable marker scoped to the OTHER principal → pass (the old
+        // ID-diff fence refused here; the real gate matches principal).
+        let other = rocky_core::freeze_marker::FreezeMarker {
+            freeze_id: "agent-only".to_string(),
+            principal: PolicyPrincipal::Agent,
+            scope: "any".to_string(),
+            reason: "unit".to_string(),
+            created_at: Utc::now(),
+        };
+        rocky_core::freeze_marker::write_freeze_marker(&harness.provider, &other)
+            .await
+            .unwrap();
+        gc_seam_regate(
+            Some(&cfg),
+            "plan-x",
+            PolicyPrincipal::Human,
+            &touched,
+            &models_dir,
+            &[],
+            None,
+            "unit",
+        )
+        .await
+        .expect("an Agent-scoped marker must not deny a Human gc");
+
+        // A marker matching THIS principal → deny.
+        let mine = rocky_core::freeze_marker::FreezeMarker {
+            freeze_id: "human-any".to_string(),
             principal: PolicyPrincipal::Human,
             scope: "any".to_string(),
             reason: "unit".to_string(),
             created_at: Utc::now(),
         };
-        rocky_core::freeze_marker::write_freeze_marker(&harness.provider, &marker)
+        rocky_core::freeze_marker::write_freeze_marker(&harness.provider, &mine)
             .await
             .unwrap();
-        let err = gc_seam_marker_fence(Some(&cfg), &touched, &known, "unit")
-            .await
-            .expect_err("a marker the gate never saw must refuse");
-        assert!(
-            matches!(
-                err,
-                rocky_core::state_sync::StateSyncError::SeamTransition(_)
-            ) && err.to_string().contains("mid-seam-freeze"),
-            "got: {err}"
-        );
+        let err = gc_seam_regate(
+            Some(&cfg),
+            "plan-x",
+            PolicyPrincipal::Human,
+            &touched,
+            &models_dir,
+            &[],
+            None,
+            "unit",
+        )
+        .await
+        .expect_err("a matching marker must deny");
+        assert!(err.to_string().contains("DENIES"), "got: {err}");
 
-        // The same marker inside the gated set → pass (the gate evaluated it).
-        let gated: std::collections::BTreeSet<String> =
-            ["mid-seam-freeze".to_string()].into_iter().collect();
-        gc_seam_marker_fence(Some(&cfg), &touched, &gated, "unit")
-            .await
-            .expect("an already-gated marker is not new");
-
-        // LIST transport failure → fail-closed refusal, never an empty set.
+        // LIST transport failure → fail-closed refusal.
         harness.faults.arm(FaultOp::List, FaultMode::FailAll);
-        let err = gc_seam_marker_fence(Some(&cfg), &touched, &gated, "unit")
-            .await
-            .expect_err("a LIST failure must refuse, not read as no-markers");
-        assert!(
-            matches!(
-                err,
-                rocky_core::state_sync::StateSyncError::SeamTransition(_)
-            ),
-            "got: {err}"
-        );
+        let err = gc_seam_regate(
+            Some(&cfg),
+            "plan-x",
+            PolicyPrincipal::Human,
+            &touched,
+            &models_dir,
+            &[],
+            None,
+            "unit",
+        )
+        .await
+        .expect_err("a LIST failure must refuse, not read as no-markers");
+        assert!(err.to_string().contains("fail-closed"), "got: {err}");
         harness.faults.clear();
+    }
+
+    /// Finding 1+3 integration (the review's blocking pair): the mid-seam
+    /// winner carries a LEDGER-ONLY freeze row (no marker anywhere). The
+    /// replay's re-gate must refuse, the command must exit nonzero, and the
+    /// session must restore the winner locally — no ghost tombstone stays
+    /// visible to path-opening readers like `restore plan`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gc_cas_replay_refuses_ledger_freeze_and_restores_winner_locally() {
+        let _serial = rocky_core::state_sync::remote_testing::serial_guard();
+        let harness = rocky_core::test_harness::CrossPodHarness::new_s3_like();
+        let root = TempDir::new().unwrap();
+
+        let plan_id = {
+            let store = StateStore::open(&harness.pod_b.state_path).unwrap();
+            let old = Utc::now() - Duration::days(30);
+            seed(&store, "r1", "orders", "SELECT 1 AS id", &[], HA, 500, old);
+            record_run(&store, "r1", "orders");
+            let plan = plan_from_store(&store, Utc::now(), 7);
+            write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
+                .unwrap()
+        };
+        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "{}").unwrap();
+        rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
+            .await
+            .unwrap();
+
+        let object_key = format!(
+            "v{}/state.redb",
+            rocky_core::state::current_schema_version()
+        );
+        harness.faults.arm_precondition_failures(&object_key, 1);
+
+        // Mid-seam winner: publishes a LEDGER freeze row (Human, scope any).
+        let faults = harness.faults.clone();
+        let winner_cfg = harness.pod_a.cfg.clone();
+        let winner_path = harness.pod_a.state_path.clone();
+        let key_for_watcher = object_key.clone();
+        let watcher = tokio::spawn(async move {
+            use rocky_core::fault_store::PutKind;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while faults.put_count(&key_for_watcher, PutKind::Update) < 1 {
+                if std::time::Instant::now() > deadline {
+                    return false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            let _authority = rocky_core::state_sync::download_state(&winner_cfg, &winner_path)
+                .await
+                .unwrap();
+            {
+                let store = StateStore::open(&winner_path).unwrap();
+                store
+                    .record_policy_decision(&rocky_core::state::PolicyDecisionRecord {
+                        timestamp: Utc::now(),
+                        plan_id: "freeze:mid-seam".to_string(),
+                        principal: PolicyPrincipal::Human,
+                        capability: PolicyCapability::Apply,
+                        model: "any".to_string(),
+                        effect: rocky_core::config::PolicyEffect::Deny,
+                        rule_id: None,
+                        reason: "kill switch engaged mid-seam".to_string(),
+                        verify_after: Vec::new(),
+                        auto_apply: None,
+                    })
+                    .unwrap();
+            }
+            rocky_core::state_sync::upload_state(&winner_cfg, &winner_path)
+                .await
+                .unwrap();
+            true
+        });
+
+        let config = write_cas_policy_config(root.path());
+        let err = run_gc_apply_in_with(
+            root.path(),
+            &config,
+            &plan_id,
+            &harness.pod_b.state_path,
+            PolicyPrincipal::Human,
+            true,
+            std::sync::Arc::new(FixedLivenessOracle::reclaimable()),
+        )
+        .await
+        .expect_err("the replay must refuse under the winner's ledger freeze");
+        assert!(format!("{err:#}").contains("DENIES"), "got: {err:#}");
+        let fired = watcher.await.expect("the winner task must not panic");
+        assert!(fired, "the freeze writer never saw a CAS put");
+
+        // Ghost-state check: the LOCAL file must be the restored winner —
+        // freeze row present, NO tombstone from the refused attempt.
+        let local = StateStore::open(&harness.pod_b.state_path).unwrap();
+        assert!(
+            local.list_tombstones().unwrap().is_empty(),
+            "a refused attempt's eviction must not stay locally visible"
+        );
+        assert!(
+            local
+                .list_policy_decisions()
+                .unwrap()
+                .iter()
+                .any(|d| d.plan_id == "freeze:mid-seam"),
+            "the restored local ledger must be the winner's (freeze row present)"
+        );
+
+        // And remote is untouched by the refused seam: no tombstones there.
+        let _authority =
+            rocky_core::state_sync::download_state(&harness.pod_a.cfg, &harness.pod_a.state_path)
+                .await
+                .unwrap();
+        let published = StateStore::open(&harness.pod_a.state_path).unwrap();
+        assert!(published.list_tombstones().unwrap().is_empty());
+    }
+
+    fn write_cas_policy_config(root: &Path) -> std::path::PathBuf {
+        let path = root.join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[state]\nbackend = \"s3\"\ns3_bucket = \"test\"\nconcurrency_control = \"cas\"\non_upload_failure = \"skip\"\n\n[state.retry]\nmax_retries = 0\n\n[policy]\nversion = 1\n",
+        )
+        .unwrap();
+        path
     }
 
     fn write_cas_config(root: &Path) -> std::path::PathBuf {
