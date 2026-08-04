@@ -832,6 +832,30 @@ class RockyClient:
             emit_fivetran_state_to: Optional path to write the canonical Fivetran
                 state envelope to as a side effect (atomic + idempotent). The
                 envelope is delivered only to the file, not in the return value.
+
+        Example:
+
+            List each discovered source and its tables::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                result = client.discover(pipeline="bronze")
+
+                for source in result.sources:
+                    print(source.id, source.source_type)
+                    for table in source.tables:
+                        print("  ", table.name, table.row_count)
+
+            :attr:`~rocky_sdk.types.DiscoverResult.failed_sources` is the field
+            to check before acting on absence. A source missing from
+            ``sources`` because its metadata fetch failed is NOT evidence it
+            was removed upstream, so a consumer diffing against a prior run
+            must not delete on that basis::
+
+                if result.failed_sources:
+                    # Unknown state — reconcile later rather than deleting.
+                    raise RuntimeError(f"{len(result.failed_sources)} sources unreadable")
         """
         args = ["discover"]
         if pipeline is not None:
@@ -852,6 +876,30 @@ class RockyClient:
         Every project shape content-addresses a plan and persists it to
         ``.rocky/plans/<plan_id>.json``. Pass the returned ``plan_id`` to
         :meth:`apply` to execute it.
+
+        Example:
+
+            Review the planned statements, then execute the plan::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                plan = client.plan("client=acme")
+
+                for statement in plan.statements:
+                    print(statement.purpose, "->", statement.target)
+                    print(statement.sql)
+
+                # `plan_id` is None for replication-only invocations — only a
+                # run that compiled a models/ directory persists a blueprint,
+                # so guard before applying rather than assuming a string.
+                if plan.plan_id is not None:
+                    result = client.apply(plan.plan_id)
+
+            Governance previews (``classification_actions``, ``mask_actions``,
+            ``retention_actions``) are empty on projects without the
+            corresponding config, so an empty list means "not configured", not
+            "nothing to do".
         """
         args = ["plan"]
         if filter is not None:
@@ -872,6 +920,23 @@ class RockyClient:
         ``gc`` plans yield :class:`RestoreApplyOutput` and :class:`GcApplyOutput`,
         respectively; compact / archive / promote plans yield their respective
         outputs. See :func:`_parse_apply`.
+
+        Example:
+
+            Because the return type is a union, narrow before reading
+            kind-specific fields — ``tables_copied`` exists on a run-shaped
+            result and on none of the others::
+
+                from rocky_sdk import RockyClient, RunResult
+
+                client = RockyClient(config_path="rocky.toml")
+                result = client.apply("a1b2c3d4")
+
+                if isinstance(result, RunResult):
+                    print(result.tables_copied, "copied;", result.tables_failed, "failed")
+                else:
+                    # gc / restore / compact / archive / promote plan kinds.
+                    print(type(result).__name__)
         """
         return _parse_apply(self.run_cli(["apply", plan_id], allow_partial=True))
 
@@ -920,6 +985,29 @@ class RockyClient:
                 ``timeout_seconds`` governs this run. A tenant-collapsed run that
                 copies a heavy client's tables in one invocation can pass a larger
                 budget here without relaxing it for every other run.
+
+        Example:
+
+            Run one client's tables and stream progress, then act on partial
+            success — a failed run still reports what DID materialize::
+
+                from rocky_sdk import RockyClient
+
+                client = RockyClient(config_path="rocky.toml")
+                result = client.run("client=acme", log_callback=print)
+
+                print(result.status, result.tables_copied, "copied")
+
+                # Partial success is a normal return, not an exception: check
+                # `errors` rather than assuming a returned result means success.
+                # `asset_key` is the path as a list of segments, not a string.
+                for failure in result.errors:
+                    print("failed:", ".".join(failure.asset_key), failure.error)
+
+            To also execute compiled models in the same invocation, pass
+            ``run_models=True``::
+
+                result = client.run("client=acme", run_models=True)
         """
         _validate_governance_override(governance_override)
         run_args = self._build_run_args(
