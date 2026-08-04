@@ -1824,6 +1824,9 @@ enum Command {
         /// Pipeline name (required if multiple pipelines)
         #[arg(long)]
         pipeline: Option<String>,
+        /// Print extra context for each model (full EXPLAIN plan, pricing rates, models skipped before EXPLAIN).
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// Generate OPTIMIZE/VACUUM SQL for storage compaction, or apply a saved plan.
@@ -4051,6 +4054,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             models,
             model,
             pipeline,
+            verbose,
         } => {
             rocky_cli::commands::run_estimate(
                 &cli.config,
@@ -4058,6 +4062,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 pipeline.as_deref(),
                 model.as_deref(),
                 json,
+                verbose,
             )
             .await
         }
