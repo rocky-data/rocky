@@ -6846,6 +6846,23 @@ pub struct PromoteTargetPlan {
 ///   outcomes are captured here. The warehouse adapter is resolved at apply
 ///   time (to call `execute_statement`), but discovery is NOT re-run.
 ///
+/// Because discovery is not re-run, a safety check that lives *inside*
+/// discovery does not execute on this path — which is how the duplicate
+/// physical-target refusal was absent from `branch promote --plan <id>` and
+/// `rocky apply <promote-plan>` (#1310). Such checks belong at
+/// `run_promote_apply`, the seam all three entrypoints cross, and that is
+/// where the duplicate-target refusal now lives. "Discovery is not re-run"
+/// therefore means *this plan is the reviewed artifact*, not *nothing is
+/// checked at apply*.
+///
+/// The general rule, from the #1325 audit across all nine `PlanKind`s: a
+/// guard over the plan **payload** replays by definition; a guard over
+/// **derived** state (discovery output, compiled models, live warehouse
+/// shape) is only re-established where that derivation repeats at apply.
+/// `Replication` re-runs discovery and so is unaffected; promote does not.
+/// When adding a plan-build-time check, ask which entrypoints reach the line
+/// rather than whether the check is correct.
+///
 /// ## Branch state drift at apply time
 ///
 /// `branch_state_hash` reflects the branch metadata + config bytes at plan
