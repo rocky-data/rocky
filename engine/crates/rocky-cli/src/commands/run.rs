@@ -10683,7 +10683,14 @@ async fn process_table(
             return Ok(TableOutcome::Pruned(PrunedTable {
                 asset_key,
                 source_schema: task.source_schema.clone(),
-                table_name: task.target_table_name.clone(),
+                // SOURCE name, not the target's. This record is source-shaped
+                // (it carries `source_schema`) and lands in `excluded_tables`
+                // beside entries built from the production `table.name`, so
+                // using the suffixed name here would make one output list carry
+                // two naming conventions depending on why a table was excluded.
+                // The general #1280 rule — derived identity follows the target —
+                // is about what a run WROTE; nothing was written here.
+                table_name: task.source_table_name.clone(),
             }));
         }
     }
