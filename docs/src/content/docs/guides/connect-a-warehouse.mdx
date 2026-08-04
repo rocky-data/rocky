@@ -135,7 +135,7 @@ rocky apply "$plan_id"
 
 Run `rocky doctor` first: it's the credentials and connectivity smoke test, and it tells you which adapter Rocky can reach before you spend any warehouse time. For a replication pipeline, scope the run with `--filter` (for example `rocky plan --filter tenant=acme`).
 
-The full field reference for every adapter is in [Configuration](/reference/configuration/#adaptername); per-adapter auth detail is in [Authentication](/reference/authentication/).
+Each adapter's own fields, authentication, and examples have a dedicated page — [DuckDB](/reference/adapters/duckdb/), [Databricks](/reference/adapters/databricks/), [Snowflake](/reference/adapters/snowflake/), [BigQuery](/reference/adapters/bigquery/), [Fivetran](/reference/adapters/fivetran/). The fields shared by every adapter type are in [Configuration](/reference/configuration/#adaptername), and Databricks auth detail is in [Authentication](/reference/authentication/).
 
 ## Next steps
 

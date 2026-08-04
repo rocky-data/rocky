@@ -131,119 +131,18 @@ default_schema = "analytics"
 x_custom_header = "service-account"
 ```
 
-### `type = "duckdb"`
+### Per-adapter setup
 
-Local in-process execution adapter. Use as a warehouse, source, or both: the same adapter instance can handle discovery and execution because they share the same database.
+The connection fields, authentication, and examples for each adapter type live on their own page:
 
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `path` | string | No | (in-memory) | Path to a persistent DuckDB file. Required when using the same DuckDB adapter for both discovery and execution, so the discovery side sees rows written by the warehouse side. |
+- [DuckDB](/reference/adapters/duckdb/) — local in-process execution
+- [Databricks](/reference/adapters/databricks/) — SQL warehouse + Unity Catalog governance
+- [Snowflake](/reference/adapters/snowflake/) — PAT, OAuth, key-pair, and password auth
+- [BigQuery](/reference/adapters/bigquery/) — project/location plus environment-supplied credentials
+- [Fivetran](/reference/adapters/fivetran/) — metadata-only source discovery
 
-```toml
-# In-memory DuckDB
-[adapter.local]
-type = "duckdb"
+`type = "trino"`, `type = "airbyte"`, and `type = "iceberg"` are accepted by the config parser but have no dedicated page yet; configure adapter-specific keys through [`[adapter.NAME.extra]`](#adaptername).
 
-# Persistent DuckDB file
-[adapter.local]
-type = "duckdb"
-path = "warehouse.duckdb"
-```
-
-### `type = "databricks"`
-
-Databricks SQL warehouse adapter. Executes SQL via the Statement Execution REST API and manages Unity Catalog governance.
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `host` | string | Yes | Workspace hostname (e.g., `"workspace.cloud.databricks.com"`). |
-| `http_path` | string | Yes | SQL warehouse HTTP path (e.g., `"/sql/1.0/warehouses/abc123"`). |
-| `token` | string | No | Personal Access Token. Tried first if set. |
-| `client_id` | string | No | OAuth M2M client ID (service principal). Used as fallback when `token` is not set. |
-| `client_secret` | string | No | OAuth M2M client secret. Required if `client_id` is set. |
-| `timeout_secs` | integer | No | Statement execution timeout in seconds (default `120`). Increase for large full-refresh queries. |
-
-```toml
-[adapter.prod]
-type = "databricks"
-host = "${DATABRICKS_HOST}"
-http_path = "${DATABRICKS_HTTP_PATH}"
-token = "${DATABRICKS_TOKEN}"
-```
-
-OAuth M2M instead of PAT:
-
-```toml
-[adapter.prod]
-type = "databricks"
-host = "${DATABRICKS_HOST}"
-http_path = "${DATABRICKS_HTTP_PATH}"
-client_id = "${DATABRICKS_CLIENT_ID}"
-client_secret = "${DATABRICKS_CLIENT_SECRET}"
-```
-
-### `type = "snowflake"`
-
-Snowflake warehouse adapter. Supports Programmatic Access Token (PAT), OAuth, key-pair (RS256 JWT), and password authentication.
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `account` | string | Yes | Snowflake account identifier (e.g., `"org-account"`). |
-| `warehouse` | string | Yes | Warehouse name for query execution. |
-| `database` | string | No | Default database. |
-| `schema` | string | No | Default schema. |
-| `role` | string | No | Role to assume. |
-| `username` | string | No | Username for key-pair or password auth. |
-| `password` | string | No | Password for password auth. |
-| `private_key_path` | string | No | Path to PKCS#8 PEM private key for key-pair JWT auth. |
-| `oauth_token` | string | No | Pre-supplied OAuth token from an IdP. |
-| `pat` | string | No | Programmatic Access Token (issued via Snowsight User Profile). Sent as a Bearer token with the `PROGRAMMATIC_ACCESS_TOKEN` token-type header, distinct from `oauth_token`. |
-
-Authentication priority: PAT (highest) > OAuth > Key-pair JWT > Password (lowest).
-
-```toml
-# Programmatic Access Token (PAT) auth — recommended for trial accounts and
-# scripts; issue via Snowsight → User Profile → Personal Access Tokens.
-[adapter.snow]
-type = "snowflake"
-account = "${SNOWFLAKE_ACCOUNT}"
-warehouse = "COMPUTE_WH"
-pat = "${SNOWFLAKE_PAT}"
-
-# Key-pair JWT auth — recommended for production (rotateable, scoped per user).
-[adapter.snow]
-type = "snowflake"
-account = "${SNOWFLAKE_ACCOUNT}"
-warehouse = "COMPUTE_WH"
-username = "${SNOWFLAKE_USER}"
-private_key_path = "${SNOWFLAKE_KEY_PATH}"
-
-# Password auth
-[adapter.snow]
-type = "snowflake"
-account = "${SNOWFLAKE_ACCOUNT}"
-warehouse = "COMPUTE_WH"
-username = "${SNOWFLAKE_USER}"
-password = "${SNOWFLAKE_PASSWORD}"
-```
-
-### `type = "fivetran"`
-
-Fivetran source adapter. Calls the Fivetran REST API to discover connectors and tables. **Metadata only**: Rocky never moves data through this adapter.
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `destination_id` | string | Yes | Fivetran destination ID. |
-| `api_key` | string | Yes | Fivetran API key (Basic Auth). |
-| `api_secret` | string | Yes | Fivetran API secret (Basic Auth). |
-
-```toml
-[adapter.fivetran]
-type = "fivetran"
-destination_id = "${FIVETRAN_DESTINATION_ID}"
-api_key = "${FIVETRAN_API_KEY}"
-api_secret = "${FIVETRAN_API_SECRET}"
-```
 
 ### `type = "manual"`
 
