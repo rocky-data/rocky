@@ -4015,19 +4015,21 @@ auto_create_schemas = true
 
     /// #1242's exact loss scenario, interleaved for real: the run winner
     /// commits AFTER the gc seam's first download and BEFORE its publish.
-    /// One armed conflict rejects gc's first CAS put; a watcher task keyed on
-    /// that put count (an event, not wall-clock) then publishes the winner,
-    /// so the seam's replay downloads it and re-derives on top — the counting
-    /// oracle pins the per-attempt liveness re-reads. The final published
-    /// blob holds BOTH effects. Under the legacy half-seam this exact
-    /// schedule silently erased the winner (#1228): forcing
-    /// `seam_cas = false` makes this test fail fast on the watcher-fired
-    /// assertion (the deadline-bounded watcher never sees a CAS put).
+    /// TWO armed conflicts reject gc's first two CAS puts — three attempts
+    /// by construction, not by racing — and a watcher task keyed on the
+    /// first rejected put (an event, not wall-clock) publishes the winner
+    /// inside the two jittered ~20ms backoffs, so attempt 3's download
+    /// carries it and re-derives on top — the counting oracle pins the
+    /// per-attempt liveness re-reads. The final published blob holds BOTH
+    /// effects. Under the legacy half-seam this schedule silently erased
+    /// the winner (#1228): forcing `seam_cas = false` makes this test fail
+    /// fast on the watcher-fired assertion (the deadline-bounded watcher
+    /// never sees a CAS put).
     ///
     /// Determinism: the watcher loses only if its in-memory seed+upload
-    /// (microseconds) outlasts the session's jittered ~20ms (18–22ms)
-    /// conflict backoff — and a lost race fails the tombstone assertion
-    /// loudly, never a false green.
+    /// (milliseconds) outlasts BOTH backoffs (≥ ~36ms even at minimum
+    /// jitter) — and a lost race fails the tombstone assertion loudly,
+    /// never a false green.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gc_cas_seam_preserves_a_run_writer_landing_mid_seam() {
         struct CountingOracle(std::sync::atomic::AtomicUsize);
@@ -4065,13 +4067,13 @@ auto_create_schemas = true
             "v{}/state.redb",
             rocky_core::state::current_schema_version()
         );
-        harness.faults.arm_precondition_failures(&object_key, 1);
+        harness.faults.arm_precondition_failures(&object_key, 2);
 
         // The mid-seam run winner: fires the moment gc's first CAS put is
-        // observed (the armed conflict), inside the session's backoff window.
-        // Deadline-bounded so a code path that never issues a CAS put (the
-        // legacy half-seam) turns this test into a fast red instead of a
-        // hang.
+        // observed (the first armed conflict), inside the session's two
+        // backoff windows. Deadline-bounded so a code path that never
+        // issues a CAS put (the legacy half-seam) turns this test into a
+        // fast red instead of a hang.
         let faults = harness.faults.clone();
         let winner_cfg = harness.pod_a.cfg.clone();
         let winner_path = harness.pod_a.state_path.clone();
@@ -4128,19 +4130,17 @@ auto_create_schemas = true
         );
 
         // 2 oracle reads per attempt (the paired pre/post liveness proofs —
-        // probed empirically at a single attempt) × THREE attempts: the armed
-        // conflict rejects attempt 1; the winner's upload lands inside
-        // attempt 2's window, so its CAS put loses a GENUINE race; attempt 3
-        // replays on the winner and commits. The schedule exercises both
-        // conflict kinds. If this fails with 2, the replay re-published
-        // without re-deriving — the #1242 defect; if the per-attempt read
-        // count legitimately changes, update both constants.
+        // probed empirically at a single attempt) × THREE attempts, forced
+        // by the two armed conflicts. If this fails with 2, the replay
+        // re-published without re-deriving — the #1242 defect; if the
+        // per-attempt read count legitimately changes, update both
+        // constants.
         assert_eq!(
             harness
                 .faults
                 .put_count(&object_key, rocky_core::fault_store::PutKind::Update),
             3,
-            "armed + genuine conflict must force exactly three CAS attempts"
+            "two armed conflicts must force exactly three CAS attempts"
         );
         assert_eq!(
             oracle.0.load(std::sync::atomic::Ordering::SeqCst),
