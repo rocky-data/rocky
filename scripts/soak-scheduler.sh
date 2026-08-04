@@ -310,18 +310,21 @@ jq -n \
   --arg sha "$(git -C "$REPO" rev-parse HEAD 2>/dev/null)" \
   --arg branch "$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)" \
   --arg state_path "$STATE_PATH" \
-  --argjson t0 "$T0" --argjson end "$END" --argjson pid "$SERVE_PID" \
+  --argjson t0 "$T0" --argjson end_ts "$END" --argjson pid "$SERVE_PID" \
   --argjson sample "$SAMPLE_SECONDS" --argjson poll "$POLL_SECONDS" \
   --argjson harvest "$HARVEST_SECONDS" \
   --argjson drain "$DRAIN_SECONDS" --argjson port "$PORT" \
   --argjson token_was_set "$TOKEN_WAS_SET" \
   --argjson ulimit "$(ulimit -n)" \
   '{binary:$bin, version:$version, git_sha:$sha, branch:$branch, state_path:$state_path,
-    t0:$t0, planned_end:$end, pid:$pid, sample_interval:$sample, harvest_interval:$harvest,
+    t0:$t0, planned_end:$end_ts, pid:$pid, sample_interval:$sample, harvest_interval:$harvest,
     poll_interval:$poll,
     drain_timeout:$drain, port:$port, cron:"* * * * *", timezone:"UTC", catchup:"latest",
     retry_max:0, serve_token_was_unset:$token_was_set, ulimit_n:$ulimit}' \
-  >"$OUT/meta.json"
+  >"$OUT/meta.json" || die "meta.json write failed (jq)"
+# The verdict hard-depends on meta.json; an empty file must abort the soak
+# NOW, not surface as INVALID after 24 hours.
+[[ -s "$OUT/meta.json" ]] || die "meta.json is empty"
 
 # ---------------------------------------------------------------------------
 # Phase 4 — unified sample + harvest loop.
