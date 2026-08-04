@@ -82,10 +82,7 @@ fn bench_dag(c: &mut Criterion) {
             |b, &cap| {
                 b.iter(|| {
                     rt.block_on(async {
-                        let mut executor = DagExecutor::new(SleepDispatcher);
-                        if let Some(n) = cap {
-                            executor = executor.with_max_concurrency(n);
-                        }
+                        let executor = DagExecutor::new(SleepDispatcher, cap);
                         executor.execute(&dag).await.unwrap()
                     })
                 });

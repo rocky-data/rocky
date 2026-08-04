@@ -638,8 +638,8 @@ async fn execute_run_plan(
     // is not a missing convenience but a wrong answer: the time-interval runner
     // reads an empty selection as `--latest`, so a reviewed historical
     // partition applied clean while rebuilding the current one (#1283). It is
-    // replayed below; `--parallel` deliberately is not — a persisted plan never
-    // captured it, so there is nothing to replay (see below and #1288).
+    // replayed below, and so is `--parallel` where the stored value can be
+    // trusted — see the `node_concurrency` argument at the DAG call (#1288).
     if run_plan.dag {
         // Fail-closed (D): the DAG runner dispatches sub-runs with NO governance
         // context, so a governed (agent) DAG apply would execute every pipeline
@@ -676,24 +676,21 @@ async fn execute_run_plan(
             // would write production while reporting success. The non-DAG path
             // below passes the same value.
             shadow_config.as_ref(),
-            // No node-fan-out bound on a replay. A stored plan DOES carry
-            // `parallel` (`RunPlan::parallel`, reconstructed into
-            // `partition_opts` above), so this is a deliberate discard rather
-            // than a missing value — and the reason is the field's own shape.
+            // Replay the planned bound where the stored value carries intent.
             //
-            // It is a plain `u32` with `#[serde(default = "default_parallel")]`
-            // returning **1**, so it cannot distinguish "the planner asked for
-            // 1" from "this plan predates the field". Honoring it would
-            // silently serialize every DAG plan stored before #1288 — a large
-            // slowdown applied to plans whose authors never chose it.
+            // `rocky plan`'s own `--parallel` is `default_value = "1"`, so a
+            // stored **1** cannot be told apart from a flag the planner never
+            // typed — and bounding on it would serialize every plan whose
+            // author simply omitted the flag, which is most of them. A stored
+            // value other than 1 can only have been typed, so discarding it
+            // would ignore an intent the plan unambiguously records.
             //
-            // The cost is that plan-time intent is not replayed: `rocky plan
-            // --dag --parallel 1` then `rocky apply` runs unbounded. This is
-            // byte-identical to pre-#1288 behaviour, not a new regression.
-            // Fixing it needs the stored field to become optional, which
-            // changes the plan's contract and its `plan_id` hash — out of
-            // scope here, and tracked separately.
-            None,
+            // Hence: replay anything but 1, and treat 1 as "unset". The
+            // remaining gap is `--parallel 1` specifically, which cannot be
+            // replayed until the stored field distinguishes omitted from
+            // explicit — that changes the plan's contract and its `plan_id`
+            // hash, so it is tracked separately rather than done here.
+            crate::commands::run_dag_exec::replayed_node_concurrency(run_plan.parallel),
         )
         .await
         .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));

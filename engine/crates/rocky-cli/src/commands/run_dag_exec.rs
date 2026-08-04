@@ -56,7 +56,8 @@ type SubRunner = Arc<
 ///
 /// Every sub-run drives [`super::run::run`], which holds the state store's
 /// exclusive writer flock for its **whole duration**, and the executor
-/// dispatches a layer's nodes concurrently with no bound. Without a turnstile
+/// dispatches a layer's nodes concurrently, bounded only when `--parallel`
+/// asks for it (#1288) and unbounded otherwise. Without a turnstile
 /// the first sub-run to open the store wins and every same-layer sibling
 /// sharing the state file dies on `LockHeldByOther` — deterministically, for a
 /// project as small as two independent `SELECT 1` models. The flock-side retry
@@ -646,6 +647,20 @@ struct CliDispatcher {
 /// still where the DAG half is *refused*: the bound is applied once, to node
 /// fan-out, in [`run_with_dag`]. Threading it here as well is what would give
 /// node-fan-out x per-partition-fan-out (#1288).
+/// The node-fan-out bound to replay from a stored plan's `parallel` field.
+///
+/// `rocky plan`'s own `--parallel` is `default_value = "1"`, so a stored **1**
+/// cannot be told apart from a flag the planner never typed — bounding on it
+/// would serialize every plan whose author simply omitted it, which is most of
+/// them. Any other value can only have been typed, and discarding it ignores an
+/// intent the plan unambiguously records.
+///
+/// Lives here, beside [`node_concurrency_limit`], rather than inline at the
+/// `apply` call site, so the rule has one definition that a test can call.
+pub(crate) fn replayed_node_concurrency(stored: u32) -> Option<u32> {
+    (stored != 1).then_some(stored)
+}
+
 /// Build the DAG executor with the caller's node-fan-out bound applied.
 ///
 /// Separate from [`run_with_dag`] so the wiring is assertable: dropping the
@@ -655,10 +670,7 @@ fn dag_executor_with_bound<D: rocky_core::dag_executor::NodeDispatcher + 'static
     dispatcher: D,
     node_concurrency: Option<u32>,
 ) -> DagExecutor<D> {
-    match node_concurrency_limit(node_concurrency) {
-        Some(n) => DagExecutor::new(dispatcher).with_max_concurrency(n),
-        None => DagExecutor::new(dispatcher),
-    }
+    DagExecutor::new(dispatcher, node_concurrency_limit(node_concurrency))
 }
 
 /// How many DAG nodes may execute at once, from `--parallel` as the caller
@@ -994,8 +1006,8 @@ mod run_opts_threading_tests {
         // applied twice, which is a multiplication.
         assert_eq!(
             opts.parallel, 1,
-            "--parallel must NOT reach the sub-run: the DAG bounds node fan-out \
-             and does not bound it, so honoring it here multiplies (#1288)"
+            "--parallel must NOT reach the sub-run: the DAG already applies it \
+             to node fan-out, so applying it again here multiplies (#1288)"
         );
         assert!(
             got[0].2.force_rebuild,
@@ -1351,6 +1363,35 @@ mod tests {
             None,
             "an absent --parallel must leave the executor unbounded"
         );
+    }
+
+    /// A stored plan's `--parallel` is replayed when it carries intent.
+    ///
+    /// `rocky plan`'s own `--parallel` is `default_value = "1"`, so a stored
+    /// **1** cannot be told from a flag the planner never typed — bounding on
+    /// it would serialize every plan whose author simply omitted it. Any other
+    /// value can only have been typed, and discarding it ignores an intent the
+    /// plan unambiguously records. Review caught the first revision discarding
+    /// *all* stored values on the strength of the ambiguous one.
+    ///
+    /// Mutation that must turn this red: replay unconditionally
+    /// (`Some(parallel)`), or discard unconditionally (`None`).
+    #[test]
+    fn a_planned_bound_is_replayed_unless_it_is_the_ambiguous_default() {
+        use super::replayed_node_concurrency as replayed;
+
+        assert_eq!(
+            replayed(1),
+            None,
+            "a stored 1 is indistinguishable from an omitted flag and must not \
+             silently serialize a plan whose author never asked"
+        );
+        assert_eq!(
+            replayed(2),
+            Some(2),
+            "an unambiguous bound must be replayed"
+        );
+        assert_eq!(replayed(8), Some(8));
     }
 
     /// `--parallel 0` is one, never unbounded.

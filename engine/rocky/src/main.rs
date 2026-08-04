@@ -939,7 +939,10 @@ enum Command {
         #[arg(long)]
         lookback: Option<u32>,
         /// Concurrency for warehouse-bound work (default 4; pass
-        /// `--parallel 1` to force fully serial, or any N to override).
+        /// `--parallel 1` for one model or partition at a time, or any N to
+        /// override). It does NOT bound a replication pipeline's table
+        /// fan-out, which comes from that pipeline's `[execution] concurrency`
+        /// (default 32).
         /// Drives both per-partition execution for `time_interval` models
         /// and intra-layer concurrency for transformation models: models in
         /// the same dependency layer run up to N at a time, with a barrier
@@ -5063,7 +5066,7 @@ mod tests {
         assert_eq!(
             run_parallel(&["rocky", "run", "--parallel", "1"]),
             Some(1),
-            "--parallel 1 must still force serial"
+            "--parallel 1 must still reach execution as 1"
         );
         assert_eq!(
             run_parallel(&["rocky", "run", "--parallel", "8"]),

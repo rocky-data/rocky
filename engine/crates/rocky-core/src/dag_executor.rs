@@ -128,16 +128,19 @@ pub struct DagExecutor<D: NodeDispatcher> {
 }
 
 impl<D: NodeDispatcher + 'static> DagExecutor<D> {
-    pub fn new(dispatcher: D) -> Self {
+    /// Build an executor with an explicit node-fan-out bound.
+    ///
+    /// `max_concurrency` is a required argument rather than a builder step so
+    /// that not bounding is a **decision** in the source rather than a missing
+    /// call. Review found that deleting a `.with_max_concurrency(..)` from the
+    /// production path left every test green, because a DAG runs identically
+    /// whether it is unbounded or bounded above its node count (#1288); an
+    /// argument cannot be dropped that quietly.
+    pub fn new(dispatcher: D, max_concurrency: Option<usize>) -> Self {
         Self {
             dispatcher: Arc::new(dispatcher),
-            max_concurrency: None,
+            max_concurrency,
         }
-    }
-
-    pub fn with_max_concurrency(mut self, n: usize) -> Self {
-        self.max_concurrency = Some(n);
-        self
     }
 
     /// The configured node-fan-out bound, or `None` for unbounded.
@@ -429,10 +432,7 @@ mod tests {
             in_flight: Arc::new(AtomicUsize::new(0)),
             peak: Arc::clone(&peak),
         };
-        let executor = match max {
-            Some(m) => DagExecutor::new(dispatcher).with_max_concurrency(m),
-            None => DagExecutor::new(dispatcher),
-        };
+        let executor = DagExecutor::new(dispatcher, max);
         executor.execute(&dag).await.expect("execute");
         peak.load(Ordering::SeqCst)
     }
@@ -489,7 +489,7 @@ mod tests {
         let dispatcher = CountingDispatcher {
             dispatched: Arc::clone(&counter),
         };
-        let executor = DagExecutor::new(dispatcher);
+        let executor = DagExecutor::new(dispatcher, None);
         let result = executor.execute(&dag).await.unwrap();
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
@@ -518,7 +518,7 @@ mod tests {
         let dispatcher = CountingDispatcher {
             dispatched: Arc::clone(&counter),
         };
-        let executor = DagExecutor::new(dispatcher);
+        let executor = DagExecutor::new(dispatcher, None);
         let result = executor.execute(&dag).await.unwrap();
 
         assert!(result.had_failures());
@@ -548,7 +548,7 @@ mod tests {
         let dispatcher = CountingDispatcher {
             dispatched: Arc::clone(&counter),
         };
-        let executor = DagExecutor::new(dispatcher);
+        let executor = DagExecutor::new(dispatcher, None);
         let result = executor.execute(&dag).await.unwrap();
 
         assert_eq!(counter.load(Ordering::SeqCst), 4);
@@ -576,7 +576,7 @@ mod tests {
         let dispatcher = CountingDispatcher {
             dispatched: Arc::clone(&counter),
         };
-        let executor = DagExecutor::new(dispatcher);
+        let executor = DagExecutor::new(dispatcher, None);
         let result = executor.execute(&dag).await.unwrap();
 
         // a, c, d all dispatched (b skipped). 3 dispatches.
