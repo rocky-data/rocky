@@ -939,4 +939,32 @@ mod tests {
         assert_eq!(plan.parallel, 1);
         assert!(!plan.run_all);
     }
+
+    /// #1325: a composed backfill never carries the `dag && model` shape that
+    /// `validate_run_plan_execution_shape` rejects (#1173).
+    ///
+    /// The backfill apply arm does NOT call that validation, and is safe only
+    /// because it never reads either field. This pins the plan-time half of
+    /// that argument: if backfill ever becomes DAG-aware or model-scoped at
+    /// compose time, this fails and points at the apply arm's doc comment,
+    /// which says to add the shape check there.
+    ///
+    /// It does not — and cannot cheaply — pin the apply-time half, which stays
+    /// a structural guarantee documented at `run_apply_backfill_plan`.
+    #[test]
+    fn build_run_plan_never_composes_the_shape_apply_does_not_validate() {
+        let plan = build_run_plan(
+            Path::new("models"),
+            &["a".to_string()],
+            &[vec!["a".to_string()]],
+            None,
+            None,
+        );
+        assert!(
+            !(plan.dag && plan.model.is_some()),
+            "a composed backfill carries the contradictory dag+model shape that the \
+             backfill apply arm does not validate — add validate_run_plan_execution_shape \
+             to run_apply_backfill_plan"
+        );
+    }
 }

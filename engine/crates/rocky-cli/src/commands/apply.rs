@@ -3102,6 +3102,23 @@ async fn run_apply_ai_authored_plan(
 /// ([`crate::commands::run::execute_backfill_set`]) so classified retry (R1)
 /// and failure containment (R2) apply to the rebuild. The closure is never
 /// re-authored — a backfill only re-runs existing recipes over its window.
+///
+/// **Why this arm does not call [`validate_run_plan_execution_shape`]** (#1325).
+/// It is the third kind carrying a `RunPlan` payload, and the other two —
+/// `Run` and `AiAuthored` — do call it. The reason this one is safe is NOT
+/// that a backfill plan cannot carry the rejected `dag && model` shape:
+/// `build_run_plan` hardcodes `dag: false` / `model: None` today, but that is
+/// the argument #1173 already rejected, since the check exists precisely for
+/// plans written by an OLDER binary, and a plan payload is on-disk JSON that
+/// the gc apply path already treats as possibly hand-authored.
+///
+/// It is safe because this arm never READS those fields. It consumes
+/// `models_dir`, `models`, `partition_from`, `partition_to`, and `parallel`,
+/// so the DAG runner is never reached and DAG-precedence cannot widen the
+/// authorized scope. That guarantee is structural, not enforced: routing a
+/// backfill through the shared `execute_run_plan` (as `Run` and `AiAuthored`
+/// already do) would reintroduce the exposure with no test failing. Add the
+/// shape validation here if this arm ever grows a consumer of either field.
 async fn run_apply_backfill_plan(
     root: &Path,
     config_path: &Path,
