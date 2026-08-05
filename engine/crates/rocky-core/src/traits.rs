@@ -305,11 +305,52 @@ pub enum SplitStrategy {
 // Warehouse
 // ---------------------------------------------------------------------------
 
+/// Whether identifier case is part of object identity on a live connection.
+///
+/// Deliberately two states and no `Unknown`. "Could not determine" is carried
+/// by the `Err` arm of [`WarehouseAdapter::identifier_case_significance`], so
+/// a caller cannot pattern-match a third variant and let it fall through a
+/// gate — the failure mode #1240 records, where an `Unknown` type satisfied a
+/// compatibility check unconditionally and the gate read as fail-open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseSignificance {
+    /// Two spellings differing only by case name TWO objects.
+    Significant,
+    /// Two spellings differing only by case name ONE object.
+    Insignificant,
+}
+
 /// Executes SQL against a warehouse and provides dialect information.
 #[async_trait]
 pub trait WarehouseAdapter: Send + Sync {
     /// Returns the SQL dialect for this warehouse.
     fn dialect(&self) -> &dyn SqlDialect;
+
+    /// Does this CONNECTION treat identifier case as part of object identity?
+    ///
+    /// Not a dialect question. Snowflake's `QUOTED_IDENTIFIERS_IGNORE_CASE` is
+    /// account/session state, and a BigQuery dataset carries its own
+    /// `is_case_insensitive` — so two connections to the same dialect can
+    /// legitimately disagree, and the answer has to be asked for rather than
+    /// looked up (#1281).
+    ///
+    /// **The default is `Err`, and that is load-bearing.** An adapter that has
+    /// not been grounded must not be read as reporting a definite answer:
+    /// every caller treats `Err` as "keep the conservative behaviour", so a new
+    /// adapter inherits today's refusals rather than silently acquiring a
+    /// relaxation nobody verified. Adapters whose answer is a dialect constant
+    /// (DuckDB, Databricks, Trino) override with that constant and issue no
+    /// round trip.
+    ///
+    /// Callers MUST NOT relax a safety decision on `Err`. In particular a
+    /// transport failure, a permissions error, and "this adapter does not
+    /// implement the probe" are indistinguishable here **on purpose** — all
+    /// three mean the same thing to a gate.
+    async fn identifier_case_significance(&self) -> AdapterResult<CaseSignificance> {
+        Err(AdapterError::msg(
+            "this adapter does not report whether identifier case is part of object identity",
+        ))
+    }
 
     /// Execute a SQL statement (DDL/DML) without returning rows.
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()>;

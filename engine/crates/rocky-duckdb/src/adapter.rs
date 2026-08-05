@@ -117,6 +117,18 @@ impl WarehouseAdapter for DuckDbWarehouseAdapter {
         &self.dialect
     }
 
+    /// DuckDB folds identifier case, so this is a dialect constant and needs
+    /// no round trip (#1281).
+    ///
+    /// "Identifiers … are always case-insensitive … DuckDB also treats quoted
+    /// identifiers as case-insensitive" (case is preserved for display only) —
+    /// duckdb.org/docs/stable/sql/dialect/keywords_and_identifiers
+    async fn identifier_case_significance(
+        &self,
+    ) -> AdapterResult<rocky_core::traits::CaseSignificance> {
+        Ok(rocky_core::traits::CaseSignificance::Insignificant)
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         let conn = Arc::clone(&self.connector);
         let sql = sql.to_string();

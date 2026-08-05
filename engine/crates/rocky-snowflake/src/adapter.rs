@@ -62,6 +62,84 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
         Some(self.connector.warehouse())
     }
 
+    /// Read `QUOTED_IDENTIFIERS_IGNORE_CASE` off the live session (#1281).
+    ///
+    /// Rocky renders Snowflake targets DOUBLE-QUOTED (see this crate's
+    /// `dialect::format_table_ref`), so this parameter — and not the unquoted
+    /// upper-casing rule — is what decides whether two of Rocky's targets
+    /// differing only by case are one object or two. `TRUE` makes quoted
+    /// identifiers case-insensitive, i.e. case is NOT part of identity.
+    ///
+    /// Fail-closed by construction: anything other than exactly one row
+    /// carrying a parseable boolean returns `Err`, which every caller reads as
+    /// "keep the conservative behaviour". A wrong definite answer here relaxes
+    /// a safety decision, so an ambiguous response must never be rounded into
+    /// one.
+    async fn identifier_case_significance(
+        &self,
+    ) -> AdapterResult<rocky_core::traits::CaseSignificance> {
+        use rocky_core::traits::CaseSignificance;
+
+        let result = self
+            .execute_query("SHOW PARAMETERS LIKE 'QUOTED_IDENTIFIERS_IGNORE_CASE'")
+            .await?;
+
+        // Locate `value` BY NAME. `SHOW PARAMETERS` returns
+        // key/value/default/level/description/type, and pinning the ordinal
+        // would silently read `default` (the adjacent column, and frequently
+        // the same text) if Snowflake ever reorders them.
+        let value_idx = result
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case("value"))
+            .ok_or_else(|| {
+                AdapterError::msg(format!(
+                    "SHOW PARAMETERS returned no `value` column (got {:?}), so \
+                     QUOTED_IDENTIFIERS_IGNORE_CASE could not be read",
+                    result.columns
+                ))
+            })?;
+
+        let [row] = result.rows.as_slice() else {
+            return Err(AdapterError::msg(format!(
+                "SHOW PARAMETERS LIKE 'QUOTED_IDENTIFIERS_IGNORE_CASE' returned {} rows, \
+                 expected exactly 1 — refusing to guess which one is the session's value",
+                result.rows.len()
+            )));
+        };
+
+        let cell = row.get(value_idx).ok_or_else(|| {
+            AdapterError::msg("SHOW PARAMETERS row is shorter than its column list")
+        })?;
+
+        // The SQL API renders this as the STRING "true"/"false"; a driver that
+        // types it natively would give a JSON bool. Accept both rather than
+        // assume the wire shape (#1153 is the same lesson on query cells).
+        let ignore_case = match cell {
+            serde_json::Value::Bool(b) => *b,
+            serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" => false,
+                other => {
+                    return Err(AdapterError::msg(format!(
+                        "QUOTED_IDENTIFIERS_IGNORE_CASE has unparseable value {other:?}"
+                    )));
+                }
+            },
+            other => {
+                return Err(AdapterError::msg(format!(
+                    "QUOTED_IDENTIFIERS_IGNORE_CASE has unexpected JSON type: {other}"
+                )));
+            }
+        };
+
+        Ok(if ignore_case {
+            CaseSignificance::Insignificant
+        } else {
+            CaseSignificance::Significant
+        })
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.connector
             .execute_statement(sql)

@@ -51,6 +51,17 @@ impl WarehouseAdapter for TrinoAdapter {
         &self.dialect
     }
 
+    /// Trino folds identifier case, so this is a dialect constant and needs
+    /// no round trip (#1281).
+    ///
+    /// "Identifiers are not treated as case sensitive" —
+    /// trino.io/docs/current/language/reserved.html
+    async fn identifier_case_significance(
+        &self,
+    ) -> AdapterResult<rocky_core::traits::CaseSignificance> {
+        Ok(rocky_core::traits::CaseSignificance::Insignificant)
+    }
+
     fn classify_failure(&self, err: &AdapterError) -> rocky_core::failure_class::FailureClass {
         crate::connector::classify_trino_failure(err)
     }

@@ -134,6 +134,18 @@ impl WarehouseAdapter for DatabricksWarehouseAdapter {
         &self.dialect
     }
 
+    /// Databricks folds identifier case, so this is a dialect constant and needs
+    /// no round trip (#1281).
+    ///
+    /// Identifiers are case-insensitive, delimited ones included; Unity Catalog
+    /// stores names lower-cased —
+    /// docs.databricks.com/aws/en/sql/language-manual/sql-ref-identifiers
+    async fn identifier_case_significance(
+        &self,
+    ) -> AdapterResult<rocky_core::traits::CaseSignificance> {
+        Ok(rocky_core::traits::CaseSignificance::Insignificant)
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.connector
             .execute_statement(sql)
