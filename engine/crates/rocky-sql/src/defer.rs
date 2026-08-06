@@ -343,6 +343,28 @@ impl CollisionIdentity {
     pub fn of_qualified(qualified: &str) -> Self {
         Self(qualified.to_lowercase())
     }
+
+    /// Build WITHOUT folding, for a connection that has been *observed* to
+    /// treat identifier case as part of object identity (#1281).
+    ///
+    /// A deliberately separate constructor rather than a `rules` parameter on
+    /// [`Self::of`]. Folding is this type's whole reason to exist: it answers
+    /// "could these two be the SAME object?", where a wrong "no" lets two
+    /// models write one table with no error at all. Making that behaviour
+    /// configurable through the main constructor would put the fail-open
+    /// choice one argument away at every call site; making it a named
+    /// constructor means every relaxation is greppable and has to be argued
+    /// for where it is written.
+    ///
+    /// **Only reachable from a definite probe result.** "Assumed
+    /// case-sensitive", "the dialect is usually case-sensitive", and "the
+    /// probe failed" must all keep using [`Self::of`] — an assumption is
+    /// exactly what this constructor must not encode, because unlike the
+    /// reference-matching question, guessing wrong here is silent.
+    #[must_use]
+    pub fn of_observed_case_sensitive(catalog: &str, schema: &str, table: &str) -> Self {
+        Self(format!("{catalog}.{schema}.{table}"))
+    }
 }
 
 impl std::fmt::Display for CollisionIdentity {
