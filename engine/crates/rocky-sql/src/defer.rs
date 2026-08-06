@@ -853,6 +853,23 @@ impl VisitorMut for DeferRewriter<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// #1281: the folding dialects see NO behaviour change from the probe.
+    ///
+    /// DuckDB, Databricks and Trino answer `Insignificant`, which routes
+    /// `case_rules` through `all_insensitive()`, where before the probe they
+    /// went through `uniform(false)`. The relaxation is only safe to describe
+    /// as "no change for these three" if those two are the same value — so
+    /// pin it rather than assert it in a PR body.
+    #[test]
+    fn uniform_false_and_all_insensitive_are_the_same_rules() {
+        assert_eq!(
+            super::IdentifierCaseRules::uniform(false),
+            super::IdentifierCaseRules::all_insensitive(),
+            "a folding dialect's rules must not change depending on which \
+             constructor produced them"
+        );
+    }
+
     use super::*;
 
     fn target(catalog: &str, schema: &str, table: &str) -> DeferTarget {
