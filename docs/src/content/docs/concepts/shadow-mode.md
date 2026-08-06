@@ -72,19 +72,38 @@ can therefore have that read redirected even though the two name different
 objects. Configuring Snowflake targets in upper case — the idiomatic choice —
 avoids it entirely. Tracked in issue #1282.
 
-Where a reference matches a routed upstream **only if case is ignored**, Rocky
-refuses the run rather than guess. Redirecting it could read a table the model
-never named; leaving it would read production while the model writes its shadow.
-Spell the reference exactly as the upstream's configured target.
+### Rocky asks the connection, and falls back to refusing
 
-Deciding whether two *targets* collide is the opposite question, and Rocky
-answers it conservatively on every warehouse: two selected models whose targets
-differ only by identifier case are always treated as one object, and the run is
-refused. Case-sensitivity is connection state Rocky cannot observe — a Snowflake
-account may set `QUOTED_IDENTIFIERS_IGNORE_CASE`, and a BigQuery dataset may be
-created `is_case_insensitive` — so assuming the two are distinct could let both
-models write the same shadow table with no error. Rename one target so they
-differ by more than case.
+Case-sensitivity is **connection state, not dialect state**. A Snowflake account
+may set `QUOTED_IDENTIFIERS_IGNORE_CASE`, so two connections to the same
+warehouse can legitimately disagree about whether `Orders` and `orders` are one
+object. Rocky reads that setting from the live session rather than assuming it.
+
+When the connection answers, the two questions above become decisions:
+
+- A reference matching a routed upstream **only if case is ignored** is
+  redirected when the connection folds case (it does name that upstream), and
+  left alone when it does not (it names a genuinely different object).
+- Two selected models whose targets differ only by case are refused when the
+  connection folds case, and route independently when it does not.
+
+When the connection **cannot** be asked — an adapter that does not report the
+setting, or a probe that fails — Rocky keeps the conservative behaviour rather
+than guessing, and the run is not failed for the probe's sake:
+
+- A case-fold-only reference refuses the run. Redirecting it could read a table
+  the model never named; leaving it would read production while the model writes
+  its shadow. Spell the reference exactly as the upstream's configured target.
+- Two targets differing only by case are treated as one object and refused,
+  because assuming they are distinct could let both models write the same shadow
+  table with no error at all. Rename one so they differ by more than case.
+
+Those two fail closed in opposite directions, which is why each consults the
+setting separately instead of sharing one answer.
+
+BigQuery does not report this yet: a dataset may be created
+`is_case_insensitive`, and that flag varies *per dataset* rather than per
+connection, so BigQuery keeps the conservative behaviour above.
 
 ## Shadow target rewriting
 
