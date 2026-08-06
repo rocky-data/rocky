@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.69.0] - 2026-08-06
+
 ### Added
 
 - **`[run] strict_scheduling` refuses a run whose physical-read ordering could not be fully resolved.** #1352 derives ordering edges from physical `schema.table` reads and reports what it cannot safely resolve — contradicting bare-read pairs, models whose reference extraction failed, colliding targets — as advisory warnings, and the run still exits 0. A consumer that ignores them can read a stale physical target and report success. Setting `strict_scheduling = true` turns any such warning into a refusal that names every unresolved pair and says how to fix it (declare the upstream in `depends_on`) or opt out.
