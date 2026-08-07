@@ -1257,9 +1257,26 @@ mod tests {
             "the message must say what IS protected: {}",
             check.message,
         );
+        // Pin the CORRECTED writer list (#1372 migrated gc; restore is what is
+        // left). A `contains("rocky gc") && contains("unconditionally")` check
+        // passes against BOTH the old and the corrected message — `rocky gc`
+        // now appears in the protected list and `unconditionally` refers to
+        // restore — so it cannot tell the true claim from the false one.
         assert!(
-            check.message.contains("rocky gc") && check.message.contains("unconditionally"),
-            "the message must name the seam writers that bypass CAS: {}",
+            check.message.contains("rocky restore") && check.message.contains("unconditionally"),
+            "the message must name `rocky restore`, the only unconditionally exposed \
+             writer left, as bypassing CAS: {}",
+            check.message,
+        );
+        let protected_half = check
+            .message
+            .split("still uploads state")
+            .next()
+            .unwrap_or("");
+        assert!(
+            protected_half.contains("rocky gc"),
+            "`rocky gc` has been compare-and-swap protected since #1372, so it must appear \
+             in the PROTECTED half of the message, not among the bypassing writers: {}",
             check.message,
         );
         assert!(
