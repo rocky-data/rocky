@@ -55,13 +55,13 @@ WASM_PACK_SOURCE = (
 )
 SETUP_ZIG_SOURCE = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29"
 PYPI_PUBLISH_SOURCE = (
-    "pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247"
+    "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
 )
 GH_RELEASE_SOURCE = (
     "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
 )
 TAIKI_INSTALL_SOURCE = (
-    "taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf"
+    "taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf"
 )
 # Actions a job may run when it is not reachable from a pull request. Release,
 # publish and deployment workflows never execute candidate code, so the
