@@ -650,13 +650,22 @@ async fn collect_health_checks(
 /// # No remote deployment is fully protected yet
 ///
 /// `docs/adr/ADR-CONCURRENCY.md` is normative: compare-and-swap applies to
-/// *every* remote state write, split by writer class. Only the run half is
-/// implemented. The ledger-seam writers — `rocky gc`, `rocky policy`, and
-/// `rocky apply`, which commit through
-/// `RemoteStateSession::upload_only_fail_closed` — still call the
-/// unconditional [`upload_state`][rocky_core::state_sync::upload_state] on
-/// **every** backend, so a concurrent maintenance or governance command can
-/// silently erase a run's just-committed state.
+/// *every* remote state write, split by writer class. Most of it is now
+/// implemented — the end-of-run upload, `rocky policy` freeze/unfreeze, and
+/// (since #1372) `rocky gc` all commit through the compare-and-swap seam.
+///
+/// What is left is narrower than this arm used to claim, and the exposed set
+/// is not the one it named:
+///
+/// * `rocky restore` calls the unconditional
+///   [`upload_state`][rocky_core::state_sync::upload_state] on **every**
+///   remote backend, on every restore apply, including a failing one. It is
+///   the only writer exposed unconditionally.
+/// * `rocky apply` reaches the same unconditional upload only for its
+///   verify-after custody rows, which are gated on a non-empty `verify_after`
+///   — so a project with no `[policy]` block never reaches it.
+///
+/// A concurrent restore can still silently erase a run's just-committed state.
 ///
 /// That exposure is backend-independent, which is why `cas` on a
 /// conditional-write backend earns a Warning rather than a Healthy: a green
@@ -714,22 +723,23 @@ fn state_concurrency_check(
         // the arm that flips to Healthy once the last seam lands.
         (ConcurrencyControl::Cas, true) => {
             suggestions.push(
-                "state_concurrency: end-of-run uploads and the `rocky policy` freeze/unfreeze \
-                 ledger write are compare-and-swap protected, but `rocky gc` and `rocky apply` \
-                 still write state unconditionally — until issue #1228 lands, do not run \
-                 maintenance or governance commands concurrently with a pipeline run"
+                "state_concurrency: end-of-run uploads, the `rocky policy` freeze/unfreeze \
+                 ledger write and `rocky gc` are compare-and-swap protected. `rocky restore` \
+                 still writes state unconditionally, as does `rocky apply` when `verify_after` \
+                 is configured — until issue #1228 lands, do not run those two concurrently \
+                 with a pipeline run"
                     .into(),
             );
             (
                 HealthStatus::Warning,
                 format!(
                     "[state] concurrency_control = \"cas\" protects this writer's end-of-run \
-                     upload and the `rocky policy` freeze/unfreeze ledger write on the \
-                     '{backend}' backend, but the remaining ledger-seam writers (`rocky gc`, \
-                     `rocky apply`) still upload state unconditionally on every backend — a \
-                     concurrent maintenance or governance command can silently overwrite a run's \
-                     committed state. Avoid running them alongside a pipeline run; tracked in \
-                     issue #1228"
+                     upload, the `rocky policy` freeze/unfreeze ledger write and `rocky gc` on \
+                     the '{backend}' backend. `rocky restore` still uploads state \
+                     unconditionally on every backend, and `rocky apply` does so when \
+                     `verify_after` is configured — a concurrent one can silently overwrite a \
+                     run's committed state. Avoid running those alongside a pipeline run; \
+                     tracked in issue #1228"
                 ),
             )
         }
