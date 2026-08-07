@@ -770,13 +770,22 @@ async fn hash_table(
     table: &TableRef,
     value_columns: &[String],
 ) -> Result<Vec<PartitionChecksum>> {
-    let table_ref_str = table.validated_full_name().map_err(|e| {
-        anyhow!(
-            "rocky compact --measure-dedup could not validate table reference {table} before \
+    // Dialect-formatted, not `validated_full_name()` — this string is
+    // interpolated into the checksum query below, and that helper emits bare
+    // identifiers regardless of dialect (#1396), so on Snowflake a lower or
+    // mixed-case table was checksummed under the upper-cased name. The
+    // dialect's own `format_table_ref` validates each component too, so the
+    // identifier check this error message describes is preserved.
+    let table_ref_str = adapter
+        .dialect()
+        .format_table_ref(&table.catalog, &table.schema, &table.table)
+        .map_err(|e| {
+            anyhow!(
+                "rocky compact --measure-dedup could not validate table reference {table} before \
                  building the checksum query; verify the warehouse returned catalog, schema, and \
                  table names that are valid SQL identifiers: {e}"
-        )
-    })?;
+            )
+        })?;
     let sql = generate_whole_table_checksum_sql(&table_ref_str, value_columns);
     let result = adapter.execute_query(&sql).await.map_err(|e| {
         anyhow!(

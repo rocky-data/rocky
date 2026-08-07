@@ -337,8 +337,17 @@ fn read_or_default<T: Default, E: std::fmt::Display>(
 /// integral-float cell shapes adapters return — a bare `as_str()` would drop
 /// numeric cells to `0` and let a real mismatch pass.
 async fn get_row_count(adapter: &dyn WarehouseAdapter, target: &TargetRef) -> Result<u64> {
-    let table_name = target
-        .validated_full_name()
+    // Format through the ADAPTER'S dialect, not `validated_full_name()`.
+    // That helper emits a bare `catalog.schema.table` and never consults a
+    // dialect, so on Snowflake — which folds unquoted identifiers to upper
+    // case while Rocky creates its objects quoted — a lower or mixed-case
+    // target was counted under the WRONG name: either "not found", or a real
+    // row count from a different table. `rocky compare` is the tool used to
+    // verify a shadow run, so a wrong count here is a false verification
+    // rather than a visible error (#1396).
+    let table_name = adapter
+        .dialect()
+        .format_table_ref(&target.catalog, &target.schema, &target.table)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let sql = format!("SELECT COUNT(*) FROM {table_name}");
     let result = adapter
@@ -589,6 +598,78 @@ schema_template = "staging__{{source}}"
         assert!(
             error.to_string().contains("1 table(s) failed comparison"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    /// #1396: `get_row_count` formats its identifier with the ADAPTER'S
+    /// dialect, so a quoting warehouse gets a quoted reference.
+    ///
+    /// Calls the real function and captures the SQL it emits. My first attempt
+    /// asserted properties of the dialect instead and was VACUOUS — it passed
+    /// with the fix reverted. Snowflake is used deliberately: DuckDB renders
+    /// bare, so a DuckDB fixture would pass against the broken code too.
+    #[tokio::test]
+    async fn get_row_count_quotes_its_identifier_on_a_quoting_dialect() {
+        use rocky_core::traits::{AdapterResult, QueryResult, SqlDialect, WarehouseAdapter};
+        use std::sync::Mutex;
+
+        struct CapturingAdapter {
+            dialect: rocky_snowflake::dialect::SnowflakeSqlDialect,
+            seen: Mutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl WarehouseAdapter for CapturingAdapter {
+            fn dialect(&self) -> &dyn SqlDialect {
+                &self.dialect
+            }
+            async fn execute_statement(&self, _sql: &str) -> AdapterResult<()> {
+                unimplemented!("get_row_count only queries")
+            }
+            async fn execute_query(&self, sql: &str) -> AdapterResult<QueryResult> {
+                self.seen.lock().unwrap().push(sql.to_string());
+                Ok(QueryResult {
+                    columns: vec!["c".into()],
+                    rows: vec![vec![serde_json::json!(7)]],
+                })
+            }
+            async fn describe_table(
+                &self,
+                _t: &rocky_ir::TableRef,
+            ) -> AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+                unimplemented!("get_row_count never describes")
+            }
+        }
+
+        let adapter = CapturingAdapter {
+            dialect: rocky_snowflake::dialect::SnowflakeSqlDialect,
+            seen: Mutex::new(Vec::new()),
+        };
+        let target = rocky_ir::TargetRef {
+            catalog: "cat".into(),
+            schema: "main".into(),
+            table: "orders".into(),
+        };
+
+        let count = super::get_row_count(&adapter, &target)
+            .await
+            .expect("row count");
+        assert_eq!(count, 7);
+
+        let sql = adapter
+            .seen
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("a query was issued");
+        assert!(
+            sql.contains(r#""orders""#),
+            "Snowflake folds unquoted identifiers to upper case, so the table must be quoted \
+             or the count reads a different object: {sql}"
+        );
+        assert!(
+            !sql.contains("FROM cat.main.orders"),
+            "a bare `catalog.schema.table` is the #1396 defect: {sql}"
         );
     }
 }
