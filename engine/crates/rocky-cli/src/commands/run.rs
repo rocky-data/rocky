@@ -6182,21 +6182,23 @@ fn apply_shadow_rewrite(
         _ => dialect_case_rules(dialect)?,
     };
     let recursive_visibility = dialect_recursive_cte_visibility(dialect);
+    // Collision identity ALWAYS folds, including under an observed
+    // case-sensitive connection. An earlier revision relaxed this; red-team
+    // review found the relaxation introduces a cross-session TOCTOU that the
+    // unconditional fold does not have: the probe runs in its own SQL API
+    // request and every later statement opens an independent session, so an
+    // account flipping `QUOTED_IDENTIFIERS_IGNORE_CASE` between probe and DDL
+    // turns a pair judged distinct into one aliased object, and
+    // `CREATE OR REPLACE` clobbers silently.
+    //
+    // The trade is deliberately lopsided. Folding costs at most an
+    // unnecessary refusal on a case-differing target pair, which the operator
+    // resolves by renaming one. Not folding costs two models writing one
+    // shadow table with no error at all. A relaxation worth that risk needs
+    // the probe result pinned to the executing session, which the SQL API
+    // does not currently offer (it rejects the parameter per-request).
     let collision_identity = |catalog: &str, schema: &str, table: &str| {
-        match case_significance {
-            // Observed: two spellings differing only by case really are two
-            // objects, so folding them would refuse a pair that cannot collide.
-            Some(rocky_core::traits::CaseSignificance::Significant) => {
-                rocky_sql::defer::CollisionIdentity::of_observed_case_sensitive(
-                    catalog, schema, table,
-                )
-            }
-            // Observed-insensitive AND unknown both fold. Insensitive folds
-            // because it must; unknown folds because a wrong "these are
-            // distinct" is silent — two models writing one shadow table with no
-            // error at all.
-            _ => rocky_sql::defer::CollisionIdentity::of(catalog, schema, table),
-        }
+        rocky_sql::defer::CollisionIdentity::of(catalog, schema, table)
     };
     let target_identity = |catalog: &str, schema: &str, table: &str| {
         rocky_sql::defer::TargetIdentity::of(catalog, schema, table, case_rules)
@@ -6451,14 +6453,32 @@ fn apply_shadow_rewrite(
             // this model writes its shadow — an isolation break that exits 0
             // and then shows up as a clean `rocky compare`.
             //
-            // #1281: with a definite observation this is no longer a guess, so
-            // the refusal only stands when the connection could not be asked.
-            // Under `Insignificant` the matcher above already folded, so such a
-            // reference was redirected and cannot reach here. Under
-            // `Significant` the reference names a genuinely different object,
-            // and leaving it alone is correct rather than merely tolerated.
+            // #1281: ONLY an observed-INSIGNIFICANT connection may drop this
+            // refusal, and then only vacuously — the matcher above already
+            // folded, so such a reference was redirected and cannot reach here.
+            //
+            // `Significant` must NOT drop it, though an earlier revision of
+            // this PR did. Independent red-team review caught the reason:
+            // `QUOTED_IDENTIFIERS_IGNORE_CASE` governs QUOTED identifiers,
+            // while Snowflake folds UNQUOTED ones to upper case regardless of
+            // it. Rocky renders targets quoted. So for the idiomatic uppercase
+            // configuration — target `CAT.RAW.ORDERS`, SQL reading unquoted
+            // `FROM cat.raw.orders` — the reference names the SAME object even
+            // though case IS part of identity, and `dialect_case_rules`
+            // returns `uniform(true)` whose `unquoted_uppercases` is false, so
+            // the matcher reports a case-fold-only near-miss. Dropping the
+            // refusal there leaves the read unrewritten and the model reads
+            // PRODUCTION while writing its shadow, exiting 0.
+            //
+            // Resolving that correctly needs the unquoted-uppercasing axis
+            // (#1282), which is deliberately out of scope here. Until then a
+            // `Significant` observation is not sufficient to route this
+            // reference, so it keeps refusing exactly as `None` does.
             anyhow::ensure!(
-                case_significance.is_some() || outcome.case_fold_only_refs.is_empty(),
+                matches!(
+                    case_significance,
+                    Some(rocky_core::traits::CaseSignificance::Insignificant)
+                ) || outcome.case_fold_only_refs.is_empty(),
                 "shadow mode cannot tell whether upstream reference(s) {:?} in model '{}' name a \
                  model routed by this run: they match only when identifier case is ignored, and \
                  whether case separates two objects depends on connection state Rocky cannot \
@@ -17654,16 +17674,78 @@ auto_create_schemas = true
     /// fail closed in opposite directions, which is why they no longer share a
     /// key. Reverting `collision_identity` to the case-aware `target_identity`
     /// makes the Snowflake half pass and fails this test.
-    /// #1281: with the connection OBSERVED to treat case as identity, the two
-    /// targets are genuinely distinct objects and route independently — the
-    /// refusal in `case_differing_targets_collide_on_every_dialect` was only
-    /// ever covering an unknown.
+    /// #1281 regression guard, from independent red-team review: an observed
+    /// case-SENSITIVE connection must still REFUSE a case-fold-only reference.
     ///
-    /// The contrast with that test is the point: same fixture, same dialect,
-    /// only the observation differs. This is the relaxation #1281 buys.
+    /// This is the idiomatic Snowflake shape — uppercase targets, an unquoted
+    /// lowercase read. `QUOTED_IDENTIFIERS_IGNORE_CASE` governs QUOTED
+    /// identifiers; Snowflake folds UNQUOTED ones to upper case regardless, and
+    /// Rocky renders targets quoted. So `FROM main.orders` names the SAME
+    /// object as target `MAIN.ORDERS` even though the probe says case IS
+    /// identity — while `dialect_case_rules` returns `uniform(true)`, whose
+    /// `unquoted_uppercases` is false, so the matcher only reports a near-miss.
+    ///
+    /// An earlier revision dropped the refusal for every `Some(..)`, which left
+    /// the read unrewritten: the model wrote its shadow while reading
+    /// PRODUCTION, exit 0. Resolving it properly needs #1282's unquoted-
+    /// uppercasing axis, so until then `Significant` refuses exactly as `None`.
     #[cfg(feature = "duckdb")]
     #[test]
-    fn observed_case_sensitive_lets_case_differing_targets_route_independently() {
+    fn observed_case_sensitive_still_refuses_a_case_fold_only_reference() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        // Uppercase target, unquoted lowercase read of it.
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "MAIN", "ORDERS");
+        write_model_with_target(
+            &models_dir,
+            "mart",
+            "SELECT id FROM main.orders",
+            "MAIN",
+            "MART",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            Some(rocky_core::traits::CaseSignificance::Significant),
+            false,
+        )
+        .expect_err(
+            "an unquoted lowercase read of an uppercase target names the SAME Snowflake \
+             object, so shadow mode must refuse rather than leave it reading production",
+        );
+        assert!(
+            format!("{err:#}").contains("identifier case is ignored"),
+            "{err:#}"
+        );
+    }
+
+    /// #1281: collision detection folds even under an observed case-SENSITIVE
+    /// connection — the relaxation an earlier revision shipped is reverted.
+    ///
+    /// Red-team review found it introduces a cross-session TOCTOU the
+    /// unconditional fold does not have: the probe runs in its own SQL API
+    /// request, every later statement opens an independent session, and an
+    /// account flipping `QUOTED_IDENTIFIERS_IGNORE_CASE` between probe and DDL
+    /// turns a pair judged distinct into one aliased object that
+    /// `CREATE OR REPLACE` clobbers silently.
+    ///
+    /// The trade is lopsided on purpose: folding costs at most an unnecessary
+    /// refusal, resolved by renaming a target. Not folding costs two models
+    /// writing one shadow table with no error at all.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn collision_folds_even_when_the_connection_is_observed_case_sensitive() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let models_dir = tmp.path().join("models");
         std::fs::create_dir(&models_dir).expect("mkdir models");
@@ -17676,7 +17758,7 @@ auto_create_schemas = true
             })
             .expect("compile models");
 
-        super::apply_shadow_rewrite(
+        let err = super::apply_shadow_rewrite(
             &mut compiled,
             None,
             None,
@@ -17685,25 +17767,13 @@ auto_create_schemas = true
             Some(rocky_core::traits::CaseSignificance::Significant),
             false,
         )
-        .expect("observed case-sensitive: `orders` and `Orders` are two objects, not a collision");
-
-        // And they really did route to DIFFERENT shadow targets — an `Ok`
-        // alone would also be produced by silently routing both to one.
-        let targets: std::collections::BTreeSet<String> = compiled
-            .project
-            .models
-            .iter()
-            .map(|m| {
-                format!(
-                    "{}.{}.{}",
-                    m.config.target.catalog, m.config.target.schema, m.config.target.table
-                )
-            })
-            .collect();
-        assert_eq!(
-            targets.len(),
-            2,
-            "both models must keep distinct shadow targets, got {targets:?}"
+        .expect_err(
+            "a definite case-sensitive observation must NOT unlock collision routing: the \
+             session can change between probe and DDL",
+        );
+        assert!(
+            format!("{err:#}").contains("is shared by selected models"),
+            "{err:#}"
         );
     }
 
