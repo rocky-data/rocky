@@ -333,6 +333,44 @@ fn copy_endpoints(task: &TableTask) -> (TableRef, TableRef) {
     )
 }
 
+/// Build the replication [`ModelIr`] the copy statement is generated from.
+///
+/// Extracted from `process_table` so the source/target split is testable at the
+/// seam that actually emits SQL. [`copy_endpoints`] above splits the two names
+/// correctly and has its own test, but **nothing derived from it reaches the
+/// copy statement** — its `source_table` feeds only the change marker, the
+/// describe, and the row-count check. The statement itself is built from this
+/// `ModelIr`, which is where #1280's split has to hold and where it did not.
+fn replication_model_ir(
+    task: &TableTask,
+    strategy: MaterializationStrategy,
+    governance: GovernanceConfig,
+) -> ModelIr {
+    ModelIr::replication(
+        TargetRef {
+            catalog: task.target_catalog.clone(),
+            schema: task.target_schema.clone(),
+            table: task.target_table_name.clone(),
+        },
+        strategy,
+        SourceRef {
+            catalog: task.source_catalog.clone(),
+            schema: task.source_schema.clone(),
+            // The read keeps the PRODUCTION name — see `TableTask::source_table_name`,
+            // whose doc comment specifies exactly this. #1280 split the field for it;
+            // #1383 then applied the split to `copy_endpoints` and to the target above
+            // but left this one on `target_table_name`, so a shadow-suffix run built
+            // `FROM <source_schema>.<table><suffix>`: normally absent, giving a
+            // misleading "table not found", and — where such a table happened to
+            // exist — silently copying it into the shadow target at exit 0.
+            table: task.source_table_name.clone(),
+        },
+        ColumnSelection::All,
+        task.metadata_columns.clone(),
+        governance,
+    )
+}
+
 #[derive(Clone)]
 struct TableTask {
     source_catalog: String,
@@ -10986,20 +11024,9 @@ async fn process_table(
     let resolved_strategy =
         resolve_merge_update_columns(&strategy, &source_cols, &task.metadata_columns);
 
-    let model_ir = ModelIr::replication(
-        TargetRef {
-            catalog: task.target_catalog.clone(),
-            schema: task.target_schema.clone(),
-            table: task.target_table_name.clone(),
-        },
+    let model_ir = replication_model_ir(
+        task,
         resolved_strategy.clone(),
-        SourceRef {
-            catalog: task.source_catalog.clone(),
-            schema: task.source_schema.clone(),
-            table: task.target_table_name.clone(),
-        },
-        ColumnSelection::All,
-        task.metadata_columns.clone(),
         GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: pipeline.target.governance.auto_create_catalogs,
@@ -13926,6 +13953,108 @@ merge_keys = ["id"]
             source_table.state_key(),
             target_table.state_key(),
             "shadow and production must not share a watermark key"
+        );
+    }
+
+    /// The same split, at the seam that actually EMITS the copy statement.
+    ///
+    /// The sibling test above asserts `copy_endpoints`, and its stated mutation
+    /// does turn it red — but nothing derived from `copy_endpoints` reaches the
+    /// copy SQL. Its `source_table` feeds only the change marker, the describe,
+    /// and the row-count check. The statement is generated from the `ModelIr`
+    /// built by `replication_model_ir`, whose `SourceRef` read
+    /// `target_table_name` from #1383 until this test existed — so the property
+    /// was asserted at one seam and violated at the other, and a test whose own
+    /// comment says "asserting the SOURCE side is the point" passed throughout.
+    ///
+    /// Mutation that must turn this red: `SourceRef.table:
+    /// task.target_table_name.clone()` in `replication_model_ir`. That is the
+    /// state shipped in engine-v1.69.0, where a shadow-suffix replication run
+    /// read `<source_schema>.<table><suffix>` — normally absent, so the run
+    /// failed with a misleading "table not found"; present, so it silently
+    /// copied an unrelated table into the shadow target and exited 0.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_suffix_copy_sql_reads_production_not_the_shadow_target() {
+        use rocky_core::traits::SqlDialect;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let task = TableTask {
+            source_catalog: "cat".into(),
+            source_schema: "raw".into(),
+            target_catalog: "cat".into(),
+            target_schema: "raw".into(),
+            source_table_name: "orders".into(),
+            target_table_name: "orders_rocky_shadow".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            check_column_match: false,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude: vec![],
+            metadata_columns: vec![],
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        };
+
+        let model_ir = super::replication_model_ir(
+            &task,
+            MaterializationStrategy::FullRefresh,
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: true,
+            },
+        );
+
+        assert_eq!(
+            model_ir
+                .source
+                .as_ref()
+                .expect("a replication IR always carries a source")
+                .table,
+            "orders",
+            "the IR the copy is generated from must READ the production table"
+        );
+        assert_eq!(model_ir.target.table, "orders_rocky_shadow");
+
+        // Bind to the emitted statement, not just the struct: this is the
+        // artifact the warehouse executes, and the bug was invisible in every
+        // assertion that stopped short of it.
+        let dialect = DuckDbSqlDialect;
+        let sql = rocky_core::sql_gen::generate_bootstrap_create_table_as_sql(
+            &model_ir,
+            &dialect as &dyn SqlDialect,
+        )
+        .expect("a full-refresh replication IR generates a bootstrap CTAS");
+
+        // Compare against the dialect's own rendering rather than parsing the
+        // statement. `generate_replication_create_table_as_sql` interpolates
+        // `format!("{select_clause}\nFROM {source_ref}")`, so the read is
+        // exactly `FROM ` + whatever `format_table_ref` produces — no quoting
+        // or whitespace assumption of this test's own can drift from it.
+        let rendered = |table: &str| {
+            dialect
+                .format_table_ref("cat", "raw", table)
+                .expect("the fixture identifiers are valid")
+        };
+        let production_read = format!("FROM {}", rendered("orders"));
+        let shadow_read = format!("FROM {}", rendered("orders_rocky_shadow"));
+
+        assert!(
+            sql.contains(&production_read),
+            "the copy must READ production ({production_read}): {sql}"
+        );
+        assert!(
+            !sql.contains(&shadow_read),
+            "the copy must not read its own shadow target ({shadow_read}): {sql}"
+        );
+        assert!(
+            sql.contains(&rendered("orders_rocky_shadow")),
+            "the shadow target must still be what the statement WRITES: {sql}"
         );
     }
 

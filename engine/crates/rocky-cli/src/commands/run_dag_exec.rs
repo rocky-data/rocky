@@ -320,7 +320,7 @@ pub async fn run_with_dag(
     // #1272 was filed because `--dag --shadow` silently wrote production. The
     // obvious repair — thread `shadow_config` into every sub-run — is necessary
     // but NOT sufficient, and shipping it alone would have replaced a visible
-    // wrong with an invisible one. Four independent reasons, each verified:
+    // wrong with an invisible one. Three independent reasons, each verified:
     //
     // 1. **Cross-model reads are not routed.** The DAG dispatches each
     //    transformation model as its own ONE-model sub-run, so
@@ -335,10 +335,15 @@ pub async fn run_with_dag(
     // 2. **Seeds are not routed.** A seed node dispatches to `seed::run_seed`,
     //    which takes no shadow config and DROPs, recreates and repopulates its
     //    CONFIGURED target.
-    // 3. **Replication suffix mode corrupts the SOURCE.** `TableTask` carries one
-    //    `table_name` for both sides and `run()` stores the SUFFIXED name in it,
-    //    so the copy reads `<source_schema>.<table>_rocky_shadow`.
-    // 4. **Snapshot and load are unrouted** and already refuse inside `run()`.
+    // 3. **Snapshot and load are unrouted** and already refuse inside `run()`.
+    //
+    // A fourth reason stood here until the source/target split was finished:
+    // replication suffix mode read `<source_schema>.<table><suffix>`, i.e. its
+    // own shadow target. #1280 split `TableTask` into `source_table_name` /
+    // `target_table_name` and #1383 applied the split, but the replication
+    // `ModelIr`'s `SourceRef` kept the target name until it was fixed, so the
+    // claim outlived the field it described. The three reasons above are
+    // independent of it and the refusal is unchanged.
     //
     // Refusing whole rather than carving out the narrow survivors (a
     // single-model DAG; replication under `schema_override`) is deliberate:
@@ -353,10 +358,9 @@ pub async fn run_with_dag(
              as its own sub-run, so a model's reads of an upstream built by this same run are \
              NOT redirected to that upstream's shadow target — the downstream shadow table would \
              be built from production data and the run would still report success. Seed, \
-             snapshot and load nodes are not routed at all, and replication's suffix mode \
-             rewrites the source it reads. Run the shadow pipeline without `--dag` (a single \
-             `rocky run --shadow` routes every selected model and rewrites the reads between \
-             them), or run the DAG without the flag"
+             snapshot and load nodes are not routed at all. Run the shadow pipeline without \
+             `--dag` (a single `rocky run --shadow` routes every selected model and rewrites \
+             the reads between them), or run the DAG without the flag"
         );
     }
 

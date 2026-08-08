@@ -16,8 +16,9 @@ Shadow mode writes pipeline output to shadow tables instead of (or alongside) pr
 
 :::caution[Where shadow isolation applies]
 Isolation covers a plain `rocky run` over **transformation** pipelines, and
-**replication** pipelines under `--shadow-schema` (or a branch). Everywhere else
-Rocky now refuses the flag instead of running without isolation:
+**replication** pipelines in either mode — `--shadow-suffix` or `--shadow-schema`
+(or a branch). Everywhere else Rocky refuses the flag instead of running without
+isolation:
 
 - **`rocky run --dag`** refuses `--shadow` / `--branch` outright. The DAG runs
   each model as its own sub-run, so a model's reads of an upstream built by the
@@ -25,10 +26,12 @@ Rocky now refuses the flag instead of running without isolation:
   shadow table would be built from production data while the run reported
   success. Run the shadow pipeline without `--dag`.
 - **Snapshot and load** pipelines refuse it: their targets are not rewritten.
-- **Replication in suffix mode** refuses it. The suffix would be applied to the
-  table name that the source read and the target write share, so the run would
-  read `<source_schema>.<table>_rocky_shadow`. Use `--shadow-schema` instead,
-  which moves only the target schema and leaves the source alone.
+Replication supports both shadow modes, and they isolate differently. Under
+`--shadow-suffix` the copy writes `<table><suffix>` **in the pipeline's own
+target schema**, reading the unsuffixed production source. Under
+`--shadow-schema` the whole target schema moves and table names are untouched.
+Prefer the schema override when you want the shadow objects kept away from
+production tables rather than sitting beside them.
 - **Seeds** cause a `--dag` run to be refused along with the rest; `rocky seed`
   itself has no shadow mode and always writes its configured target.
 
