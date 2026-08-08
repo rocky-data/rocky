@@ -62,6 +62,29 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
         Some(self.connector.warehouse())
     }
 
+    /// Read `QUOTED_IDENTIFIERS_IGNORE_CASE` off the live session (#1281).
+    ///
+    /// Rocky renders Snowflake targets DOUBLE-QUOTED (see this crate's
+    /// `dialect::format_table_ref`), so this parameter — and not the unquoted
+    /// upper-casing rule — is what decides whether two of Rocky's targets
+    /// differing only by case are one object or two. `TRUE` makes quoted
+    /// identifiers case-insensitive, i.e. case is NOT part of identity.
+    ///
+    /// Fail-closed by construction: anything other than exactly one row
+    /// carrying a parseable boolean returns `Err`, which every caller reads as
+    /// "keep the conservative behaviour". A wrong definite answer here relaxes
+    /// a safety decision, so an ambiguous response must never be rounded into
+    /// one.
+    async fn identifier_case_significance(
+        &self,
+    ) -> AdapterResult<rocky_core::traits::CaseSignificance> {
+        let result = self
+            .execute_query("SHOW PARAMETERS LIKE 'QUOTED_IDENTIFIERS_IGNORE_CASE'")
+            .await?;
+
+        case_significance_from_show_parameters(&result)
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.connector
             .execute_statement(sql)
@@ -402,6 +425,112 @@ mod tests {
     /// Verifies that the adapter can be constructed and used as a trait object.
     fn _assert_warehouse_adapter_trait_object(_: &dyn WarehouseAdapter) {}
 
+    // ---------------------------------------------------------------- //
+    // `SHOW PARAMETERS` response decoding (#1281)                       //
+    // ---------------------------------------------------------------- //
+
+    /// A `SHOW PARAMETERS` response in the shape the SQL API returns.
+    fn show_parameters(rows: Vec<Vec<serde_json::Value>>) -> rocky_core::traits::QueryResult {
+        rocky_core::traits::QueryResult {
+            columns: ["key", "value", "default", "level", "description", "type"]
+                .iter()
+                .map(|c| (*c).to_string())
+                .collect(),
+            rows,
+        }
+    }
+
+    fn param_row(key: &str, value: &str) -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!(key),
+            serde_json::json!(value),
+            serde_json::json!("false"),
+            serde_json::json!("SESSION"),
+            serde_json::json!("…"),
+            serde_json::json!("BOOLEAN"),
+        ]
+    }
+
+    #[test]
+    fn decodes_both_states_from_a_well_formed_response() {
+        use rocky_core::traits::CaseSignificance;
+
+        assert_eq!(
+            case_significance_from_show_parameters(&show_parameters(vec![param_row(
+                "QUOTED_IDENTIFIERS_IGNORE_CASE",
+                "false"
+            )]))
+            .expect("a well-formed response decodes"),
+            CaseSignificance::Significant,
+            "IGNORE_CASE=false means quoted case IS part of identity"
+        );
+
+        assert_eq!(
+            case_significance_from_show_parameters(&show_parameters(vec![param_row(
+                "QUOTED_IDENTIFIERS_IGNORE_CASE",
+                "true"
+            )]))
+            .expect("a well-formed response decodes"),
+            CaseSignificance::Insignificant
+        );
+    }
+
+    /// `SHOW ... LIKE` takes a SQL `LIKE` pattern and `_` matches any single
+    /// character, so the request is not the literal parameter name. A response
+    /// for a *different* parameter must be an `Err`, never a definite answer —
+    /// a wrong definite answer is the one outcome this probe must not produce.
+    ///
+    /// Mutation that must turn this red: dropping the `key` check.
+    #[test]
+    fn a_response_for_a_different_parameter_is_refused() {
+        let err = case_significance_from_show_parameters(&show_parameters(vec![param_row(
+            // Matches the wildcard pattern; is not the parameter asked for.
+            "QUOTEDxIDENTIFIERSyIGNOREzCASE",
+            "true",
+        )]))
+        .expect_err("a key that is not the parameter asked for must not answer");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("QUOTEDxIDENTIFIERSyIGNOREzCASE") && msg.contains("wildcard"),
+            "the error must name the parameter that actually answered and say why: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_response_never_yields_a_definite_answer() {
+        // Zero rows, and more than one row: both leave "which is the session's
+        // value?" unanswered.
+        for rows in [
+            vec![],
+            vec![
+                param_row("QUOTED_IDENTIFIERS_IGNORE_CASE", "true"),
+                param_row("QUOTED_IDENTIFIERS_IGNORE_CASE", "false"),
+            ],
+        ] {
+            assert!(
+                case_significance_from_show_parameters(&show_parameters(rows)).is_err(),
+                "a row count other than exactly 1 must be an error"
+            );
+        }
+
+        // A row shorter than its column list.
+        let mut short = show_parameters(vec![vec![serde_json::json!(
+            "QUOTED_IDENTIFIERS_IGNORE_CASE"
+        )]]);
+        assert!(
+            case_significance_from_show_parameters(&short).is_err(),
+            "a short row must be an error, not a missing value read as false"
+        );
+
+        // The `key` column absent entirely.
+        short = show_parameters(vec![param_row("QUOTED_IDENTIFIERS_IGNORE_CASE", "true")]);
+        short.columns[0] = "not_key".into();
+        assert!(
+            case_significance_from_show_parameters(&short).is_err(),
+            "without a `key` column the answer cannot be attributed to a parameter"
+        );
+    }
+
     /// Verifies construction compiles and the dialect is correct.
     #[test]
     fn test_adapter_construction() {
@@ -497,5 +626,186 @@ mod tests {
 
         // Just verify we can access the connector without panic
         let _connector_ref = adapter.connector();
+    }
+}
+
+/// The parameter this probe reads. Also the value the response's `key` column
+/// must carry back, which is what makes the wildcard below harmless.
+const QUOTED_IDENTIFIERS_IGNORE_CASE: &str = "QUOTED_IDENTIFIERS_IGNORE_CASE";
+
+/// Decode a whole `SHOW PARAMETERS` response into a [`CaseSignificance`] (#1281).
+///
+/// Separate from the cell decoder so the *response shape* is testable, not just
+/// the value: a probe whose only job is to be trustworthy later has to reject a
+/// wrong row as firmly as a wrong value.
+///
+/// **Why the `key` is checked.** `SHOW ... LIKE` takes a SQL `LIKE` pattern, in
+/// which `_` matches any single character — so the pattern this sends is not the
+/// literal parameter name, and a Snowflake parameter named
+/// `QUOTEDxIDENTIFIERSyIGNOREzCASE` would match it. No such parameter exists
+/// today, and none is likely to; but the cost of finding out the hard way is a
+/// *wrong definite answer*, which is the one outcome this whole capability must
+/// not produce. Validating the returned `key` closes that off without editing
+/// the request. Escaping the underscores would too, but it would change the
+/// exact string that was live-verified against a real account, and an assertion
+/// on the response is cheaper to be sure of than a new pattern that cannot
+/// currently be re-verified.
+///
+/// Everything here fails closed: a missing column, a row count other than one,
+/// a short row, or a `key` that is not the parameter asked for all return `Err`.
+fn case_significance_from_show_parameters(
+    result: &rocky_core::traits::QueryResult,
+) -> AdapterResult<rocky_core::traits::CaseSignificance> {
+    // Locate columns BY NAME. `SHOW PARAMETERS` returns
+    // key/value/default/level/description/type, and pinning the ordinal would
+    // silently read `default` (the adjacent column, and frequently the same
+    // text) if Snowflake ever reorders them.
+    let column = |want: &str| {
+        result
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(want))
+            .ok_or_else(|| {
+                AdapterError::msg(format!(
+                    "SHOW PARAMETERS returned no `{want}` column (got {:?}), so \
+                     {QUOTED_IDENTIFIERS_IGNORE_CASE} could not be read",
+                    result.columns
+                ))
+            })
+    };
+    let key_idx = column("key")?;
+    let value_idx = column("value")?;
+
+    let [row] = result.rows.as_slice() else {
+        return Err(AdapterError::msg(format!(
+            "SHOW PARAMETERS LIKE '{QUOTED_IDENTIFIERS_IGNORE_CASE}' returned {} rows, \
+             expected exactly 1 — refusing to guess which one is the session's value",
+            result.rows.len()
+        )));
+    };
+
+    let short_row = || AdapterError::msg("SHOW PARAMETERS row is shorter than its column list");
+
+    let key = row
+        .get(key_idx)
+        .ok_or_else(short_row)?
+        .as_str()
+        .ok_or_else(|| AdapterError::msg("SHOW PARAMETERS `key` is not a string"))?;
+    if !key
+        .trim()
+        .eq_ignore_ascii_case(QUOTED_IDENTIFIERS_IGNORE_CASE)
+    {
+        return Err(AdapterError::msg(format!(
+            "SHOW PARAMETERS LIKE '{QUOTED_IDENTIFIERS_IGNORE_CASE}' answered for \
+             parameter {key:?} instead — `_` is a LIKE wildcard, so the pattern \
+             matched something else and this value must not be read as the answer"
+        )));
+    }
+
+    case_significance_from_parameter_cell(row.get(value_idx).ok_or_else(short_row)?)
+}
+
+/// Map a `SHOW PARAMETERS` `value` cell to a [`CaseSignificance`] (#1281).
+///
+/// Extracted from [`SnowflakeWarehouseAdapter::identifier_case_significance`]
+/// so BOTH states are testable. The live sandbox reports `false`, and its
+/// account is suspended, so `ALTER SESSION` (which needs compute) cannot flip
+/// it — the `true` branch is reachable only here.
+///
+/// `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` means quoted identifiers are
+/// resolved case-INsensitively, so case is NOT part of object identity.
+///
+/// Anything unparseable is an `Err`, never a default. Rounding an unknown
+/// value to either state would hand a caller a definite answer it can relax a
+/// safety decision on.
+fn case_significance_from_parameter_cell(
+    cell: &serde_json::Value,
+) -> AdapterResult<rocky_core::traits::CaseSignificance> {
+    use rocky_core::traits::CaseSignificance;
+
+    // The SQL API renders this as the STRING "true"/"false"; a driver that
+    // types it natively would give a JSON bool. Accept both rather than assume
+    // the wire shape (#1153 is the same lesson on query cells).
+    let ignore_case = match cell {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            other => {
+                return Err(AdapterError::msg(format!(
+                    "QUOTED_IDENTIFIERS_IGNORE_CASE has unparseable value {other:?}"
+                )));
+            }
+        },
+        other => {
+            return Err(AdapterError::msg(format!(
+                "QUOTED_IDENTIFIERS_IGNORE_CASE has unexpected JSON type: {other}"
+            )));
+        }
+    };
+
+    Ok(if ignore_case {
+        CaseSignificance::Insignificant
+    } else {
+        CaseSignificance::Significant
+    })
+}
+
+#[cfg(test)]
+mod case_significance_tests {
+    use super::case_significance_from_parameter_cell as parse;
+    use rocky_core::traits::CaseSignificance;
+    use serde_json::json;
+
+    /// #1281 acceptance: BOTH states, not just the account's default.
+    ///
+    /// `true` is unreachable on the live sandbox — flipping it needs
+    /// `ALTER SESSION`, which needs compute, which the lapsed trial refuses —
+    /// so this is the only place that branch is exercised. Stated plainly
+    /// rather than implied, because a reader would otherwise assume the live
+    /// test covers both.
+    #[test]
+    fn both_states_map_to_the_right_significance() {
+        assert_eq!(
+            parse(&json!("false")).unwrap(),
+            CaseSignificance::Significant,
+            "IGNORE_CASE=false: quoted identifiers are case-sensitive, so case IS identity"
+        );
+        assert_eq!(
+            parse(&json!("true")).unwrap(),
+            CaseSignificance::Insignificant,
+            "IGNORE_CASE=true: quoted identifiers fold, so case is NOT identity"
+        );
+    }
+
+    /// Snowflake's SQL API sends strings; a natively-typed driver would send a
+    /// JSON bool. Neither shape may be the one that silently fails.
+    #[test]
+    fn accepts_both_wire_shapes_and_surrounding_whitespace() {
+        assert_eq!(
+            parse(&json!(true)).unwrap(),
+            CaseSignificance::Insignificant
+        );
+        assert_eq!(parse(&json!(false)).unwrap(), CaseSignificance::Significant);
+        assert_eq!(
+            parse(&json!("  TRUE  ")).unwrap(),
+            CaseSignificance::Insignificant,
+            "case and padding are the API's formatting, not a different answer"
+        );
+    }
+
+    /// Fail-closed: an unrecognized value is an error, NOT a default.
+    ///
+    /// Defaulting either way would be worse than erroring — the caller relaxes
+    /// a safety decision on a definite answer, and an invented one is
+    /// indistinguishable from an observed one at the call site.
+    #[test]
+    fn an_unparseable_value_errors_rather_than_defaulting() {
+        for bad in [json!("yes"), json!("1"), json!(""), json!(1), json!(null)] {
+            assert!(
+                parse(&bad).is_err(),
+                "{bad:?} must not be rounded into a definite answer"
+            );
+        }
     }
 }
