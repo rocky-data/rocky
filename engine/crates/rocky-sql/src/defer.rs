@@ -343,6 +343,28 @@ impl CollisionIdentity {
     pub fn of_qualified(qualified: &str) -> Self {
         Self(qualified.to_lowercase())
     }
+
+    /// Build WITHOUT folding, for a connection that has been *observed* to
+    /// treat identifier case as part of object identity (#1281).
+    ///
+    /// A deliberately separate constructor rather than a `rules` parameter on
+    /// [`Self::of`]. Folding is this type's whole reason to exist: it answers
+    /// "could these two be the SAME object?", where a wrong "no" lets two
+    /// models write one table with no error at all. Making that behaviour
+    /// configurable through the main constructor would put the fail-open
+    /// choice one argument away at every call site; making it a named
+    /// constructor means every relaxation is greppable and has to be argued
+    /// for where it is written.
+    ///
+    /// **Only reachable from a definite probe result.** "Assumed
+    /// case-sensitive", "the dialect is usually case-sensitive", and "the
+    /// probe failed" must all keep using [`Self::of`] — an assumption is
+    /// exactly what this constructor must not encode, because unlike the
+    /// reference-matching question, guessing wrong here is silent.
+    #[must_use]
+    pub fn of_observed_case_sensitive(catalog: &str, schema: &str, table: &str) -> Self {
+        Self(format!("{catalog}.{schema}.{table}"))
+    }
 }
 
 impl std::fmt::Display for CollisionIdentity {
@@ -831,6 +853,23 @@ impl VisitorMut for DeferRewriter<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// #1281: the folding dialects see NO behaviour change from the probe.
+    ///
+    /// DuckDB, Databricks and Trino answer `Insignificant`, which routes
+    /// `case_rules` through `all_insensitive()`, where before the probe they
+    /// went through `uniform(false)`. The relaxation is only safe to describe
+    /// as "no change for these three" if those two are the same value — so
+    /// pin it rather than assert it in a PR body.
+    #[test]
+    fn uniform_false_and_all_insensitive_are_the_same_rules() {
+        assert_eq!(
+            super::IdentifierCaseRules::uniform(false),
+            super::IdentifierCaseRules::all_insensitive(),
+            "a folding dialect's rules must not change depending on which \
+             constructor produced them"
+        );
+    }
+
     use super::*;
 
     fn target(catalog: &str, schema: &str, table: &str) -> DeferTarget {

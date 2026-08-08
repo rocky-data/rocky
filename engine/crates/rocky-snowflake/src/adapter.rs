@@ -62,6 +62,57 @@ impl WarehouseAdapter for SnowflakeWarehouseAdapter {
         Some(self.connector.warehouse())
     }
 
+    /// Read `QUOTED_IDENTIFIERS_IGNORE_CASE` off the live session (#1281).
+    ///
+    /// Rocky renders Snowflake targets DOUBLE-QUOTED (see this crate's
+    /// `dialect::format_table_ref`), so this parameter — and not the unquoted
+    /// upper-casing rule — is what decides whether two of Rocky's targets
+    /// differing only by case are one object or two. `TRUE` makes quoted
+    /// identifiers case-insensitive, i.e. case is NOT part of identity.
+    ///
+    /// Fail-closed by construction: anything other than exactly one row
+    /// carrying a parseable boolean returns `Err`, which every caller reads as
+    /// "keep the conservative behaviour". A wrong definite answer here relaxes
+    /// a safety decision, so an ambiguous response must never be rounded into
+    /// one.
+    async fn identifier_case_significance(
+        &self,
+    ) -> AdapterResult<rocky_core::traits::CaseSignificance> {
+        let result = self
+            .execute_query("SHOW PARAMETERS LIKE 'QUOTED_IDENTIFIERS_IGNORE_CASE'")
+            .await?;
+
+        // Locate `value` BY NAME. `SHOW PARAMETERS` returns
+        // key/value/default/level/description/type, and pinning the ordinal
+        // would silently read `default` (the adjacent column, and frequently
+        // the same text) if Snowflake ever reorders them.
+        let value_idx = result
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case("value"))
+            .ok_or_else(|| {
+                AdapterError::msg(format!(
+                    "SHOW PARAMETERS returned no `value` column (got {:?}), so \
+                     QUOTED_IDENTIFIERS_IGNORE_CASE could not be read",
+                    result.columns
+                ))
+            })?;
+
+        let [row] = result.rows.as_slice() else {
+            return Err(AdapterError::msg(format!(
+                "SHOW PARAMETERS LIKE 'QUOTED_IDENTIFIERS_IGNORE_CASE' returned {} rows, \
+                 expected exactly 1 — refusing to guess which one is the session's value",
+                result.rows.len()
+            )));
+        };
+
+        let cell = row.get(value_idx).ok_or_else(|| {
+            AdapterError::msg("SHOW PARAMETERS row is shorter than its column list")
+        })?;
+
+        case_significance_from_parameter_cell(cell)
+    }
+
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()> {
         self.connector
             .execute_statement(sql)
@@ -497,5 +548,110 @@ mod tests {
 
         // Just verify we can access the connector without panic
         let _connector_ref = adapter.connector();
+    }
+}
+
+/// Map a `SHOW PARAMETERS` `value` cell to a [`CaseSignificance`] (#1281).
+///
+/// Extracted from [`SnowflakeWarehouseAdapter::identifier_case_significance`]
+/// so BOTH states are testable. The live sandbox reports `false`, and its
+/// account is suspended, so `ALTER SESSION` (which needs compute) cannot flip
+/// it — the `true` branch is reachable only here.
+///
+/// `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` means quoted identifiers are
+/// resolved case-INsensitively, so case is NOT part of object identity.
+///
+/// Anything unparseable is an `Err`, never a default. Rounding an unknown
+/// value to either state would hand a caller a definite answer it can relax a
+/// safety decision on.
+fn case_significance_from_parameter_cell(
+    cell: &serde_json::Value,
+) -> AdapterResult<rocky_core::traits::CaseSignificance> {
+    use rocky_core::traits::CaseSignificance;
+
+    // The SQL API renders this as the STRING "true"/"false"; a driver that
+    // types it natively would give a JSON bool. Accept both rather than assume
+    // the wire shape (#1153 is the same lesson on query cells).
+    let ignore_case = match cell {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" => true,
+            "false" => false,
+            other => {
+                return Err(AdapterError::msg(format!(
+                    "QUOTED_IDENTIFIERS_IGNORE_CASE has unparseable value {other:?}"
+                )));
+            }
+        },
+        other => {
+            return Err(AdapterError::msg(format!(
+                "QUOTED_IDENTIFIERS_IGNORE_CASE has unexpected JSON type: {other}"
+            )));
+        }
+    };
+
+    Ok(if ignore_case {
+        CaseSignificance::Insignificant
+    } else {
+        CaseSignificance::Significant
+    })
+}
+
+#[cfg(test)]
+mod case_significance_tests {
+    use super::case_significance_from_parameter_cell as parse;
+    use rocky_core::traits::CaseSignificance;
+    use serde_json::json;
+
+    /// #1281 acceptance: BOTH states, not just the account's default.
+    ///
+    /// `true` is unreachable on the live sandbox — flipping it needs
+    /// `ALTER SESSION`, which needs compute, which the lapsed trial refuses —
+    /// so this is the only place that branch is exercised. Stated plainly
+    /// rather than implied, because a reader would otherwise assume the live
+    /// test covers both.
+    #[test]
+    fn both_states_map_to_the_right_significance() {
+        assert_eq!(
+            parse(&json!("false")).unwrap(),
+            CaseSignificance::Significant,
+            "IGNORE_CASE=false: quoted identifiers are case-sensitive, so case IS identity"
+        );
+        assert_eq!(
+            parse(&json!("true")).unwrap(),
+            CaseSignificance::Insignificant,
+            "IGNORE_CASE=true: quoted identifiers fold, so case is NOT identity"
+        );
+    }
+
+    /// Snowflake's SQL API sends strings; a natively-typed driver would send a
+    /// JSON bool. Neither shape may be the one that silently fails.
+    #[test]
+    fn accepts_both_wire_shapes_and_surrounding_whitespace() {
+        assert_eq!(
+            parse(&json!(true)).unwrap(),
+            CaseSignificance::Insignificant
+        );
+        assert_eq!(parse(&json!(false)).unwrap(), CaseSignificance::Significant);
+        assert_eq!(
+            parse(&json!("  TRUE  ")).unwrap(),
+            CaseSignificance::Insignificant,
+            "case and padding are the API's formatting, not a different answer"
+        );
+    }
+
+    /// Fail-closed: an unrecognized value is an error, NOT a default.
+    ///
+    /// Defaulting either way would be worse than erroring — the caller relaxes
+    /// a safety decision on a definite answer, and an invented one is
+    /// indistinguishable from an observed one at the call site.
+    #[test]
+    fn an_unparseable_value_errors_rather_than_defaulting() {
+        for bad in [json!("yes"), json!("1"), json!(""), json!(1), json!(null)] {
+            assert!(
+                parse(&bad).is_err(),
+                "{bad:?} must not be rounded into a definite answer"
+            );
+        }
     }
 }
