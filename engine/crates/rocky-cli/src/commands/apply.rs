@@ -3415,6 +3415,55 @@ async fn run_apply_backfill_plan(
 /// the adapter surfaces them) is treated as drift and aborts the apply with
 /// a clear "re-plan and re-apply" error. The check happens BEFORE any SQL
 /// is emitted to the warehouse.
+/// Rebuild the shadow routing a [`ReplicationPlan`] captured (#1403).
+///
+/// Deliberately the same shape as the `RunPlan` arm's reconstruction, branch
+/// lookup included. `--branch` is internally `--shadow --shadow-schema
+/// <branch.schema_prefix>` and clap rejects it alongside the shadow flags, so a
+/// branch plan carries `shadow == false` — consulting only `shadow` would
+/// replay it as a PRODUCTION run.
+///
+/// Extracted rather than inlined so the mapping is testable without standing up
+/// an apply. The defect this fixes was invisible precisely because the decision
+/// lived inside a long async function as a literal `None`.
+///
+/// `state_path` is read ONLY on the branch arm; the other arms never open the
+/// store, so a caller with no branch cannot fail here on an unreadable path.
+fn replication_shadow_config(
+    replication_plan: &ReplicationPlan,
+    state_path: &Path,
+) -> Result<Option<rocky_core::shadow::ShadowConfig>> {
+    // Mirrors the `RunPlan` arm: clap gives `--shadow-suffix` a default, and
+    // the CLI drops it before it reaches a plan unless shadow was requested, so
+    // a `None` here means "not a shadow plan" rather than "defaulted".
+    let suffix = replication_plan
+        .shadow_suffix
+        .clone()
+        .unwrap_or_else(|| "_rocky_shadow".to_string());
+
+    if let Some(ref name) = replication_plan.branch {
+        let store = rocky_core::state::StateStore::open_read_only(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        let record = store.get_branch(name)?.with_context(|| {
+            format!("branch '{name}' not found — create it with `rocky branch create {name}`")
+        })?;
+        return Ok(Some(rocky_core::shadow::ShadowConfig {
+            suffix,
+            schema_override: Some(record.schema_prefix),
+            cleanup_after: false,
+        }));
+    }
+    Ok(if replication_plan.shadow {
+        Some(rocky_core::shadow::ShadowConfig {
+            suffix,
+            schema_override: replication_plan.shadow_schema.clone(),
+            cleanup_after: false,
+        })
+    } else {
+        None
+    })
+}
+
 async fn run_apply_replication_plan(
     root: &Path,
     config_path: &Path,
@@ -3546,6 +3595,8 @@ async fn run_apply_replication_plan(
     // plan's policy checks.
     let apply_run_id = new_apply_run_id();
 
+    let replication_shadow_config = replication_shadow_config(&replication_plan, state_path)?;
+
     crate::commands::run::run(
         config_path,
         // Execute-from-owned: the SAME snapshot the drift check read (#1120).
@@ -3563,9 +3614,10 @@ async fn run_apply_replication_plan(
         false,
         replication_plan.resume.as_deref(),
         replication_plan.resume_latest,
-        // No shadow config — branch promote and shadow paths are
-        // independent of replication-plan replay.
-        None,
+        // Shadow routing replays, exactly as it does for a `RunPlan` (#1403).
+        // Passing `None` here meant `rocky plan --shadow` was accepted and then
+        // applied against PRODUCTION, reporting Success — the #1272 shape.
+        replication_shadow_config.as_ref(),
         &partition_opts,
         // No model filter — replication runs every discovered table.
         None,
@@ -7347,6 +7399,119 @@ schema_template = "s__{source}"
     // Replication plan (Phase 5b)
     // ------------------------------------------------------------------
 
+    /// #1403: a non-shadow replication plan must serialize exactly as it did
+    /// before the shadow fields existed.
+    ///
+    /// `plan_id` is `blake3({kind, payload})` (`plan_store.rs`), so a field that
+    /// always emits — the shape `RunPlan.shadow` uses — would hand every
+    /// unchanged replication project a brand-new plan id on upgrade, for a
+    /// feature it does not use. `skip_serializing_if` is what prevents that,
+    /// and nothing else in the type system will notice if it is removed.
+    ///
+    /// Mutation that must turn this red: drop `skip_serializing_if` from any of
+    /// the four fields.
+    #[test]
+    fn a_non_shadow_replication_plan_serializes_without_the_shadow_keys() {
+        let value = serde_json::to_value(minimal_replication_plan()).unwrap();
+        let obj = value.as_object().expect("a plan payload is a JSON object");
+        for key in ["shadow", "shadow_suffix", "shadow_schema", "branch"] {
+            assert!(
+                !obj.contains_key(key),
+                "`{key}` must be absent from a non-shadow plan — its presence \
+                 changes plan_id for every existing project: {value}"
+            );
+        }
+    }
+
+    /// #1403: the routing a plan captured is what apply replays.
+    ///
+    /// Mutation that must turn this red: returning `None` unconditionally,
+    /// which is exactly what the replication arm did — `rocky plan --shadow`
+    /// was accepted, discarded, and applied against production at exit 0.
+    #[test]
+    fn a_shadow_replication_plan_replays_its_routing() {
+        let unused = std::path::Path::new("/nonexistent/state.redb");
+
+        let mut plan = minimal_replication_plan();
+        plan.shadow = true;
+        plan.shadow_suffix = Some("_pr".to_string());
+        let cfg = replication_shadow_config(&plan, unused)
+            .expect("no branch means the state store is never opened")
+            .expect("a shadow plan must replay a shadow config");
+        assert_eq!(cfg.suffix, "_pr");
+        assert_eq!(cfg.schema_override, None);
+
+        let mut schema_plan = minimal_replication_plan();
+        schema_plan.shadow = true;
+        schema_plan.shadow_schema = Some("shadow_s".to_string());
+        let cfg = replication_shadow_config(&schema_plan, unused)
+            .unwrap()
+            .expect("a schema-override shadow plan must replay a shadow config");
+        assert_eq!(cfg.schema_override.as_deref(), Some("shadow_s"));
+
+        // The control: a plan that did not ask for shadow must still apply
+        // against production. A fix that turned every replication apply into a
+        // shadow run would be worse than the bug.
+        assert!(
+            replication_shadow_config(&minimal_replication_plan(), unused)
+                .unwrap()
+                .is_none(),
+            "a non-shadow plan must not acquire a shadow config"
+        );
+    }
+
+    /// `--branch` is the case the other tests cannot reach, and the one most
+    /// likely to be got wrong: clap rejects it alongside the shadow flags, so a
+    /// branch plan carries `shadow == false` and looks like a production plan
+    /// to anything that only consults `shadow`.
+    ///
+    /// Needs a real state store because the schema prefix lives in the branch
+    /// record, not the plan — which is why this arm is unreachable from an
+    /// in-memory test, and why it had no coverage until red-team review asked.
+    ///
+    /// Mutations that must turn this red: persisting `branch: None`, or
+    /// returning `None` from the branch arm. Both leave the two tests above
+    /// green while restoring production routing for every branch plan.
+    #[test]
+    fn a_branch_replication_plan_replays_the_branch_schema() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .put_branch(&rocky_core::state::BranchRecord {
+                    name: "feature_x".to_string(),
+                    schema_prefix: "branch__feature_x".to_string(),
+                    created_by: "test".to_string(),
+                    created_at: chrono::Utc::now(),
+                    description: None,
+                })
+                .unwrap();
+        }
+
+        let mut plan = minimal_replication_plan();
+        plan.branch = Some("feature_x".to_string());
+        // A branch plan really does carry `shadow == false` — asserted rather
+        // than assumed, because the whole finding rests on it.
+        assert!(!plan.shadow);
+
+        let cfg = replication_shadow_config(&plan, &state_path)
+            .expect("the branch record exists")
+            .expect("a branch plan must replay as a shadow run, not production");
+        assert_eq!(cfg.schema_override.as_deref(), Some("branch__feature_x"));
+
+        // An unknown branch must fail loudly rather than silently degrade to a
+        // production run — the failure mode this whole PR is about.
+        let mut missing = minimal_replication_plan();
+        missing.branch = Some("no_such_branch".to_string());
+        let err = replication_shadow_config(&missing, &state_path)
+            .expect_err("an unknown branch must not resolve to production routing");
+        assert!(
+            err.to_string().contains("no_such_branch"),
+            "the error must name the branch: {err}"
+        );
+    }
+
     fn minimal_replication_plan() -> ReplicationPlan {
         ReplicationPlan {
             filter: Some("source=orders".to_string()),
@@ -7355,6 +7520,10 @@ schema_template = "s__{source}"
             idempotency_key: None,
             resume: None,
             resume_latest: false,
+            shadow: false,
+            shadow_suffix: None,
+            shadow_schema: None,
+            branch: None,
             governance_override: None,
             config_snapshot: serde_json::json!({"adapter": {"default": {"type": "duckdb"}}}),
             source_state_snapshot: vec![ReplicationConnectorSnapshot {

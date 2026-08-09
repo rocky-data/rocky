@@ -3730,6 +3730,33 @@ pub struct ReplicationPlan {
     /// apply time, like `RunPlan.resume_latest`.
     #[serde(default)]
     pub resume_latest: bool,
+    /// Run in shadow mode (`--shadow`), with `shadow_suffix` / `shadow_schema`
+    /// describing the shadow target — the same contract as [`RunPlan`].
+    ///
+    /// Skipped when `false`, unlike `RunPlan.shadow` which always serializes.
+    /// `plan_id` is `blake3({kind, payload})`, so emitting `"shadow": false`
+    /// would give every unchanged replication project a new plan id purely
+    /// because these fields were added. The asymmetry with `RunPlan` is
+    /// deliberate and costs nothing: a plan that did not request shadow reads
+    /// back identically either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shadow: bool,
+    /// Suffix appended to table names in shadow mode (`--shadow-suffix`).
+    ///
+    /// `None` when shadow was not requested — the CLI normalises clap's
+    /// `_rocky_shadow` default away before it reaches the plan, so this never
+    /// carries a default nobody asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_suffix: Option<String>,
+    /// Override schema for shadow tables (`--shadow-schema`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_schema: Option<String>,
+    /// `--branch <name>`. Internally equivalent to `--shadow --shadow-schema
+    /// <branch.schema_prefix>`, and clap rejects it combined with either, so
+    /// `shadow` is `false` when this is set — persisting it is what stops a
+    /// branch run from replaying as a production run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Governance override resolved at plan time from
     /// `--governance-override`.
     #[serde(skip_serializing_if = "Option::is_none")]

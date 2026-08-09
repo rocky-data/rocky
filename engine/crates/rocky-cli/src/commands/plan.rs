@@ -1306,6 +1306,19 @@ pub(crate) fn build_source_state_snapshot(
 /// the project has no `models/` directory or when compile produced
 /// zero models. Discovery has already happened earlier in `plan()`;
 /// this function only canonicalizes the result and persists.
+/// Keep a shadow descriptor only when shadow routing is actually requested.
+///
+/// `--shadow-suffix` / `--shadow-schema` are accepted without `--shadow`, where
+/// they are inert. Returning `None` there keeps a production plan's payload —
+/// and therefore its `plan_id` — exactly as it was before these fields existed.
+fn shadow_descriptor(run_options: &PlanRunOptions, value: Option<&String>) -> Option<String> {
+    if run_options.shadow || run_options.branch.is_some() {
+        value.cloned()
+    } else {
+        None
+    }
+}
+
 fn build_and_persist_replication_plan(
     rocky_cfg: &rocky_core::config::RockyConfig,
     connectors: &[DiscoveredConnector],
@@ -1325,6 +1338,25 @@ fn build_and_persist_replication_plan(
         idempotency_key: run_options.idempotency_key.clone(),
         resume: run_options.resume.clone(),
         resume_latest: run_options.resume_latest,
+        // Shadow routing IS part of a persisted plan's contract — the same
+        // reason the `RunPlan` branch captures it. Dropping it here was #1403:
+        // `rocky plan --shadow` was accepted, silently discarded, and
+        // `rocky apply` then wrote the PRODUCTION targets and reported
+        // Success. That is the #1272 defect shape, one plan kind over.
+        shadow: run_options.shadow,
+        // Only carry the descriptors when the plan is actually a shadow plan.
+        // `--shadow-schema` and `--shadow-suffix` are accepted WITHOUT
+        // `--shadow` (only `--branch` conflicts with them), and such a run is
+        // still a production run. Persisting an inert flag would add a payload
+        // key — and so a new `plan_id` — to a plan whose behaviour is
+        // unchanged. `main.rs` already applies exactly this normalisation to
+        // `shadow_suffix` before it reaches `PlanRunOptions`, and for the same
+        // stated reason; `shadow_schema` is not normalised there, so it is
+        // handled here rather than widening that path and shifting `RunPlan`
+        // ids too.
+        shadow_suffix: shadow_descriptor(run_options, run_options.shadow_suffix.as_ref()),
+        shadow_schema: shadow_descriptor(run_options, run_options.shadow_schema.as_ref()),
+        branch: run_options.branch.clone(),
         governance_override: run_options.governance_override.clone(),
         config_snapshot,
         source_state_snapshot,
@@ -2207,6 +2239,58 @@ mod tests {
 
     use super::*;
     use rocky_ir::MaskStrategy;
+
+    /// #1403: an inert shadow descriptor must not reach the payload.
+    ///
+    /// `--shadow-suffix` / `--shadow-schema` are accepted WITHOUT `--shadow`
+    /// (only `--branch` conflicts with them), and such a run is a production
+    /// run. Persisting the flag anyway adds a payload key to a plan whose
+    /// behaviour is unchanged, and `plan_id` is `blake3({kind, payload})` — so
+    /// an existing project's plan id would move for a flag that does nothing.
+    ///
+    /// Found by red-team review: the first revision of this fix persisted
+    /// `shadow_schema` unconditionally and shifted exactly that id.
+    ///
+    /// Mutation that must turn this red: returning `value.cloned()`
+    /// unconditionally from `shadow_descriptor`.
+    #[test]
+    fn an_inert_shadow_descriptor_is_not_persisted() {
+        let schema = "shadow_s".to_string();
+
+        let inert = PlanRunOptions {
+            shadow: false,
+            branch: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            shadow_descriptor(&inert, Some(&schema)),
+            None,
+            "without --shadow or --branch the descriptor is inert and must not \
+             enter the payload"
+        );
+
+        let shadowed = PlanRunOptions {
+            shadow: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            shadow_descriptor(&shadowed, Some(&schema)).as_deref(),
+            Some("shadow_s"),
+            "under --shadow the descriptor must be persisted"
+        );
+
+        let branched = PlanRunOptions {
+            shadow: false,
+            branch: Some("feature_x".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            shadow_descriptor(&branched, Some(&schema)).as_deref(),
+            Some("shadow_s"),
+            "a branch plan carries shadow == false, so branch must also keep \
+             the descriptor"
+        );
+    }
 
     // ------------------------------------------------------------------
     // replication copy preview — strategy / override fidelity (bug fix:
