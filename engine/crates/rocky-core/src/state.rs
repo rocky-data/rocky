@@ -808,12 +808,13 @@ impl StateStore {
     /// handle that re-reads pages. A request-local store can never reuse its
     /// cache — it is dropped one response later — yet a full-table read
     /// (`list_runs` pass 1 visits every `RUN_HISTORY` row) fills the cache
-    /// with pages the process immediately frees. On Linux/glibc those freed
-    /// transients are retained as allocator high-water, so a polled
-    /// `GET /api/v1/runs` ratchets serve's RSS with history size: measured
-    /// +8.6 MB retained per request at 1,435 rows under the default budget
-    /// vs +1.0 MB under a 1 MiB budget, with request latency unchanged
-    /// (#1399). Callers holding a store open to serve repeated reads should
+    /// with pages the process immediately frees. Freeing them does not return
+    /// the RSS on Linux/glibc — measured, not a proven allocator mechanism —
+    /// so a polled `GET /api/v1/runs` ratchets serve's RSS with history size:
+    /// one request retained +8.6 MB at 1,435 rows and +211 MB at 50,000 rows
+    /// under the default budget, vs +1.0 MB and +4.0 MB under a 1 MiB budget,
+    /// with no latency cost (p99 187ms vs 205ms at 50,000 rows) — #1399.
+    /// Callers holding a store open to serve repeated reads should
     /// keep using [`open_read_only`][Self::open_read_only] — a real cache
     /// helps there.
     pub fn open_read_only_with_cache(path: &Path, cache_bytes: usize) -> Result<Self, StateError> {
