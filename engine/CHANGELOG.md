@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.70.0] - 2026-08-10
+
+### Fixed
+
+- **A shadow replication run read the table it was about to write.** This is a regression introduced in 1.69.0 and present in every 1.69.0 binary. #1280 split `TableTask`'s single `table_name` into `source_table_name` (always the production object) and `target_table_name` (suffixed under `--shadow`), and the copy's endpoints were split correctly — but the `ModelIr` the run actually generates SQL from kept `target_table_name` in its `SourceRef`. Nothing derived from the corrected endpoints reaches the emitted statement, so under `--shadow-suffix` the copy read `<table><suffix>` instead of `<table>`.
+
+  Normally that object does not exist and the run fails with a misleading "table not found". Where a table by that name did exist — a previous shadow run's output, most plausibly — the copy silently sourced the wrong one and reported success. The source name is now read through a single function shared by both paths, so the two cannot drift apart again, and the regression test binds to the *emitted SQL* rather than to an intermediate structure: the seam that was already covered is not the seam that was broken. (#1406)
+
+- **`rocky plan --shadow` was accepted, silently dropped, and then applied against production.** `ReplicationPlan` persisted no shadow routing at all — no `shadow`, `shadow_suffix`, `shadow_schema` or `branch` — although `RunPlan` has persisted exactly those fields for some time and `apply` reconstructs a `ShadowConfig` from them on the transformation path. So `rocky plan --shadow` on a replication-only project produced a plan indistinguishable from a production one, and the subsequent `rocky apply` wrote production and exited 0 reporting Success. Unlike #1406 this was not a 1.69.0 regression; the fields were absent in 1.68.0 too.
+
+  The four fields are now persisted and replayed, including branch routing, which resolves the branch's schema prefix from the state store at apply time. They are written only when the plan is genuinely a shadow or branch plan: `--shadow-schema` without `--shadow` is accepted by the argument parser and remains a production run, and persisting an inert descriptor would have shifted `plan_id` — a blake3 of the payload — for existing projects. (#1408)
+
+- **Row counts and checksums format their identifiers with the adapter's own dialect.** `rocky compare` counted an unquoted identifier, so on Snowflake, where an unquoted reference resolves uppercase, a table whose name is not already uppercase could be verified against a *different* object than the one named — or fail to resolve at all. Both the row-count and checksum paths now render table references through the dialect rather than by string interpolation. (#1400, closes #1396)
+
+- **`rocky doctor` named the wrong writers in its CAS-bypass check.** The diagnostic listed seams that do not bypass compare-and-swap and omitted ones that do, so an operator acting on its output would have hardened the wrong path. (#1398)
+
+### Added
+
+- **Adapters can report whether identifier case is part of object identity.** A new `identifier_case_significance` trait method lets an adapter answer, from the live connection, whether two identifiers differing only in case name the same object; the Snowflake implementation reads `QUOTED_IDENTIFIERS_IGNORE_CASE` from `SHOW PARAMETERS` rather than assuming a default.
+
+  **Nothing in the engine calls this yet** — it is the grounding probe for #1281, landed on its own so the warehouse-facing question can be answered and reviewed independently of any consumer. Its answer is deliberately scoped to *quoted* identifiers; Snowflake folds unquoted references to uppercase regardless of the parameter, which is a separate axis tracked as #1282. (#1390)
+
 ## [1.69.0] - 2026-08-06
 
 ### Added
