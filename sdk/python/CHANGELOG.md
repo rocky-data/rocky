@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-08-10
+
+### Added
+
+- **New generated result models.** `state_schedule_hold_schema` covers the runtime schedule pause/resume surface, and `brief_schema` gains the scheduler section. Both are additive — no existing model changed shape — but they are new public types, which is why this is a minor rather than a patch. (#1334, #1339)
+
+- **Worked examples on `RockyClient`'s four core methods, executed in CI.** `run()`, `plan()`, `apply()` and `dag()` carry runnable docstring examples, and a new test module executes them so the documentation cannot drift from the client's actual signatures. (#1387)
+
+### Changed
+
+- Regenerated types pick up engine-side additions to the run, dag, ci-diff, promote-plan, preview-diff, project and tick schemas. (#1352, #1356, #1360, #1384, #1385)
+
 ## [0.10.0] — 2026-07-24
 
 ### Added

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.37.1] — 2026-08-10
+
+### Fixed
+
+- **Preview selects the base run from the ref the caller named.** The command resolved the base run independently of the ref it was given, so a preview against an explicitly named ref could diff against a different run than the one requested. (#1360)
+
+### Changed
+
+- Regenerated engine bindings: new `state_schedule_hold` and scheduler `brief` types, plus additions to the run, dag, ci-diff, promote-plan, preview-diff, project and tick types. (#1334, #1339, #1352, #1356, #1384, #1385)
+- Dependency refresh: `js-yaml` 4.2.0 → 4.3.1, `undici` 7.28.0 → 7.29.0, and dev-dependency bumps for `fast-uri`, `postcss`, `brace-expansion`, `jsdom`, `@testing-library/jest-dom` and the vscode-minor-patch group. (#1368, #1375, #1376, #1377, #1378, #1392)
+
 ## [1.37.0] — 2026-07-24
 
 ### Added
