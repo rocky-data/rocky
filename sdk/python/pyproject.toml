@@ -40,7 +40,17 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+# Pinned, and with an upper bound, on purpose. An unbounded `hatchling` meant
+# every release built against whatever had just been published: hatchling
+# 1.32.0 landed 2026-08-11 and emits `Metadata-Version: 2.5`, which the twine
+# 6.1.0 bundled in our allow-listed `gh-action-pypi-publish` pin rejects
+# outright — so `sdk-release` failed at the publish step with a wheel that had
+# built cleanly. 1.30.0 emitted 2.5 too and was reverted in 1.30.1, so this is
+# an in-progress ecosystem transition rather than a one-off.
+#
+# Lift the `<1.32` ceiling once the publish action is bumped to a build
+# carrying twine >= 7.0.0 (verified to accept 2.5); see #1395.
+requires = ["hatchling>=1.30.1,<1.32"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

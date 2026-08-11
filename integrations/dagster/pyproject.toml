@@ -61,7 +61,12 @@ rocky-sdk = { path = "../../sdk/python", editable = true }
 dagster_rocky = "dagster_rocky"
 
 [build-system]
-requires = ["hatchling"]
+# Bounded on purpose — same reason as `sdk/python/pyproject.toml`: hatchling
+# 1.32.0 (2026-08-11) emits `Metadata-Version: 2.5`, which the twine 6.1.0 in
+# our allow-listed `gh-action-pypi-publish` pin rejects at the publish step.
+# `dagster-release` uses the same action, so it would have failed identically.
+# Lift `<1.32` once that action carries twine >= 7.0.0; see #1395.
+requires = ["hatchling>=1.30.1,<1.32"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
