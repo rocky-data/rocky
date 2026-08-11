@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.70.1] - 2026-08-10
+## [1.70.1] - 2026-08-11
+
+### Changed
+
+- **Dependency refresh — 146 crates**, including `aws-lc-rs` 1.17 → 1.18 / `aws-lc-sys` 0.41 → 0.44, the `arrow` family 58.3 → 58.4, `clap` 4.6.4 → 4.6.6, `blake3` 1.8.5 → 1.8.6, `rmcp` and `salsa`. No source changes; the full suite passes at 5835 tests with clippy clean under `-D warnings`. (#1420)
+
+  One advisory is knowingly **not** closed by this: `thrift` stays at 0.17.0 (RUSTSEC memory-allocation advisory, patched in 0.23.0) because `parquet` 58.4.0 pins `thrift ^0.17`, so no in-range update reaches it. `parquet` 59.2.0 drops the dependency entirely, but that is an `arrow` 58 → 59 major migration and is tracked separately rather than folded into a patch release.
 
 ### Fixed
 

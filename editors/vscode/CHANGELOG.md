@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.37.1] — 2026-08-10
+## [1.37.1] — 2026-08-11
 
 ### Fixed
 
@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Regenerated engine bindings: new `state_schedule_hold` and scheduler `brief` types, plus additions to the run, dag, ci-diff, promote-plan, preview-diff, project and tick types. (#1334, #1339, #1352, #1356, #1384, #1385)
 - Dependency refresh: `js-yaml` 4.2.0 → 4.3.1, `undici` 7.28.0 → 7.29.0, and dev-dependency bumps for `fast-uri`, `postcss`, `brace-expansion`, `jsdom`, `@testing-library/jest-dom` and the vscode-minor-patch group. (#1368, #1375, #1376, #1377, #1378, #1392)
+- **`@dagrejs/dagre` 3.0.0 → 3.1.1** — a *runtime* dependency, used for lineage-graph layout in the Inspector canvas, so unlike the bumps above it ships in the extension. Minor release; the lineage view renders unchanged across the extension's 208 unit tests. Alongside it, dev-dependency bumps for `@types/node`, `eslint`, `mocha` and `typescript-eslint`. The `engines.vscode` / `@types/vscode` / `@vscode/test-electron` triangle is deliberately untouched. (#1418, #1420)
 
 ## [1.37.0] — 2026-07-24
 

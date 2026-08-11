@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.62.0] — 2026-08-10
+## [1.62.0] — 2026-08-11
+
+### Changed
+
+- **The build backend is now bounded: `hatchling>=1.30.1,<1.32`.** Same reason as `rocky-sdk`: hatchling 1.32.0 (2026-08-11) emits `Metadata-Version: 2.5`, which the twine in our pinned publish action rejects at upload. `dagster-release` uses that same action, so it would have failed identically. Runtime dependencies are unaffected — this constrains only how the wheel is built. (#1420)
+
+- Development dependencies refreshed (ruff 0.15.18 → 0.16.2, `tqdm`, `tomlkit`, `pytz`, `tzdata`, `typing-extensions`, `platformdirs`). The `rocky-sdk>=0.9.1` floor is unchanged. (#1420)
 
 ### Fixed
 

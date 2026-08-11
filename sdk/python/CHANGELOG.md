@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.11.0] — 2026-08-10
+## [0.11.0] — 2026-08-11
 
 ### Added
 
@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Regenerated types pick up engine-side additions to the run, dag, ci-diff, promote-plan, preview-diff, project and tick schemas. (#1352, #1356, #1360, #1384, #1385)
+
+- **The build backend is now bounded: `hatchling>=1.30.1,<1.32`.** It was previously unbounded, so each release built against whatever had just been published. hatchling 1.32.0 landed on 2026-08-11 and emits `Metadata-Version: 2.5`, which the twine bundled in our pinned publish action rejects — the wheel built cleanly and failed at upload. The bound is a range rather than a single pin because the transition is not monotonic: 1.30.0 emitted 2.5, 1.30.1 reverted to 2.4, and 1.32.0 re-landed it. Runtime dependencies are unaffected; this constrains only how the wheel is built. (#1420)
+
+- Development dependencies refreshed (ruff 0.15.18 → 0.16.2, `typing-extensions`, `packaging`, `platformdirs`, `typeguard`). (#1420)
 
 ## [0.10.0] — 2026-07-24
 
