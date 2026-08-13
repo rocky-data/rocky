@@ -127,7 +127,17 @@ export type TimeGrain = "hour" | "day" | "month" | "year";
 export interface CompileOutput {
   command: string;
   compile_timings: PhaseTimings;
+  /**
+   * Diagnostics for the models this result describes. Under `--model`, filtered to those whose owning model name equals the selector exactly — so a diagnostic raised against a different model is absent even when that model is an upstream of the selected one.
+   *
+   * Attribution is not always a model you can select: import diagnostics (`E033`, `E034`, `W012`) carry the import name and `W011` carries a contract name, none of which are valid `--model` values. A target collision (`E036`) is attached to every participating model, so one diagnostic can appear under several selectors.
+   */
   diagnostics: Diagnostic[];
+  /**
+   * Number of execution layers this result describes.
+   *
+   * Under `--model` only the layers containing the selected model are counted, so this reports `1`. It is not the selected model's depth in the DAG, and not how many layers a rebuild of it would need — treat it as informative only when no selector is passed.
+   */
   execution_layers: number;
   /**
    * Expanded SQL for each model after macro substitution. Only populated when `--expand-macros` is passed. Keys are model names, values are the SQL after all `@macro()` calls have been replaced.
@@ -135,7 +145,15 @@ export interface CompileOutput {
   expanded_sql?: {
     [k: string]: string;
   };
+  /**
+   * Whether the diagnostics this result describes include error-severity entries — and, for the CLI, whether the command exits non-zero.
+   *
+   * Under `--model` this is computed from the exact-attribution filter above, so it says nothing about whether the selected model's upstreams compile: an error attributed to another model is filtered out and leaves this `false`, even though `rocky run` would classify that model as a compile error and exclude it from execution. A failure that aborts compilation outright rather than emitting a diagnostic — an unparseable model, a semantic-graph or contract-load failure — fails the command before any scoping applies. To learn whether a model can be built, compile without a selector.
+   */
   has_errors: boolean;
+  /**
+   * Number of models this result describes — the whole project, or `1` when `--model` selects one. Not a project-wide total under a selector.
+   */
   models: number;
   /**
    * Per-model details extracted from each model's TOML frontmatter. Empty when the project has no models. Downstream consumers (`dagster-rocky` to surface per-model freshness policies and partition-keyed assets) iterate this list rather than re-loading model frontmatter themselves.

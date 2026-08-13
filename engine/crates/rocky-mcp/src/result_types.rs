@@ -38,7 +38,11 @@ pub struct CompileResult {
     pub error_count: usize,
     /// Count of warning-severity diagnostics.
     pub warning_count: usize,
-    /// Number of models in the project.
+    /// Number of models this result describes — the whole project, or `1`
+    /// when a `model` selector was passed. Not a project-wide total under a
+    /// selector, and `has_errors` / the counts above are scoped the same way:
+    /// they describe the selected model's own validity, not whether its
+    /// upstreams can be rebuilt.
     pub model_count: usize,
     /// All diagnostics (errors + warnings + info).
     pub diagnostics: Vec<DiagnosticLite>,

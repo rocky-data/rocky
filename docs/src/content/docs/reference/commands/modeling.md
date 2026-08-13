@@ -23,7 +23,7 @@ rocky compile [flags]
 |------|------|---------|-------------|
 | `--models <PATH>` | `PathBuf` | `models` | Directory containing `.sql` and `.toml` model files. |
 | `--contracts <PATH>` | `PathBuf` | | Directory containing data contract definitions. |
-| `--model <NAME>` | `string` | | Restrict the reported result and exit status to one exact model name. The full project is still compile-checked for dependency and type context. |
+| `--model <NAME>` | `string` | | Restrict the reported result and exit status to one exact model name — whether *that model's own source* is valid, not whether its upstreams can be rebuilt. The full project is still loaded and compile-checked internally for dependency and type context. |
 | `--expand-macros` | `bool` | `false` | Expand macros from `macros/` and include the expanded SQL in the output. |
 | `--target-dialect <DIALECT>` | `dbx` \| `sf` \| `bq` \| `duckdb` | | Run the **P001 dialect-portability lint** against the chosen target. Non-portable constructs emit `error`-severity diagnostics. Precedence: flag > `[portability] target_dialect` in `rocky.toml` > unset. See [Portability linting](/concepts/linters/). |
 | `--with-seed` | `bool` | `false` | Execute `data/seed.sql` against an in-memory DuckDB and use its `information_schema` as the source-of-truth for raw source schemas. Turns leaf `.sql` models from `Unknown` columns into concrete types. Requires the `duckdb` feature (enabled by default in the shipped binary). |
@@ -105,6 +105,44 @@ Model selection is exact: an unknown name is an error. Rocky still loads and
 compile-checks the full project internally so the selected model has dependency
 and type context, but the visible counts, layers, model details, diagnostics,
 and failure state describe only the selected model.
+
+**What the exit status does and does not cover.** The selector filters
+diagnostics by **exact attribution** — a diagnostic is reported only when its
+owning model name equals the selector — and the exit status follows that
+filtered set. The dividing line is *how a problem is reported*, not what kind of
+problem it is:
+
+- A **hard compilation failure** — one that aborts compilation rather than
+  emitting a diagnostic, such as a model whose SQL cannot be parsed — fails the
+  command regardless of the selector, because compilation never gets far enough
+  to filter anything. Failures during semantic-graph construction and contract
+  loading behave the same way.
+- An **error diagnostic attributed to another model** is filtered out, so the
+  selected model is reported clean. This holds even though that other model
+  genuinely fails to compile: `rocky run` classifies such a model as a
+  compile error and excludes it from execution. Selecting a model therefore
+  tells you nothing about whether its upstreams compile.
+
+Two consequences worth knowing:
+
+- **Not every diagnostic names a model you can select.** Import-level
+  diagnostics (`E033`, `E034`, `W012`) carry the *import* name, and `W011`
+  carries a contract name that need not correspond to a model at all. Because
+  `--model` requires a real model name, those cannot be surfaced by selecting
+  anything — run without a selector to see them.
+- **A diagnostic can be attributed to more than one model.** A target collision
+  (`E036`) attaches an error to every participating model, so selecting any one
+  of them reports it.
+
+To check whether a model can actually be *built*, compile without a selector.
+`rocky run --model` builds only the selected model and needs `--defer` to
+resolve references to upstreams you did not build; without it the SQL is left
+unchanged and the run succeeds only if the reference already resolves in the
+active namespace.
+
+Note that under `--model`, `execution_layers` counts only the layers containing
+the selected model — so it reports `1`, not the model's depth in the DAG and not
+how many layers rebuilding it would take.
 
 Every diagnostic carries a severity (`"error"`, `"warning"`, `"info"`), a code (`E###` errors, `W###` warnings, `P###` portability lints, or `V###` validation), the owning model, and (when the compiler can locate it) a `span` and `suggestion`.
 

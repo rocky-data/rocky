@@ -706,13 +706,32 @@ class ModelDetail(BaseModel):
 
 
 class CompileResult(BaseModel):
-    """Output of ``rocky compile --json``."""
+    """Output of ``rocky compile --json``.
+
+    Every count below describes *what the result covers*, which is the whole
+    project or — when ``model_filter`` is passed — the one selected model.
+    """
 
     version: str
     command: str
+    #: Number of models this result describes: the whole project, or ``1``
+    #: under ``model_filter``. Not a project-wide total under a selector.
     models: int
+    #: Number of execution layers this result describes. Under ``model_filter``
+    #: only the layers containing the selected model are counted, so this
+    #: reports ``1`` — not the model's depth in the DAG.
     execution_layers: int
+    #: Under ``model_filter``, filtered to diagnostics whose owning model name
+    #: equals the selector exactly. Note that not every diagnostic names a
+    #: selectable model: import diagnostics (``E033``/``E034``/``W012``) carry
+    #: the import name and ``W011`` a contract name, so those surface only
+    #: without a selector.
     diagnostics: list[Diagnostic]
+    #: Whether ``diagnostics`` includes error-severity entries — and whether
+    #: the CLI exited non-zero. Under ``model_filter`` this says nothing about
+    #: whether the selected model's upstreams compile: an error attributed to
+    #: another model is filtered out and leaves this ``False``. Compile without
+    #: a selector to learn whether a model can actually be built.
     has_errors: bool
     models_detail: list[ModelDetail] = []
     #: Per-phase compile timings. Loose ``dict`` — the nested shape lives on
