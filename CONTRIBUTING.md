@@ -124,7 +124,7 @@ git tag engine-v1.7.0
 git push origin engine-v1.7.0
 ```
 
-For convenience, the monorepo exposes `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`; these wrap the local-build path below. The `rocky-release` Claude skill in `.claude/skills/rocky-release/SKILL.md` walks the full checklist.
+For convenience, the monorepo exposes `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`; these wrap the local-build path below. The `rocky-release` skill (mirrored at `.agents/skills/` and `.claude/skills/`) walks the full checklist.
 
 `scripts/release.sh engine|dagster|vscode <version>` remains as a **local-build fallback** for hotfix scenarios where CI is unavailable. It builds what it can locally (macOS natively, Linux via Docker) and attaches those artifacts to the GitHub Release. Prefer the CI-driven flow for normal releases.
 
