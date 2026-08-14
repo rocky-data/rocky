@@ -15,11 +15,10 @@ on:
       - 'integrations/dagster/tests/fixtures_generated/**'
       - 'editors/vscode/src/types/generated/**'
       - 'editors/vscode/schemas/rocky-project.schema.json'
-      - 'examples/playground/pocs/00-foundations/00-playground-default/**'
-      - 'examples/playground/pocs/00-foundations/01-replication-basics/**'
-      - 'examples/playground/pocs/02-performance/03-partition-checksum/**'
+      - 'examples/playground/pocs/**'
       - 'scripts/regen_fixtures.sh'
       - 'scripts/_normalize_fixture.py'
+      - 'scripts/copy_project_schema.py'
       - 'justfile'
       - '.github/workflows/codegen-drift.yml'
   pull_request:
@@ -32,11 +31,10 @@ on:
       - 'integrations/dagster/tests/fixtures_generated/**'
       - 'editors/vscode/src/types/generated/**'
       - 'editors/vscode/schemas/rocky-project.schema.json'
-      - 'examples/playground/pocs/00-foundations/00-playground-default/**'
-      - 'examples/playground/pocs/00-foundations/01-replication-basics/**'
-      - 'examples/playground/pocs/02-performance/03-partition-checksum/**'
+      - 'examples/playground/pocs/**'
       - 'scripts/regen_fixtures.sh'
       - 'scripts/_normalize_fixture.py'
+      - 'scripts/copy_project_schema.py'
       - 'justfile'
       - '.github/workflows/codegen-drift.yml'
 
@@ -140,6 +138,16 @@ jobs:
 
       - name: Fail if anything drifted
         run: |
+          untracked=$(git ls-files --others --exclude-standard -- schemas/ \
+                                    sdk/python/src/rocky_sdk/types_generated/ \
+                                    integrations/dagster/tests/fixtures_generated/ \
+                                    editors/vscode/src/types/generated/)
+          if [ -n "$untracked" ]; then
+            echo "❌ Codegen produced files that are not committed:"
+            echo "$untracked"
+            echo "Run \`just codegen\` and \`just regen-fixtures\` locally and commit the result."
+            exit 1
+          fi
           if ! git diff --exit-code schemas/ \
                                     docs/public/openapi.json \
                                     sdk/python/src/rocky_sdk/types_generated/ \
