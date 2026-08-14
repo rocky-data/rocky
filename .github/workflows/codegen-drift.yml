@@ -16,7 +16,10 @@ on:
       - 'editors/vscode/src/types/generated/**'
       - 'editors/vscode/schemas/rocky-project.schema.json'
       - 'examples/playground/pocs/00-foundations/00-playground-default/**'
+      - 'examples/playground/pocs/00-foundations/01-replication-basics/**'
+      - 'examples/playground/pocs/02-performance/03-partition-checksum/**'
       - 'scripts/regen_fixtures.sh'
+      - 'scripts/_normalize_fixture.py'
       - 'justfile'
       - '.github/workflows/codegen-drift.yml'
   pull_request:
@@ -30,7 +33,10 @@ on:
       - 'editors/vscode/src/types/generated/**'
       - 'editors/vscode/schemas/rocky-project.schema.json'
       - 'examples/playground/pocs/00-foundations/00-playground-default/**'
+      - 'examples/playground/pocs/00-foundations/01-replication-basics/**'
+      - 'examples/playground/pocs/02-performance/03-partition-checksum/**'
       - 'scripts/regen_fixtures.sh'
+      - 'scripts/_normalize_fixture.py'
       - 'justfile'
       - '.github/workflows/codegen-drift.yml'
 
