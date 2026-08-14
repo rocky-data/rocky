@@ -162,4 +162,4 @@ Each subproject follows its language's idioms; the linter is the source of truth
 
 ## Reporting issues
 
-File issues against `rocky-data/rocky` with a label naming the subproject (`engine`, `dagster`, `vscode`, `playground`). Include the subproject's version, your platform, and minimal repro steps.
+File issues against `rocky-data/rocky` with a label naming the subproject (`engine`, `sdk`, `dagster`, `vscode`, `playground`). Include the subproject's version, your platform, and minimal repro steps.
