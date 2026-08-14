@@ -17,7 +17,7 @@ These questions are also red-team bait, deliberately. Give every substantive ana
 
 | Path | Language | What it is |
 |---|---|---|
-| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. 23-crate Cargo workspace. |
+| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. Multi-crate Cargo workspace. |
 | `sdk/python/` | Python | `rocky-sdk` — standalone typed Python client (`RockyClient`) over the `rocky` CLI. Owns the generated Pydantic models. For notebooks, scripts, and orchestrators. |
 | `integrations/dagster/` | Python | Dagster integration — a thin `ConfigurableResource` adapter over `rocky-sdk`'s `RockyClient`; maps results to assets/checks. Depends on `rocky-sdk`. |
 | `editors/vscode/` | TypeScript | VS Code extension — LSP client (stdio to `rocky lsp`), syntax highlighting, commands for AI features. |
@@ -28,7 +28,8 @@ Each subproject has its own `AGENTS.md` with build commands, coding standards, a
 ## Agent-tool compatibility
 
 - `AGENTS.md` is the canonical, vendor-neutral source for persistent repository guidance. Tool-specific files and directories exist only for discovery compatibility.
-- Root task skills follow the Agent Skills format and are mirrored in `.agents/skills/` and `.claude/skills/`. Keep the two trees byte-identical and keep workflow text independent of any particular agent client, model, marketplace, or plugin.
+- Root task skills follow the Agent Skills format and are mirrored in `.agents/skills/` and `.claude/skills/`. Keep the two trees byte-identical (CI-checked by `skills-mirror-drift.yml`) and keep workflow text independent of any particular agent client, model, marketplace, or plugin.
+- Subproject-local skills (under `engine/.claude/skills/` and `editors/vscode/.claude/skills/`) currently exist only in the Claude Code discovery tree; the byte-identical rule above covers only the root trees. They are plain Markdown and their rules apply to any agent working in those subprojects — browse them directly if your client does not discover them.
 - If a client does not discover a relevant skill automatically, read its `SKILL.md` directly and follow the nearest applicable `AGENTS.md`.
 
 > **Adversarial / red-team code review** (regardless of agent client): read [`AGENT_REVIEW.md`](AGENT_REVIEW.md) before reviewing engine changes. It is the grounded correctness profile — Rocky's real compiler pipeline (surface → SQL string → single `ModelIr`, no HIR), the incremental-recompute surfaces, the enum-exhaustiveness rule, the nullability/3VL invariants, and the test-evidence bar.
@@ -64,13 +65,14 @@ Every Rocky CLI command that emits `--output json` is backed by a typed Rust out
 
 The `codegen-drift` CI workflow (`.github/workflows/codegen-drift.yml`) fails any PR where the committed bindings drift from what `just codegen` produces locally.
 
-Every CLI JSON output is covered — there are no hand-written bindings. The generated Pydantic models live in `rocky-sdk` (`sdk/python/`) and are re-exported by `dagster_rocky.types`; the vscode `rockyJson.ts` is a type-alias shim over the generated TypeScript — see [`sdk/python/AGENTS.md`](sdk/python/AGENTS.md) and [`integrations/dagster/AGENTS.md`](integrations/dagster/AGENTS.md). After shape-changing schema edits, `just regen-fixtures` recaptures the dagster test fixtures (a separate CI-checked drift surface). Full workflow and pitfalls: the `rocky-codegen` skill.
+Every CLI JSON output is covered by an exported schema and generated bindings. The generated Pydantic models live in `rocky-sdk` (`sdk/python/`) and are re-exported by `dagster_rocky.types`; the vscode `rockyJson.ts` is a type-alias shim over the generated TypeScript. The SDK **also** keeps hand-written runtime models in `rocky_sdk/types.py` — the `parse_rocky_output()` dispatch targets, guarded by `test_schema_parity.py` rather than codegen — so a new output field lands in both layers; see [`sdk/python/AGENTS.md`](sdk/python/AGENTS.md) and [`integrations/dagster/AGENTS.md`](integrations/dagster/AGENTS.md). After shape-changing schema edits, `just regen-fixtures` recaptures the dagster test fixtures (a separate CI-checked drift surface). Full workflow and pitfalls: the `rocky-codegen` skill.
 
 **When modifying Rocky DSL syntax (`.rocky` files):**
 1. `engine/crates/rocky-lang/` (parser + lexer)
 2. `engine/crates/rocky-compiler/` (type checking)
 3. `editors/vscode/syntaxes/rocky.tmLanguage.json` (TextMate grammar)
 4. `editors/vscode/snippets/rocky.json` (snippets)
+5. `docs/src/content/docs/concepts/rocky-dsl.md` + `docs/rocky-lang-spec.md` (published DSL page + full spec)
 
 ## Build orchestration
 
@@ -96,7 +98,7 @@ Tag-namespaced — each artifact ships independently:
 
 Release **`rocky-sdk` before any `dagster-rocky` release that raises its `rocky-sdk>=…` floor** — the published `dagster-rocky` wheel resolves the SDK from PyPI, not the monorepo path source.
 
-**Release workflow:** Tagging `engine-v*` triggers `engine-release.yml`, which builds all 5 platform targets (macOS ARM64/Intel, Linux x86_64/ARM64, Windows x86_64) via a CI matrix and attaches them to the GitHub Release. `scripts/release.sh` remains as a local-build hotfix fallback. Convenience recipes: `just release-engine <version>`, `just release-dagster <version> [--publish]`, `just release-vscode <version> [--publish]`.
+**Release workflow:** Tagging `engine-v*` triggers `engine-release.yml`, which builds all 5 platform targets (macOS ARM64/Intel, Linux x86_64/ARM64, Windows x86_64) via a CI matrix and attaches them to the GitHub Release. `scripts/release.sh` remains as a local-build hotfix fallback. Convenience recipes: `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, `just release-vscode <version> [--publish]`.
 
 The `engine/install.sh` and `engine/install.ps1` scripts filter releases by the `engine-v*` prefix when fetching the latest version.
 
@@ -108,7 +110,7 @@ The `engine/install.sh` and `engine/install.ps1` scripts filter releases by the 
 
 ## CI
 
-`.github/workflows/` contains path-filtered workflows. Touching `engine/**` triggers `engine-ci.yml` only; touching multiple subprojects triggers each relevant workflow independently.
+`.github/workflows/` contains path-filtered workflows. Touching a subproject triggers its own CI plus any cross-cutting gates whose path filters match — e.g. `engine/**` triggers both `engine-ci.yml` and `codegen-drift.yml`. Touching multiple subprojects triggers each relevant workflow independently.
 
 Cost-saving measures:
 - `engine-ci.yml` runs test + clippy + fmt on every PR. Coverage and security audit are in `engine-weekly.yml` (Monday schedule + manual dispatch).

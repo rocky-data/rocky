@@ -18,7 +18,7 @@ Rocky has its own transformation language as an alternative to SQL: `.rocky` fil
 
 | # | Subproject | File | What it owns |
 |---|---|---|---|
-| 1 | `engine/crates/rocky-lang/` | `src/token.rs`, `src/parser.rs`, `src/lower.rs` | Lexer (logos), parser, and lowering to the IR |
+| 1 | `engine/crates/rocky-lang/` | `src/token.rs`, `src/parser.rs`, `src/lower.rs` | Lexer (logos), parser, and lowering to SQL |
 | 2 | `engine/crates/rocky-compiler/` | `src/` (type checking, semantic graph) | Type checking, contract validation, diagnostics |
 | 3 | `editors/vscode/syntaxes/` | `rocky.tmLanguage.json` | TextMate grammar — syntax highlighting in VS Code |
 | 4 | `editors/vscode/snippets/` | `rocky.json` | Snippet triggers users type to insert keywords |
@@ -30,7 +30,7 @@ All four live under `engine/` and `editors/vscode/` in the same monorepo, so the
 1. **Define the syntax** in the engine lexer and parser.
    - Add a token in `engine/crates/rocky-lang/src/token.rs` (logos-derived enum).
    - Extend `engine/crates/rocky-lang/src/parser.rs` to accept it.
-   - Update `engine/crates/rocky-lang/src/lower.rs` to lower it to the IR (`rocky-core::ir`).
+   - Update `engine/crates/rocky-lang/src/lower.rs` to lower it to SQL (`lower_to_sql`); the emitted SQL then compiles through the standard pipeline into `ModelIr`. There is no direct DSL→IR lowering.
 2. **Type-check it** in `engine/crates/rocky-compiler/src/`.
    - Add or extend the semantic-graph node.
    - Add a diagnostic code (E0xx / W0xx) if there's a new failure mode.

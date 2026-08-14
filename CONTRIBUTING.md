@@ -4,7 +4,7 @@ Rocky is a monorepo. The five subprojects share one repository, one issue tracke
 
 | Subproject | Path | Language | Build |
 |---|---|---|---|
-| Rocky CLI engine | `engine/` | Rust (23-crate Cargo workspace) | `cargo` |
+| Rocky CLI engine | `engine/` | Rust (multi-crate Cargo workspace) | `cargo` |
 | Python SDK | `sdk/python/` | Python | `uv` |
 | Dagster integration | `integrations/dagster/` | Python | `uv` |
 | VS Code extension | `editors/vscode/` | TypeScript | `npm` |
@@ -40,7 +40,7 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The engine is a Cargo workspace with 25 members: 23 library crates plus the `rocky` and `rocky-lsp` binaries (Rust edition 2024, MSRV 1.88). Run a single crate's tests with `cargo test -p rocky-core`. End-to-end tests in `crates/rocky-core/tests/e2e.rs` use DuckDB and need no credentials.
+The engine is a Cargo workspace: the library crates under `engine/crates/` plus the `rocky` and `rocky-lsp` binary crates (Rust edition 2024, MSRV 1.88). Run a single crate's tests with `cargo test -p rocky-core`. End-to-end tests in `crates/rocky-core/tests/e2e.rs` use DuckDB and need no credentials.
 
 ### Python SDK (`sdk/python/`)
 
@@ -100,6 +100,7 @@ The generated Pydantic models live in the `rocky-sdk` package. `dagster_rocky.ty
 2. `engine/crates/rocky-compiler/` (type checking)
 3. `editors/vscode/syntaxes/rocky.tmLanguage.json` (TextMate grammar)
 4. `editors/vscode/snippets/rocky.json` (snippets)
+5. `docs/src/content/docs/concepts/rocky-dsl.md` + `docs/rocky-lang-spec.md` (published DSL page + full spec)
 
 ## Releases
 
@@ -123,7 +124,7 @@ git tag engine-v1.7.0
 git push origin engine-v1.7.0
 ```
 
-For convenience, the monorepo exposes `just release-engine <version>`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`; these wrap the local-build path below. The `rocky-release` Claude skill in `.claude/skills/rocky-release/SKILL.md` walks the full checklist.
+For convenience, the monorepo exposes `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`; these wrap the local-build path below. The `rocky-release` Claude skill in `.claude/skills/rocky-release/SKILL.md` walks the full checklist.
 
 `scripts/release.sh engine|dagster|vscode <version>` remains as a **local-build fallback** for hotfix scenarios where CI is unavailable. It builds what it can locally (macOS natively, Linux via Docker) and attaches those artifacts to the GitHub Release. Prefer the CI-driven flow for normal releases.
 

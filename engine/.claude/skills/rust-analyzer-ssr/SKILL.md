@@ -1,6 +1,6 @@
 ---
 name: rust-analyzer-ssr
-description: Use rust-analyzer's Structural Search and Replace (SSR) for semantic Rust code transformations across the engine workspace. Apply when refactoring API shapes, migrating patterns, or searching for code structure across all 23 crates.
+description: Use rust-analyzer's Structural Search and Replace (SSR) for semantic Rust code transformations across the engine workspace. Apply when refactoring API shapes, migrating patterns, or searching for code structure across the workspace crates.
 ---
 
 # rust-analyzer Structural Search and Replace (SSR)
