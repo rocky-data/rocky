@@ -1,0 +1,48 @@
+name: docs-build
+
+# Builds the docs site on pull requests that touch docs/.
+#
+# Without this, a docs PR got no build at all: engine-docs.yml runs only on
+# push to main, so a broken page — an unclosed MDX component, a bad import —
+# would fail for the first time on main, with the site already deploying.
+#
+# This is deliberately a separate workflow rather than a pull_request trigger
+# on engine-docs.yml. That workflow contains a deploy job holding pages: write
+# and id-token: write, and the credential-containment policy (correctly) treats
+# any PR-reachable workflow containing a credentialed job as a violation — a
+# runtime `if:` guard is not a containment boundary. This workflow requests a
+# read-only token and has no deploy job, so a PR build cannot reach Pages.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs-build.yml'
+
+# CI only reads the repo; restrict the token to the minimum (CodeQL ql-for-actions).
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    name: Build docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+      - run: npm ci
+        working-directory: docs
+      - run: npm run build
+        working-directory: docs
