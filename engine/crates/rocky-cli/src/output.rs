@@ -2174,6 +2174,10 @@ impl OptimizeOutput {
 // ---------------------------------------------------------------------------
 
 /// JSON output for `rocky estimate`.
+///
+/// `estimates` is empty when the project declares no models; `message` is
+/// populated in that case to explain why, mirroring [`OptimizeOutput`]. An
+/// unknown `--model` is an error, not an empty result.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct EstimateOutput {
     pub version: String,
@@ -2184,6 +2188,20 @@ pub struct EstimateOutput {
     /// individual model produced a cost estimate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_estimated_cost_usd: Option<f64>,
+    /// Why `estimates` is empty, when it is. Absent whenever `estimates` is
+    /// non-empty.
+    ///
+    /// Populated for both empty cases: no model matched (`--model` is refused
+    /// outright, so this means the project declares none), and models matched
+    /// but none produced an estimate because SQL generation or `EXPLAIN`
+    /// failed for every one of them.
+    ///
+    /// Without this, an empty `estimates` array was the command's only signal
+    /// that it had nothing to report — and the text path said `No models
+    /// found.` while the JSON path said nothing at all, so the human was told
+    /// and the machine was not (#1428).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Cost estimate for a single model.
@@ -2218,6 +2236,15 @@ impl EstimateOutput {
             estimates,
             total_models: count,
             total_estimated_cost_usd: total_cost,
+            message: None,
+        }
+    }
+
+    /// An empty result that says why — see [`OptimizeOutput::empty`].
+    pub fn empty(message: impl Into<String>) -> Self {
+        EstimateOutput {
+            message: Some(message.into()),
+            ..EstimateOutput::new(vec![])
         }
     }
 }
@@ -9027,6 +9054,18 @@ pub struct RetentionStatusOutput {
     pub version: String,
     pub command: String,
     pub models: Vec<ModelRetentionStatus>,
+    /// Why `models` is empty, when it is. Absent whenever `models` is
+    /// non-empty.
+    ///
+    /// Reachable only under `--drift`, which reports just the models that
+    /// declare a retention policy: a project with no models fails to compile
+    /// before reaching this output, and an unknown `--model` is refused
+    /// rather than returning an empty result. When `--model` scopes the run
+    /// the message describes that model, not the project — an empty `models`
+    /// array otherwise gave a project-wide impression from a single-model
+    /// query (#1428).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Per-model retention declaration + (eventually) warehouse-observed value.
@@ -9055,6 +9094,15 @@ impl RetentionStatusOutput {
             version: VERSION.to_string(),
             command: "retention-status".to_string(),
             models,
+            message: None,
+        }
+    }
+
+    /// An empty result that says why — see [`OptimizeOutput::empty`].
+    pub fn empty(message: impl Into<String>) -> Self {
+        RetentionStatusOutput {
+            message: Some(message.into()),
+            ..RetentionStatusOutput::new(vec![])
         }
     }
 }
