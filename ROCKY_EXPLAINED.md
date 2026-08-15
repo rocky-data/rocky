@@ -294,16 +294,21 @@ Each warehouse adapter implements the `WarehouseAdapter` trait:
 Same operation:          Databricks:              Snowflake:
 ─────────────────        ──────────────────────   ─────────────────────
 Upsert rows      →       MERGE INTO t USING ...   MERGE INTO t USING ...
-                         WHEN MATCHED THEN         (same, but different
-                         UPDATE SET ...            IDENTIFIER quoting)
+                         WHEN MATCHED THEN        (same, but different
+                         UPDATE SET ...           IDENTIFIER quoting)
 
-Create partition →       INSERT OVERWRITE          Not supported natively;
--keyed table             PARTITION(dt='2024-01')   Rocky uses DELETE+INSERT
+Create partition →       INSERT OVERWRITE         Not supported natively;
+-keyed table             PARTITION(dt='2024-01')  Rocky uses DELETE+INSERT
 
-Materialized view →      CREATE OR REPLACE          CREATE OR REPLACE
-                         MATERIALIZED VIEW          DYNAMIC TABLE
-                                                    TARGET_LAG = '1 hour'
+Materialized     →       CREATE OR REPLACE        CREATE OR REPLACE
+view strategy            MATERIALIZED VIEW        MATERIALIZED VIEW
+
+Dynamic table    →       not supported;           CREATE OR REPLACE
+strategy                 SQL generation           DYNAMIC TABLE
+                         returns an error         TARGET_LAG = '1 hour'
 ```
+
+`materialized_view` and `dynamic_table` are two separate strategies. Databricks, Snowflake, and BigQuery support `materialized_view`, and all three emit `CREATE OR REPLACE MATERIALIZED VIEW`. DuckDB and Trino return a "not supported" error when Rocky generates the SQL. Only Snowflake supports `dynamic_table`. It needs a `target_lag` value, such as `"1 minute"` or `"downstream"`.
 
 ---
 
@@ -354,9 +359,9 @@ redb state file
      check_history, dag_snapshots, … — same file, one table each)
 ```
 
-A **watermark** is the timestamp of the newest row Rocky has already loaded. It answers "where did I leave off?" Rocky reads it *from the target table*, not the source, using `SELECT MAX(updated_at) FROM target.orders_summary`.
+A **watermark** is the timestamp of the newest row Rocky has already loaded. It answers "where did I leave off?" Rocky keeps the value in the state store. It reads the value from there before it generates SQL, and uses it as a literal in the WHERE clause. After a successful load, Rocky computes the new value *from the target table*, using `SELECT MAX(updated_at) FROM target.orders_summary`.
 
-Reading from the target prevents a race. New rows can land in the source while a run is in flight. The target holds only what Rocky actually wrote, so the watermark never moves past unprocessed data.
+Computing the new value from the target, rather than the source, prevents a race. New rows can land in the source while a run is in flight. The target holds only what Rocky actually wrote, so the watermark never moves past unprocessed data.
 
 **run_progress_entries + idempotency_keys** make runs resumable. If a run is interrupted, Rocky can skip the models that already completed. `rocky run --resume-latest` uses this.
 
@@ -391,12 +396,12 @@ Step 6: For each model in each layer (in parallel within layer):
       If a column type changed unsafely → DROP + recreate target
       If a column was added → ALTER TABLE ADD COLUMN
 
-  6b. Skip-unchanged gate
-      blake3(model definition) == stored hash?
-      If yes AND no schema drift → SKIP this model entirely
+  6b. Skip-unchanged gate (off by default — see section 14)
+      When on, a model that passes every clause is skipped
+      and no SQL is sent for it
 
-  6c. Read watermark (incremental only)
-      SELECT MAX(ts_col) FROM target_table
+  6c. Read the prior watermark (incremental only)
+      Read it from the state store; it bounds the WHERE clause
 
   6d. Generate SQL
       ir + dialect + watermark → SQL string
@@ -407,12 +412,14 @@ Step 6: For each model in each layer (in parallel within layer):
   6f. Run quality checks
       SELECT COUNT(*) ... (row count, null rate, custom assertions)
 
-  6g. Defer watermark write
-      Don't write yet — wait until the whole layer succeeds
+  6g. Queue the watermark write
+      New value = SELECT MAX(ts_col) FROM target_table
+      A table queues it only when it succeeded.
+      A failed table queues nothing.
 
-Step 7: Commit watermarks (batch, after layer completes)
-  Write all watermarks for the layer in one transaction
-  (If any model failed, no watermarks are committed for that layer)
+Step 7: Commit the queued watermarks (one batch)
+  Write every queued watermark in one transaction.
+  A sibling's failure does not hold back a successful table.
 
 Step 8: Fire post-run hooks
   Shell commands or webhooks on "pipeline_complete" / "pipeline_error" events
@@ -422,7 +429,7 @@ Step 9: Emit JSON output
   Exit code 0 (all good) or 2 (partial success — some tables failed)
 ```
 
-The key insight in step 6g: watermarks are committed *after* the layer succeeds, not after each individual model. This means if two models in the same layer both run, but one fails, neither gets its watermark committed. Safe to re-run.
+The rule in step 6g is per table, not per layer. Rocky commits a watermark only for a table that succeeded. A failed table never queues one, so it keeps its old watermark and re-reads the same rows next time. A sibling's failure does not hold back a successful table's watermark. Holding it back would be the unsafe choice: the next run would load that table's rows a second time.
 
 ---
 
@@ -431,25 +438,26 @@ The key insight in step 6g: watermarks are committed *after* the layer succeeds,
 Most production tables are too big to rebuild from scratch every time. Incremental loads solve this by only processing *new* rows.
 
 ```
-First run (watermark = null):
-─────────────────────────────
-SELECT * FROM source.orders
-WHERE updated_at > NULL          ← null means "everything"
-INSERT INTO target.orders_summary ...
+First run (no target table, no prior watermark):
+────────────────────────────────────────────────
+CREATE TABLE target.orders_summary AS
+SELECT * FROM source.orders      ← no watermark filter at all
 
 State store: watermarks["orders_summary"] = "2024-01-10 23:59:59"
-
+                                            (MAX(updated_at) in the target)
 
 Second run (watermark = "2024-01-10 23:59:59"):
 ────────────────────────────────────────────────
+INSERT INTO target.orders_summary
 SELECT * FROM source.orders
 WHERE updated_at > '2024-01-10 23:59:59'  ← only new rows
-INSERT INTO target.orders_summary ...
 
 State store: watermarks["orders_summary"] = "2024-01-15 08:22:11"
 ```
 
-**Why read the watermark from the target, not the state store?**
+Rocky does a full refresh when the target table is missing, or when an incremental model has no prior watermark. It does not compare a timestamp against NULL. In SQL, `updated_at > NULL` evaluates to UNKNOWN, so such a filter would return no rows, not every row.
+
+**Why compute the new watermark from the target, not the source?**
 
 ```
 Race condition scenario (if you read from source):
@@ -539,24 +547,42 @@ The change detection uses `IS DISTINCT FROM` (NULL-safe comparison) on the key c
 
 ## 14. The Skip-Unchanged Gate
 
-If a model's definition hasn't changed and the source schema hasn't changed, Rocky skips it entirely — no SQL sent to the warehouse.
+The gate lets `rocky run` skip a model when its logic and its upstream data both look unchanged. Rocky then sends no SQL to the warehouse for that model.
+
+The gate is off by default. Turn it on with `skip_unchanged = true` under `[run]` in `rocky.toml`, or with `--skip-unchanged` for a single run. With neither set, every selected model builds.
 
 ```
-Every run:
-───────────────────────────────────────────────────────────────────
-Compute blake3(normalize(SQL) + typed_columns + strategy + config)
-                    ↓
-Compare with stored hash in state store
-                    ↓
-  Same hash?              Different hash?
-      │                         │
-      ▼                         ▼
-  SKIP (no SQL run)       Run the model, store new hash
+Gate on, for each selected model:
+──────────────────────────────────────────────────────────
+Is the model eligible?            no ──▶ BUILD
+  plain strategy, deterministic
+  SQL, not [skip] eligible = false
+      │ yes
+      ▼
+Can Rocky list its upstreams?     no ──▶ BUILD
+      │ yes
+      ▼
+Did the last build succeed?       no ──▶ BUILD
+      │ yes
+      ▼
+Same logic hash as that build?    no ──▶ BUILD
+  blake3(normalize(SQL) + typed
+  columns + strategy + config)
+      │ yes
+      ▼
+Every upstream unchanged?         no ──▶ BUILD
+      │ yes
+      ▼
+    SKIP (no SQL sent)
 ```
 
-**Normalization matters:** `SELECT a,b` and `SELECT a, b` (extra space) would hash differently without normalization. Rocky normalizes whitespace and sorts order-independent clauses before hashing.
+Every clause must pass. The first one that fails builds the model, and Rocky records which clause it was.
 
-**Fail-safe:** If the SQL contains non-deterministic functions (`RAND()`, `NOW()`, `UUID()`), Rocky marks it as *volatile* and never skips it. The list of volatile functions is a compile-time constant; any unknown function is assumed volatile (fail-safe).
+The gate is a best-effort optimization. It is not a promise that a rebuild would have produced the same rows. Two more cases always build. `--force-rebuild` rebuilds every selected model. Shadow runs and branch runs never skip, because they write to different targets.
+
+**Normalization matters:** `SELECT a,b` and `SELECT a, b` (extra space) would hash differently without normalization. Rocky re-parses the SQL and re-emits it in a canonical form. That collapses whitespace, drops comments, and makes keyword case irrelevant. It also renames internal table and CTE aliases to positional tokens, so `orders AS a` and `orders AS b` produce the same hash. The normalizer does not reorder clauses, and it leaves output column aliases alone. It errs toward treating two queries as different. A missed match costs one extra rebuild. A wrong match would skip a model that really changed.
+
+**Fail-safe:** If the SQL contains a non-deterministic function (`RAND()`, `NOW()`, `UUID()`), Rocky treats the model as *volatile* and builds it. The list of volatile functions is a compile-time constant. Any function that is not on the known-pure allowlist is assumed volatile. A `LIMIT` with no `ORDER BY` is also treated as volatile, because the rows it returns are not fixed. The model's owner can override the scan with `deterministic = true` under `[skip]` in the model's sidecar TOML. That is the only way a flagged model becomes skip-eligible.
 
 ---
 
@@ -605,22 +631,26 @@ The breaking-change classifier lives in `rocky-core` (consumed by `rocky review`
 
 A [data contract](https://rocky-data.dev/reference/glossary/) is a promise about what a model will always contain. Other teams can depend on this promise.
 
+A contract is a TOML file named `{model_name}.contract.toml`. Rocky reads it from the contracts directory, or from next to the model's `.sql` file. It has two sections: `[[columns]]` and `[rules]`.
+
 ```
 contracts/orders_summary.contract.toml
 ───────────────────────────────────────
-[required]
-columns = ["order_id", "total"]    # These must always exist
+[[columns]]
+name = "order_id"
+type = "Int64"          # E011 if the model produces another type
+nullable = false        # E012 if the model can produce NULL
 
-[required.types]
-order_id = "Int64"                 # And must be these types
-total    = "Decimal"
+[[columns]]
+name = "total"
+type = "Decimal"
 
-[protected]
-columns = ["order_id"]             # This column can never be removed
-
-[allowed_type_changes]
-total = ["Int64 → Decimal"]        # Widening is OK; narrowing is not
+[rules]
+required  = ["order_id", "total"]   # E010 if missing from the output
+protected = ["order_id"]            # E013 if removed
 ```
+
+Use these exact key names. Rocky ignores a key it does not recognise, and both sections default to empty. A contract file with the wrong key names still parses, and it then checks nothing at all. The `[rules]` block also accepts `no_new_nullable`. The compiler parses that key, but it does not check it yet.
 
 At compile time, Rocky checks every model against its contract:
 
@@ -628,9 +658,9 @@ At compile time, Rocky checks every model against its contract:
 Compile time check:
 ───────────────────
 orders_summary outputs: { order_id: String, total: Decimal }
-contract requires:       { order_id: Int64,  total: Decimal }
+contract expects:       { order_id: Int64,  total: Decimal }
 
-E011: column 'order_id' type mismatch
+E011: column 'order_id' type mismatch:
       contract expects Int64, got String
       → compilation fails
 ```
@@ -639,7 +669,14 @@ The "validate → promote" workflow:
 ```
 Staging model (no contract) → validate shape → promote to prod (contract enforced)
 ```
-Once a model has a contract, any PR that breaks it fails at compile time — no warehouse run needed.
+Once a model has a contract, a PR that breaks it fails at compile time. No warehouse run is needed. Four things fail the compile:
+
+- a missing `required` column (E010)
+- a wrong type (E011)
+- a nullable column that the contract declares `nullable = false` (E012)
+- a removed `protected` column (E013)
+
+One case only warns. A column can appear under `[[columns]]` but not under `required`. If the model then stops producing it, Rocky reports W010 and the compile still passes.
 
 ---
 
@@ -680,7 +717,11 @@ Output: "alice@example.com"
 Use when: this environment gets full access (e.g., prod)
 ```
 
-Masking generates a real SQL expression, applied at the column level in the warehouse. It is not application-level filtering. Databricks and Snowflake get Dynamic Data Masking. DuckDB gets a `CASE/WHEN` expression.
+Masking generates real SQL, not application-level filtering. Rocky has two masking surfaces, and only one of them persists in the warehouse.
+
+Databricks is the only adapter that installs a masking policy. Rocky creates a Unity Catalog function named `rocky_mask_<strategy>_<env>` in the table's schema, then binds it to the column. The mask then applies to every reader of that table. Rocky namespaces the function by environment, so a `prod` policy does not overwrite a `dev` one.
+
+The second surface is preview only. `rocky preview rows` wraps a classified column in a masking expression, so a preview shows the value the masked target would show. Rocky can build that expression for Databricks, Snowflake, and DuckDB. For BigQuery and Trino it refuses to show the column instead, rather than return an unmasked value.
 
 ---
 
@@ -939,7 +980,7 @@ client.run(...)
 
 The watchdog measures wall-clock time, not progress. It does not restart the clock when the subprocess prints a line. Pass `timeout_seconds` to override the budget for one call, or set it on the client for every call.
 
-All 60+ output types are Pydantic v2 models auto-generated from Rocky's Rust JSON schemas. When a Rust `*Output` struct changes, `just codegen` regenerates the Pydantic models. You always get the right shape.
+Most output types are Pydantic v2 models generated from Rocky's Rust JSON schemas. When a Rust `*Output` struct changes, `just codegen` regenerates them. A CI job called `codegen-drift` fails the build if the committed models no longer match the schemas.
 
 The SDK carries two naming conventions, and it helps to know which you are holding. The generated classes keep the Rust struct names (`RunOutput`, `DiscoverOutput`). The hand-written classes use Python-flavored names (`RunResult`, `DiscoverResult`) and are the public API. `client.run()` returns a `RunResult`.
 

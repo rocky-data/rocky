@@ -170,7 +170,7 @@ When you set `secret`, Rocky signs the request body with HMAC-SHA256 and sends t
 X-Rocky-Signature: sha256=<hex-encoded digest>
 ```
 
-The receiving service verifies the signature to confirm the request came from Rocky.
+Rocky only adds the header. Verifying it is the receiving service's job, and Rocky cannot tell whether it happens. To verify, recompute HMAC-SHA256 over the raw request body with the same secret. Compare your result against the header's lower-case hex digest.
 
 ### Body templates
 

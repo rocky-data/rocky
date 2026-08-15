@@ -27,7 +27,7 @@ rocky ai "Calculate monthly revenue per customer from orders, joined with custom
 The LLM gets context first: the models already in your project, the source
 tables, and the output format. It writes source code. Rocky compiles that code
 straight away. If compilation fails, Rocky feeds the diagnostics back and asks
-again, up to a configurable attempt limit (default: 3).
+again. The limit is three attempts, and no flag or config key changes it.
 
 That loop is the safety mechanism. An LLM can write SQL that parses but means
 the wrong thing. The compiler catches it before Rocky reports success.
@@ -189,7 +189,7 @@ Claude by default. No AI feature runs on its own. You always call it through a
 1. Run `rocky ai-explain --all --save` to write an intent for every model.
 2. Read the generated intents and edit them. They are plain English, so change anything that reads wrong.
 3. Run `rocky ai-test --all --save` to write a baseline set of assertions.
-4. From here, `rocky ai-sync` maintains the models as upstream schemas change.
+4. From here, `rocky ai-sync` proposes updates from each model's declared intent. It does not detect upstream schema changes yet.
 
 Intent is optional. A model without intent still compiles, tests, and runs.
 Intent turns on the maintenance commands. It is never required.

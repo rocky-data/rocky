@@ -1117,22 +1117,26 @@ The v1 Databricks implementation validates each `rocky_role_<name>` principal ag
 
 ## `[freshness]`
 
-Set a project-wide staleness budget, so you do not repeat the same threshold in every model sidecar. Freshness is how far behind the newest row in a table is. A per-model `[freshness]` block still wins for every field it sets; fields it leaves out fall through to this block.
+Set a project-wide staleness budget, so you do not repeat the same threshold in every model sidecar. Freshness is how far behind the newest row in a table is. Rocky acts on one key here: `expected_lag_seconds`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `expected_lag_seconds` | integer | (unset) | Maximum lag before a model counts as stale. This is the field that makes the block active: without it, Rocky treats the project as having no freshness default. |
-| `time_column` | string | (unset) | Timestamp column Rocky reads to measure lag. Inherited by per-model blocks that do not name their own. |
-| `severity` | string | (unset) | `"error"` or `"warning"`. Reported when the freshness check trips. |
+| `time_column` | string | (unset) | Timestamp column to measure lag from. Rocky accepts the key. Nothing reads it today. See the note below. |
+| `severity` | string | (unset) | `"error"` or `"warning"`. Rocky accepts the key. Nothing reads it today. See the note below. |
 
 ```toml
 [freshness]
 expected_lag_seconds = 3600   # every model should be under an hour behind
-time_column = "updated_at"
-severity = "warning"
 ```
 
+:::caution[time_column and severity are inert]
+Rocky parses both keys, so a config that sets them still loads. Nothing reads either value today. This block also does not merge field by field into a per-model `[freshness]` block. The engine carries a helper that would copy `time_column` and `severity` into a model. Nothing calls it. Only `expected_lag_seconds` changes what Rocky does.
+:::
+
 The compiler raises `W005` on a model that has at least one temporal output column (`DATE`, `TIMESTAMP`, `TIMESTAMP_NTZ`) and no `freshness` declaration in scope. A model with no temporal column never raises it. Setting `expected_lag_seconds` here puts a declaration in scope for every model at once, which silences the warning project-wide; a per-model `[freshness]` block silences it for that model.
+
+The scheduler uses it as the staleness budget for a pipeline that sets [`[pipeline.NAME.schedule]`](#pipelinenameschedule) `freshness = true`. For a transformation pipeline, a member model's own `max_lag_seconds` wins: the budget is the smallest one the members declare. When no member declares one, this project value applies. Every other pipeline type loads no member models, so this value is its only budget.
 
 This block is separate from the [`[pipeline.NAME.checks]`](#pipelinenamechecks) freshness check, which runs as part of the data-quality pipeline and has its own `threshold_seconds`.
 
@@ -1140,32 +1144,24 @@ This block is separate from the [`[pipeline.NAME.checks]`](#pipelinenamechecks) 
 
 ## `[schema_evolution]`
 
-Give downstream consumers time to react when a source column disappears. Rocky does not drop the column from the target immediately. It keeps the column, fills it with `NULL` for new rows, and warns on every run until the grace period expires.
+This block holds the grace period for a column that disappears from the source. It takes one key. Rocky does not act on that key yet, so read the note below before you rely on it.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `grace_period_days` | integer | `7` | Days to keep a dropped column in the target table before removing it. |
+| `grace_period_days` | integer | `7` | Days a target table would keep a dropped column before Rocky removes it. Rocky accepts the key. Nothing reads the value today. |
 
 ```toml
 [schema_evolution]
-grace_period_days = 30   # a month for consumers to migrate off a removed column
+grace_period_days = 30
 ```
 
-```
-source drops `legacy_id`
-        │
-        ▼
-  ┌─────────────────────────────────────────────┐
-  │ grace period (grace_period_days)            │
-  │  target keeps `legacy_id`, writes NULL      │
-  │  every run warns                            │
-  └───────────────────┬─────────────────────────┘
-                      │ period expires
-                      ▼
-             column dropped from target
-```
+:::caution[The grace period does not run yet]
+Rocky accepts the key, so a config that sets it still loads. No run starts a grace period, warns while one is open, or drops a column when one expires.
 
-See [Schema drift](/concepts/schema-drift/) for how Rocky detects the change in the first place.
+Drift detection reports two kinds of change: a column the source has and the target lacks, and a column whose type differs between the two. It never reports a column that disappeared from the source, so `grace_period_days` never takes effect. The engine does carry the remaining parts: a grace-period detector, an `ALTER TABLE ... DROP COLUMN` generator, and a state-store record. Only tests call them.
+:::
+
+See [Schema drift](/concepts/schema-drift/) for the changes Rocky does detect and act on.
 
 ---
 

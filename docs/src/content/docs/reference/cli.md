@@ -48,8 +48,8 @@ One line each, for finding the right command. Commands with a section on this pa
 | [`seed`](#rocky-seed) | Load static reference CSVs into the warehouse. |
 | [`snapshot`](#rocky-snapshot) | Run an SCD Type 2 snapshot pipeline. |
 | [`docs`](#rocky-docs) | Generate an HTML catalog of the project. |
-| `load` | Bulk-load CSV, Parquet, or JSONL files from a directory into the warehouse. |
-| `profile` | Report per-column row, null, distinct, min, and max for a model's target table. |
+| [`load`](#rocky-load) | Bulk-load CSV, Parquet, or JSONL files from a directory into the warehouse. |
+| [`profile`](#rocky-profile) | Report per-column row, null, and distinct counts for a model's data. |
 | `ai` | Generate a model from a plain-English description. |
 | `ai-sync` | Reconcile model intent against the current schema. |
 | `ai-explain` | Explain what a model does in plain English. |
@@ -77,7 +77,7 @@ One line each, for finding the right command. Commands with a section on this pa
 | `cost` | Roll up per-model cost for a recorded run. |
 | `metrics` | Show quality metrics for a model. |
 | `optimize` | Analyze materialization costs and recommend strategy changes. |
-| `estimate` | Estimate a run's cost with warehouse `EXPLAIN`, without running it. |
+| [`estimate`](#rocky-estimate) | Estimate each transformation model's cost with warehouse `EXPLAIN`, without running it. |
 | `compact` | Generate `OPTIMIZE` / `VACUUM` SQL for storage compaction. |
 | `profile-storage` | Profile storage and recommend column encodings. |
 | `archive` | Generate an archive plan, then apply it with `archive apply <plan-id>`. |
@@ -182,6 +182,7 @@ Lists available connectors and their tables from the configured source.
 
 ```bash
 rocky discover [--pipeline NAME] [--with-schemas]
+               [--emit-fivetran-state-to PATH] [--no-cache]
 ```
 
 **Flags:**
@@ -190,6 +191,8 @@ rocky discover [--pipeline NAME] [--with-schemas]
 |------|-------------|
 | `--pipeline <NAME>` | Pipeline name. Required when more than one `[pipeline.NAME]` is defined. |
 | `--with-schemas` | Warm the schema cache for every discovered source. For each `(catalog, schema)` pair reachable via the source adapter, issues one `batch_describe_schema` round-trip and persists the per-table columns to `state.redb::schema_cache`. Subsequent `rocky compile` / `rocky lsp` invocations pick up the entries instead of typechecking leaf models as `Unknown`. Errors on individual sources are logged and skipped. Setting this flag with `[cache.schemas] enabled = false` errors with a clear message rather than silently no-op-ing. `DiscoverOutput.schemas_cached` records the count. |
+| `--emit-fivetran-state-to <PATH>` | Write a canonical Fivetran state envelope for every Fivetran adapter in the config. See [Emitting the Fivetran state envelope](/reference/commands/core-pipeline/#emitting-the-fivetran-state-envelope). |
+| `--no-cache` | Takes effect only together with `--emit-fivetran-state-to`. On its own the flag changes nothing. It makes Rocky fetch the Fivetran state envelope straight from the API and skip the read caches configured under `[adapter.<name>.cache]`. A successful fetch still writes back to that cache. It does not touch the schema cache or the state store, and an open circuit breaker still short-circuits the fetch. |
 
 **Behavior:**
 
@@ -232,20 +235,23 @@ connector_def456  | acme / eu_central / stripe          | 8
 Generates the SQL statements Rocky would execute, without actually running them. Useful for auditing and previewing changes before a run.
 
 ```bash
-rocky plan --filter <key=value> [--pipeline NAME]
+rocky plan [--filter <key=value>] [--pipeline NAME] [flags]
 ```
 
 **Flags:**
 
+The two flags below are the ones most plans use. `rocky plan` accepts many more: model selection, partition selection, shadow and branch routing, `--dag`, `--semantic`, and others. [`rocky plan` in Core Pipeline Commands](/reference/commands/core-pipeline/#rocky-plan) holds the complete table.
+
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--filter <key=value>` | Yes | Filter sources by component. Example: `--filter tenant=acme`. |
-| `--pipeline <NAME>` | | Pipeline name. Required when more than one pipeline is defined. |
+| `--filter <key=value>` | No | Filter sources by component. Example: `--filter tenant=acme`. Without it, the plan covers every discovered source. |
+| `--pipeline <NAME>` | Only with several pipelines | Pipeline name. Required when `rocky.toml` defines more than one pipeline. |
 
 **Behavior:**
 
 - Runs discovery and drift detection.
 - Generates all SQL statements (catalog creation, schema creation, incremental copy, permission grants) and returns them without execution.
+- Writes the plan to `.rocky/plans/<plan-id>.json` and prints the `plan_id`. Pass that id to `rocky apply` to execute it.
 
 **JSON output:**
 
@@ -271,15 +277,15 @@ rocky plan --filter <key=value> [--pipeline NAME]
 Executes the full pipeline end-to-end.
 
 ```bash
-rocky run --filter <key=value> [flags]
+rocky run [--filter <key=value>] [flags]
 ```
 
 **Flags:**
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--filter <key=value>` | Yes | Filter sources by component. Example: `--filter tenant=acme`. |
-| `--pipeline <NAME>` | | Pipeline name. Required when more than one pipeline is defined. |
+| `--filter <key=value>` | No | Filter sources by component. Example: `--filter tenant=acme`. Without it, the run covers every discovered source. |
+| `--pipeline <NAME>` | Only with several pipelines | Pipeline name. Required when `rocky.toml` defines more than one pipeline. |
 | `--governance-override <JSON>` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | | Models directory for transformation execution. |
 | `--all` | | Execute both replication and compiled models. |
@@ -506,15 +512,15 @@ date_key = "DATE"
 Compare shadow tables against production tables. Used after `rocky plan --shadow` + `rocky apply <plan-id>` (or the single-step `rocky run --shadow` alias) to validate results before promoting shadow data to production.
 
 ```bash
-rocky compare --filter <key=value> [flags]
+rocky compare [--filter <key=value>] [flags]
 ```
 
 **Flags:**
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--filter <key=value>` | Yes | Filter tables by component. |
-| `--pipeline <NAME>` | | Pipeline name. |
+| `--filter <key=value>` | No | Filter tables by component. Without it, the comparison covers every discovered table. |
+| `--pipeline <NAME>` | Only with several pipelines | Pipeline name. Required when `rocky.toml` defines more than one pipeline. |
 | `--shadow-suffix <SUFFIX>` | | Shadow table suffix (default `_rocky_shadow`). |
 | `--shadow-schema <NAME>` | | Override schema for shadow tables. |
 
@@ -721,7 +727,7 @@ rocky docs --models models/ --output-path site/api.html  # Custom paths
 
 ### `rocky emit-sql`
 
-Render the runnable SQL each transformation model would produce, without a warehouse connection and without running anything. Rocky always reduces to plain SQL you can run directly. See [No lock-in](/guides/no-lock-in/) for the full workflow.
+Render the SQL each transformation model would produce, without a warehouse connection and without running anything. Rocky reduces your models to plain SQL wherever it can. The behavior notes below say which models emit a statement you can run as-is, which need an existing target, and which emit nothing. See [No lock-in](/guides/no-lock-in/) for the full workflow.
 
 ```bash
 rocky emit-sql                                   # Print SQL for every model to stdout
@@ -914,7 +920,7 @@ Bulk-load data files from a directory into the warehouse. Rocky reads CSV, Parqu
 ```bash
 rocky load                              # Load from the pipeline's configured directory
 rocky load --source-dir data/dropbox/   # Load from a specific directory
-rocky load --format parquet --truncate  # Replace the target contents
+rocky load --format parquet --truncate  # Empty each target before its file loads
 ```
 
 **Flags:**
@@ -923,9 +929,17 @@ rocky load --format parquet --truncate  # Replace the target contents
 |------|---------|-------------|
 | `--source-dir <PATH>` | (from pipeline config) | Directory holding the data files. Overrides the pipeline's configured location. |
 | `--format <FORMAT>` | auto-detect | `csv`, `parquet`, or `jsonl`. Detected from the file extension when unset. |
-| `--target <NAME>` | derived from file name | Target table name. |
+| `--target <NAME>` | derived from file name | Target table name. Pins every file in the directory to this one table. |
 | `--pipeline <NAME>` | | Pipeline name. Required when more than one pipeline is defined. |
-| `--truncate` | `false` | Empty the target table before loading. |
+| `--truncate` | `false` | Empty the target table before each file loads. Read the warning below first. |
+
+:::caution[`--truncate` empties the target once per file, not once per command]
+Rocky loads the files one at a time, and `--truncate` deletes every row of the target before each one. When several files share a single target table, **only the last file's rows survive**. Each earlier file's rows are deleted by the next file's truncate. Rocky loads the directory in sorted filename order, so the last name wins.
+
+Files share one target when you pass `--target <NAME>`, or when the pipeline config sets `target.table`. With neither, Rocky derives the table name from each file's own name. Each file then lands in its own table, and the truncates do not erase each other.
+
+To combine several files into one table, leave `--truncate` off. Empty that table yourself first if you need a clean replacement.
+:::
 
 A `load` pipeline re-ingests every file it finds on each run rather than tracking what it already read. That is why a `load` pipeline cannot join the [`[pipeline.NAME.schedule]`](/reference/configuration/#pipelinenameschedule) graph: scheduling one would duplicate data. `rocky validate` rejects that config with `V044`.
 
@@ -933,7 +947,7 @@ A `load` pipeline re-ingests every file it finds on each run rather than trackin
 
 ### `rocky profile`
 
-Report what is actually in a model's target table, column by column: row count, null count, distinct count, minimum, and maximum. Use it before you write a contract or a test, so the assertion matches the data. DuckDB only.
+Report what is actually in a model's data, column by column: row count, null count, and distinct count. Use it before you write a contract or a test, so the assertion matches the data. DuckDB only.
 
 ```bash
 rocky profile fct_orders                  # Profile every column
@@ -944,9 +958,13 @@ rocky profile fct_orders --column amount  # Profile one column
 
 | Argument / flag | Default | Description |
 |------|---------|-------------|
-| `model` | required | Model whose target table to profile. |
+| `model` | required | Model to profile. Rocky profiles its target table, or a source table when the target does not exist yet. |
 | `--column <NAME>` | (every column) | Profile only this column. |
 | `--models <PATH>` | `models` | Models directory. Rocky compiles it to obtain the model's inferred schema. |
+
+**Which table Rocky profiles.** Rocky profiles the model's target table when that table is materialized. When it is not, Rocky profiles the first source table it can resolve instead, so you still get observed numbers before the first `rocky run`. On that fallback path Rocky skips any column the source does not have. The JSON output names the table it read under `profiled_table` and the missing target under `fell_back_from`. The text output prints neither field, so read the JSON when you need to know which table the numbers came from.
+
+**Minimum and maximum.** `--output json` carries a `min` and a `max` for every column. The text output prints the row, null, and distinct counts only.
 
 ---
 
@@ -1014,7 +1032,9 @@ rocky imports update --check   # CI guard: report what is behind, write nothing
 
 ### `rocky estimate`
 
-Estimate what a run would cost before you run it. Rocky asks the warehouse to `EXPLAIN` each model's query and prices the result, so nothing materializes.
+Estimate what your transformation models would cost before you run them. Rocky loads the models directory, generates each model's SQL, and asks the warehouse to `EXPLAIN` it. Nothing materializes.
+
+`rocky estimate` prices the transformation models only. It does not estimate a replication pipeline's tables, and it does not price the rest of a run.
 
 ```bash
 rocky estimate                    # Estimate every model
@@ -1031,7 +1051,7 @@ rocky estimate --verbose          # Show the full EXPLAIN plan and pricing rates
 | `--pipeline <NAME>` | | Pipeline name. Required when more than one pipeline is defined. |
 | `--verbose` | `false` | Print extra context per model: the full `EXPLAIN` plan, the pricing rates used, and any models skipped before `EXPLAIN`. |
 
-Pricing comes from [`[cost]`](/reference/configuration/#cost). For a recommendation rather than an estimate, use `rocky optimize`.
+**Where the prices come from.** Rocky carries one built-in rate table per adapter type: Databricks, Snowflake, BigQuery, and DuckDB. It picks the table matching the pipeline's target adapter. An unrecognized adapter type falls back to the Databricks rates, and `--verbose` labels that as a fallback. `rocky estimate` does not read the [`[cost]`](/reference/configuration/#cost) block, so editing those keys does not move these numbers. For a recommendation rather than an estimate, use `rocky optimize`.
 
 ---
 
@@ -1040,7 +1060,8 @@ Pricing comes from [`[cost]`](/reference/configuration/#cost). For a recommendat
 Run Rocky's built-in performance benchmarks, and compare a run against a saved baseline. Useful when a change might have slowed compilation down.
 
 ```bash
-rocky bench                              # Run every group
+rocky bench                              # Run compile, dag, and sql_gen
+rocky bench startup                      # Run the startup group
 rocky bench compile --models 500         # Compile benchmark at 500 models
 rocky bench --save baseline.json         # Record a baseline
 rocky bench --compare baseline.json      # Compare against it
@@ -1050,7 +1071,7 @@ rocky bench --compare baseline.json      # Compare against it
 
 | Argument / flag | Default | Description |
 |------|---------|-------------|
-| `group` | `all` | Benchmark group: `compile`, `dag`, `sql_gen`, `startup`, or `all`. |
+| `group` | `all` | Benchmark group: `compile`, `dag`, `sql_gen`, `startup`, or `all`. `all` runs `compile`, `dag`, and `sql_gen`. It leaves `startup` out, so name that group to run it. |
 | `--models <N>` | | Number of models to generate for the compile benchmarks. |
 | `--format <FORMAT>` | `table` | `json` for machine-readable output. |
 | `--save <PATH>` | | Write the results to a JSON baseline file. |

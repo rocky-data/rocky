@@ -123,24 +123,28 @@ A passing contract is what lets you refactor a model's internals without breakin
 
 **Definition.** [Drift](/reference/glossary/#drift) is a mismatch between the source schema and the target table's current schema. Rocky's [graduated drift handling](../../concepts/schema-drift) tries to fix the divergence in place. It runs `ALTER COLUMN TYPE` for a safe widening and `ALTER TABLE ADD COLUMN` for a new column. It drops and recreates the table only when it cannot do either.
 
-**Detection signal.** The `drift` block (a `DriftSummary`) on `rocky run` / `rocky apply --output json`. It reports `tables_checked`, `tables_drifted`, and one `actions_taken[]` entry per drifted table. Each entry carries `table`, `action`, and a human-readable `reason`. There are three possible actions:
+**Detection signal.** The `drift` block (a `DriftSummary`) on `rocky run` / `rocky apply --output json`. It reports `tables_checked`, `tables_drifted`, and one `actions_taken[]` entry per drifted table. Each entry carries `table`, `action`, and a human-readable `reason`. Rocky adds an entry only when it changed the target, so a table with no drift produces no entry. Three actions reach the wire:
 
 | `action` | Meaning |
 |---|---|
-| `Ignore` | No column-type drift detected (added / removed columns are handled separately) |
-| `AlterColumnTypes` | Safe in-place widening planned (e.g. INT → BIGINT) |
-| `DropAndRecreate` | Source/target diverged in a way Rocky can't widen; full refresh next run |
+| `add_columns` | The source has columns the target lacked, and no type drifted. Rocky ran `ALTER TABLE ADD COLUMN` for each one. |
+| `alter_column_types` | Every changed type was a safe widening (e.g. INT → BIGINT). Rocky ran `ALTER` on each drifted column, plus any new columns. |
+| `drop_and_recreate` | A type change was not a safe widening. Rocky dropped the target and rebuilt it with a full refresh. |
 
-Each entry's `reason` string summarises the per-column detail: which columns changed, which the source added, and which are past their grace-period deadline. The full column-level breakdown stays inside the engine and is not part of the JSON wire shape.
+Rocky applies each action during the run that reports it. The entry records what already happened. It is not a plan for the next run.
+
+Each entry's `reason` names the columns behind the action, one phrase per column. The JSON carries no other column-level detail.
+
+Rocky does not detect a column that disappeared from the source. No action covers a removed column, and no grace period runs today.
 
 **Recovery playbook.**
 
-- **`Ignore`**: no column-type drift, so no type change needs your attention. If Rocky is auto-applying additive drift and your team does not want that, audit `auto_apply_additive_drift` under `[resilience]` in `rocky.toml`.
-- **`AlterColumnTypes`**: let the next `rocky apply` run the `ALTER`. Afterwards, check that downstream tables, views, and dashboards still parse the widened type.
-- **`DropAndRecreate`**: Rocky full-refreshes the target on the next run. Schedule that run in a maintenance window if the table is large or if consumers cannot tolerate the gap.
-- **Grace period**: decide before the deadline whether to keep the columns or accept the drop. Re-adding a column upstream restores it.
+- **`add_columns`**: Rocky already added the columns. They are nullable, so historical rows hold NULL. Check any downstream model that reads them.
+- **`alter_column_types`**: Rocky already widened the columns. Check that downstream tables, views, and dashboards still parse the wider type.
+- **`drop_and_recreate`**: Rocky already dropped the target and rebuilt it. Consumers saw the table disappear and come back mid-run. Check whether the source type change was intended.
+- **Governing the auto-apply**: these mutations apply on Rocky's own authority by default. Set `auto_apply_additive_drift = true` under `[resilience]` in `rocky.toml` to route each one through the policy plane instead. Rocky then applies only a provably additive change that a `[policy]` rule allows, and refuses the rest with a require-review failure.
 
-Schema drift is the only category where the runtime corrects itself. Your job is to audit the planned action, then let the run proceed.
+Rocky corrects drift inside the run rather than waiting for you. Your job is to read what it did, then check the consumers downstream.
 
 ---
 
@@ -290,7 +294,7 @@ Hook failures look like runtime failures. The fix is in your hook script or webh
 3. For an **unexpected** violation, where the cost spiked without a known cause, check three things:
    - Did the `MaterializationStrategy` change recently, for example `Merge` → `FullRefresh`? `rocky optimize --output json` recommends a cheaper strategy when one fits.
    - Did the upstream row count grow? `rocky history --model <name>` shows the row-count history.
-   - Is the SQL doing a cross-join or another antipattern? `rocky lineage --column` shows which upstream column drives the cost.
+   - Is the SQL doing a cross-join or another antipattern? Run `rocky lineage <model> --column <name>`. It traces that column back through the upstream columns feeding it, and labels each edge with the transform. It reports no cost of its own, so you read the path and judge which join is doing the work.
 4. For PR-time violations, the [`rocky-preview` GitHub Action](../../guides/preview-a-pr) renders the cost delta in the PR comment, so reviewers see it before merge.
 
 **Why budgets warn by default.** Cost is a signal, not a gate, until you have calibrated budgets against real usage. Switch to `on_breach = "error"` once your `[budget]` blocks reflect reality. Until then, the `rocky cost` warning on every PR is the calibration loop.

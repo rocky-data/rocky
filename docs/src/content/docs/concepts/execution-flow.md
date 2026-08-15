@@ -107,7 +107,9 @@ If the target does not exist yet, Rocky creates it from scratch on the first run
 
 ### 6b. Skip-unchanged gate
 
-Rocky computes a `blake3` hash over:
+The gate is off by default, so every selected model builds. Turn it on with `skip_unchanged = true` under `[run]` in `rocky.toml`, or with `--skip-unchanged` for one invocation.
+
+With the gate on, Rocky computes a `blake3` hash over:
 - The normalized SQL text
 - The typed column list
 - The materialization strategy + config
@@ -138,7 +140,7 @@ For `TimeInterval` models, it replaces the `@start_date` and `@end_date` placeho
 
 Rocky calls `WarehouseAdapter::execute_statement(sql)`. The adapter owns connection pooling, retries on transient errors, and warehouse-specific quirks.
 
-Databricks, for example, calls `POST /api/2.0/sql/statements` and polls for the result. Adaptive concurrency control keeps Rocky from overloading the warehouse; see [AIMD adaptive concurrency](#aimd-adaptive-concurrency) below.
+Databricks, for example, calls `POST /api/2.0/sql/statements` and polls for the result. Adaptive concurrency control backs Rocky off when the warehouse signals a rate limit; see [AIMD adaptive concurrency](#aimd-adaptive-concurrency) below.
 
 A failed statement produces a `failure_kind`. The `FailureKind` enum in `output.rs` has eight variants: `AuthFailed`, `ConnectionFailed`, `QueryRejected`, `QuotaExceeded`, `NotFound`, `Transient`, `CompileError`, `Unknown`. They serialize to kebab-case on the wire, for example `auth-failed` and `compile-error`. Rocky branches on the kind:
 - `Transient` → retry with backoff
@@ -245,7 +247,7 @@ Exit code:
 
 ## Checkpoint and resume
 
-A run can be interrupted mid-layer by a killed process or a network failure. Rocky resumes it from the last successful checkpoint.
+A run can be interrupted mid-layer by a killed process or a network failure. Rocky can resume it from the last successful checkpoint, but only when you ask for it. Pass `--resume-latest` or `--resume <run-id>`. Without one of those flags the next run starts fresh and rebuilds every selected table.
 
 The state store records which tables completed in the `run_progress_entries` table, one entry per `run_id` plus table, with a `run_progress` header row per `run_id`. `rocky run --resume-latest` looks up the most recent `run_id`, reads which tables already completed, and skips them.
 
@@ -264,11 +266,12 @@ rocky run -c rocky.toml --resume run-20240115-123456-789
 Databricks and other rate-limited warehouses push back when you send too many statements at once. Rocky finds the safe level itself with AIMD: additive increase on success, multiplicative decrease on a throttle.
 
 ```
-Start: concurrency = 1
+Start: concurrency = max_concurrency   (32 when concurrency = "adaptive")
 
-Each successful statement:  concurrency = min(concurrency + 1, max_concurrency)
+Every 10 successes:         concurrency + 1, capped at max_concurrency
+                            (+2 while below half of max_concurrency)
 Each 429 / throttle error:  concurrency = max(concurrency / 2, 1)
-                            back off for cooldown_seconds
+                            the success counter resets to 0
 ```
 
-This settles on the warehouse's real throughput within a few statements. You tune nothing.
+The throttle runs only when `concurrency = "adaptive"`, which is the default. Set `concurrency` to an integer instead and Rocky holds that many in-flight tables for the whole run.

@@ -119,23 +119,30 @@ Rocky type-checks every change an agent writes. The agent produces a plan. A pla
    └──────────┬──────────┘
               ▼
    ┌─────────────────────┐
-   │ your [policy] rules │
+   │ rocky apply reads   │   this gate runs before any
+   │ your [policy] rules │   SQL reaches the warehouse
    └──────────┬──────────┘
               │
      ┌────────┴────────┬──────────────────┐
      │ require review  │ allow            │ deny
      ▼                 │                  ▼
   ┌──────────────┐     │        ┌───────────────────┐
-  │ a human      │     │        │ refused. Rocky    │
-  │ approves     │     │        │ rolls the write   │
-  └──────┬───────┘     │        │ back.             │
-         │             │        └─────────┬─────────┘
+  │ a human      │     │        │ refused. No SQL   │
+  │ approves,    │     │        │ runs, so there is │
+  │ then applies │     │        │ nothing to undo.  │
+  └──────┬───────┘     │        └─────────┬─────────┘
+         │             │                  │
          └──────┬──────┘                  │
                 ▼                         │
      ┌────────────────────┐               │
-     │ apply, then re-run │               │
-     │ the checks         │               │
+     │ the warehouse runs │               │
+     │ the plan           │               │
      └─────────┬──────────┘               │
+               ▼                          │
+     ┌──────────────────────────┐         │
+     │ a rule can require that  │         │
+     │ named checks passed here │         │
+     └─────────┬────────────────┘         │
                │                          │
                └────────────┬─────────────┘
                             ▼
@@ -145,11 +152,15 @@ Rocky type-checks every change an agent writes. The agent produces a plan. A pla
               └──────────────────────────────┘
 ```
 
-- **You write the rules in `rocky.toml`.** A `[policy]` rule says what each principal may do, and where. The answer is allow, require review, or deny. If a change touches too many downstream models, Rocky downgrades an allow to require review. It does the same when it cannot work out how far the change reaches. You can test the rules: `[[policy.tests]]` scenarios run through the real evaluator, so `rocky policy test` in CI catches an edit that would have opened a hole.
+The diagram shows the gate at `rocky apply`. The MCP `draft` and `propose` tools read the same rules earlier, before Rocky keeps a file or a plan. Rocky leaves no new file for a denied draft, and writes no plan for a denied proposal.
+
+A rule can also name checks that must pass in that run. If one fails, or never ran, Rocky stops and records the failure. It cannot undo the write: the change stays until a human reverts it.
+
+- **You write the rules in `rocky.toml`.** A `[policy]` rule says what each principal may do, and where. The answer is allow, require review, or deny. A rule can also set a ceiling on how far a change may reach, with `max_downstreams`. Rocky downgrades that rule's allow to require review when a change exceeds the ceiling, or when it cannot work out the reach. You can test the rules: `[[policy.tests]]` scenarios run through the real evaluator, so `rocky policy test` in CI catches an edit that would have opened a hole.
 - **A plan written by AI waits for a human.** The agent proposes. `rocky apply` refuses an unapproved AI-authored plan unless one of your `[policy]` rules grants that scope. The engine enforces this. It is not a convention you can forget.
 - **You can ask the ledger what happened.** `rocky audit --for <table>` says who changed what, under whose authority, and what was verified. `rocky review --queue` ranks what waits on you. `rocky brief` is the morning digest, and every line cites the ledger.
 - **Rocky tracks what an agent builds back to its recipe.** This applies on the content-addressed path. `rocky gc --derivable` lists artifacts whose recorded recipe matches their bytes. A review gates each eviction, and it leaves a tombstone. `rocky restore` then rebuilds the exact bytes, or it refuses. Restore works for a recipe that reads no recorded upstreams. It cannot yet rebuild a recipe with several inputs, so eviction is not reversible for every artifact.
-- **The agent surface is MCP.** `rocky mcp` exposes 30 tools. They ground an agent in your real schemas and data, draft changes that compile in the same call, and propose the result. A denied draft leaves nothing on disk.
+- **The agent surface is MCP.** `rocky mcp` exposes 30 tools. They ground an agent in your real schemas and data, draft changes that compile in the same call, and propose the result.
 
 <p align="center">
   <img src="docs/public/demo-policy-enforce.gif" alt="an agent's change to a contracted model is planned, rocky apply run as the agent principal is denied by the policy plane with the rule named, and rocky audit shows the recorded decision" width="900" />
@@ -178,7 +189,11 @@ These features are ready for production on Databricks: the checker, named branch
 
 `rocky emit-sql` writes your transformation models out as plain SQL, in dependency order. It runs offline and needs no warehouse connection.
 
-Two kinds of model produce no standalone SQL: ephemeral models, which Rocky inlines as CTEs, and strategies that need a live warehouse to render, such as a Snowflake dynamic table. Rocky reports those on stderr instead of dropping them quietly.
+Read the exported SQL with these limits in mind.
+
+- **Some models produce no standalone SQL.** Rocky inlines an ephemeral model as a CTE. Other models cannot render offline, such as a Snowflake dynamic table, which needs a live warehouse name. Rocky lists what it skipped on stderr, so you never mistake the export for the whole project.
+- **An incremental or merge model exports only its steady-state `INSERT` or `MERGE`.** That statement assumes the target table already exists. `rocky run` creates the table on the first build, and the exported file cannot. Rocky prefixes each of those statements with a note that says so.
+- **Every model renders in one dialect.** Rocky resolves one dialect for the whole project from `rocky.toml`. With no config it uses DuckDB. If your models target more than one adapter, the export matches `rocky run` only for the models whose target uses that dialect.
 
 It is one command, not a rewrite. Adopting Rocky is not a one-way door. See [No lock-in](https://rocky-data.dev/guides/no-lock-in/).
 
