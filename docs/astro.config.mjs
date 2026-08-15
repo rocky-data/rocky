@@ -19,7 +19,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "Rocky",
-      description: "Rust SQL transformation engine that replaces dbt",
+      description: "A SQL transformation engine that checks your pipeline before it runs",
       logo: {
         dark: "./src/assets/rocky-logo-dark.svg",
         light: "./src/assets/rocky-logo-light.svg",
