@@ -6,15 +6,23 @@ on:
     paths:
       - 'docs/**'
       - '.github/workflows/engine-docs.yml'
+  # Build (but never deploy) on docs PRs. Without this, a broken page —
+  # an unclosed MDX component, a bad import — only surfaces after merge,
+  # when the site is already building from main.
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/engine-docs.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
+# Deploys share one `pages` group so they never race each other. PR builds
+# get their own per-ref group, so a PR can never cancel an in-flight deploy.
 concurrency:
-  group: pages
+  group: ${{ github.event_name == 'push' && 'pages' || format('docs-pr-{0}', github.ref) }}
   cancel-in-progress: true
 
 env:
@@ -36,13 +44,19 @@ jobs:
       - run: npm run build
         working-directory: docs
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: github.event_name != 'pull_request'
         with:
           path: docs/dist
 
   deploy:
     name: Deploy
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
