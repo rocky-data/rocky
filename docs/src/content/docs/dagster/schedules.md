@@ -5,11 +5,12 @@ sidebar:
   order: 11
 ---
 
-Dagster's [`ScheduleDefinition`](https://docs.dagster.io/api/dagster/schedules-sensors#dagster.ScheduleDefinition)
-is fully sufficient for scheduled Rocky runs without any Rocky-specific glue.
-`dagster-rocky` ships `build_rocky_schedule()` as a thin convenience that
-bakes in sensible defaults and accepts the same `target=` shape as
-`rocky_source_sensor()` for symmetry.
+You do not need Rocky-specific glue to schedule a Rocky run. Dagster's
+[`ScheduleDefinition`](https://docs.dagster.io/api/dagster/schedules-sensors#dagster.ScheduleDefinition)
+already does the whole job.
+
+`build_rocky_schedule()` is a thin convenience on top. It sets a few
+defaults and takes the same `target=` shape as `rocky_source_sensor()`.
 
 ## Quickstart
 
@@ -56,13 +57,13 @@ Returns a `ScheduleDefinition` with sensible defaults.
 
 ## Tag namespacing
 
-Every schedule built via `build_rocky_schedule` automatically adds a
-`rocky/schedule=<name>` tag to runs it triggers, so you can filter the run
-history view by Rocky-driven schedules.
+Every schedule from `build_rocky_schedule` tags the runs it triggers with
+`rocky/schedule=<name>`. Filter the run history view on that tag to see
+only Rocky-driven schedules.
 
-User-supplied tags merge on top of the namespace tag, so a user explicitly
-setting `rocky/schedule=<other>` wins. This is intentional; advanced users may
-want different schedule-tag values for grouping.
+Your own tags merge on top of the namespace tag. If you set
+`rocky/schedule=<other>` yourself, your value wins. That is deliberate.
+Some users want their own schedule-tag values for grouping.
 
 ## Pairing with sensors
 
@@ -73,10 +74,15 @@ Schedules and sensors complement each other:
 - **Sensors** fire when upstream state changes, useful for pipelines that
   should kick off as soon as Fivetran completes a sync.
 
-Both can target the same asset selection. Note that Dagster's `run_key`
-deduplication is per-instigator: the sensor's `run_key` only stops that same
-sensor from re-emitting the same `(source, sync)` pair on a later tick.
-`build_rocky_schedule` sets no `run_key` at all, so a schedule fire concurrent
-with a sensor fire on the same selection will launch two runs — Dagster does not
-dedupe across a schedule and a sensor. Rocky's incremental, idempotent execution
-keeps the cost of the redundant run low, but both runs do execute.
+Both can target the same asset selection. If they do, expect two runs.
+
+Dagster deduplicates on `run_key` per instigator. A sensor's `run_key`
+only stops that same sensor from re-emitting the same `(source, sync)`
+pair on a later tick. `build_rocky_schedule` sets no `run_key` at all. So
+a schedule that fires at the same time as a sensor, on the same
+selection, launches two runs. Dagster does not dedupe across a schedule
+and a sensor.
+
+Rocky's execution is incremental and
+[idempotent](/reference/glossary/#idempotent), which keeps the redundant
+run cheap. Both runs still execute.

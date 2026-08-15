@@ -1,33 +1,54 @@
 ---
 title: Schema Drift
-description: Automatic detection and graduated resolution of schema changes
+description: How Rocky spots a changed column type and repairs the target table
 sidebar:
   order: 10.7
 ---
 
-Rocky automatically detects schema drift between source and target tables and resolves it using **graduated evolution** -- safe type widenings are handled with `ALTER TABLE` (preserving data) where the warehouse supports the change, while unsafe changes trigger a full refresh.
+Schema drift is a column whose type in the source no longer matches its type in the target table. Rocky checks for it as it copies each table, and fixes what it safely can. This is **graduated evolution**: a safe widening becomes an `ALTER TABLE` that keeps the data, and anything else becomes a full refresh.
 
 ![Two rocky run invocations sandwiching an ALTER TABLE; the second run reports "Drift: 1/1 tables drifted"](/demo-drift-recover.gif)
 
 ## What It Detects
 
-Schema drift in Rocky means **column type mismatches** between source and target tables. For example, a column that was `STRING` in the source but is `INT` in the target, or an `INT` that widened to `BIGINT`.
+Drift in Rocky means **column type mismatches** between the source and the target. A column that is `STRING` in the source and `INT` in the target has drifted. So has an `INT` that widened to `BIGINT`.
 
-## How It Works
+## How Rocky classifies and resolves a change
 
-1. Runs `DESCRIBE TABLE` on both the source and target tables
-2. Compares column types (case-insensitive)
-3. Classifies each type change as **safe** or **unsafe**
-4. Safe widenings are resolved with `ALTER TABLE ALTER COLUMN`
-5. Unsafe changes trigger `DROP TABLE IF EXISTS` followed by full refresh
+Rocky runs the check inside each table's copy, whenever the target already exists.
 
-The check runs as part of each table's copy, whenever the target already exists. Two cases bypass it. With the opt-in `prune_unchanged` optimization, a table whose source reports an unchanged change-marker since the last successful copy is skipped entirely — copy, drift check, and data checks — so drift is only re-evaluated once the source changes again. And a failed `DESCRIBE TABLE` is swallowed rather than failing the run: an unreadable target is treated as absent and rebuilt with a full refresh, and an unreadable source produces no drift result for that run, so the copy proceeds unchecked.
+```
+  per table, when the target already exists
+        │
+        ├─► DESCRIBE TABLE source ─┐
+        │                          ├─► compare types, case-insensitive
+        └─► DESCRIBE TABLE target ─┘             │
+                                                 ▼
+                                       ┌───────────────────┐
+                                       │ any type changed? │
+                                       └──┬─────────────┬──┘
+                                       no │             │ yes
+                                          ▼             ▼
+                                  copy the rows   ┌────────────────┐
+                                                  │ safe widening? │
+                                                  └──┬──────────┬──┘
+                                               yes   │          │  no
+                                                     ▼          ▼
+                              ALTER TABLE ALTER COLUMN      DROP TABLE IF
+                              data preserved                EXISTS, then
+                                                            full refresh
+```
+
+Two cases bypass the check.
+
+- **The source has not changed and `prune_unchanged` is on.** This opt-in optimization skips the whole table when the source reports the same change-marker as the last successful copy. That skips the copy, the drift check, and the data checks. Rocky re-evaluates drift once the source changes again.
+- **`DESCRIBE TABLE` fails.** Rocky swallows the error instead of failing the run. It treats an unreadable target as absent and rebuilds it with a full refresh. An unreadable source produces no drift result for that run, so the copy proceeds unchecked.
 
 ## Graduated Evolution
 
 ### Safe Type Widenings
 
-These type changes preserve data and are handled with `ALTER TABLE` without a full refresh:
+These type changes keep the data. Rocky applies them with `ALTER TABLE` and skips the full refresh:
 
 | From | To | Example |
 |---|---|---|
@@ -42,15 +63,23 @@ ALTER TABLE acme_warehouse.staging__us_west__shopify.orders
 ALTER COLUMN amount TYPE DECIMAL(12, 2)
 ```
 
-Classification is per-dialect. The table above is the engine's default allowlist, verified end-to-end on DuckDB. Snowflake and BigQuery override it with narrower rules aligned with what their `ALTER COLUMN` accepts: Snowflake allows only `NUMBER(p,s)` precision widening and `VARCHAR` length widening (integer types all canonicalize to `NUMBER(38,0)` in its `DESCRIBE TABLE` output, so integer widening never surfaces as drift there), and BigQuery allows only `INT64 → NUMERIC`, `INT64 → BIGNUMERIC`, and `NUMERIC → BIGNUMERIC` — numeric → `STRING` is not assignable on BigQuery and falls through to a full refresh.
+Classification is per-dialect. The table above is the engine's default allowlist, verified end-to-end on DuckDB. Snowflake and BigQuery override it with narrower rules that match what their own `ALTER COLUMN` accepts.
+
+- **Snowflake** allows `NUMBER(p,s)` precision widening and `VARCHAR` length widening, and nothing else. Its `DESCRIBE TABLE` output canonicalizes every integer type to `NUMBER(38,0)`, so integer widening never surfaces as drift there.
+- **BigQuery** allows `INT64 → NUMERIC`, `INT64 → BIGNUMERIC`, and `NUMERIC → BIGNUMERIC`, and nothing else. A numeric → `STRING` change is not assignable on BigQuery, so it falls through to a full refresh.
 
 :::caution[Databricks and Trino execution gaps]
-Databricks and Trino currently inherit the default allowlist, and their `ALTER` execution paths have known gaps: Delta tables reject `ALTER COLUMN ... TYPE` changes unless the type-widening table feature is enabled (Rocky does not set it) and never accept numeric → `STRING`, and Trino requires `SET DATA TYPE` syntax the default statement doesn't use. On those warehouses, a drift classified as a safe widening fails that table's run with the warehouse's error — loud, never a silent divergence — instead of evolving the column in place; Rocky does not yet fall back to a full refresh on a failed `ALTER`. Tracked in [#1115](https://github.com/rocky-data/rocky/issues/1115).
+Databricks and Trino inherit the default allowlist, but their `ALTER` execution paths have known gaps:
+
+- Delta tables reject `ALTER COLUMN ... TYPE` unless the type-widening table feature is enabled, and Rocky does not set it. Delta never accepts numeric → `STRING`.
+- Trino requires `SET DATA TYPE` syntax, which the default statement does not use.
+
+On those two warehouses a safe widening does not evolve the column in place. The table's run fails with the warehouse's own error. The failure is loud, never a silent divergence, but Rocky does not yet fall back to a full refresh after a failed `ALTER`. Tracked in [#1115](https://github.com/rocky-data/rocky/issues/1115).
 :::
 
 ### Unsafe Type Changes
 
-Any type change not in the safe allowlist triggers a full refresh:
+Any type change outside the safe allowlist costs a full refresh. Rocky drops the target and rebuilds it from the source:
 
 ```sql
 DROP TABLE IF EXISTS acme_warehouse.staging__us_west__shopify.orders
@@ -61,12 +90,12 @@ Examples: `STRING` to `INT`, `BIGINT` to `INT` (narrowing), `DATE` to `TIMESTAMP
 
 ## What Is NOT Drift
 
-- **New columns in source** -- handled additively rather than as drift: the runtime issues `ALTER TABLE ADD COLUMN` for each (nullable, so historical rows stay `NULL`) before the copy, surfaced as an `add_columns` action
-- **Columns removed from source** -- extra columns in the target table are ignored
+- **New columns in the source.** Rocky adds them rather than treating them as drift. Before the copy it issues one `ALTER TABLE ADD COLUMN` per new column, each nullable, so historical rows keep `NULL`. The run reports an `add_columns` action.
+- **Columns removed from the source.** Rocky ignores extra columns in the target table.
 
 ## Output
 
-Drift detection runs inline on replication runs; the actions taken are reported in the `drift` section of the run JSON output:
+Drift detection runs inline on a replication run. Rocky reports what it did in the `drift` section of the run JSON output:
 
 ```json
 {
@@ -84,12 +113,18 @@ Drift detection runs inline on replication runs; the actions taken are reported 
 }
 ```
 
-Use `rocky plan` to preview the SQL Rocky would emit (including any drop statements) without executing:
+Run `rocky plan` to preview the SQL, including any drop statements, without executing it:
 
 ```bash
 rocky plan --filter client=acme --output json
 ```
 
-Three actions are surfaced in the run output: `alter_column_types` (all drifted columns passed the safe-widening check and were altered in place), `drop_and_recreate` (at least one incompatible change; target rebuilt from the source), and `add_columns` (source-only columns added to the target).
+The run output surfaces three actions:
 
-By default these mutations are applied automatically. With the opt-in drift-governance gate (`auto_apply_additive_drift` plus a `[policy]` grant for `schema_change.additive`), only provably additive, policy-allowed changes proceed; anything else is refused before it touches the target and surfaced as a require-review failure for that table.
+| Action | What Rocky did |
+|---|---|
+| `alter_column_types` | Every drifted column passed the safe-widening check, so Rocky altered them in place. |
+| `drop_and_recreate` | At least one change was incompatible, so Rocky rebuilt the target from the source. |
+| `add_columns` | Rocky added source-only columns to the target. |
+
+By default Rocky applies these mutations automatically. The opt-in drift-governance gate (`auto_apply_additive_drift` plus a `[policy]` grant for `schema_change.additive`) narrows that. Only provably additive, policy-allowed changes proceed. Rocky refuses anything else before it touches the target, and reports a require-review failure for that table.

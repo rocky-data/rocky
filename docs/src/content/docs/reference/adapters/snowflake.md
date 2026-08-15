@@ -1,11 +1,11 @@
 ---
 title: Snowflake adapter
-description: Snowflake warehouse adapter — connection fields and the PAT / OAuth / key-pair / password priority order
+description: The Snowflake adapter's connection fields, and the order it tries four kinds of credential
 sidebar:
   order: 3
 ---
 
-Snowflake warehouse adapter. Supports Programmatic Access Token (PAT), OAuth, key-pair (RS256 JWT), and password authentication.
+The Snowflake warehouse adapter accepts four kinds of credential: a Programmatic Access Token (PAT), an OAuth token, a key pair (RS256 JWT), and a password.
 
 ## Fields
 
@@ -24,7 +24,25 @@ Snowflake warehouse adapter. Supports Programmatic Access Token (PAT), OAuth, ke
 
 ## Authentication
 
-Priority order: **PAT** (highest) > **OAuth** > **key-pair JWT** > **password** (lowest).
+Rocky tries the credentials in a fixed order and uses the first one the config supplies.
+
+```
+  pat                        ──set──► Programmatic Access Token
+     │ not set
+     ▼
+  oauth_token                ──set──► OAuth
+     │ not set
+     ▼
+  private_key_path + username ──set──► key-pair JWT (RS256)
+     │ not set
+     ▼
+  username + password         ──set──► password
+     │ not set
+     ▼
+  error: no authentication configured
+```
+
+So a config that sets both `pat` and `password` authenticates with the PAT, and never uses the password.
 
 ```toml
 # Programmatic Access Token (PAT) auth — recommended for trial accounts and

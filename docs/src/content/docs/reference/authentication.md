@@ -1,33 +1,55 @@
 ---
 title: Authentication
-description: PAT and OAuth M2M authentication for Databricks
+description: How Rocky picks between a PAT and OAuth M2M when connecting to Databricks
 sidebar:
   order: 9
 ---
 
-Rocky supports two authentication methods for connecting to **Databricks** warehouses. They are auto-detected based on which credentials are available. These apply to all Databricks API calls: SQL Statement Execution, Unity Catalog operations, and workspace bindings.
+Rocky connects to **Databricks** warehouses two ways. You do not choose between them explicitly: Rocky looks at which credentials you supplied and picks. The choice applies to every Databricks API call — SQL statement execution, Unity Catalog operations, and workspace bindings.
+
+## Detection Order
+
+Rocky checks the personal access token first, and falls back to the service principal:
+
+```
+   read [adapter.NAME]
+          │
+          ▼
+   ┌─────────────────┐   yes   ┌──────────────────────────┐
+   │ `token` set and ├────────►│ PAT                      │
+   │ non-empty?      │         │ Authorization: Bearer …  │
+   └────────┬────────┘         └──────────────────────────┘
+            │ no
+            ▼
+   ┌──────────────────┐  yes   ┌──────────────────────────┐
+   │ `client_id` and  ├───────►│ OAuth M2M                │
+   │ `client_secret`? │        │ POST /oidc/v1/token      │
+   └────────┬─────────┘        │ short-lived access token │
+            │ no               └──────────────────────────┘
+            ▼
+   error at startup
+```
 
 ## PAT (Personal Access Token)
 
-**Tried first.** Simple token-based authentication, good for development.
+A single long-lived token. Rocky tries this first. Good for development.
 
-- Set via environment variable: `DATABRICKS_TOKEN`
-- Or in config: `token = "${DATABRICKS_TOKEN}"`
-- Sent as: `Authorization: Bearer <token>`
+- Supply it in the environment as `DATABRICKS_TOKEN`.
+- Or in the config as `token = "${DATABRICKS_TOKEN}"`.
+- Rocky sends it as `Authorization: Bearer <token>`.
 
 ## OAuth M2M (Service Principal)
 
-**Used as fallback when the PAT token is empty.** Recommended for production deployments.
+A client ID and secret that Rocky exchanges for a short-lived token. Rocky uses this when the PAT is empty. Prefer it in production.
 
-- Environment variables: `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`
-- Token endpoint: `https://<host>/oidc/v1/token`
-- Grant type: `client_credentials`
-- Scope: `all-apis`
-- Returns a short-lived access token that Rocky automatically refreshes
+- Supply `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET` in the environment.
+- Rocky calls the token endpoint `https://<host>/oidc/v1/token`.
+- Grant type: `client_credentials`. Scope: `all-apis`.
+- The endpoint returns a short-lived access token, and Rocky refreshes it for you.
 
 ## Configuration
 
-Authentication is configured on the Databricks adapter:
+Both methods live on the Databricks adapter block:
 
 ```toml
 [adapter.prod]
@@ -45,18 +67,12 @@ token = "${DATABRICKS_TOKEN}"
 
 ## Environment Variable Substitution
 
-Rocky substitutes `${VAR_NAME}` references in `rocky.toml` at parse time. Keep secrets out of your config files and inject them from the environment, CI/CD variables, or a secrets manager.
-
-## Detection Order
-
-1. If `token` is set and non-empty, Rocky uses PAT authentication
-2. If `token` is empty or unset, Rocky checks for `client_id` and `client_secret`
-3. If neither is configured, Rocky reports an error at startup
+Rocky replaces every `${VAR_NAME}` reference in `rocky.toml` when it parses the file. Keep the secrets themselves out of the config and inject them from the environment, from CI/CD variables, or from a secrets manager.
 
 ## Validation
 
-Run `rocky validate` to check that at least one authentication method is properly configured before executing a pipeline.
+Run `rocky validate` before a pipeline to confirm at least one method is configured correctly.
 
 ## Source Adapter Authentication
 
-Authentication for source adapters is separate from warehouse authentication. Each source adapter is its own `[adapter.NAME]` block. Fivetran uses HTTP Basic Auth with `api_key` and `api_secret` (see the [Fivetran adapter](/reference/adapters/fivetran/) for the full block); DuckDB and `manual` sources require no authentication.
+Source adapters authenticate separately from the warehouse. Each one is its own `[adapter.NAME]` block. Fivetran uses HTTP Basic Auth with `api_key` and `api_secret` — see the [Fivetran adapter](/reference/adapters/fivetran/) for the full block. DuckDB and `manual` sources need no credentials at all.

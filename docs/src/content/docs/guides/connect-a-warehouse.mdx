@@ -7,11 +7,11 @@ sidebar:
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-The [playground](/guides/playground/) runs on local DuckDB with no credentials. To run against a real warehouse, you swap one block: the `[adapter]` definition. Storage and compute stay in your warehouse; Rocky connects over its API and drives the SQL.
+The [playground](/guides/playground/) runs on local DuckDB and needs no credentials. To run against a real warehouse, you swap one block: the `[adapter]` definition. Your tables stay in your warehouse. Rocky connects over the warehouse API and sends it SQL.
 
-## The shape
+## Name an adapter, then point a pipeline at it
 
-Rocky uses **named adapters** plus **named pipelines**. An adapter defines one connection; a pipeline's `target` points at it by name:
+Rocky uses **named adapters** and **named pipelines**. An [adapter](/reference/glossary/#adapter) defines one connection. A [pipeline](/reference/glossary/#pipeline) is a unit of work declared in `rocky.toml`, and its `target` points at that adapter by name:
 
 ```toml
 [adapter.prod]
@@ -22,14 +22,14 @@ type = "databricks"   # or "snowflake", "bigquery"
 adapter = "prod"
 ```
 
-Connection fields use `${VAR}` substitution so secrets never land in the file. Export the variables in your shell or CI, and keep `rocky.toml` checked in safely.
+Connection fields use `${VAR}` substitution, so no secret lands in the file. Export the variables in your shell or in CI. You can then commit `rocky.toml` safely.
 
 ## Configure the adapter
 
 <Tabs syncKey="warehouse">
 <TabItem label="Databricks">
 
-Databricks is the production target. Auth is Personal Access Token first, OAuth M2M (service principal) as a fallback.
+Databricks is the production target. Rocky reads a Personal Access Token first. If no token is set, it falls back to OAuth M2M with a service principal.
 
 ```toml
 [adapter.prod]
@@ -59,7 +59,7 @@ client_secret = "${DATABRICKS_CLIENT_SECRET}"
 </TabItem>
 <TabItem label="Snowflake">
 
-Snowflake is Beta. Auth priority is PAT, then OAuth, then key-pair JWT, then password. A Programmatic Access Token (Snowsight → User Profile → Personal Access Tokens) is the simplest:
+Snowflake is Beta. Rocky tries each auth method in this order: Programmatic Access Token, OAuth, key-pair JWT, password. A Programmatic Access Token (Snowsight → User Profile → Personal Access Tokens) is the simplest:
 
 ```toml
 [adapter.prod]
@@ -85,7 +85,7 @@ private_key_path = "${SNOWFLAKE_KEY_PATH}"
 </TabItem>
 <TabItem label="BigQuery">
 
-BigQuery is Beta. The adapter takes a project and a location; credentials come from the environment, not the config file:
+BigQuery is Beta. The adapter takes a project and a location. Credentials come from the environment, not from the config file:
 
 ```toml
 [adapter.prod]
@@ -107,7 +107,7 @@ gcloud auth application-default login
 </TabItem>
 <TabItem label="DuckDB">
 
-DuckDB runs in-process with no credentials. It powers the playground and `rocky test`, and is handy for local development against a file:
+DuckDB runs inside the Rocky process and needs no credentials. It backs the playground and `rocky test`. Use it for local development against a file:
 
 ```toml
 [adapter.local]
@@ -119,12 +119,12 @@ path = "warehouse.duckdb"
 </Tabs>
 
 :::note[Adapter status]
-Databricks is production-grade. Snowflake, BigQuery, and Trino are Beta: connection, execution, and the core run loop work, but conformance coverage is still growing. See the [Roadmap](/getting-started/roadmap/) for the honest breakdown.
+Databricks is production-grade. Snowflake, BigQuery, and Trino are Beta: connection, execution, and the core run loop work, but conformance coverage is still growing. See the [Roadmap](/getting-started/roadmap/) for the full breakdown.
 :::
 
 ## Run against it
 
-Once the adapter is configured and the env vars are exported:
+Configure the adapter, export the environment variables, then run these four commands in order. Each one costs more than the one before it, so a failure stops you early:
 
 ```bash
 rocky validate          # config + adapter wiring; no network calls
@@ -133,12 +133,14 @@ plan_id=$(rocky plan --output json | jq -r .plan_id)
 rocky apply "$plan_id"
 ```
 
-Run `rocky doctor` first: it's the credentials and connectivity smoke test, and it tells you which adapter Rocky can reach before you spend any warehouse time. For a replication pipeline, scope the run with `--filter` (for example `rocky plan --filter tenant=acme`).
+`rocky doctor` tells you which adapter Rocky can reach before you spend any warehouse time. `rocky plan` compiles the models and writes a plan; `rocky apply` executes that plan against the warehouse.
 
-Each adapter's own fields, authentication, and examples have a dedicated page — [DuckDB](/reference/adapters/duckdb/), [Databricks](/reference/adapters/databricks/), [Snowflake](/reference/adapters/snowflake/), [BigQuery](/reference/adapters/bigquery/), [Fivetran](/reference/adapters/fivetran/). The fields shared by every adapter type are in [Configuration](/reference/configuration/#adaptername), and Databricks auth detail is in [Authentication](/reference/authentication/).
+For a replication pipeline, scope the run with `--filter`. For example, `rocky plan --filter tenant=acme` plans one tenant.
+
+Each adapter has its own reference page for fields, authentication, and examples: [DuckDB](/reference/adapters/duckdb/), [Databricks](/reference/adapters/databricks/), [Snowflake](/reference/adapters/snowflake/), [BigQuery](/reference/adapters/bigquery/), [Fivetran](/reference/adapters/fivetran/). The fields every adapter type shares are in [Configuration](/reference/configuration/#adaptername). Databricks auth detail is in [Authentication](/reference/authentication/).
 
 ## Next steps
 
-- [Migrating from dbt](/guides/migrate-from-dbt/): import an existing dbt project and point it at this adapter.
+- [Migrating from dbt](/guides/migrate-from-dbt/): run `rocky import-dbt` on a dbt project and point the result at this adapter.
 - [CI/CD integration](/guides/ci-cd/): gate PRs with `rocky ci` and preview changes before they merge.
 - [Governance](/guides/governance/): grants, classification, masking, and retention on the warehouse.

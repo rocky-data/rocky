@@ -1,19 +1,48 @@
 ---
 title: Hooks and Webhooks
-description: Lifecycle events, shell hooks, and webhook integrations
+description: The 18 lifecycle events Rocky fires during a run, and how to attach a shell command or an HTTP webhook to any of them.
 sidebar:
   order: 12
 ---
 
-Rocky fires lifecycle events at key points during pipeline execution. You can attach shell scripts or HTTP webhooks to any event for notifications, gating, auditing, or custom integrations.
+Rocky fires a lifecycle event at each notable point in a run. Attach a shell script or an HTTP webhook to any event. Use it to send a notification, gate the run, write an audit record, or drive your own integration.
 
 :::note[Not the same as seed hooks]
 The lifecycle hooks on this page fire **shell commands and webhooks** on pipeline events. They are separate from the `pre_hook` / `post_hook` fields on a seed sidecar, which run **SQL statements** on the warehouse around a single [`rocky seed`](/reference/cli/#rocky-seed) load.
 :::
 
+## How a hook is dispatched
+
+Every event follows the same path, whichever kind of hook you attach to it.
+
+```
+  a lifecycle event fires
+            │
+            │ Rocky builds the event context as JSON:
+            │ { event, run_id, pipeline, timestamp, duration_ms,
+            │   metadata }
+            │
+      ┌─────┴──────────────────────┐
+      ▼                            ▼
+ ┌───────────────────┐     ┌───────────────────────┐
+ │ shell hook        │     │ webhook               │
+ │ [[hook.on_*]]     │     │ [hook.webhooks.on_*]  │
+ ├───────────────────┤     ├───────────────────────┤
+ │ sh -c "<command>" │     │ HTTP POST to `url`    │
+ │ context on STDIN  │     │ body from a preset or │
+ │                   │     │ your body_template    │
+ └─────────┬─────────┘     └───────────┬───────────┘
+           │ the hook fails            │ `secret` is set
+           ▼                           ▼
+   on_failure decides:          Rocky signs the body:
+     abort  → stop the run        X-Rocky-Signature:
+     warn   → log, continue         sha256=<hex digest>
+     ignore → continue quietly
+```
+
 ## Lifecycle events
 
-Events are organized into five phases:
+Rocky fires 18 events, grouped into six phases:
 
 ### Pipeline phase
 
@@ -69,7 +98,7 @@ The bare names above (`pipeline_start`, `budget_breach`, …) are what Rocky wri
 
 ## Shell hooks
 
-Shell hooks execute a command and pipe the event context as JSON to stdin:
+A shell hook runs a command and pipes the event context to its stdin as JSON:
 
 ```toml
 [[hook.on_pipeline_complete]]
@@ -101,17 +130,19 @@ The script receives JSON like:
 | `warn` | Log a warning and continue (default) |
 | `ignore` | Silently continue |
 
-Use `abort` for gating hooks (deploy freeze, approval gates). Use `warn` or `ignore` for notifications.
+Use `abort` for a gating hook, such as a deploy freeze or an approval gate. Use `warn` or `ignore` for a notification.
 
 ### Security: trust the `command` source
 
-The `command` string is passed to `sh -c` verbatim. The event context is delivered to the script as JSON on **stdin** (it is not interpolated into the command line), so the runtime values Rocky exposes (`run_id`, `event`, etc.) cannot inject shell metacharacters into your command.
+Rocky passes the `command` string to `sh -c` verbatim. It delivers the event context to your script as JSON on **stdin**, never interpolated into the command line. The runtime values Rocky exposes, such as `run_id` and `event`, therefore cannot inject shell metacharacters into your command.
 
-Still, **never build a hook `command` by string-formatting untrusted input** (a webhook payload, a Fivetran response, a value pulled from a row, anything you don't fully control). Use only static commands or commands templated from values you control yourself. If you need to react to dynamic input, hand it off through the JSON context to a script you wrote, and let that script decide what to do with quoting / validation.
+Even so, **never build a hook `command` by string-formatting untrusted input**. That covers a webhook payload, a Fivetran response, a value pulled from a row, and anything else you do not fully control. Use a static command, or template it from values you control yourself.
+
+To react to dynamic input, pass it through the JSON context to a script you wrote. Let that script decide how to quote and validate it.
 
 ## Webhooks
 
-Webhooks send HTTP requests instead of running shell commands:
+A webhook sends an HTTP request instead of running a shell command:
 
 ```toml
 [hook.webhooks.on_pipeline_error]
@@ -129,21 +160,21 @@ secret = "${WEBHOOK_SECRET}"
 | `datadog` | Datadog Events API | DD event JSON |
 | `teams` | Microsoft Teams Webhook | Adaptive Card JSON |
 
-Presets provide default body templates and headers. Override any field in your config.
+Each preset supplies a default body template and the headers that service expects. Override any field in your config.
 
 ### HMAC signing
 
-When `secret` is set, Rocky signs the request body with HMAC-SHA256:
+When you set `secret`, Rocky signs the request body with HMAC-SHA256 and sends the digest in a header:
 
 ```
 X-Rocky-Signature: sha256=<hex-encoded digest>
 ```
 
-The receiving service can verify the signature to ensure the request came from Rocky.
+The receiving service verifies the signature to confirm the request came from Rocky.
 
 ### Body templates
 
-Custom body templates use Mustache-style syntax:
+A custom body template uses Mustache-style syntax:
 
 ```toml
 body_template = """
@@ -157,7 +188,7 @@ Supported: `{{field}}`, `{{metadata.key}}`, `{{#if field}}...{{/if}}`.
 
 ## Testing hooks
 
-Validate your hook configuration without running a real pipeline:
+Check your hook configuration without running a real pipeline:
 
 ```bash
 # List all configured hooks
@@ -167,4 +198,4 @@ rocky hooks list
 rocky hooks test on_pipeline_start
 ```
 
-The test command sends a synthetic event context to verify scripts execute correctly.
+`rocky hooks test` sends a synthetic event context, so you can confirm your script runs and reads the JSON correctly.

@@ -5,7 +5,9 @@ sidebar:
   order: 6
 ---
 
-Commands for governing what agents (and humans) may change, auditing what was decided, and reclaiming storage. The common thread is the review gate: every mutating plan on this page requires an explicit human sign-off before `rocky apply` will execute it, and the read-only commands never write anything.
+These commands govern what an agent, or a person, may change. They also record what was decided and reclaim storage.
+
+One rule runs through all of them: the review gate. Every mutating plan on this page needs an explicit human sign-off before `rocky apply` will execute it. The read-only commands write nothing at all.
 
 For the concepts behind the policy plane and the agent authoring loop, see [Operating Rocky with agents](/concepts/operating-rocky-with-agents/).
 
@@ -31,7 +33,18 @@ rocky gc --derivable
 | `--dry-run` | `bool` | `false` | Emit the read-only inventory instead of writing a plan. |
 | `--min-age-days <DAYS>` | `int` | `7` | Minimum written-age an artifact must reach to pass the age check. Measures build time, not read recency. |
 
-An artifact is *derivable* only when all six eligibility checks pass: its recipe identity was recorded, the recipe's provenance records this artifact's exact output hash (the recipe is bound to these specific bytes, not a sibling output or a re-materialization at a new hash), the ledger's replay-check verdict says it is replayable and deterministic, nothing references it, policy allows reclamation, and it is past the age threshold. Every check fails closed — any doubt keeps the artifact.
+### The six derivability checks
+
+An artifact is *derivable* only when all six checks pass.
+
+1. Its recipe identity was recorded.
+2. The recipe's provenance records this artifact's exact output hash. The recipe must be bound to these specific bytes, not to a sibling output and not to a re-materialization at a new hash.
+3. The ledger's replay-check verdict says the artifact is replayable and deterministic.
+4. Nothing references it.
+5. Policy allows reclamation.
+6. It is past the age threshold.
+
+Every check fails closed. Any doubt keeps the artifact.
 
 ### Review gating and what eviction means
 
@@ -39,7 +52,26 @@ A `gc` plan is **unconditionally review-gated**: `rocky apply <plan-id>` refuses
 
 Eviction is ledger-only: a durable restore tombstone is written and the ledger row retired in one transaction. No physical byte-delete follows. Reclaiming the bytes safely needs a protocol-aware VACUUM (retention windows plus TOCTOU-safe deletion against concurrent re-adds), which is future work, so `[gc] physical_delete = true` is a hard error rather than a silent no-op.
 
-**Honest boundary:** `rocky restore` rebuilds an evicted artifact from the recipe its tombstone references, and refuses unless the recomputed content hash matches the tombstoned one. Its coverage is narrower than gc's eviction set: it attempts a rebuild only for a recipe that is non-partitioned, content-addressed, and reads no recorded upstreams, and it refuses a recipe with any recorded upstream outright (multi-input DAG re-derivation is a later phase). Even a supported recipe can refuse — a missing provenance binding, canonical IR that will not deserialize, unreachable object store or table state, a hash that no longer reproduces, a path outside the storage prefix, or a lost race on ledger reinstatement. Re-running the pipeline is not a substitute: it recomputes from current upstreams and need not reproduce the evicted bytes. Treat eviction as removal with a recorded rebuild path that may not work for every artifact, not as a reversible operation. `rocky gc` applies to the content-addressed write path only.
+### What restore can and cannot undo
+
+**Treat eviction as removal with a recorded rebuild path, not as a reversible operation.** The rebuild path may not work for every artifact.
+
+`rocky restore` rebuilds an evicted artifact from the recipe its tombstone references. It refuses unless the recomputed content hash matches the tombstoned one.
+
+Restore covers less than gc evicts. It attempts a rebuild only for a recipe that is non-partitioned, content-addressed, and reads no recorded upstream. A recipe with any recorded upstream is refused outright, because re-deriving a multi-input DAG is a later phase.
+
+Even a supported recipe can refuse. Any of these stops it:
+
+- a missing provenance binding,
+- canonical IR that will not deserialize,
+- an unreachable object store or table state,
+- a hash that no longer reproduces,
+- a path outside the storage prefix,
+- a lost race on ledger reinstatement.
+
+Re-running the pipeline is not a substitute. A re-run recomputes from the current upstreams and need not reproduce the evicted bytes.
+
+`rocky gc` applies to the content-addressed write path only.
 
 ---
 
@@ -71,7 +103,7 @@ A backfill re-runs **existing** recipes over a scoped window — it never rewrit
 
 ## `rocky policy`
 
-The agent-authority policy plane: `[policy]` rules in `rocky.toml` resolve `(principal, capability, scope)` triples to `allow`, `require_review`, or `deny`, enforced at the mutating seams (`rocky apply`, promote, and the MCP propose/draft tools). Absent a `[policy]` block, behavior is unchanged.
+The agent-authority policy plane. A `[policy]` rule in `rocky.toml` resolves a `(principal, capability, scope)` triple to one of three effects: `allow`, `require_review`, or `deny`. Rocky enforces the resolved effect at the mutating seams: `rocky apply`, promote, and the MCP propose and draft tools. With no `[policy]` block, behaviour is unchanged.
 
 ```bash
 rocky policy check --principal agent --capability apply --model fct_orders
@@ -101,7 +133,16 @@ rocky brief --since 24h
 rocky brief --since 7d --output json
 ```
 
-Read-only. Composed template-first from typed queries over the state store and the decision ledger — decisions awaiting review (ranked), agent activity by principal, runs, drift, freshness, quality, cost, and the resident scheduler's posture (paused pipelines, consecutive-failure streaks, scheduler-spawned runs in the window, and the incident-bundle spool). Every event line cites a `run_id`, `plan_id`, or `decision_ref`; the scheduler's posture lines carry pipeline names and counts, and its incident line carries the newest bundle's project-relative path. A section whose signal is not recorded reports `unavailable` rather than a false all-clear. The default output is a Slack/email-ready Markdown digest; `--output json` is the machine surface.
+Read-only. Rocky composes the brief from typed queries over the state store and the decision ledger. The digest covers:
+
+- decisions awaiting review, ranked;
+- agent activity by principal;
+- runs, drift, freshness, quality, and cost;
+- the resident scheduler's posture: paused pipelines, consecutive-failure streaks, scheduler-spawned runs in the window, and the incident-bundle spool.
+
+Every event line cites a `run_id`, a `plan_id`, or a `decision_ref`. The scheduler's posture lines carry pipeline names and counts. Its incident line carries the newest bundle's project-relative path.
+
+A section whose signal is not recorded reports `unavailable` rather than a false all-clear. The default output is a Markdown digest ready to paste into Slack or an email. `--output json` is the machine surface.
 
 ---
 
@@ -147,4 +188,4 @@ rocky review <plan-id> --approve     # record the sign-off that unblocks rocky a
 | `--approve` | `bool` | `false` | Record the sign-off marker. Without it, the review is a dry run. |
 | `--models <DIR>` | `path` | `models` | Models directory used to rank the queue by downstream blast radius. |
 
-`rocky apply` refuses an AI-authored, policy-escalated, `gc`, or `backfill` plan until a review marker exists for it. Approving records who signed off and when into the same ledger `rocky audit` reads.
+`rocky apply` refuses an AI-authored, policy-escalated, `gc`, `backfill`, or `restore` plan until a review marker exists for it. Approving records who signed off, and when, into the same ledger `rocky audit` reads.

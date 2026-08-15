@@ -1,19 +1,32 @@
 ---
 title: Schema Patterns
-description: Configurable schema naming patterns for source-to-target mapping
+description: Parse a source schema name into components, then route the data with them
 sidebar:
   order: 4
 ---
 
-Rocky uses a configurable schema pattern system to parse source schema names into structured components and resolve target catalog/schema names using templates.
+A source schema name usually encodes facts. It says which tenant owns the data, which region it came from, and which system produced it. A schema pattern tells Rocky how to read those facts out of the name. Rocky then fills a target catalog and schema template from them, which is how it decides where the data lands.
 
-## Purpose
+## What the pattern decides
 
-In multi-tenant data platforms, source schemas follow naming conventions that encode information: which tenant owns the data, which region it came from, which source system produced it. Rocky's schema pattern system extracts this information and uses it to determine where data should land in the target warehouse.
+```
+  source schema name    src__acme__us_west__shopify
+        │
+        │ schema_pattern:  prefix "src__", separator "__",
+        │                  components ["tenant", "regions...", "source"]
+        ▼
+  parsed components     tenant  = "acme"
+                        regions = ["us_west"]
+                        source  = "shopify"
+        │
+        │ target templates: catalog_template, schema_template
+        ▼
+  target                acme_warehouse.staging__us_west__shopify
+```
 
 ## Configuration
 
-The schema pattern lives on the pipeline source; the templates live on the pipeline target. Both reference the same component names:
+The schema pattern lives on the pipeline source. The templates live on the pipeline target. Both use the same component names:
 
 ```toml
 [pipeline.bronze.source.schema_pattern]
@@ -37,7 +50,7 @@ schema_template = "staging__{regions}__{source}"
 
 ## Component types
 
-Each entry in the `components` list defines a named component. The suffix determines how it matches:
+Each entry in the `components` list defines one named component. Its suffix decides how it matches:
 
 ### Variable (single segment)
 
@@ -101,7 +114,7 @@ src__globex__emea__france__paris__zendesk
 
 ## Template resolution
 
-Templates use `{component_name}` placeholders that are replaced with parsed values:
+A template uses `{component_name}` placeholders. Rocky replaces each one with the parsed value:
 
 ```toml
 [pipeline.bronze.target]
@@ -112,7 +125,7 @@ schema_template = "staging__{regions}__{source}"
 
 ### Single-valued components
 
-`{tenant}` is replaced with the parsed value directly:
+Rocky substitutes the parsed value directly for `{tenant}`:
 
 ```
 {tenant}_warehouse  →  acme_warehouse
@@ -120,7 +133,7 @@ schema_template = "staging__{regions}__{source}"
 
 ### Multi-valued components
 
-`{regions}` is replaced with all values joined by the separator:
+Rocky joins every value of `{regions}` with the separator:
 
 ```
 staging__{regions}__{source}
@@ -141,7 +154,9 @@ Target table: `acme_warehouse.staging__us_west__shopify.<table_name>`
 
 ### Pinning the join separator at the use site
 
-By default, multi-valued components (`{regions}`) are joined with the caller-supplied separator. Different call sites supply different separators: target rendering uses `target.separator` while `metadata_columns.value` uses `pattern.separator`. The same placeholder can therefore resolve to different strings depending on which TOML field it appears in, a footgun for templates that hash or compare the rendered value (RLS keys, audit hashes).
+By default Rocky joins a multi-valued component such as `{regions}` with the separator the caller supplies. Different call sites supply different separators. Target rendering uses `target.separator`. A `metadata_columns.value` field uses `pattern.separator`.
+
+The same placeholder can therefore resolve to two different strings, depending on which TOML field it appears in. That trips up any template that hashes or compares the rendered value, such as a row-level security key or an audit hash.
 
 Use `{name:SEP}` to pin the join separator at the use site:
 
@@ -161,11 +176,11 @@ Grammar:
 | `{name}` | Bare form — multi-valued components join with the caller-supplied default separator. |
 | `{name:SEP}` | Explicit form — multi-valued components join with the literal string `SEP` (may be empty, single-, or multi-character). The closing `}` terminates `SEP`, so a literal `}` cannot appear inside it. |
 
-`:SEP` is silently ignored when `name` resolves to a single-valued component, so swapping a component from single to variadic does not require updating every template.
+Rocky ignores `:SEP` when `name` resolves to a single-valued component. You can therefore switch a component from single to variadic without updating every template.
 
 ## Error handling
 
-Rocky produces clear errors for invalid schemas:
+This is how Rocky handles a schema name that does not fit the pattern:
 
 | Condition | Error |
 |---|---|
@@ -175,7 +190,7 @@ Rocky produces clear errors for invalid schemas:
 
 ## Custom patterns
 
-The schema pattern system is not limited to `tenant/regions/source`. You can define any components that match your naming convention:
+Schema patterns are not limited to `tenant`, `regions`, and `source`. Define whatever components match your naming convention:
 
 ```toml
 [pipeline.bronze.source.schema_pattern]
@@ -200,9 +215,9 @@ schema_template = "{department}__{system}"
 
 ## Config groups vs schema patterns
 
-Schema patterns route at the pipeline level: they parse a source schema *name* into components, then fill a target `catalog_template` / `schema_template` from those parsed values. The values come from the schema name itself, and a `...` component can be multi-valued.
+Schema patterns route at the pipeline level. They parse a source schema *name* into components, then fill a target `catalog_template` or `schema_template` from those values. The values come from the schema name itself, and a `...` component can hold several of them.
 
-Rocky has a separate model-level routing feature that shares the same template grammar but takes its values from a different place. A **config group** lives in `models/groups/<name>.toml` and defines a `schema_template` once. Each model opts in with `group = "<name>"` and fills the template's placeholders from its own `[args]` block:
+Rocky has a second routing feature that works at the model level. It shares the template grammar but takes its values from somewhere else. A **config group** lives in `models/groups/<name>.toml` and defines a `schema_template` once. Each model opts in with `group = "<name>"`, and fills the template's placeholders from its own `[args]` block:
 
 ```toml
 # models/groups/daily_marts.toml
@@ -215,13 +230,13 @@ group = "daily_marts"
 region = "emea"   # fills {region} -> schema "mart_emea"
 ```
 
-A group's `schema_template` uses the same `{name}` / `{name:SEP}` placeholder grammar as the target templates on this page and resolves through the same engine code. Use schema patterns when the routing information is encoded in source schema names; use config groups when a fan-out of models shares one routing and materialization that you set by hand.
+A group's `schema_template` uses the same `{name}` and `{name:SEP}` grammar as the target templates on this page, and resolves through the same engine code. Use a schema pattern when the routing information is encoded in the source schema names. Use a config group when a fan-out of models shares one routing and materialization that you set by hand.
 
 See [Config groups](/reference/model-format/#config-groups) in the model format reference for the full `[args]` rules, precedence, enforced groups, and shared tags.
 
 ## Filtering by parsed component
 
-Once your sources are parsed into components, you can scope `rocky plan` and `rocky compare` (and the single-step `rocky run` sibling) to a subset via the `--filter` flag. The filter key is one of the component names you declared above (or the reserved `id`), and the value is matched against the parsed value, with containment semantics for multi-valued (`...`) components:
+Once Rocky parses your sources into components, the `--filter` flag scopes `rocky plan` and `rocky compare` to a subset. The single-step `rocky run` accepts it too. The filter key is one of the component names you declared above, or the reserved `id`. Rocky matches the value against the parsed value. For a multi-valued (`...`) component, the filter matches if the value is one of them:
 
 ```sh
 # Plan everything for tenant "acme" (then `rocky apply <plan-id>` to execute)

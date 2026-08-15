@@ -1,11 +1,23 @@
 ---
 title: IDE Setup
-description: Install and configure the Rocky VS Code extension for type-aware editing, lineage visualization, and AI generation
+description: Install the Rocky VS Code extension, point it at the Rocky binary, and use hover types, lineage, and the AI commands.
 sidebar:
   order: 4
 ---
 
-The Rocky VS Code extension connects to the Rocky language server to provide real-time compilation, type-aware hover, go-to-definition, column-level lineage, and AI model generation directly in your editor.
+The Rocky VS Code extension gives you compile errors, column types, lineage, and the AI commands inside the editor. It does none of that work itself. It starts a **language server** (a background Rocky process that speaks the Language Server Protocol) and asks it every question:
+
+```
+  VS Code                    stdio (LSP)        Rocky engine
+  ┌─────────────────┐                       ┌──────────────────────┐
+  │ Rocky extension │ ─── you type ───────► │ rocky-lsp            │
+  │ editor + panels │                       │ (or `rocky lsp`)     │
+  │                 │ ◄── diagnostics, ──── │ recompiles the       │
+  └─────────────────┘     types, lineage    │ project incrementally│
+                                            └──────────────────────┘
+```
+
+So the extension needs a Rocky binary it can reach. Section 1 installs the extension; section 2 points it at that binary.
 
 ![A Rocky DSL model on the left and its compiled SQL on the right, updating live as you type](/demo-vscode-compiled-sql.gif)
 
@@ -13,11 +25,11 @@ The extension source is in the monorepo at [`editors/vscode/`](https://github.co
 
 ## 1. Install the Extension
 
-There are four ways to install the extension, depending on your workflow.
+Pick one of four methods. Method A suits most users. Methods B, C, and D are for people who work on the extension itself.
 
 ### Method A: Install from the VS Code Marketplace
 
-The extension is published on the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=rocky-data.rocky). Install it directly from VS Code:
+The extension is published on the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=rocky-data.rocky). Install it from VS Code:
 
 1. Open VS Code
 2. Go to **Extensions** (**Cmd+Shift+X** / **Ctrl+Shift+X**)
@@ -30,7 +42,7 @@ Or install from the command line:
 code --install-extension rocky-data.rocky
 ```
 
-This is the recommended method for most users. The extension updates automatically when new versions are published.
+VS Code updates the extension for you when a new version is published.
 
 ### Method B: F5 Development Host (for contributors)
 
@@ -43,7 +55,7 @@ npm install
 npm run compile
 ```
 
-Open the `editors/vscode` folder in VS Code, then press **F5**. This launches a new VS Code window with the extension loaded. Changes to the TypeScript source are picked up on the next F5 launch.
+Open the `editors/vscode` folder in VS Code, then press **F5**. VS Code launches a second window with the extension loaded. It picks up TypeScript changes on the next F5 launch.
 
 ### Method C: Install from VSIX
 
@@ -56,7 +68,7 @@ npm run compile
 npx vsce package
 ```
 
-This produces a file like `rocky-<version>.vsix`. Install it in VS Code:
+This writes a file like `rocky-<version>.vsix`. Install it in VS Code:
 
 ```bash
 code --install-extension rocky-<version>.vsix
@@ -66,7 +78,7 @@ Or open VS Code, go to **Extensions** > **...** (three dots menu) > **Install fr
 
 ### Method D: Symlink for Local Development
 
-If you are iterating on the extension frequently, symlink the compiled output into VS Code's extensions directory:
+If you change the extension often, symlink the compiled output into VS Code's extensions directory:
 
 ```bash
 cd rocky/editors/vscode
@@ -79,11 +91,11 @@ ln -s "$(pwd)" ~/.vscode/extensions/rocky-data.rocky-<version>
 # Restart VS Code
 ```
 
-This avoids rebuilding a VSIX on every change. Run `npm run compile` after editing TypeScript files, then reload the VS Code window (**Cmd+Shift+P** > **Developer: Reload Window**).
+You then skip the VSIX rebuild on every change. Run `npm run compile` after you edit a TypeScript file, then reload the VS Code window (**Cmd+Shift+P** > **Developer: Reload Window**).
 
 ## 2. Configure the Rocky Binary Path
 
-The extension runs the Rocky language server. It prefers a standalone `rocky-lsp` binary when one is available (the install scripts place `rocky-lsp` next to `rocky`), and otherwise falls back to running `rocky lsp`. By default it resolves both from your `PATH`. If Rocky is installed elsewhere, configure the path:
+The extension starts the language server itself. It looks for a standalone `rocky-lsp` binary first, because the install scripts place `rocky-lsp` next to `rocky`. If it finds none, it runs `rocky lsp` instead. It resolves both names from your `PATH`. If Rocky is installed somewhere else, set the path yourself:
 
 1. Open VS Code Settings (**Cmd+,** / **Ctrl+,**)
 2. Search for `rocky.server.path`
@@ -128,13 +140,13 @@ Pass additional flags to the language server:
 
 ## 3. Verify the Connection
 
-After installing the extension and configuring the binary path:
+Install the extension and set the binary path, then check that the server starts:
 
 1. Open a Rocky project in VS Code (a directory containing `rocky.toml` or `models/`)
 2. Open any `.rocky` or `.sql` file in the `models/` directory
 3. Check the status bar at the bottom left -- you should see **Rocky: Ready**
 
-If the status bar shows **Rocky: Failed**, check the Output panel (**View** > **Output** > select **Rocky Language Server** from the dropdown) for error details.
+If the status bar shows **Rocky: Failed**, open the Output panel (**View** > **Output** > select **Rocky Language Server** from the dropdown). It carries the error.
 
 ## 4. Tour of Features
 
@@ -142,9 +154,9 @@ If the status bar shows **Rocky: Failed**, check the Output panel (**View** > **
 
 Hover over any column name to see its inferred type and source lineage:
 
-- **Column type**: The resolved type from the compiler's type checker (e.g., `Int64`, `String`, `Decimal`)
-- **Source lineage**: Which upstream model and column this value comes from
-- **Intent**: If the model has an `intent` field in its TOML config, the hover shows the plain-English description
+- **Column type**: The type the compiler's type checker resolved (for example `Int64`, `String`, `Decimal`)
+- **Source lineage**: The upstream model and column this value comes from
+- **Intent**: The model's plain-English description, when its TOML config has an `intent` field
 
 Hover works on:
 - Column references in SELECT clauses
@@ -153,14 +165,14 @@ Hover works on:
 
 ### Autocompletion
 
-The language server provides context-aware completions:
+The language server completes what you type, using the compiled project:
 
-- **Column names**: When typing in a SELECT, WHERE, or GROUP BY clause, the server suggests columns from the referenced tables
-- **Model names**: When typing a FROM clause or `depends_on` in TOML, the server suggests available models in the project
-- **SQL functions**: After typing a function name and `(`, the server shows parameter hints
-- **Keywords**: SQL and Rocky DSL keywords are suggested based on cursor position
+- **Column names**: In a SELECT, WHERE, or GROUP BY clause, it suggests columns from the referenced tables
+- **Model names**: In a FROM clause, or in `depends_on` in a TOML file, it suggests models in the project
+- **SQL functions**: After a function name and `(`, it shows parameter hints
+- **Keywords**: It suggests SQL and Rocky DSL keywords that fit the cursor position
 
-Completions are triggered automatically as you type. Press **Ctrl+Space** to trigger them manually.
+Completions appear as you type. Press **Ctrl+Space** to ask for them.
 
 ### Go to Definition
 
@@ -179,19 +191,19 @@ Completions are triggered automatically as you type. Press **Ctrl+Space** to tri
 
 ### Rename Symbol
 
-**F2** on a model name renames it across the project:
+**F2** on a model name renames it across the project. The rename:
 
 - Updates the TOML `name` field
-- Updates all `depends_on` references in other models
+- Updates every `depends_on` reference in other models
 - Updates SQL references
 
 :::caution
-Rename only updates files within the Rocky project. If the model is referenced by external systems (Dagster assets, CI configs), update those manually.
+Rename touches files inside the Rocky project only. Update references from other systems (Dagster assets, CI configs) yourself.
 :::
 
 ### Diagnostics
 
-Type errors, unresolved references, and warnings appear as you type with a 300ms debounce. The Problems panel (**View** > **Problems**) shows all diagnostics grouped by file.
+Type errors, unresolved references, and warnings appear as you type, after a 300ms pause. The Problems panel (**View** > **Problems**) groups every diagnostic by file.
 
 ### Document Symbols
 
@@ -209,9 +221,9 @@ SUBSTRING(string, start, length)
 
 ## 5. Inlay Hints
 
-Inlay hints display inline type annotations in your SQL and Rocky DSL files. They show the inferred type of each column without hovering.
+An inlay hint is a type annotation the editor draws inline. Hints show each column's inferred type in your SQL and Rocky DSL files, so you do not have to hover.
 
-Enable or disable inlay hints:
+Turn hints on or off:
 
 ```json
 {
@@ -219,7 +231,7 @@ Enable or disable inlay hints:
 }
 ```
 
-When enabled, you see type annotations inline:
+With hints on, the types appear beside the columns:
 
 ```sql
 SELECT
@@ -230,15 +242,15 @@ SELECT
 FROM stg_orders
 ```
 
-Inlay hints update in real time as you edit.
+Hints update as you edit.
 
 ## 6. The Rocky Inspector
 
-The **Rocky Inspector** is a bottom-panel view that turns the active model into a trust dashboard. Open it from **Cmd+Shift+P** > **Rocky: Open in Inspector**, or just browse between model files -- while the panel is visible it follows the active editor. Clicking a node in the lineage canvas retargets the Inspector to that model.
+The **Rocky Inspector** is a bottom-panel view. It shows everything Rocky knows about the model in the active editor. Open it from **Cmd+Shift+P** > **Rocky: Open in Inspector**. While the panel is visible it follows the active editor, so switching model files switches the Inspector. Clicking a node in the lineage canvas also retargets it.
 
 ![The Rocky Inspector's Overview as a model trust dashboard, its Governance card flagging two classified columns with one left unmasked](/demo-vscode-inspector.gif)
 
-The Inspector has a tab per concern, each backed by a Rocky CLI command and degrading gracefully when its data isn't available yet:
+Each tab covers one concern and runs one Rocky CLI command. A tab whose data is not available yet says so rather than failing:
 
 - **Overview** -- cost, blast radius, drift, governance, and freshness for the model in one place
 - **Columns** -- the model's columns with inferred types, tracing each one's upstream lineage
@@ -249,32 +261,32 @@ The Inspector has a tab per concern, each backed by a Rocky CLI command and degr
 
 ### Lineage canvas
 
-The **Lineage** tab renders the project's column-level graph as an interactive canvas. Open it directly with **Cmd+Shift+P** > **Rocky: Show Model Lineage**, framed on the current model.
+The **Lineage** tab draws the project's column-level graph as an interactive canvas. Lineage is the map of which columns feed which, traced through every transformation (see the [glossary](/reference/glossary/)). Open the canvas directly with **Cmd+Shift+P** > **Rocky: Show Model Lineage**, framed on the current model.
 
-- Opens focused on a model's neighborhood and expands out to the whole project
+- Opens on the current model's neighbourhood, and expands out to the whole project
 - Built from `rocky catalog` (assets and dependencies) and `rocky compile` (per-model materialization)
-- Trust-plane overlays drawn on the graph itself: cost, freshness, drift, governance, breaking changes against the base ref, and the last run
+- Draws overlays on the graph itself: cost, freshness, drift, governance, breaking changes against the base ref, and the last run
 - Right-click a node for actions scoped to that model: open its file, refocus the graph, or run an AI action -- explain (generate intent), generate tests, draft a data-grounded contract, or build a downstream model
 
 ## 7. AI Commands
 
-The extension exposes AI features directly in the editor. These require `ANTHROPIC_API_KEY` to be set in your environment.
+The extension runs Rocky's AI commands from the Command Palette. Each one needs `ANTHROPIC_API_KEY` set in your environment.
 
 ### Generate Model from Intent
 
 **Cmd+Shift+P** > **Rocky: Generate Model from Intent**
 
-This opens an input box where you describe the model you want:
+An input box opens. Describe the model you want:
 
 ```
 monthly revenue per customer from the orders table, filtered to 2024
 ```
 
-Rocky generates the model code, compiles it to verify correctness, and opens it in a new editor tab. If compilation fails, it retries with the error context (up to 3 attempts).
+Rocky generates the model code, compiles it, and opens it in a new editor tab. If the compile fails, Rocky sends the errors back to the model and retries, up to 3 attempts in total.
 
 ### AI via the command line
 
-The extension runs `rocky ai "<intent>"` under the hood. You can also use this directly from the terminal:
+The extension runs `rocky ai "<intent>"` for you. The same command works in a terminal:
 
 ```bash
 rocky ai "top 10 customers by lifetime value from customer_orders"
@@ -282,13 +294,13 @@ rocky ai "top 10 customers by lifetime value from customer_orders"
 
 ### Other AI commands
 
-Three more AI commands work on existing models, each saving its result back into the project:
+Three more AI commands work on models you already have. Each writes its result back into the project:
 
 - **Rocky: Sync Models (AI Schema Change Detection)** -- reconcile a model against upstream schema changes, guided by its stored intent (`rocky ai-sync`)
 - **Rocky: Explain Model (Generate Intent)** -- write a plain-English `intent` for a model from its code (`rocky ai-explain`)
 - **Rocky: Generate Tests from Intent** -- derive `[[tests]]` assertions from a model's intent (`rocky ai-test`)
 
-These actions are also available by right-clicking a node in the Inspector's lineage canvas.
+You can also reach these actions by right-clicking a node in the Inspector's lineage canvas.
 
 ### All commands
 
@@ -306,7 +318,7 @@ Access via the Command Palette (**Cmd+Shift+P** / **Ctrl+Shift+P**).
 
 ## 8. File Watchers
 
-The extension watches for changes to these file types:
+The extension watches these file patterns:
 
 | Pattern | Effect |
 |---|---|
@@ -314,41 +326,42 @@ The extension watches for changes to these file types:
 | `**/*.toml` | Recompile on save (picks up config and dependency changes) |
 | `**/models/**/*.sql` | Recompile on save |
 
-The language server recompiles the project incrementally when any watched file changes. Diagnostics (errors and warnings) update in real time in the Problems panel.
+When a watched file changes, the language server recompiles the project incrementally. The Problems panel updates as it goes.
 
 ## 9. Troubleshooting
 
 ### "Rocky: Failed" in status bar
 
-1. Check that the `rocky` binary is installed and accessible at the configured path
-2. Run `rocky --version` in the terminal to verify the binary works
-3. Open the Output panel and select **Rocky Language Server** to see the error
-4. Try running `rocky lsp` manually in a terminal to see if it starts
+1. Check that the `rocky` binary exists at the configured path
+2. Run `rocky --version` in a terminal to confirm the binary works
+3. Open the Output panel and select **Rocky Language Server** to read the error
+4. Run `rocky lsp` in a terminal and see whether it starts
 
 ### No completions or hover
 
-1. Make sure you have a `models/` directory (or `.rocky` files) in the workspace root
-2. Check that the project compiles: run `rocky compile` in the terminal
+1. Confirm the workspace root has a `models/` directory or `.rocky` files
+2. Run `rocky compile` in a terminal and confirm the project compiles
 3. Restart the language server: **Cmd+Shift+P** > **Rocky: Restart Language Server**
 
 ### Diagnostics not updating
 
-1. Check the status bar -- if it shows an error count, the server is running
-2. Try saving the file (auto-compile triggers on save)
-3. If diagnostics are stale, restart the language server
+1. Look at the status bar. An error count there means the server is running
+2. Save the file. A save triggers a recompile
+3. Restart the language server if the diagnostics stay stale
 
 ### Extension not activating
 
-The extension activates when it detects:
-- A file with the `.rocky` extension is open
-- A workspace contains `**/*.rocky` files
-- A workspace contains a `rocky.toml` file
+The extension starts when any one of these is true:
 
-If none of these conditions are met, the extension remains inactive.
+- A file with the `.rocky` extension is open
+- The workspace contains `**/*.rocky` files
+- The workspace contains a `rocky.toml` file
+
+Otherwise it stays inactive.
 
 ### Performance with large projects
 
-For projects with hundreds of models, the initial compilation may take a few seconds. Subsequent recompilations are incremental and fast. If the editor feels sluggish:
+The first compile of a project with hundreds of models takes a few seconds. Later recompiles are incremental and faster. If the editor feels slow:
 
-1. Check `rocky compile` time in the terminal -- if it takes more than 5 seconds, the project may benefit from splitting into sub-projects
-2. Reduce the number of watched files by configuring `files.watcherExclude` in VS Code settings
+1. Time `rocky compile` in a terminal. Over 5 seconds is a sign the project should be split into sub-projects
+2. Watch fewer files: set `files.watcherExclude` in VS Code settings

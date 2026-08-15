@@ -1,179 +1,234 @@
 ---
 title: Troubleshooting
-description: Common errors and their solutions
+description: Look up the error message you got, then follow the numbered fix
 sidebar:
   order: 3
 ---
 
-This page is a **symptom-first** reference: paste an error message into your search and find the fix. For the inverse view (categories of failure with a recovery playbook per category), see [Failure modes](/advanced/failure-modes/).
+This page is symptom-first. Search it for the error message you got, then follow the numbered steps under it.
 
-## Compilation Errors
+For the opposite view, categories of failure with a recovery playbook for each, see [Failure modes](/advanced/failure-modes/).
+
+## Compile errors
 
 ### "Model 'X' not found"
 
-A model references another model that doesn't exist in the project.
+A model references another model that the project does not contain.
 
-**Possible causes:**
-- The referenced model file is missing or misnamed
-- The `name` field in the `.toml` sidecar doesn't match the file name
-- The model is in a subdirectory that Rocky isn't scanning
+**Likely causes**
 
-**Fix:** Check that the referenced model exists in `models/` and its `name` field matches. Rocky auto-discovers dependencies from SQL table references; bare names matching model file names become DAG edges.
+- The referenced model file is missing or misnamed.
+- The `name` field in the `.toml` sidecar does not match the file name.
+- The model sits in a subdirectory that Rocky does not scan.
+
+**Fix**
+
+1. Check that the referenced model exists under `models/`.
+2. Check that its `name` field matches the file name.
+3. Check the SQL reference itself. Rocky discovers dependencies from SQL table references, and a bare name that matches a model file name becomes a DAG edge.
 
 ### "Type mismatch on column 'X'"
 
-A column's type changed between upstream and downstream models.
+A column's type differs between the upstream model and the downstream model.
 
-**Fix:** Run `rocky compile` for detailed diagnostics. Add an explicit `CAST()` to convert types, or update the upstream model. If this is expected (schema evolution), use `rocky ai-sync` to propagate changes.
+**Fix**
+
+1. Run `rocky compile` to see which two types disagree and where.
+2. Add an explicit `CAST()` to convert one side, or change the upstream model to produce the expected type.
+3. If the change is intentional schema evolution, run `rocky ai-sync` to propagate it downstream.
 
 ### "Join key type mismatch"
 
-Two models being joined have the same column name but different types.
+Two models in a join share a column name but not its type.
 
-**Fix:** Add explicit `CAST()` on one side of the join to match types. The diagnostic message shows which models and types are involved.
+**Fix**
+
+1. Read the diagnostic. It names both models and both types.
+2. Add an explicit `CAST()` on one side of the join so the types match.
 
 ### "Contract violation"
 
-A model's output doesn't satisfy its data contract.
+A model's output does not satisfy its data contract.
 
-**Fix:** Check the `.contract.toml` file for required columns and types. Either update the model to produce the required schema or update the contract.
+**Fix**
 
-## LSP / IDE Issues
+1. Open the model's `.contract.toml` file and read the required columns and types.
+2. Choose one side to change. Either update the model to produce the required schema, or update the contract.
 
-### Language server not starting
+## LSP and IDE problems
 
-The VS Code extension can't connect to `rocky lsp`.
+### The language server does not start
 
-**Possible causes:**
-- Rocky binary not installed or not on `PATH`
-- Wrong path in `rocky.server.path` VS Code setting
-- Binary is for a different platform (e.g., Linux binary on macOS)
+The VS Code extension cannot connect to `rocky lsp`.
 
-**Fix:**
-```bash
-# Verify rocky is installed
-rocky --version
+**Likely causes**
 
-# Check the path VS Code is using
-# In VS Code: Settings → Rocky → Server Path
-```
+- The Rocky binary is not installed, or it is not on `PATH`.
+- The `rocky.server.path` VS Code setting points somewhere wrong.
+- The binary is built for another platform, such as a Linux binary on macOS.
 
-### No diagnostics or hover info
+**Fix**
 
-The LSP is connected but not providing features.
+1. Confirm the binary runs at all:
 
-**Possible causes:**
-- No `models/` directory in the workspace root
-- Models have syntax errors that prevent compilation
+   ```bash
+   rocky --version
+   ```
 
-**Fix:** Ensure your workspace root contains a `models/` directory. Check the Rocky output channel in VS Code (View → Output → Rocky Language Server) for error messages.
+2. Check which path VS Code is using, under Settings → Rocky → Server Path.
+3. Point that setting at the binary you just ran, or put the binary on `PATH`.
 
-## AI Features
+### No diagnostics or hover information
+
+The language server connects but shows no types and no errors.
+
+**Likely causes**
+
+- The workspace root has no `models/` directory.
+- The models have syntax errors that stop compilation.
+
+**Fix**
+
+1. Confirm your workspace root contains a `models/` directory.
+2. Open the Rocky output channel in VS Code, under View → Output → Rocky Language Server.
+3. Fix the errors it reports there.
+
+## AI command problems
 
 ### "ANTHROPIC_API_KEY not set"
 
-AI commands require an Anthropic API key.
+The AI commands need an Anthropic API key in the environment.
 
-**Fix:**
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-```
+**Fix**
 
-Add to your shell profile (`~/.zshrc`, `~/.bashrc`) for persistence.
+1. Export the key:
 
-### AI generation produces incorrect code
+   ```bash
+   export ANTHROPIC_API_KEY=sk-ant-...
+   ```
 
-The compile-verify loop retries up to 3 times but may still fail.
+2. Add the same line to your shell profile (`~/.zshrc`, `~/.bashrc`) so it survives a new shell.
 
-**Fix:** Try a more specific intent description. Include:
-- The grain (what one row represents)
-- Key columns and their sources
-- Filter conditions
-- Aggregation logic
+### The generated model is wrong
+
+The compile-verify loop retries up to 3 times, and it can still land on wrong SQL.
+
+**Fix**
+
+1. Rewrite the intent to be more specific. Name the grain, which is what one row of the model represents.
+2. Name the key columns and where they come from.
+3. State the filter conditions.
+4. State the aggregation logic.
 
 ### "Compilation failed after 3 attempts"
 
-The AI couldn't generate valid code within the retry budget.
+The AI could not produce valid code inside the retry budget.
 
-**Fix:** The intent may be too complex for a single model. Break it into smaller models with explicit upstream dependencies.
+**Fix**
 
-## Connection Errors
+1. Split the intent into smaller models. One model per idea.
+2. Wire the pieces together with explicit upstream dependencies.
+
+## Connection errors
 
 ### Databricks: "401 Unauthorized"
 
-**Possible causes:**
-- Personal Access Token expired
-- OAuth M2M credentials incorrect
-- Token doesn't have access to the specified warehouse
+**Likely causes**
 
-**Fix:** Regenerate the token in Databricks workspace settings. For OAuth M2M, verify `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`.
+- The Personal Access Token expired.
+- The OAuth M2M credentials are wrong.
+- The token has no access to the warehouse you named.
+
+**Fix**
+
+1. Regenerate the token in your Databricks workspace settings.
+2. For OAuth M2M, check `DATABRICKS_CLIENT_ID` and `DATABRICKS_CLIENT_SECRET`.
 
 ### Databricks: "Statement execution timeout"
 
-Long-running queries exceeding the configured timeout.
+A query ran longer than the configured timeout.
 
-**Fix:** Increase the timeout on the Databricks adapter:
-```toml
-[adapter.prod]
-type = "databricks"
-timeout_secs = 600  # 10 minutes
-```
+**Fix**
 
-For large full-refresh syncs, consider switching to incremental strategy.
+1. Raise the timeout on the Databricks adapter:
+
+   ```toml
+   [adapter.prod]
+   type = "databricks"
+   timeout_secs = 600  # 10 minutes
+   ```
+
+2. For a large full-refresh sync, switch the model to an incremental strategy instead of raising the timeout further.
 
 ### Fivetran: "403 Forbidden"
 
-**Fix:** Verify `FIVETRAN_API_KEY` and `FIVETRAN_API_SECRET`. Ensure the API key has access to the specified `destination_id`.
+**Fix**
 
-## State Store
+1. Check `FIVETRAN_API_KEY` and `FIVETRAN_API_SECRET`.
+2. Confirm the API key has access to the `destination_id` you configured.
+
+## State store problems
+
+The [state store](/reference/glossary/#state-store) is the embedded redb database where Rocky keeps run records, watermarks, and plans.
 
 ### "State file locked"
 
-Another Rocky process is holding the state file lock.
+Another Rocky process holds the state file lock.
 
-**Fix:** Check for running Rocky processes:
-```bash
-ps aux | grep rocky
-```
+**Fix**
 
-If no process is running, the lock may be stale. Remove the lock file:
-```bash
-rm -f models/.rocky-state.redb.lock
-```
+1. Look for a running Rocky process:
 
-The state store lives at `models/.rocky-state.redb` by default (run `rocky doctor` to confirm the path). Older projects using the legacy current-directory state file will instead have `.rocky-state.redb.lock` in the working directory.
+   ```bash
+   ps aux | grep rocky
+   ```
+
+2. If one is running, wait for it or stop it. Two Rocky runs cannot hold the lock at the same time.
+3. If none is running, the lock is stale. Remove it:
+
+   ```bash
+   rm -f models/.rocky-state.redb.lock
+   ```
+
+The state store lives at `models/.rocky-state.redb` by default. Run `rocky doctor` to confirm the path. A project on the legacy current-directory state file has `.rocky-state.redb.lock` in the working directory instead.
 
 ### "State file corrupted"
 
 The embedded redb state file is damaged.
 
-**Fix:** Delete the state file and re-run. This resets all watermarks, so the next run will be a full refresh:
-```bash
-rm models/.rocky-state.redb   # legacy projects: rm .rocky-state.redb in the current directory
-plan_id=$(rocky plan --filter client=acme --output json | jq -r .plan_id)
-rocky apply "$plan_id"
-```
+**Fix**
 
-## Build Issues
+1. Delete the state file and re-run. This resets every watermark, so the next run is a full refresh:
 
-### DuckDB compilation fails (out of memory)
+   ```bash
+   rm models/.rocky-state.redb   # legacy projects: rm .rocky-state.redb in the current directory
+   plan_id=$(rocky plan --filter client=acme --output json | jq -r .plan_id)
+   rocky apply "$plan_id"
+   ```
 
-Building Rocky from source requires significant memory for DuckDB's C++ compilation.
+## Build problems
 
-**Fix:** Close other applications during build, or use a swap file:
-```bash
-# Create a 4GB swap file
-sudo fallocate -l 4G /tmp/rocky-swap
-sudo chmod 600 /tmp/rocky-swap
-sudo mkswap /tmp/rocky-swap
-sudo swapon /tmp/rocky-swap
+### Building from source runs out of memory
 
-# Build
-cargo build --release
+DuckDB's C++ compilation needs a lot of memory to build Rocky from source.
 
-# Clean up
-sudo swapoff /tmp/rocky-swap
-sudo rm /tmp/rocky-swap
-```
+**Fix**
 
-Or install from a pre-built binary instead of building from source.
+1. Install a pre-built binary instead of building from source. This is the fastest fix.
+2. If you must build, close other applications first.
+3. If that is not enough, add a swap file for the build:
+
+   ```bash
+   # Create a 4GB swap file
+   sudo fallocate -l 4G /tmp/rocky-swap
+   sudo chmod 600 /tmp/rocky-swap
+   sudo mkswap /tmp/rocky-swap
+   sudo swapon /tmp/rocky-swap
+
+   # Build
+   cargo build --release
+
+   # Clean up
+   sudo swapoff /tmp/rocky-swap
+   sudo rm /tmp/rocky-swap
+   ```

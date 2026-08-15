@@ -7,11 +7,40 @@ sidebar:
 
 import { Steps } from '@astrojs/starlight/components';
 
-This walks through a Rocky pipeline that replicates Fivetran-landed sources into Databricks.
+This page builds a Rocky pipeline that copies Fivetran-landed source tables into Databricks. It takes about five minutes.
 
 :::tip[No warehouse credentials?]
 The [Playground](/guides/playground/) runs the same flow against a local DuckDB file, with nothing to configure. Start there if you just want to see Rocky work.
 :::
+
+There are two ways to reach the warehouse. Both start the same way.
+
+```
+  Shared setup
+  ────────────
+  rocky init        scaffold the project
+  rocky validate    check config + adapter wiring, no network
+  rocky discover    ask the source which tables exist
+        │
+        ├───────────────────────────┐
+        │ PR-gated deploy           │ Local iteration
+        ▼                           ▼
+  rocky plan                    rocky run
+        │ writes                    │ plans and applies
+        ▼ .rocky/plans/<id>.json    │ in one step
+  you review the SQL and drift      │
+        │                           │
+        ▼                           │
+  rocky apply <id>                  │
+        │                           │
+        └────────────┬──────────────┘
+                     ▼
+                 warehouse
+```
+
+Steps 1 to 4 below are the shared setup. Steps 5 and 6 are the PR-gated path.
+The local path is one command, covered after the steps. Step 7 inspects what
+the run stored.
 
 <Steps>
 
@@ -22,7 +51,7 @@ The [Playground](/guides/playground/) runs the same flow against a local DuckDB 
    cd my-pipeline
    ```
 
-   This scaffolds a runnable DuckDB starter project: a `rocky.toml`, a `models/` directory with `_defaults.toml` and a sample `stg_orders` model, and a `seeds/seed.sql`. Step 2 replaces the generated `rocky.toml` with the Fivetran → Databricks config below.
+   This writes a runnable DuckDB starter project. You get a `rocky.toml`, a `models/` directory holding `_defaults.toml` and a sample `stg_orders` model, and a `seeds/seed.sql`. Step 2 replaces the generated `rocky.toml` with the Fivetran to Databricks config below.
 
 2. **Configure a source, a target, and the pipeline that wires them together.**
 
@@ -75,7 +104,7 @@ The [Playground](/guides/playground/) runs the same flow against a local DuckDB 
    backend = "local"
    ```
 
-   `[adapter.*]` blocks define connections; `[pipeline.*]` blocks tie them together. Select between pipelines with `--pipeline NAME`. Export the referenced environment variables (`DATABRICKS_HOST`, `FIVETRAN_API_KEY`, and the rest) before running Rocky.
+   An `[adapter.*]` block defines one connection. A `[pipeline.*]` block ties adapters together into a unit of work. Select between pipelines with `--pipeline NAME`. Export the environment variables this config references (`DATABRICKS_HOST`, `FIVETRAN_API_KEY`, and the rest) before you run Rocky.
 
 3. **Validate the config.**
 
@@ -99,7 +128,7 @@ The [Playground](/guides/playground/) runs the same flow against a local DuckDB 
    plan_id=$(rocky plan --filter tenant=acme --output json | jq -r .plan_id)
    ```
 
-   Compiles the pipeline, runs drift detection, and records a deterministic plan keyed by `plan_id`. Inspect the SQL, drift actions, and checks before you commit to a run.
+   Rocky compiles the pipeline, detects drift, and records a plan keyed by `plan_id`. A plan is the exact work Rocky will do, written down before it does any of it. The same inputs always produce the same plan. Read the SQL, the drift actions, and the checks before you commit to a run. See the [glossary](/reference/glossary/).
 
 6. **Apply the plan.**
 
@@ -107,7 +136,7 @@ The [Playground](/guides/playground/) runs the same flow against a local DuckDB 
    rocky apply "$plan_id"
    ```
 
-   Executes the plan: discover, create catalogs and schemas, apply drift, copy data, run checks. Outputs a versioned JSON result with materializations, check results, drift actions, and permissions.
+   Rocky executes the plan in order: discover, create catalogs and schemas, apply drift, copy data, run checks. It prints a versioned JSON result holding the materializations, check results, drift actions, and permissions.
 
 7. **Inspect the state.**
 
@@ -115,19 +144,19 @@ The [Playground](/guides/playground/) runs the same flow against a local DuckDB 
    rocky state
    ```
 
-   Shows the stored watermarks for every table.
+   Shows the stored watermark for every table. A watermark is the timestamp of the newest row Rocky has already loaded. See the [glossary](/reference/glossary/).
 
 </Steps>
 
-## Plan and apply, or just run
+## The one-command path
 
-For local iteration and automation, `rocky run` does the same work as the `rocky plan` + `rocky apply` two-step (steps 5–6) in one command:
+`rocky run` does the work of steps 5 and 6 in one command. Use it for local iteration and for automation.
 
 ```bash
 rocky run --filter tenant=acme
 ```
 
-Either path resumes from the last checkpoint after a failure with `--resume-latest`:
+Either path resumes from the last checkpoint after a failure. Add `--resume-latest`:
 
 ```bash
 rocky run --filter tenant=acme --resume-latest

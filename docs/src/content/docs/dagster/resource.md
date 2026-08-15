@@ -5,7 +5,9 @@ sidebar:
   order: 3
 ---
 
-`RockyResource` is a `dagster.ConfigurableResource` that invokes the Rocky CLI via subprocess and parses JSON output into strongly-typed Pydantic models. It exposes roughly one Python method per Rocky CLI command. The sections below document the primary methods; additional methods exist on the resource (e.g. `apply()`, `run_model()`, `catalog()`, `dag()`, `cost()`, `compliance()`, and the branch/plan promotion helpers) and follow the same subprocess-plus-typed-result pattern.
+`RockyResource` is a `dagster.ConfigurableResource`. It runs the Rocky CLI in a subprocess and parses the JSON output into typed Pydantic models. There is roughly one Python method per Rocky CLI command.
+
+This page documents the main methods. The resource carries more than these, including `apply()`, `run_model()`, `catalog()`, `dag()`, `cost()`, `compliance()`, and the branch and plan promotion helpers. Every one follows the same shape: run a subprocess, return a typed result.
 
 ## Configuration
 
@@ -22,15 +24,15 @@ sidebar:
 | `strict_doctor` | `bool` | `False` | When `True`, runs `rocky doctor` once at resource startup and gates execution on the result. Defaults to `False` so startup cost stays zero for users who don't opt in. |
 | `strict_doctor_checks` | `list[str]` | `[]` | Per-check allowlist for the strict-doctor gate (only meaningful with `strict_doctor=True`). Empty list fails on any critical check; a non-empty list fails only when a listed critical check fires. |
 
-The resource also accepts four optional per-call **resolver** fields — `shadow_suffix_fn`, `governance_override_fn`, `idempotency_key_fn`, and `timeout_fn` — each a callable that produces a value per run when the caller didn't supply one explicitly. These are `resource_dependency` attributes rather than Dagster config schema entries.
+The resource also accepts four optional **resolver** fields: `shadow_suffix_fn`, `governance_override_fn`, `idempotency_key_fn`, and `timeout_fn`. Each one is a callable. It produces a value for a run when the caller did not supply one. These are `resource_dependency` attributes, not Dagster config schema entries.
 
 ## Behavior
 
-- All methods return strongly-typed Pydantic models (see [Type Reference](/dagster/types/)).
+- All methods return typed Pydantic models. See the [Type Reference](/dagster/types/).
 - On CLI failure, raises `dagster.Failure` with stderr attached as metadata.
 - If the binary is not found on `PATH`, raises `Failure` with a link to the installation instructions.
-- **Partial success**: Rocky can exit non-zero but still emit valid JSON (e.g., when some tables succeed and others fail). Methods like `run()`, `compile()`, `test()`, and `ci()` handle this automatically, returning the parsed result so callers can distinguish successes from failures.
-- **Execution paths**: `run()` and `run_streaming()` invoke a single fused `rocky run` (the engine's own plan+apply path) and do **not** persist a separate plan artifact. Only `run_pipes()` keeps the two-step shape — it runs `rocky plan` followed by `rocky apply <plan-id>`, persists an auditable plan artifact to `.rocky/plans/<plan-id>.json`, and surfaces the `plan_id` as Pipes `extras` so a materialization can be correlated back to the exact plan it applied. `run_pipes()` requires engine `v1.34+`, which content-addresses every plan (including replication-only projects); if `rocky plan` emits no `plan_id`, `run_pipes()` raises `dagster.Failure` with an upgrade hint rather than falling back.
+- **Partial success**: Rocky can exit non-zero and still print valid JSON. That happens when some tables succeed and others fail. `run()`, `compile()`, `test()`, and `ci()` handle it for you. They return the parsed result, so you can tell the successes from the failures.
+- **Execution paths**: `run()` and `run_streaming()` invoke a single fused `rocky run`, which is the engine's own plan+apply path. Neither persists a separate plan artifact. Only `run_pipes()` keeps the two-step shape. It runs `rocky plan`, then `rocky apply <plan-id>`. It persists an auditable plan artifact to `.rocky/plans/<plan-id>.json` and surfaces the `plan_id` as Pipes `extras`. A materialization therefore traces back to the exact plan it applied. `run_pipes()` requires engine `v1.34+`, which content-addresses every plan, replication-only projects included. If `rocky plan` emits no `plan_id`, `run_pipes()` raises `dagster.Failure` with an upgrade hint rather than falling back.
 
 ---
 
@@ -50,7 +52,7 @@ for source in result.sources:
 
 ### `plan(filter=None, *, pipeline=None, env=None) -> PlanResult`
 
-Runs `rocky plan` and returns the planned SQL statements without executing them. Every plan is content-addressed and persisted to `.rocky/plans/<plan_id>.json`; the returned `PlanResult` carries that `plan_id`, which you can pass to `apply()` (or `rocky apply <plan-id>`) to execute it.
+Runs `rocky plan` and returns the planned SQL statements without executing them. Every [plan](/reference/glossary/#plan) is content-addressed and persisted to `.rocky/plans/<plan_id>.json`. The returned `PlanResult` carries that `plan_id`. Pass it to `apply()`, or to `rocky apply <plan-id>`, to execute the plan.
 
 **Wraps**: `rocky plan [--filter <filter>] --output json`
 
@@ -64,7 +66,7 @@ Runs `rocky plan` and returns the planned SQL statements without executing them.
 
 Runs Rocky in buffered mode (`subprocess.run`) and returns the full execution result including materializations, check results, drift detection, and permission changes.
 
-**Wraps**: `rocky run --filter <filter> --output json` — the engine's fused plan+apply path, spawned as a single subprocess. No intermediate plan artifact is persisted (`ROCKY_SUPPRESS_DEPRECATION=1` is set on every CLI subprocess so alias deprecation notices don't bubble up to Dagster logs).
+**Wraps**: `rocky run --filter <filter> --output json`, the engine's fused plan+apply path, spawned as a single subprocess. No intermediate plan artifact is persisted. Every CLI subprocess also gets `ROCKY_SUPPRESS_DEPRECATION=1`, so alias deprecation notices stay out of the Dagster logs.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -82,9 +84,9 @@ Runs Rocky in buffered mode (`subprocess.run`) and returns the full execution re
 
 ### `run_streaming(context, filter, governance_override=None, *, pipeline=None, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None) -> RunResult`
 
-Pipes-style execution with live stderr streaming to `context.log`. Same semantics as `run()` but spawns the binary via `subprocess.Popen` and forwards Rocky's stderr (tracing output) to `context.log.info` line-by-line as the run progresses. Use this from inside a Dagster `@multi_asset` or `@op` for runs longer than a few seconds.
+Pipes-style execution with live stderr streaming to `context.log`. Same semantics as `run()`, but it spawns the binary via `subprocess.Popen`. It forwards Rocky's stderr, the engine's tracing output, to `context.log.info` line by line as the run progresses. Use it inside a Dagster `@multi_asset` or `@op` for runs longer than a few seconds.
 
-**Wraps**: `rocky run --filter <filter> --output json` (the same fused plan+apply subprocess as `run()`). All engine stderr — discover, drift, and copy progress — streams to `context.log` in a single pass from process start, so operators watching the run viewer see progress lines from the beginning of the run.
+**Wraps**: `rocky run --filter <filter> --output json`, the same fused plan+apply subprocess as `run()`. All engine stderr streams to `context.log` in a single pass from process start: discover, drift, and copy progress. An operator watching the run viewer sees progress lines from the very beginning of the run.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -101,9 +103,9 @@ def replicate(context: dg.AssetExecutionContext, rocky: RockyResource):
 
 ### `run_pipes(context, filter, governance_override=None, *, pipeline=None, run_models=False, partition=None, partition_from=None, partition_to=None, latest=False, missing=False, lookback=None, parallel=None, pipes_client=None) -> PipesClientCompletedInvocation`
 
-Full Dagster Pipes execution with structured event streaming. Spawns `rocky plan` followed by `rocky apply <plan-id>` via `PipesSubprocessClient`, which sets the `DAGSTER_PIPES_CONTEXT` / `DAGSTER_PIPES_MESSAGES` env vars on the apply subprocess. The engine emits one Pipes message per materialization, asset check, and log line, so the run viewer gets `MaterializationEvent` and `AssetCheckEvaluation` events in real time. The plan id is attached via `extras={"plan_id": plan_id}`, so Dagster surfaces it as run metadata in the run viewer.
+Full Dagster Pipes execution with structured event streaming. Spawns `rocky plan` followed by `rocky apply <plan-id>` via `PipesSubprocessClient`, which sets the `DAGSTER_PIPES_CONTEXT` / `DAGSTER_PIPES_MESSAGES` env vars on the apply subprocess. The engine emits one Pipes message per materialization, asset check, and log line. The run viewer therefore gets `MaterializationEvent` and `AssetCheckEvaluation` events in real time. The plan id is attached via `extras={"plan_id": plan_id}`, so Dagster shows it as run metadata.
 
-**Wraps**: `rocky plan --filter <filter> --output json` followed by `rocky apply <plan-id> --output json` (via Dagster Pipes protocol). This is the only execution mode that keeps the two-step shape. Replication-only projects route through plan+apply too — engine `v1.34+` content-addresses every plan — so a missing `plan_id` raises `dagster.Failure` with an upgrade hint rather than falling back to `rocky run`.
+**Wraps**: `rocky plan --filter <filter> --output json` followed by `rocky apply <plan-id> --output json`, over the Dagster Pipes protocol. This is the only execution mode that keeps the two-step shape. Replication-only projects route through plan+apply too, because engine `v1.34+` content-addresses every plan. A missing `plan_id` therefore raises `dagster.Failure` with an upgrade hint rather than falling back to `rocky run`.
 
 | Parameter | Type | Description |
 |---|---|---|
@@ -132,7 +134,7 @@ Resume a failed run from where it left off.
 
 ### `state() -> StateResult`
 
-Runs `rocky state` and returns the current watermark state for all tracked tables.
+Runs `rocky state` and returns the current [watermark](/reference/glossary/#watermark) for every tracked table. A watermark is the timestamp of the newest row Rocky has already loaded.
 
 **Wraps**: `rocky state --output json`
 
@@ -142,9 +144,9 @@ Runs `rocky state` and returns the current watermark state for all tracked table
 
 ### `compile(model_filter=None) -> CompileResult`
 
-Runs `rocky compile` and returns compiler diagnostics (errors, warnings, info). When `server_url` is
-configured, fetches from the HTTP API instead of spawning a subprocess. The HTTP endpoint compiles
-the whole project only; passing `model_filter` raises `ValueError` rather than silently ignoring it.
+Runs `rocky compile` and returns compiler diagnostics: errors, warnings, and info. When `server_url`
+is configured, it fetches from the HTTP API instead of spawning a subprocess. The HTTP endpoint
+compiles the whole project only, so passing `model_filter` raises `ValueError` instead of ignoring it.
 
 **Wraps**: `rocky compile --models <models_dir> --output json` or `GET /api/v1/compile`
 
@@ -251,9 +253,9 @@ Retrieve pipeline run history. Returns `ModelHistoryResult` when filtered to a s
 
 ### `metrics(model, *, trend=False, column=None, alerts=False) -> MetricsResult`
 
-Retrieve quality metrics for a model. When `server_url` is configured, fetches from the HTTP API
-instead. The HTTP endpoint supports default metrics only; passing `trend`, `column`, or `alerts`
-raises `ValueError` rather than silently ignoring the option.
+Retrieve quality metrics for a model. When `server_url` is configured, it fetches from the HTTP API
+instead. The HTTP endpoint serves the default metrics only, so passing `trend`, `column`, or `alerts`
+raises `ValueError` instead of ignoring the option.
 
 **Wraps**: `rocky metrics <model> --output json` or `GET /api/v1/models/<model>/metrics`
 
@@ -271,8 +273,8 @@ Analyze materialization strategies and return cost optimization recommendations.
 **Wraps**: `rocky optimize --models <models_dir> --output json`
 
 `--models` is forwarded so the engine computes each model's `downstream_references`
-against the configured layout; without it a custom `models_dir` silently yields
-`downstream_references: 0` for every model and skews the recommendation.
+against the configured layout. Without it, a custom `models_dir` yields
+`downstream_references: 0` for every model, which skews the recommendation.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -301,12 +303,12 @@ resource's configured `models_dir`.
 
 **Wraps**: `rocky retention-status --models <models_dir> --output json`
 
-Passing `env` raises `ValueError` — `rocky retention-status` has no `--env` flag
-(unlike `compliance`); retention is not environment-scoped.
+Passing `env` raises `ValueError`. `rocky retention-status` has no `--env` flag,
+unlike `compliance`, because retention is not scoped to an environment.
 
 ### `validate_migration(dbt_project, rocky_project=None, *, sample_size=None) -> ValidateMigrationResult`
 
-Compare a dbt project against a Rocky import to validate migration correctness.
+Compare a dbt project against a Rocky import to check that the migration is correct.
 
 **Wraps**: `rocky validate-migration --dbt-project <path> --output json`
 
@@ -367,9 +369,9 @@ When `server_url` is configured, the following methods use the `rocky serve` HTT
 - `lineage()` -- `GET /api/v1/models/<target>/lineage[/<column>]`
 - `metrics()` -- `GET /api/v1/models/<model>/metrics`
 
-These endpoints serve each command's default output. `lineage`'s `column` is supported (it has a dedicated route), but `compile`'s `model_filter` and `metrics`'s `trend`, `column`, or `alerts` raise `ValueError` rather than being silently ignored.
+These endpoints serve each command's default output. `lineage`'s `column` works, because it has its own route. `compile`'s `model_filter` and `metrics`'s `trend`, `column`, and `alerts` raise `ValueError` instead of being ignored.
 
-This is useful when a Rocky server is already running (e.g., in a development environment or alongside the LSP).
+Use this when a Rocky server is already running, for example in a development environment or alongside the LSP.
 
 ## Example
 

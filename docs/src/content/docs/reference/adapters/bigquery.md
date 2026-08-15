@@ -1,11 +1,11 @@
 ---
 title: BigQuery adapter
-description: BigQuery warehouse adapter — project and location fields, and the bearer-token / service-account detection order
+description: The BigQuery adapter's two config fields, and the order Rocky checks for credentials
 sidebar:
   order: 4
 ---
 
-BigQuery warehouse adapter. Executes SQL through the BigQuery REST API.
+The BigQuery warehouse adapter runs your SQL through the BigQuery REST API.
 
 ## Fields
 
@@ -23,12 +23,12 @@ location = "US"
 
 ## Authentication
 
-Credentials come from the environment rather than from `rocky.toml`, and are detected in this order:
+Rocky reads BigQuery credentials from the environment, never from `rocky.toml`. It checks two variables in this order.
 
-1. **`BIGQUERY_TOKEN`** — a pre-obtained OAuth bearer token, used as-is. Checked first, so setting it overrides any service-account key on the same machine.
-2. **`GOOGLE_APPLICATION_CREDENTIALS`** — path to a service-account JSON key. Rocky mints a JWT from the key, exchanges it for an access token at Google's token endpoint, and refreshes it automatically before expiry.
+1. **`BIGQUERY_TOKEN`** — an OAuth bearer token you obtained yourself. Rocky uses it as is. Because Rocky checks it first, setting it overrides any service-account key on the same machine.
+2. **`GOOGLE_APPLICATION_CREDENTIALS`** — the path to a service-account JSON key. Rocky mints a JWT from the key, exchanges it for an access token at Google's token endpoint, and refreshes the token before it expires.
 
-If neither is set, the adapter fails with `no authentication method available — set GOOGLE_APPLICATION_CREDENTIALS or provide a bearer token`.
+If neither variable is set, the adapter fails with `no authentication method available — set GOOGLE_APPLICATION_CREDENTIALS or provide a bearer token`.
 
 :::caution[Key file permissions]
 The service-account key holds an RSA private key. On Unix, Rocky emits a warning when the file at `GOOGLE_APPLICATION_CREDENTIALS` is group- or world-readable — `chmod 600` (or `0400`) it.

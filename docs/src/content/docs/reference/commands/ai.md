@@ -1,11 +1,11 @@
 ---
 title: AI Commands
-description: AI-powered model generation, schema sync, intent explanation, and test generation
+description: Generate a model from a description, reconcile it with the warehouse, explain it, and draft its tests
 sidebar:
   order: 3
 ---
 
-AI-assisted commands for generating, reconciling, explaining, and testing Rocky models. These commands require an AI provider to be configured.
+These commands use an AI model to draft, reconcile, explain, and test Rocky models. Each one needs a configured AI provider. None of them materializes anything on its own: a person still runs `rocky apply`.
 
 ---
 
@@ -378,11 +378,31 @@ What leaves your machine is bounded: warehouse queries go to your warehouse; the
 
 ### Safety model: read-only and propose-only
 
-The server **never materializes anything**. Materialization stays human-gated:
+The server **never materializes anything**. An agent can write files and record a plan. It stops there.
 
-- The generators (`ai_contract`, `ai_test`, `explain_model`) return **drafts** and mutate nothing; hand them to the `draft_contract` / `draft_check` write tools, or save them to disk and run `compile` / `test` yourself.
+```
+   agent, through rocky mcp                human
+   ────────────────────────                ──────────────────────────
+   draft_model     ──writes──► models/<name>.sql + sidecar
+   draft_contract  ──writes──► models/<model>.contract.toml
+   draft_check     ──writes──► [[tests]] in the sidecar
+        │
+        │ this is as far as the agent goes
+        ▼
+   propose         ──writes──► .rocky/plans/<plan-id>.json
+                                        │
+                                        ▼
+                              rocky review <plan-id> --approve
+                                        │
+                                        ▼
+                              rocky apply <plan-id> ──► warehouse
+```
+
+Three rules keep that boundary in place:
+
+- The generators (`ai_contract`, `ai_test`, `explain_model`) return **drafts** and mutate nothing. Hand a draft to the `draft_contract` or `draft_check` write tool, or save it to disk and run `compile` and `test` yourself.
 - `governance_preview` and `drift_preview` are **read-only** previews.
-- The `propose` tool only writes an **AI-authored plan**; a human runs `rocky review <plan_id> --approve` then `rocky apply <plan_id>`. The server never approves on the user's behalf.
+- The server never approves on your behalf. Approval is the one step it cannot take.
 
 ### Tools
 
@@ -467,4 +487,4 @@ claude mcp add rocky -- rocky mcp --config rocky.toml
 ### Related Commands
 
 - [`rocky ai`](#rocky-ai) -- one-shot model generation from the CLI (no MCP client needed)
-- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- execute an approved AI-authored plan (a human runs `rocky review <plan_id> --approve` first)
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- execute an approved AI-authored plan (a human runs `rocky review <plan_id> --approve` first)

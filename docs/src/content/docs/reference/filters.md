@@ -5,19 +5,27 @@ sidebar:
   order: 6
 ---
 
-Several Rocky commands accept a `--filter` flag to scope execution to a subset of sources.
+Run one tenant, one region, or one connector instead of the whole pipeline. Pass `--filter key=value` and the command works on only the sources that match.
 
 ## Commands that accept `--filter`
 
-`--filter` is **optional** on every command below. Omit it and the command processes every source the pipeline discovers; pass it to narrow execution to a subset.
+`--filter` is **optional** everywhere. Omit it and the command processes every source the pipeline discovers.
 
 | Command | What gets filtered |
 |---|---|
-| `rocky plan` | Which sources have SQL statements generated. The plan is then executed with `rocky apply <plan-id>`, which materializes only those sources end-to-end (drift → create → copy → check). |
-| `rocky run` | Which sources are materialized in the single-step `discover → drift → create → copy → check` path. |
-| `rocky compare` | Which shadow-vs-prod tables are compared |
+| `rocky plan` | Which sources get SQL statements generated. `rocky apply <plan-id>` then materializes only those sources end to end: drift, create, copy, check. |
+| `rocky run` | Which sources get materialized in the single-step `discover → drift → create → copy → check` path. |
+| `rocky compare` | Which shadow-versus-production tables get compared. |
 
-`rocky discover` does NOT take a filter: it always reports every source the pipeline's adapter returns. Filtering is a **consumer-side** concern: discover produces the catalog, the other commands narrow it.
+`rocky discover` takes no filter. It always reports every source the pipeline's adapter returns, because filtering belongs to the consumer: discover builds the catalog, the other commands narrow it.
+
+```
+   rocky discover ──► lists every source. It hands nothing to another command.
+
+   rocky plan    ┐
+   rocky run     ├──► discovers ──► applies ──► acts on the
+   rocky compare ┘    every source  --filter    matching sources
+```
 
 ## Syntax
 
@@ -25,7 +33,7 @@ Several Rocky commands accept a `--filter` flag to scope execution to a subset o
 --filter <key>=<value>
 ```
 
-Exactly **one** `key=value` pair per invocation. The first `=` separates key from value; subsequent `=` characters are part of the value, so values may themselves contain `=`:
+Pass exactly **one** `key=value` pair per invocation. The first `=` separates the key from the value. Any further `=` belongs to the value, so a value may itself contain one:
 
 ```sh
 # Value "a=b" — the first = is the separator
@@ -36,9 +44,9 @@ rocky plan --filter name=a=b
 
 ### `id` — the reserved key
 
-Matches against the **connector's unique identifier** as reported by the source adapter. For Fivetran this is the connector id (e.g. `conn_abc123`); for other adapters it's whatever that adapter's SDK calls the primary key.
+Matches the **connector's unique identifier**, as the source adapter reports it. For Fivetran that is the connector id, such as `conn_abc123`. For another adapter it is whatever that adapter's SDK calls the primary key.
 
-Bypasses schema parsing: the source doesn't even need a parseable schema for this filter to match. Useful when you want to pin a run to a specific connector regardless of its naming convention.
+`id` skips schema parsing entirely, so the source does not even need a parseable schema name to match. Use it to pin a run to one connector whatever its naming convention.
 
 ```sh
 rocky plan --filter id=conn_abc123
@@ -46,7 +54,7 @@ rocky plan --filter id=conn_abc123
 
 ### Any other key — parsed schema component
 
-Every other key name is matched against a named component parsed out of the source schema by the pipeline's [schema_pattern](/concepts/schema-patterns/). The key must match one of the component names declared in `rocky.toml`:
+Every other key names a component that the pipeline's [`schema_pattern`](/concepts/schema-patterns/) parsed out of the source schema name. A schema like `src__acme__us_west__shopify` is not one opaque string to Rocky: the pattern splits it into named parts, and those part names are your filter keys. The key must match a component declared in `rocky.toml`:
 
 ```toml
 [pipeline.bronze.source.schema_pattern]
@@ -55,18 +63,18 @@ separator = "__"
 components = ["tenant", "regions...", "source"]
 ```
 
-With that pattern, the valid filter keys are `tenant`, `regions`, `source`, the reserved `id`, or the reserved `table` (see below). Filtering on an unknown key (e.g. `--filter department=finance` against the pattern above) silently matches nothing (no error; the command just proceeds with zero sources in scope).
+With that pattern, the valid keys are `tenant`, `regions`, `source`, the reserved `id`, and the reserved `table` below. An unknown key — `--filter department=finance` against this pattern — matches nothing. Rocky raises no error and the command proceeds with zero sources in scope.
 
 ### `table` — the second reserved key
 
-`table` is reserved for per-table filtering **within** a matched source. At the connector level every source passes; the discovered table list is then subset so only tables whose name exactly equals the value are materialized:
+`table` filters **within** a matched source rather than between sources. Every source passes at the connector level, and Rocky then narrows each one's discovered table list to tables whose name equals the value exactly:
 
 ```sh
 # Copy only the `orders` table from every in-scope source
 rocky plan --filter table=orders
 ```
 
-Matching is exact-literal only — no globs or wildcards (`--filter table=orders_*` matches the literal string `orders_*`, which almost never exists). Glob-style table selection lives in the TOML `[[table_overrides]]` grammar instead.
+Matching is exact and literal. There are no globs: `--filter table=orders_*` looks for a table actually named `orders_*`, which almost never exists. Glob-style table selection lives in the TOML `[[table_overrides]]` grammar instead.
 
 ## Matching semantics
 
@@ -81,7 +89,7 @@ rocky plan --filter tenant=acme
 
 ### Multi-valued components (`...`)
 
-A component declared with the `...` suffix (e.g. `regions...` in the pattern above) can hold multiple parsed values. A filter value matches by **containment**, not equality:
+A component declared with the `...` suffix, such as `regions...` above, holds several parsed values at once. A filter matches it by **containment**, not equality:
 
 ```sh
 # Matches every source whose parsed regions list CONTAINS "us_west"
@@ -91,11 +99,11 @@ A component declared with the `...` suffix (e.g. `regions...` in the pattern abo
 rocky plan --filter regions=us_west
 ```
 
-This is almost always what you want in multi-region pipelines: "run everything that touches us-west".
+In a multi-region pipeline this is almost always what you want: "run everything that touches us-west".
 
 ### Case sensitivity
 
-Keys and values are matched case-sensitively as-is. `tenant=acme` does NOT match a source parsed as `tenant=ACME`. If your upstream emits mixed case, filter accordingly.
+Rocky matches keys and values exactly as written, case included. `tenant=acme` does **not** match a source parsed as `tenant=ACME`. Match your upstream's casing.
 
 ## Common patterns
 
@@ -140,11 +148,11 @@ key         = "id" | "table" | <component name from schema_pattern>
 value       = any non-empty string
 ```
 
-The filter flag is optional for `plan`, `run`, and `compare` — omit it to process every discovered source. When you do pass one, a typo in the key or value (e.g. `--filter tenat=acme`) matches nothing and the command exits successfully with zero sources scoped; it is not silently widened back to "everything".
+The flag stays optional on `plan`, `run`, and `compare`. When you do pass one, a typo in the key or the value — `--filter tenat=acme` — matches nothing. The command scopes to zero sources and exits successfully. Rocky never widens a failed match back to "everything".
 
 ## What's NOT supported today
 
-These are frequent requests; none of them work yet:
+People ask for these often. None of them work yet:
 
 - **Boolean combinations.** One filter per invocation. `--filter 'tenant=acme AND regions=us_west'` is not a thing. Workaround: tighten your schema pattern so a single component is the narrowing axis, or run multiple invocations.
 - **Negation / exclusion.** `--filter tenant!=acme` is not a thing. Workaround: run per-tenant filters.
@@ -157,17 +165,18 @@ If any of these bite you, [open an issue](https://github.com/rocky-data/rocky/is
 
 ## Error messages
 
-Rocky produces actionable errors for invalid filter input:
+Rocky names the problem when a filter will not parse:
 
 | Input | Error |
 |---|---|
 | `rocky plan --filter noequalssign` | `invalid filter 'noequalssign': expected key=value (e.g., client=acme)` |
 | `rocky plan --filter a=1 --filter b=2` | clap: `error: the argument '--filter <FILTER>' cannot be used multiple times` |
 
-A filter that parses correctly but matches zero sources is **not** an error. The command scopes to zero sources and exits successfully. This is deliberate: empty match is valid orchestration output (e.g. "no tenants had new data this tick").
+A filter that parses but matches zero sources is **not** an error. The command scopes to zero sources and exits successfully. That is deliberate: an empty match is a valid orchestration result, as in "no tenant had new data this tick".
 
 ## Related
 
-- [Schema Patterns](/concepts/schema-patterns/) — how source schema names are parsed into the components you filter on
-- [CLI Reference](/reference/cli/) — full CLI surface, all commands
-- [Core pipeline commands](/reference/commands/core-pipeline/) — `plan`, `apply`, `compare` detail
+- [Schema Patterns](/concepts/schema-patterns/) — how Rocky parses a source schema name into the components you filter on
+- [CLI Reference](/reference/cli/) — every command and flag
+- [Core pipeline commands](/reference/commands/core-pipeline/) — `plan`, `apply`, and `compare` in detail
+- [Glossary](/reference/glossary/) — plain definitions of the terms on this page

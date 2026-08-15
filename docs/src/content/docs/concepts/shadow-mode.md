@@ -1,97 +1,125 @@
 ---
 title: Shadow Mode
-description: Validate pipeline changes by comparing shadow tables against production
+description: Run a change against copies of your tables, then diff them against production
 sidebar:
   order: 14
 ---
 
-Shadow mode writes pipeline output to shadow tables instead of (or alongside) production tables. This lets you validate changes (new logic, schema migrations, adapter upgrades) without affecting production data.
+Shadow mode writes a pipeline's output to shadow tables instead of production tables, or alongside them. You get to see what a change does to the data before it reaches the tables people query. Use it for new logic, schema migrations, and adapter upgrades.
 
-## How it works
+## What a shadow run does
 
-1. Rocky rewrites target table names by appending a suffix (default: `_rocky_shadow`) or routing to a dedicated schema
-2. The pipeline runs normally, writing to shadow targets
-3. A comparison engine checks row counts, schemas, and optionally sample data between shadow and production
-4. Results show pass/warn/fail with detailed diffs
+```
+  rocky run --shadow
+        │
+        │ 1. Rocky rewrites every target name
+        │    with the default _rocky_shadow suffix
+        ▼
+  the pipeline runs as usual, writing to the shadow targets
+        │
+        ▼
+  analytics.marts.fct_revenue_rocky_shadow   the shadow table
+  analytics.marts.fct_revenue                production, untouched
+        │
+        │ 2. rocky compare reads both tables:
+        │    row counts, schema, optional sampled rows
+        ▼
+  PASS / WARN / FAIL, with the diffs
+```
 
 :::caution[Where shadow isolation applies]
-Isolation covers a plain `rocky run` over **transformation** pipelines, and
-**replication** pipelines in either mode — `--shadow-suffix` or `--shadow-schema`
+Isolation covers a plain `rocky run` over a **transformation** pipeline, and a
+**replication** pipeline in either mode — `--shadow-suffix` or `--shadow-schema`
 (or a branch). Everywhere else Rocky refuses the flag instead of running without
 isolation:
 
-- **`rocky run --dag`** refuses `--shadow` / `--branch` outright. The DAG runs
-  each model as its own sub-run, so a model's reads of an upstream built by the
-  same run are not redirected to that upstream's shadow target — the downstream
-  shadow table would be built from production data while the run reported
-  success. Run the shadow pipeline without `--dag`.
-- **Snapshot and load** pipelines refuse it: their targets are not rewritten.
-Replication supports both shadow modes, and they isolate differently. Under
-`--shadow-suffix` the copy writes `<table><suffix>` **in the pipeline's own
-target schema**, reading the unsuffixed production source. Under
-`--shadow-schema` the whole target schema moves and table names are untouched.
-Prefer the schema override when you want the shadow objects kept away from
-production tables rather than sitting beside them.
-- **Seeds** cause a `--dag` run to be refused along with the rest; `rocky seed`
+- **`rocky run --dag`** refuses `--shadow` and `--branch` outright. The DAG runs
+  each model as its own sub-run. A model's read of an upstream built by the same
+  run is therefore not redirected to that upstream's shadow target. The
+  downstream shadow table would be built from production data while the run
+  reported success. Run the shadow pipeline without `--dag`.
+- **Snapshot and load pipelines** refuse it. Rocky does not rewrite their
+  targets.
+- **Seeds** cause a `--dag` run to be refused along with the rest. `rocky seed`
   itself has no shadow mode and always writes its configured target.
 
 A stored `rocky plan --shadow` carries its routing into `rocky apply`.
 :::
 
-Shadow and branch runs currently reject `content_addressed`, `time_interval` and
-`ephemeral` models. The first two persist object-storage or partition-state
-identities that cannot yet be isolated by rewriting only the warehouse target.
-Ephemeral models are neither materialized nor inlined into their consumers, so a
-consumer would read the production table and no rewrite could redirect it — give
-the model a materialized strategy to shadow it. Rocky also rejects a derived
-shadow target that matches any configured production target or another selected
-shadow target.
+## Models a shadow run refuses
 
-Rocky does **not** yet verify that a derived shadow target is unoccupied by an
-object it does not know about. If a table matching the derived name already
-exists and is not a Rocky model target — a source, a seed, or an ad-hoc table —
-a full-refresh model will replace it. Prefer a dedicated shadow schema you own.
+Shadow and branch runs reject `content_addressed`, `time_interval` and
+`ephemeral` models.
+
+- `content_addressed` and `time_interval` models persist object-storage or
+  partition-state identities. Rewriting the warehouse target alone cannot
+  isolate those yet.
+- An `ephemeral` model is neither materialized nor inlined into its consumers.
+  The consumer would read the production table, and no rewrite could redirect
+  that read. Give the model a materialized strategy to shadow it.
+
+Rocky also refuses a derived shadow target that matches a configured production
+target, or that matches another selected model's shadow target.
+
+Rocky does **not** yet check whether a derived shadow target is already occupied
+by an object it does not know about. Suppose a table with the derived name
+already exists and is not a Rocky model target — a source, a seed, or an ad-hoc
+table. A full-refresh model will replace it. Prefer a dedicated shadow schema
+that you own.
+
+## How Rocky redirects a read to a shadow table
 
 A model that reads another selected model's table is routed to that upstream's
-shadow target whether or not it declares the dependency in `depends_on` —
-matching is on the upstream's configured `catalog.schema.table`, so a physical
-read is redirected too. When a reference could resolve to more than one
-selected upstream (two models whose targets share a name in different
-catalogs, read as a bare or partially qualified name), Rocky refuses the run
-rather than guess which one to read.
+shadow target. This holds whether or not the model declares the dependency in
+`depends_on`. Rocky matches on the upstream's configured
+`catalog.schema.table`, so it redirects a physical read too.
+
+Sometimes a reference could resolve to more than one selected upstream. Two
+models may have targets that share a table name in different catalogs, read as a
+bare or partially qualified name. Rocky refuses the run rather than guess which
+one to read.
+
+### Identifier case
 
 Matching follows the warehouse's own rule for identifier case, per component.
-On DuckDB, Databricks and Trino — where case is not part of object identity —
-`Orders` and `orders` name one table and either spelling is redirected. On
-BigQuery and Snowflake they are two tables, so a reference is matched exactly:
-a model reading `raw.Orders` is **not** redirected to the shadow of a model
-whose target is `raw.orders`, because it never read that table.
 
-One gap remains on Snowflake, unchanged from before this behaviour existed:
-matching compares the spelled text of a reference, and Snowflake resolves an
-*unquoted* identifier by upper-casing it while Rocky writes its targets quoted.
-A model whose target is configured in lower case, read by an unquoted reference,
-can therefore have that read redirected even though the two name different
-objects. Configuring Snowflake targets in upper case — the idiomatic choice —
-avoids it entirely. Tracked in issue #1282.
+| Warehouse | Case is part of object identity | What Rocky matches |
+|---|---|---|
+| DuckDB, Databricks, Trino | No | `Orders` and `orders` name one table, and either spelling is redirected |
+| BigQuery, Snowflake | Yes | The reference must match exactly |
+
+On BigQuery and Snowflake, a model reading `raw.Orders` is **not** redirected to
+the shadow of a model whose target is `raw.orders`. It never read that table.
 
 Where a reference matches a routed upstream **only if case is ignored**, Rocky
 refuses the run rather than guess. Redirecting it could read a table the model
-never named; leaving it would read production while the model writes its shadow.
-Spell the reference exactly as the upstream's configured target.
+never named. Leaving it alone would read production while the model writes its
+shadow. Spell the reference exactly as the upstream's configured target.
 
-Deciding whether two *targets* collide is the opposite question, and Rocky
-answers it conservatively on every warehouse: two selected models whose targets
-differ only by identifier case are always treated as one object, and the run is
-refused. Case-sensitivity is connection state Rocky cannot observe — a Snowflake
+Deciding whether two *targets* collide is the opposite question. Rocky answers
+it conservatively on every warehouse. Two selected models whose targets differ
+only by identifier case are always treated as one object, and Rocky refuses the
+run. Case sensitivity is connection state Rocky cannot observe: a Snowflake
 account may set `QUOTED_IDENTIFIERS_IGNORE_CASE`, and a BigQuery dataset may be
-created `is_case_insensitive` — so assuming the two are distinct could let both
-models write the same shadow table with no error. Rename one target so they
-differ by more than case.
+created `is_case_insensitive`. Assuming the two targets are distinct could let
+both models write the same shadow table with no error. Rename one target so the
+two differ by more than case.
+
+:::note[Snowflake gap]
+One gap remains on Snowflake, unchanged from before this behaviour existed.
+Matching compares the spelled text of a reference. Snowflake resolves an
+*unquoted* identifier by upper-casing it, while Rocky writes its targets quoted.
+So a model's target may be configured in lower case and read by an unquoted
+reference. Rocky can redirect that read even though the two name different
+objects. Configuring Snowflake targets in upper case — the idiomatic choice —
+avoids it entirely. Tracked in issue #1282.
+:::
 
 ## Shadow target rewriting
 
 ### Suffix mode (default)
+
+Rocky appends a suffix to the table name. The default suffix is `_rocky_shadow`.
 
 ```
 production: analytics.marts.fct_revenue
@@ -107,11 +135,20 @@ shadow:     analytics.rocky_shadow.fct_revenue
 
 Schema override keeps the table name clean and groups all shadow tables together.
 
+### The two modes on a replication pipeline
+
+Replication supports both modes, and they isolate differently. Under
+`--shadow-suffix` the copy writes `<table><suffix>` **in the pipeline's own
+target schema**, and reads the unsuffixed production source. Under
+`--shadow-schema` the whole target schema moves and the table names stay as they
+are. Prefer the schema override when you want the shadow objects kept away from
+production tables rather than sitting beside them.
+
 ## Comparison engine
 
 `rocky compare` reads the shadow tables back and diffs them against production.
-It enumerates targets differently per pipeline type — replication discovers
-them from the source, transformation reads them off its models — and compares
+It finds the targets differently per pipeline type: replication discovers them
+from the source, and transformation reads them off its models. It then compares
 each pair the same way. `rocky branch compare` does the same for a branch's
 shadow schema.
 
@@ -119,7 +156,7 @@ The comparison evaluates three dimensions:
 
 ### Row count
 
-Compares the number of rows between shadow and production:
+Rocky counts the rows on each side and reports the difference:
 
 ```
 shadow:     148,203 rows
@@ -130,7 +167,7 @@ verdict:    PASS (within 1% warn threshold)
 
 ### Schema diff
 
-Compares column names, types, and order:
+Rocky compares column names, types, and order:
 
 | Diff type | Description |
 |-----------|-------------|
@@ -141,11 +178,11 @@ Compares column names, types, and order:
 
 ### Sample comparison
 
-Hash-based comparison of sample rows to detect value differences even when row counts match.
+Rocky hashes a sample of rows from each side and compares the hashes. This finds value differences that the row count misses, because two tables can hold the same number of rows and different data.
 
 ## Thresholds
 
-Configure pass/warn/fail thresholds:
+Set the pass, warn, and fail thresholds:
 
 | Threshold | Default | Description |
 |-----------|---------|-------------|
@@ -163,7 +200,7 @@ Configure pass/warn/fail thresholds:
 
 ## Use cases
 
-- **Schema migrations**: Verify a column rename doesn't change output
-- **Logic changes**: Compare old vs new calculation results
-- **Adapter testing**: Validate a new warehouse adapter against the production adapter
-- **dbt migration**: Compare Rocky output against dbt output (via `rocky validate-migration`)
+- **Schema migrations**: check that a column rename does not change the output
+- **Logic changes**: compare the old and the new calculation, row for row
+- **Adapter testing**: run a new warehouse adapter beside the production one
+- **dbt migration**: compare Rocky's output against dbt's output with `rocky validate-migration`

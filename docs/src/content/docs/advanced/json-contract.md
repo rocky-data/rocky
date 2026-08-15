@@ -1,15 +1,21 @@
 ---
 title: JSON Contract
-description: How Rocky's JSON output schema is versioned and maintained
+description: The rules that keep Rocky's --output json payloads stable across releases
 sidebar:
   order: 2
 ---
 
-## Versioning
+Rocky commands that support `--output json` print a JSON payload. That payload is the interface contract between Rocky and whatever reads it: Dagster, the Python SDK, a shell script, or your own service.
 
-Rocky's CLI output is the interface contract with orchestrators like Dagster. Every JSON output includes a top-level `version` field that tracks the engine's release version; it's set from `env!("CARGO_PKG_VERSION")` at compile time, so the field reports whichever Rocky binary is producing the output.
+This page states the rules that keep those payloads stable. It covers how Rocky sets the `version` field and what each kind of release may change. It also covers how Rocky builds an `asset_key`. Finally, it traces how a change to a Rust struct reaches the published Python and TypeScript bindings.
 
-Examples throughout the reference docs show an illustrative version string like `"version": "1.6.0"`; the actual value reflects whichever Rocky binary produced the output, not a fixed release:
+For the per-command field lists, see the [JSON output reference](/reference/json-output/).
+
+## How the `version` field is set
+
+Every JSON output carries a top-level `version` field. Rocky sets it from `env!("CARGO_PKG_VERSION")` at compile time, so the field always names the binary that produced the output.
+
+The reference docs show an illustrative version string such as `"version": "1.6.0"`. Read it as an example, not as a fixed release:
 
 ```json
 {
@@ -19,65 +25,80 @@ Examples throughout the reference docs show an illustrative version string like 
 }
 ```
 
-## Stability Guarantees
+## What each release may change
 
 Rocky follows the engine's semver cadence:
 
-- **Patch** (`1.6.x`): bug fixes, no schema changes.
-- **Minor** (`1.x.0`): new optional fields may be added. Existing fields are never removed or renamed within a minor series.
-- **Major** (`x.0.0`): breaking changes to field names, types, or structure. Consumers should pin or branch their parsing logic on the major version.
+- **Patch** (`1.6.x`): bug fixes. No schema changes.
+- **Minor** (`1.x.0`): new optional fields may appear. No existing field is removed or renamed inside a minor series.
+- **Major** (`x.0.0`): field names, types, or structure may break. Pin your parser, or branch it on the major version.
 
-Consumers should parse defensively: tolerate unknown fields, treat absent optional fields as `null`, and don't assume the set of enum variants is closed.
+Parse defensively. Tolerate unknown fields. Treat an absent optional field as `null`. Do not assume the set of enum variants is closed.
 
-## Asset Key Format
+## How `asset_key` is built
 
-The `asset_key` field in materializations and check results follows a fixed format:
+The `asset_key` field appears in materializations and check results. Its shape is fixed:
 
 ```
 [source_type, ...component_values, table_name]
 ```
 
-Example: `["fivetran", "acme", "us_west", "shopify", "orders"]`
+For example: `["fivetran", "acme", "us_west", "shopify", "orders"]`
 
-In the CLI JSON, a multi-valued component (like a list of regions) emits **one array element per value** — the values are not joined:
+A component can hold several values, such as a list of regions. In the CLI JSON, each value becomes its own array element. Rocky never joins them:
 
 ```
 ["fivetran", "acme", "us_west", "us_central", "shopify", "orders"]
 ```
 
-This format is consumed by dagster-rocky to build Dagster `AssetKey` objects. The `__` join of multi-value components into a single key segment (e.g. `us_west__us_central`) is applied by the dagster-rocky translator when it constructs the Dagster `AssetKey`, not by the CLI JSON contract.
+dagster-rocky consumes this array to build a Dagster `AssetKey`. Its translator is what joins a multi-value component into one key segment with `__`, giving `us_west__us_central`. That join happens in dagster-rocky, not in the CLI JSON contract.
 
-## Parsing
+## Parsing a payload in Python
 
-Use the `parse_rocky_output()` function in dagster-rocky to auto-detect the command type:
+Call `parse_rocky_output()`. It reads the payload's `"command"` field and returns the matching typed model:
 
 ```python
 from dagster_rocky import parse_rocky_output
 
 result = parse_rocky_output(json_str)
-# Returns: DiscoverOutput | RunOutput | PlanOutput | StateOutput | ...
+# Returns: DiscoverResult | RunResult | PlanResult | StateResult | ...
 ```
 
-The command is detected from the `"command"` field in the JSON. Shape-based discrimination (e.g. column vs model lineage) covers the commands whose output shape is disambiguated by the presence of an argument.
+`dagster_rocky` re-exports these names from `dagster_rocky.types`. That shim re-exports `rocky_sdk.types`, which includes the generated models from the cascade below.
 
-## Codegen Pipeline
+A few commands print more than one shape under the same command name. For those, the function discriminates on the fields that are present, such as column lineage versus model lineage.
 
-Rocky's JSON output schemas are autogenerated from typed Rust structs. Every CLI command that emits `--output json` is backed by a struct in `engine/crates/rocky-cli/src/output.rs` (or `commands/doctor.rs`) that derives `JsonSchema`. The full pipeline:
+## How a schema change reaches the bindings
 
-1. Edit the relevant `*Output` struct in `output.rs`.
-2. Run `just codegen` from the monorepo root.
-3. That exports the JSON schemas to `schemas/`, regenerates Pydantic v2 models in `sdk/python/src/rocky_sdk/types_generated/` (re-exported by `dagster_rocky.types`), and TypeScript interfaces in `editors/vscode/src/types/generated/`.
-4. Commit the schema and regenerated bindings together.
+Rocky generates its JSON schemas from typed Rust structs. Every command that emits `--output json` is backed by a struct in `engine/crates/rocky-cli/src/output.rs`, or in `commands/doctor.rs`, that derives `JsonSchema`. One command regenerates everything downstream:
 
-The `codegen-drift` CI workflow fails any PR where committed bindings don't match `just codegen` output. The `.git-hooks/pre-commit` hook mirrors the same check locally; enable once with `just install-hooks`.
+```
+  engine/crates/rocky-cli/src/output.rs
+    │   you edit a *Output struct (it derives JsonSchema)
+    ▼
+  just codegen ──┬─ exports ─► schemas/                        JSON Schema
+   (monorepo     │
+    root)        ├─ writes ──► sdk/python/src/rocky_sdk/       Pydantic v2
+                 │             types_generated/                 models
+                 │
+                 └─ writes ──► editors/vscode/src/types/       TypeScript
+                               generated/                       interfaces
+    │
+    ▼
+  one commit ── the Rust change, the schemas, and both bindings
+    │
+    ▼
+  codegen-drift CI ─► fails the PR when a committed binding differs
+                      from a fresh `just codegen`
+```
 
-See the [JSON Output](/reference/json-output/) reference for the per-command payload shapes.
+Run `just install-hooks` once to get the same check locally. The `.git-hooks/pre-commit` hook then mirrors what `codegen-drift` does in CI.
 
-## Adding New Fields
+## Adding a field to an output
 
-When adding fields to Rocky's JSON output:
+1. Add the field to the relevant Rust `*Output` struct as optional (nullable).
+2. Run `just codegen` to regenerate the Pydantic models and the TypeScript interfaces.
+3. Commit the Rust change, the schema, and both bindings together.
+4. Document the field in the [JSON output reference](/reference/json-output/).
 
-1. Add the field as optional (nullable) in the relevant Rust `*Output` struct.
-2. Run `just codegen` to regenerate Pydantic models and TypeScript interfaces.
-3. The new field ships with the next minor engine release; no separate schema version bump is needed.
-4. Document the new field in the JSON Output reference.
+The field ships with the next minor engine release. It needs no separate schema version bump, because a new optional field is allowed inside a minor series.

@@ -1,15 +1,20 @@
 ---
 title: The Rocky Compiler
-description: Type system, semantic graph, and compile pipeline
+description: The type system, the column lineage graph, and the stages a compile runs through.
 sidebar:
   order: 7
 ---
 
-Rocky includes a full compiler (`rocky-compiler` crate) that performs static analysis on your SQL models before they reach the warehouse. It catches type mismatches, missing columns, contract violations, and broken lineage at compile time rather than at execution time.
+Rocky ships a real compiler, in the `rocky-compiler` crate. It analyses your SQL
+models before they reach the warehouse. It catches type mismatches, missing
+columns, contract violations, and broken lineage at compile time, not at
+execution time.
 
 ## Compile pipeline
 
-The compiler runs as a sequence of stages. The first five do the core work (load, resolve, build the graph, type-check, validate contracts); three more lint passes run afterward, before the diagnostics are merged into the result:
+The compiler runs a fixed sequence of stages. The first five do the core work:
+load, resolve, build the graph, type-check, validate contracts. Three lint passes
+run after that. Then Rocky merges every diagnostic into one result.
 
 ```
  ┌──────────────────────────────────────┐
@@ -56,25 +61,41 @@ The compiler runs as a sequence of stages. The first five do the core work (load
 
 ### 1. Load models
 
-Model files (`.sql` + `.toml` sidecar) are loaded from the models directory. Each model has a SQL file containing the transformation logic and a TOML file containing configuration (name, target, strategy, intent).
+Rocky loads the model files from the models directory. A model is a `.sql` file
+holding the transformation, plus a `.toml` sidecar holding its configuration:
+name, target, strategy, intent.
+
+A `.rocky` DSL file takes one extra step first. `lower_to_sql()` in the
+`rocky-lang` crate lowers the DSL to a SQL string. From there the model follows
+exactly the same path as a hand-written `.sql` file. Raw SQL and the DSL are two
+front ends onto one pipeline.
 
 ### 2. Resolve dependencies
 
-The resolver parses each model's SQL to extract table references and classifies them:
+The resolver reads each model's SQL, pulls out the table references, and sorts
+them into three kinds:
 
-- **Bare names** matching another model in the project become DAG edges (e.g., `FROM orders` where `orders` is a model)
-- **Two-part names** like `schema.table` are treated as external source references
-- **Three-part names** like `catalog.schema.table` are treated as fully qualified external references
+- A **bare name** that matches another model in the project becomes a DAG edge. For example, `FROM orders` where `orders` is a model.
+- A **two-part name** such as `schema.table` is an external source reference.
+- A **three-part name** such as `catalog.schema.table` is a fully qualified external reference.
 
-Explicit `depends_on` entries in the model config are merged with auto-resolved dependencies. Self-references and duplicates are removed.
+Rocky merges any explicit `depends_on` entries from the model config with the
+dependencies it resolved. It then drops self-references and duplicates.
 
 ### 3. Build semantic graph
 
-Walking each model in topological order, the compiler extracts column-level lineage from the SQL AST, resolves table aliases to real model or source names, and expands `SELECT *` against upstream schemas. The result is a `SemanticGraph` of per-model schemas, upstream/downstream relationships, and cross-model lineage edges. The [Semantic graph](#semantic-graph) section below covers it in detail.
+Rocky walks the models in topological order. For each one it pulls column-level
+lineage out of the SQL AST. It resolves table aliases to real model or source
+names. It expands `SELECT *` against the upstream schemas.
+
+The result is a `SemanticGraph`: per-model schemas, upstream and downstream
+relationships, and cross-model lineage edges. The [Semantic graph](#semantic-graph)
+section below covers it in detail.
 
 ### 4. Type check
 
-The type checker propagates inferred types through the semantic graph and walks SQL AST expressions to detect issues.
+The type checker pushes inferred types through the semantic graph. It walks the
+SQL AST expressions to find problems.
 
 It infers types from:
 
@@ -86,19 +107,31 @@ It infers types from:
 - Comparison operators (both sides must be compatible)
 - Join keys (must have compatible types)
 
-Each model receives a typed schema: a list of `TypedColumn` entries with name, `RockyType`, and nullability.
+Every model comes out with a typed schema: a list of `TypedColumn` entries,
+each with a name, a `RockyType`, and a nullability flag.
 
 ### 5. Validate contracts
 
-If a contracts directory exists, `.contract.toml` files are loaded and validated against the inferred schemas. See the [Testing and Contracts](/concepts/testing) page for details on the contract format.
+If a contracts directory exists, Rocky loads the `.contract.toml` files and
+checks them against the inferred schemas. The
+[Testing and Contracts](/concepts/testing) page has the contract format.
 
 ### 6. Lint passes and merge
 
-After contract validation, three always-on lint passes run against the typed models. The blast-radius lint (`P002`) flags a `SELECT *` model whose downstream consumers read specific columns. The classification-tag check (`W004`) flags a `[classification]` tag with no matching `[mask]` strategy. The freshness-coverage check (`W005`) flags a model with temporal columns but no `freshness` declaration in scope. Their diagnostics are merged with the type-checker and contract diagnostics into the final `CompileResult`.
+Three lint passes always run after contract validation, against the typed models:
+
+- The blast-radius lint (`P002`) flags a `SELECT *` model whose downstream consumers read specific columns.
+- The classification-tag check (`W004`) flags a `[classification]` tag with no matching `[mask]` strategy.
+- The freshness-coverage check (`W005`) flags a model that has temporal columns but no `freshness` declaration in scope.
+
+Rocky merges their diagnostics with the type-checker and contract diagnostics
+into the final `CompileResult`.
 
 ## The type system
 
-`RockyType` is Rocky's unified type representation. All warehouse-specific types map to and from `RockyType` via a `TypeMapper` trait, so the compiler works identically regardless of the target warehouse.
+`RockyType` is Rocky's one type representation. Every warehouse type maps to and
+from `RockyType` through a `TypeMapper` trait, so the compiler behaves the same
+whichever warehouse you target.
 
 ### Variants
 
@@ -112,28 +145,34 @@ After contract validation, three always-on lint passes run against the typed mod
 | Semi-structured | `Variant` |
 | Unresolved | `Unknown` |
 
-`Unknown` is not an error. It means the type could not be inferred from available information. `Unknown` is compatible with any other type during type checking, so it does not produce false positives.
+`Unknown` is not an error. It means the compiler could not infer the type from
+what it had. `Unknown` is compatible with every other type during type checking,
+so it raises no false positives.
 
 ### Numeric promotion
 
-When two numeric types appear in the same expression (arithmetic, `COALESCE`, `CASE`, `UNION`), the compiler computes a common supertype:
+When two numeric types meet in one expression (arithmetic, `COALESCE`, `CASE`,
+`UNION`), the compiler works out a common supertype:
 
 - `Int32` widens to `Int64`
 - `Float32` widens to `Float64`
-- Integer widens to `Float64` when mixed with floats
-- Integer widens to `Decimal` when mixed with decimals (precision adjusted)
-- `Decimal` pairs take the maximum precision and scale
+- An integer widens to `Float64` when mixed with a float
+- An integer widens to `Decimal` when mixed with a decimal, with the precision adjusted
+- Two decimals take the larger precision and the larger scale
 - `Timestamp` and `TimestampNtz` resolve to `Timestamp`
 
-Incompatible types (e.g., `String` + `Int64`) produce an error diagnostic.
+Types that cannot mix, such as `String` and `Int64`, produce an error diagnostic.
 
 ### Assignability
 
-The `is_assignable` function determines whether a value of one type can be written to a column of another type. It allows widening conversions (e.g., `Int32` into `Int64`) but rejects narrowing conversions (e.g., `Int64` into `Int32`).
+The `is_assignable` function decides whether a value of one type can be written
+into a column of another. It allows a widening conversion, such as `Int32` into
+`Int64`. It rejects a narrowing conversion, such as `Int64` into `Int32`.
 
 ## Semantic graph
 
-The semantic graph is a cross-model column lineage map. It tracks every column's origin and transformation kind through the entire DAG.
+The semantic graph is a cross-model map of column lineage. It records where every
+column came from and how it was transformed, across the whole DAG.
 
 ```
 raw_orders                  orders_enriched              orders_summary
@@ -144,36 +183,44 @@ customer_id──[Direct]──────▶ customer_id
                             region    ◀──[Direct]── raw_customers.region
 ```
 
-The graph is built in topological order, so downstream models always see the full column list of their upstreams (including `SELECT *` expansions).
+Rocky builds the graph in topological order. A downstream model always sees the
+full column list of its upstreams, including anything a `SELECT *` expanded to.
 
-The semantic graph is the foundation for several compiler features:
+Four compiler features sit on top of the graph.
 
-**Column lineage tracing.** Given any output column in any model, you can trace it backward through the DAG to its ultimate source columns. The `trace_column` method walks lineage edges recursively:
+**Column lineage tracing.** Take any output column in any model and trace it
+backward to the source columns it came from. The `trace_column` method walks
+lineage edges recursively:
 
 ```
 c.id → b.id → a.id → source.raw.users.id
 ```
 
-**Transform tracking.** Each lineage edge records how the column was transformed:
+**Transform tracking.** Each lineage edge records how the column changed:
 
-- `Direct` -- column passed through unchanged
-- `Cast` -- explicit type cast
-- `Expression` -- derived from an expression
-- `Aggregation` -- result of an aggregate function
+- `Direct` — the column passed through unchanged
+- `Cast` — an explicit type cast
+- `Expression` — derived from an expression
+- `Aggregation` — the result of an aggregate function
 
-**Star expansion.** When a model uses `SELECT *`, the compiler expands it using the upstream model's inferred schema or known source schemas. This means downstream models always see the full column list, even through star selects.
+**Star expansion.** When a model uses `SELECT *`, the compiler expands it against
+the upstream model's inferred schema, or against a known source schema. That is
+why downstream models still see the full column list through a star select.
 
-**Intent propagation.** Each model's `intent` field (from its TOML config) is stored in the semantic graph, where the AI features (sync, explain) read it.
+**Intent propagation.** Rocky stores each model's `intent` field, from its TOML
+config, in the semantic graph. The AI features (`ai-sync`, `ai-explain`) read it
+from there.
 
 ## Diagnostics
 
-The compiler produces structured diagnostics with codes, severity levels, source spans, and optional suggestions.
+Every compiler finding is structured. It carries a code, a severity, a source
+span, and sometimes a suggested fix.
 
 ### Severity levels
 
-- **Error** -- compilation cannot proceed. The model has a definite problem.
-- **Warning** -- something looks wrong but is not blocking.
-- **Info** -- informational, usually about limitations in type inference.
+- **Error** — compilation cannot continue. The model has a definite problem.
+- **Warning** — something looks wrong, but it does not block.
+- **Info** — informational, usually about a limit in type inference.
 
 ### Diagnostic codes
 
@@ -193,6 +240,7 @@ The compiler produces structured diagnostics with codes, severity levels, source
 | `E033` | Imported snapshot's recipe hash does not match the configured `pin` |
 | `E034` | Imported snapshot declares a format version newer than this build of rocky can read |
 | `E035` | Managed-Iceberg `format_options` declares a combination the warehouse rejects (e.g. `partition_by` + `cluster_by`) |
+| `E036` | Two or more models write the same target table |
 | `W001` | Unused model (no downstream consumers) |
 | `W002` | Duplicate column in model output |
 | `W003` | `time_column` is TIMESTAMP where DATE is preferred for the granularity |
@@ -211,7 +259,7 @@ The compiler produces structured diagnostics with codes, severity levels, source
 
 ### Format
 
-Diagnostics render in a format inspired by `rustc`:
+Diagnostics render in a format modelled on `rustc`:
 
 ```
 error[E011]: column 'id' type mismatch: contract expects Int64, got String
@@ -219,22 +267,24 @@ error[E011]: column 'id' type mismatch: contract expects Int64, got String
  = help: add CAST(id AS BIGINT) to fix the type
 ```
 
-Each diagnostic includes:
-- **code** -- machine-readable identifier for filtering and suppression
-- **message** -- human-readable description of the issue
-- **span** -- file, line, and column where the issue was found (when available)
-- **model** -- which model the diagnostic relates to
-- **suggestion** -- actionable fix (when the compiler can determine one)
+Each diagnostic carries:
+- **code** — a machine-readable identifier, for filtering and suppression
+- **message** — a description you can read
+- **span** — the file, line, and column, when Rocky knows them
+- **model** — which model the diagnostic belongs to
+- **suggestion** — an actionable fix, when the compiler can work one out
 
 ## Reference tracking
 
-The type checker builds a `ReferenceMap` as a side effect. This map records:
+The type checker builds a `ReferenceMap` as it runs. That map records three
+things:
 
 - Where each model is referenced in `FROM` and `JOIN` clauses across the project
 - Where each column is referenced
 - Where each model is defined
 
-This data powers IDE features like Find References and Rename Symbol when Rocky runs as an LSP server.
+This is what powers Find References and Rename Symbol when Rocky runs as an LSP
+server.
 
 ## Using the compiler
 
@@ -268,4 +318,6 @@ if result.has_errors {
 }
 ```
 
-The `CompileResult` gives you access to the resolved project, semantic graph, typed schemas, and all diagnostics. Downstream tools (test runner, CI pipeline, AI sync) build on this result.
+`CompileResult` gives you the resolved project, the semantic graph, the typed
+schemas, and every diagnostic. The test runner, the CI pipeline, and AI sync all
+build on it.

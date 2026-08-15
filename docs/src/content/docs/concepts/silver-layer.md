@@ -1,15 +1,32 @@
 ---
 title: Silver Layer (Models)
-description: Custom SQL transformation models with TOML configuration
+description: SQL transformation models, and the TOML sidecar that configures each one
 sidebar:
   order: 3
 ---
 
-The silver layer is where you write custom SQL transformations, the equivalent of dbt models. Each model is a SQL query paired with TOML configuration that declares dependencies, materialization strategy, and target table.
+The silver layer is where you write your own SQL transformations. A model is one SQL query plus a TOML file. The TOML declares the model's dependencies, its materialization strategy, and its target table.
 
-:::tip[SQL stays first-class]
-Rocky models are plain SQL files. No Jinja, no `{{ ref() }}` macros, no templating. Dependencies and materialization live in a sidecar TOML file; your `.sql` is what the warehouse sees.
+:::tip[Models are plain SQL]
+Rocky models are plain SQL files. Dependencies and materialization live in a sidecar TOML file. Your `.sql` is what the warehouse sees.
 :::
+
+```
+  models/fct_orders.sql     the query you wrote
+  models/fct_orders.toml    name, depends_on, strategy, target
+            │
+            │ rocky run
+            ▼
+  ┌─────────────────────────────────────────────────────┐
+  │ the strategy decides the statement                  │
+  │   full_refresh → CREATE OR REPLACE TABLE …          │
+  │   incremental  → INSERT INTO … WHERE ts > watermark │
+  │   merge        → MERGE INTO … USING (…)             │
+  │   … and the other strategies listed below           │
+  └──────────────────────────┬──────────────────────────┘
+                             ▼
+           acme_warehouse.analytics.fct_orders
+```
 
 ## Model formats
 
@@ -25,7 +42,7 @@ models/
 
 ### Inline format (legacy)
 
-A single SQL file with TOML frontmatter. Supported for backward compatibility; the sidecar format is preferred because embedded TOML breaks SQL editor tooling.
+A single SQL file with TOML frontmatter at the top. Rocky still reads it. Prefer the sidecar format, because embedded TOML breaks SQL editor tooling.
 
 ```sql
 ---toml
@@ -164,7 +181,7 @@ WHEN NOT MATCHED THEN INSERT *
 
 ### full_refresh (default)
 
-Rebuilds the entire table on every run:
+Rocky rebuilds the whole table on every run:
 
 ```sql
 CREATE OR REPLACE TABLE target AS SELECT ...
@@ -172,17 +189,17 @@ CREATE OR REPLACE TABLE target AS SELECT ...
 
 ### incremental
 
-Appends new rows past the stored watermark:
+Rocky appends the rows that arrived after the stored watermark:
 
 ```sql
 INSERT INTO target SELECT ... WHERE updated_at > :watermark
 ```
 
-Watermarks live in Rocky's embedded state store ([state management](/concepts/state-management/)) and advance after each successful run.
+A watermark is the timestamp of the newest row Rocky has already loaded. Watermarks live in Rocky's embedded [state store](/concepts/state-management/) and advance after each successful run.
 
 ### merge
 
-Upserts by unique key:
+Rocky upserts by unique key:
 
 ```sql
 MERGE INTO target USING (...) AS source
@@ -193,14 +210,14 @@ WHEN NOT MATCHED THEN INSERT *
 
 ## Validation
 
-Run `rocky validate` to load all models and validate the DAG before execution:
+Run `rocky validate` to load every model and check the dependency graph before you execute anything:
 
 ```bash
 rocky validate
 ```
 
-This checks:
-- All model files parse correctly
-- All `depends_on` references point to existing models
-- No circular dependencies exist
-- Target table identifiers pass SQL validation
+It checks that:
+- Every model file parses
+- Every `depends_on` reference points to a model that exists
+- No model depends on itself, directly or through a cycle
+- Every target table identifier passes SQL validation

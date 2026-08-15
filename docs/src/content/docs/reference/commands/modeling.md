@@ -72,7 +72,16 @@ rocky compile
 }
 ```
 
-`models_detail` carries each compiled model's declarative shape: `name`, materialization `strategy` (wire form `{"type": "..."}`), `target` coordinates, and direct `depends_on`. Optional fields appear only when present: `freshness`, `contract_source` (`"auto"` for a sibling `.contract.toml`, `"explicit"` for one passed via `--contracts`), `incrementality_hint` (a `full_refresh` model with a monotonic-looking column), and `cost_hint` (when upstream statistics support an estimate). The `tags` object holds the model's `[tags]` merged over any config-group baseline (sidecar wins). Empty `tags`, `depends_on`, and absent optional fields are omitted.
+`models_detail` carries each compiled model's declarative shape. Four fields are always there: `name`, the materialization `strategy` (wire form `{"type": "..."}`), the `target` coordinates, and the direct `depends_on` list.
+
+Four more appear only when they apply:
+
+- `freshness` — the model's freshness expectation.
+- `contract_source` — `"auto"` for a sibling `.contract.toml`, `"explicit"` for one passed via `--contracts`.
+- `incrementality_hint` — set on a `full_refresh` model that has a monotonic-looking column.
+- `cost_hint` — set when the upstream statistics support an estimate.
+
+The `tags` object holds the model's `[tags]` merged over any config-group baseline, with the sidecar winning. Rocky omits an empty `tags`, an empty `depends_on`, and any absent optional field.
 
 Compile a single model with contracts, showing a warning diagnostic:
 
@@ -404,6 +413,84 @@ rocky catalog --out build/catalog
 
 ---
 
+## `rocky dag`
+
+Print the whole project as one graph. Every pipeline stage is a node, the dependencies between stages are edges, and the nodes are grouped into the layers they execute in. `rocky run --dag` executes that same graph.
+
+```bash
+rocky dag [flags]
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--models <PATH>` | `PathBuf` | each pipeline's own configured location | Override the models directory. Omit it and every transformation pipeline uses its own configured `models` location. `rocky run --dag` does the same, which keeps the two in agreement. Passing it overrides the location for **every** transformation pipeline, so Rocky refuses a project that defines more than one rather than build each model twice. |
+| `--seeds <PATH>` | `PathBuf` | | Seeds directory. |
+| `--contracts <PATH>` | `PathBuf` | | Contracts directory. |
+| `--column-lineage` | `bool` | `false` | Also emit column-level lineage edges. This one requires a compile, so it costs more than the plain graph. |
+
+### What a node carries
+
+Each node has an id of the form `{kind}:{name}`, for example `transformation:stg_orders`. The kind is one of `source`, `load`, `transformation`, `quality`, `snapshot`, `seed`, `test`, and `replication`.
+
+A node also carries the fields that apply to its kind:
+
+- the pipeline name from `rocky.toml`;
+- the target table;
+- the materialization strategy;
+- the per-model freshness expectation;
+- the partition shape;
+- the ids it depends on.
+
+### How execution layers work
+
+`execution_layers` is the graph sorted into runnable groups.
+
+```
+   execution_layers        what the grouping means
+   ────────────────        ────────────────────────────────────────
+   layer 0  [ A , B ]      A and B depend on nothing, so Rocky can
+              │            run them at the same time
+              ▼
+   layer 1  [ C , D ]      C and D depend only on earlier layers,
+              │            never on each other
+              ▼
+   layer 2  [ E ]          E waits for every layer before it
+```
+
+Nodes inside one layer have no dependency on each other, so an orchestrator can run them in parallel. Each layer waits for the layer before it.
+
+### Reading `column_lineage` correctly
+
+`column_lineage` is empty unless you pass `--column-lineage`. An empty list on its own does not mean the project has no lineage.
+
+- You did not pass `--column-lineage`: nothing was computed, and you can conclude nothing from the empty list.
+- You passed it and `column_lineage_unavailable` is absent: the list is the complete answer, empty included.
+- You passed it and `column_lineage_unavailable` is present: it carries a human-readable reason, and the empty list must **not** be read as "no lineage".
+
+### Examples
+
+Print the graph for the whole project:
+
+```bash
+rocky dag
+```
+
+Include column-level lineage edges:
+
+```bash
+rocky dag --column-lineage
+```
+
+### Related Commands
+
+- [`rocky emit-sql`](#rocky-emit-sql) -- render the SQL for the models this graph orders
+- [`rocky catalog`](#rocky-catalog) -- the same lineage, written to disk as a queryable snapshot
+- [`rocky run --dag`](/reference/commands/core-pipeline/#rocky-run) -- execute every pipeline as one graph
+
+---
+
 ## `rocky emit-sql`
 
 Render the runnable SQL each transformation model would emit, without a warehouse connection and without running anything. The SQL is generated through the same path `rocky run` uses, including declared surrogate-key columns wrapped exactly as they are at materialization.
@@ -479,7 +566,7 @@ emit-sql: 1 model(s) not emitted:
 
 ### Related Commands
 
-- `rocky dag` -- inspect the dependency order `emit-sql` renders in
+- [`rocky dag`](#rocky-dag) -- inspect the dependency order `emit-sql` renders in
 - [`rocky catalog`](#rocky-catalog) -- the same compiled graph, exported as a lineage snapshot rather than runnable SQL
 - [No lock-in](/guides/no-lock-in/) -- the full fallback recipe for stepping away from the engine
 
@@ -767,7 +854,9 @@ The `breaking_findings` field is JSON-only: `--output table` still renders the s
 
 ## `rocky preview`
 
-Run a PR-time preview of model changes: prune-and-copy substrate that re-executes only changed models and their downstream column lineage on a per-PR branch, copying everything else from the base ref. Three subcommands compose into a single review artifact: `preview create` runs the workflow, `preview diff` reports the structural and sampled row-level diff, and `preview cost` reports the cost delta vs. base.
+Preview a change before it merges. Rocky re-executes only the changed models and their downstream column lineage on a per-pull-request branch, and copies everything else from the base ref.
+
+Three subcommands compose into one review artifact. `preview create` runs the workflow, `preview diff` reports the structural and sampled row-level diff, and `preview cost` reports the cost delta against base. A fourth, `preview rows`, is separate: it samples the output rows of a single model.
 
 For the design (why CTAS today and warehouse-native clones tomorrow, how the column-level pruner works, what the sampling window's correctness ceiling is), see the [How Preview Works](/concepts/preview-internals/) concept page. For a step-by-step walkthrough on a feature branch, see the [Preview a PR](/guides/preview-a-pr/) how-to.
 
@@ -775,9 +864,10 @@ For the design (why CTAS today and warehouse-native clones tomorrow, how the col
 rocky preview create --base <ref> [--name <branch_name>]
 rocky preview diff   --name <branch_name> [--base <ref>] [--sample-size <N>]
 rocky preview cost   --name <branch_name> [--base <ref>]
+rocky preview rows   --model <name> [--cte <name>] [--limit <N>]
 ```
 
-All three subcommands accept `--output json|markdown`. The Markdown form is pre-rendered for posting to a PR comment; the JSON form embeds the same Markdown in a top-level `markdown` field for orchestrator use.
+`preview create`, `preview diff`, and `preview cost` accept `--output json|markdown`. The Markdown form is pre-rendered for posting to a PR comment; the JSON form embeds the same Markdown in a top-level `markdown` field for orchestrator use.
 
 ### `rocky preview create`
 
@@ -855,13 +945,36 @@ rocky preview cost --name preview-fix-price --output markdown
 
 The JSON shape (`PreviewCostOutput`) reports per-model `delta_usd`, `branch_duration_ms`, `base_duration_ms`, and bytes scanned, plus an aggregate `summary.delta_usd`, `summary.savings_from_copy_usd`, and `models_skipped_via_copy`. Underlying cost math is identical to [`rocky cost`](/reference/commands/administration/#rocky-cost) (Databricks / Snowflake duration × DBU rate; BigQuery bytes × $/TB; DuckDB zero); fields fall back to `null` when no base `RunRecord` exists or when the adapter does not surface USD.
 
+### `rocky preview rows`
+
+Sample the result rows of one transformation model, or of one CTE inside it. Classified columns are masked inline in the output.
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--model <NAME>` | `string` | **(required)** | Model to preview. |
+| `--cte <NAME>` | `string` | | Preview one named CTE inside the model instead of the model's final output. |
+| `--limit <N>` | `u32` | `100` | Maximum number of rows to return. |
+| `--allow-warehouse` | `bool` | `false` | Permit execution against a warehouse other than DuckDB. That may cost money, so it is opt-in. A local DuckDB project does not need the flag. |
+| `--pipeline <NAME>` | `string` | | Pipeline whose target adapter to run against. Required when the project defines more than one pipeline. |
+| `--models <PATH>` | `PathBuf` | `models` | Models directory. |
+| `--sql-file <PATH>` | `PathBuf` | | Preview an ad-hoc SQL snippet read from this file instead of the model's compiled SQL. This backs the editor's "Preview Selection". Mutually exclusive with `--cte`. |
+
+`--sql-file` still needs `--model`, which names the enclosing model. If that model has any masked column, Rocky refuses the ad-hoc preview rather than risk leaking a pre-mask value.
+
+**Example.** Peek at a model's rows during local development:
+
+```bash
+rocky preview rows --model customer_orders --limit 20
+```
+
 ### Output shapes
 
-Wire contracts for all three subcommands are exported by `rocky export-schemas`:
+Wire contracts for all four subcommands are exported by `rocky export-schemas`:
 
 - `schemas/preview_create.schema.json`
 - `schemas/preview_diff.schema.json`
 - `schemas/preview_cost.schema.json`
+- `schemas/preview_rows.schema.json`
 
 These back the autogenerated Pydantic and TypeScript bindings. See [JSON Output](/reference/json-output/) for the codegen pipeline and version compatibility contract.
 
@@ -871,3 +984,47 @@ These back the autogenerated Pydantic and TypeScript bindings. See [JSON Output]
 - [`rocky branch`](/reference/commands/core-pipeline/#rocky-branch) -- the schema-prefix branches `preview create` registers
 - [`rocky cost`](/reference/commands/administration/#rocky-cost) -- the per-run cost rollup `preview cost` diffs across base and branch
 - [`rocky compare`](/reference/cli/#rocky-compare) -- ad-hoc shadow comparison; `preview diff` extends the same kernel with sampled row-level diffing
+
+---
+
+## `rocky imports`
+
+Maintain the producer-contract baselines declared in `[imports.<name>]`. An import is a vendored snapshot of another team's compiled IR. Your `rocky compile` diffs the baseline you accepted against the snapshot you vendored, and fails when the producer made a breaking change.
+
+```bash
+rocky imports update           # advance every baseline to its snapshot
+rocky imports update --check   # CI guard: report and exit non-zero, write nothing
+```
+
+### `rocky imports update`
+
+Advance the vendored baselines to the current snapshot. This is the explicit "I reviewed the producer's current state and accept it" gesture. It also reports any stale pin. It never rewrites `rocky.toml`.
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--check` | `bool` | `false` | Read-only CI guard. Report what is out of date, exit non-zero, and write nothing. |
+
+### Where the baseline sits
+
+```
+   producer project           consumer project
+   ────────────────           ─────────────────────────────────────
+   rocky publish-ir           [imports.<name>] in rocky.toml
+        │                       baseline = the IR you already accepted
+        │ writes an IR          snapshot = the vendored file
+        ▼ snapshot              pin      = optional recipe hash
+   snapshot file ─ vendored ─►        │
+                                      ▼
+                                rocky compile
+                                  diffs baseline against snapshot,
+                                  fails on a breaking change
+                                      │
+                                      ▼
+                                rocky imports update
+                                  moves the baseline up to the snapshot
+```
+
+### Related Commands
+
+- [`rocky compile`](#rocky-compile) -- the command that reads the baselines and raises the diagnostics
+- [Cross-team contracts](/concepts/cross-team-contracts/) -- the full producer and consumer workflow

@@ -5,18 +5,90 @@ sidebar:
   order: 1
 ---
 
-Rocky provides a single binary with subcommands for the full pipeline lifecycle. Commands are organized into categories:
+Rocky ships one binary. Every subcommand below is a step in the pipeline lifecycle, grouped here by the job it does:
 
 - **Core Pipeline**: `init`, `validate`, `discover`, `plan`, `apply`, `state`, `branch` (single-step alias: `run`)
-- **Modeling**: `compile`, `lineage`, `lineage-diff`, `test`, `ci`, `ci-diff`, `preview`, `emit-sql`, `catalog`
-- **Data**: `seed`, `snapshot`, `docs`
-- **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`
-- **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `import-dbt`, `init-adapter`, `adapter`, `hooks`, `validate-migration`, `test-adapter`
-- **Administration**: `history`, `replay`, `trace`, `metrics`, `optimize`, `compact`, `profile-storage`, `archive`, `compliance`, `retention-status`
+- **Modeling**: `compile`, `lineage`, `lineage-diff`, `test`, `ci`, `ci-diff`, `preview`, `emit-sql`, `catalog`, `publish-ir`, `imports`
+- **Data**: `seed`, `snapshot`, `docs`, `load`, `profile`
+- **AI**: `ai`, `ai-sync`, `ai-explain`, `ai-test`, `ai-contract`
+- **Development**: `playground`, `shell`, `watch`, `fmt`, `list`, `serve`, `lsp`, `mcp`, `import-dbt`, `init-adapter`, `adapter`, `hooks`, `validate-migration`, `test-adapter`, `completions`, `bench`
+- **Administration**: `history`, `replay`, `trace`, `metrics`, `optimize`, `estimate`, `compact`, `profile-storage`, `archive`, `compliance`, `retention-status`, `export-schemas`, `export-openapi`
 - **Governance & Reclamation**: `policy`, `audit`, `review`, `brief`, `backfill`, `gc` — see [Governance & Reclamation Commands](/reference/commands/governance-reclamation/)
 - **Diagnostics**: `doctor`, `compare`
 
 The pages under **Reference → Commands** group these same commands by category.
+
+## Command index
+
+One line each, for finding the right command. Commands with a section on this page link to it.
+
+| Command | What it does |
+|---|---|
+| [`init`](#rocky-init) | Scaffold a new Rocky project. |
+| [`validate`](#rocky-validate) | Check `rocky.toml` for correctness, with no network calls. |
+| [`discover`](#rocky-discover) | List the connectors and tables the source exposes. |
+| [`plan`](#rocky-plan) | Build a reviewable record of what a run would do, without running it. |
+| `apply` | Execute a plan that was already built and reviewed. |
+| [`run`](#rocky-run) | Plan and apply in one step. |
+| `tick` | Evaluate schedule demand once and run what is due. Experimental. |
+| [`state`](#rocky-state) | Show stored watermarks, and flush the schema cache. |
+| `branch` | Create, list, promote, and drop isolated output branches. |
+| `compile` | Resolve dependencies, type-check, and validate contracts. |
+| `lineage` | Trace a column back through every transformation that feeds it. |
+| `lineage-diff` | Report the downstream blast radius of a change, for PR review. |
+| `test` | Run declarative tests and fixture-driven unit tests. |
+| `ci` | Compile plus test, for a CI runner with no warehouse credentials. |
+| `ci-diff` | Compare a branch against a base and report what changed. |
+| `preview` | Build only the changed subtree of a PR into a branch. |
+| [`emit-sql`](#rocky-emit-sql) | Print the warehouse SQL a model compiles to. |
+| [`catalog`](#rocky-catalog) | Write a project-wide column-level lineage snapshot to disk. |
+| `dag` | Show the whole DAG: every pipeline stage and its dependencies. |
+| `publish-ir` | Publish this project's compiled schema for other teams to check against. |
+| `imports` | Maintain the vendored producer snapshots your project checks against. |
+| [`seed`](#rocky-seed) | Load static reference CSVs into the warehouse. |
+| [`snapshot`](#rocky-snapshot) | Run an SCD Type 2 snapshot pipeline. |
+| [`docs`](#rocky-docs) | Generate an HTML catalog of the project. |
+| `load` | Bulk-load CSV, Parquet, or JSONL files from a directory into the warehouse. |
+| `profile` | Report per-column row, null, distinct, min, and max for a model's target table. |
+| `ai` | Generate a model from a plain-English description. |
+| `ai-sync` | Reconcile model intent against the current schema. |
+| `ai-explain` | Explain what a model does in plain English. |
+| `ai-test` | Draft test assertions from a model's intent. |
+| `ai-contract` | Draft a data contract from a model's observed data. |
+| `playground` | Create a sample DuckDB project that needs no credentials. |
+| [`shell`](#rocky-shell) | Open an interactive SQL shell against the target. |
+| [`watch`](#rocky-watch) | Recompile when a file in the models directory changes. |
+| [`fmt`](#rocky-fmt) | Format `.rocky` files: normalize indentation, trim whitespace. |
+| [`list`](#rocky-list) | List pipelines, adapters, models, sources, and dependency relationships. |
+| `serve` | Start the HTTP API server exposing the compiler's semantic graph. |
+| `lsp` | Start the Language Server Protocol server for IDE integration. |
+| `mcp` | Serve Rocky's tools to an AI agent over MCP. |
+| `import-dbt` | Convert a dbt project into Rocky models. |
+| `validate-migration` | Compare a migrated project against its dbt original. |
+| `init-adapter` | Scaffold a new warehouse adapter crate. |
+| `adapter` | Discover and inspect process adapters installed on `$PATH`. |
+| `test-adapter` | Run conformance tests against an adapter. |
+| `hooks` | List and test the configured lifecycle hooks. |
+| `completions` | Print a shell completion script. |
+| `bench` | Run the built-in performance benchmarks. |
+| `history` | Show past runs. |
+| `replay` | Inspect, audit, and re-execute a past run against its record. |
+| `trace` | Show what a run did over time: per-model offsets, duration bars, concurrency lanes. |
+| `cost` | Roll up per-model cost for a recorded run. |
+| `metrics` | Show quality metrics for a model. |
+| `optimize` | Analyze materialization costs and recommend strategy changes. |
+| `estimate` | Estimate a run's cost with warehouse `EXPLAIN`, without running it. |
+| `compact` | Generate `OPTIMIZE` / `VACUUM` SQL for storage compaction. |
+| `profile-storage` | Profile storage and recommend column encodings. |
+| `archive` | Generate an archive plan, then apply it with `archive apply <plan-id>`. |
+| [`compliance`](#rocky-compliance) | Report whether every classified column is masked as policy requires. |
+| [`retention-status`](#rocky-retention-status) | Report each model's declared retention policy. |
+| `export-schemas` | Write a JSON Schema file for every `--output json` payload. |
+| `export-openapi` | Write an OpenAPI 3.1 document for the `rocky serve` API. |
+| [`doctor`](#rocky-doctor) | Diagnose a broken setup. |
+| [`compare`](#rocky-compare) | Compare shadow tables against production tables. |
+| `restore` | Write a review-gated plan to rebuild an artifact that `gc` evicted. |
+| `policy`, `audit`, `review`, `brief`, `backfill`, `gc` | See [Governance & Reclamation](/reference/commands/governance-reclamation/). |
 
 ## Global Flags
 
@@ -378,7 +450,7 @@ playground                replication      default              default         
 
 ### `rocky seed`
 
-Load static reference data from CSV files into the target warehouse. Rocky's equivalent of dbt's `dbt seed`.
+Load static reference data from CSV files into the target warehouse.
 
 ```bash
 rocky seed                           # Load all seeds from seeds/
@@ -832,3 +904,206 @@ rocky retention-status [--model NAME] [--drift]
 - Compiles the project, then emits one `ModelRetentionStatus` per model with `configured_days`, `warehouse_days` (always `None` in v1), and `in_sync`.
 - Models without a `retention` sidecar value report `configured_days = null` and `in_sync = true`.
 - JSON output is [`RetentionStatusOutput`](/reference/json-output/).
+
+---
+
+### `rocky load`
+
+Bulk-load data files from a directory into the warehouse. Rocky reads CSV, Parquet, and JSONL, and infers the format from the file extension unless you pin it.
+
+```bash
+rocky load                              # Load from the pipeline's configured directory
+rocky load --source-dir data/dropbox/   # Load from a specific directory
+rocky load --format parquet --truncate  # Replace the target contents
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--source-dir <PATH>` | (from pipeline config) | Directory holding the data files. Overrides the pipeline's configured location. |
+| `--format <FORMAT>` | auto-detect | `csv`, `parquet`, or `jsonl`. Detected from the file extension when unset. |
+| `--target <NAME>` | derived from file name | Target table name. |
+| `--pipeline <NAME>` | | Pipeline name. Required when more than one pipeline is defined. |
+| `--truncate` | `false` | Empty the target table before loading. |
+
+A `load` pipeline re-ingests every file it finds on each run rather than tracking what it already read. That is why a `load` pipeline cannot join the [`[pipeline.NAME.schedule]`](/reference/configuration/#pipelinenameschedule) graph: scheduling one would duplicate data. `rocky validate` rejects that config with `V044`.
+
+---
+
+### `rocky profile`
+
+Report what is actually in a model's target table, column by column: row count, null count, distinct count, minimum, and maximum. Use it before you write a contract or a test, so the assertion matches the data. DuckDB only.
+
+```bash
+rocky profile fct_orders                  # Profile every column
+rocky profile fct_orders --column amount  # Profile one column
+```
+
+**Arguments and flags:**
+
+| Argument / flag | Default | Description |
+|------|---------|-------------|
+| `model` | required | Model whose target table to profile. |
+| `--column <NAME>` | (every column) | Profile only this column. |
+| `--models <PATH>` | `models` | Models directory. Rocky compiles it to obtain the model's inferred schema. |
+
+---
+
+### `rocky ai-contract`
+
+Draft a data contract from a model's observed data, rather than writing the column list by hand. Rocky profiles the target table, sends the shape to Anthropic, and prints the drafted contract. DuckDB only.
+
+```bash
+rocky ai-contract fct_orders           # Print the draft to stdout
+rocky ai-contract fct_orders --save    # Write <model>.contract.toml
+```
+
+**Arguments and flags:**
+
+| Argument / flag | Default | Description |
+|------|---------|-------------|
+| `model` | required | Model whose target table to profile and draft a contract for. |
+| `--save` | `false` | Write the draft to `<model>.contract.toml` in the models directory instead of printing it. |
+| `--with-data` | `false` | Include observed cell **values** (min/max plus low-cardinality domain samples) in the prompt. Off by default: without it, only the schema and aggregate statistics — row, null, and distinct counts — leave the machine. Turn it on when sending sample values is acceptable for that table. |
+| `--models <PATH>` | `models` | Models directory, and the destination when `--save` is passed. |
+
+Rocky reads the API key from the `ANTHROPIC_API_KEY` environment variable, never from `rocky.toml`. See [`[ai]`](/reference/configuration/#ai) for the token budget.
+
+---
+
+### `rocky publish-ir`
+
+Publish this project's compiled schema so another team can check their models against it. Rocky compiles the project and writes its typed `ProjectIr` as JSON. The consumer vendors that file and points an [`[imports.<name>]`](/reference/configuration/#importsname) block at it; their `rocky compile` then fails (`E030`) when you drop a column they still read.
+
+```bash
+rocky publish-ir --with-seed --out project-ir.json
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--models <PATH>` | `models` | Models directory. |
+| `--contracts <PATH>` | | Contracts directory. |
+| `--out <PATH>` | `project-ir.json` | Where to write the snapshot JSON. |
+| `--with-seed` | `false` | Run `data/seed.sql` against an in-memory DuckDB before compiling, so leaf models resolve to concrete column types in the snapshot. |
+
+Pass `--with-seed` for a self-contained DuckDB producer. Without concrete types, the snapshot gives the consumer's contract nothing to check against.
+
+---
+
+### `rocky imports`
+
+Maintain the vendored producer snapshots your project checks against. Nothing advances a baseline on its own: advancing it is your explicit statement that you reviewed the producer's change and accept it.
+
+```bash
+rocky imports update           # Advance every baseline to its current snapshot
+rocky imports update --check   # CI guard: report what is behind, write nothing
+```
+
+**Subcommand `update` flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--check` | `false` | Read-only. Report what is out of date and exit non-zero without writing anything. |
+
+`update` reports a stale `pin` but never rewrites `rocky.toml`. See [Cross-team contracts](/concepts/cross-team-contracts/) and [`[imports.<name>]`](/reference/configuration/#importsname).
+
+---
+
+### `rocky estimate`
+
+Estimate what a run would cost before you run it. Rocky asks the warehouse to `EXPLAIN` each model's query and prices the result, so nothing materializes.
+
+```bash
+rocky estimate                    # Estimate every model
+rocky estimate --model fct_orders # Estimate one model
+rocky estimate --verbose          # Show the full EXPLAIN plan and pricing rates
+```
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--models <PATH>` | `models` | Models directory. |
+| `--model <NAME>` | (all) | Estimate a single model. |
+| `--pipeline <NAME>` | | Pipeline name. Required when more than one pipeline is defined. |
+| `--verbose` | `false` | Print extra context per model: the full `EXPLAIN` plan, the pricing rates used, and any models skipped before `EXPLAIN`. |
+
+Pricing comes from [`[cost]`](/reference/configuration/#cost). For a recommendation rather than an estimate, use `rocky optimize`.
+
+---
+
+### `rocky bench`
+
+Run Rocky's built-in performance benchmarks, and compare a run against a saved baseline. Useful when a change might have slowed compilation down.
+
+```bash
+rocky bench                              # Run every group
+rocky bench compile --models 500         # Compile benchmark at 500 models
+rocky bench --save baseline.json         # Record a baseline
+rocky bench --compare baseline.json      # Compare against it
+```
+
+**Arguments and flags:**
+
+| Argument / flag | Default | Description |
+|------|---------|-------------|
+| `group` | `all` | Benchmark group: `compile`, `dag`, `sql_gen`, `startup`, or `all`. |
+| `--models <N>` | | Number of models to generate for the compile benchmarks. |
+| `--format <FORMAT>` | `table` | `json` for machine-readable output. |
+| `--save <PATH>` | | Write the results to a JSON baseline file. |
+| `--compare <PATH>` | | Compare the results against a saved baseline file. |
+
+---
+
+### `rocky completions`
+
+Print a shell completion script. Write it wherever your shell reads completions from.
+
+```bash
+rocky completions zsh  > ~/.zsh/completions/_rocky
+rocky completions bash > /etc/bash_completion.d/rocky
+rocky completions fish > ~/.config/fish/completions/rocky.fish
+```
+
+**Arguments:**
+
+| Argument | Description |
+|------|-------------|
+| `shell` | Target shell: `bash`, `elvish`, `fish`, `powershell`, or `zsh`. |
+
+---
+
+### `rocky export-schemas`
+
+Write a JSON Schema file for every `--output json` payload the CLI emits. The Python SDK and the VS Code extension generate their bindings from these files, so one Rust definition drives all three languages.
+
+```bash
+rocky export-schemas schemas/
+```
+
+**Arguments:**
+
+| Argument | Default | Description |
+|------|---------|-------------|
+| `output_dir` | `schemas` | Directory to write the `.schema.json` files into. |
+
+---
+
+### `rocky export-openapi`
+
+Write an OpenAPI 3.1 document describing the `rocky serve` HTTP API. Rocky assembles `components/schemas` from the same registry `export-schemas` uses, and builds `paths` from the `/api/v1` route table. It validates the result against the OpenAPI 3.1 meta-schema before writing it.
+
+```bash
+rocky export-openapi docs/public/openapi.json
+```
+
+**Arguments:**
+
+| Argument | Default | Description |
+|------|---------|-------------|
+| `output_path` | `docs/public/openapi.json` | Where to write the OpenAPI document (`.json`). |
+
+See [Embedding Rocky](/guides/embedding/) for the API itself.

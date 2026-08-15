@@ -7,7 +7,7 @@ sidebar:
 
 import pocCounts from "../../../data/poc-counts.json";
 
-The Rocky playground creates a self-contained sample project that runs entirely on DuckDB. No warehouse credentials, no Fivetran account, no external services. It is the quickest way to try Rocky's compiler, type system, lineage engine, and AI features.
+The Rocky playground creates a self-contained sample project that runs entirely on DuckDB. It needs no warehouse credentials, no Fivetran account, and no external services. It is the quickest way to try Rocky's compiler, type system, lineage engine, and AI features.
 
 ## 1. Create the Playground
 
@@ -71,9 +71,9 @@ auto_create_schemas = true
 concurrency = 4
 ```
 
-This is a `transformation` pipeline: the unnamed `[adapter]` block auto-wraps as the default adapter, and `models = "models/**"` builds the model DAG from the `models/` directory.
+This is a `transformation` pipeline. The unnamed `[adapter]` block auto-wraps as the default adapter, and `models = "models/**"` builds the model DAG from the `models/` directory.
 
-The same `playground.duckdb` file backs the whole run. `rocky test` ignores `path` and runs models against an in-memory database, auto-loading `data/seed.sql` on the fly. `rocky run` materializes models into the file -- which `rocky playground` already seeded at creation time -- so the playground works end-to-end with no manual seeding step. (Re-seed the file at any time with `duckdb playground.duckdb < data/seed.sql`.)
+The same `playground.duckdb` file backs the whole run. `rocky test` ignores `path`: it runs models against an in-memory database and loads `data/seed.sql` on the fly. `rocky run` materializes models into the file, which `rocky playground` already seeded when it created the project. So the playground works end to end with no manual seeding step. Re-seed the file at any time with `duckdb playground.duckdb < data/seed.sql`.
 
 ### raw_orders.sql + raw_orders.toml
 
@@ -107,7 +107,7 @@ schema = "main"
 
 ### customer_orders.rocky
 
-This model uses the Rocky DSL -- a concise syntax for common aggregation patterns:
+This model uses the Rocky DSL, a compact syntax for common aggregation patterns. The playground includes both kinds of model: two are plain SQL, and this one is DSL.
 
 ```
 -- Customer orders aggregation (Rocky DSL)
@@ -169,14 +169,14 @@ protected = ["customer_id"]
 ```
 
 The contract declares two rules:
-- **required**: These columns must exist with the specified types. The compiler fails if they are missing or have the wrong type.
-- **protected**: These columns cannot be removed in future changes. The compiler fails compilation (error `E013`) if a protected column disappears from the model's output.
+- **required**: these columns must exist with the declared types. The compiler fails if one is missing or has the wrong type.
+- **protected**: these columns cannot be removed by a later change. The compiler fails with error `E013` if a protected column disappears from the model's output.
 
-The columns are marked `nullable = true` (the TOML comment above explains why). A strict-contract walkthrough that pins types and nullability lives in the dedicated POCs.
+The columns are marked `nullable = true`, and the TOML comment above explains why. A strict-contract walkthrough that pins types and nullability lives in the dedicated POCs.
 
 ## 3. Compile the Models
 
-Run the compiler to type-check all models, resolve dependencies, and validate contracts. Pass `--contracts contracts` to check the model output against the contract files (plain `rocky compile` skips contract validation):
+Run the compiler to type-check all models, resolve dependencies, and validate contracts. Pass `--contracts contracts` to check the model output against the contract files. Plain `rocky compile` skips contract validation.
 
 ```bash
 rocky compile --contracts contracts
@@ -192,14 +192,14 @@ Expected output:
   Compiled: 3 models, 0 errors, 0 warnings
 ```
 
-The compiler performs several checks:
-- **Dependency resolution**: Builds a DAG from model configs. `customer_orders` depends on `raw_orders`; `revenue_summary` depends on `customer_orders`.
-- **Type inference**: Resolves column types through the chain. `amount` in `raw_orders` propagates through `sum(amount)` in `customer_orders` to `total_revenue / order_count` in `revenue_summary`.
-- **Contract validation**: Checks that `revenue_summary` outputs `customer_id` (Int64), `total_revenue` (Decimal), and `order_count` (Int64) as required by the contract.
+The compiler performs three checks:
+- **Dependency resolution**: it builds a DAG from the model configs. `customer_orders` depends on `raw_orders`, and `revenue_summary` depends on `customer_orders`.
+- **Type inference**: it resolves column types through the chain. `amount` in `raw_orders` flows through `sum(amount)` in `customer_orders` into `total_revenue / order_count` in `revenue_summary`.
+- **Contract validation**: it checks that `revenue_summary` outputs `customer_id` (Int64), `total_revenue` (Decimal), and `order_count` (Int64), as the contract requires.
 
 ### Try introducing an error
 
-Edit `revenue_summary.sql` and drop a required column -- remove the `order_count` line from the SELECT:
+Edit `revenue_summary.sql` and drop a required column. Remove the `order_count` line from the SELECT:
 
 ```sql
 SELECT
@@ -227,7 +227,7 @@ Revert the change before continuing.
 
 ## 4. Run the Tests
 
-Rocky can execute models locally using DuckDB without any warehouse connection:
+Rocky executes models locally on DuckDB, with no warehouse connection:
 
 ```bash
 rocky test
@@ -243,11 +243,11 @@ Testing 3 models...
   Result: 3 passed, 0 failed
 ```
 
-The test runner:
-1. Compiles all models
-2. Executes each model's SQL against DuckDB in dependency order
-3. Validates contract assertions against the actual output (when run with `--contracts contracts`)
-4. Reports pass/fail for each model
+The test runner does four things:
+1. Compiles all models.
+2. Executes each model's SQL against DuckDB, in dependency order.
+3. Validates contract assertions against the actual output, when you pass `--contracts contracts`.
+4. Reports pass or fail for each model.
 
 ### Test a single model
 
@@ -276,7 +276,7 @@ Columns:
   first_order <- customer_orders.first_order (direct)
 ```
 
-`avg_order_value` shows `(no lineage)`: it is a computed expression (`total_revenue / order_count`), and the column tracer only follows columns that pass through directly or via an aggregation.
+`avg_order_value` shows `(no lineage)` because it is a computed expression, `total_revenue / order_count`. The column tracer follows only columns that pass through directly or through an aggregation.
 
 ### Trace a single column through the entire chain
 
@@ -331,7 +331,7 @@ Rocky sends your intent to Claude, receives generated code, and compiles it to v
 rocky ai-explain --all --save
 ```
 
-This reads each model's SQL, generates a plain-English description, and saves it to the model's TOML config as an `intent` field. The intent is used later by `ai-sync` to automatically update models when upstream schemas change.
+This reads each model's SQL, generates a plain-English description, and saves it to the model's TOML config as an `intent` field. `ai-sync` later reads that intent to update models when upstream schemas change.
 
 ### Generate tests from intent
 
@@ -345,7 +345,7 @@ See the [AI Features guide](/guides/ai-features/) for a complete walkthrough.
 
 ## 7. Run CI Locally
 
-The `ci` command combines compilation and testing into a single pass with an exit code suitable for CI pipelines:
+The `ci` command runs compilation and testing in one pass, and returns an exit code your CI job can branch on:
 
 ```bash
 rocky ci
@@ -360,11 +360,11 @@ Rocky CI Pipeline
   Exit code: 0
 ```
 
-Exit code 0 means all checks passed. A non-zero exit code fails the CI job.
+Exit code 0 means every check passed. A non-zero exit code fails the CI job.
 
 ## 8. Explore the POC Catalog
 
-Beyond this walkthrough, the playground ships {pocCounts.total} self-contained POCs across {pocCounts.categoryCount} categories, each demonstrating one Rocky capability end-to-end. Browse them, grouped by category with links to every one, in the [Examples & POC catalog](/getting-started/examples/). Or run one directly:
+Beyond this walkthrough, the playground ships {pocCounts.total} self-contained POCs across {pocCounts.categoryCount} categories. Each one demonstrates a single Rocky capability end to end. Browse them, grouped by category with a link to every one, in the [Examples & POC catalog](/getting-started/examples/). Or run one directly:
 
 ```bash
 cd examples/playground
@@ -375,19 +375,19 @@ Most run on local DuckDB with no credentials. The exceptions: AI (`ANTHROPIC_API
 
 ## 9. Benchmarks
 
-The playground includes a benchmark suite comparing Rocky against dbt-core, dbt-fusion, and PySpark:
+The playground ships a benchmark suite. The `bench-rocky` target measures Rocky's compile time and peak memory:
 
 ```bash
 cd examples/playground/benchmarks
-make bench
+make bench-rocky
 ```
 
-Headline (10k models): Rocky compiles in **1.00s**, **34x faster** than dbt-core and **38x faster** than dbt-fusion, with **4-7x less memory**. See [Benchmarks](/getting-started/benchmarks/) for the methodology and the 50k extrapolation.
+See [Benchmarks](/getting-started/benchmarks/) for the methodology and the numbers.
 
 ## Next Steps
 
-- [Migrating from dbt](/guides/migrate-from-dbt/) -- import an existing dbt project
-- [IDE Setup](/guides/ide-setup/) -- install the VS Code extension for hover types, go-to-definition, and inline lineage
-- [CI/CD Integration](/guides/ci-cd/) -- add Rocky to your GitHub Actions or GitLab CI pipeline
-- [AI Features](/guides/ai-features/) -- generate models, sync schema changes, and create tests with AI
-- [Data Governance](/guides/governance/) -- configure contracts, permissions, and quality checks
+- [Migrating from dbt](/guides/migrate-from-dbt/) — import an existing dbt project
+- [IDE Setup](/guides/ide-setup/) — install the VS Code extension for hover types, go-to-definition, and inline lineage
+- [CI/CD Integration](/guides/ci-cd/) — add Rocky to your GitHub Actions or GitLab CI pipeline
+- [AI Features](/guides/ai-features/) — generate models, sync schema changes, and create tests with AI
+- [Data Governance](/guides/governance/) — configure contracts, permissions, and quality checks

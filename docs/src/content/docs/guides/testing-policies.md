@@ -1,17 +1,24 @@
 ---
 title: Testing Policies
-description: Pin your agent-policy rules with scenario assertions so a policy edit cannot silently open a hole, and gate them in CI with rocky policy test.
+description: Pin your agent-policy rules with scenario assertions, so a policy edit cannot silently open a hole, and gate them in CI with rocky policy test.
 sidebar:
   order: 7.5
 ---
 
-A `[policy]` block is code. It decides whether an agent may apply a schema change, promote a branch, or touch a contracted model, and like any code that guards production it drifts as you edit it. A rule reordered, a scope widened, a `deny` softened to `require_review` to unblock one change: each is a one-line edit whose blast radius is the whole policy. The failure mode is quiet. Nothing breaks at edit time; the hole only shows up the day an agent walks through it.
+A `[policy]` block is code. It decides whether an agent may apply a schema change, promote a branch, or touch a contracted model. Like any code that guards production, it drifts as you edit it.
 
-Contracts get tests for exactly this reason, and policies get the same treatment. You write scenario assertions next to the rules they cover, and `rocky policy test` runs them through the real evaluator and fails the build if any decision changed. A policy edit that would open a hole stops being a silent diff and becomes a red CI check.
+A rule reordered. A scope widened. A `deny` softened to `require_review` to unblock one change. Each is a one-line edit whose blast radius is the whole policy. The failure mode is quiet: nothing breaks at edit time, and the hole only shows up the day an agent walks through it.
+
+Contracts get tests for exactly this reason, and policies get the same treatment. You write scenario assertions next to the rules they cover. `rocky policy test` runs them through the real evaluator and fails the build if any decision changed. A policy edit that would open a hole then becomes a red CI check rather than a silent diff.
 
 ## Writing scenarios
 
-Scenarios live in the same `rocky.toml` as the policy, under `[[policy.tests]]`. Each one names a principal, a capability, a target, and the effect the evaluator must resolve to:
+Scenarios live in the same `rocky.toml` as the policy, under `[[policy.tests]]`. Each one names four things:
+
+- a **principal**, meaning who is acting: a person, CI, or an AI agent;
+- a **capability**, meaning what they want to do;
+- a **target**, meaning what they want to do it to;
+- the **effect** the evaluator must resolve to: `allow`, `require_review`, or `deny`.
 
 ```toml
 [policy]
@@ -56,15 +63,38 @@ reachable_downstreams = 42
 expect                = "require_review"
 ```
 
-A scenario describes the target model directly rather than pointing at a model in your project. The fields — `model` (the name, matched against a rule's `scope.models` globs), `tags`, `classifications`, `contracted`, `layer`, `downstreams`, and `reachable_downstreams` — are the exact attributes the evaluator reads at a real enforcement seam. The runner assembles them into the same value the policy engine sees when it gates a live `apply`, then compares the resolved effect against `expect`.
+A scenario describes the target model directly, rather than pointing at a model in your project. Its fields are the exact attributes the evaluator reads at a real enforcement seam: `model` (the name, matched against a rule's `scope.models` globs), `tags`, `classifications`, `contracted`, `layer`, `downstreams`, and `reachable_downstreams`.
 
-One convenience mirrors production: a live seam reads a model's layer from its `layer` tag, so if you set `tags = { layer = "gold" }` and leave `layer` unset, the runner fills `layer` from that tag. A rule scoped with `layer = "gold"` then matches the scenario just as it would the real model. Set `layer` explicitly only when you want to model a value that differs from the tag.
+One evaluator serves both the scenario and the live change:
 
-Declaring the attributes, rather than resolving them from a live model, is deliberate. A scenario pins the behaviour of the *policy*, not the current state of your graph. It keeps meaning the same whether or not the project compiles today, and it lets you assert cases your project does not happen to contain right now: a model with forty downstream consumers, a table classified `pii`, a change to something behind a contract.
+```
+              scenario                    live change
+        [[policy.tests]] block       rocky apply, promote, or
+        declares the attributes      an MCP write tool
+                  │                            │
+                  └─────────────┬──────────────┘
+                                ▼
+                    ┌───────────────────────┐
+                    │   policy evaluator    │  one code path
+                    └───────────┬───────────┘
+                                ▼
+              effect: allow | require_review | deny
+                  │                            │
+                  ▼                            ▼
+        compare with `expect`          gate the live change
+        PASS, or FAIL and a
+        non-zero exit code
+```
+
+One convenience mirrors production. A live seam reads a model's layer from its `layer` tag. So if you set `tags = { layer = "gold" }` and leave `layer` unset, the runner fills `layer` from that tag. A rule scoped with `layer = "gold"` then matches the scenario just as it would match the real model. Set `layer` explicitly only when you want to model a value that differs from the tag.
+
+Declaring the attributes, rather than resolving them from a live model, is deliberate. A scenario pins the behaviour of the *policy*, not the current state of your graph. It keeps its meaning whether or not the project compiles today. And it lets you assert cases your project does not happen to contain right now: a model with forty downstream consumers, a table classified `pii`, a change to something behind a contract.
 
 ### The blast-radius ceiling
 
-The last scenario above is the one worth dwelling on. A rule can carry a `max_downstreams` ceiling, and the ceiling fails closed: an additive change that would ripple past the limit is degraded from `allow` to `require_review`, and so is a change whose blast radius cannot be computed at all. Leave `reachable_downstreams` out of a scenario to model that uncomputable case and assert that the policy still stops for review:
+The last scenario above is the one worth dwelling on. A rule can carry a `max_downstreams` ceiling, and that ceiling fails closed. An additive change that would ripple past the limit is degraded from `allow` to `require_review`. So is a change whose blast radius cannot be computed at all.
+
+Leave `reachable_downstreams` out of a scenario to model that uncomputable case, and assert that the policy still stops for review:
 
 ```toml
 [[policy.tests]]
@@ -75,15 +105,15 @@ tags   = { layer = "bronze" }
 expect = "require_review"
 ```
 
-This is the assertion that earns its keep. A ceiling that quietly stops firing is precisely the kind of regression a green unit-test suite can miss and a live incident cannot, so it is worth a scenario of its own.
+A ceiling that quietly stops firing is exactly the kind of regression a green unit-test suite can miss and a live incident cannot. That is why it is worth a scenario of its own.
 
-## Running the runner
+## Run the scenarios
 
 ```bash
 rocky policy test
 ```
 
-The command loads the `[policy]` block and its scenarios, evaluates each one, and prints a pass/fail line per scenario. It exits non-zero the moment any resolved effect differs from what the scenario expected, which is what makes it a CI gate:
+The command loads the `[policy]` block and its scenarios, evaluates each one, and prints one pass/fail line per scenario. It exits non-zero the moment any resolved effect differs from what the scenario expected. That is what makes it a CI gate:
 
 ```
 policy test: 3 scenario(s)
@@ -97,7 +127,7 @@ policy test: 3 scenario(s)
   2 passed, 1 failed
 ```
 
-The failure block names the rule that decided the actual effect and quotes the evaluator's own reasoning, so a red scenario points straight at the rule that changed. Add `--output json` for the machine-readable form when a workflow needs to parse the results rather than read them.
+The failure block names the rule that decided the actual effect, and quotes the evaluator's own reasoning. A red scenario therefore points straight at the rule that changed. Add `--output json` for the machine-readable form when a workflow parses the results rather than reads them.
 
 Wire it into CI next to your other gates:
 
@@ -106,10 +136,12 @@ Wire it into CI next to your other gates:
   run: rocky policy test
 ```
 
-`rocky policy test` treats an empty run as a failure, not a pass. A missing `rocky.toml`, a config with no `[policy]` block, or a `[policy]` block with zero scenarios each exits non-zero. A guardrail that asserts nothing is worse than no guardrail, because it reads as green.
+`rocky policy test` treats an empty run as a failure, not a pass. Three cases each exit non-zero: a missing `rocky.toml`, a config with no `[policy]` block, and a `[policy]` block with zero scenarios. A guardrail that asserts nothing reads as green, which is worse than no guardrail.
 
 ## What this does and does not protect
 
-Policy tests verify that the evaluator resolves the effects you expect. They are a correctness check on your rules, the same way a contract test is a correctness check on a schema. They do not enforce anything themselves, and they cannot defend against an operator who edits the policy and the tests together to wave a change through. The threat model here is an over-eager agent and honest drift in a policy that grew rule by rule, not a hostile hand on the local checkout. Within that model, a scenario you cannot delete without a reviewer noticing is a strong guarantee.
+Policy tests verify that the evaluator resolves the effects you expect. They are a correctness check on your rules, the same way a contract test is a correctness check on a schema.
 
-For how the rules themselves are written and evaluated, and the enforcement seams the same evaluator gates, see [Operating Rocky with Agents](/concepts/operating-rocky-with-agents/).
+They enforce nothing themselves. They also cannot defend against an operator who edits the policy and the tests together to wave a change through. The threat model here is an over-eager agent, plus honest drift in a policy that grew rule by rule. It is not a hostile hand on the local checkout. Within that model, a scenario you cannot delete without a reviewer noticing is a strong guarantee.
+
+For how the rules themselves are written and evaluated, and for the enforcement seams the same evaluator gates, see [Operating Rocky with Agents](/concepts/operating-rocky-with-agents/).

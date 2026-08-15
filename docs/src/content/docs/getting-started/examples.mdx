@@ -7,9 +7,9 @@ sidebar:
 
 import pocCounts from "../../../data/poc-counts.json";
 
-The playground ships **{pocCounts.total} self-contained POCs** across {pocCounts.categoryCount} categories. Each is a small project with its own `rocky.toml`, `models/`, and a single `run.sh` that takes it end-to-end. Most run on local DuckDB with no credentials, so you can read the code and run it in one step.
+The playground ships **{pocCounts.total} self-contained POCs** across {pocCounts.categoryCount} categories. A POC here is a small proof-of-concept project that demonstrates one Rocky capability end to end. Each has its own `rocky.toml`, a `models/` directory, and a single `run.sh` that runs the whole thing. Most run on local DuckDB with no credentials, so you can read the code and run it in one step.
 
-These complement the [Quickstart](/getting-started/quickstart/) and [Playground](/guides/playground/) walkthroughs: those teach the workflow, and the POCs show one capability each, in isolation.
+The [Quickstart](/getting-started/quickstart/) and [Playground](/guides/playground/) walkthroughs teach the workflow. The POCs show one capability each, in isolation.
 
 ## Run one
 
@@ -39,7 +39,7 @@ The demos from the [README](https://github.com/rocky-data/rocky#readme), each a 
 
 ## Browse by category
 
-Each link opens the category folder on GitHub, where every POC has a README that states what it shows, the exact command, and the expected output.
+Each link opens the category folder on GitHub. Every POC in it has a README that states what it shows, the exact command, and the expected output. The line under each heading says what the category covers; the folder holds the full list.
 
 ### [Foundations](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations) ({pocCounts.perCategory["00-foundations"]} POCs)
 
@@ -55,11 +55,11 @@ Incremental, merge, partition checksums, drift recovery, ephemeral CTEs, delete+
 
 ### [AI](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/03-ai) ({pocCounts.perCategory["03-ai"]} POCs)
 
-Model generation, intent extraction, schema-change sync, test generation, schema-grounded validation, and MCP data-grounding. Most need an `ANTHROPIC_API_KEY`.
+Model generation, intent extraction, schema-change sync, test generation, schema-grounded validation, MCP data-grounding, and agent-policy tests. Most need an `ANTHROPIC_API_KEY`.
 
 ### [Governance](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/04-governance) ({pocCounts.perCategory["04-governance"]} POCs)
 
-Unity Catalog grants, schema patterns, workspace isolation, tagging, classification and masking, retention, and cross-team contracts. Some need a Databricks workspace; classification/masking and retention run on DuckDB.
+Unity Catalog grants, schema patterns, workspace isolation, tagging, classification and masking, and retention. Plus cross-team contracts, auto-created target schemas, tag inheritance from a config group, recipe provenance, and the agent policy plane. Some need a Databricks workspace. Classification and masking, retention, auto-created schemas, tag inheritance, recipe provenance, and the agent policy plane all run on DuckDB.
 
 ### [Orchestration](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/05-orchestration) ({pocCounts.perCategory["05-orchestration"]} POCs)
 
@@ -75,4 +75,4 @@ Snowflake dynamic tables, Databricks materialized views, Fivetran discovery, a c
 
 ## The full catalog
 
-The complete, always-current list with a one-line description per POC lives in [`examples/playground/README.md`](https://github.com/rocky-data/rocky/tree/main/examples/playground#readme). It also documents the [benchmark suite](https://github.com/rocky-data/rocky/tree/main/examples/playground/benchmarks) comparing Rocky against dbt Core, dbt Fusion, and PySpark.
+The complete, always-current list, with a one-line description per POC, lives in [`examples/playground/README.md`](https://github.com/rocky-data/rocky/tree/main/examples/playground#readme). It also documents the [benchmark suite](https://github.com/rocky-data/rocky/tree/main/examples/playground/benchmarks).

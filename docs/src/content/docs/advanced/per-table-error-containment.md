@@ -1,23 +1,56 @@
 ---
 title: Per-table error containment
-description: How rocky run isolates failures at the table boundary and how to consume the failure_kind discriminator
+description: How rocky run keeps one failed table from killing the whole run, and how to branch on failure_kind
 sidebar:
   order: 4
 ---
 
-`rocky run` (and the canonical `rocky plan` + `rocky apply` flow it backs) treats each table as an isolated unit of work. One table failing does not crash the run. The other tables in the same invocation keep going, the run finishes with a partial-success exit code, and the per-table failures are enumerated on `RunOutput.errors[*]` with a typed `failure_kind` discriminator so orchestrators can branch on the kind of failure without parsing the free-form `error` string.
+`rocky run` treats each table as its own unit of work. The canonical `rocky plan` plus `rocky apply` flow behind it does the same. One table failing does not crash the run.
 
-## The containment property
+The other tables in that invocation keep going. The run then finishes with a partial-success exit code, and lists every per-table failure on `RunOutput.errors[*]`. Each entry carries a typed `failure_kind` discriminator, so an orchestrator can branch on the kind of failure instead of parsing the free-form `error` string.
 
-The per-table loop in `commands/run.rs` dispatches every table through `process_table` inside a `tokio::JoinSet`. The match arm that handles a task's `Result` has three branches:
+## How the run loop contains a failure
 
-- **Success** -- the materialization is appended to `RunOutput.materializations` and progress is checkpointed.
-- **Adapter error** (`Ok((idx, Err(e)))`) -- the error is classified into a [`FailureKind`](#failure_kind-taxonomy) **before** stringification (so the typed connector variant is preserved), then a `TableError { asset_key, error, failure_kind }` is pushed onto `table_errors`. The loop continues with the remaining tables.
-- **Task panic** (`Err(JoinError)`) -- the panic message is captured into a `TableError` with `failure_kind = "unknown"`. The loop continues.
+The per-table loop in `commands/run.rs` dispatches every table through `process_table` inside a `tokio::JoinSet`. Each finished task lands on one of three branches:
 
-Two paths abort the run early, both calling `JoinSet::abort_all()`: `[execution] fail_fast = true` (config, not a CLI flag — default `false`) aborts on the first error, and the adaptive error-rate circuit `[execution] error_rate_abort_pct` (default `50`, set to `0` to disable) aborts once more than that percentage of completed tables have failed, checked after at least 4 tables complete. Otherwise the run finishes with a non-zero exit code so callers can distinguish partial success from clean success, while the JSON output stays well-formed.
+```
+                 one table  ──►  process_table  ──►  task Result
+                                                          │
+       ┌──────────────────────────┬────────────────────────┘
+       ▼                          ▼                        ▼
+   success                 Ok((idx, Err(e)))        Err(JoinError)
+   the write landed        the adapter failed       the task panicked
+       │                          │                        │
+       ▼                          ▼                        ▼
+   append to               classify into a          capture the panic
+   materializations        FailureKind FIRST,       message as a
+   + checkpoint            then push a              TableError with
+   progress                TableError               failure_kind
+                                  │                 "unknown"
+                                  │                        │
+       └──────────────────────────┴────────────────────────┘
+                                  │
+                                  ▼
+                        keep going with the next table
+                                  │
+              ┌───────────────────┴───────────────────┐
+              │ unless an abort path fires:           │
+              │   fail_fast = true       (first error)│
+              │   error_rate_abort_pct   (too many)   │
+              │ both call JoinSet::abort_all()        │
+              └───────────────────────────────────────┘
+```
 
-This is true for every adapter (Databricks, Snowflake, BigQuery, DuckDB) -- the loop is adapter-agnostic and catches `anyhow::Error` from any source, including connector errors, schema-drift failures, governance reconciliation errors, and worker-task panics.
+Classifying the adapter error into a [`FailureKind`](#failure_kind-taxonomy) *before* stringifying it is what preserves the typed connector variant. The `TableError` pushed onto `table_errors` holds `asset_key`, `error`, and `failure_kind`.
+
+Two config keys abort the run early. Both live under `[execution]`, and neither is a CLI flag.
+
+- `fail_fast = true` (default `false`) aborts on the first error.
+- `error_rate_abort_pct` (default `50`, `0` disables it) aborts once more than that percentage of completed tables have failed. Rocky checks the rate only after at least 4 tables complete.
+
+Without an abort, the run finishes and exits non-zero. That lets a caller tell partial success from clean success, while the JSON output stays well-formed.
+
+The loop is agnostic to the [adapter](/reference/glossary/#adapter), the plugin that runs Rocky's SQL on one particular warehouse. So this holds for Databricks, Snowflake, BigQuery, and DuckDB alike. The loop catches `anyhow::Error` from any source: connector errors, schema-drift failures, governance reconciliation errors, and worker-task panics.
 
 ### What `errors[*]` looks like
 
@@ -45,7 +78,7 @@ This is true for every adapter (Databricks, Snowflake, BigQuery, DuckDB) -- the 
 
 ## `failure_kind` taxonomy
 
-`failure_kind` is a coarse classifier over the failure surface. Most variants partition the connector error spaces for Databricks and Snowflake; `compile-error` covers a model that fails to compile mid-run (not a connector failure at all); and `unknown` is the fallback for failures that reach the output layer type-erased.
+`failure_kind` is a coarse classifier over the failure surface. Most variants partition the connector error spaces for Databricks and Snowflake. `compile-error` is the exception: it covers a model that fails to compile mid-run, which is not a connector failure at all. `unknown` is the fallback for a failure that reaches the output layer type-erased.
 
 | Variant | Meaning | Retry-safe? |
 |---|---|---|
@@ -58,7 +91,11 @@ This is true for every adapter (Databricks, Snowflake, BigQuery, DuckDB) -- the 
 | `compile-error` | The model failed to compile during the run -- a type error, unresolved reference, or other `Error`-severity diagnostic surfaced while building this model. No warehouse call was attempted. The diagnostic is carried in `error`. | No. Fix the model SQL or its upstream; re-running won't help. |
 | `unknown` | The failure could not be classified -- e.g. errors raised outside the connector layer that reach the output struct type-erased. | Depends. Surface the raw `error` string. |
 
-The classifier walks the `anyhow::Error` chain on each per-table failure, downcasts to `AdapterError`, and probes `.inner()` for the typed connector enum. Errors built via `anyhow::anyhow!("...{e}")` (which stringify and drop the type) fall through to `unknown`; errors propagated via `?` / `.context(...)` preserve the typed source and classify correctly. As of engine `v1.34`, the 23 sites in `run.rs` that previously stringified adapter errors have been converted to type-preserving wraps, so `failure_kind` returns a non-`unknown` value for every real production adapter error.
+The classifier walks the `anyhow::Error` chain on each per-table failure. It downcasts to `AdapterError`, then probes `.inner()` for the typed connector enum.
+
+How the error was built decides whether that works. An error built with `anyhow::anyhow!("...{e}")` stringifies its source and drops the type, so it falls through to `unknown`. An error propagated with `?` or `.context(...)` keeps the typed source and classifies correctly.
+
+Engine `v1.34` converted the 23 sites in `run.rs` that used to stringify adapter errors into type-preserving wraps. Since then, `failure_kind` returns a non-`unknown` value for every real production adapter error.
 
 ### Recommended consumer policy
 
@@ -71,9 +108,11 @@ Map each variant to one of four actions:
 | **Don't retry; alert the model owner** | `auth-failed`, `query-rejected`, `not-found`, `compile-error` |
 | **Surface raw `error` for triage** | `unknown` |
 
-Note that since engine 1.58.0 the run loop already retries proven-transient failures in-run, on by default (`[resilience] transient_max_retries`, default 2 — see [Classified retry](/advanced/failure-modes/#classified-retry)). A `transient` entry that reaches your `errors[*]` has therefore already exhausted its in-run retry budget: "retry with backoff" at the orchestrator level should mean a *delayed* re-run or `--resume-latest`, not an immediate tight-loop retry that doubles the engine's own attempts.
+"Retry with backoff" needs one qualification. Since engine 1.58.0 the run loop already retries proven-transient failures itself, on by default. See [Classified retry](/advanced/failure-modes/#classified-retry) and `[resilience] transient_max_retries`, which defaults to 2.
 
-Treat `connection-failed` as retry-safe even though the warehouse never saw the request: `reqwest::is_connect()` is the primary signal (it fires on actual TCP / TLS / DNS failures), and other non-timeout transport errors also classify as `connection-failed`. Timeouts classify as `transient` instead, and credential issues land on `auth-failed` (via the typed `Auth` variant / 401 / 403), never here.
+So a `transient` entry that reaches your `errors[*]` has already exhausted its in-run retry budget. At the orchestrator level, retry means a *delayed* re-run or `--resume-latest`. It does not mean a tight-loop retry, which only doubles the engine's own attempts.
+
+Treat `connection-failed` as retry-safe even though the warehouse never saw the request. `reqwest::is_connect()` is the primary signal, and it fires on real TCP, TLS, and DNS failures. Other non-timeout transport errors also classify as `connection-failed`. A timeout classifies as `transient` instead. A credential problem lands on `auth-failed`, via the typed `Auth` variant or a 401 or 403, and never here.
 
 ## Consuming from Dagster
 
@@ -137,23 +176,23 @@ defs = dg.Definitions(
 )
 ```
 
-Requires engine `v1.34+` (which emits the discriminator on the wire) and `dagster-rocky` `v1.35+` (which surfaces `failure_kind` directly on `RunResult.errors[*]`). Older bindings default the field to `"unknown"` when parsing a newer engine's output.
+This needs two versions. Engine `v1.34+` emits the discriminator on the wire, and `dagster-rocky` `v1.35+` surfaces `failure_kind` directly on `RunResult.errors[*]`. Older bindings default the field to `"unknown"` when they parse a newer engine's output.
 
-For non-Dagster consumers, `rocky run --output json | jq` gives the same shape:
+For a non-Dagster consumer, `rocky run --output json | jq` gives the same shape:
 
 ```bash
 rocky --config rocky.toml run --output json \
   | jq -r '.errors[] | "\(.failure_kind)\t\(.asset_key | join("/"))\t\(.error)"'
 ```
 
-Branch on the first column in your shell pipeline -- `transient` and `quota-exceeded` go into a retry loop, everything else pages the on-call.
+Branch on the first column in your shell pipeline. Send `transient` and `quota-exceeded` into a retry loop, and page the on-call for everything else.
 
 ## When `failure_kind` is `unknown`
 
-`unknown` is the fallback when the classifier can't reach a typed connector variant on the error chain. Two cases produce it today:
+`unknown` is the fallback when the classifier cannot reach a typed connector variant on the error chain. Two cases produce it today:
 
-1. **Non-adapter errors** -- drift reconciliation failures, governance errors, state-store failures that surface at the per-table level. The error is real and well-formed, but the type-erased `anyhow::Error` doesn't expose a connector variant. The free-form `error` string is the only signal; triage manually.
-2. **Worker-task panics** -- a `JoinError` from a panicked task produces a `TableError` with `failure_kind = "unknown"`. The panic message is in `error`. This is rare and almost always a bug to file rather than retry.
+1. **Non-adapter errors** -- drift reconciliation failures, governance errors, and state-store failures that surface at the per-table level. The error is real and well-formed. But the type-erased `anyhow::Error` exposes no connector variant, so the free-form `error` string is your only signal. Triage it by hand.
+2. **Worker-task panics** -- a `JoinError` from a panicked task produces a `TableError` with `failure_kind = "unknown"`. The panic message is in `error`. This is rare, and it is almost always a bug to file rather than a failure to retry.
 
 Treat `unknown` as a surface-and-triage signal, never as silently retry-safe.
 
