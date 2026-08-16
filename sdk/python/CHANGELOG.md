@@ -9,7 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
-- **`DriftOutput` is no longer exported.** It modelled the output of a `rocky drift` command that does not exist, so nothing could ever produce a payload for it to parse. `DriftSummary` and `DriftActionOutput` remain available and are unchanged — drift is reported on `RunResult.drift`. (#1431)
+- **BREAKING: `DriftOutput` is no longer exported.** It modelled the output of a `rocky drift` command that does not exist, so nothing could ever produce a payload for it to parse. `DriftSummary` and `DriftActionOutput` remain available and are unchanged — drift is reported on `RunResult.drift`. (#1431)
+
+  `DriftOutput` was importable from `rocky_sdk.types` and `rocky_sdk.types_generated` in the released `sdk-v0.11.0`, so removing it breaks any code that imports the name — even though no code could obtain an instance of it. **This must ship as a minor bump (`0.12.0`), not a patch**: pre-1.0, minor is the only signal available for a breaking change, and a changelog note alone does not stop an existing resolver from picking the new version up.
+
+  `dagster-rocky` is unaffected — it references `DriftOutput` nowhere, and `import dagster_rocky.types` succeeds against this change. The break is limited to third-party code importing the name directly.
 
 ## [0.11.0] — 2026-08-11
 

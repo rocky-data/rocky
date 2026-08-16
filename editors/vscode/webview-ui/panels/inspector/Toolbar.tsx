@@ -7,7 +7,6 @@ const SEARCH_DEBOUNCE_MS = 180;
 const OVERLAY_LABELS: Record<OverlayKind, string> = {
   cost: "Cost",
   freshness: "Freshness",
-  drift: "Drift",
   breaking: "Breaking",
   lastRun: "Last run",
   governance: "Governance",

@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type {
   BreakingData,
-  DriftData,
   GovernanceData,
   GraphData,
   ReplayData,
@@ -10,7 +9,6 @@ import { getRpc } from "../../runtime/rpcClient";
 import { type ColorMode, type OverlayKind } from "./context";
 import { makeBreakingOverlay } from "./overlays/breaking";
 import { costOverlay } from "./overlays/cost";
-import { makeDriftOverlay } from "./overlays/drift";
 import { freshnessOverlay } from "./overlays/freshness";
 import { makeGovernanceOverlay } from "./overlays/governance";
 import { makeLastRunOverlay } from "./overlays/lastRun";
@@ -29,7 +27,6 @@ export function useLineageGraph() {
   const [colorMode, setColorMode] = useState<ColorMode>("kind");
   const [search, setSearch] = useState("");
   const [active, setActive] = useState<Set<OverlayKind>>(new Set());
-  const [drift, setDrift] = useState<DriftData | null>(null);
   const [breaking, setBreaking] = useState<BreakingData | null>(null);
   const [replay, setReplay] = useState<ReplayData | null>(null);
   const [governance, setGovernance] = useState<GovernanceData | null>(null);
@@ -49,12 +46,6 @@ export function useLineageGraph() {
       return next;
     });
     // Each data-backed overlay fetches on first enable; the base graph is unaffected.
-    if (kind === "drift" && drift === null) {
-      void getRpc()
-        .request<DriftData>("drift")
-        .then(setDrift)
-        .catch((err) => setDrift({ actions: [], unavailable: String(err) }));
-    }
     if (kind === "breaking" && breaking === null) {
       void getRpc()
         .request<BreakingData>("breaking")
@@ -81,7 +72,6 @@ export function useLineageGraph() {
     const list: LineageOverlay[] = [];
     if (active.has("cost")) list.push(costOverlay);
     if (active.has("freshness")) list.push(freshnessOverlay);
-    if (active.has("drift") && drift) list.push(makeDriftOverlay(drift));
     if (active.has("breaking") && breaking && graph) {
       list.push(makeBreakingOverlay(breaking, graph));
     }
@@ -90,7 +80,7 @@ export function useLineageGraph() {
       list.push(makeGovernanceOverlay(governance));
     }
     return list;
-  }, [active, drift, breaking, replay, governance, graph]);
+  }, [active, breaking, replay, governance, graph]);
 
   return {
     graph,
