@@ -1,22 +1,44 @@
 ---
 title: Data Quality Checks
-description: Inline data quality checks that run during replication, plus per-model declarative assertions
+description: The two quality surfaces Rocky runs inline against the warehouse - pipeline-level checks and per-model declarative assertions.
 sidebar:
   order: 11.5
 ---
 
-Rocky ships two complementary quality surfaces, both executed inline against the warehouse. There is no separate testing step like `dbt test`:
+Rocky has two quality surfaces. Both run inline against the warehouse during a run.
 
-1. **Pipeline-level checks** — configured per pipeline in `rocky.toml` under `[pipeline.<name>.checks]`. These run after each table is replicated: row count, column match, freshness, null rate, anomaly detection, custom SQL.
-2. **Model-level declarative assertions** — configured per model in the model's sidecar TOML (or directly under `[pipeline.<name>.checks]`) via repeated `[[assertions]]` blocks. These cover the DQX parity surface: `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, `composite`, plus the time-window sugar `not_in_future` and `older_than_n_days`.
+1. **Pipeline-level checks** — configured per pipeline in `rocky.toml` under `[pipeline.<name>.checks]`. They run after each table is replicated: row count, column match, freshness, null rate, anomaly detection, custom SQL.
+2. **Model-level declarative assertions** — configured per model in the model's sidecar TOML, or directly under `[pipeline.<name>.checks]`, as repeated `[[assertions]]` blocks. They cover `not_null`, `unique`, `unique_expr`, `accepted_values`, `relationships`, `expression`, `row_count_range`, `in_range`, `regex_match`, `aggregate`, and `composite`, plus the time-window shorthands `not_in_future` and `older_than_n_days`.
 
-Assertions run on **every** pipeline type (including **replication**, not just transformation/quality), so a target table doubled by the same source arriving twice is caught at load time. For the cross-*table* variant (the same key arriving through two sibling sources that later get `UNION`-ed together), see [Cross-source overlap](#cross-source-overlap).
+A third check runs before either of them. The compiler validates each model against its contract, so a model that breaks its contract never reaches the warehouse:
 
-Both surfaces share the same JSON output shape (`check_results[]`) and the same severity / quarantine plumbing, so orchestrators don't need to distinguish between them.
-
-Compile-time contract diagnostics run even earlier, before any check executes, so a model that violates its contract never reaches the warehouse:
+```
+        rocky compile                rocky run / rocky apply
+        ─────────────                ───────────────────────
+   ┌────────────────────┐
+   │ contract           │  no errors    ┌──────────────────┐
+   │ diagnostics        │──────────────►│ pipeline-level   │
+   │ E010 / E013        │               │ checks, after    │
+   └─────────┬──────────┘               │ each table lands │
+             │ an error                 └────────┬─────────┘
+             ▼                                   │
+   the run stops. Nothing      ┌──────────────┐  │
+   reaches the warehouse.      │ model-level  │  │
+                               │ assertions,  │  │
+                               │ on any       │  │
+                               │ pipeline type│  │
+                               └───────┬──────┘  │
+                                       └────┬────┘
+                                            ▼
+                                   check_results[] — one
+                                   shape for both surfaces
+```
 
 ![rocky compile surfaces E010 and E013 contract diagnostic codes on a broken model](/demo-data-contracts.gif)
+
+Assertions run on **every** pipeline type, **replication** included, not just transformation and quality. So a target table doubled by the same source arriving twice is caught at load time. For the cross-*table* version of that problem, where the same key arrives through two sibling sources that later get `UNION`-ed together, see [Cross-source overlap](#cross-source-overlap).
+
+Both surfaces share one JSON output shape (`check_results[]`) and the same severity and quarantine plumbing. An orchestrator does not need to tell them apart.
 
 ## Pipeline-level checks
 
@@ -32,9 +54,9 @@ freshness = { threshold_seconds = 86400 }
 
 ### Row Count
 
-Compares `COUNT(*)` between source and target tables. The check passes if counts match.
+Compares `COUNT(*)` between the source and target tables. The check passes when the counts match.
 
-Rocky uses batched queries with `UNION ALL`. Instead of running one query per table (5N queries for N tables), it batches up to 200 tables per query, reducing the total to roughly 3 queries for a typical pipeline. Freshness checks batch the same way.
+Rocky batches these queries with `UNION ALL` rather than running one per table. A naive approach costs 5N queries for N tables. Batching up to 200 tables per query brings a typical pipeline down to about 3 queries. Freshness checks batch the same way.
 
 ```json
 {
@@ -47,7 +69,7 @@ Rocky uses batched queries with `UNION ALL`. Instead of running one query per ta
 
 ### Column Match
 
-Compares column sets between source and target tables (case-insensitive). Reports any missing or extra columns. Uses cached columns from drift detection, so it does not require an additional query.
+Compares the source and target column sets, ignoring case, and reports any missing or extra column. It reuses the columns cached by drift detection, so it costs no extra query.
 
 ```json
 {
@@ -60,7 +82,7 @@ Compares column sets between source and target tables (case-insensitive). Report
 
 ### Freshness
 
-Checks the time since the last data sync by comparing `MAX(timestamp_column)` against the current time. A table that has not received new data within the threshold is flagged.
+Measures how long ago the table last received data, by comparing `MAX(timestamp_column)` against the current time. A table that has seen nothing new within the threshold is flagged.
 
 ```json
 {
@@ -73,17 +95,17 @@ Checks the time since the last data sync by comparing `MAX(timestamp_column)` ag
 
 ### Null Rate
 
-Samples the table using `TABLESAMPLE` and calculates the null percentage per column. This avoids scanning the entire table.
+Samples the table with `TABLESAMPLE` and works out the null percentage per column. Sampling means it never scans the whole table.
 
 ```toml
 null_rate = { columns = ["email"], threshold = 0.05 }
 ```
 
-The generated SQL uses `TABLESAMPLE (N PERCENT)`, so it stays practical on large tables.
+The generated SQL uses `TABLESAMPLE (N PERCENT)`, so the check stays practical on a large table.
 
 ### Custom SQL
 
-User-provided SQL templates with a `{target}` placeholder that Rocky substitutes at execution time. The query result is compared against a threshold.
+Your own SQL, with a `{target}` placeholder that Rocky substitutes at execution time. Rocky compares the query result against a threshold.
 
 ```toml
 custom = [
@@ -93,11 +115,19 @@ custom = [
 
 The check passes if the query result is less than or equal to the threshold.
 
-## Model-level declarative assertions (DQX parity)
+## Model-level declarative assertions
 
-Declarative assertions are defined as repeated `[[assertions]]` (or `[[tests]]` in a model sidecar) blocks. Each one declares a `type`, optional `column`, optional `severity`, optional `filter`, and type-specific parameters.
+Write a declarative assertion as a repeated `[[assertions]]` block, or as `[[tests]]` in a model sidecar. Each block declares a `type`, an optional `column`, an optional `severity`, an optional `filter`, and the parameters that type needs. Together they match the assertion surface of Databricks Labs' DQX.
 
-**Don't confuse `[[tests]]` with `[[test]]`.** They differ by one letter and run on different paths. The plural `[[tests]]` (and the equivalent `[[assertions]]`) are the declarative assertions on this page. Assertions written under `[pipeline.<name>.checks]` run inline against the warehouse during `rocky run`/`apply`; the model-sidecar `[[tests]]` form runs standalone with `rocky test --declarative`, which executes each assertion against the configured warehouse adapter. The singular `[[test]]` is a separate surface: fixture-driven unit tests that mock upstream inputs (`given`) and assert expected output rows (`expect`), run locally on DuckDB by plain `rocky test`. The assertions check rows already in the warehouse; the unit tests check the model's SQL against fixtures, with no warehouse connection.
+**Don't confuse `[[tests]]` with `[[test]]`.** They differ by one letter and run on different paths:
+
+| Block | What it checks | How it runs |
+|---|---|---|
+| `[[assertions]]` under `[pipeline.<name>.checks]` | rows already in the warehouse | inline during `rocky run` / `rocky apply` |
+| `[[tests]]` in a model sidecar | rows already in the warehouse | standalone with `rocky test --declarative`, against the configured warehouse adapter |
+| `[[test]]` (singular) in a model sidecar | the model's SQL against fixtures | locally on DuckDB with plain `rocky test`, no warehouse connection |
+
+The plural `[[tests]]`, and the equivalent `[[assertions]]`, are the declarative assertions on this page. The singular `[[test]]` is a separate surface: a fixture-driven unit test that mocks the upstream inputs (`given`) and asserts the expected output rows (`expect`).
 
 ```toml
 [[assertions]]
@@ -136,15 +166,17 @@ filter = "region = 'US'"
 | `not_in_future` | row | — (sugar for `col <= CURRENT_TIMESTAMP()`) | Timestamp column cannot contain future values. NULLs pass. |
 | `older_than_n_days` | row | `days: u32` | Every timestamp must be at least `days` old. NULLs pass. Dialect-aware. |
 
-Most row-level assertions are **quarantinable** (see below): `not_null`, `accepted_values`, `expression`, `in_range`, `regex_match`, `not_in_future`, `older_than_n_days`. Set-based, table-level, and referential assertions (`unique`, `unique_expr`, `composite`, `row_count_range`, `aggregate`, `relationships`) are evaluated post-hoc and cannot be quarantined — `relationships` needs a join, not a per-row predicate.
+Most row-level assertions are **quarantinable**, meaning Rocky can route the failing rows aside instead of only counting them: `not_null`, `accepted_values`, `expression`, `in_range`, `regex_match`, `not_in_future`, `older_than_n_days`. See [Row quarantine](#row-quarantine) below.
+
+The set-based, table-level, and referential assertions (`unique`, `unique_expr`, `composite`, `row_count_range`, `aggregate`, `relationships`) run after the fact and cannot be quarantined. `relationships`, for instance, needs a join, not a per-row predicate.
 
 ### Severity and `fail_on_error`
 
-Each assertion takes an optional `severity` (`error` by default, or `warning`) and the pipeline takes an optional `fail_on_error` (`true` by default).
+Each assertion takes an optional `severity`, either `error` (the default) or `warning`. Each pipeline takes an optional `fail_on_error`, which defaults to `true`.
 
-- `severity = "error"` + `fail_on_error = true` — a failing assertion causes the pipeline to exit non-zero (partial-success code 2 if other tables succeeded).
-- `severity = "warning"` — a failing assertion appears in `check_results[]` with `passed = false` and `severity = "warning"`, but never fails the pipeline.
-- `fail_on_error = false` at the pipeline level downgrades every `error` to a non-fatal result (useful for shadow runs and observation modes).
+- `severity = "error"` + `fail_on_error = true` — a failing assertion exits the pipeline non-zero. That is code 2, partial success, if other tables succeeded.
+- `severity = "warning"` — a failing assertion appears in `check_results[]` with `passed = false` and `severity = "warning"`. It never fails the pipeline.
+- `fail_on_error = false` at the pipeline level downgrades every `error` to a non-fatal result. Use it for shadow runs and observation modes.
 
 ```toml
 [pipeline.silver.checks]
@@ -164,7 +196,7 @@ severity = "warning"  # unknown status reports but doesn't fail
 
 ### Reusable named tests
 
-When the same assertion is applied across many models, define it once in `models/test_definitions.toml` and reference it by name. A definition is any assertion `type` plus its parameters and an optional default `column`:
+To apply the same assertion across many models, define it once in `models/test_definitions.toml` and reference it by name. A definition is any assertion `type`, plus its parameters and an optional default `column`:
 
 ```toml
 # models/test_definitions.toml
@@ -178,7 +210,7 @@ column = "status"
 values = ["pending", "shipped", "delivered"]
 ```
 
-A model applies one with a `[[use_test]]` block, optionally binding or overriding the column, severity, and filter at the use site. Inline `[[tests]]` and `[[use_test]]` references coexist:
+A model applies one with a `[[use_test]]` block. At the use site you may bind or override the column, the severity, and the filter. Inline `[[tests]]` and `[[use_test]]` references sit side by side:
 
 ```toml
 # models/fct_orders.toml
@@ -195,11 +227,11 @@ name = "known_status"   # uses the definition's default column
 severity = "warning"
 ```
 
-References resolve into ordinary assertions at load, so they run identically to inline ones. A `[[use_test]]` naming no definition fails the load with a clear error, so a typo can't silently drop a check.
+A reference resolves into an ordinary assertion at load, so it runs exactly like an inline one. A `[[use_test]]` naming no definition fails the load with a clear error, so a typo cannot silently drop a check.
 
 ### Per-assertion `filter`
 
-Every assertion kind accepts an optional `filter`, a SQL boolean predicate that scopes the check to a subset of rows. Rows where `(filter)` evaluates to `TRUE` are subject to the assertion; rows where it's `FALSE` or `NULL` pass unconditionally.
+Every assertion kind accepts an optional `filter`: a SQL boolean predicate that scopes the check to a subset of rows. A row where `(filter)` is `TRUE` is subject to the assertion. A row where it is `FALSE` or `NULL` passes unconditionally.
 
 ```toml
 [[assertions]]
@@ -209,11 +241,11 @@ min = "0"
 filter = "region = 'US' AND status != 'cancelled'"
 ```
 
-Filter is user-supplied SQL: the caller is responsible for valid SQL in the target dialect. Rocky validates identifiers inside structured parameters (columns, values) but passes the filter expression through verbatim.
+The filter is your SQL. You are responsible for making it valid in the target dialect. Rocky validates identifiers inside structured parameters, such as columns and values, but it passes the filter expression through verbatim.
 
 ### Row quarantine
 
-Row-level assertions can quarantine failing rows instead of just reporting a count. Configure quarantine at the pipeline level:
+A row-level assertion can move its failing rows aside instead of only reporting a count. Configure quarantine at the pipeline level:
 
 ```toml
 [pipeline.silver.checks.quarantine]
@@ -227,13 +259,13 @@ mode = "split"   # or "tag" or "drop"
 | `tag` | Rocky rewrites `<target>` in place, adding a per-assertion `_error_<name>` column populated on failing rows (NULL on passing rows). Every row stays in the table. Useful for observation without a second table — rewrites the source, so use with care on a raw replication target. |
 | `drop` | Only `<target>__valid` (the passing rows) is written; failing rows are discarded. Quarantine count is still reported in `check_results[]`. |
 
-Set-based, table-level, and referential assertions are not quarantinable; they run as post-hoc checks regardless of mode.
+Set-based, table-level, and referential assertions are never quarantinable. They run as after-the-fact checks whatever the mode.
 
-The quarantine predicate is built from every quarantinable assertion, combined with AND. Filters compose via `CASE WHEN (filter) THEN base_valid_pred ELSE TRUE END`, so out-of-scope rows stay on the valid side even when the base predicate would fail them.
+Rocky builds the quarantine predicate from every quarantinable assertion, combined with AND. A filter composes into it as `CASE WHEN (filter) THEN base_valid_pred ELSE TRUE END`. An out-of-scope row therefore stays on the valid side, even when the base predicate would fail it.
 
 ### Output
 
-Every assertion produces a `check_results[]` entry in the `rocky apply` JSON output:
+Every assertion produces one `check_results[]` entry in the `rocky apply` JSON output:
 
 ```json
 {
@@ -246,15 +278,15 @@ Every assertion produces a `check_results[]` entry in the `rocky apply` JSON out
 }
 ```
 
-The `name` is the assertion's explicit `name` when set, else a synthesized `"{kind}:{column}"`. The type-specific detail fields (`kind`, `column`, `failing_rows`) are flattened onto the result, consistent with every other check.
+The `name` is the assertion's explicit `name` when you set one, and otherwise a synthesized `"{kind}:{column}"`. The type-specific detail fields (`kind`, `column`, `failing_rows`) are flattened onto the result, as they are for every other check.
 
-Consumers (dagster-rocky, the VS Code lineage view, custom scripts) parse this shape via the generated Pydantic / TypeScript bindings (see the [JSON Output](/reference/json-output/) reference).
+Consumers parse this shape through the generated Pydantic and TypeScript bindings: dagster-rocky, the VS Code lineage view, and your own scripts. See the [JSON Output](/reference/json-output/) reference.
 
 ## Cross-source overlap
 
-The assertions above check one table at a time. They can't catch a subtler duplication: the **same business key arriving through two different sources** that later get `UNION`-ed into one consolidation target. Each source table is internally unique (every per-table `unique` check passes), yet the consolidation double-counts every shared key.
+The assertions above check one table at a time. They cannot catch a subtler duplication: the **same business key arriving through two different sources** that later get `UNION`-ed into one consolidation target.
 
-This is the classic "same account onboarded twice under two paths" failure. `cross_source_overlap` is the cross-table check that sees it.
+Each source table is internally unique, so every per-table `unique` check passes. The consolidation still double-counts every shared key. This is the classic "same account onboarded twice under two paths" failure, and `cross_source_overlap` is the cross-table check that sees it.
 
 ```toml
 [pipeline.bronze.checks.cross_source_overlap]
@@ -264,9 +296,9 @@ max_overlap_rows = 0          # any overlap fails; raise to tolerate a known set
 sample = 20                   # overlapping keys attached to the result for triage
 ```
 
-Exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression, passed through verbatim) is required, mirroring `unique` / `unique_expr`.
+Give exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression, passed through verbatim). This mirrors `unique` and `unique_expr`.
 
-**How it works.** The runner buckets the pipeline's managed source tables into **sibling groups**: tables with the same source type and table name that landed in more than one target schema (the tenant/region fan-out that gets unioned downstream). It tags each sibling's rows with its source identity and runs:
+**How it works.** The runner buckets the pipeline's managed source tables into **sibling groups**. Siblings share a source type and a table name, and they landed in more than one target schema. That is the tenant or region fan-out that gets unioned downstream. Rocky tags each sibling's rows with its source identity and runs:
 
 ```sql
 SELECT order_id, COUNT(DISTINCT _src) AS _n_src
@@ -280,7 +312,11 @@ GROUP BY order_id
 HAVING COUNT(DISTINCT _src) > 1
 ```
 
-The `COUNT(DISTINCT _src)` is the crux: it counts how many *distinct sources* a key appears in, so a single source's own internal duplicates never false-flag; only a key spanning two or more siblings does. (With a `key_expr` or multi-column `keys`, the projected key list changes accordingly.) A key appearing under more than one source is an overlap. Sibling tables whose key can't be evaluated (missing column / keyless) are **skipped with a logged reason** rather than failing the check. The result is a `check_results[]` entry named `cross_source_overlap:<source_type>.<table>`, carrying the overlap count, the contributing tables, and a bounded `sample` of overlapping keys (the detail fields are flattened onto the result, consistent with every other check):
+The `COUNT(DISTINCT _src)` is the crux. It counts how many *distinct sources* a key appears in, so one source's own internal duplicates never raise a false flag. Only a key that spans two or more siblings does. With a `key_expr` or multi-column `keys`, the projected key list changes to match.
+
+Some sibling tables cannot be evaluated: the key column is missing, or the table is keyless. Rocky **skips them with a logged reason** rather than failing the check.
+
+The result is a `check_results[]` entry named `cross_source_overlap:<source_type>.<table>`. It carries the overlap count, the contributing tables, and a bounded `sample` of overlapping keys. The detail fields are flattened onto the result, as with every other check:
 
 ```json
 {
@@ -302,4 +338,6 @@ Rocky catches cross-source duplication at two points:
 | **Preventive** | `on_collision` | `rocky discover` — before a stray catalog is even created | `[pipeline.NAME.source.discovery] on_collision` → `collision_candidates` |
 | **Detective** | `cross_source_overlap` | `rocky run` — after the sibling tables are materialized | `[pipeline.NAME.checks.cross_source_overlap]` |
 
-The preventive layer needs an adapter that resolves external object ids (e.g. Fivetran) and inspects connector metadata; the detective layer works on any warehouse by querying the materialized tables directly. They're complementary: use both for defense in depth, or just the detective check if your sources don't expose object ids at discover time. See [discovery configuration](/reference/configuration/#pipelinenamesourcediscovery) for `on_collision`.
+The preventive layer needs an adapter that resolves external object ids, such as Fivetran, and that inspects connector metadata. The detective layer works on any warehouse, because it queries the materialized tables directly.
+
+Use both for defense in depth. Use the detective check alone if your sources expose no object ids at discover time. See [discovery configuration](/reference/configuration/#pipelinenamesourcediscovery) for `on_collision`.

@@ -1,122 +1,248 @@
 ---
 title: The Architecture of Trust
-description: How Rocky's typed graph turns the failure modes serious data teams fear into compile errors, CI gates, and audit artifacts, graded honestly against what ships today.
+description: Every trust claim Rocky makes, graded against what ships today.
 sidebar:
   order: 2
 ---
 
-Rocky earns trust primitive by primitive. Each claim below is graded against what ships today; where something is partial or still on the roadmap, this page says so.
+This page grades each of Rocky's trust primitives against what ships today. Where
+a primitive is partial or still on the roadmap, the grade says so.
 
 ## The failures worth designing against
 
-The expensive failures on a mature data platform are rarely slow queries. They are trust failures, and they share a shape: a change happens somewhere, nothing breaks loudly, and the damage surfaces days later in a number someone trusted.
+The expensive failures on a mature data platform are trust failures, not slow
+queries. They share a shape. A change happens somewhere, nothing breaks loudly,
+and the damage surfaces days later in a number someone trusted. The
+[Introduction](/getting-started/introduction/) lists the specific ones.
 
-Four are worth naming because they recur on every team that reaches real scale:
-
-- **Silent schema drift.** A source column changes type or disappears upstream. The pipeline keeps running. A downstream join quietly starts producing wrong numbers, and a dashboard diverges for three days before anyone notices.
-- **Unattributable cost.** Warehouse spend jumps in a month. Nobody can point at the model that caused it, because cost was never a property of a model, only a line item on an invoice.
-- **The un-auditable change.** An auditor asks who altered `fct_revenue.amount`, when, and on whose approval. The honest answer involves `git blame`, a Slack thread, and a screenshot.
-- **The contract broken without warning.** A model promises a column to its consumers. Someone removes it, or changes its type, or relaxes its nullability. The consumers find out in production.
-
-These are not edge cases. They are the load-bearing risks Rocky is built to convert from production incidents into things you catch before merge.
+Every primitive below exists to turn one of those failures into something you
+catch before you merge.
 
 ## The mental model: code, typed IR, warehouse
 
-Rocky sits between your code and your warehouse as a typed compiler. Your SQL and config compile down to a typed intermediate representation that knows every model, every column, and every type across the full dependency graph. The warehouse still owns storage and compute. Rocky owns the graph, and the compiler is the trust boundary.
+Rocky sits between your code and your warehouse as a typed compiler.
 
-That single decision is what makes the rest possible. Once the graph is typed and known before execution, a schema change is a type error, a missing contract column is a diagnostic with a code, and a column's downstream blast radius is a query you can run in CI. None of that is reachable for a string-templating engine, because a string template never has to know what a column is.
+```
+  your code                Rocky                 your warehouse
+  ─────────                ─────                 ──────────────
+  .sql / .rocky  ────────► typed IR    ────────► storage
+  .toml sidecars           every model,          compute
+  contracts                every column,         the tables
+                           every type
+                               │
+                               │ before anything runs
+                               ▼
+                   E### errors, W### warnings,
+                   lineage, drift, cost, contracts
+```
 
-Rocky is not a warehouse, not a table format, and not a query engine. It is the typed layer above whichever of those you have chosen, and it stays warehouse-neutral on purpose.
+Your SQL and config compile down to a typed intermediate representation, or
+[IR](/reference/glossary/#ir-intermediate-representation). The IR knows every
+model, every column, and every type across the full dependency graph. The
+warehouse still owns storage and compute. Rocky owns the graph, and the compiler
+is the trust boundary.
+
+That single decision is what makes the rest possible. Once the graph is typed and
+known before execution, three things follow. A schema change becomes a type
+error. A missing contract column becomes a diagnostic with a code. A column's
+downstream blast radius becomes a query you can run in CI. None of that is
+reachable from a template that substitutes strings, because a string template
+never has to know what a column is.
+
+Rocky is not a warehouse, not a table format, and not a query engine. It is the
+typed layer above whichever of those you have chosen, and it stays
+warehouse-neutral on purpose.
 
 ## The trust primitives, graded honestly
 
-Each primitive below is tied to its real CLI surface or diagnostic code. The inline grade tells you how far it ships today, so you can plan around the edges instead of discovering them.
+Each primitive below names its real CLI surface or diagnostic code. The inline
+grade tells you how far it ships today, so you can plan around the edges instead
+of finding them later.
 
 ### Compile-time types and diagnostics
 
-Rocky infers column-level types across the whole DAG and surfaces problems as diagnostic codes you can grep in CI logs. The codes run from `E001` through `E035` for errors, with `W` warnings and `P` lints alongside. Compilation fails on any error-level diagnostic, which is the entire point: the failure mode becomes a non-zero exit code at PR time rather than a wrong number in production.
+Rocky infers column-level types across the whole DAG. It reports problems as
+diagnostic codes you can grep in a CI log. The error codes run from `E001` to
+`E036`, with `W` warnings and `P` lints alongside.
+
+Compilation fails on any error-level diagnostic. That is the whole point: the
+failure becomes a non-zero exit code at PR time, not a wrong number in
+production.
 
 **Shipped.** This is the foundation the other primitives build on.
 
 ### Compile-time column-level lineage
 
-`rocky lineage <model>` traces a model's inputs and outputs; `rocky lineage <model>.<column>` traces a single column through every transformation that touches it. The edges come from the compiler's semantic analysis, so lineage is computed at compile time rather than reconstructed after the fact. `rocky lineage-diff main` turns this into a blast-radius report for PR review: change a column, see exactly which downstream columns are affected before you merge.
+`rocky lineage <model>` traces a model's inputs and outputs.
+`rocky lineage <model>.<column>` traces a single column through every
+transformation that touches it. The edges come from the compiler's semantic
+analysis, so Rocky computes lineage at compile time rather than reconstructing it
+afterwards.
 
-The lineage graph is intra-project. It knows the columns inside one Rocky project, not across project boundaries.
+`rocky lineage-diff main` turns that into a blast-radius report for PR review.
+Change a column, and see exactly which downstream columns it affects before you
+merge.
+
+The lineage graph is intra-project. It knows the columns inside one Rocky
+project, not across project boundaries.
 
 **Shipped, within a project.**
 
 ### Branches
 
-`rocky branch create` and `rocky run --branch <name>` give you isolated branches for development and review. Today a branch is implemented as a schema prefix: models for branch `feature_x` materialize under a `branch__feature_x` namespace, so a branch never touches the production tables. Approval writes a signed artifact under `.rocky/approvals/<branch>/`, and promotion verifies that signature before merging the branch forward.
+`rocky branch create` and `rocky run --branch <name>` give you isolated branches
+for development and review. A branch today is a schema prefix: models for branch
+`feature_x` materialize under a `branch__feature_x` namespace, so a branch never
+touches a production table. Approval writes a signed artifact under
+`.rocky/approvals/<branch>/`, and promotion verifies that signature before it
+merges the branch forward.
 
-The branch isolation you get today is schema-prefix isolation, not a warehouse-native zero-copy clone. Delta `SHALLOW CLONE` and Snowflake zero-copy `CLONE` would make branch creation near-instant and storage-free; that integration is a follow-up, not what runs now.
+What you get today is schema-prefix isolation, not a warehouse-native zero-copy
+clone. Delta `SHALLOW CLONE` and Snowflake zero-copy `CLONE` would make branch
+creation near-instant and free of storage cost. That integration is a follow-up,
+not what runs now.
 
 **Partial.** Schema-prefix branches with signed approval and promotion ship today. Warehouse-native clones do not.
 
 ### Per-model cost
 
-Rocky records per-model cost on every run, which makes cost a property of a model rather than a line on an invoice. On BigQuery, bytes-scanned maps directly to billing, so the figure is billing-exact. On Databricks and Snowflake the cost figure is a duration × DBU-rate estimate; Databricks already reports warehouse-scanned bytes (surfaced for observability, since it is DBU-priced rather than bytes-priced), while Snowflake's bytes plumbing is still a follow-up. On DuckDB it is zero.
+Rocky records per-model cost on every run, which makes cost a property of a model
+rather than a line on an invoice.
 
-**Partial.** Per-model cost populates on every run; it is billing-exact on BigQuery and a duration-based estimate on Databricks/Snowflake (Databricks surfaces scanned bytes for observability; Snowflake's bytes plumbing is the follow-up).
+The accuracy depends on the warehouse:
+
+- **BigQuery.** Bytes scanned maps directly to billing, so the figure is billing-exact.
+- **Databricks and Snowflake.** The figure is a duration × DBU-rate estimate. A DBU is Databricks' compute billing unit. Databricks also reports warehouse-scanned bytes, surfaced for observability rather than pricing, because Databricks prices by DBU. Snowflake's bytes plumbing is still a follow-up.
+- **DuckDB.** Zero.
+
+**Partial.** Per-model cost populates on every run. It is billing-exact on BigQuery and a duration-based estimate on Databricks and Snowflake. Databricks surfaces scanned bytes for observability. Snowflake's bytes plumbing is the follow-up.
 
 ### Compile-time contracts
 
-A `.contract.toml` declares what a model must produce, and the compiler checks the model's inferred schema against it. The relevant codes are concrete:
+A `.contract.toml` declares what a model must produce. The compiler checks the
+model's inferred schema against it. Four codes cover the intra-project case:
 
 - `E010`: a required column is missing from the model output.
 - `E011`: a column's type does not match the contract.
 - `E012`: the contract says non-nullable and the model output is nullable.
 - `E013`: a protected column has been removed.
 
-Any of these fails compilation, so a broken contract is a red CI check, not a production surprise.
+Any of these fails compilation, so a broken contract is a red CI check rather
+than a production surprise.
 
-The `E010`–`E013` codes are intra-project: they validate a model against a contract inside the same Rocky project. Cross-team enforcement across a project boundary also ships, through a vendored-snapshot mechanism. A producer runs `rocky publish-ir` to publish a snapshot of its compiled IR; a consumer vendors that snapshot and declares an `[imports.<name>]` block (with `baseline`, `snapshot`, and an optional `pin`), maintained via `rocky imports update [--check]`. The consumer's `rocky compile` then diffs baseline against snapshot and fails on a producer's breaking change: `E030` (a column the consumer reads was dropped), `E031` (its type narrowed), `E032` (nullable tightened to NOT NULL), `E033` (snapshot drifted from the pinned recipe hash), and `E034` (snapshot format newer than this build), with `W030`/`W031` for non-breaking additions and widenings. See [Cross-Team Contracts](/concepts/cross-team-contracts/) for the full workflow.
+Those four are intra-project: they check a model against a contract inside one
+Rocky project. Enforcement across a project boundary also ships, through a
+**vendored snapshot**. Vendored means the consuming team keeps its own committed
+copy of the producing team's compiled schema, and diffs against that copy.
+
+The flow has three parts. A producer runs `rocky publish-ir` to publish a
+snapshot of its compiled IR. A consumer vendors that snapshot and declares an
+`[imports.<name>]` block, with `baseline`, `snapshot`, and an optional `pin`,
+maintained by `rocky imports update [--check]`. The consumer's `rocky compile`
+then diffs the baseline against the snapshot and fails on a producer's breaking
+change:
+
+- `E030`: a column the consumer reads was dropped.
+- `E031`: that column's type narrowed.
+- `E032`: it went from nullable to NOT NULL.
+- `E033`: the snapshot drifted from the pinned recipe hash.
+- `E034`: the snapshot format is newer than this build can read.
+
+`W030` and `W031` cover the non-breaking cases: an added column and a widened
+type. See [Cross-Team Contracts](/concepts/cross-team-contracts/) for the full
+workflow.
 
 **Shipped.** Intra-project (`E010`–`E013`) and cross-team via published-IR snapshots (`E030`–`E034`, enforced at the consumer's compile).
 
 ### Declarative governance
 
-Rocky models governance as code through a `GovernanceAdapter`: tag management, grant and revoke, workspace bindings, column tags, masking policies bound to classification tags, and role-graph reconciliation. How much of that surface is real depends entirely on the warehouse.
+Rocky models governance as code through a `GovernanceAdapter`. The surface covers
+tag management, grant and revoke, workspace bindings, column tags, masking
+policies bound to classification tags, and role-graph reconciliation.
+
+How much of that is real depends entirely on the warehouse:
 
 - **Databricks** implements the full surface through Unity Catalog.
-- **Snowflake** reconciles object tags (`ALTER … SET TAG`) and `GRANT`/`REVOKE` role grants, plus retention policy; workspace binding and masking are not driven.
-- **BigQuery** reconciles tags as labels (`ALTER … SET OPTIONS(labels=…)`); grants map to IAM, so `apply_grants`/`revoke_grants` currently log and no-op — actual IAM integration is a follow-up.
-- **DuckDB** is a no-op, since it has no governance model to drive.
+- **Snowflake** reconciles object tags (`ALTER … SET TAG`) and `GRANT`/`REVOKE` role grants, plus retention policy. Workspace binding and masking are not driven.
+- **BigQuery** reconciles tags as labels (`ALTER … SET OPTIONS(labels=…)`). Grants map to IAM, so `apply_grants` and `revoke_grants` currently log and do nothing. Real IAM integration is a follow-up.
+- **DuckDB** does nothing, because it has no governance model to drive.
 
-So declarative governance at depth is a Databricks capability today. The skeleton is warehouse-neutral; the depth is not yet portable.
+So governance at depth is a Databricks capability today. The skeleton is
+warehouse-neutral. The depth is not yet portable.
 
 **Partial.** Full on Databricks; tags + `GRANT`/`REVOKE` on Snowflake; label-based tagging only on BigQuery (grants no-op, IAM follow-up); no-op on DuckDB.
 
 ### Schema drift handling
 
-When a source schema changes under a materialized model, Rocky does not silently keep going. Drift handling chooses between ignoring the change, applying safe column-type widenings, and a full drop-and-recreate, with a grace period before destructive action. The point is that drift becomes an explicit, graded decision instead of a silent divergence.
+When a source schema changes under a materialized model, Rocky does not quietly
+keep going. It picks one of three responses: ignore the change, apply a safe
+column-type widening, or drop and recreate the table. A grace period runs before
+any destructive action. Drift becomes an explicit, graded decision instead of a
+silent divergence.
 
 **Shipped.**
 
 ### Content-addressed writes and replay
 
-Replay is two distinct things, and being precise about which one ships matters.
+Replay means two distinct things. Being precise about which one ships matters.
 
-The first is deterministic recording with ledger verification. Rocky records each run's per-model SQL hashes, row counts, bytes, and timings, and content-addresses the written artifacts so that the same inputs and code produce the same physical files. `rocky replay <run_id>` inspects that record and verifies it against the ledger. That ships today.
+**The first is deterministic recording with ledger verification.** Rocky records
+each run's per-model SQL hashes, row counts, bytes, and timings. It
+content-addresses the written artifacts: it names each one by the hash of its own
+bytes. The same inputs and code therefore produce the same physical files.
+`rocky replay <run_id>` inspects that record and verifies it against the ledger.
+That ships today.
 
-Alongside the run record, every materialization stamps a recipe-identity triple: `recipe_hash` (a fingerprint of the model's canonical typed IR, so the same program hashes the same no matter when it ran), `input_hash` (the inputs it read), and `env_hash` (the engine, adapter, and dialect it ran under). `rocky history --recipe <hash>` answers the audit question directly — "what produced this, and every other time this exact program ran." The triple is honest about strength: an `input_hash` proven by an observed freshness signature is tagged `heuristic` and is never presented as a byte-content claim, while a content-addressed input is `strong`. This is an identity and audit primitive, not a reproducibility claim.
+Every materialization also stamps a **recipe-identity triple**: three hashes that
+together answer "what produced this row set".
 
-The second is re-execution from the pinned record: replaying a past run by reconstructing each model's recipe from provenance (never the working tree) and re-running it to reproduce its output from scratch. `rocky replay --execute --verify` does this and compares the re-derived BLAKE3 against the recorded hash. It runs on a local DuckDB engine by default, or against the live warehouse with `--warehouse` — the latter materializes into an isolated `hcv2_replay_<run>` schema (never the recorded target's production location) and encodes the recomputed artifact with the target table's own physical column mapping, so a `bit_exact` verdict means the warehouse reproduced the recorded bytes exactly. Re-execution is scoped honestly: it covers deterministic, content-addressed models; a mutable-source read is `non_replayable` rather than re-run against current data, and a non-deterministic recipe is flagged so a `diverged` verdict there is expected rather than a failure.
+- `recipe_hash` fingerprints the model's canonical typed IR, so the same program hashes the same no matter when it ran.
+- `input_hash` covers the inputs it read.
+- `env_hash` covers the engine, adapter, and dialect it ran under.
 
-In short: deterministic recording and content-addressed verification, plus re-execution from the record for deterministic content-addressed models — locally or on the warehouse.
+`rocky history --recipe <hash>` answers the audit question directly: what
+produced this, and every other time this exact program ran. The triple is honest
+about its own strength. An `input_hash` proven by an observed freshness signature
+is tagged `heuristic` and is never presented as a claim about byte content. A
+content-addressed input is tagged `strong`. This is an identity and audit
+primitive, not a reproducibility claim.
+
+**The second is re-execution from the pinned record.** To replay a past run,
+Rocky rebuilds each model's recipe from provenance, never from the working tree.
+It then re-runs that recipe to reproduce the output from scratch.
+`rocky replay --execute --verify` does this and compares the re-derived BLAKE3
+hash against the recorded one.
+
+It runs on a local DuckDB engine by default, or against the live warehouse with
+`--warehouse`. The warehouse path materializes into an isolated
+`hcv2_replay_<run>` schema, never the recorded target's production location. It
+encodes the recomputed artifact with the target table's own physical column
+mapping. So a `bit_exact` verdict means the warehouse reproduced the recorded
+bytes exactly.
+
+Re-execution is scoped honestly. It covers deterministic, content-addressed
+models. A model that reads a mutable source is classified `non_replayable`
+instead of being re-run against current data. A non-deterministic recipe is
+flagged, so a `diverged` verdict there is expected rather than a failure.
 
 **Shipped for deterministic content-addressed models.** Recording and ledger verification ship; re-execution ships for the deterministic content-addressed case (mutable-source models classified `non_replayable`, non-deterministic recipes flagged).
 
-Content-addressed materialization itself ships for single-writer Delta and UniForm: blake3-hashed Parquet files plus a Delta log commit, with Iceberg-compatible readers seeing the same snapshot. It is single-writer and does not yet cover multi-writer concurrency, broad schema evolution, or deletion vectors.
+Content-addressed materialization itself ships for single-writer Delta and
+UniForm, a Delta feature that also publishes Iceberg metadata. It writes
+blake3-hashed Parquet files plus a Delta log commit, and Iceberg-compatible
+readers see the same snapshot. It is single-writer. It does not yet cover
+multi-writer concurrency, broad schema evolution, or deletion vectors. A deletion
+vector is a Delta feature that records deleted rows in a side file rather than
+rewriting the Parquet.
 
 **Partial.** Single-writer content-addressed Delta/UniForm ships; multi-writer, broad schema evolution, and deletion vectors do not.
 
 ### VS Code trust overlays
 
-The VS Code extension renders the lineage graph and overlays four trust signals onto it, each backed by CLI output:
+The VS Code extension draws the lineage graph and paints four trust signals onto
+it. Each one is backed by CLI output.
 
-1. **Drift**: schema drift against the warehouse. The overlay expects a dedicated drift command; there is no standalone `rocky drift` subcommand yet (drift is detected inside `rocky run`/`rocky plan`), so this overlay degrades gracefully to unavailable until that surface lands.
+1. **Drift**: schema drift against the warehouse. This overlay expects a dedicated drift command. There is no standalone `rocky drift` subcommand yet, because drift is detected inside `rocky run` and `rocky plan`. The overlay degrades to unavailable until that surface lands.
 2. **Breaking**: breaking changes from the semantic CI diff.
 3. **Replay**: the last recorded run for each model.
 4. **Governance**: compliance and masking status.
@@ -125,7 +251,8 @@ The VS Code extension renders the lineage graph and overlays four trust signals 
 
 ## The honesty grade
 
-Every load-bearing claim, in one table. The partial and not-yet rows are where teams get surprised.
+Every load-bearing claim, in one table. The partial rows are where teams get
+surprised.
 
 | Claim | Grade | What that means |
 |---|---|---|
@@ -144,28 +271,37 @@ Every load-bearing claim, in one table. The partial and not-yet rows are where t
 
 ## What to lead with
 
-If you are deciding whether Rocky is worth your team's time, lead with the enforcement plane: branches, content-addressed replay, per-model cost, declarative governance, the dialect-divergence lint (`P001`), and compile-time contracts. The lint alone is useful the day you start a warehouse migration and essential the day you finish one.
+If you are deciding whether Rocky is worth your team's time, lead with the
+enforcement plane: branches, content-addressed replay, per-model cost,
+declarative governance, the dialect-divergence lint (`P001`), and compile-time
+contracts. The lint alone is useful the day you start a warehouse migration, and
+essential the day you finish one.
 
-Rocky being written in Rust matters for speed and for the existence of a real LSP, but it is not the reason to choose it. The reason is that the failure modes above become compile errors and CI gates.
+Rocky being written in Rust matters for speed, and for the existence of a real
+LSP. It is not the reason to choose it. The reason is that the failure modes
+above become compile errors and CI gates.
 
 ## Where Rocky sits next to the adjacent tools
 
-A sophisticated reader will already be holding Rocky up against a few specific things. Here is the honest framing for each.
-
-### dbt Fusion (head-to-head)
-
-In June 2026 dbt Labs open-sourced the Fusion runtime as dbt Core v2.0 (Rust, Apache 2.0, alpha); the recommended Fusion distribution is a genuine compiler with multi-dialect SQL validation, a real LSP, and column-level lineage in the editor, and it is the closest thing in the dbt ecosystem to what Rocky does. The differentiation is in the enforcement plane: named branches, content-addressed recording and ledger verification, per-model cost budgets that fail the build, a dialect-portability lint, and declarative governance and masking under Apache 2.0 rather than gated behind a paid platform tier. Fusion still uses Jinja templating, so its strictest, build-failing analysis is opt-in; Rocky keeps SQL first-class with no Jinja, and offers an optional typed DSL only where SQL does not fit.
-
-Always read "dbt" with the qualifier. dbt Core 1.x is a templating engine and cannot catch the failures above at compile time by design. dbt Core v2.0 (the Fusion runtime) is the actual head-to-head; the type-checking and column-level lineage that catch some of these live in its Fusion extension and require opting into `strict` mode (the default `baseline` mode is lighter and warn-only). They are structurally different tools.
+You are probably holding Rocky up against something already in your stack. Here
+is the honest framing for two of them.
 
 ### Databricks LakeFlow (head-to-head, with a caveat)
 
-LakeFlow is warehouse-coupled and comes free with the platform. If portability across warehouses and a real compiler with serious tooling matter to you, that is where Rocky differentiates. If they do not, the warehouse-native option may simply be good enough for your team, and that is a legitimate answer.
+LakeFlow is coupled to the warehouse and comes free with the platform. Rocky
+differentiates if portability across warehouses matters to you, and if a real
+compiler with serious tooling matters. If neither does, the warehouse-native
+option may simply be good enough for your team. That is a legitimate answer.
 
 ### Polaris and the open table formats (category clarification)
 
-This one is a category question, not a head-to-head. Polaris is Snowflake's Iceberg REST catalog; Iceberg and Delta are open table formats. Rocky is none of those. Rocky targets them. It writes content-addressed Delta and UniForm that Iceberg-compatible readers can consume, and it treats the format and catalog as the substrate it sits above.
+This one is a category question, not a head-to-head. Polaris is Snowflake's
+Iceberg REST catalog. Iceberg and Delta are open table formats. Rocky is none of
+those. Rocky targets them. It writes content-addressed Delta and UniForm that an
+Iceberg-compatible reader can consume. It treats the format and the catalog as
+the substrate it sits above.
 
 ---
 
-Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.
+Rocky is the typed graph between your code and whichever warehouse, table format,
+or query engine you've chosen.

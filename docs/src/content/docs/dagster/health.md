@@ -5,9 +5,9 @@ sidebar:
   order: 15
 ---
 
-`dagster-rocky` ships `rocky_healthcheck()`, a wrapper around
-`rocky doctor` suitable for Dagster+ code-location startup probes, custom
-asset checks, and custom ops.
+`rocky_healthcheck()` wraps the `rocky doctor` command. `rocky doctor` runs
+Rocky's built-in environment checks and gives each one a status. Use the wrapper
+in a Dagster+ code-location startup probe, a custom asset check, or a custom op.
 
 ## `rocky_healthcheck(rocky) -> HealthcheckResult`
 
@@ -20,8 +20,8 @@ Calls `RockyResource.doctor()` and translates the outcome into a
 | `False` | `<DoctorResult>` | `None` | At least one check is critical |
 | `False` | `None` | `<message>` | The binary failed to invoke |
 
-Warning-status checks are treated as **non-blocking**; only `critical` fails
-the health probe.
+A warning-status check does not block. Only a `critical` check fails the health
+probe.
 
 ## Quickstart
 
@@ -83,9 +83,10 @@ location as unhealthy and routes traffic away from it.
 
 ## State-backend health
 
-Alongside `rocky_healthcheck`, `dagster-rocky` ships `state_health()` (also
-available as `RockyResource.state_health()`), a live snapshot of Rocky's
-state backend suited to sensors, schedules, and asset checks:
+`state_health()` reports a live snapshot of Rocky's
+[state store](/reference/glossary/#state-store), the embedded database that
+holds run records, watermarks, and plans. It is also available as
+`RockyResource.state_health()`. Use it in sensors, schedules, and asset checks.
 
 ```python
 from dagster_rocky import RockyResource, state_health
@@ -109,16 +110,17 @@ print(health.probe_outcome)      # "ok" / failure reason when probe_write=True, 
 | `probe_duration_ms` | Probe duration when `probe_write=True`, else `None` |
 | `probe_error` | Probe error message on failure, else `None` |
 
-The cheap path (`probe_write=False`, the default) reads the config plus the
-most recent run from history. With `probe_write=True` it additionally runs
-`rocky doctor --check state_rw` to exercise a put/get/delete round-trip
-against the backend. It is tolerant of a missing binary or unreadable store —
-fields degrade to `None` rather than raising, so it's safe to call every
-sensor tick.
+The cheap path is the default, `probe_write=False`. It reads the config and the
+most recent run from history, and nothing more.
 
-## Why a wrapper, not a method on `RockyResource`?
+`probe_write=True` also runs `rocky doctor --check state_rw`. That exercises a
+put, get, and delete round-trip against the backend.
+
+Either path tolerates a missing binary or an unreadable store. Fields degrade to
+`None` instead of raising, so it is safe to call on every sensor tick.
+
+## Why the healthcheck is a function, not a resource method
 
 `rocky_healthcheck` lives outside `RockyResource` because the resource is a
-frozen Pydantic model; extending it with new methods on every iteration
-churns the resource module. It can be promoted to a method later if it
-stabilizes.
+frozen Pydantic model. Adding a method for each new idea churns the resource
+module. The function can become a method later, once it settles.

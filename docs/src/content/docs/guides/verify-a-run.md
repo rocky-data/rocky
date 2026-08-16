@@ -1,17 +1,22 @@
 ---
 title: Verify a Run Without Rocky
-description: How a compliance, governance, or finance auditor can verify a recorded Rocky run end-to-end using only a redb reader, a SQL client, and a Parquet hasher, no rocky binary required
+description: Check what a Rocky run did with three general-purpose tools, a small redb reader, a SQL client, and a file hasher. You do not need the rocky binary.
 sidebar:
   order: 9
 ---
 
-This guide shows a compliance, governance, or finance reviewer how to verify what a Rocky pipeline did without trusting (or installing) the `rocky` binary, using general-purpose tools (a small redb reader, a SQL client, and a Parquet hasher) to answer the questions an audit actually asks.
+This guide is for a compliance, governance, or finance reviewer. It shows you how to check what a Rocky pipeline did without trusting, or installing, the `rocky` binary. You use three general-purpose tools instead.
 
-Rocky records every run into an embedded ledger and, on the content-addressed write path, names output files by the hash of their bytes. Both facts are verifiable with off-the-shelf tools.
+Two facts make that possible.
 
-## The audit question
+- Rocky records every run into an embedded **ledger**: a single database file holding one record per run.
+- On one write path, Rocky names each output file after a **hash** of that file's own bytes. A hash is a short fingerprint. Change one byte of the file and the fingerprint changes.
 
-An audit of a data run reduces to four questions. Each maps to a concrete, independently verifiable field.
+Both facts are checkable with off-the-shelf tools.
+
+## The four questions an audit asks
+
+Each question maps to a concrete field you can verify on your own.
 
 | Question | Where the answer lives | How you verify it |
 |---|---|---|
@@ -20,19 +25,19 @@ An audit of a data run reduces to four questions. Each maps to a concrete, indep
 | What was the code? | `ModelExecution.sql_hash` (per model) | Read the ledger; reconstruct the model from git at `git_commit` |
 | What was the output? | `ModelExecution.rows_affected` + the warehouse table itself | Read the ledger; `DESCRIBE` / `COUNT(*)` the table with a SQL client |
 
-The first three come straight out of Rocky's state ledger. The fourth is confirmed against the warehouse directly, so a tampered ledger cannot fake a row count that the warehouse disagrees with.
+The first three answers come straight out of the ledger. The fourth is confirmed against the warehouse directly. So a tampered ledger cannot fake a row count that the warehouse disagrees with.
 
 ## The three tools
 
 None of these is the `rocky` binary.
 
-1. **A redb reader.** Rocky's ledger is an [redb](https://github.com/cberner/redb) embedded key-value store, written to `.rocky-state.redb` (local backend). redb has no ubiquitous CLI, so the reader below is a ~30-line Rust program using the open-source `redb` crate and `serde_json`. The reader opens tables and decodes their values.
-2. **A SQL client.** Whatever speaks to your warehouse: `duckdb`, `snowsql`, the `bq` CLI, or the Databricks SQL CLI (`dbsqlcli`). Used to confirm the output table's schema and row count.
-3. **A Parquet hasher.** For the content-addressed path (last section), a `blake3` hasher such as [`b3sum`](https://github.com/BLAKE3-team/BLAKE3) plus any Parquet viewer.
+1. **A redb reader.** Rocky's ledger is an [redb](https://github.com/cberner/redb) embedded key-value store, written to `.rocky-state.redb` on the local backend. redb has no widely installed CLI, so the reader below is a ~30-line Rust program built on the open-source `redb` crate and `serde_json`. It opens tables and decodes their values.
+2. **A SQL client.** Whatever already speaks to your warehouse: `duckdb`, `snowsql`, the `bq` CLI, or the Databricks SQL CLI (`dbsqlcli`). You use it to confirm the output table's schema and row count.
+3. **A file hasher.** For the content-addressed path (the section after the walkthrough), a `blake3` hasher such as [`b3sum`](https://github.com/BLAKE3-team/BLAKE3), plus any Parquet viewer. "Content-addressed" means the file is named after the hash of its own contents.
 
 ### The redb reader
 
-The ledger is a redb database whose tables are plain strings and whose values are `serde_json`-encoded blobs. The logical table names used in Rocky's source are uppercase constants (`RUN_HISTORY`, `OUTPUT_ARTIFACTS`, `BRANCHES`); the on-disk table names are their lowercase string forms. You open the on-disk name.
+The ledger is a redb database. Its table names are plain strings and its values are `serde_json`-encoded blobs. Rocky's source refers to the tables by uppercase constants (`RUN_HISTORY`, `OUTPUT_ARTIFACTS`, `BRANCHES`). The on-disk names are the lowercase string forms. You open the on-disk name.
 
 | Logical name (Rocky source) | On-disk table name | Value |
 |---|---|---|
@@ -40,7 +45,7 @@ The ledger is a redb database whose tables are plain strings and whose values ar
 | `OUTPUT_ARTIFACTS` | `output_artifacts` | one `ArtifactRecord` JSON blob per content-addressed write |
 | `BRANCHES` | `branches` | one branch record per named branch |
 
-A minimal reader (pinned to `redb = "2"` and `serde_json = "1"`) that dumps every run record:
+Here is a minimal reader, pinned to `redb = "2"` and `serde_json = "1"`, that dumps every run record:
 
 ```rust
 // Cargo.toml: redb = "2"   serde_json = "1"
@@ -62,25 +67,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Swap `"run_history"` for `"output_artifacts"` or `"branches"` to dump those tables. The reader never links against Rocky; it reads the file format directly.
+Swap `"run_history"` for `"output_artifacts"` or `"branches"` to dump those tables. The reader never links against Rocky. It reads the file format directly.
 
-## The walkthrough
+## Verify one run, step by step
 
-This walks an auditor through verifying a single run of a three-model transformation pipeline (`raw_orders` → `stg_orders` → `fct_revenue`). The outputs shown are representative; identity fields are scrubbed to placeholders.
+The walkthrough below verifies a single run of a three-model transformation pipeline (`raw_orders` → `stg_orders` → `fct_revenue`). The outputs shown are representative, and the identity fields are replaced with placeholders.
 
-### Step 1 — Open the ledger
+### Step 1 — Get the ledger file
 
-Point the reader at the run's `.rocky-state.redb` and open the `run_history` table (logical name `RUN_HISTORY`).
+Ask the operator for the run's `.rocky-state.redb`. It is a single file.
+
+If the project uses a remote backend (S3 or Valkey), ask for the local snapshot instead. The table layout is identical.
+
+### Step 2 — Open the `run_history` table
+
+Point the reader at the file and open the table by its on-disk name.
 
 ```rust
 let table = txn.open_table(RUN_HISTORY)?; // on-disk "run_history"
 ```
 
-The store is a single file. If you only have a remote (S3/Valkey) backend, ask the operator to export the local snapshot; the table layout is identical.
+### Step 3 — Pick the run you are auditing
 
-### Step 2 — Find the run
-
-List `run_history` and pick the run by its timestamp. Each row is one `RunRecord`, keyed by `run_id`.
+List `run_history` and choose the run by its timestamp. Each row is one `RunRecord`, keyed by `run_id`.
 
 ```json
 {
@@ -97,17 +106,25 @@ List `run_history` and pick the run by its timestamp. Each row is one `RunRecord
   "target_catalog": "analytics_prod",
   "hostname": "ci-runner-01",
   "rocky_version": "1.47.1",
-  "models_executed": [ /* ... see step 3 ... */ ]
+  "models_executed": [ /* ... see step 5 ... */ ]
 }
 ```
 
-The `run_id` is Rocky's `run-<UTC-date>-<UTC-time>-<millis>` form. The `status` and `trigger` values are the capitalized enum forms as they serialize on disk (`"Success"`, `"Ci"` / `"Manual"`); `session_source` serializes lowercase (`"cli"`, `"dagster"`, `"lsp"`, `"http_api"`; a CI runner records `"cli"`).
+### Step 4 — Read the run's identity fields
 
-That single row answers *who* (`triggering_identity` + `git_commit`), *when* (`started_at` / `finished_at`), and *under what config* (`config_hash`). The `git_commit` is the anchor for the next step.
+That single row answers three of the four audit questions:
 
-### Step 3 — Read the per-model code fingerprints
+- *Who* — `triggering_identity` and `git_commit`.
+- *When* — `started_at` and `finished_at`.
+- *Under what config* — `config_hash`.
 
-`models_executed` is an embedded array on the `RunRecord` (not a separate table). Each entry is a `ModelExecution` carrying the SQL hash, status, and row count for one model.
+Three conventions help you read the values correctly. The `run_id` uses the form `run-<UTC-date>-<UTC-time>-<millis>`. The `status` and `trigger` values are capitalized on disk (`"Success"`, `"Ci"`, `"Manual"`). The `session_source` value is lowercase (`"cli"`, `"dagster"`, `"lsp"`, `"http_api"`), and a CI runner records `"cli"`.
+
+Carry the `git_commit` forward. It anchors step 6.
+
+### Step 5 — Read the per-model code fingerprint
+
+Read `models_executed`, an array embedded on the `RunRecord` rather than a separate table. Each entry is a `ModelExecution` for one model.
 
 ```json
 "models_executed": [
@@ -125,21 +142,21 @@ That single row answers *who* (`triggering_identity` + `git_commit`), *when* (`s
 ]
 ```
 
-`sql_hash` is the fingerprint of the exact SQL Rocky executed for `fct_revenue`. `rows_affected` is what Rocky recorded writing. (`bytes_written` is `null` on every adapter today; see the honesty grade at the end.)
+`sql_hash` is the fingerprint of the exact SQL Rocky executed for `fct_revenue`. `rows_affected` is what Rocky recorded writing. (`bytes_written` is `null` on every adapter today. See the honesty table at the end.)
 
-### Step 4 — Reconstruct the code from git
+### Step 6 — Recover the model source from git
 
-The run record pins `git_commit`. Recover the model source at that commit, independent of Rocky:
+Use the `git_commit` from step 4 to check out the model's source, independent of Rocky.
 
 ```bash
 git show a1b2c3d4e5f60718293a4b5c6d7e8f9012345678:models/fct_revenue.rocky
 ```
 
-You now have the exact code that produced the run. The `sql_hash` lets you confirm that the source at that commit is the source that ran: compile or compare against your own record of that commit. If the working tree has drifted from `git_commit`, the audit trail still points at the immutable commit, not the current files.
+You now hold the exact code that produced the run. Use `sql_hash` to confirm the source at that commit is the source that ran: compile it, or compare it against your own record of that commit. If the working tree has drifted since, the audit trail still points at the immutable commit rather than the current files.
 
-### Step 5 — Confirm the output against the warehouse
+### Step 7 — Confirm the output against the warehouse
 
-Finally, query the warehouse directly with your SQL client. This is the step that does not rely on the ledger being honest.
+Query the warehouse directly with your SQL client. This is the step that does not rely on the ledger being honest.
 
 ```sql
 -- snowsql / bq / dbsqlcli / duckdb — whichever fits your warehouse
@@ -147,17 +164,34 @@ DESCRIBE TABLE analytics_prod.staging__orders.fct_revenue;
 SELECT COUNT(*) FROM analytics_prod.staging__orders.fct_revenue;
 ```
 
-Compare the live row count to `rows_affected` from step 3 and the live schema to what the model at `git_commit` declares. Agreement across the ledger, the git source, and the live warehouse is the verification.
+Compare the live row count to `rows_affected` from step 5. Compare the live schema to what the model at `git_commit` declares. Agreement across the ledger, the git source, and the live warehouse is the verification.
 
-## A stronger guarantee: content-addressed output
+## Stronger proof: output files named by their own hash
 
-On the content-addressed write path (S3-backed lakehouse materialization), Rocky goes further than recording a row count: it names each output Parquet file by the BLAKE3 hash of its bytes, and records that hash in the `output_artifacts` ledger table. This lets an auditor prove the output bytes are exactly what Rocky recorded, with no trust in the ledger at all.
+On the content-addressed write path (S3-backed lakehouse materialization), Rocky goes further than recording a row count. It names each output Parquet file after the BLAKE3 hash of that file's bytes, and it records the same hash in the `output_artifacts` ledger table. You can then prove the output bytes are exactly what Rocky recorded, with no trust in the ledger at all.
 
-The hash is computed on the Parquet bytes before the object-store upload, by the writer's `build_parquet` step. That step pins its Parquet settings (writer version, SNAPPY compression, page size, dictionary encoding off) precisely so the same Rocky version on the same input produces byte-identical output. The engine's own `build_parquet_is_byte_stable_across_runs` test (in `engine/crates/rocky-iceberg/src/uniform_writer/parquet_builder.rs`) pins that determinism, which is what makes the filename a stable content address rather than a coincidence.
+```
+  THE LEDGER                       THE FILE IN OBJECT STORAGE
+  output_artifacts row             736713a2…d5bf0.parquet
+  ┌─────────────────────┐          ┌───────────────────────────┐
+  │ blake3_hash: 736713…│          │ the filename IS the hash  │
+  │ file_path:   s3://… │─────────►│ the bytes are the output  │
+  └──────────┬──────────┘          └─────────────┬─────────────┘
+             │                                   │ you run b3sum
+             │ recorded hash                     ▼
+             │                          ┌──────────────────┐
+             └────────── compare ──────►│ hash you compute │
+                                        └──────────────────┘
 
-This repository ships a real sample of one such file so you can run the check yourself, not just read about it: `examples/audit-sample/736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0.parquet`. It is a genuine, identity-free Parquet produced by the engine's content-addressed `build_parquet` path, and its filename is the BLAKE3 hash of its bytes.
+  All three equal ⇒ the bytes are exactly what Rocky recorded.
+  Any one differs ⇒ the bytes changed after the run.
+```
 
-Given a content-addressed output file named `<hash>.parquet`, verify it in two steps:
+Rocky computes the hash on the Parquet bytes before it uploads them, in the writer's `build_parquet` step. That step pins its Parquet settings (writer version, SNAPPY compression, page size, dictionary encoding off). The same Rocky version on the same input therefore produces byte-identical output. The engine's own `build_parquet_is_byte_stable_across_runs` test, in `engine/crates/rocky-iceberg/src/uniform_writer/parquet_builder.rs`, pins that determinism. That is what makes the filename a stable address for the content rather than a coincidence.
+
+This repository ships a real sample of such a file, so you can run the check yourself: `examples/audit-sample/736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0.parquet`. It is a genuine, identity-free Parquet produced by the engine's content-addressed `build_parquet` path, and its filename is the BLAKE3 hash of its bytes.
+
+Given any content-addressed file named `<hash>.parquet`, verify it in two steps:
 
 ```bash
 # 1. Hash the bytes yourself.
@@ -168,9 +202,9 @@ b3sum 736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0.parquet
 #    All three agreeing means the bytes are exactly what was recorded.
 ```
 
-Run against the shipped sample, `b3sum` prints `736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0`, which is exactly the filename. That equality is the whole guarantee.
+Run against the shipped sample, `b3sum` prints `736713a2611f762af09ee4445c09157bcfdbf6e07145dd8edf2cfd203d8d5bf0`. That is exactly the filename. The equality is the whole guarantee.
 
-The matching `output_artifacts` ledger row carries the same hash plus the join keys back to the run. For the shipped sample, that row reads (the `run_id`, `file_path` prefix, and timestamp are illustrative; the `blake3_hash` and `size_bytes` are the sample's real values):
+The matching `output_artifacts` ledger row carries the same hash, plus the keys that join back to the run. For the shipped sample, that row reads as follows. The `run_id`, the `file_path` prefix, and the timestamp are illustrative; the `blake3_hash` and `size_bytes` are the sample's real values.
 
 ```json
 {
@@ -184,16 +218,19 @@ The matching `output_artifacts` ledger row carries the same hash plus the join k
 }
 ```
 
-Because the filename *is* the hash and the ledger row carries it, any divergence between the filename, your own `b3sum`, and the recorded `blake3_hash` means the bytes changed since the run.
+This stronger proof applies to the content-addressed materialization path only. A general run against DuckDB, Snowflake, BigQuery, or Databricks records the ledger and `sql_hash`, as in the walkthrough above, but emits no hash-named Parquet.
 
-This stronger guarantee applies specifically to the content-addressed materialization path. A general run against DuckDB, Snowflake, BigQuery, or Databricks records the ledger and `sql_hash` (the walkthrough above), but does not emit a hash-named Parquet.
+## Auditable reuse: the input-match index and the provenance record
 
-## Auditable reuse: the input-match index and provenance record
+The hash above proves *what bytes a run produced*. A reuse claim asks a different question: *may a later run stand on an earlier run's bytes?*
 
-The content-addressed hash above proves *what bytes a run produced*. A reuse claim asks a different question: *can a later run legitimately stand on an earlier run's bytes?* When the opt-in `[reuse]` block is enabled, Rocky records an **input-match index** and a per-build **provenance record** that make that question answerable offline.
+Turn on the opt-in `[reuse]` block and Rocky records two things that answer it offline:
+
+- an **input-match index**, which records a fingerprint of everything that went into each build;
+- a per-build **provenance record**, which records where that build's output came from.
 
 :::note[`[reuse]` scope]
-`[reuse]` applies **only** to the content-addressed (S3/UniForm) write path — not DuckDB, Snowflake, BigQuery, or a plain warehouse target. `enabled` (the byte-level point-to reuse this section describes) is **default-off** and live-verified on that path: when on, an eligible model whose inputs match a prior strong run may stand on that run's bytes instead of re-executing. A second, orthogonal knob, `column_level` (column-level skip), is **default-on** there since engine 1.61.0. Both decisions are fail-closed — any doubt builds. See the [`[reuse]` configuration entry](/reference/configuration/#reuse) for the field reference.
+`[reuse]` applies **only** to the content-addressed (S3/UniForm) write path. It does not apply to DuckDB, Snowflake, BigQuery, or a plain warehouse target. `enabled` (the byte-level point-to reuse this section describes) is **default-off** and live-verified on that path: when on, an eligible model whose inputs match a prior strong run may stand on that run's bytes instead of re-executing. A second, orthogonal knob, `column_level` (column-level skip), is **default-on** there since engine 1.61.0. Both decisions are fail-closed: any doubt builds. See the [`[reuse]` configuration entry](/reference/configuration/#reuse) for the field reference.
 :::
 
 ```toml
@@ -202,14 +239,14 @@ The content-addressed hash above proves *what bytes a run produced*. A reuse cla
 enabled = true
 ```
 
-Two more on-disk tables join the redb reader's vocabulary:
+Two more on-disk tables join the reader's vocabulary:
 
 | Logical name (Rocky source) | On-disk table name | Value |
 |---|---|---|
 | `INPUT_INDEX` | `input_index` | one `InputIndexEntry` JSON blob per indexed build, keyed by the model's `input_hash` |
 | `INPUT_PROVENANCE` | `input_provenance` | one `ProvenanceRecord` JSON blob per indexed build, keyed by `"{run_id}|{model_name}"` |
 
-A `ProvenanceRecord` embeds everything the recompute needs:
+A `ProvenanceRecord` embeds everything a recompute needs:
 
 ```json
 {
@@ -231,43 +268,93 @@ A `ProvenanceRecord` embeds everything the recompute needs:
 }
 ```
 
-The `upstreams` array is the exact `Vec<UpstreamIdentity>` that was folded into `input_hash`. Each entry is either a `"content"` identity (a `strong` upstream, carrying the upstream's recorded `blake3_hash`) or a `"watermark"` identity (a `heuristic` upstream, carrying a `max_ts` and/or `row_count`). Persisting it is what makes the input side recomputable offline: without it you would have to trust Rocky's recorded `input_hash`; with it you re-derive `input_hash` yourself.
+Read the fields like this:
 
-### The two-claim split: read this carefully
+- `skip_hash` is a fingerprint of the model's logic.
+- `input_hash` is a fingerprint of the logic, the target table, and every upstream, folded together.
+- `model_ir_canonical_json` is Rocky's own typed description of the model (`ModelIr`), written out in a canonical, key-sorted form.
+- `output_blake3` is the BLAKE3 hash of each recorded output file, one entry per content-addressed file.
+- `output_path` is where each of those files lives. It is index-aligned with `output_blake3`.
+- `proof_class` is the label saying which guarantee applies (see below).
 
-The record carries two *separate* claims, proven by two *different* artifacts. Conflating them is the one mistake to avoid:
+The `upstreams` array is the exact list of upstream identities (`Vec<UpstreamIdentity>`) that was folded into `input_hash`. Each entry is one of two kinds. A `"content"` identity is a `strong` upstream and carries that upstream's recorded `blake3_hash`. A `"watermark"` identity is a `heuristic` upstream and carries a `max_ts`, a `row_count`, or both. Persisting the array is what makes the input side recomputable offline. Without it you would have to trust Rocky's recorded `input_hash`. With it you re-derive `input_hash` yourself.
 
-- **Input-logic match — proven by `skip_hash`.** `skip_hash` is a cosmetic-invariant hash of the model's normalised SQL plus its typed structural facts. Equal `skip_hash` means *the logic looks unchanged*. It is explicitly **not** a guarantee that two runs produce identical rows: non-deterministic SQL (timestamps, randomness, session settings, UDFs) can diverge under an identical `skip_hash`. Use it to attest *what was declared*, never *what was produced*.
-- **Byte-identity of the reused bytes — proven by `b3sum`.** The `output_blake3` is the BLAKE3 of the recorded Parquet, re-derivable exactly as in the previous section. This attests *the recorded bytes are exactly these bytes*, and nothing about whether re-executing the model would reproduce them.
+### Two separate claims, two separate proofs
 
-So the provenance record attests an **input-logic match plus the byte-identity of the recorded bytes**. It is **not** a reproducibility claim: it does not assert that a fresh re-run of the model would reproduce the recorded output.
+The record carries two claims. Different artifacts prove them. Conflating the two is the one mistake to avoid.
+
+```
+  PROVENANCE RECORD
+  ┌──────────────────────────────┐
+  │ skip_hash                    │──► equal skip_hash means
+  │ fingerprint of the LOGIC     │    THE LOGIC LOOKS UNCHANGED
+  └──────────────────────────────┘    (not: the rows are the same)
+
+  ┌──────────────────────────────┐
+  │ output_blake3                │──► equal to your own b3sum means
+  │ fingerprint of the BYTES     │    THESE ARE THE RECORDED BYTES
+  └──────────────────────────────┘    (not: a re-run would produce them)
+```
+
+**Input-logic match, proven by `skip_hash`.** `skip_hash` is a cosmetic-invariant hash of the model's normalised SQL plus its typed structural facts. Equal `skip_hash` means the logic looks unchanged. It is explicitly **not** a guarantee that two runs produce identical rows. Non-deterministic SQL (timestamps, randomness, session settings, user-defined functions) can diverge under an identical `skip_hash`. Use it to attest *what was declared*, never *what was produced*.
+
+**Byte-identity of the reused bytes, proven by `b3sum`.** The `output_blake3` value is the BLAKE3 of the recorded Parquet. You re-derive it exactly as in the previous section. It attests that the recorded bytes are exactly these bytes. It says nothing about whether re-executing the model would reproduce them.
+
+So the provenance record attests an **input-logic match plus the byte-identity of the recorded bytes**. It is **not** a reproducibility claim. It does not assert that a fresh re-run of the model would reproduce the recorded output.
 
 ### Recompute it yourself
 
-Four independent checks, none of which needs the `rocky` binary:
+Four independent checks. None of them needs the `rocky` binary.
 
-1. **IR-hash check.** Read the `ProvenanceRecord`, parse `model_ir_canonical_json` back into a `ModelIr` (it is the exact canonical, key-sorted JSON the recorder hashed), recompute its `skip_hash`, and confirm it equals the recorded `skip_hash`. This is the input-logic half: it confirms the embedded logic matches what was indexed.
-2. **Input-hash recompute.** Re-derive `input_hash` from the bytes of the record alone and confirm it equals the recorded `input_hash`. The key is `blake3` over a canonical (key-sorted, whitespace-free) JSON projection of: a version byte, the `skip_hash`, the target `catalog.schema.table` identity (read it off the `target` in the parsed `model_ir_canonical_json`), and the `upstreams` array sorted by `upstream_key`. Because the projection and its inputs are all in the record, the recompute needs no live model and no Rocky binary; it confirms the recorded `input_hash` is the one those inputs actually produce, closing the input side that step 1 only half-covers.
-3. **Byte-identity check.** For each `output_blake3` / `output_path` pair, fetch the Parquet at the path, `b3sum` it, and confirm the hash equals the recorded `output_blake3` and the file's own content-addressed name (the previous section's check, applied to the reused file). For a `strong` record you can extend this one hop upstream: each `"content"` entry in `upstreams` carries the upstream's recorded `blake3_hash`, which you cross-check against *that upstream's own* `ProvenanceRecord` (its `output_blake3`), whose `output_path` then locates the upstream bytes to `b3sum`. The `UpstreamIdentity` itself carries only the key and hash; the path to the bytes lives on the upstream's record, not on this one.
-4. **Refcount sanity.** When two runs genuinely share one set of bytes, `refcount_for_hash(blake3)` over the `output_artifacts` table returns `≥ 2`: both the original run's and the reusing run's `ArtifactRecord` rows point at the same hash. That is the evidence the reuse was *recorded*, not merely asserted. A build that has never been reused has a refcount of `1`; whenever a reuse decision claims a later run stood on these bytes, the `≥ 2` condition is the check that proves the shared reference was written.
+**Check 1 — the IR hash.** Confirm the embedded logic matches what was indexed.
 
-The `proof_class` label (`strong` or `heuristic`) tells a consumer which guarantee applies. `strong` means every upstream identity folded into the `input_hash` was itself a content hash, so every link in the chain has a recorded `b3sum` you can check against its own provenance record (this attests the *recorded* bytes, not that re-execution reproduces them). `heuristic` means at least one upstream was attested by a freshness signal (a watermark or row count) rather than a content hash; that attests *freshness*, not byte-identity, and a `heuristic` record must never be read as a byte-proof.
+1. Read the `ProvenanceRecord`.
+2. Parse `model_ir_canonical_json` back into a `ModelIr`. It is the exact canonical, key-sorted JSON the recorder hashed.
+3. Recompute its `skip_hash`.
+4. Confirm the result equals the recorded `skip_hash`.
+
+**Check 2 — the input hash.** Confirm the recorded `input_hash` is the one those inputs actually produce. This closes the input side that check 1 only half-covers.
+
+1. Read `skip_hash` from the record.
+2. Read the target `catalog.schema.table` identity off the `target` in the parsed `model_ir_canonical_json`.
+3. Sort the `upstreams` array by `upstream_key`.
+4. Build a canonical JSON projection — key-sorted and whitespace-free — of a version byte, the `skip_hash`, the target identity, and the sorted `upstreams`.
+5. Run `blake3` over that projection.
+6. Confirm the result equals the recorded `input_hash`.
+
+Every input to this recompute is in the record, so it needs no live model and no Rocky binary.
+
+**Check 3 — byte identity.** For each `output_blake3` / `output_path` pair:
+
+1. Fetch the Parquet file at `output_path`.
+2. Run `b3sum` on it.
+3. Confirm the hash equals the recorded `output_blake3`.
+4. Confirm it also equals the file's own content-addressed name.
+
+For a `strong` record you can extend this one hop upstream. Each `"content"` entry in `upstreams` carries the upstream's recorded `blake3_hash`. Cross-check that against *that upstream's own* `ProvenanceRecord`, in its `output_blake3` field. The upstream record's `output_path` then locates the upstream bytes to `b3sum`. The `UpstreamIdentity` entry itself carries only the key and the hash; the path to the bytes lives on the upstream's record, not on this one.
+
+**Check 4 — refcount sanity.** When two runs genuinely share one set of bytes, `refcount_for_hash(blake3)` over the `output_artifacts` table returns `≥ 2`. Both the original run's `ArtifactRecord` row and the reusing run's row point at the same hash. That is the evidence the reuse was *recorded*, not merely asserted. A build that has never been reused has a refcount of `1`. So whenever a reuse decision claims a later run stood on these bytes, the `≥ 2` condition is what proves the shared reference was written.
+
+The `proof_class` label tells a consumer which guarantee applies.
+
+- `strong` means every upstream identity folded into the `input_hash` was itself a content hash. Every link in the chain then has a recorded `b3sum` you can check against its own provenance record. This attests the *recorded* bytes. It does not attest that re-execution reproduces them.
+- `heuristic` means at least one upstream was attested by a freshness signal, a watermark or a row count, rather than by a content hash. That attests *freshness*, not byte-identity. Never read a `heuristic` record as a byte-proof.
 
 ## What this verifies, and what it does not
 
-Verifies, with the tools above and no `rocky` binary:
+Verified with the tools above, and no `rocky` binary:
 
-- That a run happened, when, and who triggered it (`RunRecord` audit trail).
+- That a run happened, when it ran, and who triggered it (the `RunRecord` audit trail).
 - What code ran, fingerprinted by `sql_hash` and anchored to an immutable `git_commit`.
 - The output table's live schema and row count, checked against the warehouse directly.
 - On the content-addressed path, that the output bytes match the recorded hash exactly.
-- With `[reuse]` enabled, that an indexed build's declared inputs are internally consistent (recompute `skip_hash` from the embedded canonical IR, then recompute `input_hash` from the persisted `skip_hash` + target identity + `upstreams` and confirm it matches the recorded value), and that the recorded output bytes are exactly those bytes (`b3sum`, extendable one hop to each `strong` upstream's recorded bytes via its own record), each labelled `strong` or `heuristic`.
-- For a deterministic content-addressed model, that **re-executing** the recorded recipe reproduces the recorded output byte-for-byte. `rocky replay --execute --verify` reconstructs the recipe from provenance (never the working tree), re-runs it, and compares the re-derived BLAKE3 against the recorded hash; `--warehouse` runs that re-execution against the live warehouse in an isolated replay schema, encoding the recomputed artifact with the target table's own physical column mapping so the digest is directly comparable to what the writer recorded.
+- With `[reuse]` enabled, that an indexed build's declared inputs are internally consistent, and that the recorded output bytes are exactly those bytes. The first half is checks 1 and 2 above; the second is check 3, extendable one hop to each `strong` upstream's recorded bytes via its own record. Each record is labelled `strong` or `heuristic`.
+- For a deterministic content-addressed model, that **re-executing** the recorded recipe reproduces the recorded output byte for byte. `rocky replay --execute --verify` reconstructs the recipe from provenance, never from the working tree, re-runs it, and compares the re-derived BLAKE3 against the recorded hash. Adding `--warehouse` runs that re-execution against the live warehouse, in an isolated replay schema. It encodes the recomputed artifact with the target table's own physical column mapping. The digest is then directly comparable to what the writer recorded.
 
-Does **not** verify:
+**Not** verified:
 
-- That re-running an arbitrary model reproduces its output. Re-execution is scoped to deterministic, content-addressed models: a model that reads a mutable source is classified `non_replayable` rather than re-run against current data, a model with a non-deterministic recipe (`now()`, `random()`) is flagged and may legitimately `diverge`, and a plain DuckDB/Snowflake/BigQuery/Databricks target that is not content-addressed carries no whole-output hash to compare against. The verdict (`bit_exact` / `diverged` / `non_replayable`) is always a classification, never a fabricated success.
-- That the warehouse table was not mutated by something else after the run. The ledger records what Rocky wrote; a later out-of-band `UPDATE` is outside its scope (this is exactly why step 5 checks the live warehouse).
+- That re-running an arbitrary model reproduces its output. Re-execution is scoped to deterministic, content-addressed models. A model that reads a mutable source is classified `non_replayable` rather than re-run against current data. A model with a non-deterministic recipe (`now()`, `random()`) is flagged and may legitimately `diverge`. A plain DuckDB, Snowflake, BigQuery, or Databricks target that is not content-addressed carries no whole-output hash to compare against. The verdict (`bit_exact` / `diverged` / `non_replayable`) is always a classification, never a fabricated success.
+- That the warehouse table was not mutated by something else after the run. The ledger records what Rocky wrote. A later out-of-band `UPDATE` is outside its scope. That is exactly why step 7 checks the live warehouse.
 
 ## Implementation honesty
 

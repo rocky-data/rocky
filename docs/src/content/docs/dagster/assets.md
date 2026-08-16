@@ -5,13 +5,17 @@ sidebar:
   order: 4
 ---
 
-`load_rocky_assets()` calls `rocky discover` and returns a list of Dagster `AssetSpec` objects, one for each enabled table across all sources. This gives you automatic asset discovery without manually defining each table.
+`load_rocky_assets()` returns one Dagster `AssetSpec` for every enabled table
+across all your Rocky sources. An `AssetSpec` declares an asset to Dagster
+without attaching a function that computes it. Use this when you want the asset
+list to follow your sources, instead of writing out each table by hand.
 
-## How it works
+## From `rocky discover` to `AssetSpec`
 
-1. `load_rocky_assets()` invokes `rocky.discover()` under the hood.
-2. Each enabled table across all sources becomes one `AssetSpec`.
-3. Asset keys, groups, tags, and metadata are derived from the source and table information.
+`load_rocky_assets()` calls `rocky discover`, which asks each configured source
+which tables it holds. Every enabled table becomes one `AssetSpec`. The asset
+key, group, tags, and metadata all come from the source and the table, using the
+rules below.
 
 ## Default mappings
 
@@ -31,7 +35,10 @@ For example, a table `orders` from a Fivetran source with components `tenant=acm
 
 ### Group
 
-The default group name is the first string-valued component; list-valued components are skipped, and it falls back to the source type when every component is list-valued. For the example above, the group would be `"acme"`.
+The default group name is the first component whose value is a string.
+Components whose value is a list are skipped. If every component is
+list-valued, the group falls back to the source type. In the example above, the
+group is `"acme"`.
 
 ### Tags
 
@@ -62,7 +69,9 @@ defs = dg.Definitions(
 
 ## Custom translation
 
-To customize how sources and tables map to Dagster concepts, pass a custom translator. See [Translator](/dagster/translator/) for details.
+Pass a custom translator to change how sources and tables map to Dagster keys,
+groups, tags, and metadata. See [Translator](/dagster/translator/) for the
+methods you can override.
 
 ```python
 assets = load_rocky_assets(rocky, translator=MyTranslator())

@@ -1,39 +1,68 @@
 ---
 title: Content-Addressed Materialization
-description: Cross-engine Delta + UniForm writes with content-hashed Parquet files
+description: Write Parquet files named by the hash of their own bytes, so several query engines can read the same table.
 sidebar:
   order: 16
 ---
 
-`materialization = "content_addressed"` is a write strategy that lands the model's SELECT result as **content-addressed Parquet files plus a Delta log commit** under an object-store prefix you control. Cross-engine readers (DuckDB `iceberg_scan`, Trino, Spark, anything that reads Iceberg or Delta) read the same files directly without going through Rocky.
+`materialization = "content_addressed"` writes a model's SELECT result to an
+object-store prefix you control. It writes **Parquet files named by the hash of
+their own bytes, plus a Delta log commit**. That naming is what
+[content-addressed](/reference/glossary/#content-addressed) means: the file's name
+comes from its contents, not from a timestamp or a counter.
 
-Shipped end-to-end in engine v1.30.0, including partitioned tables, rowTracking, and post-ALTER schema evolution.
+Any engine that reads Iceberg or Delta reads those files directly. DuckDB
+`iceberg_scan`, Trino, and Spark do not go through Rocky.
+
+Shipped end to end in engine v1.30.0. That includes partitioned tables,
+post-`ALTER` schema evolution, and rowTracking, a Delta feature that gives every
+row a stable ID.
 
 ## When to use it
 
-Use content-addressed materialization when you want Rocky to own the *writer* but explicitly **not** own the readers. Typical fits:
+Use content-addressed materialization when you want Rocky to own the *writer* and
+explicitly **not** own the readers. Three cases fit:
 
-- **Multiple query engines read the same table.** DuckDB analysts, Trino dashboards, and Spark batch jobs all need to read the marts your pipeline writes. Pointing each engine at object storage avoids round-tripping every read through one warehouse.
-- **You're committing into a managed Delta or Iceberg catalog.** Unity Catalog managed tables with UniForm exposed, Iceberg REST catalogs, etc.
-- **You want stable, deduplicatable file names.** Content-hashing the Parquet bytes means the same logical batch produces the same physical file name, which is useful for replay, audit, and storage de-dup against an external lake.
+- **Several query engines read one table.** DuckDB analysts, Trino dashboards, and Spark batch jobs all read the marts your pipeline writes. Pointing each engine at object storage avoids routing every read through one warehouse.
+- **You commit into a managed Delta or Iceberg catalog.** Unity Catalog managed tables with UniForm exposed, Iceberg REST catalogs, and the like. UniForm is a Delta feature that also publishes Iceberg metadata, so an Iceberg reader can read the Delta table.
+- **You want stable, de-duplicatable file names.** The same logical batch hashes to the same file name, which helps replay, audit, and storage de-dup against an external lake.
 
-Stick with `full_refresh` / `incremental` / `merge` when there's a single warehouse, or when you don't have direct object-store access from the runner.
+Stay on `full_refresh`, `incremental`, or `merge` when you have a single
+warehouse, or when the runner has no direct object-store access.
 
-## How it works
+## How a write happens
 
-On each run, the runtime:
+```
+  model SQL
+      │  execute against the configured adapter
+      ▼
+  Arrow result set
+      │  encode as Parquet
+      ▼
+  Parquet bytes
+      │  blake3 hash of those bytes derives the file name
+      ▼
+  files uploaded under storage_prefix, e.g. s3://bucket/path/<table>/
+      │  one commit referencing the new files
+      ▼
+  _delta_log commit
+      │  sync_iceberg_metadata()
+      ▼
+  Iceberg-compatible readers see the new snapshot
+```
 
-1. Executes the model SQL against the configured adapter and pulls the result into Arrow.
-2. blake3-hashes the Parquet-encoded bytes to derive each file's name.
-3. Uploads files under `storage_prefix` (e.g. `s3://bucket/path/<table>/`).
-4. Emits a Delta log commit referencing the new files. Existing Delta protocol features (partitioning, rowTracking) are honored when the underlying table declares them.
-5. Calls `sync_iceberg_metadata()` so Iceberg-compatible readers see the new snapshot.
+Rocky honors the Delta protocol features the underlying table already declares,
+such as partitioning and rowTracking.
 
-The writer's `discover()` step reads the bootstrap Delta commit to pick up the table's schema, partition spec, and rowTracking configuration. Subsequent writes adapt to schema changes (added columns, type widening) applied to the underlying Delta table between runs.
+The writer's `discover()` step reads the bootstrap Delta commit. That is where it
+picks up the table's schema, its partition spec, and its rowTracking
+configuration. Later writes adapt to schema changes applied to the underlying
+Delta table between runs, such as an added column or a widened type.
 
 ## Configuration
 
-A content-addressed sidecar carries the strategy plus `storage_prefix` and an optional `partition_columns` list:
+A content-addressed sidecar carries the strategy, a `storage_prefix`, and an
+optional `partition_columns` list:
 
 ```toml
 # models/fct_events.toml
@@ -55,17 +84,20 @@ table   = "fct_events"
 | `storage_prefix` | Yes | Object-store key prefix that holds `_delta_log/` + Parquet files for the target table. The runtime requires write access to this prefix. Env-var substitution applies (see [Environment Variables](/reference/configuration/#environment-variables)). |
 | `partition_columns` | No | Logical partition column names. Empty for unpartitioned tables. The runtime asserts this matches the table's declared partition columns at materialization time. |
 
-For partitioned tables, `partitionValues` in the Delta log are keyed by physical UUID (column-mapping mode), not the logical column name. The writer handles this internally; you only declare the logical names.
+In a partitioned table, the `partitionValues` in the Delta log are keyed by
+physical UUID, not by the logical column name. That is column-mapping mode. The
+writer handles it for you. You declare the logical names only.
 
-## Constraints + things to know
+## Constraints and things to know
 
-- **UniForm and Deletion Vectors are mutually exclusive.** The writer surfaces a clear error if the target table has DVs enabled. Use one or the other.
-- **rowTracking writers need `baseRowId`.** The Phase 3 writer surface for rowTracking carries `baseRowId` + `rowCommitVersion`; Rocky handles assignment.
-- **Replication tables don't accept this strategy.** Content-addressed is a *transformation* strategy. Pointing a replication pipeline target at a content-addressed model returns a "not supported on replication tables" error when the pipeline runs (`rocky run` / `rocky apply`), not at `rocky validate` time.
-- **No DuckDB POC yet.** The strategy requires real Delta + object storage; it's exercised via live-verify tests against a sandbox rather than a playground POC. See `engine/crates/rocky-cli/src/commands/run_content_addressed.rs` for the e2e test if you want the reference invocation.
+- **UniForm and deletion vectors cannot both be on.** A deletion vector is a Delta feature that records deleted rows in a side file rather than rewriting the Parquet. The writer returns a clear error when the target table has them enabled. Use one feature or the other.
+- **A rowTracking writer needs `baseRowId`.** Every Delta `add` action on a rowTracking table carries `baseRowId` and `defaultRowCommitVersion`. Rocky assigns both.
+- **A replication table cannot use this strategy.** Content-addressed is a *transformation* strategy. Point a replication pipeline target at a content-addressed model and you get a "not supported on replication tables" error when the pipeline runs (`rocky run` or `rocky apply`), not at `rocky validate` time.
+- **No DuckDB POC yet.** The strategy needs real Delta plus object storage, so it is exercised by live-verify tests against a sandbox rather than by a playground POC. For the reference invocation, read the end-to-end test in `engine/crates/rocky-cli/src/commands/run_content_addressed.rs`.
 
 ## Related
 
 - [Model Format](/reference/model-format/#content-addressed) — the sidecar field reference, including the full Strategy Examples block.
 - [Silver Layer](/concepts/silver-layer/) — where content-addressed models sit in the lakehouse mental model.
-- [Adapters](/concepts/adapters/) — adapter contracts for the writer side of the contract.
+- [Adapters](/concepts/adapters/) — the adapter contracts on the writer side.
+- [The Architecture of Trust](/concepts/architecture-of-trust/) — the recipe-identity hashes stamped on every materialization, and what replay can and cannot verify.

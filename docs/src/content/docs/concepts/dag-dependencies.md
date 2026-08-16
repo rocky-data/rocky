@@ -1,32 +1,43 @@
 ---
 title: DAG & Dependencies
-description: How Rocky resolves model execution order and parallel execution
+description: How Rocky works out the order models run in, and which of them run at the same time.
 sidebar:
   order: 5
 ---
 
-Rocky builds a directed acyclic graph (DAG) from model dependencies to determine execution order. Dependencies come from two merged sources: explicit `depends_on` declarations in a model's TOML, plus dependencies auto-resolved from bare table names in the model's SQL that match another project model (surfaced as diagnostic `I001`). Rocky uses topological sorting over the merged set to produce a valid execution plan with parallel execution layers.
+Rocky builds a DAG from your model dependencies, then runs the models in that
+order. A DAG is a directed acyclic graph: nodes with one-way edges and no cycles.
+
+Edges come from two places, merged:
+
+- An explicit `depends_on` list in a model's TOML.
+- A bare table name in the model's SQL that matches another model in the project. Rocky infers that edge and reports it as diagnostic `I001`.
+
+Rocky then topologically sorts the merged set. The result is an execution plan
+with layers that run in parallel.
 
 ## Declaring dependencies
 
-Each model declares what it depends on using the `depends_on` field in its TOML configuration:
+Each model names what it depends on with `depends_on` in its TOML:
 
 ```toml
 name = "fct_orders"
 depends_on = ["stg_orders", "dim_customers"]
 ```
 
-This means `fct_orders` cannot run until both `stg_orders` and `dim_customers` have completed.
+`fct_orders` cannot start until both `stg_orders` and `dim_customers` finish.
 
 ## Topological sort
 
-Rocky uses Kahn's algorithm to produce a topological ordering of models. The output is deterministic: when multiple models have no remaining dependencies (i.e., they are tied), they are sorted alphabetically.
+Rocky sorts with Kahn's algorithm. The order is deterministic: when several
+models are ready at the same time, Rocky sorts those alphabetically.
 
 ## Execution layers
 
-Models are grouped into layers. All models in a layer can run in parallel because their dependencies have been satisfied by earlier layers.
+Rocky groups models into layers. Every model in a layer can run at the same time,
+because earlier layers already satisfied its dependencies.
 
-Example dependency graph:
+Take this graph:
 
 ```
 stg_customers ──→ dim_customers ──┐
@@ -34,7 +45,7 @@ stg_customers ──→ dim_customers ──┐
 stg_orders ───────────────────────┘
 ```
 
-This produces three execution layers:
+It produces three layers:
 
 ```
 Layer 0: stg_customers, stg_orders     (no dependencies, run in parallel)
@@ -42,19 +53,33 @@ Layer 1: dim_customers                  (depends on stg_customers)
 Layer 2: fct_orders                     (depends on stg_orders + dim_customers)
 ```
 
-Rocky executes all models in Layer 0 concurrently, waits for them to finish, then executes Layer 1, and so on.
+Rocky runs all of Layer 0 at once, waits for it to finish, then runs Layer 1, and
+so on.
 
-`--parallel N` bounds how many run at once. On `rocky run` it defaults to 4. Under `rocky run --dag` it applies **only when you pass it** — leave it off and a layer's nodes all run concurrently, as they always have.
+### What `--parallel N` bounds
 
-It bounds *nodes*. A `--dag` sub-run builds one partition at a time, so the flag is not multiplied inside a node — but it is not a ceiling on every warehouse query either: a replication node takes its table fan-out from that pipeline's `[execution] concurrency` (default 32), which `--parallel` does not govern on either path. So `rocky run --dag --parallel 1` runs one node at a time, and a replication node within it may still copy several tables at once.
+`--parallel N` caps how many nodes run at once. On `rocky run` it defaults to 4.
+
+Under `rocky run --dag` it applies **only when you pass it**. Leave it off and
+every node in a layer runs at once, as it always has.
+
+The flag bounds *nodes*, not warehouse queries. A `--dag` sub-run builds one
+partition at a time, so the number is not multiplied inside a node. But it is
+also not a ceiling on every query. A replication node takes its table fan-out
+from that pipeline's `[execution] concurrency`, which defaults to 32, and
+`--parallel` does not govern that on either path.
+
+So `rocky run --dag --parallel 1` runs one node at a time, and the replication
+node inside it may still copy several tables at once.
 
 ## Validation
 
-Rocky validates the DAG at `rocky validate` time, catching problems before any SQL is executed.
+`rocky validate` checks the whole DAG before any SQL runs. It needs no warehouse
+connection.
 
 ### Cycle detection
 
-Circular dependencies are detected and reported as the set of models involved in the cycle:
+Rocky reports a circular dependency as the set of models in the cycle:
 
 ```toml
 # model_a.toml
@@ -72,7 +97,7 @@ Error: DAG error: circular dependency detected involving: ["model_a", "model_b"]
 
 ### Unknown dependencies
 
-References to models that don't exist are caught:
+Rocky catches a reference to a model that does not exist:
 
 ```toml
 name = "fct_orders"
@@ -83,11 +108,13 @@ depends_on = ["stg_orders", "nonexistent_model"]
 Error: DAG error: unknown dependency 'nonexistent_model' referenced by 'fct_orders'
 ```
 
-When the unknown name is a near miss for a real model, the message appends a `— did you mean '<model>'?` suggestion.
+When the unknown name is close to a real model name, the message adds a
+`— did you mean '<model>'?` suggestion.
 
 ## External table references
 
-Not every table reference creates a dependency. Rocky classifies references based on how they are qualified in the SQL:
+Not every table reference becomes a dependency. Rocky decides from how the
+reference is qualified in the SQL.
 
 | SQL reference | Classification | DAG behavior |
 |---|---|---|
@@ -96,9 +123,13 @@ Not every table reference creates a dependency. Rocky classifies references base
 | `dbt_fivetran.stg_facebook_ads__ad_history` | Two-part external | Ignored by DAG |
 | `analytics.dbt_fivetran.stg_facebook_ads__ad_history` | Three-part external | Ignored by DAG |
 
-Rocky reads from external tables but does not manage, build, or schedule them.
+Rocky reads from an external table. It does not manage, build, or schedule it.
 
-This distinction enables hybrid workflows where Rocky models consume tables produced by other tools (dbt packages, Fivetran connectors, manual ETL) without needing to convert or import them. External tables appear in column-level lineage but are excluded from execution planning.
+That split is what makes hybrid projects work. A Rocky model can read a table
+another tool produced (a dbt package, a Fivetran connector, a hand-written ETL
+job) without converting or importing it. External tables still show up in
+column-level [lineage](/reference/glossary/#lineage). They are left out of
+execution planning.
 
 ```sql
 -- stg_orders is a Rocky model -> DAG dependency
@@ -111,32 +142,5 @@ JOIN dbt_fivetran.stg_facebook_ads__ad_history f
     ON o.campaign_id = f.campaign_id
 ```
 
-See [Using Rocky with dbt Packages](/guides/using-dbt-packages/) for a full guide on this pattern.
-
-## How it differs from dbt Core
-
-dbt Core uses Jinja's `{{ ref('model_name') }}` macro inside SQL to create implicit dependencies. The dependency graph is extracted by parsing Jinja templates:
-
-```sql
--- dbt model
-SELECT *
-FROM {{ ref('stg_orders') }}
-JOIN {{ ref('dim_customers') }} USING (customer_id)
-```
-
-Rocky uses explicit `depends_on` declarations in TOML:
-
-```toml
-depends_on = ["stg_orders", "dim_customers"]
-```
-
-The differences:
-
-| | dbt Core | Rocky |
-|---|---|---|
-| Declaration | Implicit via `{{ ref() }}` in SQL | Explicit `depends_on` in TOML + inferred from plain SQL (no templating) |
-| When validated | During parsing/compilation | At `rocky validate` time |
-| SQL purity | SQL mixed with Jinja | Pure SQL, no template language |
-| Editor support | Requires dbt LSP for `ref()` | Standard SQL tooling works |
-
-You can run `rocky validate` to check the entire dependency graph without connecting to any warehouse.
+See [Using Rocky with dbt Packages](/guides/using-dbt-packages/) for the full
+guide to this pattern.

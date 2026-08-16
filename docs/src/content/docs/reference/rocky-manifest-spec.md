@@ -11,17 +11,40 @@ sidebar:
 
 ## What this is
 
-A `rocky-manifest` is a small JSON document that attests what produced a table version: which exact program ran, over which inputs, in which environment, and (on a content-addressed write path) the byte-hashes of the output files. It is designed to be checked offline by anyone, using a tiny tool rather than the engine that produced it.
+A `rocky-manifest` is a small JSON document that attests what produced a table version: which exact program ran, over which inputs, in which environment, and — on a content-addressed write path — the byte-hashes of the output files. It records the [provenance](/reference/glossary/#provenance) of a table in a form anyone can check offline, with a tiny tool rather than the engine that wrote it.
 
 The format is deliberately vendor-neutral. The identity fields are named for what they mean (`program_hash`, `inputs_hash`, `env_hash`) rather than for any one producer, and a `producer` object names the tool and version that wrote the manifest. The goal is an open format with a reference implementation, not a proprietary metadata blob.
 
 The reference verifier is [`rocky-verify`](#the-reference-verifier), a standalone tool that needs no Rocky engine installed.
 
+```
+   a model execution
+          │
+          ▼
+   ┌──────────────────────────────────────┐
+   │ recipe-identity triple               │
+   │  program_hash  inputs_hash  env_hash │
+   └──────────────────┬───────────────────┘
+                      │ serialize
+                      ▼
+              ┌───────────────┐
+              │ rocky-manifest│
+              └───┬───┬───┬───┘
+        ┌─────────┘   │   └──────────┐
+        ▼             ▼              ▼
+   .json file   content-addressed   Delta
+   (export)     artifacts           TBLPROPERTIES
+        │
+        ▼
+   rocky-verify ──► schema valid?  bytes match?
+   (no engine)      exit 0 / 1 / 2
+```
+
 ## The identity it carries
 
-Rocky records a recipe-identity triple on every successful model execution. A manifest is that triple, plus the scheme tag and carrier metadata, serialized into an open shape:
+Rocky records a recipe-identity triple on every successful model execution. Each part is a [fingerprint](/reference/glossary/#fingerprint): a hash that stands in for a whole definition, so two things can be compared without reading either in full. A manifest is that triple, plus the scheme tag and carrier metadata, serialized into an open shape:
 
-- **`program_hash`** — a BLAKE3 fingerprint of the model's canonical typed representation. It is the identity of the exact program. Two logically distinct programs have different program hashes; the same program has the same hash no matter when or how often it ran.
+- **`program_hash`** — a BLAKE3 fingerprint of the model's [canonical](/reference/glossary/#canonical) typed representation, meaning the one agreed written form that makes two equivalent programs hash alike. It is the identity of the exact program. Two logically distinct programs have different program hashes; the same program has the same hash no matter when or how often it ran.
 - **`inputs_hash`** — a BLAKE3 over the inputs the run actually observed. It is present only when the run observed its inputs. On a run that observes nothing, the declared inputs are already folded into `program_hash`, so a bare "no inputs" hash would add nothing and is omitted.
 - **`inputs_proof_class`** — the strength of `inputs_hash`, either `strong` or `heuristic`. `strong` means every observed upstream was attested by a content hash, so the input side is byte-verifiable. `heuristic` means at least one upstream was attested by a freshness signal such as a watermark or row count, which attests freshness rather than byte-identity. This label exists so a weak input hash is never read as a content claim. It is present exactly when `inputs_hash` is.
 - **`env_hash`** — a BLAKE3 over the environment semantics: the producing tool's version and the adapter or dialect identity. It excludes machine identity by construction, so two runs on different hosts in the same logical environment share an `env_hash`.
@@ -121,7 +144,9 @@ The same manifest content can travel in more than one place:
 2. **Alongside content-addressed artifacts.** On the content-addressed write path, the output bytes are already named by their BLAKE3 hash and recorded in the artifact ledger, which is what populates `output_hashes`.
 3. **Table-format metadata.** Embedding the identity in a table's own warehouse-side metadata is a natural carrier, so the attestation travels with the table. Rocky writes it into Delta `TBLPROPERTIES`: each manifest field is carried under a vendor-neutral namespace prefix, `recipe_manifest.`, with the field's dotted path appended, for example `recipe_manifest.program_hash`, `recipe_manifest.env_hash`, `recipe_manifest.hash_scheme`, `recipe_manifest.inputs_hash`, `recipe_manifest.inputs_proof_class`, `recipe_manifest.manifest_version`, `recipe_manifest.producer.name`, `recipe_manifest.producer.version`, `recipe_manifest.subject.model`, `recipe_manifest.subject.run_id`, `recipe_manifest.subject.status`. The prefix is deliberately not a vendor brand such as `rocky.`: vendor identity belongs in the `producer` field, not the key, and a shared neutral namespace lets a reader glob the manifest keys and tell them apart from `delta.*` reserved properties and arbitrary user tags. The write is issued as a post-create `ALTER TABLE ... SET TBLPROPERTIES`, never folded into the CREATE, so it cannot perturb the IR the program hash is computed over.
 
-   A reader reverses that mapping — strip the prefix, split the remaining dotted path — to reconstitute a standalone manifest that `rocky-verify` checks offline. Note the boundary: a managed (non-content-addressed) run carries the identity triple but no `output_hashes`, so offline verification of a table-metadata manifest is schema validation only. It proves the carrier round-tripped and the triple is well-formed, not that the table's bytes are reproducible. Byte-verifiable teeth still live only in `output_hashes` on the content-addressed path.
+   A reader reverses that mapping to rebuild a standalone manifest: strip the prefix, then split the remaining dotted path. `rocky-verify` checks the result offline.
+
+   Note the boundary. A managed run — one that is not content-addressed — carries the identity triple but no `output_hashes`. Offline verification of a table-metadata manifest is therefore schema validation only. It proves the carrier round-tripped and the triple is well-formed. It does not prove the table's bytes are reproducible. Byte-verifiable teeth live only in `output_hashes`, on the content-addressed path.
 
    The Delta `TBLPROPERTIES` carrier is where this ships today. Managed Iceberg rejects engine-managed property writes (`MANAGED_ICEBERG_OPERATION_NOT_SUPPORTED`), so the documented fallback for an Iceberg table is the snapshot-summary carrier, which remains future work.
 
@@ -142,9 +167,9 @@ rocky-verify schema
 
 **Schema validation** checks that the document is well-formed: required fields are present, hashes are 64-hex, `inputs_proof_class` is one of the two allowed values, the input-hash-and-proof-class invariant holds, and no unknown fields are present.
 
-**Byte verification** is the offline content check. When the manifest carries `output_hashes` and you point at the directory holding the artifact files, the verifier hashes each file with BLAKE3 and confirms it equals the recorded hash. This is pure byte arithmetic. It catches a manifest whose recorded output hash no longer matches the bytes it claims to describe, without trusting the manifest or any producing tool.
+**Byte verification** is the offline content check. Point the verifier at the directory holding the artifact files. When the manifest carries `output_hashes`, it hashes each file with BLAKE3 and confirms the result equals the recorded hash. This is pure byte arithmetic: it trusts neither the manifest nor the tool that wrote it. It catches a manifest whose recorded output hash no longer matches the bytes it claims to describe.
 
-The verifier exits `0` when a manifest verifies, `1` when it fails verification, and `2` when the manifest cannot be read or parsed.
+The verifier's [exit code](/reference/glossary/#exit-code) says which of the three outcomes happened: `0` when a manifest verifies, `1` when it fails verification, and `2` when the manifest cannot be read or parsed.
 
 ## What a manifest attests, and what it does not
 

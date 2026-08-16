@@ -1,64 +1,195 @@
 ---
 title: Operating Rocky with Agents
-description: "The orientation page for machine users: how an AI agent authors, checks, and proposes changes to a Rocky project through the MCP surface, and the compiler, policy, and human gates that keep it honest."
+description: "How an AI agent authors, checks, and proposes a change to a Rocky project, and the three gates that stand between its idea and your warehouse."
 sidebar:
   order: 9.3
 ---
 
-Rocky treats an AI agent as a first-class operator, not an afterthought. The same compiler, warehouse, and plan store a person drives from the CLI are exposed to a machine over the [Model Context Protocol](https://modelcontextprotocol.io) by `rocky mcp`. This page is the orientation for that machine user: the loop an agent runs, the tools it writes through, and the three gates — the compiler, the policy plane, and a human — that stand between an agent's idea and your warehouse.
+An AI agent drives Rocky through the same compiler, warehouse, and plan store a
+person drives from the CLI. The `rocky mcp` command serves those as tools over
+the [Model Context Protocol](https://modelcontextprotocol.io), an open standard
+for connecting an agent to tools. This page is the orientation for that machine
+user: the loop an agent runs, and the three gates that check its work.
 
-If you are wiring up a client and want the full tool catalog, read [MCP Authoring](/concepts/mcp-authoring/) next. This page is the shape of the work; that one is the reference.
+Read [MCP Authoring](/concepts/mcp-authoring/) for the tool-by-tool catalog.
+That page is the reference. This page is the shape of the work.
 
 ## The authoring loop
 
-An agent building or changing a model follows the same discipline a careful engineer does. The tools are named so the loop reads in order:
+An agent building or changing a model follows the same order a careful engineer
+does. The tools are named so the loop reads in sequence.
 
-1. **Inspect.** `inspect_schema`, `catalog`, and `lineage` tell the agent what already exists — the models, the source tables, and their typed columns. This works at cold start, before anything is materialized.
-2. **Sample.** `sample_rows` and `profile_column` read the real data. A column's name does not tell you its value casing, its units, or whether it is actually unique — the data does. Skipping this step is how an agent writes a `WHERE status = 'complete'` filter against a column that stores `'COMPLETE'`.
-3. **Draft.** `draft_model` writes the SQL and a sidecar into `models/`, and **compiles in the same call**. The agent gets the type-check with the write, not on a separate round-trip. `draft_contract` and `draft_check` do the same for a data contract and a data-quality check.
-4. **Compile-loop.** The draft response carries the diagnostics. The agent reads the codes, fixes the SQL, and re-drafts until it compiles clean. This is the tight loop where most of the work happens.
-5. **Propose.** `propose` records an **AI-authored plan** and returns a `plan_id`. It executes nothing.
-6. **Review, then apply.** A human runs `rocky review <plan_id> --approve` and `rocky apply <plan_id>`. The agent surfaces the `plan_id`; it never approves on your behalf.
+```
+        ┌────────────────┐   read-only. What models, tables,
+        │ 1. inspect     │   and typed columns already exist.
+        │  inspect_schema│   Works before anything is built.
+        │  catalog       │
+        │  lineage       │
+        └───────┬────────┘
+                ▼
+        ┌────────────────┐   read-only. What the values
+        │ 2. sample      │   actually look like: casing,
+        │  sample_rows   │   units, whether a key is unique.
+        │  profile_column│
+        └───────┬────────┘
+                ▼
+        ┌────────────────┐   writes the file into models/
+   ┌───►│ 3. draft       │   AND compiles it, in one call.
+   │    │  draft_model   │
+   │    │  draft_contract│
+   │    │  draft_check   │
+   │    └───────┬────────┘
+   │            ▼
+   │    ┌────────────────┐
+   └────┤ 4. read the    │
+ errors │    diagnostics │   the draft response carries them
+        └───────┬────────┘
+                │ compiles clean
+                ▼
+        ┌────────────────┐   returns a plan_id.
+        │ 5. propose     │   Executes nothing.
+        └───────┬────────┘
+                ▼
+        ┌────────────────┐   rocky review <plan_id> --approve
+        │ 6. a human     │   rocky apply  <plan_id>
+        │    approves    │   The agent never approves for you.
+        └────────────────┘
+```
 
-The read-only tools at steps 1 and 2 are the reconcile discipline in tool form. An agent that grounds before it writes produces a model that compiles first-try; an agent that guesses from column names produces one that compiles and is quietly wrong.
+Steps 1 and 2 are the reason the rest works. A column name does not tell you its
+value casing, its units, or whether it is unique. The data does. An agent that
+skips the sample writes `WHERE status = 'complete'` against a column that stores
+`'COMPLETE'`. That model compiles, and it is quietly wrong.
 
-## Two tool families, one prefix each
+Step 4 is where most of the work happens. The agent reads the diagnostic codes,
+fixes the SQL, and re-drafts until the compile is clean.
 
-The write surface splits cleanly, and the prefixes tell you which is which.
+## Generators and write tools
 
-The **`ai_*` generators** call an LLM under your own `ANTHROPIC_API_KEY` and hand back a draft. `ai_contract` drafts a `.contract.toml` from a table's aggregate profile; `ai_test` drafts SQL assertions from a model's intent and schema; `explain_model` drafts an intent description. They mutate nothing — they propose text. Without a key set they return an empty result rather than failing, so the rest of the surface keeps working. Each maps to a `rocky ai-*` CLI verb — `ai-contract`, `ai-test`, and `ai-explain` respectively.
+The write surface splits in two, and the prefix tells you which half you are in.
 
-The **`draft_*` write tools** write content into the project and compile it, gated by the policy plane. `draft_model` writes a model; `draft_contract` writes `models/<model>.contract.toml`; `draft_check` merges declarative `[[tests]]` checks into a model's sidecar. The content can be an agent's own work or a generator's output — the write tool does not care where it came from, only that it compiles and clears policy.
+The **`ai_*` generators** call a language model under your own
+`ANTHROPIC_API_KEY` and hand back a draft. They change nothing on disk. Each one
+matches a `rocky ai-*` CLI verb.
 
-The division is the point. Generating is cheap and speculative; writing is a governed act. Keeping them in separate tools means a policy that says "this agent may not author contracts in the `pii` schema" has one clear place to bite. A `draft_*` call made without its content argument is treated as a mis-dispatch — someone reaching for the generator — and returns a structured error naming the matching `ai_*` tool, so the two are never conflated.
+The **`draft_*` write tools** write content into the project and compile it.
+The content can be the agent's own work or a generator's output. The write tool
+does not care where it came from, only that it compiles and clears your policy
+rules.
 
-The write tools do not grant an agent new power. An agent in a coding harness can already write files. What the tools add is immediate compile feedback, policy visibility, and a path that works in harnesses with no filesystem access at all. Rocky's agent surface is tools, policy, and verification — never the loop itself, which stays in whatever harness you connect.
+Keeping them apart is what makes a rule like *this agent may not author
+contracts in the `pii` schema* enforceable. Generating is cheap and speculative.
+Writing is a governed act, so it has one place to be checked.
+
+The write tools do not give an agent new power. An agent in a coding harness can
+already write files. What the tools add is compile feedback with the write and a
+visible policy verdict. They also work in a harness with no filesystem access at
+all. Rocky supplies the tools, the rules, and the verification. The loop itself
+stays in whatever client you connect.
+
+See [MCP Authoring](/concepts/mcp-authoring/) for every tool in both families.
 
 ## The three gates
 
-Nothing an agent produces reaches your warehouse without clearing three independent checks.
+Nothing an agent produces reaches your warehouse without clearing three
+independent checks.
 
-**The compiler.** Every draft is type-checked and contract-validated the moment it is written. A contract that names a column the model does not produce comes back as a `W010` diagnostic; a check with a malformed block fails structurally. The agent sees this in the same response as the write.
+```
+   the agent's draft
+          │
+          ▼
+   ┌──────────────┐   Type-checks the SQL and validates it
+   │ gate 1       │   against the model's contract.
+   │ the compiler │   A contract naming a column the model
+   └──────┬───────┘   does not produce returns W010.
+          │ compiles clean
+          ▼
+   ┌──────────────┐   The [policy] block in your rocky.toml.
+   │ gate 2       │   allow  → the draft stands
+   │ your policy  │   review → draft kept, a human is told
+   │ rules        │   deny   → error, and the write is
+   └──────┬───────┘            rolled back off disk
+          │ allowed
+          ▼
+   ┌──────────────┐   rocky review <plan_id> --approve
+   │ gate 3       │   The engine refuses to apply an
+   │ a human      │   AI-authored plan without it.
+   └──────┬───────┘
+          │ approved
+          ▼
+   rocky apply <plan_id>  ──►  your warehouse
+```
 
-**The policy plane.** If your `rocky.toml` declares a `[policy]` block, every `draft_*` and `propose` call is evaluated against it before anything persists. An allowed action proceeds; a `require_review` action writes the draft (it is the artifact a human will look at) and signals that a person must take it further; a `deny` returns an error and **rolls the write back** — a new file is removed, a re-draft over an existing file restores the prior content, and nothing is left on disk. Every decision, including the denials, is written to the audit ledger. This is the same evaluator that gates `apply` and `promote`, so an agent authoring into a governed scope learns the verdict with the write rather than three steps later. See [Cross-team contracts](/concepts/cross-team-contracts/) for how policy rules are written.
+**Gate 1, the compiler.** Every draft is type-checked and contract-validated the
+moment it is written. The agent sees the result in the same response as the
+write, not on a second round-trip.
 
-**The human.** `propose` writes an AI-authored plan, and `rocky apply` refuses to run one until a human has approved it. A bare `rocky apply` on an unapproved AI-authored plan is rejected by the engine, not by convention.
+**Gate 2, your policy rules.** A `[policy]` block in `rocky.toml` states who may
+change what. Rocky evaluates every `draft_*` and `propose` call against it before
+anything persists. A `deny` removes a new file, or restores the prior content of
+a file the agent re-drafted, so a denial leaves nothing behind. Every decision,
+including each denial, is written to the audit ledger. This is the same evaluator
+that gates `apply` and `promote`, so an agent learns the verdict with the write
+rather than three steps later. See
+[Cross-team contracts](/concepts/cross-team-contracts/) for how the rules are
+written.
+
+**Gate 3, a human.** `propose` writes a plan marked as AI-authored. `rocky apply`
+refuses to run one until a person approves it. The engine enforces this, not a
+convention the prompts ask the agent to follow.
 
 ## Why a warehouse grant is not enough
 
-An AI agent that operates your warehouse holds warehouse credentials, and in most setups those credentials are broad. An agent that can build a model can usually also drop a table, rewrite a column, or alter a contract's shape, because the permission system underneath speaks in tables and roles. It grants "this role may `ALTER` this schema" or it does not. It has no vocabulary for the thing you actually want to say.
+An agent that operates your warehouse holds warehouse credentials, and those are
+usually broad. The permission system underneath speaks in tables and roles. It
+grants "this role may `ALTER` this schema", or it does not.
 
-Consider the sentence *an agent may not drop a column that is classified as PII and sits under a cross-team contract.* No `GRANT` can express it. The classification lives in Rocky's model sidecar, not in the warehouse's permission catalog. Whether a change is a breaking drop or an additive column is a fact about two compiled schemas, not about a role. The contract boundary is a Rocky artifact. A grant sees a table and a verb; it cannot see meaning.
+Now consider the sentence *an agent may not drop a column that is classified as
+PII and sits under a cross-team contract.* No `GRANT` can express it:
 
-Rocky's policy plane can, because it sits where the meaning is. It evaluates a proposed change with the compiler's knowledge in hand: the breaking-versus-additive verdict from diffing the typed output, the column classifications carried on the model, the contract boundary, and the transitive blast radius. A `[policy]` rule can therefore say the sentence a grant cannot, and the seam that enforces it is the same `rocky apply` an agent already runs. The refusal happens before any DDL is issued, it names the rule that decided, and it is written to an audit ledger you can query after the fact.
+- The classification lives in Rocky's model sidecar, not in the warehouse's
+  permission catalog.
+- Whether a change is a breaking drop or an additive column is a fact about two
+  compiled schemas, not about a role.
+- The contract boundary is a Rocky artifact.
 
-This is a different layer from the runtime controls the warehouses ship. Databricks governs table and column access through Unity Catalog, with grants, row filters, and column masks, while its Unity AI Gateway sits in front of model serving endpoints and adds guardrails, rate limits, and PII filtering to what passes through them. Snowflake gives an agent its own identity with per-agent role-based access control and an audit trail that tags what the agent did. All of that answers runtime questions: what may this agent reach, what may pass through the model, and under whose privileges is it acting. Each has its own configuration surface and its own sharp edges, so read the vendor's documentation rather than assuming an agent sees exactly what a person in the same role sees. It is real and worth using, and it is orthogonal to what Rocky governs. An agent authoring a transformation is not querying a table or prompting a model. It is proposing a change to the pipeline that produces the data. Governing that authored change, deny this drop, review that widening, allow this net-new bronze model, is the boundary the runtime controls do not cover, and the one Rocky's policy plane is built for. Use both: their controls for what an agent may read, Rocky's policy plane for what an agent may change.
+A grant sees a table and a verb. It cannot see meaning.
 
-The concrete proof is the agent-policy example in the playground (`examples/playground/pocs/04-governance/11-agent-policy`). An agent tries to drop a PII-classified column from a contracted gold model. `rocky apply` denies it at the policy seam and names the rule; `rocky audit` prints who tried, what they tried, on which target, and why it was refused; and the same plan, applied by a human, goes through, because humans own the boundary. It runs on DuckDB with no credentials.
+Rocky's policy rules can, because they sit where the meaning is. They judge a
+proposed change with the compiler's knowledge in hand. That knowledge is the
+breaking-versus-additive verdict from diffing the typed output, the column
+classifications on the model, the contract boundary, and the transitive blast
+radius. The refusal happens before any DDL is issued. It names the rule that
+decided. It is written to an audit ledger you can query afterwards.
+
+### This is a different layer from warehouse runtime controls
+
+The warehouses ship their own agent controls, and they answer runtime questions.
+Databricks governs table and column access through Unity Catalog, with grants,
+row filters, and column masks. Its Unity AI Gateway sits in front of model
+serving endpoints and adds guardrails, rate limits, and PII filtering. Snowflake
+gives an agent its own identity, with per-agent role-based access control and an
+audit trail. Read the vendor's documentation rather than assuming an agent sees
+exactly what a person in the same role sees.
+
+Those controls decide what an agent may **read**. Rocky's rules decide what an
+agent may **change**. An agent authoring a transformation is not querying a
+table or prompting a model. It is proposing a change to the pipeline that
+produces the data. Use both.
+
+### Run the denial yourself
+
+The agent-policy example in the playground
+(`examples/playground/pocs/04-governance/11-agent-policy`) shows the whole gate.
+An agent tries to drop a PII-classified column from a contracted gold model.
+`rocky apply` denies it and names the rule. `rocky audit` prints who tried, what
+they tried, on which target, and why it was refused. The same plan, applied by a
+human, goes through, because humans own the boundary. It runs on DuckDB with no
+credentials.
 
 ## Structured errors
 
-Every failing tool call returns a stable envelope rather than a prose blob:
+Every failing tool call returns a stable envelope, not a prose blob:
 
 ```json
 {
@@ -69,17 +200,34 @@ Every failing tool call returns a stable envelope rather than a prose blob:
 }
 ```
 
-`code` is a machine-matchable class — `invalid_argument`, `model_not_found`, `compile_failed`, `policy_denied`, `policy_review_required`, and a handful more. `remediation_hint` is a concrete next action, never empty. `policy_rule` names the deciding rule on a policy verdict. An agent branches on the `code` and acts on the `remediation_hint` without parsing English. It is the tool-layer analog of Rocky's diagnostic codes, which agents already learn to read.
+`code` is a machine-matchable class: `invalid_argument`, `model_not_found`,
+`compile_failed`, `policy_denied`, `policy_review_required`, and a few more.
+`remediation_hint` is a concrete next action, never empty. `policy_rule` names
+the deciding rule on a policy verdict. An agent branches on the `code` and acts
+on the `remediation_hint` without parsing English.
 
-One distinction matters: a clean compile that reports error *diagnostics* is **not** an error envelope. It is a successful call with `has_errors: true` and a list of diagnostics. "The tool failed" and "your code has a problem" are different facts, and Rocky keeps them on different wires so an agent never confuses a warehouse outage for a type error.
+One distinction matters. A compile that reports error *diagnostics* is **not** an
+error envelope. It is a successful call with `has_errors: true` and a list of
+diagnostics. "The tool failed" and "your code has a problem" are different facts.
+Rocky keeps them on different wires, so an agent never reads a warehouse outage
+as a type error. [MCP Authoring](/concepts/mcp-authoring/#structured-errors)
+covers the one case that sits below the envelope.
 
-## What this is measured against
+## The agent-conformance eval suite
 
-The agent surface is treated as a product interface, which means it is regression-tested like one. Rocky ships an agent-conformance eval suite (under `engine/evals/`) that drives a scripted agent session against `rocky mcp` on a pinned fixture and scores it with deterministic assertions: did the agent ground before it wrote, did the model compile, did a policy denial leave no file, did nothing get materialized. The suite runs the structured-error and policy-gate checks with no API key at all, so the contract those tools promise is verified on every change, and the LLM-driven authoring scenarios add their scores when a key is present. Publishing those numbers per release is the point — "operating Rocky with agents" is a claim Rocky holds itself to, not a slogan.
+The agent surface is regression-tested like a product interface. Rocky ships an
+eval suite under `engine/evals/` that drives a scripted agent session against
+`rocky mcp` on a pinned fixture. Deterministic assertions score it. Did the
+agent ground before it wrote? Did the model compile? Did a policy denial leave
+no file? Did nothing get materialized?
+
+The structured-error and policy-gate checks run with no API key at all, so the
+contract those tools promise is verified on every change. The authoring scenarios
+that need a language model add their scores when a key is present.
 
 ## Where to go next
 
-- [MCP Authoring](/concepts/mcp-authoring/) — the full tool catalog, the egress discipline, and the bring-your-own-key boundaries.
+- [MCP Authoring](/concepts/mcp-authoring/) — the full tool catalog, what data leaves your environment, and the bring-your-own-key boundaries.
 - [AI and Intent](/concepts/ai-intent/) — the compiler-as-guardrail loop both the CLI and MCP surfaces rely on.
 - [AI Commands](/reference/commands/ai/) — the `rocky ai-*` CLI verbs, the human-facing counterpart to the `ai_*` tools.
 - [Cross-team contracts](/concepts/cross-team-contracts/) — how a `[policy]` block declares who may change what.

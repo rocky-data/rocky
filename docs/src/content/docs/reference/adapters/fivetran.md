@@ -1,11 +1,11 @@
 ---
 title: Fivetran adapter
-description: Fivetran source adapter — metadata-only discovery over the Fivetran REST API
+description: The Fivetran source adapter, which reads connector and table metadata and nothing else
 sidebar:
   order: 5
 ---
 
-Fivetran source adapter. Calls the Fivetran REST API to discover connectors and tables. **Metadata only**: Rocky never moves data through this adapter.
+The Fivetran source adapter calls the Fivetran REST API to list connectors and their tables. It reads **metadata only**. Rocky never moves data through this adapter.
 
 ## Fields
 
@@ -31,3 +31,4 @@ HTTP Basic Auth using `api_key` and `api_secret`. Source-adapter authentication 
 
 - [`[adapter.NAME]`](/reference/configuration/#adaptername) — fields shared by every adapter type, including the retry policy.
 - [Fivetran state cache](/reference/fivetran-state-cache/) — sharing the resolved state envelope across processes.
+- [`rocky discover --emit-fivetran-state-to`](/reference/commands/core-pipeline/#emitting-the-fivetran-state-envelope) — write the state envelope to a file.

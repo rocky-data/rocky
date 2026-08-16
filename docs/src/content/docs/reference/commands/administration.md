@@ -1,17 +1,17 @@
 ---
 title: Administration Commands
-description: Commands for run history, quality metrics, storage optimization, compaction, profiling, and data archival
+description: Read what already ran, keep storage in shape, and manage the state store
 sidebar:
   order: 5
 ---
 
-Commands for observability into past runs, storage optimization, compaction, and archival.
+These commands read what already happened and maintain what Rocky keeps. They cover run history, quality metrics, and cost; storage optimization, compaction, profiling, and archival; the embedded state store; and the governance rollups.
 
 ---
 
 ## `rocky history`
 
-Show run history and model execution history from the embedded state store. Displays past pipeline runs with their duration, status, and per-model details.
+Show past pipeline runs from the embedded state store. Each run reports its duration, its status, and the detail for every model it touched.
 
 ```bash
 rocky history [flags]
@@ -162,7 +162,7 @@ Text output appends a `Governance audit trail (--audit):` section after the defa
 
 ### Related Commands
 
-- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- execute a planned pipeline (`rocky run` continues to work as an alias)
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- execute a planned pipeline (`rocky run` continues to work as an alias)
 - [`rocky state`](/reference/commands/core-pipeline/#rocky-state) -- view current watermarks
 - [`rocky metrics`](#rocky-metrics) -- view quality metrics for a model
 
@@ -267,7 +267,7 @@ rocky metrics fct_revenue --column net_revenue --alerts
 ### Related Commands
 
 - [`rocky history`](#rocky-history) -- view execution history for the model
-- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- execute a planned pipeline to generate fresh metrics
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- execute a planned pipeline to generate fresh metrics
 - [`rocky optimize`](#rocky-optimize) -- get strategy recommendations based on metrics
 
 ---
@@ -743,13 +743,35 @@ By default re-execution runs on an ephemeral in-memory DuckDB engine. `--warehou
 rocky replay latest --execute --verify --warehouse
 ```
 
-The warehouse path re-derives each output's blake3 encoded with the target table's own physical column mapping (read from its Delta log), so a `bit_exact` verdict means the warehouse reproduced exactly the bytes the content-addressed writer recorded. Execution is isolated: every replayed model is materialized into a fresh `hcv2_replay_<run>` schema, never the production location of any recorded target, and that schema is dropped after the run unless you pass `--keep`. No object-store objects are written — the recomputed artifact is hashed in memory, and existing content-addressed files are never touched. In-run upstream references are redirected into the replay schema, so a downstream model reads its upstream's replayed output rather than production; an upstream the run did not itself produce (or a mutable-source read) makes the model `non_replayable` rather than reading production data.
+The warehouse path re-derives each output's blake3 using the target table's own physical column mapping, read from its Delta log. A `bit_exact` verdict therefore means the warehouse reproduced exactly the bytes the content-addressed writer recorded.
+
+Re-execution never touches production. Rocky materializes each replayed model into a fresh schema and redirects every in-run upstream reference into it:
+
+```
+   production                  replay schema  hcv2_replay_<run>
+   ──────────                  ─────────────────────────────────
+   prod.stg_orders             stg_orders   ◄── re-run from recipe
+        (never written)                 │
+                                    │ the downstream model reads
+                                    │ the replayed upstream here,
+                                    ▼ not production
+   prod.fct_revenue            fct_revenue  ◄── re-run from recipe
+        (never written)
+
+   the whole replay schema is dropped after the run, unless --keep
+```
+
+Three rules make that isolation hold:
+
+- Rocky materializes every replayed model into a fresh `hcv2_replay_<run>` schema, never into the production location of any recorded target. That schema is dropped after the run unless you pass `--keep`.
+- Rocky writes no object-store objects. It hashes the recomputed artifact in memory and never touches an existing content-addressed file.
+- A model whose upstream the run did not itself produce is classified `non_replayable`, as is a model that reads a mutable source. Rocky reports the classification rather than falling back to production data.
 
 ### Related Commands
 
 - [`rocky trace`](#rocky-trace) -- same data rendered as a Gantt timeline
 - [`rocky history`](#rocky-history) -- list past runs
-- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- record a new run
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- record a new run
 
 ---
 
@@ -955,12 +977,15 @@ Missing `adapter_type` or unconfigured `[cost]` degrades cleanly: the command st
 
 ## `rocky state`
 
-Inspect or manage the embedded state store. `rocky state` is a subcommand group; the bare form continues to show watermarks for backwards compatibility.
+Inspect or manage the embedded state store. `rocky state` is a subcommand group. The bare form still shows watermarks, for backwards compatibility.
 
 ```bash
 rocky state                                # show watermarks (default)
 rocky state show                           # same as bare `rocky state`
 rocky state clear-schema-cache [--dry-run] # flush the DESCRIBE cache
+rocky state retention sweep [--dry-run]    # trim the history tables
+rocky state schedule pause <pipeline>      # hold a pipeline's schedule
+rocky state schedule resume <pipeline>     # release the hold
 ```
 
 ### Subcommands
@@ -969,6 +994,8 @@ rocky state clear-schema-cache [--dry-run] # flush the DESCRIBE cache
 |------------|-------------|
 | `show` (default) | Display stored watermarks. Same output as bare `rocky state`; the named form is provided so scripts can be explicit. |
 | `clear-schema-cache` | Flush the `DESCRIBE TABLE` schema cache. See [`rocky state clear-schema-cache`](#rocky-state-clear-schema-cache). |
+| `retention sweep` | Delete history rows that fall outside `[state.retention]`. See [`rocky state retention sweep`](#rocky-state-retention-sweep). |
+| `schedule pause` / `schedule resume` | Hold or release one pipeline's schedule at runtime. See [`rocky state schedule`](#rocky-state-schedule). |
 
 ### State-path resolution
 
@@ -1033,9 +1060,89 @@ rocky state clear-schema-cache --dry-run --output json
 
 ### Related Commands
 
-- [`rocky discover --with-schemas`](/reference/cli/#rocky-discover) -- warm the cache after a flush
+- [`rocky discover --with-schemas`](/reference/commands/core-pipeline/#rocky-discover) -- warm the cache after a flush
 - [`rocky --cache-ttl`](/reference/cli/#global-flags) -- per-invocation TTL override (use `--cache-ttl 0` for one-shot bypass without flushing)
 - [`[cache.schemas]`](/reference/configuration/) -- disable the cache entirely with `enabled = false`
+
+---
+
+## `rocky state retention sweep`
+
+Delete the history rows that fall outside `[state.retention]` in `rocky.toml`. The sweep covers three domains: run history, DAG snapshots, and quality snapshots.
+
+```bash
+rocky state retention sweep
+rocky state retention sweep --dry-run
+```
+
+### Flags
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--dry-run` | `bool` | `false` | Plan the sweep and delete nothing. Reports the same counts a real sweep would produce, give or take concurrent writers. |
+
+### What the sweep never touches
+
+The sweep only trims history. Two guardrails bound it:
+
+- Operational tables are out of scope: the schema cache, the watermarks, and the partition records are never swept.
+- The most recent `min_runs_kept` rows in each domain survive unconditionally, whatever the age policy says.
+
+### Related Commands
+
+- [`rocky retention-status`](#rocky-retention-status) -- the data-retention policy on warehouse tables, a separate surface from the state store's history
+- [`rocky history`](#rocky-history) -- the run history the sweep trims
+- [`[state.retention]`](/reference/configuration/) -- the policy the sweep reads
+
+---
+
+## `rocky state schedule`
+
+Hold or release one pipeline's schedule at runtime. A hold is durable: it lives in the state store, not in `rocky.toml`.
+
+```bash
+rocky state schedule pause <pipeline>
+rocky state schedule resume <pipeline>
+```
+
+### Arguments
+
+| Argument | Type | Default | Description |
+|----------|------|---------|-------------|
+| `pipeline` | `string` | **(required)** | The pipeline whose schedule to pause or resume. |
+
+### Flags
+
+No command-specific flags. Uses the [global flags](/reference/cli/#global-flags) only.
+
+### Which scheduler a hold reaches
+
+A hold controls whichever scheduler reads the same state file this command writes. Point both at the same `--state-path` or they will not see each other.
+
+```
+   rocky --state-path X state schedule pause <pipeline>
+                        │
+                        ▼  writes the hold
+            ┌────────────────────────────┐
+            │        state file X        │
+            └────────────┬───────────────┘
+                         │ read on every tick
+                         ▼
+            ┌────────────────────────────┐   suppresses the cron,
+            │  rocky serve --scheduler   │   after, freshness, and
+            │        --state-path X      │   webhook demand sources,
+            └────────────────────────────┘   and records a `paused`
+                                             skip on each tick
+```
+
+A pause reaches a running scheduler immediately. Editing `[schedule] enabled` in `rocky.toml` does not: a resident scheduler cannot see that change until it restarts. The command's output names the state file it acted on, so pausing the wrong instance is never silent.
+
+`resume` re-enables autonomous runs, so it is deliberately human-only. Agents get the `pause_schedule` MCP tool and no matching resume.
+
+### Related Commands
+
+- [`rocky serve`](/reference/commands/development/#rocky-serve) -- the resident process a hold controls
+- [`rocky mcp`](/reference/commands/ai/#rocky-mcp) -- the agent-facing `pause_schedule` tool
 
 ---
 
@@ -1111,7 +1218,7 @@ rocky compliance --env prod --fail-on exception
 
 ### Related Commands
 
-- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- applies classification tags + masking policies inline during the post-DAG governance pass
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- applies classification tags + masking policies inline during the post-DAG governance pass
 - [`rocky retention-status`](#rocky-retention-status) -- sibling governance rollup for retention declarations
 - [Governance configuration](/guides/governance/) -- `[mask]`, `[mask.<env>]`, `[classifications] allow_unmasked`
 
@@ -1177,5 +1284,5 @@ events                                   30 days          -                yes
 ### Related Commands
 
 - [`rocky compliance`](#rocky-compliance) -- sibling governance rollup for classification + masking
-- [`rocky apply`](/reference/commands/core-pipeline/#rocky-run) -- applies retention policies inline during the post-DAG governance pass
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- applies retention policies inline during the post-DAG governance pass
 - [Model sidecar `retention`](/reference/model-format/) -- configure `retention = "<N>[dy]"`

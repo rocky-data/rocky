@@ -3,7 +3,7 @@
 **Date:** 2026-04-10 (snapshot)
 **Rocky version:** 0.3.0 (post-optimization)
 
-> **Partial refresh, 2026-06-01:** This is an April 2026 snapshot. Only a handful of cells have been refreshed against current sources — e.g. the open-source license, the Fusion runtime rename, column-level lineage, manifest/artifacts, and the orchestration row (including a current `dagster-sqlmesh` correction); the remaining cells still reflect the April snapshot and have not been re-verified. The canonical, current comparison lives at [docs: Feature Comparison](../../../docs/src/content/docs/getting-started/comparison.md). In these tables, **dbt-core** is the dbt Core 1.x Python line; **dbt-fusion** tracks the Rust dbt Core v2.0 runtime plus Fusion's SQL-comprehension layer.
+> **Partial refresh, 2026-06-01:** This is an April 2026 snapshot. Only a handful of cells have been refreshed against current sources — e.g. the open-source license, the Fusion runtime rename, column-level lineage, manifest/artifacts, and the orchestration row (including a current `dagster-sqlmesh` correction); the remaining cells still reflect the April snapshot and have not been re-verified. This file is kept as a dated benchmark artifact. The published comparison at [docs: Feature Comparison](../../../docs/src/content/docs/getting-started/comparison.md) no longer covers dbt, so it is not a refreshed version of this table. In these tables, **dbt-core** is the dbt Core 1.x Python line; **dbt-fusion** tracks the Rust dbt Core v2.0 runtime plus Fusion's SQL-comprehension layer.
 
 This document provides a factual feature-by-feature comparison of the major SQL transformation tools in the modern data stack. Features are verified against official documentation and source code as of April 2026.
 

@@ -1,22 +1,40 @@
 ---
 title: RockyComponent
-description: State-backed Dagster component for scalable asset discovery
+description: A Dagster component that caches rocky discover output in a state file
 sidebar:
   order: 7
 ---
 
-`RockyComponent` is a state-backed Dagster component that caches `rocky discover` output, so it avoids calling external APIs on every Dagster code location reload.
+`RockyComponent` caches the output of `rocky discover` in a state file. Dagster
+reloads a code location often, and every reload would otherwise call each source
+API again. The cache removes those calls. A code location is the Python process
+where Dagster loads your definitions.
 
-## How it works
+## How the state file replaces the API call
 
-1. **`write_state_to_path()`** -- Calls `rocky discover`, serializes the result to JSON, and saves it to a state file.
-2. **`build_defs_from_state()`** -- Reads the cached JSON from the state file and creates a list of `AssetSpec` objects without making any API calls.
+Two methods split the work. One writes the state file, the other reads it.
 
-On code location reload, Dagster reads from the cached state file rather than calling Fivetran, Databricks, or any other external API. Assets appear in the Dagster UI instantly.
+```
+write_state_to_path()        run on demand, or on a state refresh
+─────────────────────────────────────────────────────────────────
+  rocky discover ──► Fivetran / Databricks / other source APIs
+  rocky compile  ──► the models directory      (skipped when absent)
+  rocky dag      ──► the whole pipeline graph  (dag_mode only)
+                 ──► one JSON slot each ──► state file on disk
+
+build_defs_from_state()      run on every code location reload
+─────────────────────────────────────────────────────────────────
+  state file on disk ──► list of AssetSpec ──► Dagster UI
+                         no API call
+```
+
+An `AssetSpec` declares an asset to Dagster without attaching a function that
+computes it.
 
 ## Configuration
 
-Configure `RockyComponent` in your `defs.yaml`:
+Configure `RockyComponent` in your `defs.yaml`, the YAML file that declares a
+component to Dagster:
 
 ```yaml
 type: dagster_rocky.RockyComponent
@@ -28,7 +46,8 @@ attributes:
 
 ## Opt-in surfaces
 
-Five fields toggle additional behaviour on top of the basic discover/compile cache. All default to off; existing components see no behaviour change unless you flip them on.
+Five fields add behaviour on top of the discover and compile cache. All five
+default to off. An existing component behaves the same until you turn one on.
 
 | Field | Since | YAML | What it does |
 |---|---|---|---|
@@ -50,7 +69,9 @@ attributes:
   discover_on_missing_state: true
 ```
 
-`post_state_write_hook` cannot be set from YAML; arbitrary Python callables are not YAML-resolvable, and a non-null YAML value raises `ResolutionException` at component load. Set it programmatically in a subclass instead:
+You cannot set `post_state_write_hook` from YAML. YAML cannot resolve a Python
+callable, and a non-null YAML value raises `ResolutionException` when the
+component loads. Set it programmatically in a subclass instead:
 
 ```python
 from pathlib import Path
@@ -64,24 +85,43 @@ class MyRockyComponent(RockyComponent):
         )
 ```
 
-Hook exceptions are logged and swallowed so a failing side-effect (typically the S3/Valkey push) cannot block code-server boot.
+The component logs and swallows any exception the hook raises. A failing
+side-effect, usually the S3 or Valkey push, therefore cannot block code-server
+boot.
 
-When you use the tenant-as-partition collapse (`tenant:` / `TenantConfig`), set `tenant.scope_runs_to_selection: true` (default off) to scope a tenant partition run to the connectors the host actually selected, emitting one `rocky run --filter id=<source>` per selected connector instead of re-copying the whole tenant. It only narrows on a strict subset of the tenant's connectors (a full or empty selection still runs the whole tenant), and each `id=` targets that partition's own source, so per-tenant isolation is preserved.
+### Scoping a tenant partition run
+
+The tenant-as-partition collapse (`tenant:` / `TenantConfig`) maps one tenant to
+one Dagster partition. By default, materializing that partition runs the whole
+tenant.
+
+Set `tenant.scope_runs_to_selection: true` to narrow that. The component then
+emits one `rocky run --filter id=<source>` per connector in the selection. The
+field defaults to off.
+
+Narrowing applies only to a strict subset of the tenant's connectors. A full or
+empty selection still runs the whole tenant. Each `id=` targets that partition's
+own source, so tenants stay isolated from each other.
 
 ## State storage
 
-By default, the component stores its state on the local filesystem. The `defs_state` mechanism in Dagster makes this configurable for alternative storage backends.
+By default the component stores its state on the local filesystem. Dagster's
+`defs_state` mechanism lets you point it at another storage backend.
 
-## Benefits
+## What the cached state gives you
 
-- **Fast reloads** -- Assets are visible in the Dagster UI instantly on code location reload, with no API calls.
-- **Resilience** -- If an external API is temporarily unavailable, the cached state ensures assets remain visible.
-- **Scalability** -- Works well with large numbers of sources and tables without adding latency to code location startup.
-- **Auditable plan artifacts** -- Materializations dispatched through `RockyResource.run_pipes()` keep the two-step `rocky plan` + `rocky apply <plan-id>` chain, persisting `.rocky/plans/<plan-id>.json` per materialization. The default `run()` / `run_streaming()` path is a fused `rocky run` and does not write a plan file. See [observability](/dagster/observability/#plan-artifact-per-materialization).
+- **No API calls on reload** -- Assets appear in the Dagster UI as soon as the code location loads.
+- **Resilience** -- Assets stay visible when a source API is temporarily unavailable.
+- **Large source counts** -- Discovery cost does not land on code location startup, however many sources and tables you have.
+- **Auditable plan artifacts** -- Materializations dispatched through `RockyResource.run_pipes()` keep the two-step `rocky plan` + `rocky apply <plan-id>` chain, persisting `.rocky/plans/<plan-id>.json` per materialization. A [plan](/reference/glossary/#plan) is a reviewable record of what a run will do. The default `run()` / `run_streaming()` path is a fused `rocky run` and does not write a plan file. See [observability](/dagster/observability/#plan-artifact-per-materialization).
 
 ## DAG mode
 
-When `dag_mode: true` is set, the component calls `rocky dag` to build a fully connected asset graph where every pipeline stage (source, load, transformation, seed, quality, snapshot) becomes a Dagster asset with resolved upstream dependencies. This replaces the separate `discover` + `surface_derived_models` paths with a single unified DAG.
+Set `dag_mode: true` and the component calls `rocky dag` instead. Every pipeline
+stage becomes a Dagster asset: source, load, transformation, seed, quality, and
+snapshot. Rocky resolves the upstream dependencies, so the assets arrive already
+connected. This one call replaces both the `discover` path and the
+`surface_derived_models` path.
 
 ```yaml
 type: dagster_rocky.RockyComponent
@@ -107,8 +147,13 @@ Materialization dispatches to the right Rocky command per node kind:
 - Source/load nodes → `rocky run --filter <source>`
 - Seed/quality/snapshot → graph-only (placeholder materialization)
 
-Override key derivation by subclassing `RockyDagsterTranslator` and implementing `get_dag_node_asset_key()` and `get_dag_group_name()`.
+To change how keys are derived, subclass `RockyDagsterTranslator` and implement
+`get_dag_node_asset_key()` and `get_dag_group_name()`.
 
 ## Refreshing state
 
-To update the cached state with the latest discovery results, trigger a state refresh — the framework `dg defs state refresh` workflow (or a scheduled job that resolves the state path via the `defs_state` config) calls `write_state_to_path(state_path)` for you. This runs separate from the normal code location reload cycle.
+Trigger a state refresh to pick up the latest discovery results. The
+`dg defs state refresh` workflow calls `write_state_to_path(state_path)` for
+you. A scheduled job that resolves the state path from the `defs_state` config
+does the same. A refresh runs on its own, separate from the code location reload
+cycle.

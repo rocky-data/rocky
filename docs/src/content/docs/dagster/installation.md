@@ -5,6 +5,28 @@ sidebar:
   order: 2
 ---
 
+`dagster-rocky` is the Python package that lets Dagster run Rocky. Install it
+into the same environment as your Dagster code location, then install the
+`rocky` binary it calls. A code location is the Python process where Dagster
+loads your definitions.
+
+You install two things because Rocky itself is a Rust program. The Python
+package only builds the commands and reads the JSON that comes back.
+
+```
+┌──────────────────┐  Python call  ┌────────────────────┐
+│ your Dagster     │──────────────►│ dagster-rocky      │
+│ code location    │               │ (+ rocky-sdk)      │
+└──────────────────┘               └─────────┬──────────┘
+                                             │ subprocess
+                                             ▼
+                                   ┌────────────────────┐   SQL
+                                   │ rocky binary       │───────► warehouse
+                                   │ (Rust, installed   │
+                                   │  separately)       │
+                                   └────────────────────┘
+```
+
 ## Install the package
 
 ```bash
@@ -22,13 +44,18 @@ The package requires:
 
 ## Install the Rocky binary
 
-The `rocky` binary must be installed separately. It is not bundled with the Python package. See the [Installation](/getting-started/installation/) page for instructions on installing Rocky for your platform.
+Install the `rocky` binary separately. The Python package does not bundle it.
+The [Installation](/getting-started/installation/) page has the steps for each
+platform.
 
-The binary must be available on your `PATH`, or you can specify its location explicitly via the `binary_path` config on `RockyResource`.
+Put the binary on your `PATH`. If you would rather keep it somewhere else, set
+the `binary_path` config on `RockyResource` to its location.
 
 ### Vendor binary for deployment
 
-For containerized or cloud deployments where you want to pin a specific Rocky version, you can vendor the binary alongside your Dagster code:
+Vendor the binary next to your Dagster code when you want to pin one Rocky
+version. This suits containers and cloud deployments, where the host machine
+has nothing installed.
 
 ```
 my_dagster_project/
@@ -40,7 +67,7 @@ my_dagster_project/
   rocky.toml
 ```
 
-Then configure the resource to use the vendored path:
+Then point the resource at the vendored path:
 
 ```python
 rocky = RockyResource(
@@ -49,7 +76,7 @@ rocky = RockyResource(
 )
 ```
 
-Download the binary for your target platform from [GitHub Releases](https://github.com/rocky-data/rocky/releases) (filter by the `engine-v*` tag prefix). The `engine/install.sh` script can automate this:
+Download the binary for your target platform from [GitHub Releases](https://github.com/rocky-data/rocky/releases). Filter by the `engine-v*` tag prefix. The `engine/install.sh` script can do this for you:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | ROCKY_INSTALL_DIR=vendor bash
@@ -61,7 +88,8 @@ curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/instal
 python -c "from dagster_rocky import RockyResource; print('ok')"
 ```
 
-If this prints `ok`, the package is installed correctly. You can also verify the binary is accessible:
+The package is installed correctly if this prints `ok`. Check the binary
+separately:
 
 ```bash
 rocky --version

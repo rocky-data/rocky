@@ -5,22 +5,40 @@ sidebar:
   order: 19
 ---
 
-When a pull request opens against a Dagster+ project, the platform spins
-up a *branch deployment*: an isolated code location that mirrors
-production but writes to a separate dev environment. The canonical
-Rocky-side response is to **shadow-run** every materialization against a
-sandboxed schema instead of production tables, so PR diffs are visible
-side-by-side without touching production data.
+Dagster+ creates a *branch deployment* when a pull request opens: an isolated
+code location that mirrors production but writes to a separate dev environment.
 
-`dagster-rocky` ships three small primitives for this:
+The Rocky-side answer is [shadow mode](/reference/glossary/#shadow-mode). Rocky
+writes each materialization to a sandboxed schema instead of the production
+tables. You compare the two side by side, and production data never changes.
 
-- **`is_branch_deployment()`:** boolean check for the standard Dagster+
-  env vars.
-- **`branch_deployment_info()`:** structured snapshot of the deployment
-  context (deployment name, PR number, Git SHA).
-- **`branch_deploy_shadow_suffix()`:** derives a stable Rocky shadow
-  suffix suitable for `rocky plan --shadow --shadow-suffix <value>` + `rocky apply <plan-id>`
-  (the single-step `rocky run --shadow --shadow-suffix <value>` alias does the same in one invocation).
+`dagster-rocky` ships three small functions that carry the deployment context
+through to the shadow suffix:
+
+```
+pull request opens
+        │
+        ▼
+Dagster+ creates a branch deployment
+        │  it sets the DAGSTER_CLOUD_* env vars
+        ▼
+is_branch_deployment()        ──► True
+branch_deployment_info()      ──► deployment name, PR number, Git SHA
+        │
+        ▼
+branch_deploy_shadow_suffix() ──► "_dagster_pr_42"
+        │
+        ▼
+rocky plan --shadow --shadow-suffix _dagster_pr_42
+        │  then: rocky apply <plan-id>
+        ▼
+sandboxed schema; production tables untouched
+```
+
+The suffix feeds `rocky plan --shadow --shadow-suffix <value>`, followed by
+`rocky apply <plan-id>`. The single-step
+`rocky run --shadow --shadow-suffix <value>` alias does the same in one
+invocation.
 
 ## Quickstart
 
@@ -53,7 +71,7 @@ defs = dg.Definitions(
 
 ## Standard Dagster+ environment variables
 
-The helpers read these env vars (set automatically by Dagster+):
+The helpers read these env vars. Dagster+ sets them for you.
 
 | Env var | Description |
 |---|---|
@@ -62,13 +80,13 @@ The helpers read these env vars (set automatically by Dagster+):
 | `DAGSTER_CLOUD_PULL_REQUEST_ID` | Originating PR number, when known |
 | `DAGSTER_CLOUD_GIT_SHA` | Build commit SHA |
 
-The PR number and Git SHA are optional; branch deployments created via
-the Dagster+ API (rather than from a PR) won't have them.
+The PR number and the Git SHA are optional. A branch deployment created through
+the Dagster+ API, rather than from a PR, has neither.
 
 ## Shadow suffix derivation
 
-`branch_deploy_shadow_suffix()` returns a stable, sanitized suffix for
-Rocky's shadow mode:
+`branch_deploy_shadow_suffix()` returns a stable, sanitized suffix for Rocky's
+shadow mode:
 
 | Context | Returned suffix |
 |---|---|
@@ -77,18 +95,17 @@ Rocky's shadow mode:
 | API-driven branch deploy | `"_dagster_<sanitized_deployment_name>"` |
 | Branch deploy with no name | `"_dagster_branch"` |
 
-A non-numeric or malformed `DAGSTER_CLOUD_PULL_REQUEST_ID` is rejected and
-falls through to the `"_dagster_<sanitized_deployment_name>"` branch — the raw
-PR id is never interpolated into the suffix.
+A non-numeric or malformed `DAGSTER_CLOUD_PULL_REQUEST_ID` is rejected. It falls
+through to the `"_dagster_<sanitized_deployment_name>"` row instead. The raw PR
+id never reaches the suffix.
 
-Sanitization replaces SQL-unsafe characters (anything that isn't
-alphanumeric or underscore) with `_`. Rocky's identifier validation
-rejects most punctuation, so this keeps the suffix usable as part of a
-table name.
+Sanitizing replaces every character that is not alphanumeric or an underscore
+with `_`. Rocky's identifier validation rejects most punctuation, so this keeps
+the suffix usable inside a table name.
 
-The function returns `None` outside branch deployments so callers can
-unconditionally pass the result through to `rocky.run()`; the resource
-accepts `shadow_suffix: str | None`, and passing `None` is a no-op:
+Outside a branch deployment the function returns `None`. The resource accepts
+`shadow_suffix: str | None`, and `None` is a no-op. So you can pass the result
+straight through to `rocky.run()` with no guard:
 
 ```python
 from dagster_rocky import RockyResource, branch_deploy_shadow_suffix
@@ -100,20 +117,19 @@ suffix = branch_deploy_shadow_suffix()  # None in production, "_dagster_pr_42" i
 rocky.run(filter="tenant=acme", shadow_suffix=suffix)
 ```
 
-## Why detection only?
+## Why the helpers stop at detection
 
-PR-comment posting with diff summaries was descoped: it needs
-per-Git-host credentials (GitHub, GitLab, and Bitbucket each differ)
-and just rebroadcasts the asset diff Dagster+ already renders in the UI.
-Detection plus shadow-suffix derivation is the credential-free,
-host-agnostic piece worth shipping.
+Posting a diff summary as a PR comment is out of scope. It needs credentials for
+each Git host, and GitHub, GitLab, and Bitbucket all differ. It would also
+repeat the asset diff that Dagster+ already renders in its UI. Detection and
+suffix derivation need no credentials and work with any host.
 
 ## Resource-level auto-shadow
 
-`RockyResource.run()` accepts a `shadow_suffix` kwarg today, so manual
-wiring works end-to-end. To auto-derive the suffix on every `run()` /
-`run_streaming()` / `run_pipes()` call, wire the exported
-`shadow_suffix_resolver()` into the resource's `shadow_suffix_fn`:
+`RockyResource.run()` accepts a `shadow_suffix` keyword argument, so wiring it by
+hand works end to end. To derive the suffix on every `run()`, `run_streaming()`,
+and `run_pipes()` call, pass the exported `shadow_suffix_resolver()` as the
+resource's `shadow_suffix_fn`:
 
 ```python
 from dagster_rocky import RockyResource, shadow_suffix_resolver
@@ -124,14 +140,14 @@ rocky = RockyResource(
 )
 ```
 
-The resolver calls `branch_deploy_shadow_suffix()` per run and fires only when
-the caller didn't pass an explicit `shadow_suffix`; outside a branch deployment
-it resolves to `None`, so production runs are unaffected.
+The resolver calls `branch_deploy_shadow_suffix()` once per run. It fires only
+when the caller passed no explicit `shadow_suffix`. Outside a branch deployment
+it resolves to `None`, so production runs do not change.
 
 ## Future work
 
-A config-string `shadow_mode="branch_deploy"` sugar over the `shadow_suffix_fn`
-wiring above is still aspirational:
+A config-string `shadow_mode="branch_deploy"` shortcut over the
+`shadow_suffix_fn` wiring above is still aspirational. It is not shipped:
 
 ```python
 # Future API (not yet shipped) — config-string sugar over shadow_suffix_fn

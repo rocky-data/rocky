@@ -1,11 +1,11 @@
 ---
 title: DuckDB adapter
-description: Local in-process execution adapter — config fields and when a persistent path is required
+description: The local in-process adapter, and when it needs a file on disk instead of memory
 sidebar:
   order: 1
 ---
 
-Local in-process execution adapter. Use as a warehouse, source, or both: the same adapter instance can handle discovery and execution because they share the same database.
+DuckDB runs inside the Rocky process. Use it as a warehouse, as a source, or as both at once. One adapter instance can serve discovery and execution together, because both sides read the same database.
 
 ## Fields
 

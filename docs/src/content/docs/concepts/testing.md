@@ -1,19 +1,42 @@
 ---
 title: Testing and Contracts
-description: Data contracts, local testing, and CI pipelines
+description: What Rocky checks at compile time, on rocky test, and during a run
 sidebar:
   order: 11
 ---
 
-Rocky provides compile-time contract validation, local model testing via DuckDB, and a CI pipeline command that combines both. These features catch problems before models reach the warehouse.
+Rocky checks a model at several points, and each check runs somewhere different. Contracts run in the compiler, before any SQL reaches a warehouse. Unit tests run on a local DuckDB. Declarative tests run against your warehouse. This page covers all three, plus the `rocky ci` command that chains the first two.
+
+```
+  your model
+      │
+      ├─► rocky compile             ─► contracts E010 E011 E012 E013,
+      │                                checked against the inferred
+      │                                schema, before anything reaches
+      │                                a warehouse
+      │
+      ├─► rocky test                ─► the model executes on in-memory
+      │                                DuckDB, and [[test]] unit tests
+      │                                run against your fixtures
+      │
+      ├─► rocky test --declarative  ─► [[tests]] assertions run against
+      │                                the configured warehouse
+      │
+      └─► rocky run / apply         ─► inline data quality checks run
+                                       on the rows the run just wrote
+
+  rocky ci runs the first two, in that order.
+```
+
+Inline checks during a run have their own page: [data quality checks](/concepts/data-quality-checks/).
 
 ## Data contracts
 
-A data contract is a TOML file that declares expectations about a model's output schema. The compiler validates inferred schemas against contracts at compile time, catching issues like missing columns, type mismatches, and nullability violations.
+A data contract is a TOML file that declares what a model's output schema must look like. The compiler compares the schema it inferred against the contract. It catches a missing column, a wrong type, and a nullability violation before any row is written.
 
 ### Contract format
 
-Contracts are stored as `{model_name}.contract.toml` files in a contracts directory:
+A contract is a `{model_name}.contract.toml` file in a contracts directory:
 
 ```toml
 # orders_summary.contract.toml
@@ -74,18 +97,18 @@ The `[rules]` section enforces schema-level constraints:
 | `W010` | Warning | Contract defines a column that is not in the model output (but not required) |
 | `W011` | Warning | Contract exists for a model that was not found in the project |
 
-When a column has type `Unknown` (the compiler could not infer its type), type checks against contracts pass without error. This avoids false positives when type information is incomplete.
+A column can end up with type `Unknown`, which means the compiler could not infer its type. A type check against a contract then passes without error. This avoids false alarms when the type information is incomplete.
 
 ## rocky test
 
-The `rocky test` command compiles models and executes them locally using DuckDB, without requiring a warehouse connection. This provides fast feedback during development.
+`rocky test` compiles your models and executes them on a local DuckDB. It needs no warehouse connection, so you get fast feedback while you write.
 
-### How it works
+### What each step does
 
-1. **Compile.** All models are compiled through the full pipeline (load, resolve, semantic graph, type check, contracts).
-2. **Execute locally.** Each model's SQL is executed against an in-memory DuckDB instance. Models run in topological order so upstream models exist before downstream models reference them.
-3. **Validate.** If contracts are present, the output schemas are checked. Compilation diagnostics are also reported.
-4. **Report.** Pass/fail results are printed for each model.
+1. **Compile.** Rocky compiles every model through the full pipeline: load, resolve, semantic graph, type check, contracts.
+2. **Execute locally.** Rocky executes each model's SQL against an in-memory DuckDB. It runs the models in dependency order, so an upstream model exists before a downstream model reads it.
+3. **Validate.** Where a contract exists, Rocky checks the output schema against it. It reports the compilation diagnostics too.
+4. **Report.** Rocky prints a pass or fail line per model.
 
 ```bash
 # Run all tests
@@ -137,7 +160,7 @@ Testing 12 models...
 
 ## Unit tests (`[[test]]`)
 
-A unit test feeds a model mocked input rows and asserts on the rows it produces. This is the same approach dbt 1.8 ships as unit tests: you exercise the model's logic in isolation, against fixtures you control, without touching the warehouse. Rocky runs unit tests on the default `rocky test` path via DuckDB, alongside the local model-execution check above.
+A unit test feeds a model mocked input rows and asserts on the rows it produces. You exercise the model's logic on its own, against fixtures you control, without touching the warehouse. Rocky runs unit tests on the default `rocky test` path via DuckDB, alongside the local model-execution check above.
 
 Unit tests live in a model's `.toml` sidecar as singular `[[test]]` blocks. Each block names the test, declares one or more mocked inputs under `[[test.given]]`, and declares the expected output under `[test.expect]`:
 
@@ -163,7 +186,7 @@ rows = [
 ]
 ```
 
-The runner seeds DuckDB with each `[[test.given]]` fixture as a table named after its `ref`, executes the model's compiled SQL against those fixtures, and compares the result to `[test.expect]`.
+The runner seeds DuckDB with each `[[test.given]]` fixture, as a table named after its `ref`. It executes the model's compiled SQL against those fixtures. It then compares the result to `[test.expect]`.
 
 | Field | Required | Description |
 |-------|----------|-------------|
@@ -239,7 +262,7 @@ values = ["pending", "shipped", "delivered"]
 severity = "warning"
 ```
 
-Run them with `--declarative`. Unlike unit tests, declarative tests execute against the configured warehouse adapter rather than DuckDB, so they need a `rocky.toml` and a reachable warehouse:
+Run them with `--declarative`. A declarative test executes against the configured warehouse adapter, not DuckDB. It therefore needs a `rocky.toml` and a warehouse it can reach:
 
 ```bash
 # Run declarative assertions against the warehouse
@@ -252,7 +275,7 @@ rocky test --declarative --pipeline silver
 rocky test --declarative --model orders_summary
 ```
 
-Each assertion compiles to a SQL query in the adapter's dialect, runs against the model's target table, and reports `pass`, `fail`, or `error`. An assertion with `severity = "error"` (the default) that fails causes a non-zero exit; `severity = "warning"` reports without failing the run. The `--output json` payload carries a `declarative` summary with per-assertion results and the SQL that ran.
+Each assertion compiles to a SQL query in the adapter's dialect. Rocky runs it against the model's target table and reports `pass`, `fail`, or `error`. A failed assertion with `severity = "error"` (the default) exits non-zero. One with `severity = "warning"` reports without failing the run. The `--output json` payload carries a `declarative` summary with the per-assertion results and the SQL that ran.
 
 ### Reusable named tests
 
@@ -268,11 +291,10 @@ The singular and plural keys are two different test mechanisms:
 | Inputs | `[[test.given]]` fixtures you supply | The model's real target table |
 | Executes against | DuckDB, locally | The configured warehouse adapter |
 | How to run | `rocky test` (default path) | `rocky test --declarative` |
-| Analogous to | dbt 1.8 unit tests | dbt / DQX data tests and assertions |
 
 ## rocky ci
 
-The `rocky ci` command runs the full CI pipeline: compile + test. It is designed for CI/CD systems and returns a non-zero exit code on failure.
+`rocky ci` runs the full CI pipeline: compile, then test. It is built for a CI system, so it returns a non-zero exit code on failure.
 
 ```bash
 rocky ci --models models/ --contracts contracts/
@@ -280,8 +302,8 @@ rocky ci --models models/ --contracts contracts/
 
 ### Pipeline
 
-1. **Compile** -- Run the full compiler (type checking, contract validation)
-2. **Test** -- Execute all models locally via DuckDB
+1. **Compile** -- run the full compiler: type checking and contract validation
+2. **Test** -- execute every model locally on DuckDB
 
 Both phases must pass for the CI pipeline to succeed.
 
@@ -323,7 +345,7 @@ Rocky CI Pipeline
 
 ## AI-generated tests
 
-Rocky can generate test assertions from a model's intent and schema using `rocky ai-test`. See the [AI and Intent](/concepts/ai-intent/) page for the full AI workflow.
+`rocky ai-test` generates test assertions from a model's intent and schema. See the [AI and Intent](/concepts/ai-intent/) page for the full AI workflow.
 
 Each generated assertion is a SQL query that returns 0 rows when the assertion holds:
 
@@ -350,14 +372,14 @@ Generated tests cover:
 - Value range expectations (non-negative amounts, valid dates)
 - Referential integrity (foreign keys exist in parent tables)
 
-Tests are saved to a `tests/` directory and can be run alongside contract validation.
+Rocky saves the generated tests to a `tests/` directory. You can run them alongside contract validation.
 
 ## Workflow
 
-A typical development workflow combines contracts, testing, and CI:
+A typical development loop combines contracts, testing, and CI:
 
-1. Write a model (SQL or Rocky DSL)
-2. Write a contract defining the expected output schema
-3. Run `rocky test` locally to verify everything compiles and executes
+1. Write a model, in SQL or the Rocky DSL
+2. Write a contract that declares the expected output schema
+3. Run `rocky test` locally to check that everything compiles and executes
 4. Commit and push -- CI runs `rocky ci` to catch regressions
-5. Optionally, run `rocky ai-test --save` to generate additional assertions from intent
+5. Optionally, run `rocky ai-test --save` to generate more assertions from intent

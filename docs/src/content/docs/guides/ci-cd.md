@@ -1,11 +1,11 @@
 ---
 title: CI/CD Integration
-description: Set up Rocky in your CI pipeline for compile-time safety, automated testing, and AI-powered coverage
+description: Run Rocky in CI to compile and test every PR, diff a branch against main, and gate a promote on breaking changes.
 sidebar:
   order: 5
 ---
 
-Rocky's `ci` command combines compilation and testing into a single step that runs entirely locally using DuckDB. No warehouse credentials, no external services. This makes it ideal for PR checks, branch protection rules, and automated pipelines.
+`rocky ci` compiles and tests your project in one step. It runs entirely on your CI machine, on DuckDB, so it needs no warehouse credentials and no external service. That makes it a cheap required check on a pull request.
 
 ## 1. The rocky ci Command
 
@@ -13,10 +13,10 @@ Rocky's `ci` command combines compilation and testing into a single step that ru
 rocky ci --models models --contracts contracts
 ```
 
-This runs two phases in sequence:
+The command runs two phases in order:
 
-1. **Compile**: Type-check all models, resolve the DAG, validate contracts
-2. **Test**: Execute each model's SQL against DuckDB in dependency order
+1. **Compile**: type-check every model, resolve the DAG, validate contracts
+2. **Test**: execute each model's SQL against DuckDB in dependency order
 
 ```
 Rocky CI Pipeline
@@ -28,21 +28,21 @@ Rocky CI Pipeline
 ```
 
 Exit codes:
-- **0** -- all checks passed
-- **1** -- compilation or test failures detected
+- **0** -- every check passed
+- **1** -- a compilation or test failure
 
-The command detects both compile-time issues (type mismatches, missing dependencies, contract violations) and runtime issues (SQL syntax errors, division by zero, invalid casts).
+The two phases catch different faults. Compile catches type mismatches, missing dependencies, and contract violations. Test catches what only shows up when the SQL runs: syntax errors, division by zero, invalid casts.
 
 ### Structural diff against a base ref
 
-For PR review, [`rocky ci-diff`](/reference/commands/modeling/#rocky-ci-diff) is a companion to `rocky ci`. It compares model files between a base git ref and `HEAD`, compiles both sides, and reports added / modified / removed columns per model. The output is both JSON (for pipelines) and Markdown (for PR comments):
+[`rocky ci-diff`](/reference/commands/modeling/#rocky-ci-diff) answers a different question for a reviewer: what did this branch change? It compares model files between a base git ref and `HEAD`, compiles both sides, and reports the added, modified, and removed columns per model. It writes JSON for your pipeline and Markdown for a PR comment:
 
 ```bash
 rocky ci-diff                    # defaults to main
 rocky ci-diff release/2026-04 --models src/models
 ```
 
-In GitHub Actions, post the pre-rendered Markdown block to the PR directly:
+In GitHub Actions, post that Markdown block straight to the PR:
 
 ```yaml
 - name: Post diff to PR
@@ -56,27 +56,46 @@ In GitHub Actions, post the pre-rendered Markdown block to the PR directly:
 
 ### Semantic breaking-change findings and the promote gate
 
-`rocky ci-diff --semantic` runs the typed-IR breaking-change classifier on top of the structural diff and surfaces classified findings under `breaking_findings` in the JSON output:
+Three commands run the same breaking-change classifier over the typed IR (the compiler's typed graph of your models, see the [glossary](/reference/glossary/#ir-intermediate-representation)). Two of them only report. One of them blocks:
+
+```
+  reporting only                 the gate
+  ─────────────────────────────  ────────────────────────────────────
+  rocky plan --semantic          rocky plan promote <branch>
+    (your working tree)            │
+  rocky ci-diff --semantic         ├─ a `breaking` finding
+    (a branch, at PR time)         │    └─► no plan_id: the promote
+    │                              │        stops here
+    ├─► findings in the JSON       │
+    │   the exit code never        └─ no `breaking` finding
+    │   changes                         └─► plan_id ─► rocky apply
+    │                                                  replays the
+    └─► a reviewer reads them                          recorded verdict
+```
+
+`rocky ci-diff --semantic` runs the classifier on top of the structural diff and puts the findings under `breaking_findings` in the JSON output:
 
 ```bash
 rocky ci-diff --semantic --output json | jq '.breaking_findings'
 ```
 
-Each finding has a tagged `change.kind` (e.g. `column_dropped`, `column_type_changed`, `target_renamed`) and a `severity` (`breaking` / `warning` / `info`). `ci-diff --semantic` is **informational**: even a `breaking` finding does not change `ci-diff`'s exit code. Use it on every PR to make breaking changes visible to reviewers before promotion.
+Each finding carries a tagged `change.kind` (such as `column_dropped`, `column_type_changed`, `target_renamed`) and a `severity` (`breaking`, `warning`, or `info`). `ci-diff --semantic` is **informational**. A `breaking` finding does not change its exit code. Run it on every PR so reviewers see breaking changes before anyone promotes.
 
-`rocky plan --semantic` surfaces the same verdict at plan time as **decision-support for the author**: it diffs your *working tree* (uncommitted edits included) against `--base` (default `main`) and attaches the verdict under `breaking_verdict` in the JSON output:
+`rocky plan --semantic` gives the author the same verdict at plan time. It diffs your *working tree*, uncommitted edits included, against `--base` (default `main`), and attaches the verdict under `breaking_verdict` in the JSON output:
 
 ```bash
 rocky plan --semantic --base main --output json | jq '.breaking_verdict'
 ```
 
-This is **reporting-only**: the verdict never gates the plan, and `breaking_verdict` is omitted (never fabricated) when no baseline is available: no `models/` directory, or the `--base` ref's models don't compile. The hard gate is still `rocky plan promote` (below).
+This reports only. The verdict never gates the plan. When no baseline exists, Rocky omits `breaking_verdict` rather than inventing one. That happens when there is no `models/` directory, or when the `--base` ref's models do not compile. The hard gate is `rocky plan promote`, below.
 
 :::caution[The classifier diffs OUTPUT SCHEMA; it is blind to value changes]
-The breaking-change classifier compares the typed **output schema** of each model (columns, types, nullability, materialization keys, masks, target). It is **blind to schema-stable value changes**: a `WHERE` / `JOIN`-key / `CASE` rewrite that changes every output row but leaves the column list and types untouched produces **no finding**. An empty `breaking_verdict.findings` therefore means "no output-schema change was detected"; it is **not** a completeness or safety signal that the data is unchanged. The verdict carries this statement verbatim in its `caveat` field so a JSON-only consumer can't miss it. To see whether values moved, pair it with [`rocky preview`](/guides/preview-a-pr/) (row-level diff on real data).
+The breaking-change classifier compares the typed **output schema** of each model: columns, types, nullability, materialization keys, masks, target. It is **blind to schema-stable value changes**. A `WHERE`, `JOIN`-key, or `CASE` rewrite that changes every output row, but leaves the column list and types alone, produces **no finding**. An empty `breaking_verdict.findings` therefore means "no output-schema change was detected". It is **not** a signal that the data is unchanged. The verdict repeats this statement verbatim in its `caveat` field, so a JSON-only consumer cannot miss it. To see whether values moved, pair it with [`rocky preview`](/guides/preview-a-pr/), which diffs rows on real data.
 :::
 
-The hard gate lives on `rocky plan promote` + `rocky apply`. When promoting a branch to production, Rocky runs the same classifier against `--base` (default `main`); any finding with `severity == "breaking"` blocks the promote **at plan time**. The gate fires once: a blocked promote never produces a `plan_id`, so there is nothing for `rocky apply` to run. The gate results are captured in the persisted plan and are **not** re-evaluated at apply time — `rocky apply` replays the recorded verdict rather than re-running the classifier. To override (e.g. a planned breaking release with downstream consumers already migrated), pass `--allow-breaking` at plan time. The override emits a `breaking_changes_allowed` audit event so the bypass leaves a paper trail.
+The hard gate lives on `rocky plan promote` and `rocky apply`. When you promote a branch to production, Rocky runs the same classifier against `--base` (default `main`). Any finding with `severity == "breaking"` blocks the promote **at plan time**.
+
+The gate fires once. A blocked promote produces no `plan_id`, so `rocky apply` has nothing to run. Rocky records the gate result in the persisted plan and does **not** re-evaluate it at apply time; `rocky apply` replays the recorded verdict. To ship a breaking change on purpose, once downstream consumers have migrated, pass `--allow-breaking` at plan time. The override emits a `breaking_changes_allowed` audit event, so the bypass leaves a paper trail.
 
 ```bash
 # PR-time: detect (informational)
@@ -91,7 +110,7 @@ plan_id=$(rocky plan promote fix-price --base main --allow-breaking --output jso
 rocky apply "$plan_id"
 ```
 
-The bare `rocky branch promote <name>` form continues to work as an alias for the two-step flow above. See [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) for the full flag list, and the [`branch_promote` schema](https://github.com/rocky-data/rocky/blob/main/schemas/branch_promote.schema.json) for the audit-event reference.
+The bare `rocky branch promote <name>` form still works as an alias for the two-step flow above. See [`rocky branch promote`](/reference/commands/core-pipeline/#rocky-branch) for the flag list, and the [`branch_promote` schema](https://github.com/rocky-data/rocky/blob/main/schemas/branch_promote.schema.json) for the audit-event reference.
 
 ## 2. GitHub Actions
 
@@ -124,7 +143,7 @@ jobs:
 
 ### With JSON output and artifact upload
 
-For richer CI reporting, output JSON and upload it as an artifact:
+Write JSON and upload it as an artifact when you want the detail after the job ends:
 
 ```yaml
 name: Rocky CI
@@ -168,7 +187,7 @@ jobs:
 
 ### PR comment with results
 
-Parse the JSON output to post a summary comment on the PR:
+Parse the JSON and post a summary comment on the PR:
 
 ```yaml
       - name: CI Check
@@ -219,7 +238,7 @@ rocky-ci:
 
 ### Separate compile and test stages
 
-Split compilation and testing into separate stages for faster feedback:
+Split compile and test into two stages. A compile failure then reports without waiting for the tests:
 
 ```yaml
 stages:
@@ -258,20 +277,20 @@ rocky-test:
 
 ## 4. Using rocky compile for PR Checks
 
-`rocky compile` is faster than `rocky ci` because it skips test execution. Use it as a lightweight required check on PRs:
+`rocky compile` skips test execution, so it finishes faster than `rocky ci`. Use it as a cheap required check on PRs:
 
 ```bash
 rocky compile --models models --contracts contracts
 ```
 
-This catches at compile time:
-- **Type mismatches**: A column used as `Int64` in one model but `String` in another
-- **Missing dependencies**: `depends_on` references a model that does not exist
-- **Contract violations**: Required columns missing, wrong types, or protected columns removed
-- **DAG cycles**: Model A depends on B, B depends on A
-- **Unresolved references**: SQL references a table or column that cannot be found
+The compiler catches:
+- **Type mismatches**: a column used as `Int64` in one model and `String` in another
+- **Missing dependencies**: a `depends_on` that names a model which does not exist
+- **Contract violations**: a missing required column, a wrong type, or a removed protected column
+- **DAG cycles**: model A depends on B, and B depends on A
+- **Unresolved references**: SQL that names a table or column Rocky cannot find
 
-For a single model check during development:
+To check one model while you work on it:
 
 ```bash
 rocky compile --models models --model revenue_summary
@@ -279,7 +298,7 @@ rocky compile --models models --model revenue_summary
 
 ## 5. AI-Powered Test Coverage
 
-Use `rocky ai-test` to automatically generate test assertions from your models. This requires `ANTHROPIC_API_KEY` to be set.
+`rocky ai-test` writes test assertions from your models. It needs `ANTHROPIC_API_KEY` set.
 
 ### Generate tests locally
 
@@ -293,7 +312,7 @@ rocky ai-explain --all --save --models models
 rocky ai-test --all --save --models models
 ```
 
-This writes one `.sql` file per assertion into the `tests/` directory (a sibling of `models/`). These are standalone SQL assertion files — `rocky ci` and `rocky test` do **not** pick them up automatically (those commands execute your models and any `[[test]]` sidecar blocks, not loose `tests/*.sql` files). Commit them and run them yourself as a dedicated CI step (execute each assertion against DuckDB), or use declarative `[[tests]]` in model sidecars with `rocky test --declarative` for gating that Rocky runs directly.
+This writes one `.sql` file per assertion into the `tests/` directory, a sibling of `models/`. Each file is a standalone SQL assertion. `rocky ci` and `rocky test` do **not** pick them up: those commands execute your models and any `[[test]]` sidecar blocks, never loose `tests/*.sql` files. So commit them and run them in a CI step of your own, executing each assertion against DuckDB. For gating that Rocky runs itself, declare `[[tests]]` in the model sidecars and run `rocky test --declarative`.
 
 ### Generate tests for a single model
 
@@ -303,7 +322,7 @@ rocky ai-test revenue_summary --save --models models
 
 ### CI workflow with AI test generation
 
-Run AI test generation as a scheduled job to keep coverage up to date:
+Generate the tests on a schedule, and open a PR with the result:
 
 ```yaml
 name: Update AI Tests
@@ -339,7 +358,7 @@ jobs:
 
 ## 6. Integration with Dagster CI
 
-If you use Dagster to orchestrate Rocky, add both checks to your CI pipeline:
+If Dagster orchestrates Rocky, run both checks in CI:
 
 ```yaml
 name: Data Pipeline CI
@@ -378,11 +397,11 @@ jobs:
         run: uv run dg check defs
 ```
 
-Rocky's `ci` command validates the models independently. Dagster's `definitions validate` ensures the orchestration layer can load and wire the models into assets.
+The two checks cover different layers. `rocky ci` validates the models on their own. Dagster's `definitions validate` confirms that the orchestration layer can load those models and wire them into assets.
 
 ## 7. JSON Output Schema
 
-All CI-related commands produce structured JSON for programmatic consumption.
+Every CI command emits structured JSON.
 
 ### rocky ci
 
@@ -439,7 +458,7 @@ All CI-related commands produce structured JSON for programmatic consumption.
 }
 ```
 
-Parse with `jq` for custom CI reporting:
+Parse the payload with `jq` to build your own CI report:
 
 ```bash
 # Check if any tests failed

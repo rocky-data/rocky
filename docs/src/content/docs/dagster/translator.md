@@ -5,7 +5,20 @@ sidebar:
   order: 5
 ---
 
-`RockyDagsterTranslator` controls how Rocky sources and tables map to Dagster asset keys, groups, tags, and metadata. Override its methods to customize the mapping for your organization's conventions.
+Rocky and Dagster name things differently. Rocky has sources, tables, and models. Dagster has asset keys, groups, tags, and metadata. `RockyDagsterTranslator` decides how one becomes the other. Override a method to match your own naming conventions.
+
+One method fills each part of the `AssetSpec`:
+
+```
+  Rocky input                             Dagster AssetSpec field
+  ───────────────────────                 ───────────────────────
+  source + table  ──get_asset_key──────►  key
+  source          ──get_group_name─────►  group_name
+  source + table  ──get_tags───────────►  tags
+  source + table  ──get_metadata───────►  metadata
+
+  ModelDetail     ──get_model_tags─────►  tags   (derived models)
+```
 
 ## Methods
 
@@ -29,9 +42,15 @@ Returns tags to attach to the asset.
 
 ### `get_model_tags(model) -> dict[str, str]`
 
-The derived-model counterpart to `get_tags`. It takes a `ModelDetail` rather than a source and table, and projects the model's resolved `[tags]` (its own tags merged over any config-group baseline) onto the derived-model `AssetSpec` as first-class Dagster tags, so a governance tag is usable in asset selection (for example `tag:domain=finance`). Both keys and values are sanitized to Dagster's tag charset `[A-Za-z0-9_.-]`: any other character (whitespace, `@`, `:`, `/`, and so on) collapses to `_`, and each is truncated to 63 characters. A key that sanitizes to empty is dropped; an empty value is kept.
+The derived-model counterpart to `get_tags`. It takes a `ModelDetail` instead of a source and a table.
 
-Rocky also synthesizes its own metadata tags: `rocky/model_name`, `rocky/target_catalog`, `rocky/target_schema`, plus `rocky/strategy` when the model declares a materialization strategy. The synthesized keys always contain a `/`, and a sanitized governance key never can (its `/` collapses to `_`), so a governance tag can never clobber Rocky's metadata.
+It projects the model's resolved `[tags]` onto the derived-model `AssetSpec` as Dagster tags. Resolved means the model's own tags merged over any [config group](/reference/glossary/#config-group) baseline. Once projected, a governance tag works in asset selection, for example `tag:domain=finance`.
+
+Dagster's tag charset is `[A-Za-z0-9_.-]`, so Rocky sanitizes both keys and values against it. Every other character collapses to `_`, including whitespace, `@`, `:`, and `/`. Each key and each value is then truncated to 63 characters. A key that sanitizes to empty is dropped. An empty value is kept.
+
+Rocky adds its own metadata tags on top: `rocky/model_name`, `rocky/target_catalog`, and `rocky/target_schema`. It adds `rocky/strategy` as well when the model declares a [materialization strategy](/reference/glossary/#materialization-strategy).
+
+Those synthesized keys always contain a `/`. A sanitized governance key never can, because its `/` collapses to `_`. A governance tag therefore cannot overwrite Rocky's metadata.
 
 **Default:** the model's sanitized `[tags]` plus `rocky/model_name`, `rocky/target_catalog`, `rocky/target_schema`, and (when present) `rocky/strategy`
 

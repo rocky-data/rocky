@@ -1,11 +1,36 @@
 ---
 title: SQL Generation
-description: The full SQL surface Rocky emits across warehouses
+description: The statements Rocky emits for each strategy, in each warehouse dialect
 sidebar:
   order: 7.5
 ---
 
-Rocky generates all SQL from its internal IR (Intermediate Representation). No Jinja templates, no string concatenation with untrusted input. Every identifier is validated before it reaches a SQL statement.
+Rocky builds every statement it sends to a warehouse. A model's statements come out of the compiler's typed IR. The IR (intermediate representation) is one typed record per model: its SQL, its columns, its target table, and its materialization strategy.
+
+A replication pipeline needs no model. Rocky renders its catalog, schema, copy and other replication statements from the pipeline config instead. Both paths end in the dialect the target warehouse speaks. See the [glossary](/reference/glossary/) for both terms.
+
+```
+  models/fct_orders.sql  +  models/fct_orders.toml
+                     │
+                     │ compile: parse, resolve the DAG, type check
+                     ▼
+          ┌──────────────────────┐
+          │ typed IR             │  one record per model:
+          │                      │  its SQL, columns, target, strategy
+          └──────────┬───────────┘
+                     │
+  rocky.toml ────────┤  replication needs no model: its catalog,
+  (a replication     │  schema, copy and other statements are
+   pipeline)         │  rendered from the pipeline config
+                     │
+                     │ generate, in the target warehouse's dialect
+     ┌───────────┬───┴────────┬────────────┬───────────┐
+     ▼           ▼            ▼            ▼           ▼
+  Databricks  Snowflake   BigQuery      Trino      DuckDB
+                  the SQL below, ready to execute
+```
+
+The rest of this page is the catalog of statements Rocky emits. Rocky validates every identifier before it reaches a statement — see [SQL Safety](#sql-safety) at the end.
 
 ## Catalog Lifecycle
 
@@ -37,7 +62,7 @@ SHOW SCHEMAS IN <catalog>
 
 ## Table Tagging
 
-Governance tags are applied to each replicated table:
+Rocky tags each replicated table for governance:
 
 ```sql
 ALTER TABLE <catalog>.<schema>.<table> SET TAGS ('managed_by' = 'rocky')
@@ -45,7 +70,7 @@ ALTER TABLE <catalog>.<schema>.<table> SET TAGS ('managed_by' = 'rocky')
 
 ## Incremental Copy
 
-The core replication operation. Copies only rows newer than the last watermark Rocky recorded for the table:
+This is the core replication statement. It copies only the rows newer than the last watermark Rocky recorded for the table:
 
 ```sql
 INSERT INTO <target_catalog>.<target_schema>.<table>
@@ -54,11 +79,11 @@ FROM <source_catalog>.<source_schema>.<table>
 WHERE _fivetran_synced > TIMESTAMP '<last watermark>'
 ```
 
-Rocky reads the previous run's `MAX(_fivetran_synced)` from its state store and threads it in as a literal — there is no correlated subquery against the target table.
+Rocky reads the previous run's `MAX(_fivetran_synced)` from its state store and writes it in as a literal. There is no correlated subquery against the target table.
 
 ## Full Refresh
 
-Used when drift is detected or when explicitly configured:
+Rocky rebuilds the whole table when it finds drift it cannot fix in place, and when you configure a full refresh:
 
 ```sql
 CREATE OR REPLACE TABLE <target> AS SELECT * FROM <source>
@@ -78,7 +103,7 @@ WHEN NOT MATCHED THEN INSERT *
 
 ## Transformation SQL
 
-User-defined SQL is wrapped in the appropriate statement depending on the materialization strategy:
+Rocky wraps the SQL you wrote in a statement chosen by the model's materialization strategy:
 
 - **Table**: `CREATE OR REPLACE TABLE ... AS <user_sql>`
 - **Incremental**: `INSERT INTO ... <user_sql>`
@@ -97,7 +122,7 @@ name = "order_key"
 columns = ["order_id"]
 ```
 
-At `rocky run` and `rocky emit-sql`, Rocky wraps the model's SELECT and appends each key as a top-level column (DuckDB shown):
+At `rocky run` and `rocky emit-sql`, Rocky wraps the model's `SELECT` and appends each key as a top-level column. DuckDB is shown here:
 
 ```sql
 SELECT *, CAST(md5(cast(coalesce(cast(order_id as VARCHAR), '_dbt_utils_surrogate_key_null_') as VARCHAR)) AS VARCHAR) AS order_key
@@ -106,7 +131,7 @@ FROM (
 ) AS __rocky_keyed
 ```
 
-The hash expression follows dbt-utils' `generate_surrogate_key`: each input is cast to text, NULL-coalesced to the `_dbt_utils_surrogate_key_null_` sentinel, joined with a `-` separator, and MD5-hashed. Most warehouses concatenate with `||` and differ only in the text type they cast to:
+The hash expression follows dbt-utils' `generate_surrogate_key`. Rocky casts each input to text, replaces a NULL with the `_dbt_utils_surrogate_key_null_` sentinel, joins the values with a `-` separator, and MD5-hashes the result. Most warehouses concatenate with `||` and differ only in the text type they cast to:
 
 - **DuckDB / Snowflake** cast to `VARCHAR`:
 
@@ -146,7 +171,7 @@ AS <user_sql>
 
 ## Time-Interval Partition Processing
 
-Per-warehouse SQL for partition-keyed materialization:
+Each warehouse gets its own statement shape for partition-keyed materialization. See [Time interval materialization](/concepts/time-interval/) for the strategy itself.
 
 **Databricks (Delta, atomic):**
 
@@ -167,11 +192,13 @@ COMMIT;
 
 ## Drift Detection
 
+Rocky reads both schemas before it copies a table:
+
 ```sql
 DESCRIBE TABLE <catalog>.<schema>.<table>
 ```
 
-When drift is found:
+When it finds a change it cannot apply in place, it drops the target and rebuilds it:
 
 ```sql
 DROP TABLE IF EXISTS <target_catalog>.<target_schema>.<table>
@@ -229,7 +256,7 @@ Rocky uses the Databricks REST API for workspace binding and isolation (not SQL)
 
 ## Catalog Discovery
 
-Find catalogs managed by Rocky using tags:
+Rocky finds the catalogs it manages by reading its own tags back:
 
 ```sql
 SELECT catalog_name
@@ -239,9 +266,9 @@ WHERE tag_name = 'managed_by' AND tag_value = 'rocky'
 
 ## SQL Safety
 
-All SQL generation follows strict safety rules:
+Rocky applies the same rules to every statement it builds:
 
-- **Identifiers** (catalogs, schemas, tables, tenants, regions, sources) are validated against `^[a-zA-Z0-9_]+$`
-- **Principal names** are validated against `^[a-zA-Z0-9_ \-\.@]+$` and always wrapped in backticks
+- **Identifiers** (catalogs, schemas, tables, tenants, regions, sources) must match `^[a-zA-Z0-9_]+$`
+- **Principal names** must match `^[a-zA-Z0-9_ \-\.@]+$`, and Rocky always wraps them in backticks
 - Rocky never uses `format!()` to interpolate untrusted input into SQL
-- All validation happens in `rocky-sql/validation.rs` before any SQL is constructed
+- Every check runs in `rocky-sql/validation.rs`, before Rocky constructs any SQL

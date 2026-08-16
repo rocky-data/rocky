@@ -5,19 +5,19 @@ sidebar:
   order: 10.5
 ---
 
-The `time_interval` materialization strategy lets you partition a model by a
-time column with a fixed granularity (`hour`, `day`, `month`, or `year`).
-Each run targets specific partitions rather than appending past a watermark,
-so re-running the same partition is idempotent, late-arriving rows are
-picked up automatically, and backfills walk the range chronologically.
+The `time_interval` materialization strategy partitions a model by a time
+column at a fixed granularity: `hour`, `day`, `month`, or `year`. A run targets
+named partitions instead of appending past a watermark. Three things follow from
+that. Re-running the same partition is idempotent. A late-arriving row is picked
+up on the next run of its partition. A backfill walks the range in order.
 
-This is the strategy you reach for when:
+Reach for this strategy when:
 
 - Your model aggregates by date and you need per-day rebuilds
-- You want per-partition cost / row-count observability
+- You want cost and row counts reported per partition
 
-For pure append-only patterns where rows never arrive late, `incremental`
-remains the simpler choice.
+For a pure append-only pattern, where a row never arrives late, `incremental`
+stays the simpler choice.
 
 ## TOML reference
 
@@ -71,15 +71,30 @@ WHERE order_at >= @start_date
 GROUP BY 1, 2
 ```
 
-The window is **half-open**: rows at exactly `@start_date` are included, rows
-at exactly `@end_date` are excluded. This matches Spark, BigQuery, and
-Postgres `tsrange` conventions.
+Each window is **half-open**. A row at exactly `@start_date` is in the window. A
+row at exactly `@end_date` belongs to the next partition. This matches Spark,
+BigQuery, and Postgres `tsrange` conventions.
 
-For `granularity = "day"`, partition key `2026-04-07` substitutes:
-- `@start_date` → `'2026-04-07 00:00:00'`
-- `@end_date` → `'2026-04-08 00:00:00'`
+```
+  granularity = "day"
 
-For `granularity = "hour"`, partition key `2026-04-07T13` substitutes:
+   04-06 00:00      04-07 00:00      04-08 00:00      04-09 00:00
+        │                │                │                │
+   ─────┼────────────────┼────────────────┼────────────────┼─────► time
+        │  partition     │  partition     │  partition     │
+        │  2026-04-06    │  2026-04-07    │  2026-04-08    │
+        └────────────────┴────────────────┴────────────────┘
+                         ▲
+                         └── @end_date of partition 2026-04-06,
+                             and @start_date of partition 2026-04-07
+
+   running partition 2026-04-07 substitutes:
+       @start_date → '2026-04-07 00:00:00'   a row here is included
+       @end_date   → '2026-04-08 00:00:00'   a row here is excluded
+```
+
+The same rule applies at every grain. For `granularity = "hour"`, partition key
+`2026-04-07T13` substitutes:
 - `@start_date` → `'2026-04-07 13:00:00'`
 - `@end_date` → `'2026-04-07 14:00:00'`
 
@@ -100,8 +115,8 @@ JSON output:
 | `month` | `%Y-%m` | `2026-04` |
 | `year` | `%Y` | `2026` |
 
-Format flexibility is intentionally restricted. `2026-04-7` (no zero padding)
-is rejected even though `chrono` would parse it.
+Rocky restricts the format on purpose. It rejects `2026-04-7`, which drops the
+zero padding, even though `chrono` would parse it.
 
 ## CLI flags
 
@@ -139,10 +154,10 @@ rocky run --filter client=acme --lookback 3
 
 ## Per-warehouse SQL
 
-Each adapter implements `insert_overwrite_partition` differently, returning
-a `Vec<String>` so the runtime can issue multiple statements when needed.
-Atomicity is preserved per partition: on any failure mid-batch the runtime
-issues `ROLLBACK` and marks the partition as `Failed` in the state store.
+Each adapter implements `insert_overwrite_partition` in its own way. Each one
+returns a `Vec<String>`, so the runtime can issue more than one statement.
+Atomicity holds per partition. If a statement fails mid-batch, the runtime
+issues `ROLLBACK` and marks the partition `Failed` in the state store.
 
 ### Databricks (Delta Lake)
 
@@ -195,9 +210,9 @@ COMMIT;
 
 ## State store
 
-Per-partition state lives in a dedicated `PARTITIONS` table in the redb
-state store (`<models>/.rocky-state.redb` by default). One row per
-`(model_name, partition_key)`:
+Per-partition state lives in its own `PARTITIONS` table in the redb
+[state store](/concepts/state-management/) (`<models>/.rocky-state.redb` by
+default). There is one row per `(model_name, partition_key)`:
 
 ```rust
 PartitionRecord {
@@ -212,10 +227,10 @@ PartitionRecord {
 }
 ```
 
-`--missing` consults this table to compute the gap between expected and
-actual. `RUN_HISTORY` remains the source of truth for whole-run success;
-`PARTITIONS` is the source of truth for per-partition success. The
-`run_id` field cross-references the two for forensics.
+`--missing` reads this table to compute the gap between expected and actual.
+`RUN_HISTORY` stays the source of truth for whole-run success. `PARTITIONS` is
+the source of truth for per-partition success. The `run_id` field
+cross-references the two when you investigate a failure.
 
 ## Timezone
 
@@ -256,10 +271,10 @@ materialization entries and a per-model summary:
 }
 ```
 
-The dagster-rocky integration consumes this via the autogenerated Pydantic
-`PartitionInfo` and `PartitionSummary` models, and translates the strategy
-discriminator into a Dagster `DailyPartitionsDefinition` (or `Hourly`,
-`Monthly`, `TimeWindow` for year). See
+The dagster-rocky integration reads this through the autogenerated Pydantic
+`PartitionInfo` and `PartitionSummary` models. It translates the strategy
+discriminator into a Dagster `DailyPartitionsDefinition`, or `Hourly`,
+`Monthly`, or `TimeWindow` for year. See
 [the dagster partitions guide](/dagster/partitions/) for the full mapping.
 
 ## Comparison with `incremental`

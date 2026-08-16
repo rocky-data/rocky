@@ -5,19 +5,46 @@ sidebar:
   order: 13
 ---
 
-Rocky's `time_interval` materialization strategy declares a model is
-partitioned by a time column with a fixed granularity (`hour`, `day`, `month`,
-or `year`). `dagster-rocky` ships `partitions.py`, a translation layer
-that converts these strategies into Dagster's
-[`PartitionsDefinition`](https://docs.dagster.io/api/dagster/partitions#dagster.PartitionsDefinition)
-variants.
+A [partition](/reference/glossary/#partition) is one time slice of a
+model, such as a single day. Rocky's `time_interval` materialization
+strategy says a model is partitioned by a time column at a fixed
+granularity: `hour`, `day`, `month`, or `year`.
 
-These builders are also **standalone helpers** you can call directly from
-hand-rolled assets. The `RockyComponent`-side wiring has since landed: with
-`surface_derived_models=True` / `dag_mode=True`, the component splits
-derived-model multi-assets by partitioning shape and threads Dagster
-partition keys into a fused `rocky run --partition <key>`. Reach for the
-standalone helpers when you are building partitioned assets by hand.
+`dagster-rocky` ships `partitions.py`. It converts those strategies into
+Dagster's
+[`PartitionsDefinition`](https://docs.dagster.io/api/dagster/partitions#dagster.PartitionsDefinition)
+variants. The translation happens twice, once when Dagster loads your
+definitions and once on every run:
+
+```
+  LOAD TIME
+  rocky compile ──► ModelDetail ──► partitions_def_for_model_detail()
+                                              │
+                                              ▼
+                                    PartitionsDefinition
+                                              │ passed as partitions_def=
+                                              ▼
+                                      your Dagster asset
+
+  RUN TIME
+  context.partition_key ──► dagster_to_rocky_partition_key()
+      "2026-04-08-13:00"              │
+                                      ▼
+                             "2026-04-08T13" ──► rocky run --partition <key>
+```
+
+`RockyComponent` can do both steps for you, but not by default. Both
+`surface_derived_models` and `dag_mode` default to `False`. Turn either
+one on. The component then groups assets by partitioning shape, and
+threads each Dagster partition key into a fused
+`rocky run --partition <key>`.
+
+The diagram above traces the compile-driven path. `dag_mode` takes a
+different route to the same builders. It reads each node's partition
+shape from `rocky dag` output, not from `rocky compile`.
+
+Reach for the standalone helpers below when you build partitioned assets
+by hand.
 
 ## Strategy mapping
 
@@ -32,8 +59,8 @@ standalone helpers when you are building partitioned assets by hand.
 
 ### `partitions_def_for_time_interval(granularity, first_partition, ...)`
 
-Pure builder. Takes a granularity + start date and returns the matching
-`PartitionsDefinition`.
+A pure builder. It takes a granularity and a start date, then returns the
+matching `PartitionsDefinition`.
 
 ```python
 from dagster_rocky import partitions_def_for_time_interval
@@ -48,12 +75,14 @@ pdef = partitions_def_for_time_interval(
 
 ### `partitions_def_for_model_detail(model)`
 
-Higher-level: takes a `ModelDetail` (from `CompileResult.models_detail`) and
-dispatches to the time_interval builder when the strategy discriminator
-matches. Returns `None` for any non-`time_interval` strategy
-(`full_refresh`, `incremental`, `merge`, `ephemeral`, `delete_insert`,
-`view` — and, today, `microbatch`, which is not translated despite being
-time-based).
+The higher-level builder. It takes a `ModelDetail` from
+`CompileResult.models_detail`. When the strategy discriminator says
+`time_interval`, it calls the pure builder above.
+
+It returns `None` for every other strategy: `full_refresh`,
+`incremental`, `merge`, `ephemeral`, `delete_insert`, and `view`. It also
+returns `None` for `microbatch` today, even though that strategy is
+time-based.
 
 ```python
 from dagster_rocky import partitions_def_for_model_detail, RockyResource
@@ -98,7 +127,8 @@ rocky_key = dagster_to_rocky_partition_key("hour", "2026-04-08-13:00")
 # "2026-04-08T13"
 ```
 
-Round-tripping a key through both helpers is idempotent for all grains.
+Round-tripping a key through both helpers is
+[idempotent](/reference/glossary/#idempotent) for all grains.
 
 ## CLI argument builders
 
@@ -117,8 +147,8 @@ args = partition_range_args("2026-04-01", "2026-04-08")
 # ["--from", "2026-04-01", "--to", "2026-04-08"]
 ```
 
-Both return `[]` when their inputs are `None` so callers can unconditionally
-splat them into the CLI argument list.
+Both return `[]` when their inputs are `None`. A caller can therefore
+splat them into the CLI argument list without checking first.
 
 ## End-to-end example
 

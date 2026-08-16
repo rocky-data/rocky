@@ -5,13 +5,13 @@ sidebar:
   order: 4
 ---
 
-Rocky models define SQL transformations and their materialization behavior. Each model is a SQL query paired with configuration that tells Rocky how to materialize it, what it depends on, and where to write the output.
+A Rocky model is one SQL query plus the configuration that says how to materialize it, what it depends on, and where the output goes. One model produces one table or view.
 
-Rocky supports two model formats: **sidecar** (recommended) and **inline** (legacy).
+Rocky reads two model formats: **sidecar** (recommended) and **inline** (legacy).
 
 ## Sidecar Format (Recommended)
 
-The sidecar format keeps SQL and configuration in separate files with matching names:
+Keep the SQL and the configuration in two files that share a name. The `.toml` file is the [sidecar](/reference/glossary/#sidecar): it carries everything that is not SQL.
 
 ```
 models/
@@ -23,11 +23,11 @@ models/
 └── dim_products.toml
 ```
 
-This separation keeps SQL files clean and editable by any SQL tool without needing to understand Rocky-specific syntax.
+The split matters because it keeps the `.sql` file readable by anything that reads SQL. You can open it in a query editor, run it by hand, or hand it to a colleague who has never heard of Rocky.
 
 ### SQL File
 
-The `.sql` file contains a plain SQL query. No templating, no Jinja, no special markers.
+The `.sql` file holds a plain SQL query. No templating, no Jinja, no special markers.
 
 ```sql
 -- models/fct_orders.sql
@@ -46,7 +46,7 @@ WHERE o.order_date >= '2024-01-01'
 
 ### TOML Config File
 
-The `.toml` file specifies the model name, dependencies, materialization strategy, and target table.
+The `.toml` file names the model, lists what it depends on, picks a materialization strategy, and says where the output lands.
 
 **Fields:**
 
@@ -104,7 +104,7 @@ The chosen `format` and `format_options` are now applied on the **first** materi
 
 ### `[skip]`
 
-Per-model overrides for the opt-in `--skip-unchanged` model-skip gate. The gate is conservative by default: a model is auto-skip-eligible only when a static scan finds its SQL deterministic and it uses a plain materialization strategy. This block lets an owner override that decision per model. Omit it entirely to follow the automatic rules.
+Overrule the `--skip-unchanged` gate for this one model. By default the gate is cautious. A model qualifies to be skipped only when a static scan finds its SQL [deterministic](/reference/glossary/#deterministic): same inputs, same output, every time. It must also use a plain materialization strategy. This block lets the model's owner say otherwise. Omit it and the automatic rules apply.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -135,11 +135,11 @@ deterministic = true    # owner asserts the SQL is pure → re-eligible despite 
 
 ### Environment variables
 
-Sidecar `.toml` files (and `models/_defaults.toml`) go through the same `${VAR}` / `${VAR:-default}` substitution as `rocky.toml`, so an orchestrator can inject per-model `[target]` values via subprocess env without templating the sidecar. See [Environment Variables](/reference/configuration/#environment-variables) for the syntax and a sidecar example, and [`examples/playground/pocs/00-foundations/07-config-layering/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations/07-config-layering) for a runnable three-layer example.
+Sidecar files and `models/_defaults.toml` get the same `${VAR}` and `${VAR:-default}` substitution as `rocky.toml`. An orchestrator can therefore set a model's `[target]` through the subprocess environment, with no templating in the sidecar. See [Environment variables](/reference/configuration/#environment-variables) for the syntax and a sidecar example, and [`examples/playground/pocs/00-foundations/07-config-layering/`](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/00-foundations/07-config-layering) for a runnable three-layer example.
 
 ### `@var()` run variables
 
-A model body can carry per-run placeholders of the form `@var(name)` or `@var(name, default)`. They are bound at run time by `rocky run --var name=value` (repeatable) and substituted into the SQL before it reaches the warehouse:
+Parameterize a model per run. Write `@var(name)` or `@var(name, default)` in the model body. Bind it with `rocky run --var name=value`, which you can repeat. Rocky substitutes the value into the SQL before it reaches the warehouse:
 
 ```sql
 -- models/orders.sql
@@ -153,15 +153,28 @@ WHERE region = '@var(region)'
 rocky run --var region=emea --var status=delivered
 ```
 
-Here `@var(region)` has no default and must be supplied; `@var(status, shipped)` falls back to `shipped` when `--var status=...` is omitted.
+`@var(region)` has no default, so you must supply it. `@var(status, shipped)` falls back to `shipped` when you omit `--var status=…`.
 
-The substitution is **textual** — Rocky replaces the marker with the supplied string verbatim, so you own the surrounding quoting and casting (the example quotes the marker because the value is a string literal). Only the variable *name* is validated, as a SQL identifier.
+The substitution is **textual**. Rocky replaces the marker with your string verbatim, so you own the quoting and the casting around it. The example quotes the marker because the value is a string literal. Rocky validates only the variable *name*, as a SQL identifier.
 
-This is deliberately distinct from config-time `${ENV}` substitution: `${ENV}` resolves config values while Rocky parses `rocky.toml` and the sidecars, before any model is seen; `@var()` resolves a run's logical inputs at compile/render time and stays visible in the model source. A `@var(name)` with no `--var` binding and no inline default is a **compile error** that names the missing variable, so a forgotten value fails fast. `rocky import-dbt` maps dbt's `{{ var('name') }}` / `{{ var('name', default) }}` onto these markers.
+`@var()` and `${ENV}` solve different problems and run at different times:
+
+```
+   ${ENV}                             @var(name)
+   ──────                             ──────────
+   resolves while Rocky parses        resolves at compile/render time,
+   rocky.toml and the sidecars,       after the model is read
+   before any model is read
+                                      stays visible in the model source
+   sets config values                 sets a run's logical inputs
+   (target catalog, credentials)      (a region, a status)
+```
+
+A `@var(name)` with no `--var` binding and no inline default is a **compile error** naming the missing variable. A forgotten value fails before anything runs. `rocky import-dbt` maps dbt's `{{ var('name') }}` and `{{ var('name', default) }}` onto these markers.
 
 ### Config groups
 
-When many models share the same routing and materialization, define a **config group** once and have each model opt in by name. A group lives in `models/groups/<name>.toml` (the file stem is the group name) and supplies a `schema_template` and a `strategy`:
+Write the shared settings once when a fan-out of models routes and materializes the same way. A **config group** lives in `models/groups/<name>.toml`, where the file stem is the group name, and supplies a `schema_template` and a `strategy`:
 
 ```toml
 # models/groups/daily_marts.toml
@@ -186,13 +199,23 @@ catalog = "warehouse"   # schema comes from the group template
 region = "emea"         # fills {region} -> schema "mart_emea"
 ```
 
-Precedence is **per-model sidecar > group > `_defaults.toml`**: a model can still pin its own `schema` or `strategy` to override the group, and the group in turn overrides directory defaults. A `group` that names no definition, or a `schema_template` placeholder the model doesn't supply, fails the load with a clear error rather than routing a model to the wrong place.
+Three layers can set the same field. The nearest one to the model wins:
 
-A model that pins its own `schema` overrides the group's template entirely — so it must **not** also supply `[args]`, since the args could only fill a template that's now bypassed. That combination is a misplacement (the args silently do nothing, usually masking a routing mistake) and fails the load. Pin a schema *or* supply args, not both.
+```
+   models/fct_orders.toml    ◄── highest: the model's own sidecar
+            ▲
+   models/groups/<name>.toml     the group it opted into
+            ▲
+   models/_defaults.toml     ◄── lowest: directory defaults
+```
+
+So a model can pin its own `schema` or `strategy` and override the group, and the group in turn overrides the directory defaults. A `group` naming no definition fails the load with a clear error. So does a `schema_template` placeholder the model does not supply. Rocky refuses rather than routing the model somewhere wrong.
+
+One combination is rejected. A model that pins its own `schema` bypasses the group's template completely, so it must **not** also supply `[args]`. Those args could only fill a template nothing now reads. Rocky fails the load rather than let the args sit there doing nothing and masking a routing mistake. Pin a schema *or* supply args, never both.
 
 #### Enforced groups
 
-Set `enforce = true` on a group to make its fields binding rather than defaults. A member model that locally pins a field the group controls — its target `schema` or its `strategy` — then fails the load instead of silently routing or materializing itself differently from the rest of the group:
+Make the group's fields binding instead of overridable. Set `enforce = true`. A member model that pins a field the group owns, its target `schema` or its `strategy`, then fails the load. It cannot quietly route or materialize itself differently from the rest of the group:
 
 ```toml
 # models/groups/regulated.toml
@@ -204,13 +227,13 @@ type = "merge"
 unique_key = ["id"]
 ```
 
-Enforcement is strictly opt-in: without `enforce`, groups stay overridable defaults. A model under an enforced group still supplies its own `[args]` (and any field the group doesn't set, like `target.catalog`); it just can't override what the group owns. Use this when a set of models must share routing and materialization as a governance guarantee.
+Enforcement is opt-in. Without `enforce`, a group stays a set of overridable defaults. A model under an enforced group still supplies its own `[args]`, and any field the group leaves unset such as `target.catalog`. It simply cannot override what the group owns. Use enforcement when a set of models must share routing and materialization as a governance guarantee.
 
-The model loader does not recurse into subdirectories, so `models/groups/` is never mistaken for model files.
+The model loader does not recurse into subdirectories, so it never mistakes `models/groups/` for model files.
 
 #### Group tags
 
-A group can also declare a `[tags]` block. Every member model inherits the group's tags as a shared baseline, so a governance attribute applied once on the group lands on the whole fan-out:
+Apply a governance attribute once and have it land on the whole fan-out. A group can declare a `[tags]` block, and every member model inherits it as a baseline:
 
 ```toml
 # models/groups/finance.toml
@@ -221,13 +244,13 @@ domain = "finance"
 tier = "gold"
 ```
 
-A member model's own `[tags]` override the group per key (sidecar > group) without dropping the rest of the group's tags — so one model can set `tier = "silver"` and still inherit `domain = "finance"`. See [`[tags]`](#tags) for how resolved tags surface on `models_detail[].tags` and project onto Dagster assets.
+A model's own `[tags]` override the group key by key, without dropping the rest. One model can set `tier = "silver"` and still inherit `domain = "finance"`. See [`[tags]`](#tags) for how the resolved tags surface on `models_detail[].tags` and project onto Dagster assets.
 
-A group carries `schema_template`, `strategy`, `tags`, `governance`, and `enforce`. An unrecognized key in a group file is rejected at load so typos surface immediately.
+A group file may carry `schema_template`, `strategy`, `tags`, `governance`, and `enforce`. Rocky rejects an unrecognized key at load, so a typo surfaces immediately.
 
 ### `[classification]`
 
-Per-column classification tags. Keys are column names, values are free-form classification strings. Rocky resolves each value against `[mask]` / `[mask.<env>]` in `rocky.toml` to pick the masking strategy, then applies both the column tag and the mask via the governance adapter after a successful DAG.
+Label a column as sensitive so the [masking policy](/reference/glossary/#masking-policy) can act on it. Keys are column names; values are free-form classification strings. Rocky resolves each value against `[mask]` and `[mask.<env>]` in `rocky.toml` to pick a strategy. It then applies both the column tag and the mask through the governance adapter, after a successful DAG run.
 
 | Key pattern | Value type | Description |
 |---|---|---|
@@ -251,7 +274,7 @@ Classification tags + masking policies are applied today against **Databricks** 
 
 ### `[tags]`
 
-Model-level governance tags. Unlike `[classification]` (keyed by column, drives masking), these describe the model **as a whole** — `domain`, `tier`, `owner`, anything your governance model needs:
+Describe the model **as a whole**: its `domain`, its `tier`, its `owner`, or anything else your governance model needs. This differs from `[classification]`, which is keyed by column and drives masking.
 
 ```toml
 # models/fct_orders.toml
@@ -267,13 +290,13 @@ owner = "data-eng"
 |---|---|---|
 | `<tag_name>` | string | Free-form governance attribute. Merged over any [config-group `[tags]`](#group-tags) baseline (sidecar > group). |
 
-Resolved tags are emitted on `rocky compile --output json` as `models_detail[].tags`. The `dagster-rocky` integration projects them onto the derived asset's Dagster tags, so the same attribute drives both Rocky's view of the model and the orchestrator's. Tags are inherited from a model's config group when it belongs to one — see [Group tags](#group-tags).
+`rocky compile --output json` reports the resolved tags as `models_detail[].tags`. The `dagster-rocky` integration projects them onto the derived asset's Dagster tags, so one attribute drives both Rocky's view of the model and the orchestrator's. A model in a config group inherits that group's tags too — see [Group tags](#group-tags).
 
-`[tags]` never touches the warehouse. For tags that should land on the warehouse securable itself, use [`[governance.tags]`](#governancetags).
+`[tags]` never touches the warehouse. To put a tag on the warehouse object itself, use [`[governance.tags]`](#governancetags).
 
 ### `[governance.tags]`
 
-Where `[tags]` is orchestrator-facing metadata, the `[governance.tags]` block writes Unity Catalog tags onto the model's **own target securable** after it materializes. The DDL is view-aware: `ALTER VIEW ... SET TAGS (...)` for view-format models, `ALTER TABLE ... SET TAGS (...)` otherwise.
+Put a tag on the warehouse object itself. After the model materializes, Rocky writes these as Unity Catalog tags on its **own target table or view**. The [DDL](/reference/glossary/#ddl-data-definition-language) matches the shape: `ALTER VIEW … SET TAGS (…)` for a view-format model, `ALTER TABLE … SET TAGS (…)` otherwise.
 
 ```toml
 # models/fct_orders.toml
@@ -292,7 +315,7 @@ This is the per-model counterpart to the pipeline-level [tagging strategy](/guid
 
 ### `[[surrogate_key]]`
 
-Declares a computed surrogate-key column. Rocky injects a deterministic hash of the listed input columns into the materialized SELECT, so you don't hand-write the hash expression in your SQL.
+Add a stable key column without writing the hash expression yourself. Rocky injects a deterministic hash over the columns you list into the model's SELECT.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -319,7 +342,7 @@ A `[[surrogate_key]]` block uses `deny_unknown_fields`: a typo such as `colums =
 
 ### `[[tests]]`
 
-Inline declarative data-quality assertions. Each `[[tests]]` block is one assertion that runs against the model's target table. Tests are declarative TOML, not SQL macros. Rocky generates the assertion SQL for the active dialect.
+Assert a property of the model's output. Each `[[tests]]` block is one assertion, and it runs against the target table. You write TOML, not a SQL macro: Rocky generates the assertion SQL for whichever dialect the run targets.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -362,7 +385,7 @@ min = 1
 
 ### `[[use_test]]`
 
-References a reusable test defined once in `models/test_definitions.toml` and applies it to this model by name. Use this when several models share the same assertion and you don't want to repeat it as inline `[[tests]]`.
+Apply a test you defined once, by name. Reach for this when several models share the same assertion and repeating it as inline `[[tests]]` would mean maintaining it in several places.
 
 A named definition lives in `models/test_definitions.toml`, keyed by name, carrying the test `type` and its parameters plus an optional default `column`:
 
@@ -404,7 +427,7 @@ Resolved references are appended to the model's `[[tests]]` at load. A `[[use_te
 
 ### `[[test]]`
 
-A fixture-driven unit test. Where `[[tests]]` asserts properties of materialized output, a `[[test]]` checks the model's SQL logic against hand-written inputs: it seeds mock upstream tables, runs the model SQL, and compares the result to an expected set of rows. The block name is singular (`[[test]]`), unlike the plural `[[tests]]` used for declarative assertions.
+Check the model's SQL logic against inputs you write by hand, with no warehouse involved. Rocky seeds mock upstream tables, runs the model's SQL over them, and compares the result to the rows you expect. Where `[[tests]]` asserts a property of real materialized output, `[[test]]` tests the logic itself. Note the singular block name: `[[test]]` here, `[[tests]]` for declarative assertions.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -443,7 +466,7 @@ A test may declare several `[[test.given]]` blocks to mock more than one upstrea
 
 ### `[columns.<name>]`
 
-Per-column documentation. Each `[columns.<name>]` table attaches a description to one output column:
+Document what an output column means. Each `[columns.<name>]` table describes one column:
 
 | Field | Type | Description |
 |---|---|---|
@@ -460,13 +483,13 @@ description = "Unique order identifier"
 description = "Order total in USD"
 ```
 
-Descriptions surface in `rocky catalog --output json` as each asset's `CatalogColumn.description`. A description is attached only when its `<name>` matches a column the model actually projects; a description for a column the SELECT doesn't produce is silently dropped, so keep the key in sync with your output columns. The `rocky docs` HTML catalog does not emit per-column detail (it has no warehouse connection to introspect the column list), so column descriptions reach consumers through `rocky catalog`, not the generated HTML.
+`rocky catalog --output json` reports each description as the asset's `CatalogColumn.description`. Rocky attaches a description only when `<name>` matches a column the model actually projects. It drops a description for a column the SELECT does not produce, silently, so keep these keys in step with your output columns. The `rocky docs` HTML catalog carries no per-column detail, because it has no warehouse connection with which to read the column list. Descriptions reach consumers through `rocky catalog`, not the generated HTML.
 
 The singular `[columns.<name>]` table documents columns, and is distinct from the plural `[[columns]]` array used to declare a contract's column schema. The two look similar but do different jobs.
 
 ### Retention
 
-Top-level `retention` key on the sidecar declares a data-retention policy for the model. Parsed at load time into a typed `RetentionPolicy { duration_days: u32 }`.
+Declare how long this model's data should be kept. The top-level `retention` key on the sidecar carries the policy, and Rocky parses it at load time into a typed `RetentionPolicy { duration_days: u32 }`.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -495,13 +518,13 @@ Applied by `GovernanceAdapter::apply_retention_policy` after a successful DAG ru
 | **Snowflake** | `ALTER TABLE ... SET DATA_RETENTION_TIME_IN_DAYS = {N}`. |
 | **BigQuery / DuckDB** | Default-unsupported — those warehouses lack a first-class retention knob at the config level. |
 
-Garbage inputs (`"abc"`, `"90"`, `"-3d"`, `"1.5d"`, leading signs, exponents) are rejected at sidecar parse time with a `ModelError::InvalidRetention` diagnostic naming the offending value. Inspect resolved policies + warehouse state with [`rocky retention-status`](/reference/cli/#rocky-retention-status).
+Rocky rejects a malformed value when it parses the sidecar: `"abc"`, `"90"`, `"-3d"`, `"1.5d"`, a leading sign, an exponent. The `ModelError::InvalidRetention` diagnostic names what it saw. Inspect the resolved policies with [`rocky retention-status`](/reference/cli/#rocky-retention-status).
 
 ---
 
 ## Inline Format (Legacy)
 
-The inline format embeds TOML configuration directly in the SQL file using a `---toml` / `---` fenced block at the top of the file:
+The inline format puts the TOML configuration inside the SQL file, in a `---toml` / `---` fenced block at the top:
 
 ```sql
 ---toml
@@ -522,11 +545,11 @@ SELECT
 FROM raw_catalog.src__acme__us_west__shopify.orders
 ```
 
-The inline format uses the same fields as the sidecar TOML file. The SQL query follows the closing `---` marker.
+The fields are identical to the sidecar file's. The SQL query follows the closing `---` marker.
 
-The frontmatter block supports the same `${VAR}` / `${VAR:-default}` substitution as sidecar `.toml` files (see [Environment Variables](/reference/configuration/#environment-variables)); the SQL body below the closing `---` is **not** substituted, so any `${VAR}` token in the query stays literal.
+The frontmatter block takes the same `${VAR}` and `${VAR:-default}` substitution as a sidecar (see [Environment variables](/reference/configuration/#environment-variables)). The SQL body below the closing `---` gets **no** substitution, so a `${VAR}` token in the query stays literal.
 
-This format is supported for backward compatibility; prefer the sidecar format.
+This format exists for backward compatibility. Prefer the sidecar.
 
 ---
 
@@ -587,7 +610,7 @@ WHERE _fivetran_deleted = false
 
 ### Incremental
 
-Appends only new rows based on a watermark column. Use this for large fact tables where full refresh is too slow.
+Appends only the rows that arrived since last time. Rocky stores a [watermark](/reference/glossary/#watermark) — the timestamp of the newest row it has already loaded — and reads past it on the next run. Use this for a large fact table where a full refresh is too slow.
 
 **SQL** (`models/fct_orders.sql`):
 
@@ -642,7 +665,7 @@ The watermark literal is the previous run's `MAX(_fivetran_synced)`, read from R
 
 ### Merge
 
-Upserts rows based on a unique key. Matching rows are updated; non-matching rows are inserted. Use this for slowly changing dimensions or tables with late-arriving updates.
+[Upserts](/reference/glossary/#upsert) on a unique key: Rocky updates a row whose key already exists and inserts one whose key does not. Use it for a [slowly changing dimension](/reference/glossary/#scd-slowly-changing-dimension), or for any table that gets late-arriving updates.
 
 **SQL** (`models/dim_customers.sql`):
 
@@ -711,7 +734,7 @@ When `update_columns` is omitted, Rocky updates all non-key columns.
 
 ### Ephemeral
 
-An ephemeral model is never materialized; Rocky inlines it as a CTE in every downstream consumer. Useful for lightweight intermediate transformations you don't want to persist.
+An [ephemeral](/reference/glossary/#ephemeral) model never becomes a table. Rocky inlines it as a [CTE](/reference/glossary/#cte-common-table-expression) — a named subquery in a `WITH` clause — inside every model that reads it. Use it for a small intermediate step you do not want to keep.
 
 **Config** (`models/stg_recent_orders.toml`):
 
@@ -734,7 +757,7 @@ No DDL runs for ephemeral models. The SQL body is injected as a `WITH stg_recent
 
 ### Delete + Insert
 
-Deletes matching rows by partition key, then inserts fresh data. A lower-overhead alternative to `merge` when the partition key identifies the rows being rewritten.
+Deletes the rows in a [partition](/reference/glossary/#partition) — a slice of the table identified by a column value — then inserts fresh ones. It costs less than `merge` when the partition key already identifies exactly the rows you are rewriting.
 
 **Config** (`models/fct_daily_activity.toml`):
 
@@ -756,7 +779,7 @@ table = "fct_daily_activity"
 
 ### Microbatch
 
-An alias for `time_interval` with `hour`-granularity defaults. dbt-compatible naming for partition-based incremental processing.
+An alias for `time_interval` that defaults to `hour` granularity. The name matches dbt's for partition-based incremental processing.
 
 **Config** (`models/fct_hourly_events.toml`):
 
@@ -804,7 +827,7 @@ The runtime executes the model SQL, converts the result to Arrow, hashes the Par
 
 ### Time Interval
 
-Partition-keyed materialization for time-series data. The model SQL uses `@start_date` and `@end_date` placeholders that the runtime substitutes per partition.
+Rebuild one time slice at a time instead of the whole table. Write `@start_date` and `@end_date` placeholders in the model SQL, and Rocky substitutes the bounds of each [partition](/reference/glossary/#partition) as it processes it.
 
 **SQL** (`models/fct_daily_events.sql`):
 
@@ -866,12 +889,24 @@ Per-partition state is tracked in the state store. The `--missing` flag consults
 
 ## DAG Resolution
 
-Rocky automatically resolves the execution order of models based on their `depends_on` declarations. Models are executed in topological order, meaning every upstream dependency runs before its downstream dependents.
+You never write an execution order. Rocky derives it from the `depends_on` declarations and runs the models in [topological order](/reference/glossary/#topological-order), so every upstream finishes before anything that reads it starts.
 
-During `rocky validate`, the DAG is checked for cycles. If a cycle is detected (e.g., model A depends on B, B depends on A), validation fails with an error listing the cycle.
+```
+   stg_orders ─────┐
+                   ▼
+   stg_customers ─► fct_orders ─────► mart_revenue
+                                          ▲
+   dim_products ─────────────────────────┘
+
+   depth 0: stg_orders, stg_customers, dim_products   (no dependencies)
+   depth 1: fct_orders
+   depth 2: mart_revenue
+```
+
+Models with no dependencies run first. Models at the same depth run concurrently, up to the limit `rocky run --parallel <N>` sets (default 4). A warehouse that cannot run statements concurrently, such as DuckDB, runs them one at a time. So does a depth that holds a `content_addressed` or `time_interval` model.
+
+`rocky validate` checks the DAG for cycles. A cycle — model A depends on B, B depends on A — fails validation with an error naming the loop:
 
 ```
 !!  dag_validation — cycle detected: fct_orders -> dim_customers -> fct_orders
 ```
-
-Models with no dependencies run first. Models at the same depth in the DAG may run concurrently in future versions.

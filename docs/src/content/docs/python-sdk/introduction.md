@@ -1,13 +1,43 @@
 ---
 title: Introduction
-description: rocky-sdk, the typed Python client for the Rocky engine
+description: rocky-sdk, the Python client that runs the rocky CLI and returns typed results
 sidebar:
   order: 1
 ---
 
-`rocky-sdk` is a typed Python client for the Rocky engine. `RockyClient` wraps the `rocky` binary (subprocess plus `--output json`) behind one method per CLI command, parses the output into Pydantic models, and raises typed errors. It is for human Python callers: notebooks, scripts, and orchestrators other than Dagster.
+`rocky-sdk` is a typed Python client for the Rocky engine. Its `RockyClient` class gives you one method per Rocky CLI command.
 
-It is also the foundation the [`dagster-rocky`](/dagster/introduction/) integration is built on: `RockyResource` is a thin Dagster adapter over `RockyClient`. Dagster is the one *turnkey* integration — every other orchestrator (Airflow, Prefect, Flyte, a cron script) integrates with Rocky by wrapping this client in a task. See [Recipes](/python-sdk/recipes/) for streaming, error handling, `rocky serve` mode, and Airflow/Prefect examples.
+Each method runs the `rocky` binary as a subprocess with `--output json`, parses the output into a [Pydantic](https://docs.pydantic.dev/) model, and raises a typed error on failure. Use it from a notebook, a script, or any orchestrator.
+
+Rocky ships one orchestrator integration, [`dagster-rocky`](/dagster/introduction/). `RockyResource` there is a thin adapter over this same `RockyClient`. Every other orchestrator, whether Airflow, Prefect, Flyte, or a cron script, wraps this client in a task.
+
+[Recipes](/python-sdk/recipes/) covers the patterns that go past this page: streaming, error handling, `rocky serve` mode, and Airflow and Prefect examples.
+
+## What one call does
+
+```
+  your code                    RockyClient                  the engine
+  ─────────                    ───────────                  ──────────
+
+  client.run(filter="tenant=acme",
+             log_callback=print)
+        │
+        ▼
+    build the argv ──────► rocky --config rocky.toml … --output json
+        │                        run --filter tenant=acme
+        │                              │
+        │                              │  subprocess, killed by a
+        │                              │  watchdog after
+        │                              │  timeout_seconds (default 3600)
+        │                              ▼
+        │                   stdout: JSON        stderr: progress lines
+        │                          │                    │
+        ▼                          ▼                    ▼
+    RunResult ◄────── parsed into Pydantic      log_callback(line)
+    (typed object)                              called as the run goes
+```
+
+Setting `server_url` diverts three read-only commands off this path. See [Use a long-lived server](/python-sdk/recipes/#use-a-long-lived-server).
 
 ## Install
 
@@ -15,7 +45,7 @@ It is also the foundation the [`dagster-rocky`](/dagster/introduction/) integrat
 pip install rocky-sdk
 ```
 
-The `rocky` binary is not bundled. Install it separately and put it on `PATH`, or pass `binary_path=`. See the [releases page](https://github.com/rocky-data/rocky/releases). The SDK requires engine v1.34.0 or newer.
+The `rocky` binary is not bundled with the package. Install it separately and put it on `PATH`, or pass `binary_path=` to the client. Get it from the [releases page](https://github.com/rocky-data/rocky/releases). The SDK needs engine v1.34.0 or newer.
 
 ## Quick start
 
@@ -40,11 +70,13 @@ run = client.run(filter="tenant=acme", log_callback=print)
 print(f"{run.tables_copied} copied, {run.tables_failed} failed, {run.duration_ms} ms")
 ```
 
-A complete runnable version lives in the repo at [`sdk/python/examples/quickstart.py`](https://github.com/rocky-data/rocky/blob/main/sdk/python/examples/quickstart.py). It spins up a throwaway DuckDB playground (no credentials) and walks through compile, lineage, a real run, and typed error handling.
+`run()` takes the filter as its first argument. It is a required string in `key=value` form, such as `"tenant=acme"`. The syntax is documented in [Filters](/reference/filters/).
+
+A complete runnable version lives in the repo at [`sdk/python/examples/quickstart.py`](https://github.com/rocky-data/rocky/blob/main/sdk/python/examples/quickstart.py). It spins up a throwaway DuckDB playground, which needs no credentials, then walks through compile, lineage, a real run, and typed error handling.
 
 ## Errors
 
-Failures raise a `RockyError` subclass carrying structured fields, so you branch on the cause instead of parsing a message.
+A failure raises a `RockyError` subclass carrying structured fields. Branch on the cause instead of parsing a message.
 
 ```python
 from rocky_sdk import RockyClient
@@ -72,6 +104,8 @@ except RockyCommandError as exc:
 | `RockyServerError` | a `rocky serve` HTTP request failed |
 | `RockyGovernanceError` | a `governance_override` would revoke every workspace binding |
 
+**The timeout is wall-clock.** A watchdog thread kills the subprocess once `timeout_seconds` elapses, whatever the process was doing. The default is 3600 seconds. Set `timeout_seconds=` on the client to change it for every call, or pass `timeout_seconds=` to one `run()` call to change it for that run only.
+
 ## Which Python surface to use
 
 | You want to | Use |
@@ -92,9 +126,11 @@ except RockyCommandError as exc:
 - **Governance and branches:** `compliance`, `retention_status`, `branch_approve`, `branch_promote`, `plan_promote`
 - **Diagnostics:** `doctor`, `validate_migration`, `test_adapter`, `hooks_list`, `hooks_test`
 
-`run()` accepts a `log_callback` that receives the engine's stderr line by line, so you can stream progress wherever you want. Setting `server_url` routes `compile`, `lineage`, and `metrics` through a running `rocky serve` instead of a subprocess. Those endpoints serve each command's default output, so `compile`'s `model_filter` and `metrics`'s `trend`, `column`, or `alerts` raise `ValueError` in server mode, while `lineage`'s `column` is supported.
+`discover()` returns a `DiscoverResult`. Read the discovered sources from `.sources`, and check `.failed_sources` before you treat a missing source as deleted upstream.
 
-Each method's full signature, parameters, and return type are in the [`RockyResource` reference](/dagster/resource/) — `RockyClient` exposes the same methods and configuration, since the Dagster resource delegates to it. Output model shapes are in the [JSON output reference](/reference/json-output/), and the `filter=` syntax in [Filters](/reference/filters/).
+`run()` accepts a `log_callback` that receives the engine's stderr line by line, so you can stream progress anywhere. See [Stream live progress](/python-sdk/recipes/#stream-live-progress).
+
+Each method's full signature, parameters, and return type are in the [`RockyResource` reference](/dagster/resource/). `RockyClient` exposes the same methods and configuration, because the Dagster resource delegates to it. The output model shapes are in the [JSON output reference](/reference/json-output/).
 
 ## Requirements
 

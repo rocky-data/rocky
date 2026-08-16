@@ -1,19 +1,40 @@
 ---
 title: State Management
-description: Embedded state store for watermarks and run history
+description: Where Rocky keeps watermarks and run history, and how it syncs them
 sidebar:
   order: 6
 ---
 
-Rocky uses an embedded key-value store to track watermarks and run history. No external database is required; state is stored in a local file that Rocky manages automatically.
+Rocky keeps watermarks and run history in an embedded key-value store. You do not run a database for it. Rocky creates and manages a single local file.
 
-## Backend
+A watermark is the timestamp of the newest row Rocky has already loaded. It is what lets the next run read only new rows. See the [glossary](/reference/glossary/) for the other terms on this page.
 
-Rocky uses [redb](https://github.com/cberner/redb), an embedded key-value store written in Rust. Think of it as SQLite for key-value data: a single file, no server process, ACID transactions, and zero configuration.
+## The redb store
+
+Rocky uses [redb](https://github.com/cberner/redb), an embedded key-value store written in Rust. Think of it as SQLite for key-value data: one file, no server process, ACID transactions, no configuration.
+
+Each kind of record lives in its own table inside that one file.
+
+```
+  rocky run / rocky apply
+        │
+        │ takes the file's writer lock — one writer at a time
+        ▼
+  <models>/.rocky-state.redb
+  ┌────────────────────────────────────────────────────────────────┐
+  │ watermarks     "catalog.schema.table" → last_value, updated_at │
+  │ check_history  "catalog.schema.table" → [ {count, timestamp} ] │
+  │ run_history    run_id                 → what the run did       │
+  │ partitions     model + partition key  → per-partition status   │
+  │ …              plus other internal tables                      │
+  └────────────────────────────────────────────────────────────────┘
+```
 
 ## State file
 
-By default, Rocky stores state in `<models>/.rocky-state.redb` (a legacy `.rocky-state.redb` in the current directory keeps working, with a one-time deprecation warning on stderr). You can override the location with the `--state-path` flag:
+By default, Rocky stores state in `<models>/.rocky-state.redb`. A legacy `.rocky-state.redb` in the current directory keeps working. Rocky prints a one-time deprecation warning on stderr when it uses that path.
+
+Override the location with the `--state-path` flag:
 
 ```bash
 plan_id=$(rocky --config rocky.toml --state-path /var/lib/rocky/state.redb plan --output json | jq -r .plan_id)
@@ -22,9 +43,20 @@ rocky --state-path /var/lib/rocky/state.redb apply "$plan_id"
 
 ## Per-namespace state files
 
-redb permits **one writer per state file**. When you fan out one `rocky run` per pipeline or per client against the single global `.rocky-state.redb`, those independent runs serialize on one advisory lock, even though they touch unrelated watermarks. Namespacing gives each run its own state file so they proceed concurrently.
+redb permits **one writer per state file**. Fan out one `rocky run` per pipeline or per client, and every run competes for the same lock on the global `.rocky-state.redb`. They serialize even though they touch unrelated watermarks. Namespacing gives each run its own state file, so the runs proceed at the same time.
 
-This is **opt-in and default-off**: with neither knob set, Rocky uses the single global state file, byte-identical to before.
+```
+  without namespacing              with namespacing
+  ───────────────────              ────────────────
+  run acme   ──┐                   run acme   ──► …/.rocky-state/acme.redb
+               ├──► one file
+  run globex ──┘    one lock       run globex ──► …/.rocky-state/globex.redb
+                    runs wait                     one lock each, no waiting
+
+  … stands for the models directory
+```
+
+This is **opt-in and default-off**. With neither knob set, Rocky uses the single global state file, byte-identical to before.
 
 Per invocation, route a run to its own state file with `--state-namespace <key>`:
 
@@ -33,7 +65,7 @@ rocky run --state-namespace acme       # writes/reads <models>/.rocky-state/acme
 rocky run --state-namespace globex      # independent file, independent lock — runs concurrently
 ```
 
-`<key>` must be a SQL identifier (`^[a-zA-Z0-9_]+$`) because it becomes a path segment; anything else is rejected.
+`<key>` becomes a path segment, so it must be a SQL identifier (`^[a-zA-Z0-9_]+$`). Rocky rejects anything else.
 
 Or make each pipeline namespace itself by default in `rocky.toml`:
 
@@ -42,10 +74,10 @@ Or make each pipeline namespace itself by default in `rocky.toml`:
 namespacing = "pipeline"   # each pipeline → <models>/.rocky-state/<pipeline>.redb
 ```
 
-The per-invocation `--state-namespace` flag overrides the config (use it to fan out by client/tenant rather than by pipeline name). An explicit `--state-path` is a hard override that **disables** namespacing for that invocation; it always wins, so a `--state-namespace` typo can't error out a run the explicit path already pins.
+The per-invocation `--state-namespace` flag overrides the config. Use it to fan out by client or tenant rather than by pipeline name. An explicit `--state-path` is a hard override: it **disables** namespacing for that invocation and always wins. A `--state-namespace` typo therefore cannot break a run whose state file the explicit path already pins.
 
 :::note[Namespaced files start fresh]
-A new namespace's file starts empty; the legacy global file is never moved or auto-seeded. Carry watermarks forward manually if you need them (copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run). See the [`[state]` configuration reference](/reference/configuration/#state) for the full field.
+A new namespace's file starts empty. Rocky never moves the legacy global file or seeds the new one from it. Carry watermarks forward yourself if you need them. Copy the global file to `<models>/.rocky-state/<key>.redb`, or point `--state-path` at it for the first run. See the [`[state]` configuration reference](/reference/configuration/#state) for the full field.
 :::
 
 ## What it stores
@@ -69,7 +101,7 @@ Watermarks are keyed by the fully qualified table name: `catalog.schema.table`.
 
 ### Check history
 
-Historical row counts are stored for anomaly detection:
+Rocky records a table's row count when the pipeline enables the `row_count` check. Anomaly detection reads that history:
 
 ```
 Key:   "acme_warehouse.staging__us_west__shopify.orders"
@@ -96,17 +128,17 @@ At the start of each table's replication, Rocky reads the watermark from the sta
 
 ## Inspecting state
 
-Use `rocky state` to view the current state:
+Run `rocky state` to view the current state:
 
 ```bash
 rocky state
 ```
 
-This displays all stored watermarks and their values, useful for debugging incremental runs.
+It prints every stored watermark and its value. Use it to debug an incremental run.
 
 ## Deleting watermarks
 
-Clearing state causes Rocky to perform a full refresh on the next run — useful when you need to backfill data or recover from issues. There is no CLI command to remove a single table's watermark; the practical options are:
+Clear the state and the next run does a full refresh. Do this to backfill data or to recover from a bad load. No CLI command removes a single table's watermark. You have two options:
 
 - **Delete the state file** to clear *all* watermarks (and run history) at once, then re-run:
 
@@ -123,14 +155,14 @@ For a scoped, review-gated re-run of specific models, use [`rocky backfill`](/re
 
 ## Anomaly detection
 
-Rocky compares the current row count of each table against a historical moving average. If the deviation exceeds a configurable threshold (e.g., 50%), Rocky flags it as an anomaly in the run output.
+Rocky compares each table's current row count against a moving average of its history. If the deviation exceeds the configured threshold (for example 50%), Rocky flags an anomaly in the run output.
 
 This catches problems like:
-- A source table was truncated (count drops to near zero)
-- A bad sync duplicated data (count spikes dramatically)
-- A connector stopped syncing (count stays flat when it should be growing)
+- Someone truncated a source table, so the count drops to near zero
+- A bad sync duplicated data, so the count spikes
+- A connector stopped syncing, so the count stays flat when it should grow
 
-The threshold is configured per pipeline in `rocky.toml`:
+Set the threshold per pipeline in `rocky.toml`:
 
 ```toml
 [pipeline.bronze.checks]
@@ -141,7 +173,7 @@ freshness = { threshold_seconds = 86400 }
 
 ## Remote State Persistence
 
-By default, state is stored locally on disk. On ephemeral environments (e.g., EKS pods, CI runners), the local file is lost between runs. Rocky supports remote state backends to persist watermarks across deployments.
+Rocky writes state to local disk by default. A container or a CI runner throws that disk away between runs, which loses every watermark. Point Rocky at a remote backend and the state survives the machine.
 
 ### Backends
 
@@ -182,21 +214,36 @@ The `tiered` backend combines Valkey (fast) with S3 (durable):
 - **Download**: try Valkey first (sub-millisecond reads); on miss or error, fall back to S3.
 - **Upload**: write to both Valkey (best-effort) and S3 (required).
 
-By default the cached copy is trusted as-is, so a Valkey write that fails while the S3 write succeeds leaves a stale copy that the next read will serve. Setting `concurrency_control = "cas"` closes that: the end-of-run upload commits to S3 first, and the cached copy is stored with the generation it was committed at so a read can check it against the durable object before using it. The remaining ledger-seam writes (`gc apply`, `apply`) are not yet covered — see [Concurrent writers](/reference/configuration/#concurrent-writers).
+By default Rocky trusts the cached copy as it finds it. A Valkey write that fails while the S3 write succeeds therefore leaves a stale copy in the cache, and the next read serves it.
+
+Set `concurrency_control = "cas"` to close that gap. The end-of-run upload commits to S3 first. Rocky then stores the cached copy, stamped with the generation it committed at. A read can therefore check the cache against the durable object before it uses it. Two ledger-seam writes (`gc apply`, `apply`) are not covered yet. See [Concurrent writers](/reference/configuration/#concurrent-writers).
 
 ### Sync Lifecycle
 
-When `backend` is not `local`, Rocky syncs state automatically:
+When `backend` is not `local`, Rocky syncs the state file around each run.
 
-1. **Before run**: Download remote state → local `.redb` file
-2. **During run**: Read/write from local `.redb` (fast, no network)
-3. **After run**: Upload local `.redb` → remote storage
+```
+   ┌────────────────────────┐
+   │ remote: S3 or Valkey   │
+   └───────────┬────────────┘
+               │ 1. download, before the run starts
+               ▼
+   ┌────────────────────────┐   2. every read and write during the
+   │ local .redb file       │      run goes here — no network calls
+   │ (writer lock held)     │
+   └───────────┬────────────┘
+               │ 3. upload, after the run finishes
+               ▼
+   ┌────────────────────────┐
+   │ remote: S3 or Valkey   │
+   └────────────────────────┘
+```
 
-If download fails, Rocky logs a warning and starts fresh from target-table metadata. Upload failure behaviour is governed by the [retry + failure policy](#retry-and-failure-policy) below.
+If the download fails, Rocky logs a warning and starts fresh from target-table metadata. The [retry + failure policy](#retry-and-failure-policy) below governs what an upload failure does.
 
 ### Retry and Failure Policy
 
-Every remote transfer (upload *or* download) runs inside a wall-clock budget with exponential-backoff retries and a three-state circuit breaker, the same machinery the Databricks and Snowflake adapters already use. Configuration lives under `[state.retry]` in `rocky.toml`; the full field list is in the [configuration reference](/reference/configuration/#stateretry).
+Every remote transfer runs inside a wall-clock budget, for uploads and downloads alike. Retries back off exponentially, and a three-state circuit breaker stops a failing backend from being hammered. This is the same machinery the Databricks and Snowflake adapters use. Configure it under `[state.retry]` in `rocky.toml`. The [configuration reference](/reference/configuration/#stateretry) lists every field.
 
 ```toml
 [state]
@@ -217,7 +264,7 @@ circuit_breaker_threshold = 5
 | `"skip"` (default) | Log a warning, mark the run successful, leave remote state stale. The next run re-derives watermarks from target-table metadata. | Most callers — the de-facto pre-1.13 behaviour. Trades state durability for run liveness. |
 | `"fail"` | Propagate a `StateSyncError::RetryBudgetExhausted` or `CircuitOpen` to the caller; the run fails. | Strict environments where re-deriving watermarks is prohibitively expensive (long-running backfills, multi-hour syncs). |
 
-**Terminal outcomes are structured.** Every `state.upload` / `state.download` event now carries an `outcome` field so you can alert on state-layer health without log-message regex:
+**Terminal outcomes are structured.** Every `state.upload` and `state.download` event carries an `outcome` field. Alert on it instead of matching log messages with a regular expression:
 
 | `outcome` | Meaning |
 |---|---|
@@ -234,7 +281,8 @@ Run `rocky doctor --check state_rw` at cold start to catch IAM / reachability pr
 
 ## State Per Environment
 
-Each environment (dev, staging, prod) maintains its own state, with no coordination between them:
-- A fresh deployment starts with no watermarks (full refresh on first run)
-- Dev environments can be reset independently by deleting the state file
-- Remote backends allow state to survive pod restarts in ephemeral environments
+Each environment (dev, staging, prod) keeps its own state. Rocky does not coordinate between them.
+
+- A fresh deployment starts with no watermarks, so the first run is a full refresh
+- Delete the state file to reset one environment without touching the others
+- A remote backend keeps state alive across pod restarts

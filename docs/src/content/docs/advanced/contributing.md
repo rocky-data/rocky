@@ -1,9 +1,13 @@
 ---
 title: Contributing
-description: How to set up a development environment and contribute to Rocky
+description: Where each kind of change belongs, how to build and test it, and what CI checks
 sidebar:
   order: 1
 ---
+
+Rocky lives in one repository. It holds the Rust engine, two Python packages, a VS Code extension, a sample pipeline, and this docs site. One pull request can change several of them at once, and one CI run covers them all.
+
+This page answers three questions. Where does my change belong? How do I build and test that part? What will CI check before it merges?
 
 ## Where to start
 
@@ -36,6 +40,8 @@ The right entry point depends on what you want to change.
 | The Python SDK | `sdk/python/src/rocky_sdk/client.py` |
 | The VS Code extension | `editors/vscode/src/` |
 
+The IR named above is the [intermediate representation](/reference/glossary/#ir-intermediate-representation): the typed blueprint Rocky builds from your SQL before it emits any warehouse dialect.
+
 ### Key invariants before you commit
 
 - **Never** commit a Rust `*Output` change without running `just codegen` — `codegen-drift.yml` CI will fail.
@@ -43,7 +49,7 @@ The right entry point depends on what you want to change.
 - **Never** hand-edit files under `*/types_generated/` or `*/types/generated/` — those are codegen outputs.
 - **Never** skip hooks (`--no-verify`). Fix the underlying issue instead.
 
-## Monorepo Structure
+## What lives where
 
 Rocky is a monorepo with five subprojects:
 
@@ -59,11 +65,13 @@ rocky-data/
 └── CLAUDE.md                   # Monorepo conventions
 ```
 
-For the full crate-level breakdown of `engine/`, see [Architecture](/concepts/architecture/).
+For the crate-level breakdown of `engine/`, see [Architecture](/concepts/architecture/).
 
-## Development Setup
+## Set up a development environment
 
-### Rocky Engine (Rust)
+Each subproject builds with its own native tool. You do not need the others installed to work on one.
+
+### Rocky engine (Rust)
 
 ```bash
 git clone https://github.com/rocky-data/rocky.git
@@ -113,7 +121,7 @@ uv run ruff check
 uv run ruff format --check
 ```
 
-### VS Code Extension (TypeScript)
+### VS Code extension (TypeScript)
 
 ```bash
 cd rocky-data/editors/vscode
@@ -128,9 +136,9 @@ npm run compile
 npm test
 ```
 
-### Build Orchestration
+### Run every subproject at once
 
-The top-level `justfile` orchestrates common tasks across all subprojects:
+The top-level `justfile` fans one command out across all subprojects:
 
 ```bash
 just build       # cargo build --release + uv build --wheel + npm compile
@@ -140,7 +148,7 @@ just codegen     # Export JSON schemas + regenerate Pydantic/TS bindings
 just --list      # All recipes
 ```
 
-## Coding Standards
+## Coding standards
 
 ### Rust
 - **Edition**: 2024 (MSRV 1.88)
@@ -159,30 +167,34 @@ just --list      # All recipes
 - Strict mode enabled
 - ESLint + Prettier formatting
 
-## Git Conventions
+## How to write a commit message
 
 - Use conventional commits: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`
 - Scope by subproject or crate: `feat(engine/rocky-databricks): add OAuth M2M auth`, `fix(dagster): handle partial-success exit codes`, `chore(vscode): bump vscode-languageclient`
 - Never include `Co-Authored-By` trailers
 
-## Cross-Project Changes
+## Changes that cross subprojects
 
-When modifying the CLI's JSON output schema:
+Two kinds of change must land in several subprojects at once. Do each as a single pull request, so CI checks the whole cascade together.
+
+**Changing the CLI's JSON output schema:**
 
 1. Edit the relevant `*Output` struct in `engine/crates/rocky-cli/src/output.rs`
 2. Run `just codegen` from the monorepo root to regenerate bindings
 3. Commit the schema and regenerated bindings together with the Rust change
 
-The `codegen-drift` CI workflow fails any PR where the committed bindings drift from what `just codegen` produces locally.
+The `codegen-drift` CI workflow fails any PR whose committed bindings differ from what `just codegen` produces locally. The full cascade is documented in the [JSON contract](/advanced/json-contract/).
 
-When modifying Rocky DSL syntax (`.rocky` files):
+**Changing Rocky DSL syntax (`.rocky` files):**
 
 1. `engine/crates/rocky-lang/` (parser + lexer)
 2. `engine/crates/rocky-compiler/` (type checking)
 3. `editors/vscode/syntaxes/rocky.tmLanguage.json` (TextMate grammar)
 4. `editors/vscode/snippets/rocky.json` (snippets)
 
-## Testing
+## Run the tests
+
+The engine's end-to-end tests run against DuckDB, so they need no credentials.
 
 ```bash
 # Engine — all tests
@@ -204,9 +216,9 @@ cd integrations/dagster && uv run pytest -v
 cd editors/vscode && npm test
 ```
 
-## CI
+## What CI runs
 
-`.github/workflows/` contains path-filtered workflows:
+The workflows in `.github/workflows/` are path-filtered. A PR that touches only `engine/**` runs the engine workflows and nothing else.
 
 | Workflow | Trigger | What it does |
 |---|---|---|
@@ -222,9 +234,9 @@ cd editors/vscode && npm test
 | `vscode-release.yml` | `vscode-v*` tag | VS Code Marketplace publish |
 | `codegen-drift.yml` | Any subproject | Validates committed bindings match `just codegen` output |
 
-## Releases
+## How a release ships
 
-Tag-namespaced: each artifact ships independently. All four are **CI-driven**: land a release PR (version bump + CHANGELOG entry), tag the merged commit, push the tag.
+Releases are tag-namespaced, so each artifact ships on its own schedule. All four are CI-driven. Land a release PR with the version bump and the CHANGELOG entry, tag the merged commit, then push the tag.
 
 | Artifact | Tag | Workflow |
 |---|---|---|
@@ -233,11 +245,11 @@ Tag-namespaced: each artifact ships independently. All four are **CI-driven**: l
 | dagster-rocky wheel | `dagster-v*` | `dagster-release.yml` — PyPI publish via OIDC |
 | Rocky VSIX | `vscode-v*` | `vscode-release.yml` — VS Code Marketplace publish |
 
-Release **rocky-sdk before any dagster-rocky release that raises its `rocky-sdk>=…` floor** — the published `dagster-rocky` wheel resolves the SDK from PyPI, not the monorepo path source.
+One ordering rule applies. Release **rocky-sdk before any dagster-rocky release that raises its `rocky-sdk>=…` floor**. The published `dagster-rocky` wheel resolves the SDK from PyPI, not from the monorepo path source.
 
 ```bash
 git tag engine-v<version>
 git push origin engine-v<version>   # CI builds + publishes
 ```
 
-The `scripts/release.sh` helper remains as a **local-build fallback** for hotfix scenarios; `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]` wrap it.
+The `scripts/release.sh` helper stays as a local-build fallback for a hotfix. These recipes wrap it: `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`.

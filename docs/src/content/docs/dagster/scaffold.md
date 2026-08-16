@@ -5,7 +5,8 @@ sidebar:
   order: 16
 ---
 
-`dagster-rocky` ships two ways to bootstrap a new project:
+There are two ways to bootstrap a new project. Take the first for a bare
+start, the second for a skeleton that already runs.
 
 1. **`dg scaffold defs dagster_rocky.RockyComponent <name>`**: uses Dagster's
    built-in scaffolder via the registered entry point. Writes a bare
@@ -15,8 +16,8 @@ sidebar:
 
 ## `dg scaffold` (canonical)
 
-After installing `dagster-rocky`, the `dg` CLI automatically discovers
-`RockyComponent` via the
+Install `dagster-rocky` and the `dg` CLI finds `RockyComponent` on its
+own. The discovery comes from the
 `[project.entry-points."dagster_dg_cli.registry_modules"]` entry in
 `dagster-rocky`'s `pyproject.toml`.
 
@@ -52,10 +53,11 @@ my_pipeline/
 └── README.md          # quickstart instructions
 ```
 
-The default `rocky.toml` uses the **DuckDB local-execution adapter** so the
-scaffold runs end-to-end without warehouse credentials. A [freshness
-policy](./freshness.md) is preconfigured so you can see it flow through to
-Dagster assets immediately.
+The default `rocky.toml` uses the **DuckDB local-execution adapter**. The
+scaffold therefore runs end to end with no warehouse credentials. It also
+preconfigures a [freshness policy](./freshness.md), which declares how far
+behind the newest row a table may fall. You see that policy on your
+Dagster assets right away.
 
 ## Overwrite protection
 
@@ -66,8 +68,8 @@ Dagster assets immediately.
 init_rocky_project(Path("my_pipeline"), overwrite=True)
 ```
 
-This protects accidental re-runs from clobbering user edits to `rocky.toml`,
-`defs.yaml`, or `README.md`.
+This stops an accidental re-run from clobbering your own edits to
+`rocky.toml`, `defs.yaml`, or `README.md`.
 
 ## Quickstart for end users
 

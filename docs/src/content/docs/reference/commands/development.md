@@ -1,17 +1,17 @@
 ---
 title: Development Commands
-description: "Commands for local development: playground, dbt import, HTTP server, LSP, and adapter scaffolding"
+description: "Sample projects, dbt import, the HTTP server, the language server, and adapter scaffolding"
 sidebar:
   order: 4
 ---
 
-Commands for local development workflows: sample projects, dbt import, the semantic-graph server, LSP, and adapter scaffolding.
+These commands support local development. Build a sample project, import a dbt project, or scaffold a new adapter. Run the semantic-graph server or the language server.
 
 ---
 
 ## `rocky playground`
 
-Create a self-contained sample project using DuckDB as the local execution engine. No warehouse credentials or external services are required. Useful for learning Rocky, testing model logic, and rapid prototyping.
+Create a self-contained sample project that runs on DuckDB in process. It needs no warehouse credentials and no external service. Use it to learn Rocky, to try model logic, and to prototype.
 
 ```bash
 rocky playground [path]
@@ -82,7 +82,9 @@ rocky playground my-experiment
 
 ## `rocky import-dbt`
 
-Import an existing dbt project as a **runnable Rocky repo**. Parses `dbt_project.yml` + `profiles.yml`, translates each `.sql` model body (expanding `{{ ref(...) }}` / `{{ source(...) }}` to plain identifiers; leaving other Jinja with a `# TODO: dbt-jinja-not-translated` comment), and writes a self-contained Rocky directory layout that `rocky compile` and `rocky plan` + `rocky apply` can use directly.
+Import an existing dbt project and emit a Rocky project you can run. The importer reads `dbt_project.yml` and `profiles.yml`, and translates each `.sql` model body. It writes a self-contained directory that `rocky compile` and `rocky plan` plus `rocky apply` accept as is.
+
+Translation expands `{{ ref(...) }}` and `{{ source(...) }}` into plain identifiers. Any other Jinja is left in place with a `# TODO: dbt-jinja-not-translated` comment above it, so nothing is dropped silently.
 
 ```bash
 rocky import-dbt --dbt-project <PATH> [flags]
@@ -108,17 +110,31 @@ rocky import-dbt --dbt-project <PATH> [flags]
 ├── rocky.toml                  derived from dbt_project.yml + profiles.yml
 ├── models/
 │   ├── _defaults.toml          catalog + schema defaults from dbt_project.yml
-│   ├── <name>.sql              translated dbt model body (Jinja stripped or commented)
+│   ├── <name>.sql              translated model body (Jinja stripped or kept
+│   │                           as a comment)
 │   └── <name>.toml             [strategy] + [target] sidecar
 ├── seeds/                      verbatim copy of <dbt_project>/seeds/
-└── MIGRATION-NOTES.md          summary: counts, known limitations, required env vars
+└── MIGRATION-NOTES.md          counts, known limitations, required env vars
 ```
 
-Connection secrets (passwords, API tokens, service-account JSON) are emitted as `${VAR}` env-var placeholders in `rocky.toml`; they are **never inlined**. The required env vars are listed in `MIGRATION-NOTES.md` so users know what to export before `rocky plan` + `rocky apply`.
+The importer never inlines a connection secret. Passwords, API tokens, and service-account JSON come out as `${VAR}` placeholders in `rocky.toml`. `MIGRATION-NOTES.md` lists every variable you must export before `rocky plan` plus `rocky apply`.
 
-`materialized` mapping: `view → view`, `table → full_refresh`, `incremental` (with `unique_key`) → `merge`, `incremental` (without) → `incremental`, `microbatch` → `merge` (default) or `time_interval`, selected by [`--microbatch-as`](#flags). On either raw SQL path — `--no-manifest` or a manifest node without `compiled_code` — a model whose raw Jinja invokes `is_incremental()` is refused and listed under `failed_details` because Rocky cannot preserve dbt's first-run/subsequent-run distinction without compiled SQL. Anything else falls back to `full_refresh` with a TODO line in `MIGRATION-NOTES.md`. Profile types Rocky doesn't natively support stub a DuckDB `[adapter]` so the project still compiles, with the original type preserved under "Not Translated".
+### How `materialized` maps
 
-When reading `profiles.yml`, the importer resolves YAML anchors/aliases (`&anchor` / `*alias`) and `{{ env_var('VAR', 'default') }}` expressions in the adapter `type` field, so a profile that templates its warehouse type detects the right adapter instead of silently stubbing DuckDB. Override detection entirely with `--target-adapter`.
+| dbt `materialized` | Rocky strategy |
+|---|---|
+| `view` | `view` |
+| `table` | `full_refresh` |
+| `incremental` with a `unique_key` | `merge` |
+| `incremental` without a `unique_key` | `incremental` |
+| `microbatch` | `merge`, or `time_interval` when you pass `--microbatch-as time_interval` |
+| anything else | `full_refresh`, plus a TODO line in `MIGRATION-NOTES.md` |
+
+Rocky refuses a model whose raw Jinja calls `is_incremental()` on either raw-SQL path: `--no-manifest`, or a manifest node with no `compiled_code`. Without compiled SQL, Rocky cannot preserve dbt's first-run versus later-run distinction. Each refused model is listed under `failed_details`.
+
+A profile type Rocky does not support natively stubs a DuckDB `[adapter]`, so the emitted project still compiles. `MIGRATION-NOTES.md` records the original type under "Not Translated".
+
+When it reads `profiles.yml`, the importer resolves YAML anchors and aliases (`&anchor`, `*alias`) plus `{{ env_var('VAR', 'default') }}` expressions in the adapter `type` field. A profile that templates its warehouse type therefore detects the right adapter instead of stubbing DuckDB. `--target-adapter` overrides the detection entirely.
 
 ### Known limitations
 
@@ -221,6 +237,9 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 | `--token <SECRET>` | `String` | | Bearer token required by every API request except `/api/v1/health`. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback.** |
 | `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
 | `--watch` | `bool` | `false` | Watch for file changes and auto-recompile. |
+| `--scheduler` | `bool` | `false` | Also run the resident scheduler: a timer loop that evaluates every pipeline's `[schedule]` and runs what is due, in-process. On SIGTERM or Ctrl-C the server drains a running scheduled child before it exits. Run one instance per project directory. Experimental. |
+| `--poll-interval-seconds <SECONDS>` | `u64` | `15` | Seconds between scheduler ticks. Must be at least 1. Only meaningful with `--scheduler`. |
+| `--drain-timeout-seconds <SECONDS>` | `u64` | `60` | Seconds a running scheduled child may keep going after a shutdown signal before Rocky terminates it. Only meaningful with `--scheduler`. |
 
 ### Examples
 
@@ -422,19 +441,19 @@ Hook 'bash scripts/notify.sh': OK (exit 0, 120ms)
 
 ## `rocky validate-migration`
 
-Compare a dbt project against its Rocky import to verify correctness.
+Cross-check a dbt project against the Rocky project imported from it. Use it after [`rocky import-dbt`](#rocky-import-dbt) to confirm that every model made the trip.
 
 ```bash
-rocky validate-migration [flags]
+rocky validate-migration --dbt-project <PATH> [flags]
 ```
 
 ### Flags
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--dbt-project` | path | required | Path to the dbt project |
-| `--rocky-project` | path | — | Path to the Rocky project (defaults to current directory) |
-| `--sample-size` | number | — | Number of sample rows for data comparison |
+| `--dbt-project <PATH>` | `PathBuf` | **(required)** | Path to the dbt project directory. |
+| `--rocky-project <PATH>` | `PathBuf` | | Path to the Rocky project directory. Optional, for a side-by-side comparison. |
+| `--sample-size <N>` | `usize` | | Number of sample rows for data comparison. |
 
 ### Examples
 
@@ -445,6 +464,11 @@ Validating 12 models...
   fct_orders:    PASS (schema match, row count match)
   dim_products:  WARN (column order differs)
 ```
+
+### Related Commands
+
+- [`rocky import-dbt`](#rocky-import-dbt) -- produce the Rocky project this command checks
+- [`rocky compile`](/reference/commands/modeling/#rocky-compile) -- type-check the imported models
 
 ---
 
@@ -524,7 +548,14 @@ The `auth` check pings each registered warehouse adapter (via `SELECT 1` or an a
 
 The `state_rw` check (v1.13.0+) runs a put → get → delete probe against the configured state backend so IAM and reachability problems surface at cold start rather than at end-of-run upload. Local backend is a no-op; tiered probes both legs.
 
-The `--verbose` flag (v1.20.0+) prints extra per-check context inline: config path, state file size, adapter type and credential signal (`token`, `oauth_client`, `oauth_token`, `key_pair`, `password`, `service_account`, `adc`, `env`, `none`), pipeline kind (`replication` / `transformation` / `quality` / `snapshot`), and state backend. JSON output is unchanged when `--verbose` is not passed: the new `details` array on each `HealthCheck` only serializes when populated, so existing consumers see byte-stable envelopes.
+The `--verbose` flag (v1.20.0+) prints extra context under each check:
+
+- the config path and the state file's size;
+- each adapter's type and its credential signal (`token`, `oauth_client`, `oauth_token`, `key_pair`, `password`, `service_account`, `adc`, `env`, `none`);
+- each pipeline's kind (`replication`, `transformation`, `quality`, or `snapshot`);
+- the state backend.
+
+Without `--verbose`, JSON output is unchanged. The `details` array on each `HealthCheck` only serializes when it has content, so an existing consumer sees a byte-stable envelope.
 
 See the [CLI Reference](/reference/cli/#rocky-doctor) for the full check list and JSON output format.
 
@@ -543,7 +574,11 @@ rocky list deps <model>      # What this model depends on
 rocky list consumers <model> # What depends on this model
 ```
 
-All subcommands support `--output json` via `-o json`. Models are discovered from the `models/` directory (and immediate subdirectories for the common `models/{layer}/` layout).
+Every subcommand supports `--output json` via `-o json`. Rocky finds models in the `models/` directory and in its immediate subdirectories, which covers the common `models/{layer}/` layout.
 
 See the [CLI Reference](/reference/cli/#rocky-list) for full examples and JSON output schemas.
-- [`rocky validate`](/reference/commands/core-pipeline/#rocky-validate) -- validate config after registering the adapter
+
+### Related Commands
+
+- [`rocky dag`](/reference/commands/modeling/#rocky-dag) -- the same dependencies as a graph rather than a list
+- [`rocky catalog`](/reference/commands/modeling/#rocky-catalog) -- export the compiled graph as a lineage snapshot

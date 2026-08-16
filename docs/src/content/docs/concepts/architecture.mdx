@@ -1,17 +1,21 @@
 ---
 title: Architecture
-description: How Rocky's crates fit together
+description: The crates that make up the engine, and how one run moves through them.
 sidebar:
   order: 1
 ---
 
 import pocCounts from "../../../data/poc-counts.json";
 
-Rocky is a Cargo workspace composed of several crates, each with a focused responsibility.
+Rocky's engine is a single Cargo workspace. It holds 25 crates under
+`engine/crates/`, plus two binary crates. Each crate does one job.
+
+This page is the map of those crates. For the step-by-step walkthrough of a run,
+read [Execution Flow](/concepts/execution-flow/).
 
 ## How data flows
 
-A `rocky run` touches every layer of the stack. From config file to warehouse result:
+A `rocky run` touches every layer. From config file to warehouse result:
 
 ```
 rocky.toml
@@ -23,7 +27,7 @@ Config struct
 Source metadata  ◀── Fivetran REST API / DuckDB info_schema / manual config
     │  compile .sql + .toml models
     ▼
-rocky-compiler  →  diagnostics (E001–E035 / W001–W031)
+rocky-compiler  →  diagnostics (E001–E036 / W001–W031)
     │  produces typed ProjectIr on success
     ▼
 ProjectIr  (one ModelIr per model, fully typed and validated)
@@ -52,9 +56,10 @@ For a detailed walkthrough of each step, see [Execution Flow](/concepts/executio
 
 ## Adapter model
 
-Rocky separates concerns through two adapter types:
+Rocky has two kinds of adapter. An adapter is the plug between the engine and one
+outside system.
 
-**Source adapters** handle *discovery*: finding what schemas and tables exist and are available for processing. They do NOT extract data. The data must already be in the warehouse, landed by an ingestion tool (Fivetran, Airbyte, etc.) or loaded manually.
+**Source adapters** handle *discovery*: finding which schemas and tables exist and are available for processing. They do NOT extract data. The data must already be in the warehouse, landed by an ingestion tool (Fivetran, Airbyte, etc.) or loaded manually.
 
 - `rocky-fivetran`: calls the Fivetran REST API to list connectors and their enabled tables in the destination
 - `rocky-duckdb`: queries `information_schema` to discover schemas and tables in a local DuckDB database
@@ -62,17 +67,17 @@ Rocky separates concerns through two adapter types:
 
 **Warehouse adapters** handle *execution*: running SQL, managing catalog lifecycle, and applying governance (tags, permissions, workspace isolation).
 
-- `rocky-databricks`: executes via the Databricks SQL Statement API and manages Unity Catalog, with adaptive concurrency (AIMD algorithm)
+- `rocky-databricks`: executes via the Databricks SQL Statement API and manages Unity Catalog, with adaptive concurrency (AIMD: additive increase, multiplicative decrease)
 - `rocky-snowflake`: executes via the Snowflake REST API with OAuth, key-pair JWT, and password auth
 - `rocky-bigquery`: executes via the BigQuery REST API with service account / ADC auth
 - `rocky-trino`: executes via Trino's `/v1/statement` REST polling state machine with HTTP Basic / JWT bearer auth (Beta as of engine v1.28.0)
 - `rocky-duckdb`: local in-process execution for development, testing, and CI
 
-**rocky-ir** defines the typed Intermediate Representation (`ModelIr`, `MaterializationStrategy`, source/target descriptors). It was extracted from `rocky-core` in engine v1.30.0 so adapter crates can depend on the IR without pulling in the SQL-generation surface.
+**rocky-ir** defines the typed Intermediate Representation, or IR. The IR is the typed graph the compiler builds before it writes any SQL: `ModelIr`, `MaterializationStrategy`, and the source and target descriptors. It was split out of `rocky-core` in engine v1.30.0, so an adapter crate can depend on the IR without pulling in the SQL-generation code.
 
-**rocky-core** sits between adapters and IR. It owns warehouse-agnostic logic (DAG resolution, schema pattern parsing, SQL generation templates, checks, contracts, state management) and depends on `rocky-ir`. rocky-core has no knowledge of Databricks, Fivetran, or any specific system.
+**rocky-core** sits between the adapters and the IR. It owns the warehouse-agnostic logic: DAG resolution, schema pattern parsing, SQL generation templates, checks, contracts, and state management. It depends on `rocky-ir`. It knows nothing about Databricks, Fivetran, or any other named system.
 
-This architecture means adding a new warehouse (e.g., Snowflake, Trino) or a new source (e.g., Airbyte) requires implementing an adapter crate without modifying the core engine.
+That split is why a new warehouse (Snowflake, Trino) or a new source (Airbyte) needs a new adapter crate. The core engine does not change.
 
 ## Monorepo
 
@@ -92,11 +97,14 @@ The playground catalog currently ships {pocCounts.total} POCs across {pocCounts.
 
 ## Crate overview
 
+The 25 crates under `engine/crates/`, and the two binary crates that ship as executables:
+
 ```
 engine/
 ├── crates/
 │   ├── rocky-ir/            # Typed Intermediate Representation (ModelIr, MaterializationStrategy)
 │   ├── rocky-core/          # Generic SQL transformation engine (depends on rocky-ir)
+│   ├── rocky-core-compiletest/  # Compile-fail (trybuild) guards for rocky-core
 │   ├── rocky-catalog-core/  # Catalog client abstraction (Iceberg REST, Unity Catalog, Polaris, Nessie)
 │   ├── rocky-sql/           # SQL parsing + typed AST
 │   ├── rocky-lang/          # Rocky DSL parser (.rocky files)
@@ -125,15 +133,15 @@ engine/
 
 ### rocky-ir
 
-The typed Intermediate Representation.
+The typed Intermediate Representation. It carries data only: no traits, no logic.
 
-- **`ModelIr`**: single in-memory plan representation; replaced the legacy `Plan` enum + `ReplicationPlan` / `TransformationPlan` structs (deleted in v1.30.0).
-- **`MaterializationStrategy`**: the strategy enum (full list in the [MaterializationStrategy](#materializationstrategy) section below).
-- Source / target descriptors and partition windows.
+- **`ModelIr`**: the single in-memory plan representation. It replaced the legacy `Plan` enum and the `ReplicationPlan` / `TransformationPlan` structs, which were deleted in v1.30.0.
+- **`MaterializationStrategy`**: the strategy enum. Full list in the [MaterializationStrategy](#materializationstrategy) section below.
+- Source and target descriptors, and partition windows.
 
 ### rocky-core
 
-The warehouse-agnostic transformation engine, consuming IR from `rocky-ir` and producing dialect-specific SQL.
+The warehouse-agnostic transformation engine. It reads IR from `rocky-ir` and writes SQL for one dialect.
 
 Key modules:
 
@@ -152,10 +160,12 @@ Key modules:
 
 ### rocky-sql
 
-SQL parsing and validation built on `sqlparser-rs`.
+SQL parsing and validation, built on `sqlparser-rs`. This crate reads SQL. The
+per-warehouse SQL that Rocky *writes* comes from each adapter crate's own
+`SqlDialect` implementation.
 
 - **parser.rs**: wraps sqlparser-rs with typed extensions for Rocky's needs
-- **dialect.rs**: Databricks SQL dialect support
+- **dialect.rs**: the one `sqlparser-rs` dialect Rocky parses every model with, whatever warehouse that model targets. It follows Databricks SQL syntax and accepts `SELECT * EXCEPT (...)`.
 - **validation.rs**: SQL identifier validation using strict regex patterns. All identifiers must pass through this module before being interpolated into SQL. This prevents SQL injection by rejecting anything that doesn't match `^[a-zA-Z0-9_]+$`.
 
 ### rocky-databricks
@@ -202,11 +212,13 @@ Observability infrastructure.
 
 ### rocky-lang
 
-Rocky DSL parser for `.rocky` files. Converts pipeline-oriented syntax into an AST that lowers to standard SQL.
+The Rocky DSL parser, for `.rocky` files. It turns pipeline-oriented syntax into
+an AST, then lowers that AST to a SQL string. From there the model takes the same
+path as hand-written SQL.
 
-- **lexer.rs**: token scanner built on the `logos` crate
-- **parser.rs**: recursive descent parser producing a typed AST
-- **lowering.rs**: AST to SQL lowering
+- **token.rs**: the token scanner, built on the `logos` crate
+- **parser.rs**: a recursive descent parser producing a typed AST
+- **lower.rs**: `lower_to_sql()`, which lowers the AST to a SQL string
 
 ### rocky-compiler
 
@@ -236,7 +248,7 @@ Snowflake warehouse adapter.
 
 ### rocky-trino
 
-Trino warehouse adapter (Beta as of engine v1.28.0). First first-party warehouse adapter built natively against `rocky-adapter-sdk`.
+Trino warehouse adapter (Beta as of engine v1.28.0).
 
 - **connector.rs**: async REST client driving Trino's `POST /v1/statement` + `nextUri` polling state machine. Same-origin guard on every `nextUri` follow-up (same scheme + host + port as the configured coordinator).
 - **dialect.rs**: double-quoted identifiers, three-part `<catalog>.<schema>.<table>` references, `DESCRIBE <table>` column introspection, ANSI `INSERT INTO` / `CREATE TABLE AS`, `TABLESAMPLE BERNOULLI`.
@@ -290,15 +302,41 @@ The `rocky` binary crate. Contains only `main.rs`, which wires all the library c
 
 ## Intermediate Representation (IR)
 
-Rocky compiles configuration and SQL into an intermediate representation before generating executable SQL. This separation means the core engine never deals with raw strings; everything is typed and validated. The IR lives in the [`rocky-ir`](#rocky-ir) crate.
+Rocky compiles your config and SQL into one typed intermediate representation
+before it writes any executable SQL. Types, lineage, and validation all live on
+that representation, so every later stage reads structure rather than re-parsing
+text. The IR lives in the [`rocky-ir`](#rocky-ir) crate.
+
+Two front ends feed it, and they converge before the IR:
+
+```
+  .rocky DSL ──► lower_to_sql() ──┐
+  (rocky-lang/lower.rs)           │
+                                  ├──► SQL string + sidecar TOML
+  raw .sql + .toml sidecar ───────┘             │
+                                                │ to_model_ir()
+                                                │ (rocky-core/models.rs)
+                                                ▼
+                                            ModelIr
+                                   the one typed intermediate
+                                                │ sql_gen.rs
+                                                ▼
+                                          dialect SQL
+```
+
+There is no second intermediate form between them. A `.rocky` model and a raw-SQL
+model both arrive at the IR as a SQL string plus its sidecar config. The DSL is a
+front end onto SQL, never a replacement for it.
 
 ### ModelIr
 
-`ModelIr` is the single in-memory plan representation. As of engine v1.30.0, the legacy `Plan` enum (and the `ReplicationPlan` / `TransformationPlan` / `From<&Plan>` bridge layer) is gone. `ModelIr` directly carries the source/target descriptors, the materialization strategy, and any dependency / sources / contracts / checks the model declares. Both replication and transformation pipelines compile to the same `ModelIr` shape, with the kind discriminated by which descriptors are populated.
+`ModelIr` is the single in-memory plan representation. As of engine v1.30.0 the legacy `Plan` enum is gone, along with the `ReplicationPlan` / `TransformationPlan` / `From<&Plan>` bridge layer.
+
+`ModelIr` carries the source and target descriptors, the materialization strategy, and whatever dependencies, sources, contracts, and checks the model declares. Replication and transformation pipelines compile to the same `ModelIr` shape. Which descriptors are populated is what tells the two kinds apart.
 
 ### MaterializationStrategy
 
-Controls how data is written to the target table. Variants:
+Decides how a model's rows land in the target table. One strategy per model.
 
 - **FullRefresh**: `CREATE OR REPLACE TABLE ... AS SELECT ...`. Rebuilds the entire table on every run.
 - **Incremental**: `INSERT INTO ... SELECT ... WHERE ts > watermark`. Only processes new rows. The watermark is read from the embedded state store at SQL-generation time (not carried on the strategy itself, so recipe-hash inputs stay runtime-state-free).
@@ -316,9 +354,9 @@ The full enum lives in `rocky-ir::ir::MaterializationStrategy`. SQL generation (
 
 ### Adapter SDK
 
-The [`rocky-adapter-sdk`](#rocky-adapter-sdk) crate provides the stable, versioned traits (`WarehouseAdapter`, `SqlDialect`, `DiscoveryAdapter`, `GovernanceAdapter`) plus an `AdapterManifest` that declares which traits each adapter implements.
+The [`rocky-adapter-sdk`](#rocky-adapter-sdk) crate holds the stable, versioned traits: `WarehouseAdapter`, `SqlDialect`, `DiscoveryAdapter`, and `GovernanceAdapter`. Each adapter ships an `AdapterManifest` declaring which optional features it supports.
 
-Adapters can be built in Rust (direct trait implementation) or in any language via the **process adapter protocol** (JSON-RPC over stdio).
+Write an adapter in Rust by implementing the traits directly. Write one in any other language through the **process adapter protocol**: JSON-RPC over stdio.
 
 Scaffold a new adapter:
 ```bash

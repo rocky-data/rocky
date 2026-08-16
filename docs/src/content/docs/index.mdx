@@ -3,13 +3,13 @@ title: "Rocky: the typed graph between your code and your warehouse"
 description: "A typed compiler over Databricks, Snowflake, BigQuery, and DuckDB: branches, replay, column-level lineage, compile-time contracts, and per-model cost attribution."
 template: splash
 hero:
-  tagline: "The typed graph between your code and whichever warehouse, table format, or query engine you've chosen. Branches, replay, column-level lineage, contracts, and per-model cost; storage and compute stay where they are."
+  tagline: "The typed graph between your code and whatever warehouse you have chosen. Branches, replay, column-level lineage, contracts, and per-model cost. Storage and compute stay where they are."
   actions:
     - text: Get Started in 60 Seconds
       link: /guides/playground/
       icon: right-arrow
       variant: primary
-    - text: Coming from dbt? Migrate in 5 steps
+    - text: Already have a project? Import it
       link: /guides/migrate-from-dbt/
       icon: right-arrow
       variant: secondary
@@ -20,36 +20,40 @@ hero:
 
 import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
-## The disasters Rocky prevents
+## The failures Rocky turns into compile errors
 
-Rocky exists because the most expensive failures in modern data platforms aren't slow queries. They're trust failures. A column type changes upstream and a revenue dashboard quietly diverges for three days. A `SELECT *` pulls a new column nobody designed for. A Snowflake-only function lands in a Databricks-targeted project and only fails in prod. Warehouse spend doubles and nobody can attribute which model caused it. An auditor asks who changed `fct_revenue.amount` and when.
+The expensive failures on a data platform are trust failures, not slow queries.
+A column type changes upstream and a revenue dashboard quietly diverges for
+three days. Warehouse spend doubles and nobody can say which model caused it.
 
-**Rocky moves correctness into the compiler.** Each disaster above becomes something you catch before a row is written, invisible to the warehouse and out of reach of the templating layer above it. Rocky is the typed graph in between.
+**Rocky moves correctness into the compiler.** Each of those becomes something
+you catch before a row is written. See
+[the full list, and how Rocky catches each one](/getting-started/introduction/).
 
 <CardGrid>
   <Card title="Typed compiler, not a templating engine" icon="approve-check">
-    Column-level type inference across the full DAG. 35+ diagnostic codes with actionable suggestions. `E013` blocks the PR before a row is written.
+    Rocky infers column types across the whole dependency graph. 35+ diagnostic codes name the problem and suggest a fix, so `E013` blocks the PR before a row is written.
   </Card>
   <Card title="Column-level lineage at compile time" icon="seti:graphql">
-    Every column traced through every transformation, before execution. `rocky lineage-diff main` lists per-column downstream blast radius for PR review.
+    Rocky traces every column through every transformation, before anything runs. `rocky lineage-diff main` lists the per-column downstream blast radius for PR review.
   </Card>
   <Card title="Branches + content-addressed run records" icon="random">
-    Named branches as isolated schemas. `rocky replay <run_id>` inspects and verifies a run against its content-addressed record: per-model SQL hashes, row counts, and bytes. `--execute --verify` re-runs a deterministic content-addressed model to reproduce its output bit-for-bit, locally or on the live warehouse in an isolated replay schema.
+    A named branch is an isolated schema. `rocky replay <run_id>` inspects a run and shows its recorded per-model SQL hashes, row counts, and bytes.
   </Card>
   <Card title="Per-model cost attribution" icon="rocket">
-    Cost is a column on every run, not a dashboard. `[budget]` blocks fail the run on overspend. `rocky preview cost` projects spend at PR time.
+    Cost is a column on every run, not a dashboard you check afterwards. `[budget]` blocks fail the run on overspend, and `rocky preview cost` projects spend at PR time.
   </Card>
   <Card title="AI gated through the compiler" icon="star">
-    Every AI suggestion type-checks before it lands. Generate, compile, auto-fix, ship. The closed loop nobody else has.
+    Every AI suggestion has to type-check before it lands. `rocky ai` generates a model, compiles it, auto-fixes what it can, and ships.
   </Card>
   <Card title="Dialect-divergence lint" icon="puzzle">
-    `P001` catches Snowflake-only constructs in a Databricks project, and the reverse. Cross-warehouse teams stop discovering portability bugs in prod.
+    `P001` catches a Snowflake-only construct in a Databricks project, and the reverse. Cross-warehouse teams stop finding portability bugs in prod.
   </Card>
-  <Card title="Declarative tests and keys, not templated SQL" icon="list-format">
-    Tests are declarative TOML and Rocky generates the assertion SQL for your target dialect. Define an assertion once in `models/test_definitions.toml` and apply it by name with `[[use_test]]`. Fixture-driven `[[test]]` blocks seed mock inputs, run the model SQL, and compare the rows on `rocky test` via DuckDB, no warehouse required. A `[[surrogate_key]]` block injects a deterministic hash into your SELECT whose value matches `dbt_utils.generate_surrogate_key` on the same warehouse.
+  <Card title="Declarative tests, not templated SQL" icon="list-format">
+    Tests are declarative TOML. Rocky generates the assertion SQL for your target dialect, and `rocky test` runs fixture-driven tests locally on DuckDB.
   </Card>
   <Card title="A tested exit door, not a one-way door" icon="cloud-download">
-    `rocky emit-sql` renders the compiled SQL for your transformation models with no warehouse connection. The output is plain runnable SQL with no Rocky-specific syntax, so adopting Rocky never locks you in.
+    `rocky emit-sql` renders the compiled SQL for your transformation models with no warehouse connection. The output is plain runnable SQL, so adopting Rocky never locks you in.
   </Card>
 </CardGrid>
 
@@ -64,23 +68,51 @@ rocky test               # run assertions locally
 rocky run                # materialize the DAG against local DuckDB
 ```
 
-No credentials needed; the playground is DuckDB-backed and seeds itself on first run.
+You need no credentials. The playground runs on DuckDB and seeds itself on the
+first run.
 
-`rocky run` is the one-step path for local iteration and automation. For production or PR-gated deploys, split it into `rocky plan` (persists an auditable plan to `.rocky/plans/<id>.json`) and `rocky apply <plan-id>`.
+`rocky run` is the one-step path for local iteration and automation. For
+production or a PR-gated deploy, split it in two: `rocky plan` writes an
+auditable plan to `.rocky/plans/<id>.json`, and `rocky apply <plan-id>` executes
+it.
 
 ## One trace, one cost graph, one replay handle
 
-`rocky run` writes a single `RunRecord` to the state store. Three read commands project that record from different angles: `rocky trace` for causality and concurrency, `rocky cost` for per-model warehouse spend, and `rocky replay` for the byte-for-byte reproduction. Walk through it end-to-end in [POC #17 (trace + cost + replay against the same run_id)](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo).
+`rocky run` writes a single `RunRecord` to the state store. Three read commands
+project that one record from different angles.
+
+```
+                    rocky run
+                        │ writes
+                        ▼
+              ┌───────────────────┐
+              │     RunRecord     │   one record, in the state store
+              └─────────┬─────────┘
+                        │ read by
+        ┌───────────────┼───────────────┐
+        ▼               ▼               ▼
+   rocky trace     rocky cost      rocky replay
+   causality and   per-model       recorded hashes
+   concurrency     warehouse spend and row counts
+```
+
+Walk through it end to end in
+[POC #17 (trace + cost + replay against the same run_id)](https://github.com/rocky-data/rocky/tree/main/examples/playground/pocs/06-developer-experience/17-trace-replay-cost-combo).
 
 <video src="/trace-cost-replay-combo.mp4" controls width="720"></video>
 
 ## Who Rocky is for
 
-Rocky is built first for **data platform engineers running production-critical, multi-tenant pipelines on Databricks**, the team where silent failures cost real money and dbt Core has hit a ceiling. The trust primitives are most battle-tested there.
+Rocky is built first for **data platform engineers running production-critical,
+multi-tenant pipelines on Databricks**, where a silent failure costs real money.
+That is where Rocky has the most production mileage.
 
-The next ring out: **Snowflake and BigQuery shops evaluating SQLMesh**, who want correctness moved to the compiler rather than the planner, and prefer SQL by default. Adapters are Beta today; see the [Roadmap](/getting-started/roadmap/).
+The next ring out: **Snowflake and BigQuery shops evaluating SQLMesh**, who want
+correctness moved into the compiler rather than the planner, and who prefer SQL
+by default. Those adapters are Beta today. See the
+[Roadmap](/getting-started/roadmap/).
 
 <CardGrid>
-  <LinkCard title="Coming from dbt?" href="/guides/migrate-from-dbt/" description="Run rocky import-dbt against your project, get a Rocky repo on disk, and ship the gains incrementally with no rewrite." />
+  <LinkCard title="Import an existing project" href="/guides/migrate-from-dbt/" description="Run rocky import-dbt against a dbt Core project. You get a Rocky repo on disk, and you can move over one piece at a time." />
   <LinkCard title="Using Dagster?" href="/dagster/introduction/" description="dagster-rocky wraps the CLI as a ConfigurableResource: auto-discovery, asset checks, and Pipes through one subprocess hop." />
 </CardGrid>
