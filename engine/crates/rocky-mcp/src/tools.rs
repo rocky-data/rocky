@@ -626,11 +626,20 @@ impl RockyMcpServer {
     )]
     async fn test(&self) -> ToolResult<TestResult> {
         let output = commands::test_output(&self.models_dir, None, None).map_err(|e| {
-            ToolError::internal(
-                format!("{e:#}"),
-                "The local test runner could not execute; confirm the project compiles (the \
-                 `compile` tool) and any `data/seed.sql` the tests need is present.",
-            )
+            // Preserve the stable taxonomy the way `compile` and `plan_preview`
+            // do: an unknown model is `model_not_found` (with its "list the
+            // models, retry" hint), not the generic internal bucket. This tool
+            // passes `None` for the filter today, so the arm is unreachable
+            // from MCP — it is here so that stays true if a `model` parameter
+            // is ever added, rather than silently degrading to `internal`.
+            match e.downcast_ref::<commands::ModelNotFound>() {
+                Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
+                None => ToolError::internal(
+                    format!("{e:#}"),
+                    "The local test runner could not execute; confirm the project compiles (the \
+                     `compile` tool) and any `data/seed.sql` the tests need is present.",
+                ),
+            }
         })?;
         let failures = output
             .failures

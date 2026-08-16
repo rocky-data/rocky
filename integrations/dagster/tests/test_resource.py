@@ -1909,6 +1909,16 @@ def test_build_plan_args_mirrors_build_run_args_flag_surface():
     on the Python side — every flag ``_build_run_args`` emits must also
     appear in ``_build_plan_args``'s output for the same kwargs (only the
     leading verb differs).
+
+    The parity is NOT total, and this test used to assert that it was: it
+    passed ``defer=True`` / ``defer_to=...`` and required byte-identical
+    argv tails. Those two flags are declared on the ``Run`` clap variant
+    only, so the argv it pinned as correct is one ``rocky plan`` rejects at
+    argument parsing (``error: unexpected argument '--defer' found``,
+    exit 2). The test therefore encoded the defect in #1404 as the contract,
+    which is part of why it survived. Parity is now asserted over the flags
+    that genuinely mirror, with the run-only pair excluded and covered by
+    its own refusal test below.
     """
     rocky = RockyResource(models_dir="m")
     kwargs: dict[str, Any] = {
@@ -1924,15 +1934,35 @@ def test_build_plan_args_mirrors_build_run_args_flag_surface():
         "parallel": 2,
         "shadow_suffix": "_pr_42",
         "idempotency_key": "key-1",
-        "defer": True,
-        "defer_to": "prod_main",
     }
     run_args = rocky._build_run_args("tenant=acme", **kwargs)
     plan_args = rocky._build_plan_args("tenant=acme", **kwargs)
-    # Only the verb token differs.
+    # Only the verb token differs, across every flag the two verbs share.
     assert run_args[0] == "run"
     assert plan_args[0] == "plan"
     assert run_args[1:] == plan_args[1:]
+
+
+def test_build_plan_args_refuses_run_only_defer_flags():
+    """``--defer`` / ``--defer-to`` exist on ``rocky run`` only.
+
+    ``run_pipes`` forwards them into its plan-step build kwargs, so before
+    #1404 a Pipes caller passing ``defer=True`` produced ``rocky plan
+    ... --defer`` — rejected by clap before any work happened. Refused in the
+    builder now, so the caller gets a clear error instead of an argument-parse
+    failure from a subprocess.
+    """
+    rocky = RockyResource(models_dir="m")
+    for extra in ({"defer": True}, {"defer_to": "prod_main"}):
+        with pytest.raises(ValueError, match="defer/defer_to are not supported by rocky plan"):
+            rocky._build_plan_args("tenant=acme", governance_override=None, **extra)
+
+    # The run verb keeps both — the fix must not reach it.
+    run_args = rocky._build_run_args(
+        "tenant=acme", governance_override=None, defer=True, defer_to="prod_main"
+    )
+    assert "--defer" in run_args
+    assert run_args[run_args.index("--defer-to") + 1] == "prod_main"
 
 
 # ---------------------------------------------------------------------------

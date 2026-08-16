@@ -861,3 +861,42 @@ def test_ai_sync_parses_populated_proposals_without_phantom_field():
     assert len(result.proposals) == 1
     assert result.proposals[0].model == "revenue"
     assert result.proposals[0].proposed_source == "SELECT *, tax FROM raw"
+
+
+def test_build_plan_args_rejects_defer():
+    # ``--defer`` / ``--defer-to`` are declared on the ``Run`` clap variant only,
+    # so the ``plan`` verb rejects them at argument parsing. The shared argv
+    # builder appended them for both verbs on the premise that the engine had
+    # backfilled every ``run`` flag onto ``plan`` -- false for these two (#1404).
+    #
+    # The reachable caller is dagster's ``RockyResource.run_pipes``, which puts
+    # ``defer`` into its build kwargs and calls this builder; the public
+    # ``RockyClient.plan()`` never exposed the argument. Refuse here, where the
+    # argv is assembled, so every route through it is covered.
+    client = _client()
+    for kwargs in ({"defer": True}, {"defer_to": "prod"}, {"defer": True, "defer_to": "prod"}):
+        with pytest.raises(ValueError, match="defer/defer_to are not supported by rocky plan"):
+            client._build_plan_args("x=y", governance_override=None, **kwargs)
+
+
+def test_build_plan_args_without_defer_is_unaffected():
+    # The guard must not disturb the ordinary plan path.
+    argv = _client()._build_plan_args("x=y", governance_override=None, pipeline="bronze")
+    assert argv[0] == "plan"
+    assert "--defer" not in argv and "--defer-to" not in argv
+    assert argv[argv.index("--pipeline") + 1] == "bronze"
+
+
+def test_run_still_accepts_defer():
+    # The flags are legitimate on ``run`` -- the fix must scope to the plan verb
+    # only, or it would break the deferred-resolution workflow it is protecting.
+    client = _client()
+    argv = client._build_run_args(
+        "x=y",
+        governance_override=None,
+        defer=True,
+        defer_to="prod",
+    )
+    assert argv[0] == "run"
+    assert "--defer" in argv
+    assert argv[argv.index("--defer-to") + 1] == "prod"

@@ -1080,8 +1080,11 @@ class RockyResource(dg.ConfigurableResource):
             context: Dagster execution context (required for Pipes injection).
             filter: Component filter (e.g. ``"tenant=acme"``).
             governance_override / run_models / partition / shadow_suffix / …:
-                Same as :meth:`run`. Threaded into the rocky CLI via
-                :meth:`_build_plan_args`.
+                Same as :meth:`run`, with one exception: ``defer`` / ``defer_to``
+                are ``run``-only flags, so supplying them here raises
+                ``ValueError`` -- the plan step builds the ``rocky plan`` verb,
+                which the CLI parses without them (#1404). Threaded into the
+                rocky CLI via :meth:`_build_plan_args`.
             pipes_client: Optional pre-configured ``PipesSubprocessClient``. When
                 supplied, ``asset_key_fn`` / ``include_keys`` are ignored.
             asset_key_fn: Optional transform applied to each Pipes event's asset
