@@ -519,12 +519,25 @@ class RockyClient:
         defer: bool = False,
         defer_to: str | None = None,
     ) -> list[str]:
-        """Build the argv for ``rocky plan`` — identical flag plumbing to ``run``.
+        """Build the argv for ``rocky plan``.
 
         Used by the two-step plan + apply path (e.g. dagster Pipes) that needs the
         persisted ``plan_id``. ``--watch`` is intentionally omitted (no run-path
         counterpart; orchestrators own the re-run cadence).
+
+        Raises:
+            ValueError: ``defer`` or ``defer_to`` was supplied. Both flags exist
+                on ``rocky run`` only, so the CLI rejects them at argument
+                parsing and the plan never runs. Refused here, before spawning a
+                subprocess, matching how the client already handles ``env`` on
+                ``retention_status`` (#1404).
         """
+        if defer or defer_to is not None:
+            raise ValueError(
+                "defer/defer_to are not supported by rocky plan (the flags are "
+                "declared on `rocky run` only). Use run() for deferred "
+                "resolution, or drop the argument from the plan call."
+            )
         return self._build_run_or_plan_args(
             "plan",
             filter,
@@ -564,8 +577,15 @@ class RockyClient:
         defer: bool,
         defer_to: str | None,
     ) -> list[str]:
-        """Shared flag plumbing for ``run`` and ``plan`` (the engine backfilled
-        every ``run`` flag onto ``plan`` so the only difference is the verb)."""
+        """Shared flag plumbing for ``run`` and ``plan``.
+
+        The engine backfilled MOST ``run`` flags onto ``plan``, but not all:
+        ``--defer`` / ``--defer-to`` are declared on the ``Run`` clap variant
+        only. Callers building the ``plan`` verb must reject them before they
+        reach argv -- see :meth:`_build_plan_args` (#1404). Treating the two
+        verbs as flag-identical is what produced an argv the CLI refuses to
+        parse.
+        """
         args = [verb, "--filter", filter]
         if pipeline is not None:
             args.extend(["--pipeline", pipeline])
