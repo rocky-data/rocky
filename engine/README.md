@@ -1,124 +1,34 @@
 # Rocky
 
-**Rocky is the typed graph between your code and whichever warehouse, table format, or query engine you've chosen.** It is a typed compiler that sits above Databricks, Snowflake, BigQuery, or DuckDB and owns the graph between your code and your data: named branches, content-addressed run records, column-level lineage, compile-time contracts, and per-model cost attribution. It ships as a single static Rust binary, and storage and compute stay where they are.
+Rocky is a SQL transformation engine. You write each model as a plain SQL file,
+or in the optional `.rocky` DSL. Rocky type-checks the model, resolves the
+dependency graph, generates SQL in your warehouse's dialect, and runs it.
 
-**Rocky is a real compiler** with type inference, diagnostic codes, and an IDE, not a warehouse, table format, query engine, or templating layer. The failures that quietly cost data teams the most (silent schema drift, column-rename blast radius, dialect divergence, cost spikes nobody can attribute) become compile errors and blocked PRs.
+Rocky does not store your data. Storage and compute stay in Databricks,
+Snowflake, BigQuery, Trino, or DuckDB. There is no Jinja templating, no
+manifest file, and no separate parse step.
 
-There is no Jinja, no manifest, and no separate parse step.
-
-## Why Rocky exists
-
-The expensive failures in modern data platforms aren't slow queries. They're trust failures:
-
-- A source column type changes upstream and a revenue dashboard quietly diverges for three days.
-- An engineer renames a column on `stg_orders` and 47 downstream models break in production.
-- A `SELECT *` pulls a new column nobody designed for; a downstream join silently double-counts.
-- A Snowflake-only function lands in a Databricks-targeted project and only fails in prod.
-- Warehouse spend doubles in a month and nobody can attribute which model caused it.
-- An auditor asks who changed `fct_revenue.amount`, when, and why, and the answer involves `git blame` and screenshots.
-
-Rocky turns each of these into a compile error or a blocked PR before it ships: a column-type change is `E011` at compile, a rename's blast radius is a `rocky lineage-diff` comment, an unbudgeted cost spike is a `[budget]` block that fails the run, and unmasked classified data fails `rocky compliance`. These failures are invisible to the warehouse and out of scope for the templating layer above it. Rocky is the typed graph in between: real type inference and diagnostic codes, not text macros or runtime checks. For how Rocky compares to other SQL transformation tools, see the [comparison page](https://rocky-data.dev/getting-started/comparison/).
-
-## Scope on the ELT spectrum
-
-| Stage | Rocky | Notes |
-|---|---|---|
-| Extract (SaaS sources) | — | Use Fivetran, Airbyte, Stitch, or warehouse-native CDC |
-| Extract (files) | ✅ | `rocky load`: CSV / Parquet / JSONL from a directory |
-| Load (bronze replication) | ✅ | Config-driven replication pipelines |
-| Transform | ✅ | Compiled SQL models |
-| Quality | ✅ | Inline assertions during `rocky run` |
-| Orchestration | Partial | First-class Dagster integration; `rocky serve` standalone |
-
-## The trust dimensions
-
-1. **SQL as a typed, compiled language.** Real type inference, diagnostic codes (`E###` errors, `W###` warnings, `P###` portability lints), and a real LSP, not text macros or runtime checks.
-2. **Compile-time column-level lineage.** Rocky knows every column's lineage before a row is written, so `rocky lineage-diff main` can block a PR when a downstream contract breaks.
-3. **Branches and a replayable run ledger.** `rocky branch create`, `rocky run --branch`, and `rocky replay`: branches are isolated schemas, and every run is recorded in an auditable ledger (who ran it, the commit, the per-model SQL hash, and row counts). On the content-addressed materialization path, output files are named by the hash of their bytes, and `rocky replay --execute --verify` re-runs a recorded recipe and checks the output reproduces bit-for-bit, locally or on the live warehouse in an isolated replay schema. A standalone `rocky-verify` binary checks a run's manifest offline, with no engine installed.
-4. **Per-model cost attribution.** Cost is a column on every run record. `[budget]` blocks fail the run, `budget_breach` fires a hook, and `rocky preview cost` projects spend at PR time.
-5. **AI gated through the compiler.** Every AI suggestion is type-checked before it lands. The `Attempts: 2` retry on `rocky ai` is the loop: generate, type-check, auto-fix, then land.
-6. **Dialect-divergence lint.** Cross-warehouse teams write SQL once, and `P001` catches Snowflake-only constructs in a Databricks project at compile time.
-7. **Declarative governance.** RBAC as code with GRANT/REVOKE diffing, Unity Catalog tags, workspace isolation, and masking strategies bound to classification tags, so compliance becomes a CI check.
-8. **An agent policy plane.** A `[policy]` block in `rocky.toml` grades what a principal (a person, CI, or an AI agent) may do, by capability and scope: allow, require review, or deny. Enforcement runs at `apply`, `promote`, and the MCP write tools; blast-radius ceilings and `verify_after` gates fail closed; decisions are recorded to a ledger you query with `rocky audit` and read each morning with `rocky brief`. AI-authored plans stop for human review by default; only an explicit `[policy]` rule you wrote can let one through.
-
-## Quick start
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash
-rocky playground my-first-project
-cd my-first-project
-rocky compile       # Type-check all models
-rocky test          # Run assertions locally with DuckDB
-rocky run           # Execute the pipeline
+```
+   models/*.sql + *.toml        models/*.rocky
+              │                        │
+              └───────────┬────────────┘
+                          ▼
+                   rocky compile ───────► diagnostics
+                          │               E001-E036  errors
+                          ▼               W001-W031  warnings
+                      typed IR            P001-P002  lints
+              (every column's type)       I001-I002  information
+                          │
+                          ▼
+                    dialect SQL ──► rocky plan prints it
+                          │
+                          │ rocky run executes it
+                          ▼
+                  your warehouse ──► run record ──► state store
 ```
 
-The playground is self-contained: sample models, contracts, and a DuckDB backend. No credentials needed.
-
-## Features
-
-| Category | Capabilities |
-|----------|-------------|
-| **Compiler** | Type checking, column-level lineage, data contracts, DAG resolution, diagnostics with suggestions |
-| **Branches** | `rocky branch create`/`delete`/`list`/`show`, `rocky run --branch`, `rocky replay <run_id>` |
-| **Agent governance** | `[policy]` rules (allow / require review / deny), blast-radius ceilings, `verify_after` gates, autonomy budgets + `rocky policy freeze`, `rocky policy test` scenario runner, decision ledger (`rocky audit`, `rocky brief`, `rocky review --queue`) |
-| **Reproducibility** | Content-addressed run records with recipe identity, `rocky replay --execute --verify` bit-exact re-execution, `rocky gc --derivable` + hash-verified `rocky restore`, offline `rocky-verify` manifests |
-| **Resilience** | Classified retry of proven-transient failures, opt-in failure containment with honest partial results, review-gated `rocky backfill` plans |
-| **Cost** | Per-model cost attribution on every run, `[budget]` blocks, `budget_breach` hook event |
-| **Observability** | `rocky trace` Gantt output, OpenTelemetry OTLP export, structured JSON events |
-| **Portability** | Dialect-divergence lint across Databricks / Snowflake / BigQuery / DuckDB |
-| **DSL** | Pipeline-oriented `.rocky` syntax; optional, models stay plain SQL by default |
-| **AI** | Intent metadata, schema-sync, intent extraction, test generation |
-| **IDE** | VS Code extension, full LSP (completion, hover, go-to-def, rename, code actions, inlay hints) |
-| **Quality** | Pipeline-level checks + 13 declarative assertions with severity, filters, and row quarantine |
-| **Execution** | DuckDB (local), Databricks (prod), Snowflake + BigQuery (beta) |
-| **Optimization** | Cost-based materialization, storage profiling, compaction, partition archival |
-| **Governance** | Unity Catalog tags, workspace isolation, declarative RBAC with GRANT/REVOKE diffing |
-| **Integration** | Dagster ([dagster-rocky](../integrations/dagster/)), dbt import, CI pipeline |
-
-## CLI at a glance
-
-```bash
-rocky init           # Scaffold a new project
-rocky validate       # Check config without API calls
-rocky compile        # Type-check all models
-rocky test           # Run assertions locally (DuckDB)
-rocky plan           # Preview generated SQL (dry-run)
-rocky run            # Execute the pipeline
-rocky state          # Inspect stored watermarks
-rocky ai "<intent>"  # Generate a model from natural language
-rocky lineage        # Trace column-level lineage
-rocky lineage-diff   # Per-changed-column downstream blast-radius for PR review
-rocky replay         # Verify a recorded run; --execute re-runs deterministic content-addressed models bit-exact
-rocky policy check   # Explain what a policy allows, requires review for, or denies
-rocky policy test    # Run pinned policy scenarios through the real evaluator (CI)
-rocky review         # Approve plans; --queue ranks pending escalations
-rocky audit          # Query the decision ledger; --for walks a custody chain
-rocky brief          # Estate digest with every line cited to the ledger
-rocky gc             # Inventory derivable (recipe-bound) artifacts; eviction behind review
-rocky restore        # Rebuild an evicted artifact, hash-verified, or refuse
-rocky mcp            # Model Context Protocol server for AI agents (28 tools)
-rocky doctor         # Aggregate health checks
-rocky serve          # HTTP API + live watch
-rocky lsp            # Language Server Protocol for IDEs
-```
-
-Full reference: [CLI commands](https://rocky-data.dev/reference/cli/).
-
-## Adapters
-
-| Role | Adapter | Status | Notes |
-|------|---------|--------|-------|
-| Source | Fivetran | Production | REST API discovery of connectors and tables |
-| Source | Airbyte | Beta | Airbyte API discovery of connections and streams |
-| Source | Iceberg | Beta | REST catalog discovery of namespaces and tables |
-| Source | Manual | Production | Schema/table lists inline in `rocky.toml` |
-| Warehouse | Databricks | Production | SQL Statement API + Unity Catalog governance |
-| Warehouse | Snowflake | Beta | SQL execution via Snowflake connector |
-| Warehouse | BigQuery | Beta | SQL execution via BigQuery connector |
-| Warehouse | DuckDB | Local / Testing | Embedded execution for development and CI |
-| Warehouse | Trino | Beta | REST `/v1/statement` polling client; Basic + JWT auth; Docker conformance harness behind the `trino-conformance` feature |
-
-Build a custom adapter in Rust or any language with the [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/), which walks through a ClickHouse-shaped skeleton, the trait surface, auth, testing, and distribution. Concepts overview: [Adapter SDK](https://rocky-data.dev/concepts/adapters/).
+The typed IR is the compiler's internal model of the project. It holds every
+model, every column, and every column's type.
 
 ## Installation
 
@@ -134,7 +44,11 @@ curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/instal
 irm https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.ps1 | iex
 ```
 
-**Build from source** (requires Rust 1.88+):
+Both scripts install the `rocky` binary. Each also installs `rocky-lsp`
+alongside it when the release ships that archive. There is no runtime to
+install.
+
+**Build from source** (requires Rust 1.88 or newer):
 
 ```bash
 git clone https://github.com/rocky-data/rocky.git
@@ -142,9 +56,262 @@ cd rocky/engine
 cargo build --release
 ```
 
+## Quick start
+
+```bash
+rocky playground my-first-project
+cd my-first-project
+rocky compile       # Type-check every model
+rocky test          # Run the models on an in-memory DuckDB
+rocky run           # Execute the pipeline
+```
+
+The playground is self-contained. It ships three sample models, a contract, and
+a DuckDB backend. You need no credentials.
+
+## Main commands
+
+Commands that work on a project read `rocky.toml` from the current directory.
+Some need no project at all, such as `rocky init` and `rocky playground`. To
+read a config somewhere else, put `--config <path>` before the command name:
+`rocky --config path/to/rocky.toml compile`. `--config` is not a global flag,
+so it does not work after the command name.
+
+`--output` is global, so it goes anywhere on the line. Pass `--output json` or
+`--output table` to force a format. Rocky picks `table` for an interactive
+terminal and `json` otherwise.
+
+**Build and check**
+
+```bash
+rocky init           # Scaffold a new project
+rocky validate       # Check the config without connecting to any API
+rocky compile        # Type-check models and validate contracts
+rocky test           # Run local model tests on DuckDB, no warehouse needed
+rocky ci             # Compile + test, no warehouse credentials needed
+rocky plan           # Print the SQL a run would execute
+rocky run            # Execute the pipeline
+rocky state          # Show stored watermarks
+```
+
+`rocky test` runs on an in-memory DuckDB. `rocky test --declarative` does not:
+it runs the `[[tests]]` from your model sidecars against the warehouse adapter
+you configured.
+
+**Understand a project**
+
+```bash
+rocky lineage <model>   # Trace column-level lineage
+rocky lineage-diff      # Report the downstream blast radius of changed columns
+rocky dag               # Show the unified DAG across every pipeline stage
+rocky history           # Show run and model execution history
+rocky metrics <model>   # Show quality metrics; add --alerts or --trend
+rocky trace <run-id>    # Render one run as a Gantt-style timeline
+rocky doctor            # Check config, state, adapters, pipelines, state_sync
+```
+
+**Branch, review, and replay**
+
+```bash
+rocky branch create <name>   # Create a branch (an isolated schema)
+rocky run --branch <name>    # Run the pipeline into that branch
+rocky branch promote <name>  # Promote branch tables to production targets
+rocky replay <run-id>        # Inspect a recorded run
+rocky review <plan-id>       # Review a plan; --queue ranks pending escalations
+rocky audit                  # Query the decision ledger; --for walks a subject
+rocky brief                  # Estate digest, every line cited to the ledger
+```
+
+`rocky brief` defaults to `--since last`. It reports what changed since the
+previous brief, then advances that cursor. The next `--since last` window
+starts where this one ended, so `rocky brief` writes state. The other windows,
+`--since 24h` and `--since 7d`, never touch the cursor.
+
+**Serve and integrate**
+
+```bash
+rocky serve          # HTTP API over the compiler's semantic graph
+rocky lsp            # Language Server Protocol for IDEs
+rocky mcp            # Model Context Protocol server (30 agent tools, 6 write)
+rocky load           # Load CSV, Parquet, or JSONL files from a directory
+rocky ai "<intent>"  # Generate a model from a natural-language description
+```
+
+The engine ships more commands than this page lists. Run `rocky --help` for the
+full set, or read the [CLI reference](https://rocky-data.dev/reference/cli/).
+
+## The gate on agent-authored changes
+
+An AI agent can author a plan. A bare `rocky apply` refuses to execute one. A
+human clears it with `rocky review <plan-id> --approve`, which writes the
+sign-off marker that unblocks the apply.
+
+A `[policy]` block supersedes that default. Rocky evaluates every model the
+plan touches and takes the most restrictive answer. `allow` proceeds with no
+marker, `require_review` still demands one, and `deny` refuses outright. So
+only a `[policy]` rule you wrote lets an agent-authored plan through
+unreviewed.
+
+Rocky enforces the same `[policy]` block at three seams: `rocky apply`,
+`rocky branch promote`, and the MCP authoring tools. Two of its mechanisms
+fail closed. A `max_downstreams` ceiling degrades `allow` to `require_review`
+when the blast radius is over the limit, or cannot be counted at all. A
+`verify_after` gate runs its named checks after the apply, and fails when a
+check did not run at all, not only when a check fails. The write has already
+landed by then, so that failure halts and alerts you. It does not roll the
+write back.
+
+Most of the 30 MCP tools only read. Six can write. Four go through that same
+policy evaluator: `draft_model`, `draft_contract`, `draft_check`, and
+`propose`. In a governed scope the evaluator returns a denial or a review
+requirement, and a denied draft leaves nothing on disk.
+
+The other two carry their own guard. `pause_schedule` needs `confirm: true`.
+Only a human can resume a schedule, with
+`rocky state schedule resume <pipeline>`. `review_queue` can record the human
+sign-off that unblocks `rocky apply`. It needs `confirm: true`, and it refuses
+any plan that is not already in the pending review queue.
+
+To see what a rule resolves to before you rely on it, run
+`rocky policy check --principal agent --capability apply --model <name>`. It
+prints the effect, the winning rule, and the reason. It is read-only.
+
+## What the compiler reports
+
+`rocky compile` prints one diagnostic per problem. Each diagnostic carries a
+stable code, so you can grep for it and gate on it.
+
+| Prefix | Codes | What it means |
+|---|---|---|
+| `E` | E001-E036 | Error. `rocky compile` exits non-zero. |
+| `W` | W001-W031 | Warning. Compilation still succeeds. |
+| `P` | P001-P002 | Lint. P001 flags SQL that does not port to your target dialect. P002 warns on a `SELECT *` whose downstream consumers name specific columns. |
+| `I` | I001-I002 | Information. |
+
+Two examples. A column whose type no longer matches its contract is `E011`. A
+Snowflake-only construct in a Databricks project is `P001`.
+
+The portability lint is opt-in. Run `rocky compile --target-dialect dbx`, or set
+`[portability] target_dialect` in `rocky.toml`. The four targets are `dbx`,
+`sf`, `bq`, and `duckdb`. When it fires, P001 is error severity, so the compile
+exits non-zero. Exempt a construct project-wide with `[portability] allow`, or
+per model with a `-- rocky-allow: <construct>` comment.
+
+## What the engine does
+
+| Category | Capabilities |
+|----------|-------------|
+| **Compiler** | Type checking, column-level lineage, data contracts, DAG resolution, diagnostics with suggestions |
+| **Branches** | `rocky branch create`/`delete`/`list`/`show`/`compare`/`approve`/`promote`, `rocky run --branch`, `rocky replay <run-id>` |
+| **Agent governance** | `[policy]` rules (allow / require review / deny), `max_downstreams` blast-radius ceilings, `verify_after` gates, `autonomy_budget`, `rocky policy check` decision explainer, `rocky policy freeze`, `rocky policy test` scenario runner, decision ledger (`rocky audit`, `rocky brief`, `rocky review --queue`) |
+| **Reproducibility** | Content-addressed run records with recipe identity, `rocky replay --execute --verify` bit-exact re-execution, `rocky gc --derivable --dry-run` inventory of reclaimable artifacts (drop `--dry-run` and it writes a review-gated eviction plan instead), hash-verified `rocky restore` |
+| **Resilience** | Classified retry of transient failures, opt-in failure containment (`contain_failures`), review-gated `rocky backfill` plans |
+| **Cost** | Per-model cost attribution on every run, `[budget]` limits, `budget_breach` hook event, `rocky preview cost --name <branch>` reports a pull request's per-model cost delta against the base branch, plus the budget breaches it projects. It reads a branch that `rocky preview create` registered |
+| **Observability** | `rocky trace` Gantt output, structured JSON events, OpenTelemetry OTLP export when `OTEL_EXPORTER_OTLP_ENDPOINT` is set |
+| **Portability** | Opt-in dialect-divergence lint targeting Databricks, Snowflake, BigQuery, or DuckDB |
+| **DSL** | Pipeline-oriented `.rocky` syntax. It is optional, and models stay plain SQL by default |
+| **AI** | Intent metadata, schema-sync, intent extraction, test generation |
+| **IDE** | VS Code extension, full LSP (completion, hover, go-to-def, rename, code actions, inlay hints) |
+| **Quality** | Pipeline-level checks plus 13 declarative assertions with severity, filters, and row quarantine |
+| **Execution** | DuckDB (local), Databricks (production), Snowflake + BigQuery + Trino (beta) |
+| **Optimization** | Cost-based materialization, storage profiling, compaction, partition archival |
+| **Governance** | Unity Catalog tags, workspace isolation, declarative RBAC with GRANT/REVOKE diffing |
+| **Integration** | Dagster ([dagster-rocky](../integrations/dagster/)), `rocky import-dbt`, `rocky validate-migration`, CI pipeline |
+
+## Gates you can put in CI
+
+Rocky turns several classes of failure into a command that exits non-zero.
+Wire the ones you need into your pipeline.
+
+| You want to catch | Command | How it fails |
+|---|---|---|
+| A model that no longer type-checks | `rocky compile` | Exits non-zero on any `E` code |
+| A broken contract or missing column | `rocky compile` | `E010`-`E013` |
+| A breaking change reaching production | `rocky branch promote <name>` | Refuses unless you pass `--allow-breaking`. The gate skips itself, and records that it did, when the models directory is missing or when either the base ref or the working tree fails to compile |
+| SQL that will not run on your target warehouse | `rocky compile --target-dialect <dbx\|sf\|bq\|duckdb>` | `P001` at error severity |
+| Classified data left unmasked | `rocky compliance --fail-on exception` | Exits 1 on any exception |
+| A run that costs more than budgeted | `rocky run` with `[budget] on_breach = "error"` | Fails the run. The default, `warn`, only fires the `budget_breach` event |
+| A policy edit that opens a hole | `rocky policy test` | Exits non-zero when a `[[policy.tests]]` scenario resolves to the wrong effect |
+
+`rocky lineage-diff` reports the per-column downstream blast radius for a pull
+request. It is a report, not a gate. No finding fails it. It still exits
+non-zero when it cannot produce the report at all, such as an empty base ref or
+a `git diff` that fails.
+
+## Where Rocky sits in an ELT pipeline
+
+| Stage | Rocky | Notes |
+|---|---|---|
+| Extract (SaaS sources) | — | Use Fivetran, Airbyte, Stitch, or warehouse-native CDC |
+| Extract (files) | ✅ | `rocky load`: CSV, Parquet, or JSONL from a directory |
+| Load (bronze replication) | ✅ | Config-driven replication pipelines |
+| Transform | ✅ | Compiled SQL models |
+| Quality | ✅ | Inline assertions during `rocky run` |
+| Orchestration | Partial | Dagster integration; `rocky serve --scheduler` runs an in-process scheduler (experimental) |
+
+For how Rocky compares to other SQL transformation tools, see the
+[comparison page](https://rocky-data.dev/getting-started/comparison/).
+
+## Adapters
+
+| Role | Adapter | Status | Notes |
+|------|---------|--------|-------|
+| Source | Fivetran | Production | REST API discovery of connectors and tables |
+| Source | Airbyte | Beta | Airbyte API discovery of connections and streams |
+| Source | Iceberg | Beta | REST catalog discovery of namespaces and tables |
+| Source | Manual | Production | Schema and table lists inline in `rocky.toml` |
+| Warehouse | Databricks | Production | SQL Statement API + Unity Catalog governance |
+| Warehouse | Snowflake | Beta | SQL execution via the Snowflake connector |
+| Warehouse | BigQuery | Beta | SQL execution via the BigQuery connector |
+| Warehouse | DuckDB | Local / Testing | Embedded execution for development and CI |
+| Warehouse | Trino | Beta | REST `/v1/statement` polling client, Basic + JWT auth |
+
+Build a custom adapter in Rust, or in any language, with the
+[Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/). It walks
+through a ClickHouse-shaped skeleton, the trait surface, auth, testing, and
+distribution. For the concepts, see
+[Adapter SDK](https://rocky-data.dev/concepts/adapters/).
+
+## Replaying a recorded run
+
+`rocky replay --execute --verify` re-runs a recorded recipe and checks that the
+output reproduces byte for byte. It runs on a local DuckDB engine by default.
+Pass `--warehouse` to re-run on the live warehouse. Those writes go into an
+isolated replay schema, never a production target. Rocky drops that schema
+afterwards unless you pass `--keep`.
+
+The workspace also contains `rocky-verify`, which validates a run manifest
+offline. Releases do not ship it, so build it with
+`cargo build --release --bin rocky-verify`.
+
+## Migrating from dbt
+
+`rocky import-dbt` converts a dbt project into a runnable Rocky repo. It reads
+`manifest.json` from `target/` when it finds one. Pass `--no-manifest` to force
+the regex-based import instead.
+
+```bash
+rocky import-dbt --dbt-project ./my-dbt --output-dir ./rocky-out
+```
+
+Rocky picks the adapter from the dbt project's `profiles.yml`. It falls back to
+`duckdb` when that profile is unreadable or names an unsupported warehouse.
+Override it with `--target-adapter <duckdb|databricks|snowflake|bigquery>`. The
+importer refuses to write into a non-empty directory unless you pass
+`--overwrite`.
+
+`rocky validate-migration` compares the two projects side by side.
+
+```bash
+rocky validate-migration --dbt-project ./my-dbt --rocky-project ./rocky-out
+```
+
+Add `--sample-size <n>` to compare rows from the warehouse as well as structure.
+
 ## Documentation
 
-**[rocky-data.dev](https://rocky-data.dev)**: concepts, guides, CLI reference, Dagster integration, and the adapter SDK.
+**[rocky-data.dev](https://rocky-data.dev)**: concepts, guides, CLI reference,
+Dagster integration, and the adapter SDK.
 
 ## License
 

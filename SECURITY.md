@@ -2,32 +2,43 @@
 
 ## Reporting a Vulnerability
 
-We take the security of Rocky and its integrations seriously. If you discover a security vulnerability in any subproject of this repository (`engine/`, `integrations/dagster/`, `editors/vscode/`, `examples/playground/`), please report it through GitHub's private vulnerability reporting:
+**Do not report a security vulnerability through a public GitHub issue.** Use either private channel below. Both reach the maintainers, and either one on its own is enough.
 
-1. Go to the [Security tab](https://github.com/rocky-data/rocky/security/advisories/new) of this repository
-2. Click "Report a vulnerability"
-3. Fill in the details of the vulnerability, including which subproject is affected
+- **The private advisory form.** Open the [private advisory form](https://github.com/rocky-data/rocky/security/advisories/new). The link goes straight to GitHub's "Report a vulnerability" page for this repository.
+- **Email.** Write to **security@rocky-data.dev**.
 
-Alternatively, you can email **security@rocky-data.dev** directly.
+Include these details in whichever channel you choose.
 
-**Please do not report security vulnerabilities through public GitHub issues.**
+1. Name the affected path, for example `engine/` or `editors/vscode/`. Every path in this repository is in scope, `.github/` and `scripts/` included. Give the closest path you know, and say so if you are unsure.
+2. Describe the vulnerability. Include the version you tested, your platform, and the steps to reproduce it.
+
+Send a partial report rather than none. We will ask for anything else we need.
 
 ## Response Timeline
 
-- **Acknowledgment:** Within 48 hours
-- **Initial assessment:** Within 1 week
-- **Fix timeline:** Depends on severity, typically within 90 days
+| Stage | When |
+|---|---|
+| We acknowledge your report | Within 48 hours |
+| We send an initial assessment | Within 1 week |
+| We ship a fix | Depends on severity, typically within 90 days |
 
 ## Supported Versions
 
-Each Rocky artifact (engine, dagster integration, VS Code extension) is versioned and released independently. Only the latest release of each is supported.
+Each Rocky artifact is versioned and released independently. Only the latest release of each one receives security fixes.
 
 | Artifact | Tag Prefix | Supported |
 |----------|------------|-----------|
 | Rocky CLI engine | `engine-v*` | Latest only |
+| rocky-sdk package | `sdk-v*` | Latest only |
 | dagster-rocky package | `dagster-v*` | Latest only |
 | Rocky VS Code extension | `vscode-v*` | Latest only |
 
+`@rocky-data/compiler`, the WebAssembly build of the compiler pipeline, has never been published. There is no released version of it to support.
+
 ## Scope
 
-This policy covers all code in the `rocky-data/rocky` monorepo. Out of scope: third-party dependencies (report directly to the upstream project), credentials accidentally committed by users to their own forks, and configuration mistakes in user projects that consume Rocky.
+This policy covers all code in the `rocky-data/rocky` monorepo. Three things fall outside it:
+
+- Third-party dependencies. Report those to the upstream project.
+- Credentials a user commits to their own fork.
+- Configuration mistakes in a project that consumes Rocky.

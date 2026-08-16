@@ -103,7 +103,7 @@ if [[ "${ROCKY_SKIP_CODEGEN_HOOK:-}" != "1" ]]; then
             DIRTY_PATHS=$(
                 git diff --name-only -- \
                     schemas/ \
-                    integrations/dagster/src/dagster_rocky/types_generated/ \
+                    sdk/python/src/rocky_sdk/types_generated/ \
                     editors/vscode/src/types/generated/
             )
             if [[ -n "$DIRTY_PATHS" ]]; then
@@ -114,7 +114,7 @@ The following files were regenerated and are not staged:
 $DIRTY_PATHS
 
 Fix with:
-  git add schemas/ integrations/dagster/src/dagster_rocky/types_generated/ editors/vscode/src/types/generated/
+  git add schemas/ sdk/python/src/rocky_sdk/types_generated/ editors/vscode/src/types/generated/
 EOF
                 FAILED=1
             fi

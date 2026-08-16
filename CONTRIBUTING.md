@@ -1,6 +1,6 @@
 # Contributing to Rocky
 
-Rocky is a monorepo. The five subprojects share one repository, one issue tracker, and one pull-request flow, but each has its own build system.
+Rocky is a monorepo. Every subproject shares one repository, one issue tracker, and one pull-request flow. Each subproject keeps its own build system.
 
 | Subproject | Path | Language | Build |
 |---|---|---|---|
@@ -8,27 +8,38 @@ Rocky is a monorepo. The five subprojects share one repository, one issue tracke
 | Python SDK | `sdk/python/` | Python | `uv` |
 | Dagster integration | `integrations/dagster/` | Python | `uv` |
 | VS Code extension | `editors/vscode/` | TypeScript | `npm` |
-| Sample project | `examples/playground/` | TOML / SQL config | none |
+| Documentation site | `docs/` | Astro | `npm` |
+| POC catalog | `examples/playground/` | TOML / SQL config | none |
 
 ## Getting started
 
-Clone once, work everywhere:
+Clone once, then work anywhere in the tree.
 
 ```bash
 git clone https://github.com/rocky-data/rocky.git
 cd rocky
 ```
 
-Each subproject is built and tested independently. From the repo root, the top-level `justfile` orchestrates common tasks across all of them. Install [`just`](https://github.com/casey/just) and then:
+The top-level `justfile` runs one task across the four code subprojects: the engine, the SDK, the Dagster integration, and the VS Code extension. It does not cover `docs/` or the playground. Install [`just`](https://github.com/casey/just), then:
 
 ```bash
-just build       # build engine + sdk + dagster wheels + vscode extension
-just test        # run all test suites
+just build       # engine, sdk wheel, dagster wheel, vscode extension
+just test        # cargo test, both pytest suites, vscode unit tests
 just lint        # cargo clippy/fmt + ruff + eslint
-just --list      # see all available recipes
+just --list      # every recipe
 ```
 
-You can also build a single subproject directly without `just`; see the per-subproject sections below.
+Two gaps to know about. `just test` runs the VS Code unit tests only; the electron suite has its own recipe, `just test-vscode-electron`. `just build` compiles the extension but does not bundle it, so it does not produce the `dist/extension.js` that debugging needs.
+
+You can also build one subproject directly. The sections below give the commands.
+
+Optional: run `just install-hooks` to point `core.hooksPath` at `.git-hooks/`. Every hook check is conditional. A check runs only when the change touches the subproject it covers.
+
+- **pre-commit:** `cargo fmt --check` for `engine/`, `ruff format --check` for `integrations/dagster/`, eslint for `editors/vscode/`.
+- **pre-commit, codegen drift:** runs only when you stage `output.rs`, `commands/doctor.rs`, or `commands/export_schemas.rs` under `engine/crates/rocky-cli/src/`.
+- **pre-push:** `cargo clippy` for `engine/`, `ruff check` for `integrations/dagster/`.
+
+Neither hook checks `sdk/python/`. A check also skips silently when its tool is not installed, so a missing `uv` turns the ruff check into a pass. The drift check compares fewer paths than `codegen-drift.yml` does, so a commit can pass the hook and still fail CI. Treat the hooks as a fast first pass, not as the gate. Set `ROCKY_SKIP_HOOKS=1` to skip every hook, or `ROCKY_SKIP_CODEGEN_HOOK=1` to skip the drift check alone.
 
 ### Engine (`engine/`)
 
@@ -40,7 +51,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The engine is a Cargo workspace: the library crates under `engine/crates/` plus the `rocky` and `rocky-lsp` binary crates (Rust edition 2024, MSRV 1.88). Run a single crate's tests with `cargo test -p rocky-core`. End-to-end tests in `crates/rocky-core/tests/e2e.rs` use DuckDB and need no credentials.
+CI is stricter than the `cargo test` and `cargo clippy` lines above. It runs `cargo nextest run --all-features` and `cargo clippy --all-targets --all-features -- -D warnings`. Some adapter code sits behind a Cargo feature, so a default-feature run can pass while CI fails.
+
+The engine is a Cargo workspace: the library crates under `engine/crates/` plus the `rocky` and `rocky-lsp` binary crates. It targets Rust edition 2024 with an MSRV of 1.88. Test one crate with `cargo test -p rocky-core`. The end-to-end tests in `crates/rocky-core/tests/e2e.rs` run against DuckDB and need no credentials.
 
 ### Python SDK (`sdk/python/`)
 
@@ -51,7 +64,7 @@ uv run pytest -v
 uv run ruff check src/ tests/ examples/ && uv run ruff format --check src/ tests/ examples/
 ```
 
-`rocky-sdk` is the standalone typed client (`RockyClient`) that `dagster-rocky` is built on. Unit tests mock the binary and need no credentials; `examples/quickstart.py` runs against a real `rocky` (the `sdk-ci` smoke job installs one). The generated Pydantic models in `src/rocky_sdk/types_generated/` come from `just codegen`; don't hand-edit them.
+`rocky-sdk` is the standalone typed client (`RockyClient`) that `dagster-rocky` builds on. The unit tests patch the subprocess layer, so they need no `rocky` binary and no credentials. `examples/quickstart.py` runs against a real binary, and the `sdk-ci` smoke job installs one. `just codegen` writes the Pydantic models in `src/rocky_sdk/types_generated/`; do not hand-edit them.
 
 ### Dagster integration (`integrations/dagster/`)
 
@@ -62,40 +75,68 @@ uv run pytest -v
 uv run ruff check && uv run ruff format --check
 ```
 
-All tests run without the Rocky binary or credentials; they use JSON fixtures in `tests/fixtures/`.
+Every test runs without the `rocky` binary and without credentials. Hand-written scenario data lives in `tests/scenarios.py` as Python dicts. Captures from a real binary live in `tests/fixtures_generated/`, and `just regen-fixtures` refreshes them.
 
 ### VS Code extension (`editors/vscode/`)
 
 ```bash
 cd editors/vscode
 npm install
-npm run compile
+npm run compile                # tsc, writes out/
+npm run bundle                 # esbuild, writes dist/extension.js
 npm run test:unit              # vitest unit tests (fast)
-npm test                       # full electron integration tests (downloads ~344 MB)
+npm test                       # electron integration tests (~344 MB download)
 ```
 
-For interactive development, open `editors/vscode/` in VS Code and press <kbd>F5</kbd> to launch the Extension Development Host.
+Run `npm run bundle` before you debug. `package.json` loads the extension from `dist/extension.js`, which esbuild produces; `npm run compile` writes only `out/`. Then open `editors/vscode/` in VS Code and press <kbd>F5</kbd> to launch the Extension Development Host.
 
-### Sample project (`examples/playground/`)
+### Documentation site (`docs/`)
 
-A self-contained DuckDB pipeline used as a smoke test for the engine and as a fixture source for the dagster integration. No build step.
+```bash
+cd docs
+npm ci
+npm run dev      # local preview
+npm run build    # the same build CI runs
+```
+
+`docs-build.yml` builds the site on every pull request that touches `docs/`. `engine-docs.yml` deploys it on push to `main`.
+
+### POC catalog (`examples/playground/`)
+
+A catalog of small POCs, one per Rocky feature. Each POC is a complete project you can run through `./run.sh`, and most need only DuckDB and no credentials. The weekly `poc-smoke` job builds a fresh binary and runs the credential-free POCs against it. It skips any POC that needs credentials, Docker, or a Rust toolchain. A second step parse-checks the credential-gated POCs, but that step is `continue-on-error`, so it cannot fail the job. `just regen-fixtures` captures the Dagster test fixtures from specific POCs here. The catalog has no build step.
 
 ## Cross-project changes
 
-The single biggest reason Rocky is a monorepo: changes to the engine's CLI JSON output schema or DSL syntax can be made atomically across all consumers in one PR.
+A change to the engine's CLI JSON output, or to the DSL, reaches every consumer. The monorepo lets you land all of it in one pull request.
 
-**When modifying CLI JSON output** (codegen-driven as of Phase 2):
-1. Edit the typed `*Output` struct in `engine/crates/rocky-cli/src/output.rs` (or `engine/crates/rocky-cli/src/commands/doctor.rs` for the doctor types).
-2. From the repo root, run `just codegen`. This regenerates:
-   - `schemas/<command>.schema.json` (canonical JSON Schema)
-   - `sdk/python/src/rocky_sdk/types_generated/` (Pydantic v2 models)
-   - `editors/vscode/src/types/generated/` (TypeScript interfaces)
-3. Commit the regenerated bindings together with your Rust change.
-4. The `codegen-drift` CI workflow will fail any PR where the committed bindings don't match what the engine produces, so this is enforced.
+**When you change CLI JSON output**, edit the typed `*Output` struct in `engine/crates/rocky-cli/src/output.rs`. The doctor types live in `engine/crates/rocky-cli/src/commands/doctor.rs`. Then run `just codegen` from the repo root.
 
-The generated Pydantic models live in the `rocky-sdk` package. `dagster_rocky.types` (and `dagster_rocky.types_generated`) re-export them from `rocky_sdk`, and `editors/vscode/src/types/rockyJson.ts` is a re-export shim over the generated TypeScript, both providing backward-compat aliases for the renamed class names.
+```
+ engine/crates/rocky-cli/src/output.rs  (the typed *Output structs)
+                 │
+                 │ just codegen — builds the rocky binary, then runs:
+       ┌─────────┴──────────┐
+       │ export-schemas     │ export-openapi
+       ▼                    ▼
+ schemas/*.schema.json   docs/public/openapi.json
+       │
+       ├────────────► Pydantic models       (rocky-sdk)
+       ├────────────► TypeScript interfaces (VS Code)
+       └────────────► project-file schema   (VS Code)
+```
 
-**When modifying Rocky DSL syntax** (`.rocky` files), update in lockstep:
+The OpenAPI document comes straight from the engine's schema registry and its route table, not from the committed schema files. The other three read `schemas/`:
+
+- `sdk/python/src/rocky_sdk/types_generated/` — Pydantic v2 models
+- `editors/vscode/src/types/generated/` — TypeScript interfaces
+- `editors/vscode/schemas/rocky-project.schema.json` — copied from `schemas/rocky_project.schema.json`
+
+Commit everything the cascade writes, `schemas/` included, in the same PR as the Rust change. `codegen-drift.yml` re-runs `just codegen` and `just regen-fixtures` on your PR, then fails it on any diff. Use `just codegen-all` locally when your change also alters the shape of command output; it bundles both steps.
+
+Three shims keep older imports working: `dagster_rocky.types` and `dagster_rocky.types_generated` re-export the Pydantic models from `rocky_sdk`, and `editors/vscode/src/types/rockyJson.ts` re-exports the generated TypeScript under its earlier names.
+
+**When you change Rocky DSL syntax** (`.rocky` files), update all five in lockstep:
+
 1. `engine/crates/rocky-lang/` (parser + lexer)
 2. `engine/crates/rocky-compiler/` (type checking)
 3. `editors/vscode/syntaxes/rocky.tmLanguage.json` (TextMate grammar)
@@ -104,41 +145,86 @@ The generated Pydantic models live in the `rocky-sdk` package. `dagster_rocky.ty
 
 ## Releases
 
-Each artifact is released independently using a tag-namespaced scheme. Releases are **CI-driven**, so land a release PR (version bump + CHANGELOG entry), tag the merged commit, push the tag, and the matching release workflow does the rest:
+Each artifact ships on its own tag prefix. Releases are CI-driven: you land a release PR, then push a tag, and the matching workflow does the rest.
 
-| Artifact | Tag pattern | CI workflow (on tag push) |
-|---|---|---|
-| Rocky CLI binary | `engine-v*` | `engine-release.yml` — full 5-target matrix (macOS ARM64/Intel, Linux x86_64/ARM64, Windows x86_64), all attached to the GitHub Release |
-| rocky-sdk wheel | `sdk-v*` | `sdk-release.yml` — build + PyPI publish via OIDC |
-| dagster-rocky wheel | `dagster-v*` | `dagster-release.yml` — build + PyPI publish via OIDC |
-| Rocky VSIX | `vscode-v*` | `vscode-release.yml` — build + VS Code Marketplace publish |
-
-`dagster-rocky` depends on `rocky-sdk`, so when a `dagster-v*` release raises its `rocky-sdk` floor, publish the `sdk-v*` tag first; the published dagster wheel resolves the SDK from PyPI, not the monorepo path source.
-
-Canonical flow for each artifact:
-
-```bash
-# 1. Bump the version + update the CHANGELOG in a release PR; merge it.
-# 2. Tag the merged commit and push:
-git tag engine-v1.7.0
-git push origin engine-v1.7.0
+```
+  1. release PR        version bump + CHANGELOG entry
+        │
+        │ merge
+        ▼
+  2. commit on main    the commit you will tag
+        │
+        │ tag it <prefix>-v<x.y.z>, then push the tag
+        ▼
+  3. release workflow  builds every artifact for that prefix
+        │
+        │ publish
+        ▼
+  4. GitHub Release, plus PyPI or the Marketplace for three of them
 ```
 
-For convenience, the monorepo exposes `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`; these wrap the local-build path below. The `rocky-release` skill (mirrored at `.agents/skills/` and `.claude/skills/`) walks the full checklist.
+Tag the merge commit, then push the tag. Take the version from the release PR. Git refuses a tag that already exists, so a stale version number fails loudly rather than silently.
 
-`scripts/release.sh engine|dagster|vscode <version>` remains as a **local-build fallback** for hotfix scenarios where CI is unavailable. It builds what it can locally (macOS natively, Linux via Docker) and attaches those artifacts to the GitHub Release. Prefer the CI-driven flow for normal releases.
+```bash
+git tag -a engine-v0.2.0 -m "Release engine-v0.2.0"
+git push origin engine-v0.2.0
+```
+
+| Artifact | Tag pattern | Workflow | Also published to |
+|---|---|---|---|
+| Rocky CLI binaries | `engine-v*` | `engine-release.yml` | nothing else |
+| `rocky-sdk` wheel | `sdk-v*` | `sdk-release.yml` | PyPI, via OIDC |
+| `dagster-rocky` wheel | `dagster-v*` | `dagster-release.yml` | PyPI, via OIDC |
+| Rocky VSIX | `vscode-v*` | `vscode-release.yml` | VS Code Marketplace |
+
+Each of these four workflows creates a GitHub Release and attaches what it built. Three of them also publish to a package registry.
+
+A fifth workflow, `engine-wasm-release.yml`, builds the compiler pipeline to WebAssembly on an `engine-wasm-v*` tag. Nothing has shipped from it. `@rocky-data/compiler` is not in the npm registry. The one `engine-wasm-v*` tag has no GitHub Release. The publish step exits early, because the repository has no `NPM_TOKEN` secret. Treat the WebAssembly package as unreleased.
+
+The engine matrix builds five targets: macOS ARM64, macOS Intel, Linux x86_64, Linux ARM64, and Windows x86_64. It attaches a `rocky` archive and a `rocky-lsp` archive for each one.
+
+`dagster-rocky` depends on `rocky-sdk`. When a `dagster-v*` release raises its `rocky-sdk` floor, push the `sdk-v*` tag first. The published dagster wheel resolves the SDK from PyPI, not from the path source in this repository.
+
+`scripts/release.sh engine|sdk|dagster|vscode <version>` is a local-build fallback for a hotfix when CI is unavailable. Run the engine path on an Apple Silicon Mac. It packages the native host build as the macOS ARM64 archive without checking the host architecture, and builds Linux x86_64 in Docker.
+
+Four `just` recipes wrap that same script: `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`. Without `--publish`, the sdk, dagster, and vscode paths build the artifact and create the GitHub Release, but never reach PyPI or the Marketplace. `just release-engine` takes no `--publish`, because the engine publishes to GitHub Releases only.
+
+Prefer the tag-driven flow for a normal release. The `rocky-release` skill, mirrored at `.agents/skills/rocky-release/` and `.claude/skills/rocky-release/`, walks the full checklist.
 
 ## Pull requests
 
 - Branch from `main`.
-- One logical change per PR. Cross-project PRs are encouraged when they ship a coordinated change (schema or DSL); otherwise keep changes scoped to one subproject.
-- Conventional commits required: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`. Scope by subproject or crate when relevant: `feat(engine/rocky-databricks): add OAuth M2M auth`, `fix(dagster): handle partial-success exit codes`, `docs(vscode): update README screenshots`.
+- One logical change per PR. Cross-project PRs are welcome when they ship a coordinated schema or DSL change; otherwise keep a PR inside one subproject.
+- Conventional commits required: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `chore:`. Scope by subproject or crate where it helps: `feat(engine/rocky-databricks): add OAuth M2M auth`, `fix(dagster): handle partial-success exit codes`, `docs(vscode): update README screenshots`.
 - **Never** include `Co-Authored-By` trailers in commit messages.
-- CI runs path-filtered workflows for the subprojects you touch. All required checks must pass before merge. Note: benchmarks only run on PRs labeled `perf`; coverage and audit run weekly via `engine-weekly.yml`.
+
+### What CI runs
+
+CI is path-filtered. The paths your PR touches decide which workflows run. Every required check must pass before merge.
+
+| What you touch | Workflow | What it runs |
+|---|---|---|
+| `engine/**` | `engine-ci.yml` | nextest, clippy, `cargo fmt --check`, an adapter-boundary lint, a release-build smoke test |
+| `sdk/python/**` | `sdk-ci.yml` | pytest, ruff, and a smoke job driving the SDK against a real `rocky` |
+| `integrations/dagster/**` | `dagster-ci.yml` | pytest and ruff |
+| `editors/vscode/**` | `vscode-ci.yml` | compile, the electron integration tests, eslint |
+| `docs/**` | `docs-build.yml` | an Astro build of the docs site |
+| `scripts/**` | `scripts-ci.yml` | shellcheck, and a self-test of the soak-verdict script |
+| `.agents/skills/**` or `.claude/skills/**` | `skills-mirror-drift.yml` | diffs the two skill trees and fails unless they are byte-identical |
+| `engine/**`, `schemas/**`, `justfile`, `examples/playground/pocs/**`, or a generated binding | `codegen-drift.yml` | re-runs `just codegen` and `just regen-fixtures`, then fails on any diff |
+| `examples/playground/pocs/**` | `poc-counts-drift.yml` | recounts the POCs and fails on any diff |
+| `engine/evals/**` or `engine/crates/rocky-mcp/**` | `engine-evals.yml` | the eval harness self-test and the structured-error contract |
+| the recipe-manifest surface (`rocky-verify`, `recipe_identity.rs`, `history.rs`, `examples/audit-sample/**`) | `manifest-conformance.yml` | builds `rocky` and `rocky-verify`, then runs the conformance script |
+
+The table covers the common cases, not every path. Each workflow in `.github/workflows/` holds its own exact `paths:` list. Read it there when you need certainty.
+
+Expect more than one workflow on most PRs. Any `engine/**` change triggers at least `engine-ci.yml` and `codegen-drift.yml`, and a narrower engine path can add more. `schemas/**` triggers `engine-ci.yml`, `sdk-ci.yml`, `dagster-ci.yml`, and `vscode-ci.yml`, plus `codegen-drift.yml`. `sdk/python/**` also triggers `dagster-ci.yml`, because the Dagster integration depends on the SDK. The credential-containment policy checks run on every PR, whatever it touches.
+
+Benchmarks run only on a PR labelled `perf` (`engine-bench.yml`). Coverage, the dependency audit, and a POC smoke run happen weekly (`engine-weekly.yml`).
 
 ### Merge strategy
 
-GitHub lets you pick a merge strategy per-PR via the dropdown on the merge button. Rocky's default is **squash and merge**, but choose deliberately; the right choice depends on the PR's shape:
+GitHub offers a merge-strategy dropdown on the merge button. This repository allows squash and rebase, and disables merge commits. Squash is the default. Choose deliberately, because the right choice depends on the PR's shape.
 
 | PR shape | Strategy | Why |
 |---|---|---|
@@ -148,18 +234,16 @@ GitHub lets you pick a merge strategy per-PR via the dropdown on the merge butto
 | Refactor series where intermediate states build meaningfully | **Rebase** | Preserves the step-by-step narrative and keeps `git bisect` granular for debugging future regressions |
 | WIP-heavy branches with "fix typo" / "oops" commits | **Squash** (or clean up via interactive rebase before opening the PR) | Collapses noise into one coherent commit |
 
-**Heuristic**: if every commit in your PR has a distinct meaningful conventional-commit scope, **rebase**: squashing would collapse those scopes into one megacommit and you'd lose the grep-by-crate affordance. Otherwise **squash**.
-
-Avoid the third option (create a merge commit) for normal PRs; it adds a branching structure to trunk-based linear history for no practical benefit in a solo-scale project.
+**Heuristic:** rebase when every commit carries a distinct, meaningful conventional-commit scope. Squashing would collapse those scopes into one commit, and `git log --grep` by crate would stop finding them. Otherwise squash.
 
 ## Code style
 
-Each subproject follows its language's idioms; the linter is the source of truth.
+Each subproject follows its language's idioms. The linter is the source of truth.
 
-- **Rust** (`engine/`): edition 2024, `cargo fmt`, `cargo clippy --all-targets -- -D warnings`. Use `tracing` for logs. Use `thiserror` for library errors and `anyhow` for binary/CLI errors. SQL identifiers must be validated via `rocky-sql/validation.rs` before interpolation.
-- **Python** (`sdk/python/`, `integrations/dagster/`): Python 3.11+, `from __future__ import annotations`, Pydantic for all data structures. Line length 100. Ruff rules: E, F, I, N, UP, B, SIM.
+- **Rust** (`engine/`): edition 2024, `cargo fmt`, `cargo clippy --all-targets -- -D warnings`. Use `tracing` for logs. Use `thiserror` for library errors and `anyhow` for binary and CLI errors. Validate SQL identifiers through `engine/crates/rocky-sql/src/validation.rs` before you interpolate them.
+- **Python** (`sdk/python/`, `integrations/dagster/`): Python 3.11+, `from __future__ import annotations`. Model every parsed Rocky payload with Pydantic; a frozen dataclass is fine for internal value types. Line length 100. Ruff rules: E, F, I, N, UP, B, SIM.
 - **TypeScript** (`editors/vscode/`): ES2022 target, strict mode, `cp.execFile()` (never `cp.exec()`), escape HTML in webview content.
 
 ## Reporting issues
 
-File issues against `rocky-data/rocky` with a label naming the subproject (`engine`, `sdk`, `dagster`, `vscode`, `playground`). Include the subproject's version, your platform, and minimal repro steps.
+File issues against `rocky-data/rocky`. Five labels name a subproject: `engine`, `sdk`, `dagster`, `vscode`, and `playground`. There is no `docs` label, so use the `documentation` label for a documentation issue. Include the subproject's version, your platform, and minimal steps to reproduce.
