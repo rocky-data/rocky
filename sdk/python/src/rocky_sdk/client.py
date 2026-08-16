@@ -1345,7 +1345,7 @@ class RockyClient:
             args.extend(["--model", model])
         if with_intent:
             args.append("--with-intent")
-        return _parse_rocky_json(self.run_cli(args), AiSyncResult, command="ai sync")
+        return _parse_rocky_json(self.run_cli(args), AiSyncResult, command="ai-sync")
 
     def ai_explain(
         self, model: str | None = None, *, all: bool = False, save: bool = False
@@ -1358,7 +1358,7 @@ class RockyClient:
             args.append("--all")
         if save:
             args.append("--save")
-        return _parse_rocky_json(self.run_cli(args), AiExplainResult, command="ai explain")
+        return _parse_rocky_json(self.run_cli(args), AiExplainResult, command="ai-explain")
 
     def ai_test(
         self, model: str | None = None, *, all: bool = False, save: bool = False
@@ -1371,7 +1371,7 @@ class RockyClient:
             args.append("--all")
         if save:
             args.append("--save")
-        return _parse_rocky_json(self.run_cli(args), AiTestResult, command="ai test")
+        return _parse_rocky_json(self.run_cli(args), AiTestResult, command="ai-test")
 
     def ai_contract(self, model: str, *, save: bool = False) -> AiContractOutput:
         """AI-draft a data contract from a model's observed data (DuckDB only)."""

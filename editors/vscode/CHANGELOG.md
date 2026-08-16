@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The `intent` hover in the config schema names a real command.** It cited `rocky ai sync`, which the CLI rejects; the subcommand is `rocky ai-sync`. (#1443)
+
 ### Removed
 
 - **Dropped the lineage drift overlay and the Overview drift card, which never showed real data.** Both shelled out to `rocky drift`, a command the CLI does not have. The error was caught into an empty result, and because that result was still a value rather than a failure, the Overview card rendered **"None" with an all-clear tone** — a fabricated clean result, in every project, for its entire lifetime. The overlay likewise decorated nothing. Drift continues to be reported by the drift diagnostics provider, which is unaffected and unrelated. (#1431)

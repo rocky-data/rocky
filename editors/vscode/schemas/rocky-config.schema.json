@@ -61,7 +61,7 @@
     },
     "intent": {
       "type": "string",
-      "description": "Natural language description of what this model does. Used by 'rocky ai sync' to propose updates when upstream schemas change"
+      "description": "Natural language description of what this model does. Used by 'rocky ai-sync' to propose updates when upstream schemas change"
     },
     "freshness": {
       "type": "object",

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **AI parse errors now name a command the CLI accepts.** `RockyParseError` from `ai_sync()`, `ai_explain()`, and `ai_test()` reported the command as `ai sync` / `ai explain` / `ai test`. Those forms are rejected by the CLI — `rocky ai` takes a positional intent — so anyone diagnosing malformed output was handed a command that fails. They now read `ai-sync`, `ai-explain`, and `ai-test`. (#1443)
+
 ### Removed
 
 - **BREAKING: `DriftOutput` is no longer exported.** It modelled the output of a `rocky drift` command that does not exist, so nothing could ever produce a payload for it to parse. `DriftSummary` and `DriftActionOutput` remain available and are unchanged — drift is reported on `RunResult.drift`. (#1431)

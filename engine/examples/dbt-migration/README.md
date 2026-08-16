@@ -47,7 +47,7 @@ Models:  2 total
 
 Next Steps:
   1. rocky compile
-  2. rocky ai explain --all --save
+  2. rocky ai-explain --all --save
 Output:  2 models translated, 0 seeds copied → imported/
          rocky.toml         → imported/rocky.toml
          MIGRATION-NOTES.md → imported/MIGRATION-NOTES.md
@@ -57,8 +57,9 @@ Warnings:
     -> add a sources.yml definition for this source
 ```
 
-Rocky prints the second next step as `rocky ai explain`. The command is
-`rocky ai-explain`, with a hyphen.
+Rocky offers the intent step only when an imported model has no `intent`.
+This project's dbt models carry no YAML descriptions, so both arrive without
+one and the step appears.
 
 `imported/` then holds `rocky.toml`, `MIGRATION-NOTES.md`, and a `models/`
 directory with one `.sql` and one `.toml` per model, plus `_defaults.toml`.

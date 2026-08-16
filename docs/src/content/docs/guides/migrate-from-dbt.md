@@ -111,8 +111,7 @@ Tests:   8 total
 
 Next Steps:
   1. rocky compile
-  2. rocky ai explain --all --save
-  3. rocky test
+  2. rocky test
 Output:  2 models translated, 0 seeds copied → imported
          rocky.toml         → imported/rocky.toml
          MIGRATION-NOTES.md → imported/MIGRATION-NOTES.md
