@@ -1,103 +1,177 @@
 # Window Functions
 
-Demonstrates Rocky DSL window function syntax (Plan 11 feature) side by side with equivalent SQL. Each transformation is implemented in both `.rocky` (DSL) and `.sql` (standard SQL) so you can compare the approaches.
+Four models. Two write window functions in the Rocky DSL. Two write the same
+logic in SQL. Compile them together and compare the SQL Rocky emits with the
+SQL you would have written by hand.
 
-## Models
-
-| Rocky DSL | SQL Equivalent | What it shows |
-|-----------|---------------|---------------|
-| `customer_order_ranking.rocky` | `customer_order_ranking_sql.sql` | `row_number`, `rank`, `dense_rank` with partition and sort |
-| `running_totals.rocky` | `running_totals_sql.sql` | `sum` with frame specification, running count, grand total |
-
-## Project Structure
+## Files
 
 ```
 window-functions/
-  rocky.toml                              # DuckDB adapter
+  rocky.toml
   models/
-    customer_order_ranking.rocky          # DSL: ranking functions
-    customer_order_ranking.toml           # Sidecar config
-    customer_order_ranking_sql.sql        # SQL equivalent
-    customer_order_ranking_sql.toml       # Sidecar config
-    running_totals.rocky                  # DSL: running aggregations
-    running_totals.toml                   # Sidecar config
-    running_totals_sql.sql               # SQL equivalent
-    running_totals_sql.toml              # Sidecar config
+    customer_order_ranking.rocky      + .toml   # DSL: row_number, rank, dense_rank
+    customer_order_ranking_sql.sql    + .toml   # the same logic in SQL
+    running_totals.rocky              + .toml   # DSL: running sum, running count, grand total
+    running_totals_sql.sql            + .toml   # the same logic in SQL
 ```
 
-## Running
+Both model forms live in one project and compile to the same column set.
+
+## Compile and read the SQL
+
+Run these from the repository root. Rocky reads `rocky.toml` from the working
+directory by default, so the `cd` is what lets the rest omit `--config`.
 
 ```bash
-# Compile models and see generated SQL
-rocky --config engine/examples/window-functions/rocky.toml compile \
-  --models engine/examples/window-functions/models/
-
-# Preview execution plan
-rocky --config engine/examples/window-functions/rocky.toml plan \
-  --models engine/examples/window-functions/models/
+cd engine/examples/window-functions
+rocky compile
 ```
 
-## Syntax Comparison
+```
+  ✓ customer_order_ranking (7 columns)
+  ✓ customer_order_ranking_sql (7 columns)
+  ✓ running_totals (7 columns)
+  ✓ running_totals_sql (7 columns)
+  Compiled: 4 models, 0 errors, 0 warnings
+```
 
-### Ranking (row_number, rank, dense_rank)
+Print the SQL for one model:
 
-**Rocky DSL:**
+```bash
+rocky emit-sql --model customer_order_ranking
+```
+
+`rocky compile` and `rocky emit-sql` need no warehouse connection.
+
+`rocky run` does not work here. The sidecars target `warehouse.analytics`. A
+DuckDB session has no catalog called `warehouse`, so `rocky run --models
+models/` reports `Catalog with name warehouse does not exist`. The models also
+read `source.raw.orders` and `source.raw.transactions`, which this example
+does not ship. Read the SQL with `rocky emit-sql` instead.
+
+## Ranking, DSL and SQL
+
+`customer_order_ranking.rocky`:
+
 ```rocky
+-- Rank customers by order value within each region.
+-- Demonstrates: row_number, rank, dense_rank with partition and sort.
 from source.raw.orders
 derive {
+    -- Sequential number per customer within their region (no gaps)
     rn: row_number() over (partition region, sort -amount),
+    -- Rank with gaps (tied amounts get same rank, next rank skips)
     order_rank: rank() over (partition region, sort -amount),
+    -- Dense rank without gaps (tied amounts get same rank, next rank is +1)
     order_dense_rank: dense_rank() over (partition region, sort -amount)
 }
-```
-
-**SQL:**
-```sql
-SELECT
-    ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn,
-    RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS order_rank,
-    DENSE_RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS order_dense_rank
-FROM source.raw.orders
-```
-
-### Running Total with Frame Specification
-
-**Rocky DSL:**
-```rocky
-from source.raw.transactions
-derive {
-    running_total: sum(amount) over (partition account_id, sort txn_date, rows unbounded..current),
-    grand_total: sum(amount) over ()
+select {
+    order_id,
+    customer_id,
+    region,
+    amount,
+    rn,
+    order_rank,
+    order_dense_rank
 }
 ```
 
-**SQL:**
+`rocky emit-sql --model customer_order_ranking` returns this, wrapped here for
+reading:
+
 ```sql
-SELECT
-    SUM(amount) OVER (
-        PARTITION BY account_id ORDER BY txn_date
-        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-    ) AS running_total,
-    SUM(amount) OVER () AS grand_total
-FROM source.raw.transactions
+-- model: customer_order_ranking
+CREATE OR REPLACE TABLE warehouse.analytics.customer_order_ranking AS
+SELECT order_id, customer_id, region, amount,
+       ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn,
+       RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS order_rank,
+       DENSE_RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS order_dense_rank
+FROM source.raw.orders;
 ```
 
-## DSL Window Syntax Reference
+`customer_order_ranking_sql.sql` holds that `SELECT` written by hand.
+
+## Running totals, DSL and SQL
+
+`running_totals.rocky`:
+
+```rocky
+-- Running totals and cumulative aggregations per account.
+-- Demonstrates: sum with frame specification (rows unbounded..current),
+-- count as a running count, and a grand total via empty over().
+from source.raw.transactions
+derive {
+    -- Cumulative sum of amount per account, ordered by transaction date
+    running_total: sum(amount) over (partition account_id, sort txn_date, rows unbounded..current),
+    -- Running count of transactions per account
+    running_count: count() over (partition account_id, sort txn_date, rows unbounded..current),
+    -- Grand total across all rows (empty partition = entire result set)
+    grand_total: sum(amount) over ()
+}
+select {
+    txn_id,
+    account_id,
+    txn_date,
+    amount,
+    running_total,
+    running_count,
+    grand_total
+}
+```
+
+`rocky emit-sql --model running_totals` returns this, wrapped here for
+reading:
+
+```sql
+-- model: running_totals
+CREATE OR REPLACE TABLE warehouse.analytics.running_totals AS
+SELECT txn_id, account_id, txn_date, amount,
+       SUM(amount) OVER (PARTITION BY account_id ORDER BY txn_date
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+       COUNT() OVER (PARTITION BY account_id ORDER BY txn_date
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_count,
+       SUM(amount) OVER () AS grand_total
+FROM source.raw.transactions;
+```
+
+## The `over` clause
 
 ```
 func(args) over (partition col1, col2, sort -col3, col4, rows start..end)
+                 └── PARTITION BY ──┘  └── ORDER BY ──┘  └─ frame bounds ─┘
 ```
 
-- **`partition`** -- columns to partition by (optional, comma-separated)
-- **`sort`** -- columns to order by (prefix `-` for descending)
-- **`rows`/`range`** -- frame bounds separated by `..`:
-  - `unbounded` -- start/end of partition
-  - `current` -- current row
-  - `N` -- offset of N rows
+| Part | Meaning | SQL it produces |
+|---|---|---|
+| `partition a, b` | group rows before the window runs | `PARTITION BY a, b` |
+| `sort c` | order rows inside the group | `ORDER BY c` |
+| `sort -c` | order descending; the `-` replaces `DESC` | `ORDER BY c DESC` |
+| `rows a..b` | frame in rows | `ROWS BETWEEN … AND …` |
+| `range a..b` | frame in values | `RANGE BETWEEN … AND …` |
+| `over ()` | one window over every row | `OVER ()` |
 
-## Key Concepts
+Frame bounds accept `unbounded`, `current`, and a row offset `N`. So
+`rows unbounded..current` becomes
+`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
 
-- Rocky's window syntax is more compact than SQL's `OVER (PARTITION BY ... ORDER BY ... ROWS BETWEEN ... AND ...)`
-- `-column` in sort means descending (no `DESC` keyword needed)
-- `rows unbounded..current` maps to `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`
-- Empty `over ()` means the window spans the entire result set
+## Where `--config` goes
+
+`--config` is a top-level flag, not a per-command flag. It comes before the
+subcommand, never after:
+
+```bash
+rocky --config rocky.toml compile   # works
+rocky compile --config rocky.toml   # error: unexpected argument '--config' found
+```
+
+The commands above omit it, because `--config` already defaults to
+`rocky.toml` in the working directory.
+
+To run from somewhere else, pass `--models` as well. It defaults to `models`
+relative to the working directory, not relative to the config:
+
+```bash
+rocky --config engine/examples/window-functions/rocky.toml compile \
+  --models engine/examples/window-functions/models/
+```

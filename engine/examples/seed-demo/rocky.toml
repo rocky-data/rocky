@@ -4,7 +4,7 @@
 # inferring column types, and loading them into the target warehouse.
 #
 # Usage:
-#   rocky --config engine/examples/seed-demo/rocky.toml seed --seeds-dir engine/examples/seed-demo/seeds/
+#   rocky --config engine/examples/seed-demo/rocky.toml seed --seeds engine/examples/seed-demo/seeds/
 
 [adapter.local]
 type = "duckdb"

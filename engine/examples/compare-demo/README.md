@@ -1,76 +1,125 @@
-# Compare Demo
+# Compare demo
 
-Demonstrates `rocky compare` -- validates shadow table copies against production tables. Shadow mode lets you test pipeline changes safely by writing to suffixed tables, then comparing them row-by-row against the existing production output.
+This example shows shadow mode and `rocky compare`. Shadow mode writes a run's
+output to renamed copies of the target tables. `rocky compare` then checks each
+shadow table against the production table it shadows.
 
-## Models
+## The two models
+
+`models/` holds two Rocky DSL models, each with a TOML sidecar.
+
+- `stg_orders` drops cancelled orders and derives `order_amount_usd` and
+  `is_completed`.
+- `fct_daily_orders` aggregates completed orders by `order_date`.
+
+The sidecar `fct_daily_orders.toml` declares `depends_on = ["stg_orders"]`.
+
+## How shadow mode and compare fit together
 
 ```
-raw_orders ──> stg_orders ──> fct_daily_orders
+                ┌─────────────────────┐  writes   ┌──────────────────────┐
+ rocky run ────►│ --shadow            │──────────►│ <table><suffix>      │
+                │ --shadow-suffix     │           └──────────┬───────────┘
+                └─────────────────────┘                      │
+                                                             │ compares
+                                                             │ row count
+                                                             │ + schema
+                ┌─────────────────────┐  reads    ┌──────────▼───────────┐
+ rocky compare ►│ --shadow-suffix     │──────────►│ <table>  (production)│
+                └─────────────────────┘           └──────────────────────┘
 ```
 
-1. **stg_orders** -- Filters cancelled orders, normalizes columns
-2. **fct_daily_orders** -- Daily order aggregation from completed orders
+`--shadow-schema` replaces the suffix instead of adding one. The table keeps its
+name and moves to the schema you name.
 
-## Project Structure
+## Type-check the models
 
-```
-compare-demo/
-  rocky.toml                     # DuckDB backend with checks enabled
-  models/
-    stg_orders.rocky             # Staging model
-    stg_orders.toml              # Sidecar config
-    fct_daily_orders.rocky       # Fact model
-    fct_daily_orders.toml        # Sidecar config
-```
-
-## The Shadow Workflow
-
-Shadow mode is a safe way to validate pipeline changes before they touch production tables. The workflow has two steps:
-
-### Step 1: Run in Shadow Mode
-
-Execute the pipeline with `--shadow`, which writes to suffixed copies of each target table instead of the production tables:
+Run this from the example directory. It needs no warehouse data.
 
 ```bash
-rocky --config engine/examples/compare-demo/rocky.toml run \
-  --shadow --shadow-suffix _shadow
+cd engine/examples/compare-demo
+rocky compile --models models/
 ```
 
-This creates tables like `stg_orders_shadow` and `fct_daily_orders_shadow` alongside the originals.
+Rocky prints:
 
-### Step 2: Compare Shadow vs Production
+```
+  ✓ stg_orders (6 columns)
+  ✓ fct_daily_orders (4 columns)
+  Compiled: 2 models, 0 errors, 0 warnings
+```
 
-Run `rocky compare` to validate the shadow tables against production:
+## Run the two shadow steps
 
 ```bash
-rocky --config engine/examples/compare-demo/rocky.toml compare \
-  --shadow-suffix _shadow
+rocky run --shadow --shadow-suffix _shadow
+rocky compare --shadow-suffix _shadow
 ```
 
-Rocky compares each table pair and reports:
-- **Row count** -- do both tables have the same number of rows?
-- **Schema match** -- do both tables have the same columns and types?
-- **Data diff** -- are there any row-level differences?
+`--shadow-suffix` defaults to `_rocky_shadow` on both commands. Leave it off if
+that name suits you. Pass the same value to both commands when you do set it.
 
-### JSON Output
+## What compare reports
 
-Use `--output json` for machine-readable results:
+`rocky compare` opens both tables in a pair, the shadow one and the production
+one. It reads two things from them.
 
-```bash
-rocky --config engine/examples/compare-demo/rocky.toml compare \
-  --shadow-suffix _shadow --output json
+- **Row count.** It reports both counts, the difference, and the percentage
+  difference.
+- **Schema.** It reports each column that differs between the two tables.
+
+It does not diff rows. `--thresholds` takes JSON and overrides three settings:
+`row_count_diff_pct_warn` (default `0.01`), `row_count_diff_pct_fail` (default
+`0.05`), and `allow_column_order_diff` (default `true`).
+
+## What this example cannot execute
+
+`rocky.toml` declares a DuckDB adapter with no `path`, so Rocky opens an
+in-memory database. That database has no `raw_orders` table and no catalog named
+`warehouse`. Two consequences follow.
+
+The pipeline is a replication pipeline, so `rocky run --shadow` discovers its
+tables from the source. It finds none and copies nothing:
+
+```
+Copied 0 tables in 0.1s (run_id: run-20260816-144334-637)
 ```
 
-## Use Cases
+`rocky compare` enumerates the same discovered tables, so it compares nothing:
 
-- **Testing model changes** -- modify a `.rocky` file, run in shadow mode, compare to verify the change produces expected results
-- **Migration validation** -- when migrating from dbt to Rocky, run both and compare output tables
-- **Branch deployments** -- in Dagster branch deploys, use the branch name as the shadow suffix to isolate changes
+```
+  Rocky Compare
 
-## Flags Reference
+  Tables: 0 compared, 0 passed, 0 warned, 0 failed
+  Overall: PASS
+```
 
-| Flag | Description |
-|------|-------------|
-| `--shadow` | Write to shadow tables instead of production |
-| `--shadow-suffix <suffix>` | Suffix appended to target table names (e.g., `_shadow`, `_branch_123`) |
-| `--output json` | Machine-readable comparison results |
+To see real table pairs, give the adapter a catalog that exists, then create
+schemas named `raw__<source>` inside it. `raw__` is the pipeline's
+`schema_pattern` prefix. Discovery lists schemas by that prefix and returns the
+tables inside each one, so a table called `raw_orders` never enters the
+comparison.
+
+The two models are a separate matter. `rocky run --shadow --models models/`
+compiles them and writes `stg_orders_shadow` and `fct_daily_orders_shadow`.
+`rocky compare` still ignores them: this pipeline is a replication pipeline, so
+compare takes its targets from source discovery. Only a transformation pipeline
+reads compare targets off its models.
+
+## Flags
+
+| Flag | Command | Description |
+|------|---------|-------------|
+| `--shadow` | `run` | Write to shadow targets instead of production |
+| `--shadow-suffix <s>` | `run`, `compare` | Suffix appended to the table name (default `_rocky_shadow`) |
+| `--shadow-schema <s>` | `run`, `compare` | Write shadow tables to this schema instead of adding a suffix |
+| `--models <dir>` | `run` | Models directory for transformation execution |
+| `--all` | `run` | Execute both replication and compiled models |
+| `--thresholds <json>` | `compare` | Comparison thresholds, for example `'{"row_count_diff_pct_fail": 0.05}'` |
+| `--pipeline <name>` | `run`, `compare` | Select a pipeline when the config declares more than one |
+| `--filter <key>=<value>` | `run`, `compare` | Restrict the run to sources whose parsed component matches |
+| `--output json` | `run`, `compare` | Emit `RunOutput` / `CompareOutput` instead of the text report |
+
+`rocky run --branch <name>` is the branch equivalent. It behaves like
+`--shadow --shadow-schema <prefix>`, and it conflicts with `--shadow` and
+`--shadow-schema`.

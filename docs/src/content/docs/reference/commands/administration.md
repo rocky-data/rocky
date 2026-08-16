@@ -1237,17 +1237,42 @@ rocky retention-status [--model NAME] [--drift]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--model <NAME>` | `string` | | Scope the report to a single model by name. |
-| `--drift` | `bool` | `false` | **v2 stretch, deferred.** v1 filters output to models with a declared policy and leaves `warehouse_days` `null`. In v2, Rocky will probe the warehouse via `SHOW TBLPROPERTIES` (Databricks) / `SHOW PARAMETERS ... FOR TABLE` (Snowflake) and populate `warehouse_days`. The JSON schema is already stable so v2 fills the field without a shape break. Text output prints a `note: --drift probe is deferred to v2` on stderr. |
+| `--drift` | `bool` | `false` | Keep only the models that declare a policy, and probe the warehouse for the value it currently applies. |
 | `--models <PATH>` | `string` | `models` | Models directory. |
 
 ### Behavior
 
 - Compiles the project so each model's resolved `retention` sidecar value surfaces as a typed `Option<RetentionPolicy>`.
 - `configured_days` is `None` when the model's sidecar carries no `retention` key.
-- `warehouse_days` is always `None` in v1 (the probe is deferred).
-- `in_sync` is `true` iff `configured_days == warehouse_days`. In v1, unconfigured models collapse to `in_sync = true` (both sides are `None`).
-- Currently applied only by Databricks (Delta `delta.logRetentionDuration` + `delta.deletedFileRetentionDuration`) and Snowflake (`DATA_RETENTION_TIME_IN_DAYS`). BigQuery and DuckDB are default-unsupported.
+- `warehouse_days` is `None` unless `--drift` probed a warehouse that reports a value.
+- `in_sync` is `true` iff `configured_days == warehouse_days`. Without `--drift`, unconfigured models collapse to `in_sync = true` (both sides are `None`).
+- The `--drift` probe reads Delta `delta.logRetentionDuration` + `delta.deletedFileRetentionDuration` on Databricks, and `DATA_RETENTION_TIME_IN_DAYS` on Snowflake. BigQuery and DuckDB have no probe and report `warehouse_days = null`.
+- A probe failure prints a warning on stderr naming the model and its adapter. The command continues with `warehouse_days = null` rather than aborting.
 - JSON output is `RetentionStatusOutput` (a flat `models` array of `ModelRetentionStatus`).
+
+### A selector that matches nothing fails
+
+`rocky retention-status --model <NAME>` exits `1` when no model carries that name. Stderr reads `model '<NAME>' not found (no transformation model with that name)`. Rocky refuses before it writes any output, so stdout stays empty even under `--output json`.
+
+`--drift` keeps only the models that declare a policy, so it can legitimately return nothing. That case exits `0` and the payload gains a `message` field explaining the empty result. The field is absent whenever `models` is non-empty.
+
+| Situation | `message` |
+|---|---|
+| `--drift --model <NAME>`, and that model declares no policy | `model '<NAME>' declares no retention policy` |
+| `--drift` with no model selected, and none declares a policy | `no models declare a retention policy` |
+
+```json
+{
+  "version": "1.70.1",
+  "command": "retention-status",
+  "models": [],
+  "message": "no models declare a retention policy"
+}
+```
+
+:::caution[This is a behavior change]
+Earlier engine versions exited `0` for an unknown `--model` and returned an empty `models` array. A misspelled or renamed model therefore looked like a project with nothing to report. A CI job that treated the empty array as a pass now fails on a bad selector. `rocky test` and `rocky estimate` gained the same refusal.
+:::
 
 ### Example
 

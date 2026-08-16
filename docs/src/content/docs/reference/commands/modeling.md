@@ -661,6 +661,23 @@ Each `results` entry carries the model name, the `[[test]]` block's `test` name,
 
 `--declarative` is a separate surface: it adds a `declarative` block summarising `[[tests]]` (plural) declared in model sidecars, run against the configured warehouse adapter rather than DuckDB. See [Testing and Contracts](/concepts/testing/) for both surfaces.
 
+### A selector that matches nothing fails
+
+`rocky test` exits `1` when a selector names something the project does not have. This holds with and without `--declarative`.
+
+| What you passed | Message on stderr |
+|---|---|
+| `--model <NAME>` naming no model in the project | `model '<NAME>' not found (no transformation model with that name)` |
+| `--models <PATH>` naming a missing or empty directory | `no models found in <PATH>` |
+
+Rocky refuses before it writes any output. Under `--output json` stdout stays empty, so read the exit code and stderr rather than the payload.
+
+A model that exists but declares no tests is not an error. It still exits `0` and reports `total: 0`.
+
+:::caution[This is a behavior change]
+Earlier engine versions exited `0` in both rows above. A misspelled or renamed `--model` reported `total: 0` and passed, which looks the same as a real model with no tests. `rocky test --declarative` accepted a models directory that does not exist. A CI job that relied on either no-op now fails. Correct the selector, or remove it to test every model.
+:::
+
 ### Related Commands
 
 - [`rocky compile`](#rocky-compile) -- compile models before testing

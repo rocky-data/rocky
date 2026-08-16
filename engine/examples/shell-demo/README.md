@@ -1,103 +1,130 @@
-# Shell Demo
+# Shell demo
 
-Demonstrates `rocky shell` -- an interactive SQL REPL that connects to the configured warehouse adapter. No models are needed; the shell connects directly to the database.
+This example shows `rocky shell`, an interactive SQL prompt. The shell sends
+each statement straight to a warehouse adapter and prints the result. It does
+not compile models, so this example needs no `models/` directory.
 
-## Running
+The shell runs whatever you type, including `INSERT`, `CREATE`, and `DROP`.
+
+## Which adapter the shell connects to
+
+Rocky picks the adapter in this order.
+
+1. The pipeline named by `--pipeline`, using that pipeline's target adapter.
+2. The only pipeline in the config, using its target adapter.
+3. The only warehouse adapter in the config.
+
+If several adapters are configured and none of the rules above resolve, Rocky
+stops and asks for `--pipeline`.
+
+## Start it
 
 ```bash
-rocky --config engine/examples/shell-demo/rocky.toml shell
+cd engine/examples/shell-demo
+rocky shell
 ```
 
-You'll see a prompt like:
+```
+Connecting... ok
+
+Rocky Shell (adapter: duckdb, name: local)
+Type SQL to execute. Special commands:
+  .tables              List tables in a schema (.tables catalog.schema)
+  .schema <table>      Describe a table's columns
+  .quit / .exit        Exit the shell
+  Lines ending with \ continue on the next line.
+
+rocky>
+```
+
+`rocky.toml` declares a DuckDB adapter with no `path`, so this session runs
+against an in-memory database. Nothing you create survives the process.
+
+## A session
+
+Every transcript below is DuckDB output. Result shapes differ by warehouse.
 
 ```
-rocky> 
-```
-
-## Example Session
-
-```sql
 rocky> SELECT 1 + 1 AS result;
-+--------+
-| result |
-+--------+
-| 2      |
-+--------+
+ result
+--------
+ 2
+(1 rows)
 
 rocky> CREATE TABLE demo (id INTEGER, name VARCHAR, value DOUBLE);
+(0 rows)
 
 rocky> INSERT INTO demo VALUES (1, 'alpha', 10.5), (2, 'beta', 20.3), (3, 'gamma', 30.1);
+ Count
+-------
+ 3
+(1 rows)
 
 rocky> SELECT name, value FROM demo WHERE value > 15 ORDER BY value DESC;
-+-------+-------+
-| name  | value |
-+-------+-------+
-| gamma | 30.1  |
-| beta  | 20.3  |
-+-------+-------+
-
-rocky> SELECT COUNT(*) AS total, AVG(value) AS avg_value FROM demo;
-+-------+-----------+
-| total | avg_value |
-+-------+-----------+
-| 3     | 20.3      |
-+-------+-----------+
+ name  | value
+-------+-------
+ gamma | 30.1
+ beta  | 20.3
+(2 rows)
 ```
 
-## Meta-Commands
+Rocky strips a trailing semicolon before it sends the statement, so the
+semicolon is optional.
 
-The shell supports special dot-prefixed commands:
+## Dot-commands
 
-| Command | Description |
-|---------|-------------|
-| `.tables` | List all tables in the current database |
-| `.schema <table>` | Show the column definitions for a table |
-| `.quit` | Exit the shell (also: `Ctrl+D`) |
+| Command | What it runs |
+|---------|--------------|
+| `.tables` | `SHOW TABLES` |
+| `.tables <catalog>.<schema>` | `SHOW TABLES IN <catalog>.<schema>` |
+| `.schema <table>` | `DESCRIBE TABLE <table>` |
+| `.quit` or `.exit` | Leaves the shell |
 
-### Example
+Each one is a shortcut for the SQL beside it, so the result columns come from
+your warehouse:
 
 ```
 rocky> .tables
-+--------+
-| name   |
-+--------+
-| demo   |
-+--------+
+ name
+------
+ demo
+(1 rows)
 
 rocky> .schema demo
-+---------+---------+
-| column  | type    |
-+---------+---------+
-| id      | INTEGER |
-| name    | VARCHAR |
-| value   | DOUBLE  |
-+---------+---------+
-
-rocky> .quit
+ column_name | column_type | null | key  | default | extra
+-------------+-------------+------+------+---------+-------
+ id          | INTEGER     | YES  | NULL | NULL    | NULL
+ name        | VARCHAR     | YES  | NULL | NULL    | NULL
+ value       | DOUBLE      | YES  | NULL | NULL    | NULL
+(3 rows)
 ```
 
-## Multi-Line Queries
+Ctrl-D also exits. Both routes print `Bye.` and leave with status 0.
 
-The shell supports multi-line SQL. A statement is executed when it ends with a semicolon:
+## Continue a statement across lines
 
-```sql
-rocky> SELECT
-   ...>   name,
-   ...>   value,
-   ...>   value / (SELECT SUM(value) FROM demo) AS pct_of_total
-   ...> FROM demo
-   ...> ORDER BY value DESC;
+End a line with a backslash. Only a backslash continues a statement. Leaving
+off the semicolon does not.
+
+```
+rocky> SELECT name, \
+   ... value \
+   ... FROM demo ORDER BY value DESC;
+ name  | value
+-------+-------
+ gamma | 30.1
+ beta  | 20.3
+ alpha | 10.5
+(3 rows)
 ```
 
-The continuation prompt (`...>`) indicates the shell is waiting for more input.
+The `   ... ` prompt means Rocky is waiting for the rest of the statement.
 
-## Use Cases
+## What the shell is useful for
 
-- **Ad-hoc exploration** -- query source or target tables during development
-- **Debugging** -- inspect table contents after a `rocky run` to verify results
-- **Quick prototyping** -- test SQL snippets before adding them to a model
-- **Schema inspection** -- use `.tables` and `.schema` to understand the database layout
+- Look at a table while you are writing the model that reads it.
+- Try a SQL snippet before you paste it into a `.sql` model.
+- Use `.tables` and `.schema` to learn an unfamiliar database.
 
-## Adapter Compatibility
-
-The shell works with any configured adapter. When connected to DuckDB (as in this demo), queries execute locally with no external credentials. When connected to Databricks or Snowflake, queries execute against the remote warehouse.
+Point the config at a file-backed DuckDB or a remote warehouse when you want
+the results of a `rocky run` to still be there.

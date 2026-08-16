@@ -902,14 +902,29 @@ rocky retention-status [--model NAME] [--drift]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--model <NAME>` | (all) | Scope the report to a single model. |
-| `--drift` | `false` | Stretch goal reserved for v2; today this filters output to models with a declared policy and leaves `warehouse_days` null. The warehouse probe (`SHOW TBLPROPERTIES` / `SHOW PARAMETERS`) is deferred. |
+| `--drift` | `false` | Keep only the models that declare a policy, and probe the warehouse for the value it currently applies. |
 | `--models <PATH>` | `models` (via `rocky.toml`) | Models directory. |
 
 **Behavior:**
 
-- Compiles the project, then emits one `ModelRetentionStatus` per model with `configured_days`, `warehouse_days` (always `None` in v1), and `in_sync`.
+- Compiles the project, then emits one `ModelRetentionStatus` per model with `configured_days`, `warehouse_days`, and `in_sync`.
 - Models without a `retention` sidecar value report `configured_days = null` and `in_sync = true`.
+- `--drift` probes the warehouse through the governance adapter. Databricks reads the Delta table properties; Snowflake reads `DATA_RETENTION_TIME_IN_DAYS`. BigQuery and DuckDB have no probe, so they report `warehouse_days = null`.
+- A probe failure prints a warning on stderr for that model and leaves `warehouse_days` null. It does not fail the command.
 - JSON output is [`RetentionStatusOutput`](/reference/json-output/).
+
+**An unknown `--model` fails.** `rocky retention-status --model <NAME>` exits `1` when no model carries that name. Stderr reads `model '<NAME>' not found (no transformation model with that name)`, and stdout stays empty even under `--output json`.
+
+**An empty `--drift` result says why it is empty.** `--drift` keeps only the models that declare a policy, so it can legitimately return nothing. That case exits `0` and the JSON payload gains a `message` field, absent whenever `models` is non-empty.
+
+| Situation | `message` |
+|---|---|
+| `--drift --model <NAME>`, and that model declares no policy | `model '<NAME>' declares no retention policy` |
+| `--drift` with no model selected, and none declares a policy | `no models declare a retention policy` |
+
+:::caution[This is a behavior change]
+Earlier engine versions exited `0` for an unknown `--model` and returned an empty `models` array. A CI job that treated the empty array as a pass now fails on a bad selector.
+:::
 
 ---
 
@@ -1052,6 +1067,19 @@ rocky estimate --verbose          # Show the full EXPLAIN plan and pricing rates
 | `--verbose` | `false` | Print extra context per model: the full `EXPLAIN` plan, the pricing rates used, and any models skipped before `EXPLAIN`. |
 
 **Where the prices come from.** Rocky carries one built-in rate table per adapter type: Databricks, Snowflake, BigQuery, and DuckDB. It picks the table matching the pipeline's target adapter. An unrecognized adapter type falls back to the Databricks rates, and `--verbose` labels that as a fallback. `rocky estimate` does not read the [`[cost]`](/reference/configuration/#cost) block, so editing those keys does not move these numbers. For a recommendation rather than an estimate, use `rocky optimize`.
+
+**An unknown `--model` fails.** `rocky estimate --model <NAME>` exits `1` when no model carries that name. Stderr reads `model '<NAME>' not found (no transformation model with that name)`, and stdout stays empty even under `--output json`.
+
+**An empty result says why it is empty.** A run that produces no estimate still exits `0`. Its JSON payload gains a `message` field, absent whenever `estimates` is non-empty.
+
+| Situation | `message` |
+|---|---|
+| The project has no models to estimate | `no models found to estimate` |
+| Models were selected, but SQL generation or `EXPLAIN` failed for every one | `no model produced an estimate` |
+
+:::caution[This is a behavior change]
+Earlier engine versions exited `0` for an unknown `--model` and returned an empty `estimates` array. They also emitted that bare array with no `message`, so text output said `No models found.` while JSON output said nothing. A CI job that treated the empty array as a pass now fails on a bad selector.
+:::
 
 ---
 
