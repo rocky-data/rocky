@@ -133,7 +133,7 @@ pub struct ModelConfig {
     #[serde(default)]
     pub adapter: Option<String>,
     /// Natural language description of what this model does.
-    /// Used by `rocky ai sync` to propose updates when upstream schemas change.
+    /// Used by `rocky ai-sync` to propose updates when upstream schemas change.
     #[serde(default)]
     pub intent: Option<String>,
     /// Per-model freshness expectation. Declarative-only — the compiler does

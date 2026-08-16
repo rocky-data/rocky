@@ -268,7 +268,7 @@ pub async fn run_ai(
     Ok(())
 }
 
-/// Execute `rocky ai sync` — detect schema changes and propose intent-guided updates.
+/// Execute `rocky ai-sync` — detect schema changes and propose intent-guided updates.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ai_sync(
     config_path: &Path,
@@ -311,7 +311,7 @@ pub async fn run_ai_sync(
             print_json(&output)?;
         } else {
             println!(
-                "No models with intent found. Use `rocky ai explain --save` to add intent to models."
+                "No models with intent found. Use `rocky ai-explain --save` to add intent to models."
             );
         }
         return Ok(());
@@ -410,7 +410,7 @@ pub async fn run_ai_sync(
     Ok(())
 }
 
-/// Execute `rocky ai explain` — generate intent descriptions from code.
+/// Execute `rocky ai-explain` — generate intent descriptions from code.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ai_explain(
     config_path: &Path,
@@ -480,7 +480,7 @@ pub async fn run_ai_explain(
     Ok(())
 }
 
-/// Execute `rocky ai test` — generate test assertions from intent.
+/// Execute `rocky ai-test` — generate test assertions from intent.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ai_test(
     config_path: &Path,

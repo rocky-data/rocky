@@ -2595,7 +2595,7 @@ pub struct AiGenerateOutput {
     pub sidecar_path: Option<String>,
 }
 
-/// JSON output for `rocky ai sync`.
+/// JSON output for `rocky ai-sync`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AiSyncOutput {
     pub version: String,
@@ -2611,7 +2611,7 @@ pub struct AiSyncProposal {
     pub proposed_source: String,
 }
 
-/// JSON output for `rocky ai explain`.
+/// JSON output for `rocky ai-explain`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AiExplainOutput {
     pub version: String,
@@ -2626,7 +2626,7 @@ pub struct AiExplanation {
     pub saved: bool,
 }
 
-/// JSON output for `rocky ai test`.
+/// JSON output for `rocky ai-test`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AiTestOutput {
     pub version: String,
