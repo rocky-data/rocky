@@ -258,6 +258,14 @@ pub async fn run_watch(
 struct IterOutcome {
     /// Fingerprint of the config snapshot this iteration loaded; `None` when
     /// the load itself failed.
+    ///
+    /// Read only by the per-iteration-reload test — production callers act on
+    /// `interrupted` alone. It was previously `iter_once`'s return value, where
+    /// an ignored result is not dead code; as a struct field an unread one is,
+    /// so a non-test build trips `-D dead-code` without this. Kept rather than
+    /// dropped because the reload contract it pins (`iter_once` never hoists
+    /// the config load above the loop) is worth an executable assertion.
+    #[allow(dead_code)]
     fingerprint: Option<String>,
     /// The inner run was interrupted by SIGINT — the watcher must stop.
     interrupted: bool,
