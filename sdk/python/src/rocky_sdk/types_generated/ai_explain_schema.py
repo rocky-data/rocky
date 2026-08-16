@@ -14,7 +14,7 @@ class AiExplanation(BaseModel):
 
 class AiExplainOutput(BaseModel):
     """
-    JSON output for `rocky ai explain`.
+    JSON output for `rocky ai-explain`.
     """
 
     command: str

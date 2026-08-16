@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rocky import-dbt` no longer ends with a command the CLI rejects.** Its Next Steps block printed `rocky ai explain --all --save`, which does not parse — `rocky ai` takes a positional `INTENT`, so `explain` is consumed as the intent and the flags are refused with `error: unexpected argument '--all' found`. The real subcommand is `rocky ai-explain`. The same invalid spelling appeared in a second user-facing hint and in four doc comments, three of which publish as JSON-schema descriptions for the `ai_*` outputs.
+
+  The step is now also **gated**. `ai-explain --all` selects only models whose `intent` is unset, but the recommendation was emitted unconditionally — and the dbt importer seeds `intent` from dbt YAML `description` fields. Importing a documented project therefore produced a next step that, even spelled correctly, prints `No models to explain.` It is now offered only when an imported model actually lacks an intent, matching the predicate the command itself filters on. (#1443)
+
 ### Removed
 
 - **The `drift` JSON schema no longer ships for a command that does not exist.** `schemas/drift.schema.json` and its generated Pydantic/TypeScript bindings described the output of `rocky drift` — a subcommand the binary rejects with `unrecognized subcommand 'drift'`. Drift detection has always run inside `rocky run` / `rocky plan` and is surfaced on `RunOutput.drift`; there was never a command that could emit the standalone envelope. Downstream consumers importing the generated `DriftOutput` type will need to drop it. `DriftSummary` and `DriftActionOutput` are unaffected and now generate from the run schema, which is where drift is actually emitted. (#1431)

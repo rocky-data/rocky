@@ -45,7 +45,7 @@
       "type": "object"
     }
   },
-  "description": "JSON output for `rocky ai test`.",
+  "description": "JSON output for `rocky ai-test`.",
   "properties": {
     "command": {
       "type": "string"

@@ -495,7 +495,7 @@
         "type": "object"
       },
       "AiExplainOutput": {
-        "description": "JSON output for `rocky ai explain`.",
+        "description": "JSON output for `rocky ai-explain`.",
         "properties": {
           "command": {
             "type": "string"
@@ -603,7 +603,7 @@
         "type": "object"
       },
       "AiSyncOutput": {
-        "description": "JSON output for `rocky ai sync`.",
+        "description": "JSON output for `rocky ai-sync`.",
         "properties": {
           "command": {
             "type": "string"
@@ -692,7 +692,7 @@
         "type": "object"
       },
       "AiTestOutput": {
-        "description": "JSON output for `rocky ai test`.",
+        "description": "JSON output for `rocky ai-test`.",
         "properties": {
           "command": {
             "type": "string"

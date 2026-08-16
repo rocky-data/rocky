@@ -6,7 +6,7 @@
  */
 
 /**
- * JSON output for `rocky ai sync`.
+ * JSON output for `rocky ai-sync`.
  */
 export interface AiSyncOutput {
   command: string;

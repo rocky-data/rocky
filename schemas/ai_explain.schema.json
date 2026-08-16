@@ -21,7 +21,7 @@
       "type": "object"
     }
   },
-  "description": "JSON output for `rocky ai explain`.",
+  "description": "JSON output for `rocky ai-explain`.",
   "properties": {
     "command": {
       "type": "string"
