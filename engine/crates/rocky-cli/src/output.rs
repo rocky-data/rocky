@@ -1637,14 +1637,6 @@ pub struct RetentionAction {
     pub warehouse_preview: Option<String>,
 }
 
-/// JSON output for `rocky drift`.
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct DriftOutput {
-    pub version: String,
-    pub command: String,
-    pub drift: DriftSummary,
-}
-
 /// JSON output for `rocky compile`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CompileOutput {

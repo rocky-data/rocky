@@ -1194,8 +1194,10 @@ class StateHealthResult(BaseModel):
 # ``DriftDetectResult`` / ``DriftTableResult`` / ``DriftedColumn`` /
 # ``DriftActionKind`` shadows (and their ``"drift"`` dispatch entry) were
 # removed — the engine never emitted a ``{command:"drift", ...}`` payload for
-# them to parse. The generated ``drift_schema`` types stay (inert) for the
-# ``DriftOutput`` shape referenced by other outputs.
+# them to parse. The generated ``DriftOutput`` envelope and its ``drift_schema``
+# module are gone too (see #1431): they described a command that never existed.
+# ``DriftSummary`` / ``DriftActionOutput`` survive, re-homed onto ``run_schema``,
+# because that is where drift is actually emitted.
 
 
 # ---------------------------------------------------------------------------
@@ -1265,7 +1267,6 @@ from .types_generated import (  # noqa: E402, F401
     DiscoverOutput,
     DoctorOutput,
     DriftActionOutput,
-    DriftOutput,
     DriftSummary,
     EdgeConfidence,
     EnvMaskingStatus,

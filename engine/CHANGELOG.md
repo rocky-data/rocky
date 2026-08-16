@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **The `drift` JSON schema no longer ships for a command that does not exist.** `schemas/drift.schema.json` and its generated Pydantic/TypeScript bindings described the output of `rocky drift` — a subcommand the binary rejects with `unrecognized subcommand 'drift'`. Drift detection has always run inside `rocky run` / `rocky plan` and is surfaced on `RunOutput.drift`; there was never a command that could emit the standalone envelope. Downstream consumers importing the generated `DriftOutput` type will need to drop it. `DriftSummary` and `DriftActionOutput` are unaffected and now generate from the run schema, which is where drift is actually emitted. (#1431)
+
 ### Fixed
 
 - **`rocky test`, `rocky estimate` and `rocky retention-status` no longer report success for a selector that matched nothing.** `rocky test --declarative` accepted a models directory that does not exist — reporting `total: 0` and exiting 0 — while the same command *without* `--declarative` compiled the project and failed with `no models found in <dir>`. One command, one flag apart, two answers to the same question. That path now refuses a missing or empty models directory, matching its sibling.

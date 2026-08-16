@@ -6588,26 +6588,6 @@
         ],
         "type": "object"
       },
-      "DriftOutput": {
-        "description": "JSON output for `rocky drift`.",
-        "properties": {
-          "command": {
-            "type": "string"
-          },
-          "drift": {
-            "$ref": "#/components/schemas/DriftSummary"
-          },
-          "version": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "command",
-          "drift",
-          "version"
-        ],
-        "type": "object"
-      },
       "DriftSummary": {
         "properties": {
           "actions_taken": {

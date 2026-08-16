@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **`DriftOutput` is no longer exported.** It modelled the output of a `rocky drift` command that does not exist, so nothing could ever produce a payload for it to parse. `DriftSummary` and `DriftActionOutput` remain available and are unchanged — drift is reported on `RunResult.drift`. (#1431)
+
 ## [0.11.0] — 2026-08-11
 
 ### Added

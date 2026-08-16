@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- **Dropped the lineage drift overlay, which never rendered.** It shelled out to `rocky drift`, a command the CLI does not have, and caught the resulting error into an empty result — so the overlay reported "no drift" to every user, in every project, for its entire lifetime. No webview requested it. Drift continues to be reported by the drift diagnostics provider, which is unaffected. (#1431)
+
 ## [1.37.1] — 2026-08-11
 
 ### Fixed

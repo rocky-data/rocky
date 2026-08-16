@@ -97,8 +97,9 @@ export type {
 // Doctor
 export type { DoctorOutput, HealthCheck, HealthStatus } from "./doctor";
 
-// Drift (canonical source for DriftSummary, DriftActionOutput)
-export type { DriftOutput, DriftSummary, DriftActionOutput } from "./drift";
+// Drift — surfaced on `RunOutput.drift`. There is no `rocky drift` command,
+// so these come from the run schema, which is where they are actually emitted.
+export type { DriftSummary, DriftActionOutput } from "./run";
 
 // History (all runs)
 export type { HistoryOutput, RunHistoryRecord, RunModelRecord } from "./history";

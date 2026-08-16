@@ -164,9 +164,8 @@ _LAZY: dict[str, tuple[str, str]] = {
     "DiffSummary": ("ci_diff_schema", "DiffSummary"),
     "DiscoverOutput": ("discover_schema", "DiscoverOutput"),
     "DoctorOutput": ("doctor_schema", "DoctorOutput"),
-    "DriftActionOutput": ("drift_schema", "DriftActionOutput"),
-    "DriftOutput": ("drift_schema", "DriftOutput"),
-    "DriftSummary": ("drift_schema", "DriftSummary"),
+    "DriftActionOutput": ("run_schema", "DriftActionOutput"),
+    "DriftSummary": ("run_schema", "DriftSummary"),
     "EdgeConfidence": ("catalog_schema", "EdgeConfidence"),
     "EncodingRecommendationOutput": ("profile_storage_schema", "EncodingRecommendationOutput"),
     "EnvMaskingStatus": ("compliance_schema", "EnvMaskingStatus"),
@@ -414,11 +413,6 @@ if TYPE_CHECKING:
         HealthCheck,
         HealthStatus,
     )
-    from .drift_schema import (
-        DriftActionOutput,
-        DriftOutput,
-        DriftSummary,
-    )
     from .history_schema import (
         HistoryOutput,
         RunHistoryRecord,
@@ -460,6 +454,8 @@ if TYPE_CHECKING:
         AnomalyOutput,
         BudgetBreachOutput,
         ContainedModelOutput,
+        DriftActionOutput,
+        DriftSummary,
         ExcludedTableOutput,
         ExecutionSummary,
         MaterializationMetadata,
@@ -809,7 +805,6 @@ __all__ = [
     "DoctorOutput",
     "HealthCheck",
     "HealthStatus",
-    "DriftOutput",
     "DriftSummary",
     "DriftActionOutput",
     "HistoryOutput",

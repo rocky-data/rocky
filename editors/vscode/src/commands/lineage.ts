@@ -12,12 +12,10 @@ import type { CatalogOutput } from "../types/generated/catalog";
 import type { CiDiffOutput } from "../types/generated/ci_diff";
 import type { CompileOutput, ModelDetail } from "../types/generated/compile";
 import type { ComplianceOutput } from "../types/generated/compliance";
-import type { DriftOutput } from "../types/generated/drift";
 import type { ReplayOutput } from "../types/generated/replay";
 import type {
   AiActionParam,
   BreakingData,
-  DriftData,
   GovernanceData,
   GraphData,
   GraphEdge,
@@ -88,28 +86,6 @@ export async function openModelFile(model: string): Promise<void> {
   );
   if (matches[0]) {
     void vscode.commands.executeCommand("vscode.open", matches[0]);
-  }
-}
-
-/** Run `rocky drift` for the drift overlay; degrades gracefully when unavailable. */
-export async function loadDrift(): Promise<DriftData> {
-  try {
-    const out = await runRockyJson<DriftOutput>(["drift", "--output", "json"], {
-      cwd: resolveProjectRoot(),
-    });
-    return {
-      actions: out.drift.actions_taken.map((a) => ({
-        table: a.table,
-        action: a.action,
-        reason: a.reason,
-      })),
-    };
-  } catch (err) {
-    const unavailable =
-      err instanceof RockyCliError
-        ? err.stderr.trim() || err.message
-        : String(err);
-    return { actions: [], unavailable };
   }
 }
 
