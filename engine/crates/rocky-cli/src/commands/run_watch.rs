@@ -44,9 +44,11 @@ const EVENT_CHANNEL_CAP: usize = 64;
 /// On first call the watcher seeds with one immediate run; thereafter every
 /// change to a watched path triggers a debounced re-run. Errors from the
 /// inner `run` are logged and the loop continues — only adapter-init /
-/// config-parse errors at startup exit non-zero. SIGINT during a run is
-/// handled by the inner run path (returns [`Interrupted`]); SIGINT between
-/// runs exits the watch loop with status 0.
+/// config-parse errors at startup exit non-zero. A single SIGINT always exits
+/// the watch loop with status 0, whether it lands between runs (caught by the
+/// loop's own `ctrl_c` arm) or during one (consumed by the inner run, which
+/// reports it back as [`IterOutcome::interrupted`]). Requiring a second signal
+/// in the second case was #1405.
 ///
 /// # Arguments
 ///
@@ -168,8 +170,9 @@ pub async fn run_watch(
     eprintln!("[watch] watching {} (Ctrl-C to stop)", watched.join(", "));
 
     // First run is immediate so the user gets feedback without having to
-    // touch a file.
-    iter_once(
+    // touch a file. A Ctrl-C during it stops the watcher: the signal was the
+    // user's, and the inner run consumed it (#1405).
+    if iter_once(
         config_path,
         filter,
         pipeline_name_arg,
@@ -184,7 +187,12 @@ pub async fn run_watch(
         env,
         skip_opts,
     )
-    .await;
+    .await
+    .interrupted
+    {
+        eprintln!("\n[watch] stopped");
+        return Ok(());
+    }
 
     // Steady-state loop: wait for an event, debounce, drain, re-run.
     loop {
@@ -216,7 +224,7 @@ pub async fn run_watch(
                     .unwrap_or_default();
                 eprintln!("[watch] detected change: {display}");
 
-                iter_once(
+                if iter_once(
                     config_path,
                     filter,
                     pipeline_name_arg,
@@ -231,10 +239,28 @@ pub async fn run_watch(
                     env,
                     skip_opts,
                 )
-                .await;
+                .await
+                .interrupted
+                {
+                    eprintln!("\n[watch] stopped");
+                    return Ok(());
+                }
             }
         }
     }
+}
+
+/// What one watch iteration observed.
+///
+/// `interrupted` exists because a swallowed SIGINT is indistinguishable from a
+/// completed run at the call site, and the watcher has to tell them apart to
+/// honour a single Ctrl-C (#1405).
+struct IterOutcome {
+    /// Fingerprint of the config snapshot this iteration loaded; `None` when
+    /// the load itself failed.
+    fingerprint: Option<String>,
+    /// The inner run was interrupted by SIGINT — the watcher must stop.
+    interrupted: bool,
 }
 
 /// Run one iteration of the watch loop. Errors are logged but never
@@ -242,13 +268,17 @@ pub async fn run_watch(
 /// developer can fix the broken model and re-save without restarting
 /// the watcher.
 ///
-/// `Interrupted` (inner SIGINT) is treated like any other run error here;
-/// the outer loop's own `ctrl_c` arm will pick up a *second* SIGINT to
-/// exit the watcher itself.
+/// `Interrupted` (inner SIGINT) is the one error that DOES stop the watcher:
+/// it is reported on [`IterOutcome::interrupted`] so the caller can exit.
+/// Previously it was logged like any other run failure and the loop went back
+/// to waiting, which meant a Ctrl-C landing *during* a run was consumed by the
+/// inner run and the watcher sat there until a second one arrived. Whether one
+/// SIGINT sufficed therefore depended on whether a run happened to be in
+/// flight — the race behind the intermittent shutdown hang in #1405.
 ///
 /// Returns the fingerprint of the config snapshot this iteration loaded
 /// (`None` when the load failed), so the per-iteration-reload contract is
-/// directly testable. Production callers ignore it.
+/// directly testable, alongside whether the run was interrupted.
 #[allow(clippy::too_many_arguments)]
 async fn iter_once(
     config_path: &Path,
@@ -264,7 +294,7 @@ async fn iter_once(
     cache_ttl_override: Option<u64>,
     env: Option<&str>,
     skip_opts: &super::run::SkipRunOptions,
-) -> Option<String> {
+) -> IterOutcome {
     let started = std::time::Instant::now();
     // Load the config FRESH for THIS iteration — deliberately NEVER hoisted
     // above the watch loop into a single load (#1120 threads ONE snapshot per
@@ -283,7 +313,10 @@ async fn iter_once(
                 config_path.display()
             ));
             eprintln!("[watch] run failed in {elapsed_ms}ms: {e:#}");
-            return None;
+            return IterOutcome {
+                fingerprint: None,
+                interrupted: false,
+            };
         }
     };
     let fingerprint = loaded.fingerprint.clone();
@@ -324,20 +357,25 @@ async fn iter_once(
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();
+    let mut interrupted = false;
     match result {
         Ok(()) => {
             eprintln!("[watch] run completed in {elapsed_ms}ms");
         }
         Err(e) if e.is::<Interrupted>() => {
-            // Inner run was interrupted. The next ctrl_c arm in the outer
-            // loop catches a second SIGINT for the watcher itself.
+            // The user pressed Ctrl-C while this run was executing. Report it
+            // so the watcher stops now rather than waiting for a second one.
             eprintln!("[watch] run interrupted in {elapsed_ms}ms");
+            interrupted = true;
         }
         Err(e) => {
             eprintln!("[watch] run failed in {elapsed_ms}ms: {e:#}");
         }
     }
-    Some(fingerprint)
+    IterOutcome {
+        fingerprint: Some(fingerprint),
+        interrupted,
+    }
 }
 
 /// Filter incoming filesystem events against the watcher's relevant set.
@@ -534,6 +572,7 @@ mod tests {
             &super::super::run::SkipRunOptions::default(),
         )
         .await
+        .fingerprint
     }
 
     #[tokio::test]
