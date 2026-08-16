@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Dropped the lineage drift overlay and the Overview drift card, which never showed real data.** Both shelled out to `rocky drift`, a command the CLI does not have. The error was caught into an empty result, and because that result was still a value rather than a failure, the Overview card rendered **"None" with an all-clear tone** — a fabricated clean result, in every project, for its entire lifetime. The overlay likewise decorated nothing. Drift continues to be reported by the drift diagnostics provider, which is unaffected and unrelated. (#1431)
 
-  Drift is only produced during `rocky run` / `rocky plan` and is never persisted, so there is no stored source a passive view could read. Rebuilding this on a durable drift signal remains open; this removes a display that could only ever assert an all-clear.
+  Drift is reported on `RunOutput.drift` — a run only; `PlanOutput` carries no drift field. Ordinary runs do not write a durable drift history, so there is no complete stored source a passive view could read. (One partial exception: a governed additive-drift auto-apply persists an `AutoApplyCustody` record carrying a `drift_summary` string in the policy-decision ledger. That is a governance audit trail for a narrow path, not a general drift feed.) Rebuilding this on a durable signal remains open; this removes a display that could only ever assert an all-clear.
 
 ## [1.37.1] — 2026-08-11
 

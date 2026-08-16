@@ -13,7 +13,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `DriftOutput` was importable from `rocky_sdk.types` and `rocky_sdk.types_generated` in the released `sdk-v0.11.0`, so removing it breaks any code that imports the name — even though no code could obtain an instance of it. **This must ship as a minor bump (`0.12.0`), not a patch**: pre-1.0, minor is the only signal available for a breaking change, and a changelog note alone does not stop an existing resolver from picking the new version up.
 
-  `dagster-rocky` is unaffected — it references `DriftOutput` nowhere, and `import dagster_rocky.types` succeeds against this change. The break is limited to third-party code importing the name directly.
+  **The surviving types also move module.** `DriftSummary` and `DriftActionOutput` keep their field shapes and their top-level exports from `rocky_sdk.types` / `rocky_sdk.types_generated`, but in `0.11.0` the barrel resolved them from `rocky_sdk.types_generated.drift_schema`, and that module is deleted here — they now resolve from `run_schema`. Two consequences beyond the `DriftOutput` name:
+
+  - `from rocky_sdk.types_generated.drift_schema import DriftSummary` (a direct submodule import) raises `ModuleNotFoundError`.
+  - Pickles of `0.11.0` instances record `drift_schema` as the defining module, so they fail to load — including instances obtained through the top-level export.
+
+  No compatibility shim is offered, because it could not survive: `just codegen-sdk` runs `rm -rf src/rocky_sdk/types_generated` and restores only `__init__.py` from git, so a hand-written `drift_schema.py` would be deleted by the next codegen run. Import the two types from `rocky_sdk.types` instead, which is stable across this change.
+
+  `dagster-rocky` is unaffected — it references `DriftOutput` nowhere, and `import dagster_rocky.types` succeeds against this change.
 
 ## [0.11.0] — 2026-08-11
 
