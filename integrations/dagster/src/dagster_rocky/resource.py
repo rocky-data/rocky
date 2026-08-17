@@ -1242,9 +1242,13 @@ class RockyResource(dg.ConfigurableResource):
     def dag(self, *, column_lineage: bool = False, models_dir: str | None = None) -> DagResult:
         """Run ``rocky dag`` and return the full unified DAG.
 
-        ``models_dir`` defaults to ``None`` so each pipeline resolves its own
-        configured root; pass a string only to force a whole-project override
-        (see :meth:`RockyClient.dag`).
+        Defaults to ``models_dir=None``, which **opts in** to per-pipeline
+        resolution. A whole-project ``--models`` makes the engine refuse any
+        project with two transformation pipelines, so the component could not
+        build definitions at all (#1348). Pass a string to force the override.
+
+        This opt-in pairs with :meth:`run_model` passing ``pipeline=``; the two
+        must move together, or discovery and execution resolve different roots.
         """
         with _translating():
             return self._get_client().dag(column_lineage=column_lineage, models_dir=models_dir)

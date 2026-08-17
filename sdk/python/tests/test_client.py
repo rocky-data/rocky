@@ -946,16 +946,32 @@ def _run_payload() -> str:
     )
 
 
-def test_dag_omits_models_so_each_pipeline_resolves_its_own_root():
-    """``--models`` is a whole-project override, not a hint.
+def test_dag_default_is_unchanged_so_no_existing_caller_moves():
+    """Omitting ``models_dir`` must keep the previous argv byte-for-byte.
 
-    The engine assigns that one directory to *every* transformation pipeline, so
-    a project with two of them is refused outright. Sending it unconditionally
-    made such projects undiscoverable (#1348).
+    Changing the default would make discovery follow the config while
+    ``run_model()`` (without ``pipeline``) still forced ``self.models_dir`` — a
+    model discovered from one root and materialized from another, which is the
+    split #1348 warns about. Per-pipeline resolution is opt-in instead.
     """
     client = _client(models_dir="custom-models")
     with patch.object(client, "run_cli", return_value=_dag_payload([])) as run_cli:
         client.dag()
+    args = run_cli.call_args[0][0]
+    assert args == ["dag", "--models", "custom-models"], args
+
+
+def test_dag_opts_in_to_per_pipeline_resolution_with_an_explicit_none():
+    """``--models`` is a whole-project override, not a hint.
+
+    The engine assigns that one directory to *every* transformation pipeline, so
+    a project with two of them is refused outright. `None` omits it so each
+    pipeline resolves its own configured root (#1348).
+    """
+    client = _client(models_dir="custom-models")
+    client._engine_version = (1, 70, 1)
+    with patch.object(client, "run_cli", return_value=_dag_payload([])) as run_cli:
+        client.dag(models_dir=None)
     args = run_cli.call_args[0][0]
     assert args == ["dag"], args
     assert "--models" not in args
@@ -972,6 +988,7 @@ def test_dag_still_allows_an_explicit_whole_project_override():
 
 def test_run_model_scopes_to_the_pipeline_and_drops_the_override():
     client = _client(models_dir="custom-models")
+    client._engine_version = (1, 70, 1)
     with patch.object(client, "run_cli", return_value=_run_payload()) as run_cli:
         client.run_model("stg_orders", pipeline="alpha")
     args = run_cli.call_args[0][0]
@@ -1002,8 +1019,9 @@ def test_discovery_and_execution_resolve_the_same_root_for_a_discovered_node():
         {"id": "transformation:one", "kind": "transformation", "label": "one", "pipeline": "alpha"},
         {"id": "transformation:two", "kind": "transformation", "label": "two", "pipeline": "beta"},
     ]
+    client._engine_version = (1, 70, 1)
     with patch.object(client, "run_cli", return_value=_dag_payload(nodes)) as run_cli:
-        dag = client.dag()
+        dag = client.dag(models_dir=None)
     discovery_args = run_cli.call_args[0][0]
     assert "--models" not in discovery_args, discovery_args
 
@@ -1017,3 +1035,40 @@ def test_discovery_and_execution_resolve_the_same_root_for_a_discovered_node():
         assert exec_args[exec_args.index("--pipeline") + 1] == node.pipeline
         # Neither side forces a whole-project root, so they cannot disagree.
         assert "--models" not in exec_args, exec_args
+
+
+def test_per_pipeline_mode_refuses_an_engine_that_predates_it():
+    """An accepted-but-older binary does something different, silently.
+
+    Per-pipeline DAG resolution shipped in engine 1.68.0 and pipeline-scoped
+    model execution in 1.69.0, but ``MIN_ROCKY_VERSION`` is 1.34.0 — so both
+    opt-ins have to state their own floor. Without this, a 1.68 binary would
+    discover a pipeline's configured root and then execute from ``models/``
+    relative to the process CWD, which can build a same-named decoy.
+    """
+    client = _client(models_dir="custom-models")
+
+    client._engine_version = (1, 67, 0)
+    with pytest.raises(RockyVersionError):
+        client.dag(models_dir=None)
+
+    client._engine_version = (1, 68, 0)
+    with pytest.raises(RockyVersionError):
+        client.run_model("stg_orders", pipeline="alpha")
+
+    # 1.68 is enough for discovery on its own.
+    with patch.object(client, "run_cli", return_value=_dag_payload([])):
+        client.dag(models_dir=None)
+
+
+def test_unknown_engine_version_warns_rather_than_blocking():
+    """Matches the surrounding fail-open policy, but must not be silent."""
+    client = _client(models_dir="custom-models")
+    client._engine_version = None
+    client._version_checked = True
+    with (
+        patch.object(client, "run_cli", return_value=_dag_payload([])),
+        patch.object(client._logger, "warning") as warn,
+    ):
+        client.dag(models_dir=None)
+    assert warn.called, "a skipped version gate must be logged"
