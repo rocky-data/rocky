@@ -4,6 +4,12 @@ This directory holds **ADRs** — durable records of significant, hard-to-revers
 
 Convention: one file per decision, `ADR-<TOPIC>.md`, status one of **Proposed** → **Accepted** → **Superseded**. Code claims are symbol-anchored; line numbers are approximate. A design gate ("stops for sign-off") is a Proposed ADR that blocks implementation until accepted.
 
+## Product / architecture direction
+
+| ADR | Scope | Status |
+|---|---|---|
+| [`ADR-FRAMEWORK.md`](ADR-FRAMEWORK.md) | Declarative fulfillment framework on Rocky (outcome spec → agent reconciler → feedback), monorepo placement, Apache 2.0 licensing posture | **Proposed** — design gate; pending independent red-team review |
+
 ## WP-01 — Remote-state protocol redesign (PR-0 design gate)
 
 Closes the 3 open Critical audit findings (RD-001/002/003) plus #1120 (freeze kill-switch / config-swap TOCTOU) and #1093 (governance-from-gated-snapshot), on a **live, concurrent multi-pod** `[state]` deployment. Read in this order:
