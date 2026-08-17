@@ -1366,11 +1366,25 @@ pub(crate) fn state_authority_identity(
         _ => {}
     }
     if let Some(url) = state.valkey_url.as_ref() {
-        // Strip any `user:password@` — keep only where it points.
+        // Keep only where it points. Two secret carriers to remove, not one:
+        //
+        //   redis://user:pass@host:6379/0   -> userinfo before the LAST '@'
+        //                                      (last, because a password may
+        //                                       itself contain '@')
+        //   redis://host:6379?password=xyz  -> query string
+        //
+        // Stripping only the userinfo would write the second form's secret into
+        // a plan file on disk.
         let raw = url.expose();
         let (scheme, rest) = raw.split_once("://").unwrap_or(("", raw));
-        let host_and_path = rest.rsplit_once('@').map_or(rest, |(_creds, h)| h);
-        parts.push(format!("valkey={scheme}://{host_and_path}"));
+        let no_userinfo = rest.rsplit_once('@').map_or(rest, |(_creds, host)| host);
+        let no_query = no_userinfo
+            .split_once('?')
+            .map_or(no_userinfo, |(host, _query)| host);
+        let no_fragment = no_query
+            .split_once('#')
+            .map_or(no_query, |(host, _frag)| host);
+        parts.push(format!("valkey={scheme}://{no_fragment}"));
     }
     // The local ledger is identified by its resolved path, which the config
     // never carries.
@@ -2297,6 +2311,46 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    /// The state-authority identity is persisted to a plan file on disk, so it
+    /// must carry no secret in ANY valkey URL form. Stripping only the
+    /// `user:pass@` userinfo leaves a `?password=` query intact.
+    #[test]
+    fn state_authority_identity_strips_every_credential_form() {
+        use rocky_core::config::{StateBackend, StateConfig};
+        let ident = |url: &str| {
+            let st = StateConfig {
+                backend: StateBackend::Valkey,
+                valkey_url: Some(rocky_core::redacted::RedactedString::new(url.to_string())),
+                ..Default::default()
+            };
+            super::state_authority_identity(&st, std::path::Path::new("/s.redb"))
+        };
+
+        for (url, secret) in [
+            ("redis://user:hunter2@h:6379/0", "hunter2"),
+            ("redis://:hunter2@h:6379", "hunter2"),
+            ("redis://user:p@ss@h:6379", "p@ss"),
+            ("redis://h:6379?password=hunter2", "hunter2"),
+            ("redis://h:6379/0#hunter2", "hunter2"),
+        ] {
+            let got = ident(url);
+            assert!(
+                !got.contains(secret),
+                "identity for {url} leaked the secret: {got}"
+            );
+            assert!(
+                got.contains("h:6379"),
+                "identity for {url} lost the host it exists to compare: {got}"
+            );
+        }
+
+        assert_ne!(
+            ident("redis://a:6379/0"),
+            ident("redis://b:6379/0"),
+            "different hosts must produce different identities"
+        );
+    }
     use std::sync::Arc;
 
     use super::*;
