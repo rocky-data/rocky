@@ -725,3 +725,56 @@ def test_dag_transformation_custom_translator_key_still_matches_engine_triple():
     assert [e.asset_key for e in mats] == [dg.AssetKey(["my_prefix", "w", "s", "m1"])]
     # Enriched from the matched engine entry — the fallback carries no row count.
     assert mats[0].materialization.metadata["dagster/row_count"].value == 42
+
+
+# --------------------------------------------------------------------------- #
+# #1348 — the node's own pipeline must reach execution
+# --------------------------------------------------------------------------- #
+
+
+def _two_pipeline_dag() -> DagResult:
+    """Two transformation models in separate pipelines — the shape the engine
+    refuses outright when discovery forces a whole-project ``--models``."""
+    return _make_dag_result(
+        nodes=[
+            {
+                "id": "transformation:one",
+                "kind": "transformation",
+                "label": "one",
+                "pipeline": "alpha",
+                "target": {"catalog": "w", "schema": "a", "table": "one"},
+            },
+            {
+                "id": "transformation:two",
+                "kind": "transformation",
+                "label": "two",
+                "pipeline": "beta",
+                "target": {"catalog": "w", "schema": "b", "table": "two"},
+            },
+        ]
+    )
+
+
+def test_transformation_execution_names_the_nodes_own_pipeline():
+    """Execution must be scoped to the pipeline discovery attributed the node to.
+
+    Without ``--pipeline`` the engine cannot know which adapter a model belongs
+    to on a multi-transformation project and refuses; with a *whole-project*
+    ``--models`` instead, it would resolve the wrong root. Asserting the kwarg
+    reaches ``run_model`` is what stops the two halves drifting apart (#1348).
+    """
+    from unittest.mock import MagicMock
+
+    mock_rocky = MagicMock()
+    mock_rocky.run_model.return_value = _dag_run_result()
+    assets = build_dag_multi_assets(
+        _two_pipeline_dag(),
+        rocky=mock_rocky,
+        translator=RockyDagsterTranslator(),
+    )
+    dg.materialize(assets, raise_on_error=False)
+
+    by_model = {
+        call.args[0]: call.kwargs.get("pipeline") for call in mock_rocky.run_model.call_args_list
+    }
+    assert by_model == {"one": "alpha", "two": "beta"}, by_model

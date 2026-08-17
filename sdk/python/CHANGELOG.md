@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`dag()` no longer forces a whole-project models override, which made multi-transformation projects undiscoverable.** It always sent `--models <models_dir>`. The engine reads that as an explicit *whole-project* override and assigns that one directory's models to **every** transformation pipeline, so a project with two of them was refused outright — `model 'x' is claimed by transformation pipelines a and b` — before any caller could see a DAG. `models_dir` now defaults to `None` and the flag is omitted, so each pipeline resolves its own configured root (the branch `rocky run --dag` already used). Pass `models_dir=` to ask for the override deliberately. (#1348)
+
+- **`run_model()` accepts `pipeline=`, so execution resolves the same root discovery did.** With `pipeline` set, `--pipeline` is sent and `--models` is not: the engine resolves that pipeline's own root. This has to move together with the change above — a node discovered in one root but built from another is silently different SQL for the same asset. Note `--models` never helped here: the engine refuses a bare `--model` on a multi-transformation project whether or not it is passed. Leaving `pipeline` at `None` keeps the previous argv byte-for-byte. (#1348, #1292)
+
+  If you construct `RockyClient(models_dir=…)` with a value that disagrees with the root your `rocky.toml` pipelines declare, `dag()` now follows the config rather than the client field. That is the intended direction, but it is a behaviour change worth knowing about.
+
+### Fixed
+
 - **AI parse errors now name a command the CLI accepts.** `RockyParseError` from `ai_sync()`, `ai_explain()`, and `ai_test()` reported the command as `ai sync` / `ai explain` / `ai test`. Those forms are rejected by the CLI — `rocky ai` takes a positional intent — so anyone diagnosing malformed output was handed a command that fails. They now read `ai-sync`, `ai-explain`, and `ai-test`. (#1443)
 
 ### Removed
