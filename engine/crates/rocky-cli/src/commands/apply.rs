@@ -3112,13 +3112,21 @@ async fn run_apply_ai_authored_plan(
 /// plans written by an OLDER binary, and a plan payload is on-disk JSON that
 /// the gc apply path already treats as possibly hand-authored.
 ///
-/// It is safe because this arm never READS those fields. It consumes
-/// `models_dir`, `models`, `partition_from`, `partition_to`, and `parallel`,
-/// so the DAG runner is never reached and DAG-precedence cannot widen the
-/// authorized scope. That guarantee is structural, not enforced: routing a
-/// backfill through the shared `execute_run_plan` (as `Run` and `AiAuthored`
-/// already do) would reintroduce the exposure with no test failing. Add the
-/// shape validation here if this arm ever grows a consumer of either field.
+/// It is safe because this arm never READS `dag` or `model`. It consumes
+/// `models_dir`, `models`, `partition_from`, `partition_to`, `parallel`, and
+/// `env` — the last feeding the governance fingerprint gate, not model
+/// selection — so the DAG runner is never reached and DAG-precedence cannot
+/// widen the authorized scope.
+///
+/// This list is the whole basis of that claim, so keep it exhaustive: it read
+/// `env` for three weeks while enumerating only the first five, which made the
+/// tripwire below unreliable on the day it shipped. If you add a field read
+/// here, add it here too.
+///
+/// That guarantee is structural, not enforced: routing a backfill through the
+/// shared `execute_run_plan` (as `Run` and `AiAuthored` already do) would
+/// reintroduce the exposure with no test failing. Add the shape validation
+/// here if this arm ever grows a consumer of `dag` or `model`.
 async fn run_apply_backfill_plan(
     root: &Path,
     config_path: &Path,
@@ -3329,8 +3337,12 @@ async fn run_apply_backfill_plan(
             (Some(ctx), Some(l)) => {
                 // Fail-closed (#4/#5): verify the routing identity before executing.
                 ctx.verify_routing_identity(&l.config)?;
-                // The governance identity resolves the plan's persisted `--env` (a
-                // backfill persists `None`), matching the plan-side fingerprint.
+                // The governance identity resolves the plan's persisted `--env`,
+                // matching the plan-side fingerprint. Deliberately reads whatever
+                // the payload carries rather than assuming what `build_run_plan`
+                // writes today: the same reasoning #1173 rejected for `dag` /
+                // `model` applies here, since a plan on disk may come from an
+                // older binary or be hand-authored.
                 Some(ctx.exec_fingerprint_gate(&l.config, run_plan.env.as_deref()))
             }
             // Fail-closed (#7): a governed backfill whose config would not load

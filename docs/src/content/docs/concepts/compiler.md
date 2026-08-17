@@ -253,7 +253,7 @@ span, and sometimes a suggested fix.
 | `W030` | Imported producer added a column, surfaced only to consumers reading it via `SELECT *` |
 | `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
 | `I001` | Model dependency inferred from SQL |
-| `I002` | Model compiled with `SELECT *` |
+| `I002` | Some columns have unknown types — provide source schemas for full type checking |
 | `P001` | Construct not portable to the target dialect (opt-in via `--target-dialect`) |
 | `P002` | `SELECT *` model has downstream consumers that read specific columns |
 
