@@ -295,8 +295,9 @@ fn arm_hard_exit_on_second_signal() {
 /// #1352 derives ordering edges from physical `schema.table` reads and reports
 /// what it could not safely resolve as advisory warnings — the run still exits
 /// 0, so a consumer that ignores them can read a stale target and report
-/// success. `[run] strict_scheduling` (or `--strict-scheduling`) turns that into
-/// a refusal for estates that want fail-closed ordering (#1355).
+/// success. `[run] strict_scheduling` turns that into a refusal for estates
+/// that want fail-closed ordering (#1355). Config-only — there is no
+/// `--strict-scheduling` CLI flag; adding one is tracked on #1357.
 ///
 /// Shared by the plain and `--dag` paths deliberately. Two copies would let
 /// "strict" come to mean different things depending on how the run was started,
@@ -308,8 +309,8 @@ pub(crate) fn refuse_on_scheduling_warnings(strict: bool, warnings: &[String]) -
     anyhow::bail!(
         "strict scheduling is on and this run's physical-read ordering could not be fully \
          resolved, so execution order is not guaranteed:\n{}\n\nDeclare each upstream in \
-         `depends_on` to resolve it, or unset `[run] strict_scheduling` / omit \
-         `--strict-scheduling` to run with these as advisory warnings.",
+         `depends_on` to resolve it, or unset `[run] strict_scheduling` to run \
+         with these as advisory warnings.",
         warnings
             .iter()
             .map(|w| format!("  - {w}"))
