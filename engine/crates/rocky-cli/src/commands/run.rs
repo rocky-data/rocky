@@ -2605,6 +2605,14 @@ pub async fn run(
     let mut assertion_targets: Vec<(TableRef, Vec<String>)> = Vec::new();
     let mut pending_checks: HashMap<String, PendingCheck> = HashMap::new();
     let mut tables_to_process: Vec<TableTask> = Vec::new();
+    // Resolved target identity -> the source that claimed it. A shadow
+    // `--shadow-schema` replaces the resolved schema template outright, so a
+    // template whose only distinguishing component is the connector (e.g.
+    // `staging__{source}`) collapses every connector into one schema. Two
+    // connectors holding a same-named table then write the same object and the
+    // second silently wins, with `tables_copied` still counting both (#1461).
+    let mut claimed_targets: HashMap<(String, String, String), (String, String)> =
+        HashMap::new();
     // PR-B3: count how many `(connector, table)` pairs matched each
     // `[[table_overrides]]` rule. Rules with zero matches surface as
     // soft warnings on `RunOutput.override_warnings` (T2) so
@@ -3104,6 +3112,39 @@ pub async fn run(
                 } else {
                     table.name.clone()
                 };
+
+                // Fail closed on two sources resolving to one target object.
+                // Refuses only on a real clash, so a multi-connector project
+                // whose table names differ still shadows fine (#1461).
+                let target_identity = (
+                    target_catalog.clone(),
+                    target_schema.clone(),
+                    target_table_name.clone(),
+                );
+                let this_source = (conn.schema.clone(), table.name.clone());
+                if let Some(prior) = claimed_targets.get(&target_identity)
+                    && *prior != this_source
+                {
+                    anyhow::bail!(
+                        "two sources resolve to the same target table \
+                         '{}.{}.{}': '{}.{}' and '{}.{}'. Writing both would \
+                         leave whichever ran last, and the run would still \
+                         report copying two tables. This happens when \
+                         `--shadow-schema` replaces a schema template whose \
+                         only distinguishing component is the connector \
+                         (e.g. `staging__{{source}}`). Use `--shadow-suffix` \
+                         instead, which keeps the template and renames the \
+                         table, or give the sources distinct target tables.",
+                        target_identity.0,
+                        target_identity.1,
+                        target_identity.2,
+                        prior.0,
+                        prior.1,
+                        this_source.0,
+                        this_source.1,
+                    );
+                }
+                claimed_targets.insert(target_identity, this_source);
 
                 tables_to_process.push(TableTask {
                     source_catalog: source_catalog.clone(),
