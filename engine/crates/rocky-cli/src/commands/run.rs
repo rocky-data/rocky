@@ -2755,11 +2755,17 @@ pub async fn run(
                 continue;
             }
             let source_catalog = pipeline.source.catalog.as_deref().unwrap_or("").to_string();
+            // Same fallback as the collection loop: on a list failure fall back
+            // to the discovered tables so both process the same set. An
+            // `unwrap_or_default()` here would differ when `list_tables`
+            // legitimately returns EMPTY — the loop then skips every table as
+            // missing-from-source, so counting them here would refuse a run the
+            // loop would have skipped.
             let source_tables: std::collections::HashSet<String> = warehouse_adapter
                 .list_tables(&source_catalog, &conn.schema)
                 .await
                 .map(|v| v.into_iter().map(|t| t.to_lowercase()).collect())
-                .unwrap_or_default();
+                .unwrap_or_else(|_| conn.tables.iter().map(|t| t.name.to_lowercase()).collect());
             let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
             let target_schema = if let Some(cfg) = shadow_config {
                 cfg.schema_override
@@ -2773,9 +2779,7 @@ pub async fn run(
                 if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
                     continue;
                 }
-                // A source read failure yields an empty set above; treat that as
-                // "cannot tell" and skip rather than refuse on incomplete data.
-                if !source_tables.is_empty() && !source_tables.contains(&table.name.to_lowercase()) {
+                if !source_tables.contains(&table.name.to_lowercase()) {
                     continue;
                 }
                 if rocky_core::config::resolve_table_override(
