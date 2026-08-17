@@ -50,7 +50,7 @@ dev = [
 #
 # Lift the `<1.32` ceiling once the publish action is bumped to a build
 # carrying twine >= 7.0.0 (verified to accept 2.5); see #1395.
-requires = ["hatchling>=1.30.1,<1.32"]
+requires = ["hatchling>=1.30.1,<1.33"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
