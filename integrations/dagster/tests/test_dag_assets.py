@@ -775,7 +775,6 @@ def test_transformation_execution_names_the_nodes_own_pipeline():
     dg.materialize(assets, raise_on_error=False)
 
     by_model = {
-        call.args[0]: call.kwargs.get("pipeline")
-        for call in mock_rocky.run_model.call_args_list
+        call.args[0]: call.kwargs.get("pipeline") for call in mock_rocky.run_model.call_args_list
     }
     assert by_model == {"one": "alpha", "two": "beta"}, by_model

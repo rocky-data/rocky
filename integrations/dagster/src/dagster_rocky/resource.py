@@ -1239,9 +1239,7 @@ class RockyResource(dg.ConfigurableResource):
         with _translating():
             return self._get_client().catalog(out=out)
 
-    def dag(
-        self, *, column_lineage: bool = False, models_dir: str | None = None
-    ) -> DagResult:
+    def dag(self, *, column_lineage: bool = False, models_dir: str | None = None) -> DagResult:
         """Run ``rocky dag`` and return the full unified DAG.
 
         ``models_dir`` defaults to ``None`` so each pipeline resolves its own
@@ -1249,9 +1247,7 @@ class RockyResource(dg.ConfigurableResource):
         (see :meth:`RockyClient.dag`).
         """
         with _translating():
-            return self._get_client().dag(
-                column_lineage=column_lineage, models_dir=models_dir
-            )
+            return self._get_client().dag(column_lineage=column_lineage, models_dir=models_dir)
 
     def run_model(
         self,

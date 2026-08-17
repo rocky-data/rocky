@@ -1240,9 +1240,7 @@ class RockyClient:
             args.extend(["--out", out])
         return _parse_rocky_json(self.run_cli(args), CatalogOutput, command="catalog")
 
-    def dag(
-        self, *, column_lineage: bool = False, models_dir: str | None = None
-    ) -> DagResult:
+    def dag(self, *, column_lineage: bool = False, models_dir: str | None = None) -> DagResult:
         """Run ``rocky dag`` and return the full unified DAG.
 
         ``models_dir`` defaults to ``None``, which omits ``--models`` so each
