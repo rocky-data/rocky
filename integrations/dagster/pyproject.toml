@@ -73,7 +73,7 @@ dagster_rocky = "dagster_rocky"
 # our allow-listed `gh-action-pypi-publish` pin rejects at the publish step.
 # `dagster-release` uses the same action, so it would have failed identically.
 # Lift `<1.32` once that action carries twine >= 7.0.0; see #1395.
-requires = ["hatchling>=1.30.1,<1.32"]
+requires = ["hatchling>=1.30.1,<1.33"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
