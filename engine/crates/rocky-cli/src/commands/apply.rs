@@ -3538,10 +3538,23 @@ async fn run_apply_replication_plan(
     // field outside the subset would silently break replay. So any config
     // change invalidates the plan and you re-plan.
     //
-    // LIMIT worth knowing: secrets serialize as `"***"` by construction
-    // (`rocky_core::redacted`), so this compares routing and shape, NOT
-    // credentials. Swapping the password behind the same host is invisible
-    // here. Catching that needs a different mechanism.
+    // TWO LIMITS worth knowing, because this comparison looks stronger than it
+    // is:
+    //
+    // 1. Secrets serialize as `"***"` by construction (`rocky_core::redacted`),
+    //    so this compares routing and shape, NOT credentials. Swapping the
+    //    password behind the same host is invisible.
+    // 2. It does not bind the STATE authority. `StateConfig.valkey_url` is
+    //    redacted whole, and the plan stores neither the resolved
+    //    `--state-path` nor the CLI state namespace — both come from the
+    //    caller at apply time. So a plan can compare equal here and still run
+    //    against a different watermark/freeze/budget ledger, which can mean an
+    //    unexpected full refresh or a freeze the reviewed authority recorded
+    //    going unseen.
+    //
+    // Closing (2) needs a credential-free state-authority identity persisted in
+    // the plan (backend, host/port/database, key prefix, resolved namespace).
+    // That is a payload change, tracked separately rather than bolted on here.
     let live_config_snapshot = serde_json::to_value(rocky_cfg)
         .context("failed to serialize the live config for the plan comparison")?;
     if live_config_snapshot != replication_plan.config_snapshot {
