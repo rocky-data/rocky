@@ -900,3 +900,120 @@ def test_run_still_accepts_defer():
     assert argv[0] == "run"
     assert "--defer" in argv
     assert argv[argv.index("--defer-to") + 1] == "prod"
+
+
+# --------------------------------------------------------------------------- #
+# #1348 — discovery and execution must resolve the same models root
+# --------------------------------------------------------------------------- #
+
+
+def _dag_payload(nodes: list[dict]) -> str:
+    return json.dumps(
+        {
+            "version": "1.70.1",
+            "command": "dag",
+            "nodes": nodes,
+            "edges": [],
+            "execution_layers": [],
+            "summary": {
+                "total_nodes": len(nodes),
+                "total_edges": 0,
+                "execution_layers": 1,
+                "counts_by_kind": {},
+            },
+        }
+    )
+
+
+def _run_payload() -> str:
+    return json.dumps(
+        {
+            "version": "1.70.1",
+            "command": "run",
+            "filter": "",
+            "duration_ms": 0,
+            "tables_copied": 0,
+            "materializations": [],
+            "check_results": [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+
+
+def test_dag_omits_models_so_each_pipeline_resolves_its_own_root():
+    """``--models`` is a whole-project override, not a hint.
+
+    The engine assigns that one directory to *every* transformation pipeline, so
+    a project with two of them is refused outright. Sending it unconditionally
+    made such projects undiscoverable (#1348).
+    """
+    client = _client(models_dir="custom-models")
+    with patch.object(client, "run_cli", return_value=_dag_payload([])) as run_cli:
+        client.dag()
+    args = run_cli.call_args[0][0]
+    assert args == ["dag"], args
+    assert "--models" not in args
+
+
+def test_dag_still_allows_an_explicit_whole_project_override():
+    """A caller who genuinely wants the override can still ask for it."""
+    client = _client(models_dir="custom-models")
+    with patch.object(client, "run_cli", return_value=_dag_payload([])) as run_cli:
+        client.dag(models_dir="one-root")
+    args = run_cli.call_args[0][0]
+    assert args == ["dag", "--models", "one-root"], args
+
+
+def test_run_model_scopes_to_the_pipeline_and_drops_the_override():
+    client = _client(models_dir="custom-models")
+    with patch.object(client, "run_cli", return_value=_run_payload()) as run_cli:
+        client.run_model("stg_orders", pipeline="alpha")
+    args = run_cli.call_args[0][0]
+    assert args == ["run", "--model", "stg_orders", "--pipeline", "alpha"], args
+    # Passing both would override the pipeline's own root with a project-wide
+    # one — the discovery/execution split #1348 warns about.
+    assert "--models" not in args
+
+
+def test_run_model_without_a_pipeline_keeps_the_previous_argv():
+    """Single-pipeline callers must be unaffected."""
+    client = _client(models_dir="custom-models")
+    with patch.object(client, "run_cli", return_value=_run_payload()) as run_cli:
+        client.run_model("stg_orders")
+    args = run_cli.call_args[0][0]
+    assert args == ["run", "--model", "stg_orders", "--models", "custom-models"], args
+
+
+def test_discovery_and_execution_resolve_the_same_root_for_a_discovered_node():
+    """#1348 acceptance: asserted, not read.
+
+    Drives execution from the node ``dag()`` actually returned, so a change that
+    stops threading the node's pipeline fails here — which two independent argv
+    assertions would not catch.
+    """
+    client = _client(models_dir="custom-models")
+    nodes = [
+        {"id": "transformation:one", "kind": "transformation", "label": "one", "pipeline": "alpha"},
+        {"id": "transformation:two", "kind": "transformation", "label": "two", "pipeline": "beta"},
+    ]
+    with patch.object(client, "run_cli", return_value=_dag_payload(nodes)) as run_cli:
+        dag = client.dag()
+    discovery_args = run_cli.call_args[0][0]
+    assert "--models" not in discovery_args, discovery_args
+
+    for node in dag.nodes:
+        with patch.object(client, "run_cli", return_value=_run_payload()) as run_cli:
+            client.run_model(node.label, pipeline=node.pipeline)
+        exec_args = run_cli.call_args[0][0]
+        # Execution names the node's own pipeline, so the engine resolves that
+        # pipeline's configured root — the same one discovery used.
+        assert "--pipeline" in exec_args, exec_args
+        assert exec_args[exec_args.index("--pipeline") + 1] == node.pipeline
+        # Neither side forces a whole-project root, so they cannot disagree.
+        assert "--models" not in exec_args, exec_args

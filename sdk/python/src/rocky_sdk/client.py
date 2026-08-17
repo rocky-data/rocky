@@ -1064,6 +1064,7 @@ class RockyClient:
         self,
         model_name: str,
         *,
+        pipeline: str | None = None,
         filter: str | None = None,
         partition: str | None = None,
         partition_from: str | None = None,
@@ -1076,8 +1077,25 @@ class RockyClient:
         """Run ``rocky run --model <name>`` for a single compiled model.
 
         ``--model`` skips the replication phase and executes only the named model.
+
+        ``pipeline`` names the transformation pipeline the model belongs to. When
+        given, ``--models`` is **not** sent: the engine resolves that pipeline's
+        own configured root, which is what :meth:`dag` discovers against. On a
+        project with two or more transformation pipelines the engine refuses a
+        bare ``--model`` regardless of ``--models`` ("cannot know which pipeline
+        (and adapter) the model belongs to"), so ``--pipeline`` is the only way
+        to execute one — and passing both would override the pipeline's root
+        with a whole-project one, which is the discovery/execution split #1348
+        warns about.
+
+        Leaving ``pipeline`` at ``None`` keeps the previous argv exactly, for
+        single-pipeline callers.
         """
-        args = ["run", "--model", model_name, "--models", self.models_dir]
+        args = ["run", "--model", model_name]
+        if pipeline is not None:
+            args.extend(["--pipeline", pipeline])
+        else:
+            args.extend(["--models", self.models_dir])
         if filter is not None:
             args.extend(["--filter", filter])
         if partition is not None:
@@ -1222,9 +1240,25 @@ class RockyClient:
             args.extend(["--out", out])
         return _parse_rocky_json(self.run_cli(args), CatalogOutput, command="catalog")
 
-    def dag(self, *, column_lineage: bool = False) -> DagResult:
-        """Run ``rocky dag`` and return the full unified DAG."""
-        args = ["dag", "--models", self.models_dir]
+    def dag(
+        self, *, column_lineage: bool = False, models_dir: str | None = None
+    ) -> DagResult:
+        """Run ``rocky dag`` and return the full unified DAG.
+
+        ``models_dir`` defaults to ``None``, which omits ``--models`` so each
+        pipeline resolves its own configured root — the same branch
+        ``rocky run --dag`` uses. Passing ``--models`` is an explicit
+        *whole-project* override: the engine assigns that one directory's models
+        to **every** transformation pipeline, so a project with two of them is
+        refused outright (``model 'x' is claimed by transformation pipelines a
+        and b``). Sending it unconditionally therefore made multi-transformation
+        projects undiscoverable (#1348).
+
+        Pass a string to ask for that override deliberately.
+        """
+        args = ["dag"]
+        if models_dir is not None:
+            args.extend(["--models", models_dir])
         if self.contracts_dir is not None:
             args.extend(["--contracts", self.contracts_dir])
         if column_lineage:
