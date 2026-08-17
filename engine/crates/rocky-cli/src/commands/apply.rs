@@ -790,6 +790,7 @@ async fn execute_run_plan(
         // `--assume-fresh-state` is a `rocky run` runtime flag, never part of
         // a persisted plan — the two-step apply path always runs without it.
         false,
+        None, // #1460: not a replication plan
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))?;
@@ -3666,6 +3667,7 @@ async fn run_apply_replication_plan(
         // `--assume-fresh-state` is a `rocky run` runtime flag, never part of
         // a persisted plan — the replication apply path always runs without it.
         false,
+        Some((plan_id, replication_plan.source_state_snapshot.as_slice())), // #1460
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
@@ -3695,7 +3697,7 @@ async fn run_apply_replication_plan(
 /// under steady-state source-system churn. Unfiltered applies keep the
 /// strict semantics because any drift is structurally undefined.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DriftScope {
+pub(crate) enum DriftScope {
     /// Snapshots match — proceed normally.
     None,
     /// Drift exists but the active filter excludes every drifted connector
@@ -3750,7 +3752,7 @@ enum DriftScope {
 /// matches today (live) and every connector that matched at plan time
 /// (persisted) — that way a removed in-scope connector is correctly
 /// surfaced as in-scope drift even though `live` no longer carries it.
-fn decide_drift_scope(
+pub(crate) fn decide_drift_scope(
     persisted: &[ReplicationConnectorSnapshot],
     live: &[ReplicationConnectorSnapshot],
     filter: Option<&str>,
@@ -3860,7 +3862,7 @@ fn connector_matches_filter(
 /// source-state snapshot and the live one. Surfaced inside the
 /// stale-source bail message so operators see what changed without
 /// having to inspect the plan file by hand.
-fn summarize_source_state_drift(
+pub(crate) fn summarize_source_state_drift(
     persisted: &[ReplicationConnectorSnapshot],
     live: &[ReplicationConnectorSnapshot],
 ) -> String {
@@ -4105,6 +4107,7 @@ pub async fn run_apply_inline_for_run(
         // `--assume-fresh-state` threads through from the CLI (main.rs
         // validated it against the configured `[state]` backend).
         assume_fresh_state,
+        None, // #1460: inline `rocky run`, not a persisted plan
     )
     .await
 }

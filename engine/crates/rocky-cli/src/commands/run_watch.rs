@@ -362,6 +362,7 @@ async fn iter_once(
         // `--assume-fresh-state` is not surfaced on the watch path (clap
         // rejects the combination at parse time).
         false,
+        None, // #1460: dev watch loop, no persisted plan
     )
     .await;
     let elapsed_ms = started.elapsed().as_millis();

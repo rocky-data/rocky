@@ -1408,6 +1408,18 @@ pub async fn run(
     // Local backend); it never overrides the governed fail-closed bail. See
     // [`resolve_replication_authority`].
     assume_fresh_state: bool,
+    // #1460: the source state a persisted replication plan was reviewed
+    // against, plus that plan's id for the message. `None` for every direct
+    // `rocky run` — byte-identical behaviour.
+    //
+    // The replication apply path discovers once to compare against the plan,
+    // then calls this function, which discovers AGAIN and builds work from the
+    // second result. So the comparison ran on one set and the writes came from
+    // another: a connector appearing between them executed without ever being
+    // in the reviewed snapshot. Passing the reviewed state here re-applies the
+    // SAME `decide_drift_scope` rule at the point the work is actually built,
+    // which keeps the filter-scope tolerance identical.
+    reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
 ) -> Result<()> {
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
@@ -2577,6 +2589,45 @@ pub async fn run(
         );
     }
     let connectors = discovery_result.connectors;
+
+    // #1460: re-apply the plan's source-state check HERE, against the set the
+    // work is built from. Same rule as the pre-check in the apply path, so
+    // out-of-filter-scope drift stays a warning and only in-scope or unfiltered
+    // drift refuses.
+    if let Some((plan_id, reviewed)) = reviewed_source_state {
+        let executed_snapshot = crate::commands::plan::build_source_state_snapshot(&connectors);
+        match crate::commands::apply::decide_drift_scope(
+            reviewed,
+            &executed_snapshot,
+            filter,
+            &pattern,
+        ) {
+            crate::commands::apply::DriftScope::None
+            | crate::commands::apply::DriftScope::OutOfScope { .. } => {}
+            crate::commands::apply::DriftScope::InScope {
+                in_scope_drifted,
+                filter: f,
+            } => {
+                let diff =
+                    crate::commands::apply::summarize_source_state_drift(reviewed, &executed_snapshot);
+                anyhow::bail!(
+                    "source state drifted between the check and execution of plan \
+                     '{plan_id}' (in-scope under filter={f}, affected=[{}]).\n{diff}\n\
+                     Nothing was written. Re-plan with `rocky plan` and apply the new plan_id.",
+                    in_scope_drifted.join(", ")
+                );
+            }
+            crate::commands::apply::DriftScope::Unfiltered => {
+                let diff =
+                    crate::commands::apply::summarize_source_state_drift(reviewed, &executed_snapshot);
+                anyhow::bail!(
+                    "source state drifted between the check and execution of plan \
+                     '{plan_id}'.\n{diff}\n\
+                     Nothing was written. Re-plan with `rocky plan` and apply the new plan_id."
+                );
+            }
+        }
+    }
 
     let concurrency = pipeline.execution.concurrency.max_concurrency();
     let mut output = RunOutput::new(filter.unwrap_or("").to_string(), 0, concurrency);
@@ -12815,6 +12866,7 @@ adapter = "default"
             None,  // no run_id override — mint the usual timestamp id
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
+            None,  // #1460
         )
         .await
         .expect("transformation run should succeed");
@@ -12931,6 +12983,7 @@ adapter = "default"
                 None,
                 None,
                 false,
+                None, // #1460
             ))
             .expect("the run must succeed regardless of the trace context");
         }
@@ -13080,6 +13133,7 @@ schema = "mart"
             None,  // no run_id override — mint the usual timestamp id
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
+            None,  // #1460
         )
         .await
         .expect(
@@ -15122,6 +15176,7 @@ timestamp_column = "ts"
                 Some(run_id),
                 None,
                 false,
+                None, // #1460
             )
             .await
         }

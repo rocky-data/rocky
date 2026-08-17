@@ -134,6 +134,7 @@ async fn run_pipeline(config_path: &Path, state_path: &Path) -> anyhow::Result<(
         None, // run_id_override
         None, // governed_ctx
         false,
+        None, // #1460
     )
     .await
 }
@@ -168,6 +169,7 @@ async fn run_pipeline_model(config_path: &Path, state_path: &Path) -> anyhow::Re
         None,
         None,
         false,
+        None, // #1460
     )
     .await
 }

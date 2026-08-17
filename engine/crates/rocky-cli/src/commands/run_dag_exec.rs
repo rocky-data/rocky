@@ -160,6 +160,7 @@ fn default_sub_runner() -> SubRunner {
                     None,
                     // `--assume-fresh-state` is not surfaced on the DAG path.
                     false,
+                    None, // #1460: DAG sub-run, no persisted plan
                 )
                 .await
                 .map_err(|e| format!("{e:#}"))
