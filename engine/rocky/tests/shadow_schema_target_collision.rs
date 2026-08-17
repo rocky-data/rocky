@@ -35,6 +35,20 @@ schema_template = "staging__{source}"
 auto_create_schemas = true
 "#;
 
+/// Same shape, but the two tables differ ONLY by case. DuckDB resolves
+/// identifiers case-insensitively, so `Orders` and `orders` are one object —
+/// an exact-string collision key answers "different" and lets both write it.
+fn seed_case_only(dir: &std::path::Path) {
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+    conn.execute_batch(
+        "CREATE SCHEMA raw__shopify;
+         CREATE SCHEMA raw__stripe;
+         CREATE TABLE raw__shopify.\"Orders\" AS SELECT * FROM (VALUES (1),(2),(3)) t(id);
+         CREATE TABLE raw__stripe.orders       AS SELECT * FROM (VALUES (99)) t(id);",
+    )
+    .expect("seed case-differing sources");
+}
+
 fn seed(dir: &std::path::Path) {
     let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
     conn.execute_batch(
@@ -141,5 +155,32 @@ fn the_suggested_shadow_suffix_alternative_isolates_both_connectors() {
         (shopify, stripe),
         (3, 1),
         "both connectors must keep their own rows"
+    );
+}
+
+/// #1461 follow-up: the collision key must fold case.
+///
+/// `raw__shopify.Orders` and `raw__stripe.orders` land in the same shadow
+/// schema. On a case-insensitive warehouse that is ONE table, so an
+/// exact-string key would pass them both through and restore the
+/// last-writer-wins loss this guard exists to stop.
+#[test]
+fn shadow_schema_refuses_targets_that_differ_only_by_case() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed_case_only(dir);
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write config");
+
+    let shadowed = run(dir, &["--shadow", "--shadow-schema", "shadow_x"]);
+    assert!(
+        !shadowed.status.success(),
+        "targets differing only by case must fail closed on a case-insensitive \
+         warehouse; stdout: {}",
+        String::from_utf8_lossy(&shadowed.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&shadowed.stderr);
+    assert!(
+        stderr.contains("same target table"),
+        "expected the collision refusal, got: {stderr}"
     );
 }

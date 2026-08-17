@@ -2662,8 +2662,10 @@ pub async fn run(
     // `staging__{source}`) collapses every connector into one schema. Two
     // connectors holding a same-named table then write the same object and the
     // second silently wins, with `tables_copied` still counting both (#1461).
-    let mut claimed_targets: HashMap<(String, String, String), (String, String)> =
-        HashMap::new();
+    let mut claimed_targets: HashMap<
+        rocky_sql::defer::CollisionIdentity,
+        (String, String),
+    > = HashMap::new();
     // PR-B3: count how many `(connector, table)` pairs matched each
     // `[[table_overrides]]` rule. Rules with zero matches surface as
     // soft warnings on `RunOutput.override_warnings` (T2) so
@@ -3167,10 +3169,15 @@ pub async fn run(
                 // Fail closed on two sources resolving to one target object.
                 // Refuses only on a real clash, so a multi-connector project
                 // whose table names differ still shadows fine (#1461).
-                let target_identity = (
-                    target_catalog.clone(),
-                    target_schema.clone(),
-                    target_table_name.clone(),
+                // Keyed by `CollisionIdentity`, not raw strings. DuckDB,
+                // Databricks and Trino resolve identifiers case-insensitively,
+                // so `raw__a.Orders` and `raw__b.orders` are ONE object there.
+                // An exact-string key answers "different" and lets both write
+                // it — the unrecoverable direction this type exists to avoid.
+                let target_identity = rocky_sql::defer::CollisionIdentity::of(
+                    &target_catalog,
+                    &target_schema,
+                    &target_table_name,
                 );
                 let this_source = (conn.schema.clone(), table.name.clone());
                 if let Some(prior) = claimed_targets.get(&target_identity)
@@ -3186,9 +3193,9 @@ pub async fn run(
                          (e.g. `staging__{{source}}`). Use `--shadow-suffix` \
                          instead, which keeps the template and renames the \
                          table, or give the sources distinct target tables.",
-                        target_identity.0,
-                        target_identity.1,
-                        target_identity.2,
+                        target_catalog,
+                        target_schema,
+                        target_table_name,
                         prior.0,
                         prior.1,
                         this_source.0,
