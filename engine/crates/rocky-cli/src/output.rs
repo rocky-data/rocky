@@ -3817,6 +3817,19 @@ pub struct ReplicationPlan {
     /// subset would silently break replay. Cheaper to keep the whole
     /// config and let the hash do its job.
     pub config_snapshot: serde_json::Value,
+    /// Credential-free identity of the state authority this plan was reviewed
+    /// against — which ledger holds its watermarks, freezes, budgets and
+    /// idempotency keys.
+    ///
+    /// `config_snapshot` cannot answer this: `valkey_url` is redacted whole, so
+    /// a Valkey A-to-B swap compares equal, and the resolved `--state-path`
+    /// comes from the caller and never appears in the config. Without this a
+    /// plan could pass the config comparison and still apply against a
+    /// different ledger. Optional so plans written before this field still
+    /// deserialize; absent means "not recorded", and apply skips the check
+    /// rather than refusing every older plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_authority: Option<String>,
     /// Discovered connectors sorted by `id`. Tables within each
     /// connector are sorted by `name`. Apply re-discovers and asserts
     /// byte-equality against this snapshot before running SQL.

@@ -517,6 +517,7 @@ pub async fn plan(
             pipeline_name,
             env,
             run_options,
+            state_path,
         ) {
             Ok((_replication_plan, plan_id, persisted_at)) => {
                 output.plan_id = Some(plan_id);
@@ -1319,6 +1320,64 @@ fn shadow_descriptor(run_options: &PlanRunOptions, value: Option<&String>) -> Op
     }
 }
 
+/// A credential-free identity for the state authority a plan was reviewed
+/// against: which ledger holds its watermarks, freezes, budgets and
+/// idempotency keys.
+///
+/// Needed because the plan's `config_snapshot` cannot answer this. `valkey_url`
+/// is a `RedactedString` and serializes whole as `"***"`, so a Valkey A-to-B
+/// swap compares equal; and the resolved `--state-path` never appears in the
+/// config at all, because it comes from the caller. A plan could therefore pass
+/// the config comparison and still apply against a different ledger — meaning an
+/// unexpected full refresh, or a freeze recorded in the reviewed authority going
+/// unseen.
+///
+/// Credential-free on purpose. For Valkey this keeps scheme, host, port and
+/// database and drops any `user:password@`, so the identity is comparable
+/// without the plan payload carrying a secret. `expose()` is the audited
+/// accessor; the exposed value is parsed and discarded, never stored.
+pub(crate) fn state_authority_identity(
+    state: &rocky_core::config::StateConfig,
+    state_path: &std::path::Path,
+) -> String {
+    use rocky_core::config::StateBackend;
+    let mut parts = vec![format!("backend={:?}", state.backend)];
+    match state.backend {
+        StateBackend::S3 => {
+            parts.push(format!(
+                "bucket={}",
+                state.s3_bucket.as_deref().unwrap_or("")
+            ));
+            parts.push(format!(
+                "prefix={}",
+                state.s3_prefix.as_deref().unwrap_or("")
+            ));
+        }
+        StateBackend::Gcs => {
+            parts.push(format!(
+                "bucket={}",
+                state.gcs_bucket.as_deref().unwrap_or("")
+            ));
+            parts.push(format!(
+                "prefix={}",
+                state.gcs_prefix.as_deref().unwrap_or("")
+            ));
+        }
+        _ => {}
+    }
+    if let Some(url) = state.valkey_url.as_ref() {
+        // Strip any `user:password@` — keep only where it points.
+        let raw = url.expose();
+        let (scheme, rest) = raw.split_once("://").unwrap_or(("", raw));
+        let host_and_path = rest.rsplit_once('@').map_or(rest, |(_creds, h)| h);
+        parts.push(format!("valkey={scheme}://{host_and_path}"));
+    }
+    // The local ledger is identified by its resolved path, which the config
+    // never carries.
+    parts.push(format!("path={}", state_path.display()));
+    parts.join(" ")
+}
+
 fn build_and_persist_replication_plan(
     rocky_cfg: &rocky_core::config::RockyConfig,
     connectors: &[DiscoveredConnector],
@@ -1326,9 +1385,11 @@ fn build_and_persist_replication_plan(
     pipeline: Option<&str>,
     env: Option<&str>,
     run_options: &PlanRunOptions,
+    state_path: &std::path::Path,
 ) -> Result<(ReplicationPlan, String, chrono::DateTime<Utc>)> {
     let config_snapshot = serde_json::to_value(rocky_cfg)
         .context("failed to serialize RockyConfig for replication plan")?;
+    let state_authority = state_authority_identity(&rocky_cfg.state, state_path);
     let source_state_snapshot = build_source_state_snapshot(connectors);
 
     let replication_plan = ReplicationPlan {
@@ -1359,6 +1420,7 @@ fn build_and_persist_replication_plan(
         branch: run_options.branch.clone(),
         governance_override: run_options.governance_override.clone(),
         config_snapshot,
+        state_authority: Some(state_authority),
         source_state_snapshot,
     };
 

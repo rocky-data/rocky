@@ -2727,6 +2727,108 @@ pub async fn run(
         )?;
     }
 
+    // #1461 preflight: refuse a target collision BEFORE any warehouse mutation.
+    //
+    // The authoritative check still runs at the collection site below, where the
+    // exact write set is known. This pass exists only to move the refusal
+    // earlier: the setup loop creates catalogs and schemas, binds workspaces and
+    // applies grants, so a collision caught during collection would refuse only
+    // after changing access control.
+    //
+    // Read-only: `list_tables` is a source read, and the three skip conditions
+    // call the SAME functions the collection loop calls. They must stay in sync
+    // — a condition added there and not here would refuse a run that is fine.
+    // `preflight_skips_a_disabled_table` pins the one most likely to drift.
+    {
+        let mut preflight_claims: HashMap<
+            rocky_sql::defer::CollisionIdentity,
+            (String, String),
+        > = HashMap::new();
+        for conn in &connectors {
+            let Ok(parsed) = pattern.parse(&conn.schema) else {
+                continue;
+            };
+            if !parsed_filter
+                .as_ref()
+                .is_none_or(|(k, v)| matches_filter(conn, &parsed, k, v))
+            {
+                continue;
+            }
+            let source_catalog = pipeline.source.catalog.as_deref().unwrap_or("").to_string();
+            let source_tables: std::collections::HashSet<String> = warehouse_adapter
+                .list_tables(&source_catalog, &conn.schema)
+                .await
+                .map(|v| v.into_iter().map(|t| t.to_lowercase()).collect())
+                .unwrap_or_default();
+            let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
+            let target_schema = if let Some(cfg) = shadow_config {
+                cfg.schema_override
+                    .clone()
+                    .unwrap_or_else(|| parsed.resolve_template(target_schema_template, target_sep))
+            } else {
+                parsed.resolve_template(target_schema_template, target_sep)
+            };
+
+            for table in &conn.tables {
+                if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
+                    continue;
+                }
+                // A source read failure yields an empty set above; treat that as
+                // "cannot tell" and skip rather than refuse on incomplete data.
+                if !source_tables.is_empty() && !source_tables.contains(&table.name.to_lowercase()) {
+                    continue;
+                }
+                if rocky_core::config::resolve_table_override(
+                    &pipeline.table_overrides,
+                    &conn.id,
+                    &conn.schema,
+                    &table.name,
+                )
+                .enabled
+                    == Some(false)
+                {
+                    continue;
+                }
+                let target_table_name = if let Some(cfg) = shadow_config {
+                    if cfg.schema_override.is_none() {
+                        format!("{}{}", table.name, cfg.suffix)
+                    } else {
+                        table.name.clone()
+                    }
+                } else {
+                    table.name.clone()
+                };
+                let id = rocky_sql::defer::CollisionIdentity::of(
+                    &target_catalog,
+                    &target_schema,
+                    &target_table_name,
+                );
+                let this = (conn.schema.clone(), table.name.clone());
+                if let Some(prior) = preflight_claims.get(&id)
+                    && *prior != this
+                {
+                    anyhow::bail!(
+                        "two sources resolve to the same target table \
+                         '{target_catalog}.{target_schema}.{target_table_name}': \
+                         '{}.{}' and '{}.{}'. Writing both would leave whichever \
+                         ran last, and the run would still report copying two \
+                         tables. This happens when `--shadow-schema` replaces a \
+                         schema template whose only distinguishing component is \
+                         the connector (e.g. `staging__{{source}}`). Use \
+                         `--shadow-suffix` instead, which keeps the template and \
+                         renames the table, or give the sources distinct target \
+                         tables.",
+                        prior.0,
+                        prior.1,
+                        this.0,
+                        this.1,
+                    );
+                }
+                preflight_claims.insert(id, this);
+            }
+        }
+    }
+
     // --- Sequential: catalog/schema setup + table collection ---
     // Governance operations route through the GovernanceAdapter trait
     // (Plan 01: genericize run.rs). Catalog/schema creation uses

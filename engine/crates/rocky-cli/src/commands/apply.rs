@@ -3578,6 +3578,32 @@ async fn run_apply_replication_plan(
         );
     }
 
+    // #1460: the config comparison above cannot see the state authority —
+    // `valkey_url` is redacted whole and the resolved `--state-path` is a
+    // caller argument, absent from the config. Compare the recorded identity so
+    // a plan cannot pass the config check and still apply against a different
+    // watermark/freeze/budget ledger.
+    //
+    // Absent means the plan predates this field; skip rather than refuse every
+    // older plan. New plans always record it.
+    if let Some(reviewed_authority) = replication_plan.state_authority.as_deref() {
+        let live_authority =
+            crate::commands::plan::state_authority_identity(&rocky_cfg.state, state_path);
+        if live_authority != reviewed_authority {
+            bail!(
+                "state authority has changed since plan '{plan_id}' was created.\n\
+                 reviewed: {reviewed_authority}\n\
+                 now:      {live_authority}\n\
+                 Watermarks, freezes, budgets and idempotency keys live in the \
+                 state store, so applying against a different one can redo work \
+                 the reviewed ledger recorded as done, or miss a freeze it \
+                 recorded.\n\
+                 Nothing was written. Re-plan against the intended state store, \
+                 or re-run with the state path the plan was created with."
+            );
+        }
+    }
+
     let (_pipeline_name, pipeline) = crate::registry::resolve_replication_pipeline(
         rocky_cfg,
         replication_plan.pipeline.as_deref(),
@@ -7693,6 +7719,7 @@ schema_template = "s__{source}"
             branch: None,
             governance_override: None,
             config_snapshot: serde_json::json!({"adapter": {"default": {"type": "duckdb"}}}),
+            state_authority: None,
             source_state_snapshot: vec![ReplicationConnectorSnapshot {
                 id: "raw__orders".to_string(),
                 schema: "raw__orders".to_string(),
@@ -7703,6 +7730,88 @@ schema_template = "s__{source}"
                 }],
             }],
         }
+    }
+
+    /// #1460: a plan must not apply against a different state store.
+    ///
+    /// The config comparison cannot catch this. `valkey_url` is redacted whole,
+    /// so a Valkey A-to-B swap compares equal, and the resolved `--state-path`
+    /// is a caller argument that never appears in the config at all. Yet
+    /// watermarks, freezes, budgets and idempotency keys all live there — so a
+    /// plan reviewed against one ledger and applied against another can redo
+    /// work the first recorded as done, or miss a freeze it recorded.
+    #[tokio::test]
+    async fn replication_apply_refuses_a_changed_state_authority() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let reviewed_state = dir.path().join("reviewed.redb");
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        rp.state_authority = Some(crate::commands::plan::state_authority_identity(
+            &planned.state,
+            &reviewed_state,
+        ));
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        // Same config, DIFFERENT state store — the case config equality misses.
+        let other_state = dir.path().join("other.redb");
+        let err = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &other_state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .expect_err("a different state store must not apply a plan reviewed against another");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("state authority has changed"),
+            "must refuse on the state-authority comparison, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// A plan written before the field existed must still apply. Absent means
+    /// "not recorded", not "mismatch" — otherwise this change would refuse
+    /// every plan already on disk.
+    #[tokio::test]
+    async fn replication_apply_tolerates_a_plan_without_a_state_authority() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        rp.state_authority = None; // pre-field plan
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        let res = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &dir.path().join("anywhere.redb"),
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await;
+        if let Err(e) = res {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("state authority has changed"),
+                "an unrecorded authority must not refuse, got: {msg}"
+            );
+        }
+        Ok(())
     }
 
     /// #1460: the plan's `config_snapshot` had no reader, so a config change

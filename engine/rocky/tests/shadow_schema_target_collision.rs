@@ -184,3 +184,61 @@ fn shadow_schema_refuses_targets_that_differ_only_by_case() {
         "expected the collision refusal, got: {stderr}"
     );
 }
+
+/// The refusal must land BEFORE any warehouse mutation. The collision was
+/// previously caught while collecting tables, which is after the setup loop
+/// creates catalogs and schemas, binds workspaces and applies grants — so a
+/// refused run could still have changed access control.
+#[test]
+fn the_collision_refusal_creates_no_target_schema() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed(dir);
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write config");
+
+    let out = run(dir, &["--shadow", "--shadow-schema", "shadow_x"]);
+    assert!(!out.status.success(), "must refuse");
+
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("reopen duckdb");
+    let created: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM information_schema.schemata \
+             WHERE schema_name IN ('shadow_x', 'staging__shopify', 'staging__stripe')",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count schemas");
+    assert_eq!(
+        created, 0,
+        "a refused run must not have created any target schema"
+    );
+}
+
+/// The preflight repeats three skip conditions the collection loop applies. If
+/// they drift, the preflight refuses a run that would have been fine — worse
+/// than the late refusal it replaces. This pins the condition most likely to
+/// drift: a table switched off by `enabled = false` must not count as a claim.
+///
+/// Both connectors hold `orders`, so under one shadow schema they WOULD
+/// collide — except stripe's is disabled, leaving exactly one writer.
+#[test]
+fn preflight_skips_a_disabled_table() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    seed(dir);
+    let cfg = format!(
+        "{ROCKY_TOML}\n\
+         [[pipeline.ingest.table_overrides]]\n\
+         match.connector = \"raw__stripe\"\n\
+         enabled = false\n"
+    );
+    fs::write(dir.join("rocky.toml"), cfg).expect("write config");
+
+    let out = run(dir, &["--shadow", "--shadow-schema", "shadow_x"]);
+    assert!(
+        out.status.success(),
+        "one enabled writer is not a collision — the preflight must not refuse; \
+         stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
