@@ -3526,6 +3526,45 @@ async fn run_apply_replication_plan(
             .with_context(|| format!("failed to load config from {}", config_path.display()))?,
     );
     let rocky_cfg = &loaded.config;
+
+    // #1460: the plan's config snapshot had no reader. It was written at plan
+    // time and never compared, so changing the adapter, database path, schema
+    // template or strategy between plan and apply re-routed an approved plan to
+    // unreviewed SQL or a different destination, with the source-state check
+    // still passing because discovery was unchanged.
+    //
+    // Compared whole, deliberately. The field's own doc rejects extracting a
+    // "replication-relevant subset" as a footgun: a runtime dependency on a
+    // field outside the subset would silently break replay. So any config
+    // change invalidates the plan and you re-plan.
+    //
+    // LIMIT worth knowing: secrets serialize as `"***"` by construction
+    // (`rocky_core::redacted`), so this compares routing and shape, NOT
+    // credentials. Swapping the password behind the same host is invisible
+    // here. Catching that needs a different mechanism.
+    let live_config_snapshot = serde_json::to_value(rocky_cfg)
+        .context("failed to serialize the live config for the plan comparison")?;
+    if live_config_snapshot != replication_plan.config_snapshot {
+        let changed =
+            changed_config_sections(&replication_plan.config_snapshot, &live_config_snapshot);
+        bail!(
+            "config has changed since plan '{plan_id}' was created{}.\n\
+             The plan is the reviewed artifact, so applying it against a \
+             different config would run SQL nobody approved — a changed \
+             adapter, path, schema template or strategy redirects the write \
+             while the source state still matches.\n\
+             Nothing was written. Re-plan with `rocky plan` and apply the new \
+             plan_id.\n\
+             Note: credentials are redacted in the snapshot, so a changed \
+             secret is not detected here.",
+            if changed.is_empty() {
+                String::new()
+            } else {
+                format!(" (differing sections: {})", changed.join(", "))
+            }
+        );
+    }
+
     let (_pipeline_name, pipeline) = crate::registry::resolve_replication_pipeline(
         rocky_cfg,
         replication_plan.pipeline.as_deref(),
@@ -3862,6 +3901,21 @@ fn connector_matches_filter(
 /// source-state snapshot and the live one. Surfaced inside the
 /// stale-source bail message so operators see what changed without
 /// having to inspect the plan file by hand.
+/// Top-level config sections that differ between two snapshots, so a refusal can
+/// say *what* changed instead of only that something did. Names only — values may
+/// contain redacted secrets and site-specific paths.
+fn changed_config_sections(persisted: &serde_json::Value, live: &serde_json::Value) -> Vec<String> {
+    let (Some(p), Some(l)) = (persisted.as_object(), live.as_object()) else {
+        return Vec::new();
+    };
+    let mut keys: std::collections::BTreeSet<&String> = p.keys().collect();
+    keys.extend(l.keys());
+    keys.into_iter()
+        .filter(|k| p.get(*k) != l.get(*k))
+        .map(|k| k.to_string())
+        .collect()
+}
+
 pub(crate) fn summarize_source_state_drift(
     persisted: &[ReplicationConnectorSnapshot],
     live: &[ReplicationConnectorSnapshot],
@@ -7636,6 +7690,96 @@ schema_template = "s__{source}"
                 }],
             }],
         }
+    }
+
+    /// #1460: the plan's `config_snapshot` had no reader, so a config change
+    /// between plan and apply went undetected. Discovery was unchanged, so the
+    /// source-state check still passed, and the approved plan ran against a
+    /// different adapter, path, schema template or strategy.
+    ///
+    /// Uses a snapshot taken from the real config, then changes the config —
+    /// so this fails for the intended reason, not because the stub snapshot in
+    /// `minimal_replication_plan` never matches anything.
+    #[tokio::test]
+    async fn replication_apply_refuses_a_changed_config() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        // Snapshot the config exactly as plan time does.
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        // Redirect the write: same discovery, different destination catalog.
+        std::fs::write(
+            &cfg_path,
+            REPLICATION_TOML.replace(r#"catalog_template = "c""#, r#"catalog_template = "other""#),
+        )?;
+
+        let state = dir.path().join("state.redb");
+        let err = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .expect_err("a changed config must not apply a plan reviewed against the old one");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("config has changed since plan"),
+            "must refuse on the config comparison, got: {msg}"
+        );
+        assert!(
+            msg.contains("Nothing was written"),
+            "the refusal must state nothing was written, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// The comparison must not fire when the config is untouched, or every
+    /// replication apply would refuse. Proves the refusal above is caused by
+    /// the change, not by the comparison always failing.
+    #[tokio::test]
+    async fn replication_apply_passes_the_config_check_when_unchanged() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        let state = dir.path().join("state.redb");
+        let res = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await;
+
+        // It may still fail further on (no live warehouse here). It must not
+        // fail on the config comparison.
+        if let Err(e) = res {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("config has changed since plan"),
+                "an unchanged config must pass the comparison, got: {msg}"
+            );
+        }
+        Ok(())
     }
 
     /// Round-trip: `ReplicationPlan` written to disk parses back into an
