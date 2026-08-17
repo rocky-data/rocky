@@ -124,14 +124,18 @@ fn the_suggested_shadow_suffix_alternative_isolates_both_connectors() {
 
     let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("reopen duckdb");
     let shopify: i64 = conn
-        .query_row("SELECT count(*) FROM staging__shopify.orders_shdw", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT count(*) FROM staging__shopify.orders_shdw",
+            [],
+            |r| r.get(0),
+        )
         .expect("shopify shadow rows");
     let stripe: i64 = conn
-        .query_row("SELECT count(*) FROM staging__stripe.orders_shdw", [], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT count(*) FROM staging__stripe.orders_shdw",
+            [],
+            |r| r.get(0),
+        )
         .expect("stripe shadow rows");
     assert_eq!(
         (shopify, stripe),

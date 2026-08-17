@@ -3016,18 +3016,36 @@ async fn run_apply_ai_authored_plan(
         state_path,
         &marker_freezes,
     );
-    match gate {
-        PolicyGate::NotConfigured => {
-            if !ai_plan_is_reviewed(root, plan_id) {
-                bail!(
-                    "AI-authored plan '{plan_id}' has not been reviewed and approved. \
-                     An AI agent authored this change, so it cannot be applied directly. \
-                     Review the breaking-change report and approve it first with \
-                     `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
-                );
-            }
-        }
-        gate => apply_policy_gate(root, plan_id, gate)?,
+    // #1459: human review is a FLOOR for an AI-authored plan, not a
+    // policy-dependent extra. This used to run only under
+    // `PolicyGate::NotConfigured`; every other gate went straight to
+    // `apply_policy_gate`, which returns `Ok(())` for `Allow` without
+    // consulting the marker. So configuring a `[policy]` block that resolved
+    // to `Allow` waived human review entirely — the protection was strongest
+    // with governance switched OFF, which is the opposite of what an operator
+    // would predict.
+    //
+    // `Allow` answers "may this principal do this?". The review gate answers
+    // "did a human read this machine-written change?". One is not an answer to
+    // the other, and `PolicyGate::RequireReview` already exists for estates
+    // that want policy to drive review.
+    //
+    // Order matters. The policy gate runs FIRST so its own refusals keep their
+    // wording and precedence: `Deny` still denies, and `RequireReview` without a
+    // marker still reports "policy requires human review" — which is what proves
+    // the kind-aware `ai_authored => agent` default is load-bearing.
+    //
+    // The marker check then runs unconditionally, catching the case policy lets
+    // through: `Allow` (and `NotConfigured`) return `Ok(())` without consulting
+    // the marker. Policy can therefore only TIGHTEN this gate, never waive it.
+    apply_policy_gate(root, plan_id, gate)?;
+    if !ai_plan_is_reviewed(root, plan_id) {
+        bail!(
+            "AI-authored plan '{plan_id}' has not been reviewed and approved. \
+             An AI agent authored this change, so it cannot be applied directly. \
+             Review the breaking-change report and approve it first with \
+             `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
+        );
     }
 
     // Resolve the post-apply verification checks before the run plan is moved.
@@ -4748,6 +4766,31 @@ auto_create_schemas = true
 version = 1
 "#;
 
+    /// #1459: a configured `[policy]` that resolves to `allow` for the agent
+    /// principal. This is the shape that used to waive human review entirely.
+    const ALLOW_POLICY_TOML: &str = r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+default_agent_effect = "allow"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#;
+
     /// Config with an adapter + pipeline and NO `[policy]` block.
     const NO_POLICY_TOML: &str = r#"
 [adapter]
@@ -4833,6 +4876,48 @@ auto_create_schemas = true
         assert!(
             msg.contains("policy requires human review"),
             "must be refused by the policy plane (not just the marker gate), got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// #1459: a configured policy resolving to `allow` must NOT waive human
+    /// review for a machine-authored plan.
+    ///
+    /// The marker check used to run only under `PolicyGate::NotConfigured`.
+    /// Every other gate went to `apply_policy_gate`, which returns `Ok(())` for
+    /// `Allow` without consulting the marker — so configuring a `[policy]` block
+    /// switched the review gate OFF. The protection was strongest with
+    /// governance absent, which is backwards.
+    ///
+    /// `Allow` answers "may this principal do this?". Review answers "did a
+    /// human read this machine-written change?". Policy may tighten the gate
+    /// (`Deny`, `RequireReview`) but never waive it.
+    #[tokio::test]
+    async fn configured_allow_policy_does_not_waive_ai_review() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("rocky.toml"), ALLOW_POLICY_TOML)?;
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.models = vec!["orders".to_string()];
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+
+        let state = dir.path().join("state.redb");
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            PolicyPrincipal::Agent,
+            true,
+        )
+        .await
+        .expect_err("an allow policy must not let an unreviewed AI plan apply");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has not been reviewed and approved"),
+            "must be refused by the review gate even though policy allowed it, got: {msg}"
         );
         Ok(())
     }
