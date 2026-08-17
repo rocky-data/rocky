@@ -61,11 +61,19 @@ use serde::{Deserialize, Serialize};
 ///
 /// `rocky plan <verb>` persists a plan and `rocky apply <plan-id>` replays it.
 /// The plan is the *reviewed artifact*, so apply deliberately does not re-derive
-/// it. The consequence is the thing to keep in mind when adding a check:
+/// it. The rule that follows is narrower than it first looks:
 ///
-/// > A guard over the plan **payload** replays by definition. A guard over
-/// > **derived** state — discovery output, compiled models, live warehouse
-/// > shape — is only re-established where that derivation repeats at apply.
+/// > Payload **values** survive a replay. Any **invariant over** those values
+/// > must be re-evaluated explicitly at every apply sink, unless the sink
+/// > structurally cannot observe an invalid shape.
+///
+/// Persisting a value is not the same as replaying the check that validated it.
+/// `ReplicationPlan.config_snapshot` is the counterexample: it is written at
+/// plan time and no production apply-side code reads it, so a plan whose
+/// adapter or destination changed between plan and apply is not detected by it.
+/// Guards over *derived* state — discovery output, compiled models, live
+/// warehouse shape — are likewise only re-established where that derivation
+/// repeats at apply.
 ///
 /// So when adding a plan-build-time check, ask *which entrypoints reach the
 /// line*, not whether the check is correct. That is how the duplicate
@@ -74,17 +82,18 @@ use serde::{Deserialize, Serialize};
 /// paths never call (#1310). Such checks belong at the seam every entrypoint
 /// crosses.
 ///
-/// Audited across all nine kinds:
+/// Audited across all nine kinds. Two entries below record a gap rather than a
+/// guarantee; do not read this table as a certification.
 ///
 /// | Kind | Load-bearing plan-time invariant | Re-established at apply? |
 /// |---|---|---|
 /// | `Run` | compile-time diagnostics | Yes — recompiles at apply |
 /// | `Promote` | duplicate physical target | **Was exposed**; now enforced at `run_promote_apply`, the shared seam (#1310) |
 /// | `Gc` | candidate is provably derivable | Yes — re-derives against the live store and takes derivability from the fresh candidate, never the payload; fail-closed on hash mismatch |
-/// | `Restore` | rebuilt bytes are hash-exact | Yes — structurally; the hash comparison *is* the operation |
+/// | `Restore` | rebuilt bytes are hash-exact | Point-in-time only — the hash is verified *before* the ledger row is reinstated, and nothing fences the object between the two |
 /// | `Compact` / `Archive` | policy gate | Yes — the gate runs at apply; a denied apply never reaches `execute_statement` |
-/// | `Replication` | source state matches what was reviewed | Yes — re-runs discovery and diffs against the persisted snapshot before any SQL is emitted |
-/// | `AiAuthored` | reviewed shape + run-plan diagnostics | Yes — review marker mandatory, then dispatches the same `execute_run_plan` as `Run` |
+/// | `Replication` | source state matches what was reviewed | **Partly — see #1460.** Apply discovers once for comparison, then `run` discovers again and builds work from the second result; `config_snapshot` has no production apply-side reader |
+/// | `AiAuthored` | human review before a machine-authored change executes | **No — see #1459.** The marker is only checked when policy is `NotConfigured`; a configured policy resolving to `Allow` reaches `apply_policy_gate`, which returns `Ok(())` without consulting it |
 /// | `Backfill` | reviewed closure + run-plan diagnostics | Yes for the closure — see the structural note on `run_apply_backfill_plan` |
 ///
 /// `Backfill` is the one entry whose safety is **structural rather than
