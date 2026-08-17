@@ -3912,7 +3912,7 @@ fn changed_config_sections(persisted: &serde_json::Value, live: &serde_json::Val
     keys.extend(l.keys());
     keys.into_iter()
         .filter(|k| p.get(*k) != l.get(*k))
-        .map(|k| k.to_string())
+        .map(ToString::to_string)
         .collect()
 }
 
