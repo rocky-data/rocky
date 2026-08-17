@@ -56,6 +56,43 @@ use rocky_core::config::{PolicyCapability, PolicyPrincipal};
 use serde::{Deserialize, Serialize};
 
 /// The kind of plan — used to guard cross-apply mismatches.
+///
+/// # Which plan-time invariants survive a replay (#1325)
+///
+/// `rocky plan <verb>` persists a plan and `rocky apply <plan-id>` replays it.
+/// The plan is the *reviewed artifact*, so apply deliberately does not re-derive
+/// it. The consequence is the thing to keep in mind when adding a check:
+///
+/// > A guard over the plan **payload** replays by definition. A guard over
+/// > **derived** state — discovery output, compiled models, live warehouse
+/// > shape — is only re-established where that derivation repeats at apply.
+///
+/// So when adding a plan-build-time check, ask *which entrypoints reach the
+/// line*, not whether the check is correct. That is how the duplicate
+/// physical-target refusal came to be absent from `branch promote --plan <id>`
+/// and `rocky apply <promote-plan>`: it sat inside discovery, which those
+/// paths never call (#1310). Such checks belong at the seam every entrypoint
+/// crosses.
+///
+/// Audited across all nine kinds:
+///
+/// | Kind | Load-bearing plan-time invariant | Re-established at apply? |
+/// |---|---|---|
+/// | `Run` | compile-time diagnostics | Yes — recompiles at apply |
+/// | `Promote` | duplicate physical target | **Was exposed**; now enforced at `run_promote_apply`, the shared seam (#1310) |
+/// | `Gc` | candidate is provably derivable | Yes — re-derives against the live store and takes derivability from the fresh candidate, never the payload; fail-closed on hash mismatch |
+/// | `Restore` | rebuilt bytes are hash-exact | Yes — structurally; the hash comparison *is* the operation |
+/// | `Compact` / `Archive` | policy gate | Yes — the gate runs at apply; a denied apply never reaches `execute_statement` |
+/// | `Replication` | source state matches what was reviewed | Yes — re-runs discovery and diffs against the persisted snapshot before any SQL is emitted |
+/// | `AiAuthored` | reviewed shape + run-plan diagnostics | Yes — review marker mandatory, then dispatches the same `execute_run_plan` as `Run` |
+/// | `Backfill` | reviewed closure + run-plan diagnostics | Yes for the closure — see the structural note on `run_apply_backfill_plan` |
+///
+/// `Backfill` is the one entry whose safety is **structural rather than
+/// enforced**: it deserializes the same `RunPlan` as `Run` and `AiAuthored` but
+/// does not call `validate_run_plan_execution_shape`. That is safe only because
+/// its apply path never reaches the DAG runner, and nothing enforces that it
+/// stays that way — the reasoning is written out at
+/// [`crate::commands::apply::run_apply_backfill_plan`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlanKind {
