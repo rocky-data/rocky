@@ -12807,6 +12807,127 @@ mod tests {
     // the `Succeeded` assertion fails because the entry is still
     // `InFlight`.
     // -----------------------------------------------------------------------
+    /// #1460: the reviewed source state must be re-checked where the work is
+    /// BUILT, not only in the apply path before `run` is called.
+    ///
+    /// The apply path discovers once to compare against the plan, then calls
+    /// `run`, which discovers again and builds work from the second result. A
+    /// connector appearing between the two executed unreviewed. This drives
+    /// `run` directly with a reviewed snapshot that does not match what
+    /// discovery finds, and asserts the refusal fires before any DDL.
+    #[tokio::test]
+    async fn execution_refuses_when_discovery_differs_from_the_reviewed_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let db = dir.join("x.duckdb");
+        {
+            use rocky_core::traits::WarehouseAdapter;
+            let a = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db).unwrap();
+            a.execute_statement("CREATE SCHEMA raw__orders")
+                .await
+                .unwrap();
+            a.execute_statement("CREATE TABLE raw__orders.t AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[state]
+backend = "local"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "default"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "default"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+"#,
+                db.display()
+            ),
+        )
+        .unwrap();
+
+        // A reviewed state naming a connector discovery will NOT find. That is
+        // the mismatch the sink has to catch.
+        let reviewed = vec![crate::output::ReplicationConnectorSnapshot {
+            id: "raw__ghost".to_string(),
+            schema: "raw__ghost".to_string(),
+            source_type: "duckdb".to_string(),
+            tables: vec![crate::output::ReplicationTableSnapshot {
+                name: "t".to_string(),
+                row_count: Some(1),
+            }],
+        }];
+
+        let state_path = dir.join("state.redb");
+        let opts = PartitionRunOptions::default();
+        let err = super::run(
+            &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
+            None,
+            None,
+            &state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &opts,
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            Some(("plan-under-test", reviewed.as_slice())),
+        )
+        .await
+        .expect_err("a reviewed state that does not match discovery must refuse");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("drifted between the check and execution"),
+            "expected the execution-seam refusal, got: {msg}"
+        );
+        assert!(
+            msg.contains("Nothing was written"),
+            "the refusal must state nothing was written, got: {msg}"
+        );
+
+        // No DDL assertion needed: the guard sits immediately after discovery
+        // binds `connectors`, and every catalog/schema creation happens in the
+        // setup loop far below it. Refusing here is structurally before any
+        // warehouse statement.
+    }
+
     #[tokio::test]
     async fn transformation_success_stamps_idempotency_succeeded_not_inflight() {
         use rocky_core::idempotency::IdempotencyState;
