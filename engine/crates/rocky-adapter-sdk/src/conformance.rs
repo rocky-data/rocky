@@ -12,8 +12,9 @@
 //! ```
 //!
 //! Pass `None` for the dialect when no live adapter is available (for example,
-//! `rocky test-adapter --builtin`). Dialect-category tests are reported as
-//! skipped in that mode rather than executed against a stub.
+//! the built-in path, `rocky test-adapter --adapter <name>`). Dialect-category
+//! tests are reported as skipped in that mode rather than executed against a
+//! stub.
 
 use std::time::Instant;
 
@@ -321,8 +322,9 @@ fn test_specs() -> Vec<TestSpec> {
 ///
 /// When `dialect` is `Some`, the harness executes one real trait call
 /// (`SqlDialect::format_table_ref`) as the first incremental live check.
-/// When `dialect` is `None` — for example in `rocky test-adapter --builtin`,
-/// which validates the test plan without a live warehouse — that spec is
+/// When `dialect` is `None` — for example on the built-in path
+/// (`rocky test-adapter --adapter <name>`), which validates the test plan
+/// without constructing a live adapter — that spec is
 /// reported as `Skipped` rather than executed against a stub. Remaining
 /// specs return placeholder passes; broader live execution lands in future
 /// SDK releases.

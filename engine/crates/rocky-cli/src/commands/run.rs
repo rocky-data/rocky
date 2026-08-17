@@ -6032,10 +6032,15 @@ pub(crate) fn dialect_case_rules(
         // resolution (see `defer.rs`'s
         // `snowflake_resolves_unquoted_identifiers_before_matching`), and
         // enabling it here is a one-line change. It is NOT enabled because doing
-        // so refuses every lowercase-configured Snowflake project — including
-        // this repo's own fixtures — and while the reasoning says such a project
-        // could not read its upstream in production either, that conclusion has
-        // not been verified against a live Snowflake account. Shipping it
+        // so refuses any lowercase-configured Snowflake project, and while the
+        // reasoning says such a project could not read its upstream in
+        // production either, that conclusion has not been verified against a
+        // live Snowflake account.
+        //
+        // The in-repo blast radius is one test fixture, not the examples: the
+        // only Snowflake POC (`05-orchestration/08-circuit-breaker`) is
+        // uppercase throughout (`catalog = "ANALYTICS"`), so it is unaffected.
+        // Do not read this deferral as "it would break our own examples". Shipping it
         // untested would trade a known, pre-existing and unchanged hazard for an
         // unmeasured break. Tracked as #1282; #1281 would settle it exactly.
         //
