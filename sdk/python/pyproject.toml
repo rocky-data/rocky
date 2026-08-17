@@ -48,8 +48,11 @@ dev = [
 # built cleanly. 1.30.0 emitted 2.5 too and was reverted in 1.30.1, so this is
 # an in-progress ecosystem transition rather than a one-off.
 #
-# Lift the `<1.32` ceiling once the publish action is bumped to a build
-# carrying twine >= 7.0.0 (verified to accept 2.5); see #1395.
+# Ceiling raised to `<1.33` in #1395 (2026-08-17), which bumped the publish
+# action to a build carrying twine 7.0.0 (verified to accept 2.5). Still
+# bounded, not open: 1.30.0 and 1.32.0 both shipped a metadata bump, so the
+# ceiling is what turns the next one into a caught failure instead of a
+# broken publish.
 requires = ["hatchling>=1.30.1,<1.33"]
 build-backend = "hatchling.build"
 

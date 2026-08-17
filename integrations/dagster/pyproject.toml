@@ -72,7 +72,10 @@ dagster_rocky = "dagster_rocky"
 # 1.32.0 (2026-08-11) emits `Metadata-Version: 2.5`, which the twine 6.1.0 in
 # our allow-listed `gh-action-pypi-publish` pin rejects at the publish step.
 # `dagster-release` uses the same action, so it would have failed identically.
-# Lift `<1.32` once that action carries twine >= 7.0.0; see #1395.
+# Ceiling raised to `<1.33` in #1395 (2026-08-17), which bumped that action
+# to a build carrying twine 7.0.0. Still bounded, not open: 1.30.0 and 1.32.0
+# both shipped a metadata bump, so the ceiling is what turns the next one into
+# a caught failure instead of a broken publish.
 requires = ["hatchling>=1.30.1,<1.33"]
 build-backend = "hatchling.build"
 
