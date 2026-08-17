@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The strict-scheduling refusal no longer tells you to omit a flag that does not exist.** When `[run] strict_scheduling` refused a run whose physical-read ordering could not be resolved, the error offered two remedies: declare `depends_on`, or "omit `--strict-scheduling`". There is no such CLI flag — `rocky run --strict-scheduling` fails with `unexpected argument`. Every real consumer reads the TOML key. The message now names only the key, and the doc comment says plainly that the setting is config-only. Whether to add the flag is tracked on #1357.
+
+### Fixed
+
 - **`rocky import-dbt` no longer ends with a command the CLI rejects.** Its Next Steps block printed `rocky ai explain --all --save`, which does not parse — `rocky ai` takes a positional `INTENT`, so `explain` is consumed as the intent and the flags are refused with `error: unexpected argument '--all' found`. The real subcommand is `rocky ai-explain`. The same invalid spelling appeared in a second user-facing hint and in four doc comments, three of which publish as JSON-schema descriptions for the `ai_*` outputs.
 
   The step is now also **gated**. `ai-explain --all` selects only models whose `intent` is unset, but the recommendation was emitted unconditionally — and the dbt importer seeds `intent` from dbt YAML `description` fields. Importing a documented project therefore produced a next step that, even spelled correctly, prints `No models to explain.` It is now offered only when an imported model actually lacks an intent, matching the predicate the command itself filters on. (#1443)

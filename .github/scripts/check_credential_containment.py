@@ -37,9 +37,9 @@ RUST_TOOLCHAIN_SOURCE = (
     "dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8"
 )
 RUST_CACHE_SOURCE = (
-    "Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4"
+    "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"
 )
-SETUP_UV_SOURCE = "astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9"
+SETUP_UV_SOURCE = "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d"
 SETUP_NODE_SOURCE = (
     "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
 )
@@ -55,13 +55,13 @@ WASM_PACK_SOURCE = (
 )
 SETUP_ZIG_SOURCE = "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29"
 PYPI_PUBLISH_SOURCE = (
-    "pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247"
+    "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
 )
 GH_RELEASE_SOURCE = (
     "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
 )
 TAIKI_INSTALL_SOURCE = (
-    "taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf"
+    "taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1"
 )
 # Actions a job may run when it is not reachable from a pull request. Release,
 # publish and deployment workflows never execute candidate code, so the

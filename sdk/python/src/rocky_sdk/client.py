@@ -109,6 +109,20 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 30
 # (whose Pipes path content-addresses every plan, a 1.34+ guarantee).
 MIN_ROCKY_VERSION = "1.34.0"
 
+
+class _Unset:
+    """Sentinel distinguishing "argument omitted" from an explicit ``None``.
+
+    Needed where ``None`` is itself meaningful — see :meth:`RockyClient.dag`,
+    where omitting ``models_dir`` must keep the previous behaviour while an
+    explicit ``None`` opts in to per-pipeline resolution.
+    """
+
+    __slots__ = ()
+
+
+_UNSET = _Unset()
+
 # Bytes of an inner payload surfaced on an error so the cause is visible without
 # dumping potentially-MB blobs.
 _JSON_ERROR_PREVIEW_BYTES = 500
@@ -351,6 +365,9 @@ class RockyClient:
         self._mirror_stderr = mirror_stderr
         self._resolved_binary: str | None = None
         self._version_checked = False
+        # Parsed engine version, when it could be determined. Kept so a
+        # per-feature floor can be checked without re-running ``--version``.
+        self._engine_version: tuple[int, int, int] | None = None
 
     # ------------------------------------------------------------------ #
     # Binary resolution + version gate                                   #
@@ -432,11 +449,41 @@ class RockyClient:
         # would otherwise sort (1, 34) below (1, 34, 0) and reject it.
         detected += (0,) * (3 - len(detected))
         required += (0,) * (3 - len(required))
+        self._engine_version = detected  # type: ignore[assignment]
 
         if detected < required:
             raise RockyVersionError(version_str, MIN_ROCKY_VERSION, binary)
 
         self._version_checked = True
+
+    def _require_engine(self, minimum: str, feature: str) -> None:
+        """Refuse a *feature* whose floor is above :data:`MIN_ROCKY_VERSION`.
+
+        The package-wide minimum is deliberately low, so a method relying on
+        newer engine behaviour has to state its own floor. Without this, an
+        accepted-but-older binary silently does something different — the worst
+        outcome here being a model discovered from one models root and executed
+        from another.
+
+        Matches the surrounding fail-open policy: when the version could not be
+        determined the call proceeds with a warning, because a slow or unusual
+        environment should not block every command. A silently skipped gate is
+        how an incompatible binary reaches a confusing failure later, so the
+        skip is logged.
+        """
+        self._verify_engine_version()
+        if self._engine_version is None:
+            self._logger.warning(
+                "engine version unknown; proceeding with %s, which needs rocky >= %s",
+                feature,
+                minimum,
+            )
+            return
+        required = tuple(int(x) for x in minimum.split(".")[:3])
+        required += (0,) * (3 - len(required))
+        if self._engine_version < required:
+            detected = ".".join(str(x) for x in self._engine_version)
+            raise RockyVersionError(detected, minimum, self._resolve_binary())
 
     # ------------------------------------------------------------------ #
     # argv construction                                                  #
@@ -1064,6 +1111,7 @@ class RockyClient:
         self,
         model_name: str,
         *,
+        pipeline: str | None = None,
         filter: str | None = None,
         partition: str | None = None,
         partition_from: str | None = None,
@@ -1076,8 +1124,26 @@ class RockyClient:
         """Run ``rocky run --model <name>`` for a single compiled model.
 
         ``--model`` skips the replication phase and executes only the named model.
+
+        ``pipeline`` names the transformation pipeline the model belongs to. When
+        given, ``--models`` is **not** sent: the engine resolves that pipeline's
+        own configured root, which is what :meth:`dag` discovers against. On a
+        project with two or more transformation pipelines the engine refuses a
+        bare ``--model`` regardless of ``--models`` ("cannot know which pipeline
+        (and adapter) the model belongs to"), so ``--pipeline`` is the only way
+        to execute one — and passing both would override the pipeline's root
+        with a whole-project one, which is the discovery/execution split #1348
+        warns about.
+
+        Leaving ``pipeline`` at ``None`` keeps the previous argv exactly, for
+        single-pipeline callers.
         """
-        args = ["run", "--model", model_name, "--models", self.models_dir]
+        args = ["run", "--model", model_name]
+        if pipeline is not None:
+            self._require_engine("1.69.0", "run_model(pipeline=...)")
+            args.extend(["--pipeline", pipeline])
+        else:
+            args.extend(["--models", self.models_dir])
         if filter is not None:
             args.extend(["--filter", filter])
         if partition is not None:
@@ -1222,9 +1288,41 @@ class RockyClient:
             args.extend(["--out", out])
         return _parse_rocky_json(self.run_cli(args), CatalogOutput, command="catalog")
 
-    def dag(self, *, column_lineage: bool = False) -> DagResult:
-        """Run ``rocky dag`` and return the full unified DAG."""
-        args = ["dag", "--models", self.models_dir]
+    def dag(
+        self,
+        *,
+        column_lineage: bool = False,
+        models_dir: str | None | _Unset = _UNSET,
+    ) -> DagResult:
+        """Run ``rocky dag`` and return the full unified DAG.
+
+        ``--models`` is an explicit *whole-project* override: the engine gives
+        that one directory's models to **every** transformation pipeline, so a
+        project with two of them is refused outright (``model 'x' is claimed by
+        transformation pipelines a and b``), which made such projects
+        undiscoverable (#1348).
+
+        ``models_dir`` is three-state, so no existing caller changes:
+
+        * **omitted** — send ``--models <self.models_dir>``, exactly as before.
+        * ``None`` — *opt in* to per-pipeline resolution: omit the flag so each
+          pipeline resolves its own configured root, the branch
+          ``rocky run --dag`` already used. Needs engine >= 1.68.0.
+        * a string — that whole-project override, deliberately.
+
+        Opt in on both sides or neither. Pair ``models_dir=None`` with
+        ``run_model(pipeline=...)``: opting in here alone would have discovery
+        read a pipeline's own root while execution still forced
+        ``self.models_dir``, which is the split #1348 warns about — a model
+        discovered from one directory and materialized from another.
+        """
+        args = ["dag"]
+        if isinstance(models_dir, _Unset):
+            args.extend(["--models", self.models_dir])
+        elif models_dir is not None:
+            args.extend(["--models", models_dir])
+        else:
+            self._require_engine("1.68.0", "dag(models_dir=None)")
         if self.contracts_dir is not None:
             args.extend(["--contracts", self.contracts_dir])
         if column_lineage:

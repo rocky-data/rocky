@@ -85,7 +85,7 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: engine
           key: release-${{ matrix.target }}
@@ -118,7 +118,7 @@ jobs:
         if: matrix.zigbuild
         # Prebuilt binary — avoids ~35s of `cargo install cargo-zigbuild
         # --locked` (compiles from source) per Linux target.
-        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
         with:
           tool: cargo-zigbuild
 

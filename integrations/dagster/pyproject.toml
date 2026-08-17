@@ -27,7 +27,14 @@ dependencies = [
     # freeze-marker and schedule/tick output types; an older SDK would be missing
     # them (and also the 0.8.3 `--models` forwarding + retention `env` guard fixes
     # the model-aware resource methods depend on).
-    "rocky-sdk>=0.9.1",
+    # 0.12.0 is the first release with `dag(models_dir=...)` and
+    # `run_model(pipeline=...)`. This resource passes both keywords
+    # unconditionally, so an older SDK — legal under the previous `>=0.9.1` —
+    # raises TypeError during DAG discovery and per-model execution. The
+    # monorepo path source masks that in dev and CI, so this floor is the only
+    # thing protecting the published wheel. Release rocky-sdk 0.12.0 BEFORE any
+    # dagster-rocky release carrying this floor. (#1348)
+    "rocky-sdk>=0.12.0",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.
