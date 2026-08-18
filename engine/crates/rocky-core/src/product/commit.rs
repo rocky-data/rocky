@@ -1629,6 +1629,89 @@ mod tests {
         assert_eq!(error.code, "staging-journal-corrupt");
     }
 
+    #[test]
+    fn crash_during_a_cold_phase_a_removes_the_renamed_new_files() {
+        // Added coverage (no answer-key counterpart): on a COLD project
+        // every staged file is brand-new (`has_prev = false`), so rollback
+        // has no backup to restore — it must instead REMOVE a renamed new
+        // file whose bytes still match the journaled staged hash. A
+        // mutation pass showed no ported test reached that branch: every
+        // Phase-B drill replaces files that exist, so `has_prev` is always
+        // true there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        let lowering = lower_phase_a(&parsed, SPEC_PATH).expect("lowers");
+
+        // Phase A commits 3 renames: journal (1), contract (2), manifest
+        // (3). Fail at 3: the brand-new contract has already renamed into
+        // place; the manifest (the marker) has not.
+        let mut calls = 0usize;
+        let mut rename = |src: &Path, dst: &Path| {
+            calls += 1;
+            if calls == 3 {
+                return Err(std::io::Error::other("injected crash between staged renames"));
+            }
+            std::fs::rename(src, dst)
+        };
+        let mut remove = |p: &Path| std::fs::remove_file(p);
+        commit_generation_with_ops(
+            &project,
+            &parsed,
+            &lowering,
+            &mut CommitOps {
+                rename: &mut rename,
+                remove: &mut remove,
+            },
+        )
+        .expect_err("the injected crash must surface");
+
+        let contract = project.join("models/revenue_daily.contract.toml");
+        assert!(contract.is_file(), "the new file renamed before the crash");
+        assert_eq!(
+            recover_generation(&project, &parsed).expect("recovers"),
+            RecoveryAction::RolledBack
+        );
+        assert!(
+            !contract.exists(),
+            "an uncommitted brand-new file must be removed, not left behind"
+        );
+        assert_eq!(leftovers(&project), Vec::<String>::new());
+        assert!(!manifest_path(&project).exists());
+    }
+
+    #[test]
+    fn half_canonical_path_aliases_are_refused_as_unsafe() {
+        // Added coverage (no answer-key counterpart): `a//b`, `a/./b`, and
+        // `a/b/` are aliases `Path::components` silently normalizes, so
+        // without the canonical-spelling gate they would flow onward and be
+        // refused later under a DIFFERENT rule (the namespace check) — the
+        // half-canonical-identity trap. The spelling gate refuses them as
+        // unsafe paths before any resolution. A mutation pass showed no
+        // ported test pinned this: the answer key's traversal cases also
+        // trip the component check.
+        let parsed = parsed_d3();
+        for alias in [
+            "models//revenue_daily.contract.toml",
+            "models/./revenue_daily.contract.toml",
+            "models/revenue_daily.contract.toml/",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let project = seeded_project(dir.path());
+            write_journal(
+                &project,
+                "revenue_daily",
+                &forged_journal_payload(&[serde_json::json!({
+                    "final": alias,
+                    "staged_sha": content_digest(b"x"),
+                    "has_prev": false,
+                })]),
+            );
+            let error = recover_generation(&project, &parsed).expect_err("refused");
+            assert_eq!(error.code, "staging-journal-unsafe-path", "{alias}");
+        }
+    }
+
     // -------- the crash claim is process death, proved with a dead child ----
 
     /// Child half of the SIGKILL drill. Not a test: it runs only when the
