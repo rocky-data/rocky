@@ -17,10 +17,10 @@ These questions are also red-team bait, deliberately. Give every substantive ana
 
 Write for a person who is busy. These rules apply to chat replies, PR descriptions, and reports. For public documentation pages, [`docs/STYLE.md`](docs/STYLE.md) is the full contract.
 
-- Lead with the outcome. One to three short lines. Detail comes after, and only if it changes a decision.
+- Lead with the outcome in one to three short lines. Put supporting detail afterward. Include detail needed to understand, verify, or act on the outcome.
 - Short sentences. One idea per sentence. Aim for under 25 words.
 - No jargon. If a technical term must appear, explain it in plain words the first time.
-- Draw flows, orders, and state changes as ASCII diagrams. Delete the prose the diagram replaces.
+- Use an ASCII diagram when it makes a flow, sequence, or state change clearer. Delete only prose the diagram makes redundant.
 - Keep code, commands, flags, paths, and error codes exact. Never simplify those. A shorter sentence that loses a condition is a defect.
 
 ## Subprojects
