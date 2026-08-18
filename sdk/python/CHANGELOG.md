@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.12.0] — 2026-08-18
 
+### Added
+
+- **`review_status()`** — a typed read of a plan's review marker, backed by the new `review_status` schema. Markers are parse-and-match validated, so a truncated or mispasted one reports unapproved rather than approving. (#1472)
+
 ### Fixed
 
 - **`dag()` no longer forces a whole-project models override, which made multi-transformation projects undiscoverable.** It always sent `--models <models_dir>`. The engine reads that as an explicit *whole-project* override and assigns that one directory's models to **every** transformation pipeline, so a project with two of them was refused outright — `model 'x' is claimed by transformation pipelines a and b` — before any caller could see a DAG. `models_dir` now defaults to `None` and the flag is omitted, so each pipeline resolves its own configured root (the branch `rocky run --dag` already used). Pass `models_dir=` to ask for the override deliberately. (#1348)

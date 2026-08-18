@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ## [1.71.0] — 2026-08-18
+
+### Added
+
+- **Plans can carry a product identity, and `rocky apply` can require it.** `RunPlan` gains optional `product_id` / `spec_digest` — both or neither. Absent fields serialize exactly as before, so existing plan ids are unchanged. `rocky apply --expect-spec-digest <hex>` fails closed in both directions: a product-bound plan refuses a bare apply, and a mismatched or missing binding refuses before any policy arm runs. The `compact`, `archive` and `branch promote` plan aliases refuse product-bound payloads outright and point at canonical `rocky apply`. MCP `propose` accepts the pair plus an optional idempotency key, deriving `<product>@<digest>` when omitted. (#1472)
+
+- **`rocky review --status`** — a typed marker oracle, with a `review_status` schema, an SDK `review_status()` method and a Dagster resource method. Review markers are now written atomically and parse-and-match validated everywhere they gate, so a truncated or mispasted marker refuses instead of approving. `review_queue` gains a product filter, and a corrupt plan there surfaces as a warning rather than being dropped. (#1472)
+
+- **`draft_metadata` MCP tool** — governed, structured sidecar patches for freshness and classifications. Parse-merge only, rolled back on deny or compile failure, with policy evaluated over the post-image. `draft_model` on an existing model now preserve-merges the sidecar, replacing only `name` and `intent`, and its policy is evaluated over both the pre- and post-image classifications with the most restrictive verdict winning — so adding or erasing a classification can no longer de-scope a deny in either direction. A sidecar that exists but cannot be read is refused rather than clobbered. (#1472)
+
+- **`rocky mcp --profile worker`** — a minimal drafting allowlist that excludes `propose`, `review_queue`, `draft_contract`, `draft_metadata` and `pause_schedule`. Its prompts and next-steps end at a hand-off instead of naming tools the profile does not expose. (#1472)
+
+- **`JobRequest.expect_spec_digest`** threads the apply expectation through the serve API. (#1472)
+
 ### Changed
 
 These three refuse where they previously proceeded. Each closes a path that

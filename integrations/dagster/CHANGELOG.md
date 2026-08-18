@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [1.63.0] — 2026-08-18
 
+### Added
+
+- **`RockyResource.review_status()`** — mirrors the SDK method, so a Dagster op can check whether a plan is approved before applying it. (#1472)
+
 ### Fixed
 
 - **A project with two or more transformation pipelines can now produce an asset graph.** `RockyComponent` caches `rocky.dag(...)`, and that call forced a whole-project `--models`, which the engine refuses on a multi-transformation project — so definitions failed to build at all. The DAG call now lets each pipeline resolve its own models root. (#1348)
