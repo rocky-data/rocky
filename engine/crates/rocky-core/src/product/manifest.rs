@@ -494,18 +494,31 @@ fn properties_of<'s>(
     let source = if model == "SpecFile" {
         root
     } else {
-        &definitions[model]
+        definitions.get(model).unwrap_or_else(|| {
+            panic!(
+                "the spec schema carries no definition for '{model}', yet the leaf walk \
+                 reached it as a model. The walk only names models it has already resolved, \
+                 so this means the schema shape and this walk disagree — and an empty field \
+                 set here would hide every field of '{model}' from the totality check."
+            )
+        })
     };
-    source
+    // Reached only for a model the walk resolved, which by construction has
+    // properties. Loud rather than empty for the same reason: silence here is
+    // indistinguishable from "this model has no fields to account for".
+    let properties = source
         .get("properties")
         .and_then(serde_json::Value::as_object)
-        .map(|properties| {
-            properties
-                .iter()
-                .map(|(name, fragment)| (name.clone(), fragment))
-                .collect()
-        })
-        .unwrap_or_default()
+        .unwrap_or_else(|| {
+            panic!(
+                "the spec schema defines no properties for '{model}', yet the leaf walk \
+                 reached it as a model — the totality check would silently cover nothing."
+            )
+        });
+    properties
+        .iter()
+        .map(|(name, fragment)| (name.clone(), fragment))
+        .collect()
 }
 
 /// A unit-lowered model's leaf field names, dotted where models nest.
@@ -1067,6 +1080,27 @@ agent = "propose_only"
     }
 
     // ----- the schema walk itself -----
+
+    #[test]
+    #[should_panic(expected = "carries no definition")]
+    fn an_unresolvable_model_stops_the_walk_instead_of_covering_nothing() {
+        // The walk names only models it has already resolved, so this state
+        // means the schema shape and the walk disagree. The failure mode being
+        // pinned is the quiet one: returning an empty field set would let the
+        // whole model vanish from the totality check while it still reported
+        // success.
+        let root = serde_json::json!({ "properties": {} });
+        let definitions = serde_json::json!({});
+        let _ = leaf_fields_of("Missing", "", &definitions, &root);
+    }
+
+    #[test]
+    #[should_panic(expected = "defines no properties")]
+    fn a_model_reached_without_properties_stops_the_walk() {
+        let root = serde_json::json!({ "properties": {} });
+        let definitions = serde_json::json!({ "Hollow": { "type": "object" } });
+        let _ = leaf_fields_of("Hollow", "", &definitions, &root);
+    }
 
     #[test]
     fn leaf_derivation_recurses_through_a_nested_unit_model() {
