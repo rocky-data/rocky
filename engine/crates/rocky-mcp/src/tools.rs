@@ -2198,15 +2198,15 @@ impl RockyMcpServer {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    table.insert(
-                        "name".to_string(),
-                        toml::Value::String(paths.stem.clone()),
-                    );
+                    table.insert("name".to_string(), toml::Value::String(paths.stem.clone()));
                     let intent = args.intent.trim();
                     if intent.is_empty() {
                         table.remove("intent");
                     } else {
-                        table.insert("intent".to_string(), toml::Value::String(intent.to_string()));
+                        table.insert(
+                            "intent".to_string(),
+                            toml::Value::String(intent.to_string()),
+                        );
                     }
                     let serialized = toml::to_string(&table).map_err(|e| {
                         ToolError::internal(

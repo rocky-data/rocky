@@ -514,7 +514,10 @@ effect = "require_review"
     // FF-WP1 fix round (finding 4): the recorded plan reference is TYPED —
     // `plan_id` + the product binding ride as envelope fields, so the runner
     // reads them structurally instead of scraping prose.
-    assert_eq!(bound_err["code"], serde_json::json!("policy_review_required"));
+    assert_eq!(
+        bound_err["code"],
+        serde_json::json!("policy_review_required")
+    );
     let bound_plan_id = bound_err["plan_id"]
         .as_str()
         .expect("the recorded plan_id is a typed envelope field")
@@ -1466,7 +1469,11 @@ async fn draft_model_refuses_to_clobber_an_unparseable_sidecar() {
         )
         .await
         .expect("draft_model returns a result");
-    assert_eq!(result.is_error, Some(true), "an unparseable sidecar refuses");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an unparseable sidecar refuses"
+    );
     let err = result.structured_content.expect("envelope");
     assert_eq!(err["code"], serde_json::json!("invalid_argument"));
     assert!(

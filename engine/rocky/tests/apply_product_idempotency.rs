@@ -90,8 +90,11 @@ async fn product_bound_plan_applies_once_then_skips_idempotently() {
     fs::write(&config, ROCKY_TOML).expect("write config");
     let models = dir.join("models");
     fs::create_dir(&models).expect("create models");
-    fs::write(models.join("orders_mart.sql"), "SELECT 1 AS id, 100 AS revenue")
-        .expect("write model sql");
+    fs::write(
+        models.join("orders_mart.sql"),
+        "SELECT 1 AS id, 100 AS revenue",
+    )
+    .expect("write model sql");
     fs::write(models.join("orders_mart.toml"), MODEL_TOML).expect("write model config");
 
     // --- 1. propose over the in-process MCP server (the sole plan writer) ---
@@ -127,12 +130,18 @@ async fn product_bound_plan_applies_once_then_skips_idempotently() {
     client.cancel().await.unwrap();
 
     // The persisted payload carries the pair + the DERIVED idempotency key.
-    let plan_path = dir.join(".rocky").join("plans").join(format!("{plan_id}.json"));
+    let plan_path = dir
+        .join(".rocky")
+        .join("plans")
+        .join(format!("{plan_id}.json"));
     let plan: serde_json::Value =
         serde_json::from_slice(&fs::read(&plan_path).expect("read plan")).expect("plan json");
     assert_eq!(plan["kind"], serde_json::json!("ai_authored"));
     assert_eq!(plan["payload"]["product_id"], serde_json::json!(PRODUCT_ID));
-    assert_eq!(plan["payload"]["spec_digest"], serde_json::json!(SPEC_DIGEST));
+    assert_eq!(
+        plan["payload"]["spec_digest"],
+        serde_json::json!(SPEC_DIGEST)
+    );
     let derived_key = format!("{PRODUCT_ID}@{SPEC_DIGEST}");
     assert_eq!(
         plan["payload"]["idempotency_key"],
@@ -213,7 +222,10 @@ async fn product_bound_plan_applies_once_then_skips_idempotently() {
                 |row| row.get(0),
             )
             .expect("query table");
-        assert_eq!(count, 1, "the first apply materialized fixture.main.orders_mart");
+        assert_eq!(
+            count, 1,
+            "the first apply materialized fixture.main.orders_mart"
+        );
     }
 
     // --- 5. the second identical apply reports the idempotent skip ---------

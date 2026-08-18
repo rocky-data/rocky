@@ -91,20 +91,34 @@ pub struct ToolError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_rule: Option<String>,
     /// The RECORDED plan behind a `propose` that resolved to
-    /// [`ToolErrorCode::PolicyReviewRequired`] — the plan was persisted for a
-    /// human reviewer, and this is its id, typed, so a runner never scrapes
-    /// it out of `message` prose. Absent on every other error (a draft-tool
-    /// require-review persists a draft file, not a plan).
+    /// [`ToolErrorCode::PolicyReviewRequired`] — set only by
+    /// [`ToolError::policy_review_required_for_plan`]; `None` (nothing on the
+    /// wire) for every other error, draft-tool require-reviews included (a
+    /// draft persists a file, not a plan). Boxed and `serde(flatten)`ed: the
+    /// WIRE shape is the flat optional `plan_id` / `product_id` /
+    /// `spec_digest` fields, while the common Err variant stays small
+    /// (clippy `result_large_err` on the `Result<_, Json<ToolError>>`
+    /// helpers).
+    #[serde(flatten)]
+    pub recorded_plan: Option<Box<RecordedPlanHandoff>>,
+}
+
+/// The typed recorded-plan reference riding on `propose`'s
+/// `policy_review_required` envelope — the machine handoff a fulfillment
+/// runner branches on instead of scraping `message` prose. Serialized
+/// flattened into [`ToolError`], so on the wire these are plain optional
+/// top-level fields of the error envelope.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct RecordedPlanHandoff {
+    /// 64-char blake3 id of the plan that was persisted for human review.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
     /// Product identity the recorded plan is bound to, echoed verbatim when
-    /// the propose carried one. Rides with `plan_id` on the
-    /// `policy_review_required` handoff; absent otherwise.
+    /// the propose carried one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub product_id: Option<String>,
     /// Approved-spec digest the recorded plan is bound to, echoed verbatim
-    /// when the propose carried one. Rides with `plan_id` on the
-    /// `policy_review_required` handoff; absent otherwise.
+    /// when the propose carried one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_digest: Option<String>,
 }
@@ -123,9 +137,7 @@ impl ToolError {
             message: message.into(),
             remediation_hint: remediation_hint.into(),
             policy_rule: None,
-            plan_id: None,
-            product_id: None,
-            spec_digest: None,
+            recorded_plan: None,
         })
     }
 
@@ -207,9 +219,7 @@ impl ToolError {
             message: message.into(),
             remediation_hint: remediation_hint.into(),
             policy_rule,
-            plan_id: None,
-            product_id: None,
-            spec_digest: None,
+            recorded_plan: None,
         })
     }
 
@@ -260,9 +270,11 @@ impl ToolError {
             hint,
             policy_rule,
         );
-        wrapped.0.plan_id = Some(plan_id.into());
-        wrapped.0.product_id = product_id;
-        wrapped.0.spec_digest = spec_digest;
+        wrapped.0.recorded_plan = Some(Box::new(RecordedPlanHandoff {
+            plan_id: Some(plan_id.into()),
+            product_id,
+            spec_digest,
+        }));
         wrapped
     }
 

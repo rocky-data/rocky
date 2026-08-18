@@ -1535,10 +1535,12 @@ fn evaluate_apply_policy_with_policy_matching_union(
     // these classifications matches it rather than falling to bare defaults.
     if let Some(extra) = extra_classifications {
         for (model, classes) in extra {
-            let attrs = attrs_map.entry(model.clone()).or_insert_with(|| ModelAttributes {
-                name: model.clone(),
-                ..Default::default()
-            });
+            let attrs = attrs_map
+                .entry(model.clone())
+                .or_insert_with(|| ModelAttributes {
+                    name: model.clone(),
+                    ..Default::default()
+                });
             for class in classes {
                 attrs.classifications.insert(class.clone());
             }
