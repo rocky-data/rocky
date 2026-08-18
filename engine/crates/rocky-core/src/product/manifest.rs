@@ -1065,4 +1065,48 @@ agent = "propose_only"
         assert_eq!(out, r#""a\u2014b\u0001\"\\\n\ud83d\ude00""#);
         assert!(out.is_ascii());
     }
+
+    // ----- the schema walk itself -----
+
+    #[test]
+    fn leaf_derivation_recurses_through_a_nested_unit_model() {
+        // Today no unit model nests another, so the real schema cannot
+        // exercise this branch — and an unexercised branch in a totality
+        // checker is a hole waiting for the first nested model. A
+        // synthetic schema of the shape schemars emits pins it now.
+        let root = serde_json::json!({
+            "properties": {
+                "outer": { "$ref": "#/definitions/Outer" }
+            }
+        });
+        let definitions = serde_json::json!({
+            "Outer": {
+                "properties": {
+                    "plain": { "type": "string" },
+                    "inner": {
+                        "anyOf": [{ "$ref": "#/definitions/Inner" }, { "type": "null" }]
+                    },
+                    "tag": { "$ref": "#/definitions/Tag" }
+                }
+            },
+            "Inner": { "properties": { "deep": { "type": "string" } } },
+            // No `properties`: an enum, which lowers as a scalar leaf.
+            "Tag": { "oneOf": [{ "type": "string", "enum": ["a"] }] }
+        });
+        let leaves = leaf_fields_of("Outer", "", &definitions, &root);
+        let expected: BTreeSet<String> = ["plain", "inner.deep", "tag"]
+            .iter()
+            .map(|leaf| (*leaf).to_string())
+            .collect();
+        assert_eq!(leaves, expected);
+    }
+
+    #[test]
+    fn a_ref_to_a_property_less_definition_is_a_leaf_not_a_model() {
+        // `FreshnessSpec.severity` is exactly this shape in the real
+        // schema. Treating the enum as a model would silently drop the
+        // `severity` leaf from the coverage claim, and the derived map
+        // would stop matching the claim.
+        assert!(spec_leaf_coverage()["product.output.freshness"].contains("severity"));
+    }
 }

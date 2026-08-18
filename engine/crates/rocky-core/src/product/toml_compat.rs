@@ -645,7 +645,10 @@ mod tests {
         assert_eq!(basic_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
         // Tab takes its compact form here, unlike the writer's.
         assert_eq!(basic_string("a\tb"), "\"a\\tb\"");
-        // Uppercase hex, and DEL is left alone.
+        // Uppercase hex — ESC is the shortest control character whose hex
+        // carries a letter, so it is what tells the two cases apart.
+        assert_eq!(basic_string("\u{1b}"), "\"\\u001B\"");
+        // And DEL is left alone.
         assert_eq!(basic_string("\u{1}\u{7f}"), "\"\\u0001\u{7f}\"");
     }
 }

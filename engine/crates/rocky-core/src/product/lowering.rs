@@ -1287,21 +1287,71 @@ mod tests {
     }
 
     #[test]
-    fn a_preserved_scalar_never_falls_below_a_preserved_table() {
-        // A sidecar whose tables precede its scalars still renders as
-        // valid TOML, because the merge reorders scalars above tables.
+    fn a_preserved_scalar_survives_and_stays_above_the_tables() {
+        // An inline table puts a table-valued key BEFORE a scalar in the
+        // source, which is the one arrangement that can invert the two.
+        // The scalar must survive the merge and still render above every
+        // table header, or the file it produces is not valid TOML.
         let parsed = parsed_d3();
         let sidecar = format!(
-            "{DRAFT_MODEL_SIDECAR}\n[target]\ncatalog = \"poc\"\n\n\
-             [other]\nk = 1\n"
+            "{DRAFT_MODEL_SIDECAR}target = {{ catalog = \"poc\" }}\nstrategy = \"merge\"\n"
         );
         let merged = merged_text(&parsed, &sidecar);
-        // Round-tripping proves the layout is valid, and the value is the
-        // one the human wrote.
+        let strategy = merged.find("strategy = ").expect("the scalar must survive");
+        let target = merged.find("[target]").expect("the table must survive");
+        assert!(
+            strategy < target,
+            "a preserved scalar must stay above every table:\n{merged}"
+        );
         let document = parse_ordered(&merged).expect("valid TOML");
+        assert_eq!(document["strategy"], TomlValue::string("merge"));
         assert_eq!(
             *document["target"].as_table().expect("target"),
             test_entry(&[("catalog", "poc")])
         );
+    }
+
+    #[test]
+    fn a_nullable_column_gets_no_not_null_test() {
+        // Every column in the fixture is non-nullable, so the goldens
+        // cannot tell the guard from its absence. This can.
+        let text = String::from_utf8(SPEC_FIXTURE.to_vec())
+            .expect("utf-8")
+            .replace(
+                r#"{ name = "revenue_eur", type = "Decimal(18,2)", nullable = false },"#,
+                r#"{ name = "revenue_eur", type = "Decimal(18,2)", nullable = true },"#,
+            );
+        let parsed = parse_spec_bytes(text.as_bytes(), SPEC_PATH).expect("valid");
+        let tests = generated_tests(&parsed);
+        assert!(
+            !tests.contains(&test_entry(&[
+                ("type", "not_null"),
+                ("column", "revenue_eur")
+            ])),
+            "a nullable column must not be asserted non-null: {tests:?}"
+        );
+        // …and the non-nullable ones still are.
+        assert!(tests.contains(&test_entry(&[
+            ("type", "not_null"),
+            ("column", "client_id")
+        ])));
+    }
+
+    #[test]
+    fn a_freshness_budget_too_wide_for_toml_is_refused() {
+        // The budget grammar accepts more seconds than a TOML integer can
+        // hold. Emitting one would write a sidecar that does not parse
+        // back, so the merge refuses instead.
+        let text = String::from_utf8(SPEC_FIXTURE.to_vec())
+            .expect("utf-8")
+            .replace(r#"max_lag = "24h""#, r#"max_lag = "200000000000000d""#);
+        let parsed = parse_spec_bytes(text.as_bytes(), SPEC_PATH).expect("the grammar accepts it");
+        let error = merge_sidecar_text(
+            &parsed,
+            &drafted_sidecar_text(),
+            "models/revenue_daily.toml",
+        )
+        .expect_err("unrepresentable");
+        assert_eq!(error.code, "max-lag-unrepresentable");
     }
 }
