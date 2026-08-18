@@ -187,9 +187,11 @@ silent divergence.
 Replay means two distinct things. Being precise about which one ships matters.
 
 **The first is deterministic recording with ledger verification.** Rocky records
-each run's per-model SQL hashes, row counts, bytes, and timings. It
-content-addresses the written artifacts: it names each one by the hash of its own
-bytes. The same inputs and code therefore produce the same physical files.
+each run's per-model SQL hashes, row counts, bytes, and timings when the
+execution path supplies them. Deterministic content-addressed materializations
+produce hash-named artifacts; ordinary warehouse runs do not provide byte-level
+replay proof. On the content-addressed path, each file is named by the hash of
+its own bytes, so the same inputs and code produce the same physical files.
 `rocky replay <run_id>` inspects that record and verifies it against the ledger.
 That ships today.
 

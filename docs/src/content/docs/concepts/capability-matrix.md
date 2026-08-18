@@ -26,23 +26,32 @@ The three classes:
 - **External control.** Your warehouse or your operations own it. Rocky
   records what it saw, and nothing more.
 
+Four more words appear across the rows, always with the same meaning:
+
+- **Enforced.** The build or the apply fails when the condition does not
+  hold.
+- **Attempted.** Best-effort: Rocky tries, warns on failure, and continues.
+- **Recorded when available.** Rocky writes the value when the execution
+  path supplies it. A missing value is normal, not an error.
+- **Durable.** The write must persist, or the operation fails closed.
+
 ## The matrix
 
 | Capability | Who enforces it |
 |---|---|
-| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Rocky-guaranteed (E010–E013), with two stated limits |
-| [Classification tag completeness](#classification-tag-completeness) | Rocky warns (W004). Nothing blocks. |
-| [Masking application](#masking-application) | Adapter-dependent: Databricks only, best-effort |
-| [Freshness](#freshness) | Declared metadata, not a gate. One opt-in run-time check exists. |
-| [Human review of AI-authored plans](#human-review-of-ai-authored-plans) | Rocky-guaranteed floor at apply |
-| [Audit ledger](#audit-ledger) | Rocky-guaranteed recording |
-| [Byte-identical replay](#byte-identical-replay) | One write path only: content-addressed S3/UniForm |
-| [Rollback after a bad apply](#rollback-after-a-bad-apply) | Does not exist. Rocky halts; recovery is yours. |
-| [Grain and uniqueness](#grain-and-uniqueness) | Test-time assertion, not a declared constraint |
+| [Contract columns, types, required, protected](#contracts-columns-types-required-protected) | Rocky-guaranteed: enforced at compile (E010–E013), with two stated limits |
+| [Classification tag completeness](#classification-tag-completeness) | Not enforced: Rocky warns (W004). Nothing blocks. |
+| [Masking application](#masking-application) | Adapter-dependent: Databricks only, attempted |
+| [Freshness](#freshness) | Declared metadata, not enforced. One opt-in run-time check, replication pipelines only. |
+| [Human review of AI-authored plans](#human-review-of-ai-authored-plans) | Rocky-guaranteed: enforced floor at apply |
+| [Audit ledger](#audit-ledger) | Rocky records it: attempted for ordinary rules, durable for budget and `verify_after` decisions |
+| [Byte-identical replay](#byte-identical-replay) | One write path only: content-addressed S3/UniForm. Elsewhere, recorded when available. |
+| [Rollback after a bad apply](#rollback-after-a-bad-apply) | No automatic restoration. Rocky halts; recovery is yours. |
+| [Grain and uniqueness](#grain-and-uniqueness) | Test-time assertion, not enforced at build |
 
 ## Contracts: columns, types, required, protected
 
-**Rocky-guaranteed.** A `.contract.toml` declares what a model must produce.
+**Rocky-guaranteed: enforced at compile.** A `.contract.toml` declares what a model must produce.
 `rocky compile` checks the model's inferred schema against it, before anything
 runs, and fails on any of these four errors:
 
@@ -67,7 +76,7 @@ Checked in `validate_contract` and `type_name_matches`,
 
 ## Classification tag completeness
 
-**Rocky warns. Nothing blocks.** When a column carries a classification tag
+**Not enforced. Rocky warns; nothing blocks.** When a column carries a classification tag
 (for example `pii`) that no `[mask]` or `[mask.<env>]` block resolves, the
 compiler emits warning `W004`. A tag listed in
 `[classifications] allow_unmasked` silences it. The warning does not fail the
@@ -83,13 +92,16 @@ Checked in `check_classification_tags`,
 
 ## Masking application
 
-**Adapter-dependent: Databricks only, and best-effort there.** After a
-successful run, `rocky apply` walks each model's `[classification]` block and
-calls the governance adapter's masking hooks. On Databricks, Rocky writes
-Unity Catalog column tags and issues masking DDL, one statement per column. On
-DuckDB, Snowflake, and BigQuery the masking hooks do nothing today.
+**Adapter-dependent: Databricks only, attempted there.** After a clean
+full-replication `--all`/`--models` model phase, Rocky reconciles masking
+best-effort: it walks each model's `[classification]` block and calls the
+governance adapter's masking hooks. Other execution paths (a single
+`--model` run, a backfill, a transformation pipeline) do not reconcile
+masks today. On Databricks, Rocky writes Unity Catalog column tags and
+issues masking DDL, one statement per column. On DuckDB, Snowflake, and
+BigQuery the masking hooks do nothing today.
 
-Best-effort means: when a masking statement fails, Rocky logs a warning and
+Attempted means: when a masking statement fails, Rocky logs a warning and
 the run continues. A masking failure is not a build error and does not roll
 anything back. Do not state a compliance guarantee on top of this on any
 warehouse. On warehouses other than Databricks, masking is an external
@@ -117,11 +129,12 @@ no materialization is blocked by it. Declaring `[freshness]` on a model does
 not create a run-time staleness alarm. Detecting stale data in production is
 an observation job that you own.
 
-One separate, opt-in run-time check exists: a pipeline's
+One separate, opt-in run-time check exists, for replication pipelines only:
 `[checks] freshness = { threshold_seconds = ... }` measures the real lag with
 SQL after the pipeline runs, and the check fails when the lag exceeds the
-threshold. That is a pipeline check with its own key, not the model's
-`[freshness]` declaration.
+threshold. Other pipeline types do not execute that check today; `rocky
+validate` flags it there as inert (V034). It is a pipeline check with its
+own key, not the model's `[freshness]` declaration.
 
 Declaration: `ModelFreshnessConfig`, `engine/crates/rocky-core/src/models.rs`
 (its own doc comment states the compiler does not enforce it). Scheduler
@@ -130,7 +143,7 @@ demand: `engine/crates/rocky-core/src/schedule/demand.rs`. Run-time check:
 
 ## Human review of AI-authored plans
 
-**Rocky-guaranteed, as a floor.** A plan proposed by an agent is marked
+**Rocky-guaranteed: enforced at apply, as a floor.** A plan proposed by an agent is marked
 AI-authored. `rocky apply` refuses to execute it until a human runs
 `rocky review <plan-id> --approve`, which writes an approval marker next to
 the plan. Three properties of that gate, as it ships today:
@@ -161,9 +174,13 @@ three gates".
 
 ## Audit ledger
 
-**Rocky-guaranteed recording.** Every policy decision at a mutating seam
-(`rocky apply`, promote) is written to a `policy_decisions` table in the
-embedded redb state store. `rocky audit` lists the decisions.
+**Rocky recording: attempted for ordinary rules, durable for the two gating kinds.**
+Policy-decision recording is best-effort for ordinary rules: at a mutating
+seam (`rocky apply`, promote), Rocky writes each decision to a
+`policy_decisions` table in the embedded redb state store, and when that
+write fails it warns and continues. Decisions relevant to an autonomy
+budget or to `verify_after` are durable instead: when they cannot be
+persisted, the apply fails closed. `rocky audit` lists the decisions.
 `rocky audit --for <table|run|plan>` assembles the custody chain for one
 subject: who proposed, what policy decided, what the plan changed, which runs
 materialized it, and what verification found. A link with no recorded signal
@@ -171,8 +188,8 @@ renders as `unavailable`. Rocky does not fabricate a value to complete the
 chain.
 
 The ledger records what Rocky did. It is evidence, not enforcement: it stops
-nothing by itself, and it is exactly as durable as the state store you
-configure it to live in.
+nothing by itself, and it lives in whatever state store you configure. The
+ledger is only as safe as that store.
 
 Ledger tables: `engine/crates/rocky-core/src/state.rs`. Command:
 `engine/crates/rocky-cli/src/commands/audit.rs`. Reading the ledger without
@@ -186,11 +203,14 @@ the BLAKE3 hash of its own bytes and records the hash in the ledger. An
 engine test pins that the writer is byte-stable across runs. On that path,
 `rocky replay --execute --verify` re-derives a past run and compares hashes.
 
-A general run against DuckDB, Databricks, Snowflake, or BigQuery still
-records the per-model `sql_hash`, row counts, and recipe-identity hashes in
-the ledger. It emits no hash-named artifacts, so there is no byte-level
-replay proof on those targets. Treat any byte-identical claim as unverified on a given adapter
-until you have run the verification against that adapter yourself.
+A general run against DuckDB, Databricks, Snowflake, or BigQuery records
+less. When persistence succeeds, successful materializations record recipe
+identity; SQL hashes and row counts are recorded only when the execution
+path supplies them (a replication copy, for example, supplies neither). A
+general run emits no hash-named artifacts, so there is no byte-level replay
+proof on those targets. Treat any byte-identical claim as unverified on a
+given adapter until you have run the verification against that adapter
+yourself.
 
 Scope and walkthrough: [Verify a Run Without Rocky](/guides/verify-a-run/).
 Byte-stability test: `build_parquet_is_byte_stable_across_runs`,
@@ -201,10 +221,12 @@ grading: [Architecture of Trust](/concepts/architecture-of-trust/).
 
 **Does not exist.** When a post-apply verification check
 (`verify_after` in a policy rule) fails, Rocky halts and reports. The
-mutation has already landed in the warehouse and it stays there. Rocky does
-not attempt an automatic rollback anywhere, because no rollback substrate
-exists to run one: a plain warehouse table has no engine-owned prior version
-to restore.
+mutation has already landed in the warehouse and it stays there. Rocky has
+no automatic restoration after a failed `verify_after` check; transactional
+statement failures may still roll back an uncommitted partition. That
+narrower mechanism is mid-run hygiene on transactional warehouses, not a
+restore. No restore substrate exists, because a plain warehouse table has
+no engine-owned prior version.
 
 Recovery after a bad apply is an external control. Plan for it with the
 warehouse's own tools: time travel, snapshots, or a re-run from upstream
