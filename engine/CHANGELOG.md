@@ -6,22 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+
+These three refuse where they previously proceeded. Each closes a path that
+reported success while doing less than asked, so the refusal is the fix — but
+an upgrade can turn a passing pipeline red, and that is deliberate.
+
+- **`--shadow-schema` refuses when two sources resolve to one target table.** The flag replaces the resolved target schema outright, so a schema template whose only distinguishing component is the connector (`staging__{source}`) collapsed every connector into one schema. Two sources holding a same-named table both wrote it, the second won, and the run still reported copying both — with `rocky compare` then reading that as a clean baseline. Only a real clash refuses; distinct table names still shadow fine. Use `--shadow-suffix`, which keeps the template and renames the table. Identifiers are compared case-insensitively, because DuckDB, Databricks and Trino resolve `Orders` and `orders` to one object. (#1461)
+
+- **A configured `[policy]` block no longer waives human review of an AI-authored plan.** The review marker was checked only when policy was absent; any configured policy resolving to `allow` reached the policy gate, which returns success without consulting it. So switching governance ON switched this protection OFF. `allow` answers "may this principal do this"; review answers "did a human read this machine-written change". Policy may now only tighten the gate — `deny` and `require_review` are unchanged. **If you relied on a permissive policy to auto-apply AI-authored plans, those applies now refuse** until `rocky review <plan-id> --approve` runs. (#1459)
+
+- **`rocky apply` on a replication plan refuses when the config or the state store has changed since the plan was written.** The plan's config snapshot had no reader, so changing the adapter, database path, schema template or strategy between plan and apply silently re-routed an approved plan to unreviewed SQL or a different destination. The state store was unbound too — watermarks, freezes, budgets and idempotency keys live there, so applying against a different one can redo work the reviewed ledger recorded as done, or miss a freeze it recorded. Both are now compared and nothing is written on a mismatch; re-plan to proceed. Two limits stated in the error rather than implied away: credentials are redacted in the snapshot, so a changed secret is not detected, and the state identity is credential-free by construction. (#1460)
 
 ### Fixed
 
 - **The strict-scheduling refusal no longer tells you to omit a flag that does not exist.** When `[run] strict_scheduling` refused a run whose physical-read ordering could not be resolved, the error offered two remedies: declare `depends_on`, or "omit `--strict-scheduling`". There is no such CLI flag — `rocky run --strict-scheduling` fails with `unexpected argument`. Every real consumer reads the TOML key. The message now names only the key, and the doc comment says plainly that the setting is config-only. Whether to add the flag is tracked on #1357.
 
-### Fixed
 
 - **`rocky import-dbt` no longer ends with a command the CLI rejects.** Its Next Steps block printed `rocky ai explain --all --save`, which does not parse — `rocky ai` takes a positional `INTENT`, so `explain` is consumed as the intent and the flags are refused with `error: unexpected argument '--all' found`. The real subcommand is `rocky ai-explain`. The same invalid spelling appeared in a second user-facing hint and in four doc comments, three of which publish as JSON-schema descriptions for the `ai_*` outputs.
 
   The step is now also **gated**. `ai-explain --all` selects only models whose `intent` is unset, but the recommendation was emitted unconditionally — and the dbt importer seeds `intent` from dbt YAML `description` fields. Importing a documented project therefore produced a next step that, even spelled correctly, prints `No models to explain.` It is now offered only when an imported model actually lacks an intent, matching the predicate the command itself filters on. (#1443)
 
-### Removed
-
-- **The `drift` JSON schema no longer ships for a command that does not exist.** `schemas/drift.schema.json` and its generated Pydantic/TypeScript bindings described the output of `rocky drift` — a subcommand the binary rejects with `unrecognized subcommand 'drift'`. Drift detection has always run inside `rocky run` / `rocky plan` and is surfaced on `RunOutput.drift`; there was never a command that could emit the standalone envelope. Downstream consumers importing the generated `DriftOutput` type will need to drop it. `DriftSummary` and `DriftActionOutput` are unaffected and now generate from the run schema, which is where drift is actually emitted. (#1431)
-
-### Fixed
 
 - **`rocky test`, `rocky estimate` and `rocky retention-status` no longer report success for a selector that matched nothing.** `rocky test --declarative` accepted a models directory that does not exist — reporting `total: 0` and exiting 0 — while the same command *without* `--declarative` compiled the project and failed with `no models found in <dir>`. One command, one flag apart, two answers to the same question. That path now refuses a missing or empty models directory, matching its sibling.
 
@@ -32,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`rocky test --declarative` now executes sidecar tests for `.rocky` DSL models.** The command's private model loader discovered `.sql` sources only, so DSL models' declared tests were silently skipped and the command exited successfully with `total: 0`. Declarative testing now uses the shared project loader and treats `.sql` and `.rocky` models consistently. (#1425)
 
 - **`rocky compile --model <name>` now reports exactly that model and rejects unknown names.** The selector previously filtered diagnostics and expanded SQL only: counts, execution layers, model details, text execution order, and `has_errors` still described the whole project. A healthy selected model could therefore exit nonzero with no visible diagnostic because an unrelated model was broken, while a misspelled model name exited 0 and returned the whole project. Rocky still compile-checks the full project internally for dependency and type context, but the returned report and exit status now share one exact-model scope; an unknown selector fails with `model not found`. (#1422)
+
+### Removed
+
+- **The `drift` JSON schema no longer ships for a command that does not exist.** `schemas/drift.schema.json` and its generated Pydantic/TypeScript bindings described the output of `rocky drift` — a subcommand the binary rejects with `unrecognized subcommand 'drift'`. Drift detection has always run inside `rocky run` / `rocky plan` and is surfaced on `RunOutput.drift`; there was never a command that could emit the standalone envelope. Downstream consumers importing the generated `DriftOutput` type will need to drop it. `DriftSummary` and `DriftActionOutput` are unaffected and now generate from the run schema, which is where drift is actually emitted. (#1431)
 
 ## [1.70.1] - 2026-08-11
 
