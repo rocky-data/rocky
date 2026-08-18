@@ -213,10 +213,12 @@ connector-level `--filter id=<conn_id>` keys remain unchanged.
 
 ```toml
 [pipeline.silver]
-type        = "transformation"
-models_dir  = "models/silver"
-contracts_dir = "contracts/silver"
-depends_on  = ["raw"]
+type       = "transformation"
+models     = "models/silver/**"   # glob, relative to rocky.toml; default "models/**"
+depends_on = ["raw"]
+
+# There is no contracts key: a model's contract is auto-discovered as the
+# sibling `<model>.contract.toml`, or passed at the CLI via `--contracts <dir>`.
 
 [pipeline.silver.target]
 catalog = "analytics"
