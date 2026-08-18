@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ApproverIdentity": {
+      "description": "Identity of an approver, captured at sign time.\n\nEmail is sourced from `git config user.email`; name from `git config user.name`. Hostname is best-effort from the `hostname` crate and surfaced as an audit aid only — it is not part of the trust boundary. Set `ROCKY_SCRUB_HOST` in the environment to replace the hostname with `\"redacted\"` when recording public demos.",
+      "properties": {
+        "email": {
+          "type": "string"
+        },
+        "host": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/ApproverSource"
+        }
+      },
+      "required": [
+        "email",
+        "host",
+        "source"
+      ],
+      "type": "object"
+    },
+    "ApproverSource": {
+      "description": "Where the approval signature was produced.\n\nReserved for future CI / OIDC paths. Today only the `Local` variant is emitted by the CLI.",
+      "enum": [
+        "local",
+        "ci_oidc",
+        "pat"
+      ],
+      "type": "string"
+    }
+  },
+  "description": "JSON output for `rocky review <plan-id> --status` — the marker oracle.\n\nA read-only projection of the plan's review state: whether a well-formed sign-off marker naming the plan exists, who approved it and when, and the plan's product binding when it carries one. The fulfillment runner polls this instead of probing the marker path (the marker file itself stays an engine-internal artifact).",
+  "properties": {
+    "approver": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ApproverIdentity"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Best-effort git identity of the approver, from the marker."
+    },
+    "breaking_change_count": {
+      "description": "Count of breaking-severity findings the approver signed off on.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "command": {
+      "description": "Always `\"review_status\"`.",
+      "type": "string"
+    },
+    "kind": {
+      "description": "The plan's kind (e.g. `\"ai_authored\"`, `\"run\"`, `\"backfill\"`).",
+      "type": "string"
+    },
+    "plan_id": {
+      "description": "The plan whose review state was read (64-char blake3 hex).",
+      "type": "string"
+    },
+    "product_id": {
+      "description": "Product identity from the plan payload, when the plan is product-bound (opaque; never parsed by the engine).",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reviewed": {
+      "description": "Whether a well-formed sign-off marker naming this plan exists. `false` means the plan awaits review; a malformed or mismatched marker is an ERROR from the command, never reported as a status.",
+      "type": "boolean"
+    },
+    "reviewed_at": {
+      "description": "When the approval was recorded, from the marker.",
+      "format": "date-time",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "spec_digest": {
+      "description": "Approved-spec digest from the plan payload, when product-bound. Applying such a plan requires `rocky apply --expect-spec-digest`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "kind",
+    "plan_id",
+    "reviewed",
+    "version"
+  ],
+  "title": "ReviewStatusOutput",
+  "type": "object"
+}

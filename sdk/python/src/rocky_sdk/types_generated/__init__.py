@@ -290,6 +290,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "RetentionStatusOutput": ("retention_status_schema", "RetentionStatusOutput"),
     "RetentionSweepOutput": ("state_retention_sweep_schema", "RetentionSweepOutput"),
     "ReviewOutput": ("review_schema", "ReviewOutput"),
+    "ReviewStatusOutput": ("review_status_schema", "ReviewStatusOutput"),
     "ReviewQueueEntry": ("review_queue_schema", "ReviewQueueEntry"),
     "ReviewQueueOutput": ("review_queue_schema", "ReviewQueueOutput"),
     "RunHistoryRecord": ("history_schema", "RunHistoryRecord"),
@@ -708,6 +709,7 @@ if TYPE_CHECKING:
         PolicyFreezeOutput,
     )
     from .review_schema import ReviewOutput
+    from .review_status_schema import ReviewStatusOutput
     from .review_queue_schema import (
         ReviewQueueEntry,
         ReviewQueueOutput,
@@ -1008,6 +1010,7 @@ __all__ = [
     "PolicyFreezeEntry",
     "ReviewOutput",
     "ReviewQueueOutput",
+    "ReviewStatusOutput",
     "ReviewQueueEntry",
     "SeedOutput",
     "SeedTableOutput",
