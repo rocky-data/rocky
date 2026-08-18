@@ -237,13 +237,14 @@ enum ProductBinding<'a> {
 /// Classify the product-identity keys on a raw plan payload, fail-closed.
 ///
 /// The pair is valid in exactly two shapes: BOTH `product_id` and
-/// `spec_digest` present as non-empty JSON strings, or NEITHER key present.
-/// Every other shape — a lone key, an empty string, a non-string value
-/// (`null` and numbers included) — is a malformed binding and refuses with an
-/// error, regardless of any `--expect-spec-digest` flag: `propose` can never
-/// write those shapes, so they are hand-authored or tampered by definition,
-/// and a gate that projects them through `as_str()` would silently collapse
-/// them to "absent" and execute ungated.
+/// `spec_digest` present as JSON strings that are non-empty after trimming,
+/// or NEITHER key present. Every other shape — a lone key, an empty or
+/// whitespace-only string, a non-string value (`null` and numbers included) —
+/// is a malformed binding and refuses with an error, regardless of any
+/// `--expect-spec-digest` flag: `propose` can never write those shapes (it
+/// trims before its non-empty check), so they are hand-authored or tampered
+/// by definition, and a gate that projects them through `as_str()` would
+/// silently collapse them to "absent" and execute ungated.
 fn classify_product_binding<'a>(
     payload: &'a serde_json::Value,
     plan_id: &str,
@@ -262,11 +263,17 @@ fn classify_product_binding<'a>(
         (None, None) => Ok(ProductBinding::Unbound),
         (Some(product), Some(digest)) => match (product.as_str(), digest.as_str()) {
             (Some(product_id), Some(spec_digest)) => {
-                if product_id.is_empty() {
-                    return Err(malformed("`product_id` is an empty string"));
+                // Trimmed emptiness, mirroring `propose`'s validation: a
+                // whitespace-only value is not an identity, and `propose`
+                // refuses to write one — so a payload carrying it is
+                // hand-authored by definition and refuses here even when a
+                // matching whitespace `--expect-spec-digest` is passed
+                // (FF-WP1 fix round 2, item 3).
+                if product_id.trim().is_empty() {
+                    return Err(malformed("`product_id` is empty or whitespace-only"));
                 }
-                if spec_digest.is_empty() {
-                    return Err(malformed("`spec_digest` is an empty string"));
+                if spec_digest.trim().is_empty() {
+                    return Err(malformed("`spec_digest` is empty or whitespace-only"));
                 }
                 Ok(ProductBinding::Bound {
                     product_id,
@@ -8391,6 +8398,22 @@ schema_template = "s__{source}"
                 "null product_id",
                 serde_json::json!({ "product_id": null, "spec_digest": "sha256:abc" }),
                 Some("sha256:abc"),
+            ),
+            // FF-WP1 fix round 2 (item 3): whitespace-only values are not
+            // identities either — `propose` trims before its non-empty check,
+            // so this shape is hand-authored by definition. The pair case
+            // passes a MATCHING whitespace flag: before the trim, the
+            // byte-equal expectation satisfied the gate and the apply
+            // executed on a binding `propose` could never have written.
+            (
+                "whitespace product_id + matching flag",
+                serde_json::json!({ "product_id": "   ", "spec_digest": "sha256:abc" }),
+                Some("sha256:abc"),
+            ),
+            (
+                "whitespace pair + matching whitespace flag",
+                serde_json::json!({ "product_id": " \t ", "spec_digest": " \t " }),
+                Some(" \t "),
             ),
         ];
 
