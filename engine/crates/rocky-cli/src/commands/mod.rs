@@ -53,6 +53,7 @@ mod playground;
 mod policy;
 mod preview;
 mod preview_rows;
+pub mod product;
 mod profile;
 mod profile_storage;
 mod publish_ir;
@@ -156,6 +157,9 @@ pub use plan::{
 };
 pub use playground::{run_playground, run_playground_with_template};
 pub use policy::{run_policy_check, run_policy_freeze, run_policy_test};
+pub use product::{
+    run_product_approve, run_product_compile, run_product_status, run_product_verify,
+};
 pub use preview::{
     PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
 };
