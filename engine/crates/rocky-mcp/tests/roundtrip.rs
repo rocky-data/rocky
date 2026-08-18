@@ -115,6 +115,108 @@ async fn tools_list_returns_expected_set() {
     client.cancel().await.unwrap();
 }
 
+/// FF-WP1 golden worker-profile surface ⟦RTL-1,3⟧: `--profile worker` serves
+/// EXACTLY the drafting allowlist. This vec is the profile's contract — a
+/// future tool addition must consciously decide its profiles or it is
+/// excluded by default (the sibling default-profile golden pins the other
+/// surface).
+#[tokio::test]
+async fn worker_profile_tools_list_is_the_minimal_allowlist() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    );
+
+    let client = connect(server).await;
+    let tools = client.list_all_tools().await.expect("list tools");
+    let mut names: Vec<String> = tools.into_iter().map(|t| t.name.to_string()).collect();
+    names.sort();
+
+    assert_eq!(
+        names,
+        vec![
+            "breaking_change",
+            "catalog",
+            "compile",
+            "dependents",
+            "draft_check",
+            "draft_model",
+            "inspect_schema",
+            "lineage",
+            "list",
+            "plan_preview",
+            "profile_column",
+            "sample_rows",
+            "test",
+        ],
+        "the worker profile is an exhaustive allowlist — nothing else may appear"
+    );
+
+    // The prompts are served unchanged in both profiles.
+    let prompts = client.list_all_prompts().await.expect("list prompts");
+    let mut prompt_names: Vec<String> = prompts.iter().map(|p| p.name.clone()).collect();
+    prompt_names.sort();
+    assert_eq!(
+        prompt_names,
+        vec![
+            "add_tests_to_pks",
+            "build_model",
+            "find_untested_models",
+            "fix_failing_test",
+            "summarize_project",
+        ],
+        "the worker profile keeps the full prompt set"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The adversarial half: a worker-profile session CALLING an excluded tool
+/// gets rmcp's tool-not-found error — the route is absent, not merely
+/// unlisted — while an allowlisted tool still runs.
+#[tokio::test]
+async fn worker_profile_calling_an_excluded_tool_is_tool_not_found() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    );
+    let client = connect(server).await;
+
+    for excluded in [
+        "propose",
+        "draft_contract",
+        "draft_metadata",
+        "review_queue",
+        "pause_schedule",
+        "estate_brief",
+        "audit_query",
+    ] {
+        let err = client
+            .call_tool(CallToolRequestParams::new(excluded))
+            .await
+            .expect_err(&format!(
+                "calling excluded tool '{excluded}' must be a protocol error"
+            ));
+        assert!(
+            err.to_string().contains("tool not found"),
+            "'{excluded}' must be tool-not-found, got: {err}"
+        );
+    }
+
+    // Control: an allowlisted tool still routes and runs.
+    let compile = client
+        .call_tool(CallToolRequestParams::new("compile"))
+        .await
+        .expect("compile is allowlisted and must run under the worker profile");
+    assert_ne!(compile.is_error, Some(true), "compile runs");
+
+    client.cancel().await.unwrap();
+}
+
 /// Malformed tool arguments (wrong-typed or missing required fields) fail
 /// *inside rmcp's parameter extraction*, before the tool body runs. rmcp 2.x
 /// surfaces that as an `isError` tool result carrying a plain-text message —

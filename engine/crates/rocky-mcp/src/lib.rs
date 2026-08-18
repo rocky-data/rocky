@@ -31,17 +31,21 @@ mod tools;
 use rmcp::{ServiceExt, transport::stdio};
 
 pub use error::{ToolError, ToolErrorCode, ToolResult};
-pub use tools::RockyMcpServer;
+pub use tools::{McpProfile, RockyMcpServer};
 
 /// Serve the Rocky MCP server over stdio until the client disconnects.
 ///
 /// `config_path` is the project's `rocky.toml`; the models directory is
 /// resolved as `<config-dir>/models`, matching the CLI's top-level
-/// convention. Logging goes to stderr (stdout is reserved for the MCP wire
-/// protocol).
-pub async fn serve_stdio(config_path: std::path::PathBuf) -> anyhow::Result<()> {
-    let server = RockyMcpServer::new(config_path);
-    tracing::info!("starting rocky MCP server over stdio");
+/// convention. `profile` selects the tool surface: [`McpProfile::Default`]
+/// serves everything, [`McpProfile::Worker`] the minimal drafting allowlist.
+/// Logging goes to stderr (stdout is reserved for the MCP wire protocol).
+pub async fn serve_stdio(
+    config_path: std::path::PathBuf,
+    profile: McpProfile,
+) -> anyhow::Result<()> {
+    let server = RockyMcpServer::new_with_profile(config_path, profile);
+    tracing::info!(?profile, "starting rocky MCP server over stdio");
     let service = server.serve(stdio()).await.inspect_err(|e| {
         tracing::error!("rocky MCP serve error: {e:?}");
     })?;

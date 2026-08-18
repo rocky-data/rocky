@@ -2255,7 +2255,33 @@ enum Command {
         /// Pipeline config file the server resolves the project from.
         #[arg(long, default_value = "rocky.toml")]
         config: PathBuf,
+        /// Tool surface to serve. `default` exposes every tool; `worker` is
+        /// the minimal drafting allowlist for untrusted workers: the
+        /// read/inspect grounding tools, compile / test / breaking_change /
+        /// dependents, draft_model + draft_check, and the prompts — no
+        /// contract, metadata, propose, review, or schedule surface.
+        #[arg(long, value_enum, default_value_t = McpProfileArg::Default)]
+        profile: McpProfileArg,
     },
+}
+
+/// Clap-facing mirror of [`rocky_mcp::McpProfile`], kept CLI-local so the
+/// rocky-mcp crate stays clap-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum McpProfileArg {
+    /// Full tool surface (unchanged behavior).
+    Default,
+    /// Minimal drafting-worker allowlist.
+    Worker,
+}
+
+impl From<McpProfileArg> for rocky_mcp::McpProfile {
+    fn from(value: McpProfileArg) -> Self {
+        match value {
+            McpProfileArg::Default => rocky_mcp::McpProfile::Default,
+            McpProfileArg::Worker => rocky_mcp::McpProfile::Worker,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -4551,7 +4577,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::run_completions::<Cli>(shell, &mut std::io::stdout());
             Ok(())
         }
-        Command::Mcp { config } => rocky_mcp::serve_stdio(config).await,
+        Command::Mcp { config, profile } => rocky_mcp::serve_stdio(config, profile.into()).await,
     };
 
     // SIGINT: map `commands::Interrupted` to the conventional shell exit

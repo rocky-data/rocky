@@ -42,6 +42,50 @@ pub struct RockyMcpServer {
     prompt_router: PromptRouter<Self>,
 }
 
+/// Which tool surface `rocky mcp` serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpProfile {
+    /// The full tool surface — unchanged behavior for every existing agent.
+    #[default]
+    Default,
+    /// The minimal drafting-worker allowlist (`--profile worker`): read /
+    /// inspect grounding tools, the compile/test/breaking-change/dependents
+    /// verification loop, `draft_model` + `draft_check`, and the prompts.
+    /// Everything else — including `draft_contract`, `draft_metadata`,
+    /// `review_queue`, `pause_schedule`, `propose`, and any FUTURE tool not
+    /// explicitly allowlisted — is absent from the listing and returns
+    /// tool-not-found when called.
+    Worker,
+}
+
+/// The worker-profile tool ALLOWLIST — exhaustively enumerated, never derived
+/// by exclusion, so a future tool addition is excluded by default and must
+/// consciously opt in here (the golden profile tests pin both surfaces).
+///
+/// Rationale (FF-DESIGN D7 ⟦RTL-1,3⟧): the untrusted drafting worker needs
+/// grounding reads and the compile/test loop for `models/<model>.sql` plus
+/// append-only checks. Contracts and metadata are spec-owned in the
+/// fulfillment loop — a worker-writable contract detaches artifacts from the
+/// spec — and approval/propose/schedule surfaces must never reach it. The
+/// in-engine LLM generator tools (`ai_*`, `suggest_freshness_block`,
+/// `explain_model`) are omitted too: the worker brings its own model, and the
+/// governed metadata path is the runner's, not the worker's.
+const WORKER_PROFILE_TOOLS: &[&str] = &[
+    "breaking_change",
+    "catalog",
+    "compile",
+    "dependents",
+    "draft_check",
+    "draft_model",
+    "inspect_schema",
+    "lineage",
+    "list",
+    "plan_preview",
+    "profile_column",
+    "sample_rows",
+    "test",
+];
+
 // ---------------------------------------------------------------------------
 // Tool input parameter structs (schemars 1.x — rmcp's `Parameters<T>` bound).
 // ---------------------------------------------------------------------------
@@ -431,17 +475,42 @@ const PROFILE_TOP_VALUES_MAX: usize = 25;
 impl RockyMcpServer {
     /// Build a server rooted at `config_path`'s directory; the models
     /// directory is `<config-dir>/models` (the CLI's top-level convention).
+    /// Serves the full default tool surface.
     pub fn new(config_path: PathBuf) -> Self {
+        Self::new_with_profile(config_path, McpProfile::Default)
+    }
+
+    /// Build a server serving `profile`'s tool surface.
+    ///
+    /// The worker profile filters the full router down to
+    /// [`WORKER_PROFILE_TOOLS`] by REMOVING every route not on the allowlist —
+    /// an excluded tool is absent from `tools/list` and a call to it gets
+    /// rmcp's standard tool-not-found error. Prompts are served unchanged in
+    /// both profiles.
+    pub fn new_with_profile(config_path: PathBuf, profile: McpProfile) -> Self {
         let root = config_path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let models_dir = root.join("models");
+        let mut tool_router = Self::tool_router();
+        if profile == McpProfile::Worker {
+            let all: Vec<String> = tool_router
+                .list_all()
+                .into_iter()
+                .map(|t| t.name.to_string())
+                .collect();
+            for name in all {
+                if !WORKER_PROFILE_TOOLS.contains(&name.as_str()) {
+                    tool_router.remove_route(&name);
+                }
+            }
+        }
         Self {
             config_path,
             models_dir,
             root,
-            tool_router: Self::tool_router(),
+            tool_router,
             prompt_router: Self::prompt_router(),
         }
     }
