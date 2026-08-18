@@ -431,6 +431,33 @@ pub struct DraftCheckResult {
     pub next_steps: String,
 }
 
+/// `draft_metadata` result — a structured freshness/classification patch
+/// merged into the model's sidecar and compile-validated in the same call.
+///
+/// The governed metadata write path: the agent supplies a typed patch, the
+/// tool parse-merges it into `models/<model>.toml` (never string-appends,
+/// never overwrites a sidecar it cannot parse), compiles, and gates the write
+/// through the agent-policy plane — evaluated against the model's attributes
+/// AS PATCHED, so a patch that first adds a governed classification is gated
+/// by that classification. A denied patch restores the prior sidecar bytes.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DraftMetadataResult {
+    /// The model the metadata was patched for.
+    pub model: String,
+    /// Repo-relative path the patch was merged into (`models/<model>.toml`).
+    pub sidecar_path: String,
+    /// Whether the immediate compile produced any error-severity diagnostics.
+    pub has_errors: bool,
+    /// Count of error-severity diagnostics.
+    pub error_count: usize,
+    /// Count of warning-severity diagnostics.
+    pub warning_count: usize,
+    /// The immediate compile's diagnostics, scoped to the model.
+    pub diagnostics: Vec<DiagnosticLite>,
+    /// The authoring-loop reminder: a draft is not applied.
+    pub next_steps: String,
+}
+
 /// One column on a `catalog` asset.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CatalogColumnLite {

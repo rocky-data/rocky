@@ -277,6 +277,40 @@ pub struct DraftCheckArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DraftMetadataArgs {
+    /// The model whose sidecar metadata to patch. Its `.sql` (or `.rocky`)
+    /// source must already exist under `models/`; the patch is merged into
+    /// the model's sidecar (`models/<model>.toml`).
+    pub model: String,
+    /// Freshness expectation to set. Replaces the sidecar's whole
+    /// `[freshness]` table when present.
+    #[serde(default)]
+    pub freshness: Option<FreshnessPatch>,
+    /// Per-column classification tags to merge into the sidecar's
+    /// `[classification]` table. Keys are column names, values are tags
+    /// (e.g. `email = "pii"`). Listed columns are set/replaced; other
+    /// columns' existing tags are preserved.
+    #[serde(default)]
+    pub classifications: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// The `[freshness]` block `draft_metadata` writes.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FreshnessPatch {
+    /// Maximum lag in seconds before the model counts as stale. Written to
+    /// the sidecar as `expected_lag_seconds`.
+    pub expected_lag_seconds: u64,
+    /// Timestamp column used to evaluate freshness at runtime. When unset
+    /// the runtime falls back to the last-materialization timestamp.
+    #[serde(default)]
+    pub time_column: Option<String>,
+    /// Severity when the freshness check trips: `"warning"` (the engine
+    /// default) or `"error"`.
+    #[serde(default)]
+    pub severity: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ExplainModelArgs {
     /// The model to draft an intent description for, from its SQL, output
     /// schema, and upstream dependencies.
@@ -2409,6 +2443,209 @@ impl RockyMcpServer {
     }
 
     #[tool(
+        description = "Write governed sidecar METADATA for an existing model — freshness and/or \
+         column classifications — as a structured patch, compile-validated in the SAME call. The \
+         sidecar (models/<model>.toml) is parsed as TOML and re-serialized: `freshness` replaces \
+         the whole [freshness] table, `classifications` merges per-column tags into \
+         [classification] (other columns' tags are preserved). Comments in the sidecar are \
+         dropped and key order may normalize on re-serialization; the data round-trips, the \
+         formatting does not. An unparseable sidecar is never clobbered — the call fails naming \
+         the file. At least one of `freshness` / `classifications` is required. Path-gated to the \
+         models directory and policy-aware: the policy gate evaluates the model's attributes AS \
+         PATCHED (a patch that first adds a governed classification is gated by that \
+         classification), and a denied patch restores the prior sidecar bytes. It does NOT run, \
+         apply, or touch the warehouse."
+    )]
+    async fn draft_metadata(
+        &self,
+        params: Parameters<DraftMetadataArgs>,
+    ) -> ToolResult<DraftMetadataResult> {
+        let args = params.0;
+        if args.freshness.is_none() && args.classifications.is_none() {
+            return Err(ToolError::invalid_argument(
+                "draft_metadata needs at least one of `freshness` / `classifications`",
+                "Pass `freshness` (expected_lag_seconds + optional time_column/severity), \
+                 `classifications` (column -> tag map), or both. An empty patch writes nothing.",
+            ));
+        }
+        // Validate the patch shape up front, before any filesystem access, so
+        // a malformed patch is a crisp invalid_argument rather than a compile
+        // diagnostic on a half-written sidecar.
+        let freshness_table = match &args.freshness {
+            Some(patch) => Some(build_freshness_table(patch)?),
+            None => None,
+        };
+        if let Some(classifications) = &args.classifications {
+            if classifications.is_empty() {
+                return Err(ToolError::invalid_argument(
+                    "draft_metadata `classifications` is present but empty",
+                    "List at least one column -> tag pair (e.g. { \"email\": \"pii\" }), or omit \
+                     the field.",
+                ));
+            }
+            for (column, tag) in classifications {
+                if column.trim().is_empty() || tag.trim().is_empty() {
+                    return Err(ToolError::invalid_argument(
+                        "draft_metadata classification columns and tags must be non-empty",
+                        "Every entry maps a real column name to a non-empty tag, e.g. \
+                         { \"email\": \"pii\" }.",
+                    ));
+                }
+            }
+        }
+        let paths = self.resolve_draft_paths(&args.model)?;
+        if !self.model_source_exists(&paths.stem) {
+            return Err(ToolError::model_not_found(&paths.stem));
+        }
+
+        // Snapshot the sidecar so a DENY (or a write/compile failure, or a
+        // panic before the verdict) restores the model's PRIOR sidecar bytes.
+        let rollback = DraftRollback::snapshot_async(vec![paths.sidecar_path.clone()]).await;
+
+        // Parse-merge, never string-append: the existing sidecar must parse as
+        // TOML or the call fails naming it — an unparseable sidecar is never
+        // clobbered (nothing has been written yet; the guard restores
+        // identical bytes).
+        let mut sidecar: toml::Table = match rollback.prior(&paths.sidecar_path) {
+            Some(bytes) => {
+                let text = std::str::from_utf8(bytes).map_err(|_| {
+                    ToolError::invalid_argument(
+                        format!(
+                            "the sidecar at {} is not valid UTF-8; refusing to rewrite it",
+                            rel_display(&self.root, &paths.sidecar_path)
+                        ),
+                        "Fix the sidecar file by hand (it must be UTF-8 TOML), then retry.",
+                    )
+                })?;
+                toml::from_str(text).map_err(|e| {
+                    ToolError::invalid_argument(
+                        format!(
+                            "the sidecar at {} does not parse as TOML ({e}); refusing to \
+                             rewrite it",
+                            rel_display(&self.root, &paths.sidecar_path)
+                        ),
+                        "Fix the sidecar so it parses (rocky compile will point at the same \
+                         problem), then retry. draft_metadata never overwrites a file it \
+                         cannot parse.",
+                    )
+                })?
+            }
+            None => {
+                // A bare `.sql`/`.rocky` model with no sidecar yet: seed the
+                // minimal sidecar `draft_check` also seeds.
+                let mut table = toml::Table::new();
+                table.insert(
+                    "name".to_string(),
+                    toml::Value::String(paths.stem.clone()),
+                );
+                table
+            }
+        };
+
+        if let Some(fresh) = freshness_table {
+            sidecar.insert("freshness".to_string(), toml::Value::Table(fresh));
+        }
+        if let Some(classifications) = &args.classifications {
+            let entry = sidecar
+                .entry("classification".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            let Some(class_table) = entry.as_table_mut() else {
+                return Err(ToolError::invalid_argument(
+                    format!(
+                        "the sidecar at {} declares `classification` as a non-table value; \
+                         refusing to rewrite it",
+                        rel_display(&self.root, &paths.sidecar_path)
+                    ),
+                    "Fix the sidecar so `[classification]` is a table of column = \"tag\" \
+                     pairs, then retry.",
+                ));
+            };
+            for (column, tag) in classifications {
+                class_table.insert(column.clone(), toml::Value::String(tag.clone()));
+            }
+        }
+
+        let serialized = toml::to_string(&sidecar).map_err(|e| {
+            ToolError::internal(
+                format!("failed to re-serialize the patched sidecar: {e}"),
+                "Retry; if it persists this is an internal TOML serialization bug.",
+            )
+        })?;
+        if let Err(e) = std::fs::write(&paths.sidecar_path, ensure_trailing_newline(&serialized)) {
+            return Err(ToolError::internal(
+                format!(
+                    "failed to write patched sidecar to {}: {e}",
+                    paths.sidecar_path.display()
+                ),
+                "Ensure the models directory is writable.",
+            ));
+        }
+
+        // Compile with the write — a hard failure rolls the patch back.
+        let compiled = self.compile_drafted(&paths.stem)?;
+
+        // ⟦RTL-2⟧ the policy gate runs AFTER the write, so the evaluation
+        // compiles the model's attributes AS PATCHED from disk — a patch that
+        // first ADDS a governed classification is gated by that
+        // classification, not by the pre-patch attribute set.
+        let decision_id = format!("draft-metadata:{}", paths.stem);
+        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
+        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+            rocky_cli::commands::PolicyGate::NotConfigured
+            | rocky_cli::commands::PolicyGate::Allow => {
+                rollback.defuse();
+                Ok(Json(DraftMetadataResult {
+                    model: paths.stem.clone(),
+                    sidecar_path: rel_display(&self.root, &paths.sidecar_path),
+                    has_errors: compiled.has_errors,
+                    error_count: compiled.error_count,
+                    warning_count: compiled.warning_count,
+                    diagnostics: compiled.diagnostics,
+                    next_steps: DRAFT_METADATA_NEXT_STEPS.to_string(),
+                }))
+            }
+            rocky_cli::commands::PolicyGate::RequireReview {
+                model,
+                rule_id,
+                reason,
+            } => {
+                rollback.defuse();
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_review_required(
+                    format!(
+                        "policy requires human review before authoring metadata in this scope: \
+                         model '{model}'{named} — {reason}. The patched sidecar was written to \
+                         {} for a human to review.",
+                        rel_display(&self.root, &paths.sidecar_path)
+                    ),
+                    "A human must review this metadata change before it goes further; do not \
+                     plan, propose, or apply it in this governed scope on your own."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+            rocky_cli::commands::PolicyGate::Deny {
+                model,
+                rule_id,
+                reason,
+            } => {
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_denied(
+                    format!(
+                        "policy denies authoring metadata for this model: '{model}'{named} — \
+                         {reason}. A deny cannot be satisfied by human review, so the patch was \
+                         not kept (the model's prior sidecar is restored)."
+                    ),
+                    "Re-scope — patch a different, ungoverned model, or drop the change. A \
+                     denied authorship cannot be applied even after review."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+        }
+    }
+
+    #[tool(
         description = "Propose materializing the model(s) as an AI-AUTHORED plan. This does NOT \
          execute anything. It records a plan that a human must review and approve \
          (`rocky review <plan_id> --approve`) before `rocky apply <plan_id>` will run it. Surface \
@@ -3915,6 +4152,16 @@ const DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied 
      `propose` to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
      and `rocky apply`. Never apply a draft directly.";
 
+/// The authoring-loop reminder every successful `draft_metadata` response
+/// carries. The patched sidecar is written and compile-validated, never
+/// applied.
+const DRAFT_METADATA_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
+     the warehouse. The metadata patch is merged into the model's sidecar and the project \
+     compiles; freshness and classifications take effect when the model is next materialized \
+     and reconciled. If this metadata change should ship with a model change, continue the \
+     loop: `compile`, then `propose` for a human to `rocky review <plan_id> --approve` and \
+     `rocky apply`. Never apply a draft directly.";
+
 /// The validated on-disk targets a draft writes to.
 struct DraftPaths {
     /// The model name (bare file stem).
@@ -4016,6 +4263,54 @@ impl Drop for DraftRollback {
             restore_or_remove(path, prior.as_deref());
         }
     }
+}
+
+/// Build the `[freshness]` TOML table a validated [`FreshnessPatch`] writes.
+///
+/// Validates the patch shape (a positive lag that fits TOML's i64 integers, a
+/// non-empty `time_column`, a `severity` the engine's `TestSeverity` accepts)
+/// so a malformed patch refuses as `invalid_argument` before any file I/O.
+fn build_freshness_table(patch: &FreshnessPatch) -> Result<toml::Table, Json<ToolError>> {
+    if patch.expected_lag_seconds == 0 {
+        return Err(ToolError::invalid_argument(
+            "freshness.expected_lag_seconds must be greater than zero",
+            "Pass the maximum acceptable staleness in seconds (e.g. 86400 for 24h).",
+        ));
+    }
+    let lag: i64 = patch.expected_lag_seconds.try_into().map_err(|_| {
+        ToolError::invalid_argument(
+            "freshness.expected_lag_seconds exceeds the TOML integer range",
+            "Pass a realistic lag in seconds (TOML integers are 64-bit signed).",
+        )
+    })?;
+    let mut table = toml::Table::new();
+    table.insert("expected_lag_seconds".to_string(), toml::Value::Integer(lag));
+    if let Some(time_column) = &patch.time_column {
+        if time_column.trim().is_empty() {
+            return Err(ToolError::invalid_argument(
+                "freshness.time_column must be non-empty when present",
+                "Name the model's timestamp column, or omit the field to fall back to the \
+                 last-materialization timestamp.",
+            ));
+        }
+        table.insert(
+            "time_column".to_string(),
+            toml::Value::String(time_column.clone()),
+        );
+    }
+    if let Some(severity) = &patch.severity {
+        if severity != "warning" && severity != "error" {
+            return Err(ToolError::invalid_argument(
+                format!("freshness.severity '{severity}' is not a valid severity"),
+                "Pass \"warning\" (non-blocking, the engine default) or \"error\".",
+            ));
+        }
+        table.insert(
+            "severity".to_string(),
+            toml::Value::String(severity.clone()),
+        );
+    }
+    Ok(table)
 }
 
 /// Structural gate for a `draft_check` spec: parse it as TOML and require

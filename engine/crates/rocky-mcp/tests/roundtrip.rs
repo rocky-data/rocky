@@ -87,6 +87,7 @@ async fn tools_list_returns_expected_set() {
             "dependents",
             "draft_check",
             "draft_contract",
+            "draft_metadata",
             "draft_model",
             "drift_preview",
             "estate_brief",
@@ -1327,6 +1328,403 @@ async fn draft_check_rejects_smuggled_sidecar_config() {
     // The sidecar is byte-for-byte untouched: the gate fires BEFORE the write.
     let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
     assert_eq!(after, before, "a rejected spec writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// draft_metadata (FF-WP1)
+// ---------------------------------------------------------------------------
+
+fn metadata_args(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    json.as_object().unwrap().clone()
+}
+
+/// Happy path: a structured patch merges `[freshness]` + `[classification]`
+/// into the sidecar via parse-merge, preserving the existing strategy/target,
+/// and the result carries the compile with the write.
+#[tokio::test]
+async fn draft_metadata_writes_freshness_and_classifications() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "freshness": {
+                        "expected_lag_seconds": 86400,
+                        "time_column": "status",
+                        "severity": "error",
+                    },
+                    "classifications": { "status": "internal" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata call");
+
+    assert_ne!(result.is_error, Some(true), "a valid patch is not an error");
+    let sc = result.structured_content.expect("structured content");
+    assert_eq!(sc["model"], serde_json::json!("orders"));
+    assert_eq!(sc["sidecar_path"], serde_json::json!("models/orders.toml"));
+    assert_eq!(sc["has_errors"], serde_json::json!(false));
+    assert!(
+        sc["next_steps"]
+            .as_str()
+            .unwrap()
+            .contains("Never apply a draft directly"),
+        "the reminder rides along"
+    );
+
+    // The sidecar re-parses and carries the patch AND the prior config.
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let parsed: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    assert_eq!(
+        parsed["freshness"]["expected_lag_seconds"],
+        toml::Value::Integer(86400)
+    );
+    assert_eq!(
+        parsed["freshness"]["time_column"],
+        toml::Value::String("status".to_string())
+    );
+    assert_eq!(
+        parsed["freshness"]["severity"],
+        toml::Value::String("error".to_string())
+    );
+    assert_eq!(
+        parsed["classification"]["status"],
+        toml::Value::String("internal".to_string())
+    );
+    assert_eq!(
+        parsed["strategy"]["type"],
+        toml::Value::String("full_refresh".to_string()),
+        "the pre-existing strategy survives the parse-merge"
+    );
+    assert_eq!(
+        parsed["target"]["table"],
+        toml::Value::String("orders".to_string()),
+        "the pre-existing target survives the parse-merge"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The merge case that motivated parse-merge: a sidecar `draft_check`
+/// previously string-appended `[[tests]]` blocks into still round-trips —
+/// the tests survive, the patch lands, and a second freshness patch REPLACES
+/// the first rather than duplicating the table. Classification merges keep
+/// other columns' tags.
+#[tokio::test]
+async fn draft_metadata_merges_over_appended_checks_and_replaces_freshness() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Step 1: draft_check string-appends a [[tests]] block (the legacy merge).
+    let check = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(metadata_args(
+            serde_json::json!({
+                "model": "orders",
+                "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+            }),
+        )))
+        .await
+        .expect("draft_check call");
+    assert_ne!(check.is_error, Some(true), "the check draft succeeds");
+
+    // Step 2: a first metadata patch.
+    let first = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "freshness": { "expected_lag_seconds": 3600 },
+                    "classifications": { "id": "internal" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata call");
+    assert_ne!(first.is_error, Some(true), "the first patch succeeds");
+
+    // Step 3: a second patch replaces [freshness] and merges a NEW column tag.
+    let second = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "freshness": { "expected_lag_seconds": 7200, "severity": "warning" },
+                    "classifications": { "status": "pii" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata call");
+    assert_ne!(second.is_error, Some(true), "the second patch succeeds");
+
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let text = std::fs::read_to_string(&sidecar).unwrap();
+    let parsed: toml::Table = toml::from_str(&text).unwrap();
+    // The appended check survived both parse-merges.
+    let tests = parsed["tests"].as_array().expect("[[tests]] survives");
+    assert_eq!(tests.len(), 1, "exactly the one appended check: {text}");
+    // [freshness] was REPLACED, not duplicated or unioned.
+    assert_eq!(
+        parsed["freshness"]["expected_lag_seconds"],
+        toml::Value::Integer(7200)
+    );
+    assert!(
+        parsed["freshness"].get("time_column").is_none(),
+        "replace semantics: the absent field does not linger from patch 1"
+    );
+    // Classification MERGED: both columns tagged.
+    assert_eq!(
+        parsed["classification"]["id"],
+        toml::Value::String("internal".to_string())
+    );
+    assert_eq!(
+        parsed["classification"]["status"],
+        toml::Value::String("pii".to_string())
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// Refusals: an unknown model, an empty patch, and a malformed-value patch
+/// each refuse with a structured envelope and write nothing.
+#[tokio::test]
+async fn draft_metadata_refuses_bad_arguments_without_writing() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read(dir.path().join("models").join("orders.toml")).unwrap();
+
+    for (args, expect_code) in [
+        (
+            serde_json::json!({ "model": "nope", "classifications": { "id": "pii" } }),
+            "model_not_found",
+        ),
+        (serde_json::json!({ "model": "orders" }), "invalid_argument"),
+        (
+            serde_json::json!({ "model": "orders", "classifications": {} }),
+            "invalid_argument",
+        ),
+        (
+            serde_json::json!({
+                "model": "orders",
+                "freshness": { "expected_lag_seconds": 0 },
+            }),
+            "invalid_argument",
+        ),
+        (
+            serde_json::json!({
+                "model": "orders",
+                "freshness": { "expected_lag_seconds": 60, "severity": "fatal" },
+            }),
+            "invalid_argument",
+        ),
+        (
+            serde_json::json!({
+                "model": "orders",
+                "classifications": { "  ": "pii" },
+            }),
+            "invalid_argument",
+        ),
+    ] {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(args)),
+            )
+            .await
+            .expect("draft_metadata returns a result");
+        assert_eq!(result.is_error, Some(true));
+        let err = result.structured_content.expect("envelope");
+        assert_eq!(err["code"], serde_json::json!(expect_code), "{err:?}");
+    }
+
+    let after = std::fs::read(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "every refusal leaves the sidecar untouched");
+
+    client.cancel().await.unwrap();
+}
+
+/// An unparseable sidecar is NEVER clobbered: the call fails naming the file
+/// and the bytes on disk stay identical.
+#[tokio::test]
+async fn draft_metadata_never_clobbers_an_unparseable_sidecar() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    // Corrupt the sidecar AFTER project creation: model source still exists.
+    let sidecar = dir.path().join("models").join("orders.toml");
+    std::fs::write(&sidecar, "name = \"orders\"\n[strategy\nbroken !!").unwrap();
+    let before = std::fs::read(&sidecar).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "classifications": { "id": "pii" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata returns a result");
+
+    assert_eq!(result.is_error, Some(true), "an unparseable sidecar refuses");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("models/orders.toml"),
+        "the error names the sidecar: {err:?}"
+    );
+    let after = std::fs::read(&sidecar).unwrap();
+    assert_eq!(after, before, "the unparseable sidecar is byte-identical");
+
+    client.cancel().await.unwrap();
+}
+
+/// A patch whose merged sidecar fails to compile-load rolls back: the sidecar
+/// parses as TOML (so the parse gate passes) but is not a valid model config,
+/// the compile step hard-fails, and the guard restores the prior bytes.
+#[tokio::test]
+async fn draft_metadata_compile_failure_rolls_back() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    // TOML-valid but ModelConfig-invalid: `strategy` must be a table.
+    let sidecar = dir.path().join("models").join("orders.toml");
+    std::fs::write(&sidecar, "name = \"orders\"\nstrategy = \"full_refresh\"\n").unwrap();
+    let before = std::fs::read(&sidecar).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "classifications": { "id": "internal" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata returns a result");
+
+    assert_eq!(result.is_error, Some(true), "the merged sidecar cannot load");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("compile_failed"),
+        "a config-invalid sidecar is a hard compile failure: {err:?}"
+    );
+    let after = std::fs::read(&sidecar).unwrap();
+    assert_eq!(
+        after, before,
+        "the compile failure restores the pre-patch sidecar bytes"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// ⟦RTL-2⟧ THE post-image gate proof: a rule denying the agent on
+/// `classifications = ["pii"]` must deny the very patch that ADDS the first
+/// `pii` tag — the gate reads the attributes AS PATCHED, not the pre-write
+/// ones (which carry no pii and would evade the rule). The deny restores the
+/// prior sidecar byte-for-byte. The control half: the same patch with a
+/// non-pii tag does NOT match the deny rule (it falls to the default
+/// require_review and persists), proving the deny came from the
+/// classification scope, not a blanket rule.
+#[tokio::test]
+async fn draft_metadata_newly_added_pii_is_denied_on_the_post_image() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { classifications = ["pii"] }
+effect = "deny"
+"#,
+    );
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let before = std::fs::read(&sidecar).unwrap();
+
+    // The attack shape: the model carries NO pii tag yet; the patch adds the
+    // first one. A pre-image gate would see zero classifications and let it
+    // through as require_review.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "classifications": { "status": "pii" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata returns a result");
+    assert_eq!(result.is_error, Some(true));
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("policy_denied"),
+        "the pii-scoped rule must catch the patch that ADDS pii: {err:?}"
+    );
+    assert_eq!(err["policy_rule"], serde_json::json!("0"));
+    let after = std::fs::read(&sidecar).unwrap();
+    assert_eq!(
+        after, before,
+        "a denied patch restores the prior sidecar bytes exactly"
+    );
+
+    // Control: a non-pii tag does not match the deny scope; it resolves to
+    // the default require_review and the patched sidecar PERSISTS.
+    let control = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "classifications": { "status": "internal" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata returns a result");
+    assert_eq!(control.is_error, Some(true));
+    let control_err = control.structured_content.expect("envelope");
+    assert_eq!(
+        control_err["code"],
+        serde_json::json!("policy_review_required"),
+        "a non-pii patch falls to the default, not the pii deny: {control_err:?}"
+    );
+    let parsed: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    assert_eq!(
+        parsed["classification"]["status"],
+        toml::Value::String("internal".to_string()),
+        "the require_review patch persists as the reviewable artifact"
+    );
 
     client.cancel().await.unwrap();
 }
