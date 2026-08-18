@@ -783,17 +783,22 @@ pub fn check_total(
 ///   file inside the project;
 /// - any `..` (or `.`) component, which walks out of the project.
 ///
+/// One rule covers both: every component must be a plain name. An absolute
+/// path leads with a root (or, on Windows, a prefix) component, and traversal
+/// shows up as `..`, so neither is `Component::Normal`. An explicit
+/// `is_absolute()` test was written here first and removed: mutation testing
+/// showed nothing broke when it was deleted, and a guard that cannot fail is a
+/// guard a later reader trusts for the wrong reason.
+///
 /// Verification only reads today, so the immediate blast radius is a wrong
 /// answer about a file that is none of the manifest's business. The reason to
 /// refuse here anyway is that this result is what a caller trusts when it
 /// decides a generation is intact, and the same keys drive writes later.
 fn contained_artifact_path(project_root: &Path, rel_path: &str) -> Option<PathBuf> {
     let candidate = Path::new(rel_path);
-    if rel_path.is_empty() || candidate.is_absolute() {
+    if rel_path.is_empty() {
         return None;
     }
-    // `Component::Normal` admits plain names only: root, prefix, `.`, and `..`
-    // are all rejected, which is the whole containment rule in one match.
     if candidate
         .components()
         .any(|component| !matches!(component, std::path::Component::Normal(_)))
