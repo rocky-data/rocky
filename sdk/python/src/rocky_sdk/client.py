@@ -996,7 +996,15 @@ class RockyClient:
                 exact string. The gate is fail-closed both ways — a
                 product-bound plan REQUIRES it (a bare apply is refused), and
                 passing it against a plan with no ``spec_digest`` is refused
-                too. Read the digest from :meth:`review_status`.
+                too. The value MUST come from your own independently approved
+                product-spec source (the approved spec snapshot you intend to
+                fulfil) — NEVER from :meth:`review_status`. The plan carries
+                the digest it was authored against, so feeding
+                ``review_status.spec_digest`` back here compares the plan
+                against itself and always passes; the gate then proves
+                nothing. Use ``review_status.spec_digest`` only to DETECT what
+                the plan pinned, and compare it against your approved
+                snapshot's digest.
 
         Example:
 
@@ -1031,13 +1039,31 @@ class RockyClient:
         is a command ERROR here (raised as :class:`RockyCommandError`), never
         a silent ``reviewed=False``.
 
+        ``spec_digest`` here is what the PLAN pinned — use it to detect the
+        plan's binding, never as the expectation you pass back to
+        :meth:`apply` (that comparison is the plan against itself, and always
+        passes). The apply-time expectation comes from your own approved
+        product-spec snapshot.
+
         Example:
 
-            Wait for the human sign-off, then apply with the digest gate::
+            Wait for the human sign-off, verify the plan pinned the spec
+            revision YOU approved, then apply with that independently held
+            digest::
+
+                # The digest of the spec revision you approved, from your own
+                # source of truth — not read back from the plan.
+                approved_digest = my_product_spec.approved_digest
 
                 status = client.review_status(plan_id)
-                if status.reviewed and status.spec_digest is not None:
-                    client.apply(plan_id, expect_spec_digest=status.spec_digest)
+                if not status.reviewed:
+                    raise RuntimeError("plan not signed off yet")
+                if status.spec_digest != approved_digest:
+                    raise RuntimeError(
+                        f"plan was authored against {status.spec_digest}, "
+                        f"not the approved {approved_digest} — re-propose"
+                    )
+                client.apply(plan_id, expect_spec_digest=approved_digest)
         """
         return _parse_rocky_json(
             self.run_cli(["review", plan_id, "--status"]),

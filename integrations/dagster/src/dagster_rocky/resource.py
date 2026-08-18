@@ -830,8 +830,14 @@ class RockyResource(dg.ConfigurableResource):
 
         ``expect_spec_digest`` passes ``--expect-spec-digest``: the engine
         refuses unless the plan payload's ``spec_digest`` equals it exactly. A
-        product-bound plan requires it; read the digest from
-        :meth:`review_status`.
+        product-bound plan requires it. The value MUST come from your own
+        independently approved product-spec source (the approved snapshot) —
+        NEVER from :meth:`review_status`: the plan carries the digest it was
+        authored against, so feeding ``review_status.spec_digest`` back here
+        compares the plan against itself and always passes. Use
+        ``review_status.spec_digest`` only to DETECT what the plan pinned,
+        and compare it against your approved snapshot's digest before
+        applying.
         """
         with _translating():
             return self._get_client().apply(plan_id, expect_spec_digest=expect_spec_digest)
@@ -842,6 +848,11 @@ class RockyResource(dg.ConfigurableResource):
         Reports whether a well-formed sign-off marker naming the plan exists,
         who approved it and when, and the plan's product binding. A malformed
         or mismatched marker is an error, never ``reviewed=False``.
+
+        ``spec_digest`` here is what the PLAN pinned — compare it against
+        your independently approved product-spec snapshot; never feed it back
+        to :meth:`apply` as the expectation (that compares the plan against
+        itself).
         """
         with _translating():
             return self._get_client().review_status(plan_id)

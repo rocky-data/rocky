@@ -133,7 +133,7 @@ rules. A `draft_*` tool never applies a change to the warehouse.
 
 | Tool | What it writes |
 |---|---|
-| `draft_model` | `models/<name>.sql` + a sidecar carrying the intent. |
+| `draft_model` | `models/<name>.sql` + a sidecar carrying the intent. On an existing model it replaces the SQL but preserve-merges the sidecar: only `name` and `intent` change; classification, freshness, tests, target, strategy, and tags are kept. Comments are dropped on re-serialize; an unparseable sidecar is never overwritten. |
 | `draft_contract` | `models/<model>.contract.toml`, compile-validated against the model's inferred schema (a column the model doesn't produce comes back as a `W010` diagnostic). |
 | `draft_check` | one or more declarative `[[tests]]` blocks merged into the model's sidecar; run the `test` tool to execute them. |
 | `draft_metadata` | a structured freshness / classification patch, parse-merged into the model's sidecar as TOML. `freshness` replaces the `[freshness]` table; `classifications` merges per-column tags into `[classification]`. Comments in the sidecar are dropped on re-serialize; an unparseable sidecar is never overwritten. The policy check runs against the sidecar **as patched**, so a patch that adds the first `pii` tag is judged by that tag. |
@@ -172,6 +172,11 @@ prompts. Everything else — `draft_contract`, `draft_metadata`, `propose`,
 absent from the listing, and calling one returns tool-not-found. The list is an
 allowlist: a tool added in a future release stays out of the worker profile
 unless it is added deliberately.
+
+The prompt names are the same in both profiles, but under the worker profile
+the workflow prompts are served as worker variants: they orchestrate only
+tools on the allowlist and end at a hand-off to the trusted runner — never at
+`propose`, contract authorship, or a generator call.
 
 ## The gates on the write path
 
