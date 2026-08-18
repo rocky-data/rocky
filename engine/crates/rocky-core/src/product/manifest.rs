@@ -1116,6 +1116,7 @@ agent = "propose_only"
         );
     }
 
+    #[test]
     fn verify_artifact_hashes_detects_drift_and_absence() {
         let parsed = parse(MINIMAL);
         let root = tempfile::tempdir().expect("tempdir");
