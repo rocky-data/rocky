@@ -28,7 +28,66 @@ use crate::result_types::*;
 /// the single canonical skill so the MCP guidance never drifts from the
 /// `rocky-ai-workflow` skill. Path is relative to this source file:
 /// `crates/rocky-mcp/src` → repo root is four `..` segments.
+///
+/// The default profile serves this verbatim; the worker profile serves
+/// [`WORKER_INSTRUCTIONS_BANNER`] + this (see
+/// [`RockyMcpServer::get_info`]) — the skill file itself stays canonical and
+/// untouched.
 const INSTRUCTIONS: &str = include_str!("../../../../.claude/skills/rocky-ai-workflow/SKILL.md");
+
+/// Prepended to the served `instructions` under the worker profile (FF-WP1
+/// fix round 2, item 5a). The skill text below the banner is the FULL
+/// authoring workflow — including verbs this profile does not serve — so the
+/// banner re-frames it up front: name what is absent, and redirect every
+/// ending to the typed hand-off to the trusted runner.
+const WORKER_INSTRUCTIONS_BANNER: &str = "WORKER PROFILE ACTIVE: this server serves the minimal \
+drafting allowlist. The propose, review_queue, draft_contract, draft_metadata, and \
+pause_schedule tools are NOT available in this session, and the workflow below is the full \
+authoring map, parts of which belong to the trusted runner. Where it reaches contract or \
+metadata authorship, or the propose -> review -> apply chain, STOP: end every workflow at the \
+typed hand-off to the trusted runner instead — report the drafted files, the invariants you \
+encoded, and anything you flagged. The runner records, reviews, and applies.\n\n";
+
+/// Worker-profile `prompts/list` descriptions (FF-WP1 fix round 2, item 5b):
+/// the static `#[prompt(description = ...)]` strings instruct the DEFAULT
+/// workflow (they name `propose`, contract authorship, and the `ai_*`
+/// generators), so the worker profile rewrites every listed description at
+/// construction to the drafting-loop shape that ends at the trusted-runner
+/// hand-off. `summarize_project` is here too: its default description says
+/// "no propose", and the worker surface must not name excluded verbs at all.
+const WORKER_PROMPT_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        "build_model",
+        "Guide the authoring of one Rocky model from a plain-language intent: inspect schema -> \
+         sample rows -> profile columns -> draft_model -> compile-loop -> plan preview -> \
+         draft_check + test. Worker profile: ends at the typed hand-off to the trusted runner.",
+    ),
+    (
+        "find_untested_models",
+        "Find models with no declarative tests and draft tests for them: catalog -> identify \
+         untested models -> ground with sample_rows / profile_column -> author the checks -> \
+         draft_check -> test. Worker profile: ends at the typed hand-off to the trusted runner.",
+    ),
+    (
+        "add_tests_to_pks",
+        "Add uniqueness + not-null tests to a model's primary-key / unique columns: \
+         inspect_schema -> confirm the keys with profile_column -> author the checks -> \
+         draft_check -> test. Worker profile: ends at the typed hand-off to the trusted runner.",
+    ),
+    (
+        "summarize_project",
+        "Produce a structured, read-only summary of the Rocky project: catalog + lineage -> \
+         grouped overview of models, their grain, governance, tests, and DAG shape. Read-only — \
+         no edits, nothing recorded.",
+    ),
+    (
+        "fix_failing_test",
+        "Diagnose and fix failing declarative tests: run `test` -> for each failure \
+         profile_column the implicated columns to ground the cause -> redraft the model SQL \
+         with draft_model where the SQL is wrong. Worker profile: ends at the typed hand-off \
+         to the trusted runner.",
+    ),
+];
 
 /// Stateless Rocky MCP server. Holds only the project locators; every tool
 /// call recompiles from the current on-disk files (correctness over a warm
@@ -507,7 +566,9 @@ impl RockyMcpServer {
     /// rmcp's standard tool-not-found error. The prompt NAMES are served in
     /// both profiles, but the workflow prompts branch on the profile: the
     /// worker variants end at the handoff to the trusted runner and never
-    /// instruct a tool the profile excludes.
+    /// instruct a tool the profile excludes, and the `prompts/list`
+    /// descriptions are rewritten here to the
+    /// [`WORKER_PROMPT_DESCRIPTIONS`] variants for the same reason.
     pub fn new_with_profile(config_path: PathBuf, profile: McpProfile) -> Self {
         let root = config_path
             .parent()
@@ -515,6 +576,7 @@ impl RockyMcpServer {
             .unwrap_or_else(|| PathBuf::from("."));
         let models_dir = root.join("models");
         let mut tool_router = Self::tool_router();
+        let mut prompt_router = Self::prompt_router();
         if profile == McpProfile::Worker {
             let all: Vec<String> = tool_router
                 .list_all()
@@ -526,6 +588,21 @@ impl RockyMcpServer {
                     tool_router.remove_route(&name);
                 }
             }
+            // FF-WP1 fix round 2 (item 5b): the static prompt descriptions
+            // instruct the default workflow (they name tools this profile
+            // excludes) — swap in the worker descriptions. A rename that
+            // orphans an entry panics HERE, at construction, so every test
+            // that builds a worker server catches the drift.
+            for (name, description) in WORKER_PROMPT_DESCRIPTIONS {
+                prompt_router
+                    .map
+                    .get_mut(*name)
+                    .unwrap_or_else(|| {
+                        panic!("WORKER_PROMPT_DESCRIPTIONS names unrouted prompt '{name}'")
+                    })
+                    .attr
+                    .description = Some((*description).to_string());
+            }
         }
         Self {
             config_path,
@@ -533,12 +610,31 @@ impl RockyMcpServer {
             root,
             profile,
             tool_router,
-            prompt_router: Self::prompt_router(),
+            prompt_router,
         }
     }
 
     fn state_path(&self) -> PathBuf {
         rocky_core::state::resolve_state_path(None, &self.models_dir).path
+    }
+
+    /// The `next_steps` reminder a successful `draft_model` result carries.
+    /// The worker profile's variant ends at the trusted-runner hand-off and
+    /// never instructs `propose` (FF-WP1 fix round 2, item 5c).
+    fn draft_model_next_steps(&self) -> &'static str {
+        match self.profile {
+            McpProfile::Default => DRAFT_NEXT_STEPS,
+            McpProfile::Worker => WORKER_DRAFT_NEXT_STEPS,
+        }
+    }
+
+    /// The `next_steps` reminder a successful `draft_check` result carries —
+    /// profile-selected like [`Self::draft_model_next_steps`].
+    fn draft_check_next_steps(&self) -> &'static str {
+        match self.profile {
+            McpProfile::Default => DRAFT_CHECK_NEXT_STEPS,
+            McpProfile::Worker => WORKER_DRAFT_CHECK_NEXT_STEPS,
+        }
     }
 
     /// Path to the project's `data/seed.sql`, if it exists. The playground
@@ -2337,7 +2433,7 @@ impl RockyMcpServer {
                     error_count: compiled.error_count,
                     warning_count: compiled.warning_count,
                     diagnostics: compiled.diagnostics,
-                    next_steps: DRAFT_NEXT_STEPS.to_string(),
+                    next_steps: self.draft_model_next_steps().to_string(),
                 }))
             }
             rocky_cli::commands::PolicyGate::RequireReview {
@@ -2591,7 +2687,7 @@ impl RockyMcpServer {
                     error_count: compiled.error_count,
                     warning_count: compiled.warning_count,
                     diagnostics: compiled.diagnostics,
-                    next_steps: DRAFT_CHECK_NEXT_STEPS.to_string(),
+                    next_steps: self.draft_check_next_steps().to_string(),
                 }))
             }
             rocky_cli::commands::PolicyGate::RequireReview {
@@ -4101,6 +4197,15 @@ impl RockyMcpServer {
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for RockyMcpServer {
     fn get_info(&self) -> ServerInfo {
+        // FF-WP1 fix round 2 (item 5a): the compiled skill is the FULL
+        // authoring workflow, served to both profiles so the guidance never
+        // forks from the canonical file — but under the worker profile it is
+        // prefixed with the banner naming the tools this session does not
+        // serve and redirecting every ending to the trusted-runner hand-off.
+        let instructions = match self.profile {
+            McpProfile::Default => INSTRUCTIONS.to_string(),
+            McpProfile::Worker => format!("{WORKER_INSTRUCTIONS_BANNER}{INSTRUCTIONS}"),
+        };
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -4109,7 +4214,7 @@ impl ServerHandler for RockyMcpServer {
         )
         .with_server_info(Implementation::from_build_env())
         .with_protocol_version(ProtocolVersion::V_2024_11_05)
-        .with_instructions(INSTRUCTIONS.to_string())
+        .with_instructions(instructions)
     }
 }
 
@@ -4548,11 +4653,26 @@ fn build_ai_run_plan(
 /// The authoring-loop reminder every successful `draft_model` response carries.
 /// A draft is written and compiled, never applied — this restates the flow so
 /// the agent never mistakes a written draft for a materialized change.
+/// Default profile only; the worker profile serves
+/// [`WORKER_DRAFT_NEXT_STEPS`].
 const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
      warehouse. Continue the authoring loop: fix any error diagnostics above and re-draft (or \
      `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, then `propose` \
      to record an AI-authored plan for a human to `rocky review <plan_id> --approve` and \
      `rocky apply`. Never apply a draft directly.";
+
+/// The worker-profile variant of [`DRAFT_NEXT_STEPS`] (FF-WP1 fix round 2,
+/// item 5c): the default reminder instructs `propose`, a tool this profile
+/// does not serve — the worker's loop ends at the typed hand-off to the
+/// trusted runner instead.
+const WORKER_DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
+     the warehouse. Continue the drafting loop: fix any error diagnostics above and re-draft \
+     (or `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, and \
+     encode what you verified as append-only checks with `draft_check`, executed via the `test` \
+     tool. When the draft is clean and its checks pass, STOP and end at the typed hand-off to \
+     the trusted runner: report the drafted files, the invariants you encoded, and anything you \
+     flagged. Recording, review, and apply belong to the trusted runner — never act on them \
+     yourself.";
 
 /// The authoring-loop reminder every successful `draft_contract` response
 /// carries. The contract is written and compile-validated, never applied.
@@ -4564,11 +4684,23 @@ const DRAFT_CONTRACT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT appli
 
 /// The authoring-loop reminder every successful `draft_check` response carries.
 /// The check is written and structurally compiled, then executed via `test`.
+/// Default profile only; the worker profile serves
+/// [`WORKER_DRAFT_CHECK_NEXT_STEPS`].
 const DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
      warehouse. The check is merged into the model's sidecar and the project compiles; run the \
      `test` tool to EXECUTE the check against the data and confirm it passes. When it is clean, \
      `propose` to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
      and `rocky apply`. Never apply a draft directly.";
+
+/// The worker-profile variant of [`DRAFT_CHECK_NEXT_STEPS`] (FF-WP1 fix
+/// round 2, item 5c): ends at the typed hand-off to the trusted runner
+/// instead of instructing `propose`.
+const WORKER_DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or \
+     touched the warehouse. The check is merged into the model's sidecar and the project \
+     compiles; run the `test` tool to EXECUTE the check against the data and confirm it passes. \
+     When it is clean, STOP and end at the typed hand-off to the trusted runner: report the \
+     model, the invariants you encoded, and anything you flagged. Recording, review, and apply \
+     belong to the trusted runner — never act on them yourself.";
 
 /// The authoring-loop reminder every successful `draft_metadata` response
 /// carries. The patched sidecar is written and compile-validated, never
@@ -5341,5 +5473,213 @@ mod tests {
         assert_eq!(lite.change, "model_removed");
         assert_eq!(lite.model, "c.s.orders");
         assert_eq!(lite.column, None);
+    }
+
+    // --- FF-WP1 fix round 2 (item 5) — worker-profile guidance surfaces ----
+
+    /// Tools the worker profile does not serve — no worker-served guidance
+    /// surface may name them (the instructions BANNER is the one deliberate
+    /// exception: naming them as absent is its job).
+    const WORKER_EXCLUDED_TOOL_MENTIONS: &[&str] = &[
+        "propose",
+        "review_queue",
+        "draft_contract",
+        "draft_metadata",
+        "pause_schedule",
+        "ai_test",
+        "ai_contract",
+    ];
+
+    fn server_with(profile: McpProfile) -> RockyMcpServer {
+        // `get_info` and the routers never touch the filesystem, so an
+        // arbitrary path is fine here.
+        RockyMcpServer::new_with_profile(PathBuf::from("rocky.toml"), profile)
+    }
+
+    /// Item 5a — served `instructions` per profile: the worker profile
+    /// prepends the banner (worker profile named, the five excluded tools
+    /// named as NOT available, the hand-off named as the ending) and serves
+    /// the skill text below it UNCHANGED; the default profile serves the
+    /// skill text verbatim, byte-identical to the compiled file.
+    #[test]
+    fn instructions_carry_the_worker_banner_and_stay_verbatim_by_default() {
+        let default_info = server_with(McpProfile::Default).get_info();
+        assert_eq!(
+            default_info.instructions.as_deref(),
+            Some(INSTRUCTIONS),
+            "default-profile instructions are the skill text, byte-unchanged"
+        );
+
+        let worker_info = server_with(McpProfile::Worker).get_info();
+        let worker = worker_info
+            .instructions
+            .as_deref()
+            .expect("worker profile serves instructions");
+        assert!(
+            worker.starts_with(WORKER_INSTRUCTIONS_BANNER),
+            "worker instructions start with the banner"
+        );
+        assert!(
+            worker.ends_with(INSTRUCTIONS),
+            "the skill text below the banner is byte-unchanged"
+        );
+        assert_eq!(
+            worker.len(),
+            WORKER_INSTRUCTIONS_BANNER.len() + INSTRUCTIONS.len(),
+            "banner + skill text and nothing else"
+        );
+        let banner_lower = WORKER_INSTRUCTIONS_BANNER.to_lowercase();
+        assert!(
+            banner_lower.contains("worker profile"),
+            "the banner says which profile is active"
+        );
+        for tool in [
+            "propose",
+            "review_queue",
+            "draft_contract",
+            "draft_metadata",
+            "pause_schedule",
+        ] {
+            assert!(
+                banner_lower.contains(tool)
+                    && banner_lower.contains("not available"),
+                "the banner names `{tool}` as not available"
+            );
+        }
+        assert!(
+            banner_lower.contains("hand-off") && banner_lower.contains("trusted runner"),
+            "the banner redirects every ending to the trusted-runner hand-off"
+        );
+    }
+
+    /// Item 5b — the worker `prompts/list` surface: EVERY listed prompt
+    /// description (the sweep is over the whole router, so a future prompt
+    /// cannot dodge it) names none of the excluded tools and the four
+    /// workflow prompts say they end at the trusted-runner hand-off.
+    #[test]
+    fn worker_prompt_descriptions_name_no_excluded_tool() {
+        let server = server_with(McpProfile::Worker);
+        let prompts = server.prompt_router.list_all();
+        assert_eq!(prompts.len(), 5, "the worker profile keeps all 5 prompts");
+        for prompt in &prompts {
+            let description = prompt
+                .description
+                .as_deref()
+                .unwrap_or_else(|| panic!("prompt '{}' has a description", prompt.name));
+            for excluded in WORKER_EXCLUDED_TOOL_MENTIONS {
+                assert!(
+                    !description.contains(excluded),
+                    "worker-profile description of '{}' must not name excluded tool \
+                     `{excluded}`: {description}",
+                    prompt.name
+                );
+            }
+            if prompt.name != "summarize_project" {
+                assert!(
+                    description.contains("hand-off to the trusted runner"),
+                    "worker-profile description of '{}' ends at the runner hand-off: \
+                     {description}",
+                    prompt.name
+                );
+            }
+        }
+    }
+
+    /// Item 5b, the other half — the DEFAULT `prompts/list` descriptions are
+    /// byte-unchanged: pinned against the exact pre-worker-profile strings,
+    /// so the worker rewrite provably never leaks into the default surface.
+    #[test]
+    fn default_prompt_descriptions_are_byte_unchanged() {
+        let expected: &[(&str, &str)] = &[
+            (
+                "add_tests_to_pks",
+                "Add uniqueness + not-null tests to a model's primary-key / unique columns: \
+                 inspect_schema -> identify key columns -> ai_test / author the checks -> \
+                 draft_check -> propose. Stops at the human approval gate.",
+            ),
+            (
+                "build_model",
+                "Guide the authoring of one Rocky model from a plain-language intent: inspect \
+                 schema -> sample rows -> profile columns -> write SQL -> compile-loop -> plan \
+                 preview -> propose. Stops at the human approval gate.",
+            ),
+            (
+                "find_untested_models",
+                "Find models with no declarative tests and draft tests for them: catalog -> \
+                 identify untested models -> ai_test / ai_contract -> draft_check / \
+                 draft_contract -> propose. Stops at the human approval gate.",
+            ),
+            (
+                "fix_failing_test",
+                "Diagnose and fix failing declarative tests: run `test` -> for each failure \
+                 profile_column the implicated columns to ground the cause -> propose a fix. \
+                 Stops at the human approval gate.",
+            ),
+            (
+                "summarize_project",
+                "Produce a structured, read-only summary of the Rocky project: catalog + \
+                 lineage -> grouped overview of models, their grain, governance, tests, and DAG \
+                 shape. Read-only — no edits, no propose.",
+            ),
+        ];
+        let server = server_with(McpProfile::Default);
+        let listed: std::collections::BTreeMap<String, Option<String>> = server
+            .prompt_router
+            .list_all()
+            .into_iter()
+            .map(|p| (p.name.to_string(), p.description.clone()))
+            .collect();
+        assert_eq!(listed.len(), expected.len(), "all prompts accounted for");
+        for (name, description) in expected {
+            assert_eq!(
+                listed.get(*name).and_then(|d| d.as_deref()),
+                Some(*description),
+                "default-profile description of '{name}' is byte-unchanged"
+            );
+        }
+    }
+
+    /// Item 5c — the profile-selected draft `next_steps`: the worker variants
+    /// name no excluded tool and end at the trusted-runner hand-off; the
+    /// default variants are byte-unchanged (pinned), still ending at
+    /// `propose` + human review.
+    #[test]
+    fn draft_next_steps_are_profile_selected() {
+        let default_server = server_with(McpProfile::Default);
+        assert_eq!(
+            default_server.draft_model_next_steps(),
+            "This is a draft — Rocky has NOT applied it or touched the warehouse. Continue the \
+             authoring loop: fix any error diagnostics above and re-draft (or `compile`) until \
+             it is clean, `plan_preview` to read the SQL Rocky would run, then `propose` to \
+             record an AI-authored plan for a human to `rocky review <plan_id> --approve` and \
+             `rocky apply`. Never apply a draft directly.",
+            "default draft_model next_steps are byte-unchanged"
+        );
+        assert_eq!(
+            default_server.draft_check_next_steps(),
+            "This is a draft — Rocky has NOT applied it or touched the warehouse. The check is \
+             merged into the model's sidecar and the project compiles; run the `test` tool to \
+             EXECUTE the check against the data and confirm it passes. When it is clean, \
+             `propose` to record an AI-authored plan for a human to `rocky review <plan_id> \
+             --approve` and `rocky apply`. Never apply a draft directly.",
+            "default draft_check next_steps are byte-unchanged"
+        );
+
+        let worker_server = server_with(McpProfile::Worker);
+        for next_steps in [
+            worker_server.draft_model_next_steps(),
+            worker_server.draft_check_next_steps(),
+        ] {
+            for excluded in WORKER_EXCLUDED_TOOL_MENTIONS {
+                assert!(
+                    !next_steps.contains(excluded),
+                    "worker next_steps must not name excluded tool `{excluded}`: {next_steps}"
+                );
+            }
+            assert!(
+                next_steps.contains("hand-off to the trusted runner"),
+                "worker next_steps end at the runner hand-off: {next_steps}"
+            );
+        }
     }
 }

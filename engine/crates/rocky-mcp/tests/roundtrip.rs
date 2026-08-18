@@ -2800,6 +2800,91 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
     client.cancel().await.unwrap();
 }
 
+/// FF-WP1 fix round 2 (item 5) — the worker-profile guidance surfaces ON THE
+/// WIRE: the `prompts/list` descriptions and the draft tools' `next_steps`
+/// name no tool the profile excludes and end at the trusted-runner hand-off.
+/// (The default surfaces are byte-pinned by the rocky-mcp unit goldens; the
+/// existing default-profile draft tests here pin the `propose` ending.)
+#[tokio::test]
+async fn worker_profile_descriptions_and_next_steps_end_at_the_handoff() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    );
+    let client = connect(server).await;
+
+    const EXCLUDED_TOOL_MENTIONS: &[&str] = &[
+        "propose",
+        "review_queue",
+        "draft_contract",
+        "draft_metadata",
+        "pause_schedule",
+        "ai_test",
+        "ai_contract",
+    ];
+
+    // Surface (b): every listed prompt description, as served over the wire.
+    let prompts = client.list_all_prompts().await.expect("list prompts");
+    assert_eq!(prompts.len(), 5, "the worker profile keeps all 5 prompts");
+    for prompt in &prompts {
+        let description = prompt.description.as_deref().unwrap_or_default();
+        for excluded in EXCLUDED_TOOL_MENTIONS {
+            assert!(
+                !description.contains(excluded),
+                "worker `prompts/list` description of '{}' must not name `{excluded}`: \
+                 {description}",
+                prompt.name
+            );
+        }
+    }
+
+    // Surface (c): the draft tools' next_steps.
+    let draft = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id, 'WORKER' AS status",
+                "worker redraft",
+            )),
+        )
+        .await
+        .expect("draft_model call");
+    assert_ne!(draft.is_error, Some(true), "draft_model succeeds");
+    let check_args = serde_json::json!({
+        "model": "orders",
+        "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let check = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(check_args))
+        .await
+        .expect("draft_check call");
+    assert_ne!(check.is_error, Some(true), "draft_check succeeds");
+
+    for (tool, result) in [("draft_model", &draft), ("draft_check", &check)] {
+        let next_steps = result.structured_content.as_ref().expect("structured")["next_steps"]
+            .as_str()
+            .expect("next_steps is a string")
+            .to_string();
+        for excluded in EXCLUDED_TOOL_MENTIONS {
+            assert!(
+                !next_steps.contains(excluded),
+                "worker `{tool}` next_steps must not name `{excluded}`: {next_steps}"
+            );
+        }
+        assert!(
+            next_steps.contains("hand-off to the trusted runner"),
+            "worker `{tool}` next_steps end at the runner hand-off: {next_steps}"
+        );
+    }
+
+    client.cancel().await.unwrap();
+}
+
 /// The default profile's `build_model` still ends at `propose` — the worker
 /// variant did not leak into the default surface (both golden pins together
 /// force a conscious per-profile choice on any prompt edit).
