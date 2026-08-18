@@ -577,7 +577,10 @@ pub(crate) fn write_test_review_marker(root: &Path, plan_id: &str) {
 /// that is malformed or names a different plan is an ERROR (the same distinct
 /// refusal the apply gate raises), never a silent `false` a polling runner
 /// would wait on forever.
-pub fn compute_review_status(root: &Path, plan_id: &str) -> Result<crate::output::ReviewStatusOutput> {
+pub fn compute_review_status(
+    root: &Path,
+    plan_id: &str,
+) -> Result<crate::output::ReviewStatusOutput> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read plan '{plan_id}' for status"))?;
     let product_id = plan
@@ -1140,8 +1143,7 @@ mod tests {
             "product_id": "product:revenue_daily",
             "spec_digest": "sha256:abc",
         });
-        let plan_id =
-            crate::plan_store::write_plan(dir.path(), PlanKind::AiAuthored, &payload)?;
+        let plan_id = crate::plan_store::write_plan(dir.path(), PlanKind::AiAuthored, &payload)?;
 
         // Pending.
         let status = compute_review_status(dir.path(), &plan_id)?;

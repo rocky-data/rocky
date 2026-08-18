@@ -554,7 +554,10 @@ effect = "require_review"
         .expect("filtered queue list");
     let sc = filtered.structured_content.expect("result");
     assert_eq!(sc["total"], serde_json::json!(1), "{sc:?}");
-    assert_eq!(sc["pending"][0]["plan_id"], serde_json::json!(bound_plan_id));
+    assert_eq!(
+        sc["pending"][0]["plan_id"],
+        serde_json::json!(bound_plan_id)
+    );
 
     // Corrupt the BARE plan's payload on disk (its integrity re-hash now
     // fails). The filter cannot classify it, so it must surface as a
@@ -1687,8 +1690,7 @@ async fn draft_metadata_writes_freshness_and_classifications() {
 
     // The sidecar re-parses and carries the patch AND the prior config.
     let sidecar = dir.path().join("models").join("orders.toml");
-    let parsed: toml::Table =
-        toml::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    let parsed: toml::Table = toml::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
     assert_eq!(
         parsed["freshness"]["expected_lag_seconds"],
         toml::Value::Integer(86400)
@@ -1733,12 +1735,14 @@ async fn draft_metadata_merges_over_appended_checks_and_replaces_freshness() {
 
     // Step 1: draft_check string-appends a [[tests]] block (the legacy merge).
     let check = client
-        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(metadata_args(
-            serde_json::json!({
-                "model": "orders",
-                "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
-            }),
-        )))
+        .call_tool(
+            CallToolRequestParams::new("draft_check").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+                }),
+            )),
+        )
         .await
         .expect("draft_check call");
     assert_ne!(check.is_error, Some(true), "the check draft succeeds");
@@ -1886,7 +1890,11 @@ async fn draft_metadata_never_clobbers_an_unparseable_sidecar() {
         .await
         .expect("draft_metadata returns a result");
 
-    assert_eq!(result.is_error, Some(true), "an unparseable sidecar refuses");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an unparseable sidecar refuses"
+    );
     let err = result.structured_content.expect("envelope");
     assert_eq!(err["code"], serde_json::json!("invalid_argument"));
     assert!(
@@ -1928,7 +1936,11 @@ async fn draft_metadata_compile_failure_rolls_back() {
         .await
         .expect("draft_metadata returns a result");
 
-    assert_eq!(result.is_error, Some(true), "the merged sidecar cannot load");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "the merged sidecar cannot load"
+    );
     let err = result.structured_content.expect("envelope");
     assert_eq!(
         err["code"],
@@ -2023,8 +2035,7 @@ effect = "deny"
         serde_json::json!("policy_review_required"),
         "a non-pii patch falls to the default, not the pii deny: {control_err:?}"
     );
-    let parsed: toml::Table =
-        toml::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    let parsed: toml::Table = toml::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
     assert_eq!(
         parsed["classification"]["status"],
         toml::Value::String("internal".to_string()),

@@ -2618,10 +2618,7 @@ impl RockyMcpServer {
                 // A bare `.sql`/`.rocky` model with no sidecar yet: seed the
                 // minimal sidecar `draft_check` also seeds.
                 let mut table = toml::Table::new();
-                table.insert(
-                    "name".to_string(),
-                    toml::Value::String(paths.stem.clone()),
-                );
+                table.insert("name".to_string(), toml::Value::String(paths.stem.clone()));
                 table
             }
         };
@@ -4434,7 +4431,10 @@ fn build_freshness_table(patch: &FreshnessPatch) -> Result<toml::Table, Json<Too
         )
     })?;
     let mut table = toml::Table::new();
-    table.insert("expected_lag_seconds".to_string(), toml::Value::Integer(lag));
+    table.insert(
+        "expected_lag_seconds".to_string(),
+        toml::Value::Integer(lag),
+    );
     if let Some(time_column) = &patch.time_column {
         if time_column.trim().is_empty() {
             return Err(ToolError::invalid_argument(

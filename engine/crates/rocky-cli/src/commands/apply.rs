@@ -7832,7 +7832,9 @@ schema_template = "s__{source}"
         // no config to gate with; a gate that ran would have errored first).
         assert!(
             !state.exists()
-                || StateStore::open(&state)?.list_policy_decisions()?.is_empty(),
+                || StateStore::open(&state)?
+                    .list_policy_decisions()?
+                    .is_empty(),
             "no custody row may exist for a pre-gate refusal"
         );
         Ok(())
