@@ -1112,6 +1112,13 @@ pub(crate) struct JobRequest {
     model: Option<String>,
     /// The positional `<plan_id>` for `apply`.
     plan_id: Option<String>,
+    /// `--expect-spec-digest <hex>` for `apply` — the approved-spec digest
+    /// the caller expects the plan to be bound to. The engine's gate is
+    /// fail-closed both ways: a product-bound plan REFUSES an apply without
+    /// this, and passing it against an unbound plan refuses too. The value
+    /// must come from the caller's independently approved product-spec
+    /// snapshot, never read back from the plan itself.
+    expect_spec_digest: Option<String>,
 }
 
 /// Mint an opaque, collision-resistant job id for this sidecar.
@@ -1373,6 +1380,62 @@ async fn submit_job(
         .into_response())
 }
 
+/// Build the full `rocky` argv (minus the binary path) for a job subprocess.
+///
+/// Pure function extracted from [`execute_job_subprocess`] so the flag
+/// threading is unit-testable without spawning anything — in a cargo test
+/// `std::env::current_exe()` is the test harness, so the spawn itself is
+/// proven by the live reachability transcript, while THIS seam pins exactly
+/// which request fields become which flags (notably `expect_spec_digest` →
+/// `--expect-spec-digest` on `apply`).
+fn job_subprocess_args(
+    kind: JobKind,
+    config_path: Option<&std::path::Path>,
+    state_path: &std::path::Path,
+    request: &JobRequest,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+    let mut args: Vec<OsString> = vec!["--output".into(), "json".into()];
+    if let Some(config) = config_path {
+        args.push("--config".into());
+        args.push(config.into());
+    }
+    args.push("--state-path".into());
+    args.push(state_path.into());
+    args.push(kind.verb().into());
+    match kind {
+        JobKind::Run | JobKind::Plan => {
+            if let Some(filter) = &request.filter {
+                args.push("--filter".into());
+                args.push(filter.into());
+            }
+            if let Some(pipeline) = &request.pipeline {
+                args.push("--pipeline".into());
+                args.push(pipeline.into());
+            }
+            if let Some(model) = &request.model {
+                args.push("--model".into());
+                args.push(model.into());
+            }
+        }
+        JobKind::Apply => {
+            if let Some(plan_id) = &request.plan_id {
+                args.push(plan_id.into());
+            }
+            // FF-WP1 (finding 5): the HTTP apply surface carries the caller's
+            // spec-digest expectation through to the engine's fail-closed
+            // gate. Without it, a product-bound plan is refused by the engine
+            // (the fail-safe); with it, the subprocess crosses the same
+            // generic gate a CLI apply does.
+            if let Some(digest) = &request.expect_spec_digest {
+                args.push("--expect-spec-digest".into());
+                args.push(digest.into());
+            }
+        }
+    }
+    args
+}
+
 /// Spawn `rocky <kind> --output json` as a subprocess and collect its outcome.
 ///
 /// Runs as a subprocess (matching the SDK's pattern) so the server never holds
@@ -1397,29 +1460,8 @@ async fn execute_job_subprocess(
     };
 
     let mut cmd = tokio::process::Command::new(exe);
-    cmd.arg("--output").arg("json");
-    if let Some(config) = &config_path {
-        cmd.arg("--config").arg(config);
-    }
-    cmd.arg("--state-path").arg(&state_path);
-    cmd.arg(kind.verb());
-    match kind {
-        JobKind::Run | JobKind::Plan => {
-            if let Some(filter) = &request.filter {
-                cmd.arg("--filter").arg(filter);
-            }
-            if let Some(pipeline) = &request.pipeline {
-                cmd.arg("--pipeline").arg(pipeline);
-            }
-            if let Some(model) = &request.model {
-                cmd.arg("--model").arg(model);
-            }
-        }
-        JobKind::Apply => {
-            if let Some(plan_id) = &request.plan_id {
-                cmd.arg(plan_id);
-            }
-        }
+    for arg in job_subprocess_args(kind, config_path.as_deref(), &state_path, &request) {
+        cmd.arg(arg);
     }
 
     let output = match cmd.output().await {
@@ -2760,6 +2802,115 @@ mod tests {
         assert_eq!(JobKind::Run.verb(), "run");
         assert_eq!(JobKind::Plan.verb(), "plan");
         assert_eq!(JobKind::Apply.verb(), "apply");
+    }
+
+    /// FF-WP1 (finding 5) — the apply job's argv threading, pinned at the
+    /// extracted pure seam: `expect_spec_digest` becomes the trailing
+    /// `--expect-spec-digest <hex>` pair after the positional plan id; without
+    /// the field the flag is absent (so a product-bound plan is refused by
+    /// the engine's fail-closed gate); run/plan jobs never carry it.
+    #[test]
+    fn job_apply_argv_threads_expect_spec_digest() {
+        let state = std::path::Path::new("/tmp/state.redb");
+        let with = JobRequest {
+            plan_id: Some("abc123".to_string()),
+            expect_spec_digest: Some("sha256:feed".to_string()),
+            ..JobRequest::default()
+        };
+        let args = job_subprocess_args(JobKind::Apply, None, state, &with);
+        let args: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let flag_pos = args
+            .iter()
+            .position(|a| a == "--expect-spec-digest")
+            .expect("the flag is appended for apply");
+        assert_eq!(args[flag_pos + 1], "sha256:feed");
+        let plan_pos = args.iter().position(|a| a == "abc123").unwrap();
+        assert!(
+            plan_pos < flag_pos,
+            "the positional plan id precedes the flag: {args:?}"
+        );
+
+        // Without the field: no flag — the engine gate stays the fail-safe.
+        let without = JobRequest {
+            plan_id: Some("abc123".to_string()),
+            ..JobRequest::default()
+        };
+        let args = job_subprocess_args(JobKind::Apply, None, state, &without);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.to_string_lossy() == "--expect-spec-digest"),
+            "no expectation, no flag: {args:?}"
+        );
+
+        // Run/plan jobs never thread the flag even if the field is set.
+        let stray = JobRequest {
+            expect_spec_digest: Some("sha256:feed".to_string()),
+            ..JobRequest::default()
+        };
+        for kind in [JobKind::Run, JobKind::Plan] {
+            let args = job_subprocess_args(kind, None, state, &stray);
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a.to_string_lossy() == "--expect-spec-digest"),
+                "{kind:?} must not thread the apply-only flag: {args:?}"
+            );
+        }
+    }
+
+    /// FF-WP1 (finding 5) — a malformed `expect_spec_digest` (non-string) in
+    /// the HTTP body is a structured `400` REJECTED before any permit,
+    /// subprocess, or job record — while a well-typed body is accepted past
+    /// body parsing (here surfacing as the held-permit 409, which proves
+    /// parsing succeeded).
+    #[tokio::test]
+    async fn job_apply_rejects_malformed_expect_spec_digest_body() {
+        let state = test_state();
+        let held = state
+            .mutation_permit
+            .try_acquire("job_incumbent")
+            .expect("permit is free");
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+
+        // Non-string digest → 400 from body deserialization (before the
+        // permit check — a 409 here would mean the malformed body parsed).
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/apply"))
+            .json(&serde_json::json!({ "plan_id": "abc", "expect_spec_digest": 123 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "bad_request");
+        assert!(
+            body.message.contains("invalid job request body"),
+            "the 400 names the body failure: {}",
+            body.message
+        );
+
+        // Control: the well-typed body parses and reaches the permit guard.
+        let resp = client
+            .post(format!("{base}/api/v1/jobs/apply"))
+            .json(&serde_json::json!({
+                "plan_id": "abc",
+                "expect_spec_digest": "sha256:feed"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            409,
+            "a well-typed body parses and reaches the (held) permit guard"
+        );
+
+        drop(held);
     }
 
     /// An unknown job id is a structured `404 job_not_found`.
