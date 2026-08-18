@@ -489,6 +489,43 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_array_indents_one_level_deeper() {
+        let document = table(&[(
+            "a",
+            TomlValue::Array(vec![
+                TomlValue::Array(vec![TomlValue::Integer(1), TomlValue::Integer(2)]),
+                TomlValue::Array(vec![TomlValue::Integer(3)]),
+            ]),
+        )]);
+        assert_eq!(
+            render_document(&document),
+            "a = [\n    [\n        1,\n        2,\n    ],\n    [\n        3,\n    ],\n]\n"
+        );
+    }
+
+    #[test]
+    fn an_array_inside_an_inline_table_restarts_at_the_outer_indent() {
+        // A quirk of the reference writer, reproduced because the bytes
+        // are the contract: the nesting level resets when rendering the
+        // values of an inline table, so this inner array indents as if it
+        // were at the top level.
+        let document = table(&[(
+            "m",
+            TomlValue::Array(vec![
+                TomlValue::Table(table(&[(
+                    "a",
+                    TomlValue::Array(vec![TomlValue::Integer(1), TomlValue::Integer(2)]),
+                )])),
+                TomlValue::Integer(2),
+            ]),
+        )]);
+        assert_eq!(
+            render_document(&document),
+            "m = [\n    { a = [\n    1,\n    2,\n] },\n    2,\n]\n"
+        );
+    }
+
+    #[test]
     fn an_empty_array_stays_on_one_line() {
         let document = table(&[("x", TomlValue::Array(vec![]))]);
         assert_eq!(render_document(&document), "x = []\n");
