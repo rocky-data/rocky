@@ -1,0 +1,19 @@
+# GENERATED from products/revenue_daily.toml (spec sha256:54df46b9278c1f265f64fd23203396ea69e68771197d5d0e5a7291cd6ffd82ff) — edit the spec, not this file.
+
+[[columns]]
+name = "client_id"
+type = "Int64"
+nullable = false
+
+[[columns]]
+name = "date"
+type = "Date"
+nullable = false
+
+[[columns]]
+name = "revenue_eur"
+type = "Decimal(18,2)"
+nullable = false
+
+[rules]
+required = ["client_id", "date", "revenue_eur"]
