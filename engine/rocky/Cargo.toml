@@ -46,6 +46,11 @@ tempfile = "3"
 # spawning the binary, so the reachability proof exercises the real read path.
 rocky-ir = { path = "../crates/rocky-ir" }
 chrono = { workspace = true }
+# `apply_product_idempotency` drives the in-process MCP `propose` (the sole
+# writer of product-bound AI plans) with the rmcp client before shelling out
+# to the real binary for review/apply — same client feature set as
+# rocky-mcp's own round-trip tests.
+rmcp = { version = "3.0", features = ["server", "macros", "transport-io", "client"] }
 
 [lints]
 workspace = true

@@ -3876,6 +3876,7 @@ dependencies = [
  "duckdb",
  "libc",
  "miette",
+ "rmcp",
  "rocky-cli",
  "rocky-core",
  "rocky-ir",
