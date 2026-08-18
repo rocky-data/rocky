@@ -48,7 +48,10 @@ pub struct SpecRejected {
 }
 
 impl SpecRejected {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    /// Visible to the rest of `product` so the lowering raises its own
+    /// refusals through the same constructor, rather than assembling the
+    /// struct by hand and drifting on the `Display` shape.
+    pub(super) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
