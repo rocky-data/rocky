@@ -1341,7 +1341,15 @@ pub(crate) fn state_authority_identity(
     state_path: &std::path::Path,
 ) -> String {
     use rocky_core::config::StateBackend;
-    let mut parts = vec![format!("backend={:?}", state.backend)];
+    // The remote ledger key embeds the state schema version
+    // (`state_sync.rs`: `format!("v{}", current_schema_version())`), so two
+    // versions are two different objects. Without this, a plan made before a
+    // schema upgrade compares equal afterwards while the new binary reads a
+    // different ledger — losing the reviewed watermarks, budgets and freezes.
+    let mut parts = vec![
+        format!("backend={:?}", state.backend),
+        format!("schema=v{}", rocky_core::state::current_schema_version()),
+    ];
     match state.backend {
         StateBackend::S3 => {
             parts.push(format!(
@@ -2311,6 +2319,23 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    /// The identity must change across a state-schema version bump, because the
+    /// remote ledger key embeds it. Without this a plan made under one version
+    /// compares equal under the next while reading a different object.
+    #[test]
+    fn state_authority_identity_includes_the_state_schema_version() {
+        use rocky_core::config::StateConfig;
+        let st = StateConfig::default();
+        let got = super::state_authority_identity(&st, std::path::Path::new("/s.redb"));
+        assert!(
+            got.contains(&format!(
+                "schema=v{}",
+                rocky_core::state::current_schema_version()
+            )),
+            "identity must record the state schema version, got: {got}"
+        );
+    }
 
     /// The state-authority identity is persisted to a plan file on disk, so it
     /// must carry no secret in ANY valkey URL form. Stripping only the

@@ -3586,6 +3586,19 @@ async fn run_apply_replication_plan(
     //
     // Absent means the plan predates this field; skip rather than refuse every
     // older plan. New plans always record it.
+    //
+    // Warn rather than skip silently. A gate that disappears without a word is
+    // how an unbound plan reaches a different ledger unnoticed, and the absence
+    // is not self-announcing anywhere else. Whether an unbound plan should be
+    // refused outright is a policy question, not one to settle by default.
+    if replication_plan.state_authority.is_none() {
+        warn!(
+            target = "rocky::replication::state_authority",
+            plan_id = plan_id,
+            "plan records no state authority (written before that field existed); \
+             applying WITHOUT verifying the state store matches the reviewed one"
+        );
+    }
     if let Some(reviewed_authority) = replication_plan.state_authority.as_deref() {
         let live_authority =
             crate::commands::plan::state_authority_identity(&rocky_cfg.state, state_path);
@@ -7804,12 +7817,30 @@ schema_template = "s__{source}"
             true,
         )
         .await;
-        if let Err(e) = res {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("state authority has changed"),
-                "an unrecorded authority must not refuse, got: {msg}"
-            );
+
+        // Assert it got PAST the authority gate, not merely that it failed
+        // somewhere. Accepting any error would let this pass for an unrelated
+        // reason and prove nothing about legacy compatibility.
+        match res {
+            Ok(()) => {}
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    !msg.contains("state authority has changed"),
+                    "an unrecorded authority must not refuse, got: {msg}"
+                );
+                // It must fail LATER than the gate — the gate sits before
+                // pipeline resolution, so a failure here means execution was
+                // reached. A failure naming the plan payload or the gate would
+                // mean the test never exercised the path.
+                assert!(
+                    !msg.contains("failed to read replication plan")
+                        && !msg.contains("is a ")
+                        && !msg.contains("config has changed"),
+                    "must fail after the plan/config/authority gates, not at one \
+                     of them — got: {msg}"
+                );
+            }
         }
         Ok(())
     }
