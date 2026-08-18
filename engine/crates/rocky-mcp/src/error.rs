@@ -3,8 +3,11 @@
 //!
 //! A failing tool call comes back as a *tool-result* error (`is_error: true`)
 //! whose `structured_content` is a `{code, message, remediation_hint,
-//! policy_rule?}` object, so a connected agent can branch on a stable `code`
-//! and act on an actionable `remediation_hint` without scraping prose. This is
+//! policy_rule?, plan_id?, product_id?, spec_digest?}` object, so a connected
+//! agent can branch on a stable `code` and act on an actionable
+//! `remediation_hint` without scraping prose (the last three ride only on
+//! `propose`'s `policy_review_required` handoff — the recorded plan's typed
+//! reference). This is
 //! deliberately **not** a JSON-RPC protocol error ([`rmcp::ErrorData`]):
 //! protocol errors carry a different wire shape and no result-level `is_error`
 //! flag, and would change the tools' failure semantics.

@@ -204,7 +204,11 @@ Every failing tool call returns a stable envelope, not a prose blob:
 `code` is a machine-matchable class: `invalid_argument`, `model_not_found`,
 `compile_failed`, `policy_denied`, `policy_review_required`, and a few more.
 `remediation_hint` is a concrete next action, never empty. `policy_rule` names
-the deciding rule on a policy verdict. An agent branches on the `code` and acts
+the deciding rule on a policy verdict. When `propose` answers
+`policy_review_required`, the envelope also carries `plan_id` (the recorded
+plan awaiting review) and, on a product-bound propose, `product_id` and
+`spec_digest` — typed fields, so a runner never scrapes the plan id out of the
+message. An agent branches on the `code` and acts
 on the `remediation_hint` without parsing English.
 
 One distinction matters. A compile that reports error *diagnostics* is **not** an

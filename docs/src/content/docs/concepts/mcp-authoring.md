@@ -201,7 +201,11 @@ rules are written.
 ## Structured errors
 
 When a tool rejects a request it has parsed, the failure comes back as a stable
-envelope: `{ code, message, remediation_hint, policy_rule? }`. An agent branches
+envelope: `{ code, message, remediation_hint, policy_rule? }`. When `propose`
+returns `policy_review_required`, the envelope also carries the recorded plan's
+typed reference — `plan_id`, plus `product_id` / `spec_digest` when the propose
+was product-bound — so a runner reads the handoff from fields, not prose. An
+agent branches
 on the `code` and acts on the `remediation_hint` without scraping text. See
 [Structured errors](/concepts/operating-rocky-with-agents/#structured-errors)
 for the field-by-field contract and a worked example.
