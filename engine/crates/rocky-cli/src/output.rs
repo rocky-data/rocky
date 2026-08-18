@@ -3560,6 +3560,20 @@ pub struct RunPlan {
     /// Informational — re-derived at apply time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub execution_layers: Vec<Vec<String>>,
+    /// Product identity this plan fulfils (e.g. `"product:revenue_daily"`).
+    /// Opaque to the engine — never parsed, only carried in the hashed
+    /// payload and compared for equality. Set together with `spec_digest`
+    /// or not at all. When unset the serialized payload is byte-identical
+    /// to the pre-product shape, so every legacy plan_id stays stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// Digest of the approved product spec this plan was authored against
+    /// (e.g. `"sha256:<hex>"`). Opaque to the engine; `rocky apply
+    /// --expect-spec-digest` compares it for equality and a plan carrying
+    /// it refuses a bare apply. Set together with `product_id` or not at
+    /// all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
 }
 
 fn default_parallel() -> u32 {

@@ -3810,6 +3810,8 @@ fn build_ai_run_plan(model: Option<String>, result: &CompilerResult) -> rocky_cl
         governance_override: None,
         models,
         execution_layers,
+        product_id: None,
+        spec_digest: None,
     }
 }
 

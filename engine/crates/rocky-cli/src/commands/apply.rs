@@ -4709,6 +4709,8 @@ mod tests {
             governance_override: None,
             models: vec!["schema.orders".to_string()],
             execution_layers: vec![vec!["schema.orders".to_string()]],
+            product_id: None,
+            spec_digest: None,
         }
     }
 
@@ -7500,6 +7502,8 @@ schema_template = "s__{source}"
             }),
             models: vec!["db.s.orders".to_string()],
             execution_layers: vec![vec!["db.s.orders".to_string()]],
+            product_id: Some("product:revenue_daily".to_string()),
+            spec_digest: Some("sha256:abc123".to_string()),
         };
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let persisted = read_plan(dir.path(), &plan_id)?;
@@ -7514,6 +7518,8 @@ schema_template = "s__{source}"
         assert_eq!(decoded.idempotency_key.as_deref(), Some("my_idem_key"));
         assert_eq!(decoded.models_dir.as_deref(), Some("custom_models"));
         assert!(decoded.governance_override.is_some());
+        assert_eq!(decoded.product_id.as_deref(), Some("product:revenue_daily"));
+        assert_eq!(decoded.spec_digest.as_deref(), Some("sha256:abc123"));
         Ok(())
     }
 
@@ -7585,6 +7591,8 @@ schema_template = "s__{source}"
                 vec!["db.s.users".to_string()],
                 vec!["db.s.orders".to_string()],
             ],
+            product_id: None,
+            spec_digest: None,
         };
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let persisted = read_plan(dir.path(), &plan_id)?;

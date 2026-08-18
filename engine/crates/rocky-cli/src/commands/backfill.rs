@@ -566,6 +566,9 @@ fn build_run_plan(
         governance_override: None,
         models: ordered.to_vec(),
         execution_layers: layers.to_vec(),
+        // A backfill re-runs existing recipes; it is never product-bound.
+        product_id: None,
+        spec_digest: None,
     }
 }
 

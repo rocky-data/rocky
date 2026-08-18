@@ -1038,6 +1038,11 @@ fn build_and_persist_run_plan(
         governance_override: run_options.governance_override.clone(),
         models,
         execution_layers,
+        // Product identity is authored by the fulfillment runtime through the
+        // MCP `propose` tool; the CLI `rocky plan` verb deliberately writes
+        // none, so its plans keep today's bytes and ids.
+        product_id: None,
+        spec_digest: None,
     };
 
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
