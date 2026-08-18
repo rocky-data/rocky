@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.63.0] — 2026-08-18
+
 ### Fixed
 
 - **A project with two or more transformation pipelines can now produce an asset graph.** `RockyComponent` caches `rocky.dag(...)`, and that call forced a whole-project `--models`, which the engine refuses on a multi-transformation project — so definitions failed to build at all. The DAG call now lets each pipeline resolve its own models root. (#1348)

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.38.0] — 2026-08-18
+
 ### Fixed
 
 - **The `intent` hover in the config schema names a real command.** It cited `rocky ai sync`, which the CLI rejects; the subcommand is `rocky ai-sync`. (#1443)
