@@ -9128,6 +9128,14 @@
       "JobRequest": {
         "description": "Optional JSON body for a job submission. Every field is optional; an empty body runs the verb with its defaults (all pipelines, no filter). Unknown fields are ignored so an embedder on a newer client stays forward-compatible.\n\nDerives `JsonSchema` (crate-visible) so the OpenAPI generator can emit the `POST /api/v1/jobs/{run|plan|apply}` request-body schema from this single source of truth rather than a hand-copied duplicate. It is deliberately not registered in [`super::commands::export_schemas`], so it stays out of the Pydantic/TypeScript codegen cascade.",
         "properties": {
+          "expect_spec_digest": {
+            "default": null,
+            "description": "`--expect-spec-digest <hex>` for `apply` — the approved-spec digest the caller expects the plan to be bound to. The engine's gate is fail-closed both ways: a product-bound plan REFUSES an apply without this, and passing it against an unbound plan refuses too. The value must come from the caller's independently approved product-spec snapshot, never read back from the plan itself.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "filter": {
             "default": null,
             "description": "`--filter <component=value>` for `run`/`plan`.",
