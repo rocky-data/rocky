@@ -868,7 +868,9 @@ pub struct ReviewQueueResult {
     /// The ranked pending escalations, each carrying its `decision_ref`,
     /// `plan_id`, `blast_radius`, `score`, and `approve_command` citation — the
     /// shipped `ReviewQueueOutput.pending` serialized verbatim so no citation is
-    /// dropped.
+    /// dropped. Under a `product_id` filter, a pending plan whose file cannot
+    /// be read integrity-checked appears as a `{plan_id, warning}` entry
+    /// instead of being silently dropped.
     pub pending: serde_json::Value,
     /// Present only when this call approved a plan.
     #[serde(skip_serializing_if = "Option::is_none")]

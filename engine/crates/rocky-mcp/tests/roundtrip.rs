@@ -419,6 +419,209 @@ async fn propose_with_product_fields_binds_identity_and_derives_key() {
     client.cancel().await.unwrap();
 }
 
+/// FF-WP1: the `test` tool accepts an optional `model` scope; an unknown
+/// model is the stable `model_not_found` taxonomy, and the unscoped call is
+/// unchanged.
+#[tokio::test]
+async fn test_tool_scopes_to_a_model_and_refuses_unknown() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Unscoped: unchanged behavior.
+    let all = client
+        .call_tool(CallToolRequestParams::new("test"))
+        .await
+        .expect("unscoped test call");
+    assert_ne!(all.is_error, Some(true));
+
+    // Scoped to the real model: runs (it declares no tests — 0/0 is fine).
+    let scoped = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({ "model": "orders" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("scoped test call");
+    assert_ne!(scoped.is_error, Some(true), "a known model scope runs");
+
+    // Unknown model: the stable model_not_found envelope.
+    let missing = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({ "model": "nope" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("unknown-model test call returns a tool result");
+    assert_eq!(missing.is_error, Some(true));
+    let err = missing.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("model_not_found"), "{err:?}");
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1: `review_queue` filters the listing by `product_id` via
+/// integrity-checked plan reads — and a pending plan whose file no longer
+/// passes its integrity check surfaces as a WARNING entry, never a silent
+/// drop.
+#[tokio::test]
+async fn review_queue_product_filter_reads_plans_and_surfaces_corruption() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "require_review"
+"#,
+    );
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Two pending escalations: one product-bound, one bare.
+    let bound = client
+        .call_tool(
+            CallToolRequestParams::new("propose").with_arguments(
+                serde_json::json!({
+                    "product_id": "product:revenue_daily",
+                    "spec_digest": "sha256:abc",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await
+        .expect("bound propose");
+    let bound_err = bound.structured_content.expect("review-required envelope");
+    let bound_plan_id = bound_err["message"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_ascii_hexdigit()))
+        .find(|w| w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("the recorded plan_id is surfaced")
+        .to_string();
+    let bare = client
+        .call_tool(CallToolRequestParams::new("propose"))
+        .await
+        .expect("bare propose");
+    let bare_err = bare.structured_content.expect("review-required envelope");
+    let bare_plan_id = bare_err["message"]
+        .as_str()
+        .unwrap()
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_ascii_hexdigit()))
+        .find(|w| w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("the recorded plan_id is surfaced")
+        .to_string();
+    assert_ne!(bound_plan_id, bare_plan_id);
+
+    // Unfiltered: both pending.
+    let unfiltered = client
+        .call_tool(CallToolRequestParams::new("review_queue"))
+        .await
+        .expect("queue list");
+    let sc = unfiltered.structured_content.expect("result");
+    assert_eq!(sc["total"], serde_json::json!(2), "{sc:?}");
+
+    // Filtered: exactly the product-bound plan.
+    let filtered = client
+        .call_tool(
+            CallToolRequestParams::new("review_queue").with_arguments(
+                serde_json::json!({ "product_id": "product:revenue_daily" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("filtered queue list");
+    let sc = filtered.structured_content.expect("result");
+    assert_eq!(sc["total"], serde_json::json!(1), "{sc:?}");
+    assert_eq!(sc["pending"][0]["plan_id"], serde_json::json!(bound_plan_id));
+
+    // Corrupt the BARE plan's payload on disk (its integrity re-hash now
+    // fails). The filter cannot classify it, so it must surface as a
+    // warning entry — not vanish.
+    let bare_path = dir
+        .path()
+        .join(".rocky")
+        .join("plans")
+        .join(format!("{bare_plan_id}.json"));
+    let mut plan_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bare_path).unwrap()).unwrap();
+    plan_json["payload"]["model"] = serde_json::json!("tampered");
+    std::fs::write(&bare_path, serde_json::to_vec_pretty(&plan_json).unwrap()).unwrap();
+
+    let filtered = client
+        .call_tool(
+            CallToolRequestParams::new("review_queue").with_arguments(
+                serde_json::json!({ "product_id": "product:revenue_daily" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("filtered queue list over a corrupt plan");
+    let sc = filtered.structured_content.expect("result");
+    assert_eq!(
+        sc["total"],
+        serde_json::json!(2),
+        "match + warning — the corrupt plan is counted, not dropped: {sc:?}"
+    );
+    let pending = sc["pending"].as_array().unwrap();
+    let warning = pending
+        .iter()
+        .find(|e| e["plan_id"] == serde_json::json!(bare_plan_id))
+        .expect("the corrupt plan surfaces");
+    assert!(
+        warning["warning"]
+            .as_str()
+            .unwrap()
+            .contains("could not be read"),
+        "the entry says WHY it is unclassifiable: {warning:?}"
+    );
+
+    // The filter is list-only: combining it with an approve is refused.
+    let combined = client
+        .call_tool(
+            CallToolRequestParams::new("review_queue").with_arguments(
+                serde_json::json!({
+                    "product_id": "product:revenue_daily",
+                    "approve_plan_id": bound_plan_id,
+                    "confirm": true,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await
+        .expect("combined call returns a result");
+    assert_eq!(combined.is_error, Some(true));
+    let err = combined.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+
+    client.cancel().await.unwrap();
+}
+
 /// FF-WP1: a runner-supplied idempotency key WINS over the derived fallback.
 #[tokio::test]
 async fn propose_runner_supplied_idempotency_key_wins() {

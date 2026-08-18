@@ -158,6 +158,14 @@ pub struct ProfileColumnArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TestArgs {
+    /// Optional single-model scope: run only this model's declarative tests.
+    /// When unset, runs the whole project's tests (unchanged behavior).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ProposeArgs {
     /// Single model to materialize. When unset, the plan covers every model.
     #[serde(default)]
@@ -430,6 +438,13 @@ pub struct ReviewQueueArgs {
     /// this exact plan — it stands in for that human intent.
     #[serde(default)]
     pub confirm: bool,
+    /// List mode only: keep only pending plans whose payload carries this
+    /// `product_id` (each candidate plan is read integrity-checked). A pending
+    /// plan whose file cannot be read or fails its integrity check surfaces as
+    /// a `warning` entry in `pending` — never silently dropped. `total`
+    /// reflects the filtered list. Mutually exclusive with `approve_plan_id`.
+    #[serde(default)]
+    pub product_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -744,25 +759,25 @@ impl RockyMcpServer {
 
     #[tool(
         description = "Run the project's DuckDB-backed local tests (contracts + assertions) and \
-         return pass/fail counts plus per-failure detail. Use after writing or changing a model."
+         return pass/fail counts plus per-failure detail. Use after writing or changing a model. \
+         Pass `model` to scope the run to one model's tests."
     )]
-    async fn test(&self) -> ToolResult<TestResult> {
-        let output = commands::test_output(&self.models_dir, None, None).map_err(|e| {
-            // Preserve the stable taxonomy the way `compile` and `plan_preview`
-            // do: an unknown model is `model_not_found` (with its "list the
-            // models, retry" hint), not the generic internal bucket. This tool
-            // passes `None` for the filter today, so the arm is unreachable
-            // from MCP — it is here so that stays true if a `model` parameter
-            // is ever added, rather than silently degrading to `internal`.
-            match e.downcast_ref::<commands::ModelNotFound>() {
-                Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
-                None => ToolError::internal(
-                    format!("{e:#}"),
-                    "The local test runner could not execute; confirm the project compiles (the \
-                     `compile` tool) and any `data/seed.sql` the tests need is present.",
-                ),
-            }
-        })?;
+    async fn test(&self, params: Parameters<TestArgs>) -> ToolResult<TestResult> {
+        let output = commands::test_output(&self.models_dir, None, params.0.model.as_deref())
+            .map_err(|e| {
+                // Preserve the stable taxonomy the way `compile` and
+                // `plan_preview` do: an unknown `model` filter is
+                // `model_not_found` (with its "list the models, retry" hint),
+                // not the generic internal bucket.
+                match e.downcast_ref::<commands::ModelNotFound>() {
+                    Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
+                    None => ToolError::internal(
+                        format!("{e:#}"),
+                        "The local test runner could not execute; confirm the project compiles \
+                         (the `compile` tool) and any `data/seed.sql` the tests need is present.",
+                    ),
+                }
+            })?;
         let failures = output
             .failures
             .into_iter()
@@ -3276,20 +3291,44 @@ impl RockyMcpServer {
         })?;
 
         let Some(plan_id) = args.approve_plan_id.as_deref() else {
-            // Read mode.
-            let pending = serde_json::to_value(&queue.pending).map_err(|e| {
-                ToolError::internal(
-                    format!("failed to serialize the review queue: {e}"),
-                    "Retry; if it persists this is an internal serialization bug.",
-                )
-            })?;
+            // Read mode, optionally product-filtered.
+            let (pending, total) = match args.product_id.as_deref() {
+                None => {
+                    let pending = serde_json::to_value(&queue.pending).map_err(|e| {
+                        ToolError::internal(
+                            format!("failed to serialize the review queue: {e}"),
+                            "Retry; if it persists this is an internal serialization bug.",
+                        )
+                    })?;
+                    (pending, queue.total)
+                }
+                Some(product) => {
+                    if product.trim().is_empty() {
+                        return Err(ToolError::invalid_argument(
+                            "review_queue `product_id` must be non-empty when present",
+                            "Pass the product identity to filter on (e.g. \
+                             \"product:revenue_daily\"), or omit the field for the full queue.",
+                        ));
+                    }
+                    filter_pending_by_product(&self.root, &queue.pending, product)?
+                }
+            };
             return Ok(Json(ReviewQueueResult {
-                total: queue.total,
+                total,
                 ranking: queue.ranking,
                 pending,
                 approval: None,
             }));
         };
+
+        if args.product_id.is_some() {
+            return Err(ToolError::invalid_argument(
+                "`product_id` filters the queue LISTING; it cannot combine with \
+                 `approve_plan_id`",
+                "Approve by exact plan_id alone — list with the product filter first, then \
+                 approve the specific plan.",
+            ));
+        }
 
         // The plan must be an outstanding escalation in THIS queue — not an
         // arbitrary reviewable plan.
@@ -4332,6 +4371,48 @@ impl Drop for DraftRollback {
             restore_or_remove(path, prior.as_deref());
         }
     }
+}
+
+/// Filter the pending review queue to plans whose payload carries
+/// `product_id == product`, reading each candidate plan integrity-checked.
+///
+/// The queue's ledger rows do not carry plan payloads (`compute_review_queue`
+/// reads decisions + marker state only), so the product filter is the point
+/// where plan files get read. Fail-open is not an option here: a pending plan
+/// whose file is missing, unreadable, or fails its integrity re-hash CANNOT
+/// prove which product it belongs to, so it surfaces as a `warning` entry —
+/// never a silent drop that would hide a possibly-matching escalation from
+/// the runner. Returns the filtered `pending` value plus its entry count.
+fn filter_pending_by_product(
+    root: &Path,
+    pending: &[rocky_cli::output::ReviewQueueEntry],
+    product: &str,
+) -> Result<(serde_json::Value, u64), Json<ToolError>> {
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for entry in pending {
+        match rocky_cli::plan_store::read_plan(root, &entry.plan_id) {
+            Ok(plan) => {
+                if plan.payload.get("product_id").and_then(|v| v.as_str()) == Some(product) {
+                    let value = serde_json::to_value(entry).map_err(|e| {
+                        ToolError::internal(
+                            format!("failed to serialize a review queue entry: {e}"),
+                            "Retry; if it persists this is an internal serialization bug.",
+                        )
+                    })?;
+                    entries.push(value);
+                }
+            }
+            Err(e) => entries.push(serde_json::json!({
+                "plan_id": entry.plan_id,
+                "warning": format!(
+                    "pending plan could not be read for product filtering ({e:#}); it may or \
+                     may not belong to '{product}' — inspect it directly, it remains pending"
+                ),
+            })),
+        }
+    }
+    let total = entries.len() as u64;
+    Ok((serde_json::Value::Array(entries), total))
 }
 
 /// Build the `[freshness]` TOML table a validated [`FreshnessPatch`] writes.
