@@ -38,12 +38,12 @@
 use std::collections::BTreeMap;
 
 use crate::product::manifest::{
-    assert_total, content_digest, Disposition, FieldRow, Location, LocationPhase, Manifest,
-    ManifestPhase, MANIFEST_FILENAME,
+    Disposition, FieldRow, Location, LocationPhase, MANIFEST_FILENAME, Manifest, ManifestPhase,
+    assert_total, content_digest,
 };
 use crate::product::spec::{ParsedSpec, SpecRejected, SpecResult};
 use crate::product::toml_compat::{
-    basic_string, parse_ordered, render_document, TomlTable, TomlValue,
+    TomlTable, TomlValue, basic_string, parse_ordered, render_document,
 };
 
 /// The top-level sidecar keys the lowering owns.
@@ -119,7 +119,10 @@ pub fn sql_rel(parsed: &ParsedSpec) -> String {
 /// nowhere, so emitting it would promise a guard that does not run.
 pub fn render_contract(parsed: &ParsedSpec) -> Vec<u8> {
     let product = parsed.product();
-    let mut lines: Vec<String> = vec![generated_header(&product.name, &parsed.digest), String::new()];
+    let mut lines: Vec<String> = vec![
+        generated_header(&product.name, &parsed.digest),
+        String::new(),
+    ];
     for column in &product.output.columns {
         lines.push("[[columns]]".to_string());
         lines.push(format!("name = {}", basic_string(&column.name)));
@@ -288,7 +291,10 @@ pub fn merge_sidecar_text(
     merged.insert("sources".to_string(), TomlValue::Array(sources));
 
     let mut tags = TomlTable::new();
-    tags.insert("product".to_string(), TomlValue::string(product.name.clone()));
+    tags.insert(
+        "product".to_string(),
+        TomlValue::string(product.name.clone()),
+    );
     if let Some(existing) = document.get("tags").and_then(TomlValue::as_table) {
         for (key, value) in existing {
             if key != "product" {
@@ -343,7 +349,9 @@ pub fn merge_sidecar_text(
             // A worker test identical to a generated one is absorbed, not
             // duplicated. Table comparison ignores key order, so a
             // reordered spelling of the same test is still the same test.
-            let Some(table) = test.as_table() else { continue };
+            let Some(table) = test.as_table() else {
+                continue;
+            };
             if !owned_tests.contains(table) {
                 tests.push(test.clone());
             }
@@ -665,7 +673,9 @@ pub fn lower_phase_b(
     ]
     .into_iter()
     .filter(|(_, recorded, current)| recorded != current)
-    .map(|(name, recorded, current)| format!("{name}: manifest {recorded:?} vs current {current:?}"))
+    .map(|(name, recorded, current)| {
+        format!("{name}: manifest {recorded:?} vs current {current:?}")
+    })
     .collect();
     if !mismatches.is_empty() {
         return Err(SpecRejected::new(
@@ -805,7 +815,10 @@ mod tests {
     #[test]
     fn golden_phase_a_contract() {
         let lowering = lower_phase_a(&parsed_d3(), SPEC_PATH).expect("phase A");
-        assert_eq!(lowering.artifacts[0].relpath, "models/revenue_daily.contract.toml");
+        assert_eq!(
+            lowering.artifacts[0].relpath,
+            "models/revenue_daily.contract.toml"
+        );
         assert_eq!(
             utf8(&lowering.artifacts[0].content),
             utf8(GOLDEN_CONTRACT),
@@ -895,7 +908,10 @@ mod tests {
         let manifest_a = verified_phase_a_manifest(&parsed);
         let edited = String::from_utf8(SPEC_FIXTURE.to_vec())
             .expect("utf-8")
-            .replace(r#"checks = ["revenue_eur >= 0"]"#, r#"checks = ["revenue_eur > 0"]"#);
+            .replace(
+                r#"checks = ["revenue_eur >= 0"]"#,
+                r#"checks = ["revenue_eur > 0"]"#,
+            );
         let spec_b = parse_spec_bytes(edited.as_bytes(), SPEC_PATH).expect("valid");
         assert_ne!(spec_b.digest, parsed.digest);
 
@@ -952,7 +968,12 @@ mod tests {
         // The never-emit list: the contract must not dress inert engine
         // surfaces up as enforcement.
         let contract = String::from_utf8(render_contract(&parsed_d3())).expect("utf-8");
-        for inert in ["no_new_nullable", "conditions", "models_dir", "contracts_dir"] {
+        for inert in [
+            "no_new_nullable",
+            "conditions",
+            "models_dir",
+            "contracts_dir",
+        ] {
             assert!(!contract.contains(inert), "{inert} must never be emitted");
         }
     }
@@ -999,11 +1020,16 @@ mod tests {
             TomlValue::string("revenue_daily")
         );
         assert_eq!(
-            *document["classification"].as_table().expect("classification"),
+            *document["classification"]
+                .as_table()
+                .expect("classification"),
             test_entry(&[("client_id", "pii")])
         );
         let freshness = document["freshness"].as_table().expect("freshness");
-        assert_eq!(freshness["expected_lag_seconds"], TomlValue::Integer(86_400));
+        assert_eq!(
+            freshness["expected_lag_seconds"],
+            TomlValue::Integer(86_400)
+        );
         assert_eq!(freshness["time_column"], TomlValue::string("date"));
         assert_eq!(
             document["sources"],
@@ -1070,7 +1096,10 @@ mod tests {
     fn a_single_column_grain_lowers_to_unique() {
         let single = String::from_utf8(SPEC_FIXTURE.to_vec())
             .expect("utf-8")
-            .replace(r#"grain = ["client_id", "date"]"#, r#"grain = ["client_id"]"#);
+            .replace(
+                r#"grain = ["client_id", "date"]"#,
+                r#"grain = ["client_id"]"#,
+            );
         let parsed = parse_spec_bytes(single.as_bytes(), SPEC_PATH).expect("valid");
         let tests = generated_tests(&parsed);
         assert!(tests.contains(&test_entry(&[("type", "unique"), ("column", "client_id")])));
@@ -1125,8 +1154,7 @@ mod tests {
     #[test]
     fn the_merge_fills_intent_only_when_it_is_absent() {
         let parsed = parsed_d3();
-        let intent_line =
-            "intent = \"Daily gross revenue per client in EUR, refunds excluded\"\n";
+        let intent_line = "intent = \"Daily gross revenue per client in EUR, refunds excluded\"\n";
 
         let without_intent = DRAFT_MODEL_SIDECAR.replace(intent_line, "");
         assert_eq!(
@@ -1148,7 +1176,10 @@ mod tests {
         let error = merge_sidecar_text(&parsed_d3(), "name = [broken", "models/revenue_daily.toml")
             .expect_err("unparseable");
         assert_eq!(error.code, "sidecar-unparseable");
-        assert!(error.message.contains("models/revenue_daily.toml"), "{error}");
+        assert!(
+            error.message.contains("models/revenue_daily.toml"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1220,7 +1251,10 @@ mod tests {
     fn a_single_column_grain_changes_the_manifest_location_detail() {
         let single = String::from_utf8(SPEC_FIXTURE.to_vec())
             .expect("utf-8")
-            .replace(r#"grain = ["client_id", "date"]"#, r#"grain = ["client_id"]"#);
+            .replace(
+                r#"grain = ["client_id", "date"]"#,
+                r#"grain = ["client_id"]"#,
+            );
         let parsed = parse_spec_bytes(single.as_bytes(), SPEC_PATH).expect("valid");
         let manifest = lower_phase_b(
             &parsed,
@@ -1231,10 +1265,12 @@ mod tests {
         .expect("phase B")
         .manifest;
         let grain = &manifest.fields["product.output.grain"];
-        assert!(grain
-            .locations
-            .iter()
-            .any(|location| location.detail == "[[tests]] type=unique"));
+        assert!(
+            grain
+                .locations
+                .iter()
+                .any(|location| location.detail == "[[tests]] type=unique")
+        );
     }
 
     #[test]

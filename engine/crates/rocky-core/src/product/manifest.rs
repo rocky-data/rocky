@@ -30,7 +30,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::product::spec::{spec_digest, SpecFile, SpecRejected, SpecResult};
+use crate::product::spec::{SpecFile, SpecRejected, SpecResult, spec_digest};
 
 /// The file name the manifest is committed under.
 pub const MANIFEST_FILENAME: &str = "lowering-manifest.json";
@@ -491,7 +491,11 @@ fn properties_of<'s>(
 ) -> Vec<(String, &'s serde_json::Value)> {
     // The root model is inlined by schemars rather than listed among the
     // definitions, so it is looked up separately.
-    let source = if model == "SpecFile" { root } else { &definitions[model] };
+    let source = if model == "SpecFile" {
+        root
+    } else {
+        &definitions[model]
+    };
     source
         .get("properties")
         .and_then(serde_json::Value::as_object)
@@ -668,10 +672,7 @@ pub fn check_leaf_coverage(declared: &BTreeMap<String, BTreeSet<String>>) -> Spe
         let empty = BTreeSet::new();
         let required = derived.get(path).unwrap_or(&empty);
         let claimed = declared.get(path).unwrap_or(&empty);
-        let uncovered: Vec<&str> = required
-            .difference(claimed)
-            .map(String::as_str)
-            .collect();
+        let uncovered: Vec<&str> = required.difference(claimed).map(String::as_str).collect();
         let stale: Vec<&str> = claimed.difference(required).map(String::as_str).collect();
         if !uncovered.is_empty() {
             problems.push(format!(
@@ -691,7 +692,10 @@ pub fn check_leaf_coverage(declared: &BTreeMap<String, BTreeSet<String>>) -> Spe
     }
     Err(SpecRejected::new(
         "manifest-not-total",
-        format!("lowering leaf coverage is not total: {}", problems.join("; ")),
+        format!(
+            "lowering leaf coverage is not total: {}",
+            problems.join("; ")
+        ),
     ))
 }
 
@@ -781,7 +785,7 @@ pub fn verify_artifact_hashes(project_root: &Path, manifest: &Manifest) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::product::spec::{parse_spec_bytes, ParsedSpec};
+    use crate::product::spec::{ParsedSpec, parse_spec_bytes};
 
     const MINIMAL: &str = r#"
 [product]
@@ -917,8 +921,7 @@ agent = "propose_only"
         let mut rows = verified_rows(&parsed);
         rows.insert(
             "product.output.grain".to_string(),
-            FieldRow::new(Disposition::Reject)
-                .with_reject_reason("example: not lowerable"),
+            FieldRow::new(Disposition::Reject).with_reject_reason("example: not lowerable"),
         );
         let manifest = manifest_with_fields(&parsed, rows);
         // A reject row still accounts for the field.
@@ -1009,7 +1012,10 @@ agent = "propose_only"
         let mut without_freshness = covered_leaf_fields();
         without_freshness.remove("product.output.freshness");
         let error = check_leaf_coverage(&without_freshness).expect_err("uncovered");
-        assert!(error.message.contains("product.output.freshness"), "{error}");
+        assert!(
+            error.message.contains("product.output.freshness"),
+            "{error}"
+        );
     }
 
     // ----- byte verification -----

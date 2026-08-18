@@ -205,9 +205,9 @@ fn render_table(table: &TomlTable, name: &str, inside_aot: bool, out: &mut Strin
             TomlValue::Table(nested) => tables.push((key, nested, false)),
             TomlValue::Array(items)
                 if is_array_of_tables(items)
-                    && !items.iter().all(|item| {
-                        item.as_table().is_some_and(is_suitable_inline_table)
-                    }) =>
+                    && !items
+                        .iter()
+                        .all(|item| item.as_table().is_some_and(is_suitable_inline_table)) =>
             {
                 for item in items {
                     if let TomlValue::Table(nested) = item {
@@ -320,7 +320,12 @@ fn render_float(number: f64) -> String {
         return "nan".to_string();
     }
     if number.is_infinite() {
-        return if number.is_sign_negative() { "-inf" } else { "inf" }.to_string();
+        return if number.is_sign_negative() {
+            "-inf"
+        } else {
+            "inf"
+        }
+        .to_string();
     }
     let rendered = number.to_string();
     if rendered.contains(['.', 'e', 'E']) {
@@ -420,7 +425,8 @@ mod tests {
 
     #[test]
     fn a_table_split_across_headers_keeps_its_first_position() {
-        let parsed = parse_ordered("[a.b]\nx = 1\n\n[zz]\ny = 2\n\n[a.c]\nz = 3\n").expect("parses");
+        let parsed =
+            parse_ordered("[a.b]\nx = 1\n\n[zz]\ny = 2\n\n[a.c]\nz = 3\n").expect("parses");
         let keys: Vec<&str> = parsed.keys().map(String::as_str).collect();
         assert_eq!(keys, ["a", "zz"]);
         let inner: Vec<&str> = parsed["a"]
@@ -456,7 +462,10 @@ mod tests {
     #[test]
     fn an_integer_too_wide_for_toml_is_refused() {
         let error = parse_ordered("n = 9223372036854775808\n").expect_err("out of range");
-        assert!(error.contains("not representable") || error.contains("range"), "{error}");
+        assert!(
+            error.contains("not representable") || error.contains("range"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -582,9 +591,15 @@ mod tests {
     fn scalars_precede_sub_tables_with_a_blank_line_between() {
         let document = table(&[
             ("name", TomlValue::string("m")),
-            ("tags", TomlValue::Table(table(&[("x", TomlValue::Integer(1))]))),
+            (
+                "tags",
+                TomlValue::Table(table(&[("x", TomlValue::Integer(1))])),
+            ),
         ]);
-        assert_eq!(render_document(&document), "name = \"m\"\n\n[tags]\nx = 1\n");
+        assert_eq!(
+            render_document(&document),
+            "name = \"m\"\n\n[tags]\nx = 1\n"
+        );
     }
 
     #[test]
@@ -615,7 +630,10 @@ mod tests {
     #[test]
     fn the_writer_escaper_matches_tomli_w() {
         assert_eq!(render_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
-        assert_eq!(render_string("a\nb\rc\u{8}d\u{c}e"), "\"a\\nb\\rc\\bd\\fe\"");
+        assert_eq!(
+            render_string("a\nb\rc\u{8}d\u{c}e"),
+            "\"a\\nb\\rc\\bd\\fe\""
+        );
         // A tab is legal raw inside a basic string, and is left raw.
         assert_eq!(render_string("a\tb"), "\"a\tb\"");
         // Lowercase hex, and DEL is escaped.
