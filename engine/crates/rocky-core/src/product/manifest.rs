@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -773,10 +773,46 @@ pub fn check_total(
 /// Returns the mismatches — a missing file or a hash drift — and an
 /// empty list when the tree is clean. This is the precondition that runs
 /// before anything a worker touched is trusted.
+/// Resolve a manifest artifact key against the project root, or refuse it.
+///
+/// A manifest is a file on disk, so its keys are input rather than fact. Two
+/// shapes have to be refused before the path is ever used:
+///
+/// - an absolute key, because `Path::join` DISCARDS the root when the argument
+///   is absolute, so `/etc/passwd` would be read as itself rather than as a
+///   file inside the project;
+/// - any `..` (or `.`) component, which walks out of the project.
+///
+/// Verification only reads today, so the immediate blast radius is a wrong
+/// answer about a file that is none of the manifest's business. The reason to
+/// refuse here anyway is that this result is what a caller trusts when it
+/// decides a generation is intact, and the same keys drive writes later.
+fn contained_artifact_path(project_root: &Path, rel_path: &str) -> Option<PathBuf> {
+    let candidate = Path::new(rel_path);
+    if rel_path.is_empty() || candidate.is_absolute() {
+        return None;
+    }
+    // `Component::Normal` admits plain names only: root, prefix, `.`, and `..`
+    // are all rejected, which is the whole containment rule in one match.
+    if candidate
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(project_root.join(candidate))
+}
+
 pub fn verify_artifact_hashes(project_root: &Path, manifest: &Manifest) -> Vec<String> {
     let mut problems = Vec::new();
     for (rel_path, expected) in &manifest.artifacts {
-        let artifact_path = project_root.join(rel_path);
+        let Some(artifact_path) = contained_artifact_path(project_root, rel_path) else {
+            problems.push(format!(
+                "{rel_path}: refused (not a project-relative path; a manifest names only \
+                 files inside its own project)"
+            ));
+            continue;
+        };
         if !artifact_path.is_file() {
             problems.push(format!("{rel_path}: missing (expected {expected})"));
             continue;
@@ -1034,6 +1070,47 @@ agent = "propose_only"
     // ----- byte verification -----
 
     #[test]
+    fn verify_artifact_hashes_refuses_a_path_outside_the_project() {
+        // A manifest key is input. An absolute key makes `Path::join` throw the
+        // project root away, so this would otherwise read a file the manifest
+        // has no business naming — and report on it as if it belonged to the
+        // generation.
+        let parsed = parse(MINIMAL);
+        let root = tempfile::tempdir().expect("tempdir");
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, b"not mine").expect("write");
+        for key in [
+            outside.to_string_lossy().to_string(),
+            "../escape.toml".to_string(),
+            "./models/tiny.contract.toml".to_string(),
+            "models/../../escape.toml".to_string(),
+            String::new(),
+        ] {
+            let manifest = Manifest {
+                product_id: parsed.product_id(),
+                spec_digest: parsed.digest.clone(),
+                output_model: parsed.output_model().to_string(),
+                spec_path: "products/tiny.toml".to_string(),
+                phase: ManifestPhase::LoweredContract,
+                fields: BTreeMap::new(),
+                artifacts: [(key.clone(), content_digest(b"not mine"))]
+                    .into_iter()
+                    .collect(),
+            };
+            let problems = verify_artifact_hashes(root.path(), &manifest);
+            assert_eq!(problems.len(), 1, "{key:?} -> {problems:?}");
+            assert!(
+                problems[0].contains("refused"),
+                "{key:?} must be refused, got {problems:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&outside).expect("still there"),
+            b"not mine",
+            "a refused key must not have been acted on"
+        );
+    }
+
     fn verify_artifact_hashes_detects_drift_and_absence() {
         let parsed = parse(MINIMAL);
         let root = tempfile::tempdir().expect("tempdir");
