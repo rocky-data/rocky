@@ -4824,7 +4824,7 @@ mod tests {
             vec!["rocky", "review", "--status", "--queue"],
         ] {
             let parsed = std::thread::scope(|s| {
-                let owned: Vec<String> = conflicting.iter().map(|s| s.to_string()).collect();
+                let owned: Vec<String> = conflicting.iter().map(ToString::to_string).collect();
                 std::thread::Builder::new()
                     .stack_size(8 * 1024 * 1024)
                     .spawn_scoped(s, move || Cli::try_parse_from(&owned).is_ok())

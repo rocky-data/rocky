@@ -1645,7 +1645,10 @@ async fn draft_check_rejects_smuggled_sidecar_config() {
 // ---------------------------------------------------------------------------
 
 fn metadata_args(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
-    json.as_object().unwrap().clone()
+    match json {
+        serde_json::Value::Object(map) => map,
+        other => panic!("metadata_args needs a JSON object, got {other}"),
+    }
 }
 
 /// Happy path: a structured patch merges `[freshness]` + `[classification]`
