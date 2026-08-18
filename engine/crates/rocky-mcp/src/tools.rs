@@ -2151,8 +2151,8 @@ impl RockyMcpServer {
                 .await;
 
         // FF-WP1 fix round (finding 2): build the sidecar to write, and
-        // collect the PRIOR sidecar's classifications for the policy union
-        // below.
+        // collect the PRIOR sidecar's classifications for the policy
+        // pre-image/post-image dual evaluation below.
         //
         // - NO existing sidecar → the minimal `name` + `intent` document,
         //   exactly as before (target/strategy resolve from the project's
@@ -2280,14 +2280,15 @@ impl RockyMcpServer {
         // a frozen agent must not keep minting drafts. Fail-closed; bounded by
         // the shared guard (no `[policy]` ⇒ no LIST ⇒ zero behavior change).
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        // FF-WP1 fix round (finding 2): classification-sensitive scope is
-        // evaluated over the PRE/POST UNION — the on-disk (post-merge)
-        // attributes PLUS the classifications the prior sidecar carried — so
-        // no edit through this tool can de-scope a classification-matched
-        // rule. Under the preserve-merge above pre ⊆ post, making the union
-        // equal the post-image; the explicit union keeps the property
+        // FF-WP1 fix round 2 (item 1): classification-sensitive scope is
+        // DUAL-evaluated — once over the on-disk (post-merge) attributes and
+        // once over the pre-image (the classifications the prior sidecar
+        // carried), with the most restrictive verdict governing — so no edit
+        // through this tool can de-scope a classification-matched rule NOR
+        // escape an exclusion-matched one. Under the preserve-merge above
+        // pre ⊆ post; the explicit dual evaluation keeps the property
         // STRUCTURAL rather than an artifact of the merge staying correct.
-        let extra_classifications: std::collections::BTreeMap<String, Vec<String>> =
+        let prior_classifications_by_model: std::collections::BTreeMap<String, Vec<String>> =
             std::iter::once((paths.stem.clone(), prior_classifications)).collect();
         let gate = rocky_cli::commands::evaluate_apply_policy_with_extra_classifications(
             &self.config_path,
@@ -2297,7 +2298,7 @@ impl RockyMcpServer {
             &self.models_dir,
             &state_path,
             &marker_freezes,
-            &extra_classifications,
+            &prior_classifications_by_model,
         );
 
         match gate {

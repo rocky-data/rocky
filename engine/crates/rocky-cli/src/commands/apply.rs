@@ -1459,7 +1459,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
 ) -> PolicyGate {
-    evaluate_apply_policy_with_policy_matching_union(
+    evaluate_apply_policy_with_policy_matching_dual(
         policy,
         plan_id,
         principal,
@@ -1472,16 +1472,21 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     )
 }
 
-/// [`evaluate_apply_policy`] with per-model EXTRA classifications unioned into
-/// the on-disk attribute resolution before rule matching.
+/// [`evaluate_apply_policy`] evaluated over BOTH the pre-image and the
+/// post-image classification state, returning the most restrictive verdict.
 ///
-/// FF-WP1 fix round (finding 2): `draft_model` on an existing model evaluates
-/// its policy over the PRE/POST UNION of the model's classifications — the
-/// on-disk (post-write) attributes plus the classifications the PRIOR sidecar
-/// carried — so an edit that erased a classification could never de-scope a
-/// classification-matched deny. The union only ever WIDENS what a
-/// `scope.classifications` rule can match; models without extra entries are
-/// evaluated exactly as [`evaluate_apply_policy`] would.
+/// FF-WP1 fix round 2 (item 1): `draft_model` on an existing model passes the
+/// classifications the PRIOR sidecar carried; the policy is evaluated once
+/// with the on-disk (post-write) attributes and once with those
+/// classifications substituted in (the pre-image), and the most restrictive
+/// of the two verdicts governs (deny > require_review > allow). So an edit
+/// through this seam can neither de-scope a `classifications`-matched rule
+/// by ERASING a classification (the pre-image still matches it) nor escape
+/// an `exclude_classifications`-matched rule by ADDING one (the pre-image
+/// still matches that too). The earlier pre/post UNION got only the first
+/// half right: unioned classifications could stop an `exclude_classifications`
+/// rule from matching — fail-open in the exclusion direction. Models without
+/// a prior entry are evaluated exactly as [`evaluate_apply_policy`] would.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_apply_policy_with_extra_classifications(
     config_path: &Path,
@@ -1491,12 +1496,12 @@ pub fn evaluate_apply_policy_with_extra_classifications(
     models_dir: &Path,
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
-    extra_classifications: &BTreeMap<String, Vec<String>>,
+    prior_classifications: &BTreeMap<String, Vec<String>>,
 ) -> PolicyGate {
     let policy = rocky_core::config::load_rocky_config(config_path)
         .ok()
         .and_then(|cfg| cfg.policy);
-    evaluate_apply_policy_with_policy_matching_union(
+    evaluate_apply_policy_with_policy_matching_dual(
         policy.as_ref(),
         plan_id,
         principal,
@@ -1505,15 +1510,27 @@ pub fn evaluate_apply_policy_with_extra_classifications(
         None,
         state_path,
         marker_freezes,
-        Some(extra_classifications),
+        Some(prior_classifications),
     )
 }
 
 /// The shared body behind [`evaluate_apply_policy_with_policy_matching`] and
 /// [`evaluate_apply_policy_with_extra_classifications`] — resolves attributes,
-/// applies the optional classification union, then runs the ledger-aware core.
+/// runs the optional pre-image/post-image dual evaluation, then the
+/// ledger-aware core.
+///
+/// With `prior_classifications` set, the policy is evaluated over two
+/// attribute sets: the resolved on-disk attributes (the post-image) and a
+/// copy with each listed model's classifications REPLACED by its prior set
+/// (the pre-image — an empty prior list is a real pre-image: the model
+/// carried NO classifications). Both candidate evaluations are PURE probes
+/// (no ledger rows); the more restrictive one picks the attribute set the
+/// single RECORDING evaluation then runs over, so the decision rows in the
+/// ledger always describe the verdict this function returns, exactly one row
+/// per touched model — same as a plain evaluation. Ties keep the post-image
+/// (today's exact behavior).
 #[allow(clippy::too_many_arguments)]
-fn evaluate_apply_policy_with_policy_matching_union(
+fn evaluate_apply_policy_with_policy_matching_dual(
     policy: Option<&rocky_core::config::PolicyConfig>,
     plan_id: &str,
     principal: PolicyPrincipal,
@@ -1522,30 +1539,31 @@ fn evaluate_apply_policy_with_policy_matching_union(
     models_glob: Option<&str>,
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
-    extra_classifications: Option<&BTreeMap<String, Vec<String>>>,
+    prior_classifications: Option<&BTreeMap<String, Vec<String>>>,
 ) -> PolicyGate {
-    let (policy, mut attrs_map) =
+    let (policy, attrs_map) =
         match resolve_policy_and_attrs(policy, touched, models_dir, models_glob) {
             Ok(pair) => pair,
             Err(gate) => return gate,
         };
 
-    // Union in the caller-supplied classifications (widening only). A model
-    // the compile did not resolve still gets an entry, so a rule scoped on
-    // these classifications matches it rather than falling to bare defaults.
-    if let Some(extra) = extra_classifications {
-        for (model, classes) in extra {
-            let attrs = attrs_map
-                .entry(model.clone())
-                .or_insert_with(|| ModelAttributes {
+    // The pre-image attribute set: the post-image attributes with each listed
+    // model's classifications replaced by the set its prior sidecar carried.
+    // A model the compile did not resolve still gets an entry, so a rule
+    // scoped on classifications matches it rather than falling to bare
+    // defaults.
+    let pre_attrs_map: Option<BTreeMap<String, ModelAttributes>> =
+        prior_classifications.map(|prior| {
+            let mut pre = attrs_map.clone();
+            for (model, classes) in prior {
+                let attrs = pre.entry(model.clone()).or_insert_with(|| ModelAttributes {
                     name: model.clone(),
                     ..Default::default()
                 });
-            for class in classes {
-                attrs.classifications.insert(class.clone());
+                attrs.classifications = classes.iter().cloned().collect();
             }
-        }
-    }
+            pre
+        });
 
     // Snapshot the decision ledger *before* this apply writes any rows, so the
     // dynamic breakers (autonomy-budget burn, active freezes) reflect only
@@ -1575,6 +1593,38 @@ fn evaluate_apply_policy_with_policy_matching_union(
     let snapshot_unreadable = prior_snapshot.is_none();
     let prior_decisions: Vec<PolicyDecisionRecord> = prior_snapshot.unwrap_or_default();
 
+    // Dual evaluation (FF-WP1 fix round 2, item 1): probe BOTH candidate
+    // attribute sets purely (no rows written) and let the more restrictive
+    // verdict pick the set the recording evaluation below runs over. Ties —
+    // including the common case where the redraft changed no classification —
+    // keep the post-image, so behavior without a strictly-tighter pre-image
+    // is byte-identical to a plain evaluation.
+    let (eval_attrs, pre_image_won) = match &pre_attrs_map {
+        None => (&attrs_map, false),
+        Some(pre_attrs) => {
+            let probe = |attrs: &BTreeMap<String, ModelAttributes>| {
+                evaluate_apply_policy_core(
+                    &policy,
+                    plan_id,
+                    principal,
+                    touched,
+                    attrs,
+                    &prior_decisions,
+                    marker_freezes,
+                    snapshot_unreadable,
+                    |_| {},
+                )
+            };
+            let post_gate = probe(&attrs_map);
+            let pre_gate = probe(pre_attrs);
+            if gate_rank(&pre_gate) > gate_rank(&post_gate) {
+                (pre_attrs, true)
+            } else {
+                (&attrs_map, false)
+            }
+        }
+    };
+
     // Tracks a failed budget-relevant decision-row write so we can fail closed
     // after the evaluation loop (the record sink returns `()`).
     let budget_write_failed = std::cell::Cell::new(false);
@@ -1584,7 +1634,7 @@ fn evaluate_apply_policy_with_policy_matching_union(
         plan_id,
         principal,
         touched,
-        &attrs_map,
+        eval_attrs,
         &prior_decisions,
         marker_freezes,
         snapshot_unreadable,
@@ -1632,7 +1682,38 @@ fn evaluate_apply_policy_with_policy_matching_union(
             "a budget-relevant decision row could not be persisted",
         );
     }
-    gate
+    if !pre_image_won {
+        return gate;
+    }
+    // The pre-image evaluation was strictly more restrictive — say so, so the
+    // surfaced reason explains why a rule matched classifications the on-disk
+    // sidecar no longer (or does not yet) shows.
+    let pre_image_suffix = "; pre-image evaluation: this verdict matched the classifications the \
+                            model's PRIOR sidecar carried — an edit through this seam is governed \
+                            by the most restrictive of its before and after states, so a redraft \
+                            can neither erase its way out of a classification-matched rule nor \
+                            add its way out of an exclusion-matched one";
+    match gate {
+        PolicyGate::RequireReview {
+            model,
+            rule_id,
+            reason,
+        } => PolicyGate::RequireReview {
+            model,
+            rule_id,
+            reason: format!("{reason}{pre_image_suffix}"),
+        },
+        PolicyGate::Deny {
+            model,
+            rule_id,
+            reason,
+        } => PolicyGate::Deny {
+            model,
+            rule_id,
+            reason: format!("{reason}{pre_image_suffix}"),
+        },
+        other => other,
+    }
 }
 
 /// Open the decision ledger for writing with a bounded retry on transient
@@ -5672,16 +5753,16 @@ effect = "deny"
         Ok(())
     }
 
-    /// FF-WP1 fix round (finding 2) — the classification-UNION threading:
+    /// FF-WP1 fix round (finding 2) — the prior-classifications threading:
     /// `evaluate_apply_policy_with_extra_classifications` matches a
     /// `classifications = ["pii"]` deny even when the ON-DISK model carries no
-    /// `pii` classification, because the caller-supplied extra set is unioned
-    /// into the resolved attributes before rule matching. This is the seam
-    /// `draft_model` uses to evaluate over the pre/post union — the control
-    /// half proves the SAME call WITHOUT the extra set resolves to the default
-    /// posture, so the deny provably came from the union.
+    /// `pii` classification, because the caller-supplied prior set drives a
+    /// pre-image evaluation whose verdict wins when more restrictive. This is
+    /// the seam `draft_model` uses — the control half proves the SAME call
+    /// WITHOUT the prior set resolves to the default posture, so the deny
+    /// provably came from the pre-image evaluation.
     #[test]
-    fn extra_classifications_union_widens_rule_matching() -> anyhow::Result<()> {
+    fn extra_classifications_pre_image_widens_rule_matching() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let config = write_config(
             dir.path(),
@@ -5720,13 +5801,13 @@ effect = "deny"
         );
         assert!(
             matches!(plain, PolicyGate::RequireReview { .. }),
-            "without the union the deny must NOT match (default posture decides); got {plain:?}"
+            "without the prior set the deny must NOT match (default posture decides); got {plain:?}"
         );
 
-        // With the extra set (the pre-image classifications), the deny matches.
-        let extra: BTreeMap<String, Vec<String>> =
+        // With the prior set (the pre-image classifications), the deny matches.
+        let prior: BTreeMap<String, Vec<String>> =
             std::iter::once(("m".to_string(), vec!["pii".to_string()])).collect();
-        let unioned = super::evaluate_apply_policy_with_extra_classifications(
+        let gate = super::evaluate_apply_policy_with_extra_classifications(
             &config,
             "draft:m",
             PolicyPrincipal::Agent,
@@ -5734,11 +5815,145 @@ effect = "deny"
             &models,
             &state,
             &[],
-            &extra,
+            &prior,
         );
         assert!(
-            matches!(unioned, PolicyGate::Deny { .. }),
-            "the unioned classification must match the pii-scoped deny; got {unioned:?}"
+            matches!(gate, PolicyGate::Deny { .. }),
+            "the prior classification must match the pii-scoped deny via the pre-image \
+             evaluation; got {gate:?}"
+        );
+        Ok(())
+    }
+
+    /// FF-WP1 fix round 2 (item 1a) — the erase direction, stated as the
+    /// redraft scenario: a `classifications = ["pii"]` deny, an on-disk model
+    /// whose redraft REMOVED the pii classification (the sidecar carries
+    /// none), and a prior set that still carries it. The pre-image evaluation
+    /// matches the deny, and the most restrictive verdict governs: still
+    /// Deny. (The union got this direction right too; the sibling exclusion
+    /// test is the one the union failed.)
+    #[test]
+    fn redraft_removing_a_classification_still_matches_the_deny() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { classifications = ["pii"] }
+effect = "deny"
+"#,
+        )?;
+        // Post-image: the redrafted sidecar carries NO classification.
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models)?;
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            models.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"warehouse\"\nschema = \"out\"\n",
+        )?;
+        let state = dir.path().join("state.redb");
+
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::Propose);
+
+        // Pre-image: the prior sidecar carried pii.
+        let prior: BTreeMap<String, Vec<String>> =
+            std::iter::once(("m".to_string(), vec!["pii".to_string()])).collect();
+        let gate = super::evaluate_apply_policy_with_extra_classifications(
+            &config,
+            "draft:m",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+            &[],
+            &prior,
+        );
+        let PolicyGate::Deny { reason, .. } = gate else {
+            panic!("removing pii in the redraft must not de-scope the deny; got {gate:?}");
+        };
+        assert!(
+            reason.contains("pre-image evaluation"),
+            "the surfaced reason must say the pre-image evaluation decided it: {reason}"
+        );
+        Ok(())
+    }
+
+    /// FF-WP1 fix round 2 (item 1b) — the exclusion direction the UNION
+    /// failed: a deny scoped `exclude_classifications = ["pii"]` (deny when
+    /// the model carries NO pii), an on-disk model whose redraft ADDED a pii
+    /// classification, and an empty prior set (the model carried none). The
+    /// union {pii} stopped the exclude rule from matching — fail-open. Dual
+    /// evaluation still matches it on the pre-image, and the most restrictive
+    /// verdict governs: Deny. The control half proves the post-image alone
+    /// resolves to the default posture.
+    #[test]
+    fn redraft_adding_a_classification_cannot_escape_an_exclusion_deny() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { exclude_classifications = ["pii"] }
+effect = "deny"
+"#,
+        )?;
+        // Post-image: the redrafted sidecar ADDS a pii classification.
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models)?;
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id, 2 AS email\n")?;
+        std::fs::write(
+            models.join("m.toml"),
+            "name = \"m\"\n\n[classification]\nemail = \"pii\"\n\n\
+             [strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"warehouse\"\nschema = \"out\"\n",
+        )?;
+        let state = dir.path().join("state.redb");
+
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::Propose);
+
+        // Control: the post-image alone does NOT match the exclusion deny
+        // (pii present), so the default posture decides.
+        let plain = super::evaluate_apply_policy(
+            &config,
+            "draft:m",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+            &[],
+        );
+        assert!(
+            matches!(plain, PolicyGate::RequireReview { .. }),
+            "post-image alone must resolve to the default posture; got {plain:?}"
+        );
+
+        // Pre-image: the prior sidecar carried NO classifications — an empty
+        // prior list is a real pre-image, not a no-op.
+        let prior: BTreeMap<String, Vec<String>> =
+            std::iter::once(("m".to_string(), Vec::new())).collect();
+        let gate = super::evaluate_apply_policy_with_extra_classifications(
+            &config,
+            "draft:m",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+            &[],
+            &prior,
+        );
+        let PolicyGate::Deny { reason, .. } = gate else {
+            panic!("adding pii in the redraft must not escape the exclusion deny; got {gate:?}");
+        };
+        assert!(
+            reason.contains("pre-image evaluation"),
+            "the surfaced reason must say the pre-image evaluation decided it: {reason}"
         );
         Ok(())
     }
