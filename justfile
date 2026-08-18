@@ -6,7 +6,7 @@ default:
 # --- Build ---
 
 # Build all subprojects (release mode)
-build: build-engine build-sdk build-dagster build-vscode
+build: build-engine build-sdk build-dagster build-framework build-vscode
 
 build-engine:
     cd engine && cargo build --release
@@ -18,13 +18,17 @@ build-sdk:
 build-dagster:
     cd integrations/dagster && uv build --wheel
 
+# rocky-fulfillment also depends on rocky-sdk — keep it after build-sdk.
+build-framework:
+    cd framework && uv build --wheel
+
 build-vscode:
     cd editors/vscode && npm install && npm run compile
 
 # --- Test ---
 
 # Run all test suites
-test: test-engine test-sdk test-dagster test-vscode
+test: test-engine test-sdk test-dagster test-framework test-vscode
 
 test-engine:
     cd engine && cargo test
@@ -34,6 +38,9 @@ test-sdk:
 
 test-dagster:
     cd integrations/dagster && uv run pytest
+
+test-framework:
+    cd framework && uv run pytest
 
 # Note: `npm test` runs the VS Code integration tests which download a full
 # Electron under .vscode-test/ (~344 MB). Use vitest unit tests by default
@@ -57,7 +64,7 @@ evals-selftest:
 
 # --- Lint ---
 
-lint: lint-engine lint-sdk lint-dagster lint-vscode
+lint: lint-engine lint-sdk lint-dagster lint-framework lint-vscode
 
 lint-engine:
     cd engine && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -67,6 +74,9 @@ lint-sdk:
 
 lint-dagster:
     cd integrations/dagster && uv run ruff check && uv run ruff format --check
+
+lint-framework:
+    cd framework && uv run ruff check && uv run ruff format --check
 
 lint-vscode:
     cd editors/vscode && npm run lint
@@ -223,6 +233,11 @@ release-dagster version *args:
 # Release VS Code extension (pass --publish to also push to Marketplace)
 release-vscode version *args:
     ./scripts/release.sh vscode {{version}} {{args}}
+
+# Release the fulfillment framework: framework-v* tag + GitHub Release only.
+# Nothing publishes to a registry yet (the script refuses --publish).
+release-framework version *args:
+    ./scripts/release.sh framework {{version}} {{args}}
 
 # --- Demo recording ---
 
