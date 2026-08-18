@@ -1,0 +1,1307 @@
+//! `rocky product <compile|verify|status|approve>` — the deterministic
+//! product-spec verbs.
+//!
+//! A product spec (`products/<name>.toml`) declares WHAT a data product
+//! must be; these verbs parse it, verify the trust posture it requires,
+//! lower it onto engine primitives, and record a human's approval of a
+//! spec revision. They are gate-side code: this module is a sibling of
+//! the other command modules and reaches engine internals directly — the
+//! policy verdicts here come from `rocky_core::policy::evaluate`, the
+//! same evaluator every enforcement path runs, never from a mirror.
+//!
+//! # The verbs
+//!
+//! - **verify** — the frozen `propose_only` posture (D5), fail-closed:
+//!   a `[policy]` block must exist, `default_agent_effect` must be
+//!   `require_review`, agent propose must resolve `allow` through an
+//!   explicit budget-free rule scoped to EXACTLY this product's output
+//!   model, and agent apply must resolve `require_review` or `deny`.
+//!   A posture failure prints a paste-ready block. Then classification
+//!   tags must resolve (a spec-compile ERROR where the engine's W004
+//!   only warns) and product identities must not collide.
+//! - **compile** — verify, then run the next lowering phase through the
+//!   staged commit protocol (`rocky_core::product::commit`): Phase A
+//!   before drafting, Phase B once the drafted sidecar exists.
+//! - **status** — read-only report: spec identity, committed manifest,
+//!   artifact byte-verification, approval record + snapshot integrity,
+//!   fulfillment state. Status never mutates — it reports a pending
+//!   staging journal rather than resolving it.
+//! - **approve** — the authority transition: write the immutable
+//!   digest-addressed snapshot file FIRST, then ONE state-store write
+//!   transaction that CASes the approval record, CASes the fulfillment
+//!   state, and appends the journal row
+//!   ([`rocky_core::state::StateStore::product_approval_cas`]).
+//!
+//! # Exit codes
+//!
+//! `verify` exits 0 on `pass`, 1 on `needs_input`, 2 on `fail` — after
+//! printing the full (JSON or text) report, so orchestrators parse the
+//! payload and branch on the code. The other verbs exit 0 on success and
+//! 1 on any refusal (the refusal code rides in the error message).
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use rocky_core::config::{MaskEntry, PolicyCapability, PolicyEffect, PolicyPrincipal, RockyConfig};
+use rocky_core::fulfill::{FulfillJournalRow, FulfillState, FulfillStateRecord, ProductApprovalRecord};
+use rocky_core::policy::{self, ModelAttributes};
+use rocky_core::product::commit::{
+    RecoveryAction, committed_manifest, recover_generation, run_phase_a, run_phase_b,
+};
+use rocky_core::product::lowering::{manifest_rel, sidecar_rel, state_dir_rel};
+use rocky_core::product::manifest::{
+    MANIFEST_FILENAME, Manifest, ManifestPhase, content_digest, verify_artifact_hashes,
+};
+use rocky_core::product::spec::{ParsedSpec, SpecRejected, SpecResult, parse_spec_file};
+use rocky_core::state::StateStore;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+use crate::output::print_json;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The spec file of a product, project-root-relative.
+pub fn spec_rel(product_name: &str) -> String {
+    format!("products/{product_name}.toml")
+}
+
+/// The immutable approval snapshot of one spec revision,
+/// project-root-relative.
+///
+/// Digest-addressed by the HEX half of the digest only: the `sha256:`
+/// prefix carries a colon, which Windows refuses in file names, and the
+/// scheme is already pinned by the record's `spec_digest`.
+pub fn approval_snapshot_rel(product_name: &str, spec_digest: &str) -> String {
+    let hex = spec_digest.strip_prefix("sha256:").unwrap_or(spec_digest);
+    format!("{}/approved-{hex}.toml", state_dir_rel(product_name))
+}
+
+/// Parse `products/<name>.toml` and pin the file to the product it names.
+///
+/// The verb takes a product NAME and derives the path, so a spec file
+/// whose `product.name` disagrees with its own file name is refused: the
+/// generated-artifact headers, the state directory, and the approval
+/// records all key on the name, and a mismatch would split that identity.
+fn load_spec(root: &Path, product_name: &str) -> SpecResult<ParsedSpec> {
+    let rel = spec_rel(product_name);
+    let parsed = parse_spec_file(&root.join(&rel))?;
+    if parsed.product().name != product_name {
+        return Err(SpecRejected::new(
+            "product-name-mismatch",
+            format!(
+                "{rel} declares product.name = '{}' — the file must be named after its \
+                 product (products/<name>.toml), or every identity surface (state dir, \
+                 approvals, generated headers) splits",
+                parsed.product().name
+            ),
+        ));
+    }
+    Ok(parsed)
+}
+
+// ---------------------------------------------------------------------------
+// The posture verification (D5 checks 1 + 2 against the real evaluator)
+// ---------------------------------------------------------------------------
+
+/// The corrected `propose_only` posture from FF-DESIGN D5, ready to
+/// paste. The authoring-lane allow is scoped to the one output model;
+/// apply stays a human decision.
+pub fn paste_block(output_model: &str) -> String {
+    format!(
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+# Authoring lane: the agent may draft and propose WITHIN the product's scope…
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = {{ models = ["{output_model}"] }}
+effect = "allow"
+
+# …but applying stays a human decision (explicit, though the default already covers it).
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = {{ models = ["{output_model}"] }}
+effect = "require_review"
+"#
+    )
+}
+
+/// Verification verdict, ordered by severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifyStatus {
+    /// The frozen posture holds and every check passed.
+    Pass,
+    /// A human must edit configuration (the paste block says how).
+    NeedsInput,
+    /// A check failed outright (e.g. agent apply resolves `allow`).
+    Fail,
+}
+
+/// One verification outcome, before it is wrapped into the output.
+#[derive(Debug, Clone)]
+pub(crate) struct PostureResult {
+    pub status: VerifyStatus,
+    pub reason: String,
+    pub paste_block: Option<String>,
+    pub propose_effect: Option<PolicyEffect>,
+    pub apply_effect: Option<PolicyEffect>,
+}
+
+impl PostureResult {
+    fn needs_input(reason: String, block: &str) -> Self {
+        Self {
+            status: VerifyStatus::NeedsInput,
+            reason,
+            paste_block: Some(block.to_string()),
+            propose_effect: None,
+            apply_effect: None,
+        }
+    }
+}
+
+/// The model attributes the lowering is ABOUT to create — the synthetic
+/// post-image the posture is evaluated against.
+///
+/// Evaluating the post-image is the point: a gate reading the pre-write
+/// attributes can be evaded by the very change under review. Phase A
+/// writes the sibling `.contract.toml`, so the post-image is contracted;
+/// the sidecar merge stamps `tags.product` and the spec's
+/// classifications.
+///
+/// `reachable_downstreams` is `None` — unknown, not zero. "A brand-new
+/// model has no dependents" is an assumption, not a proof: an existing
+/// model can already reference this name, and resumes over prior state
+/// exist. The verifier never computes the dependency graph, so
+/// reachability stays unproved and any `max_downstreams` ceiling fails
+/// closed (`allow` degrades to `require_review`), exactly as the engine
+/// degrades an uncomputable blast radius.
+pub(crate) fn synthetic_post_image(parsed: &ParsedSpec) -> ModelAttributes {
+    let product = parsed.product();
+    ModelAttributes {
+        name: parsed.output_model().to_string(),
+        tags: [("product".to_string(), product.name.clone())]
+            .into_iter()
+            .collect(),
+        classifications: product.output.classifications.values().cloned().collect(),
+        layer: None,
+        contracted: true,
+        downstreams: 0,
+        reachable_downstreams: None,
+    }
+}
+
+/// True iff the scope is EXACTLY the frozen posture's: the literal
+/// output-model name and nothing else. `models` is compared as a literal
+/// list (model names carry no glob characters, so a broader glob such as
+/// `"revenue_*"` or `"*"` can never equal the name), and every other
+/// predicate must be absent — a rule that reaches further than this one
+/// product is not the frozen posture, however it happens to resolve.
+fn is_exact_product_scope(scope: &rocky_core::config::PolicyScope, output_model: &str) -> bool {
+    !scope.any
+        && scope.models == [output_model]
+        && scope.tags.is_empty()
+        && scope.classifications.is_empty()
+        && scope.exclude_classifications.is_empty()
+        && scope.contracted.is_none()
+        && scope.layer.is_none()
+        && scope.max_downstreams.is_none()
+}
+
+/// D5 checks 1 + 2, fail-closed, cold-start capable — against the REAL
+/// evaluator ([`policy::evaluate`]), never a mirror.
+///
+/// The pass condition is EXACTLY the frozen `propose_only` posture — not
+/// any policy that happens to resolve safely for this product:
+///
+/// 1. `default_agent_effect = "require_review"` (the safe default).
+/// 2. Agent propose resolves `allow` AND the winning rule is an explicit
+///    allow scoped precisely to the output model (no `any`, no broader
+///    glob, no attribute predicates) AND that rule carries no
+///    `autonomy_budget`: the live ledger-aware engine degrades a
+///    budgeted allow to `require_review` once the budget is exhausted,
+///    so a static verification cannot prove the live posture of a
+///    budgeted rule — the frozen D5 rule carries none.
+/// 3. Agent apply resolves `require_review` or `deny`.
+///
+/// A globally-permissive policy whose resolution is coincidentally safe
+/// (a permissive default with a scoped apply-review rule, or an
+/// `any = true` propose-allow) is REJECTED: authority that reaches past
+/// the product is global agent authority whether or not this product
+/// feels it.
+///
+/// Check 1's existence test reads the parsed config directly, never
+/// `rocky policy check`: with no `[policy]` block, ENFORCEMENT resolves
+/// `NotConfigured` and allows agents everything, while `policy check`
+/// *predicts* the safe default — the prediction is stricter than the
+/// enforcement, so only the block's existence is trustworthy.
+///
+/// The Python prototype's check 3 (engine confirmation by subprocess)
+/// dissolves here: this IS the engine, evaluating with its own
+/// `policy::evaluate`. There is no second implementation to disagree
+/// with.
+pub(crate) fn verify_policy_posture(config_path: &Path, parsed: &ParsedSpec) -> PostureResult {
+    let output_model = parsed.output_model();
+    let block = paste_block(output_model);
+
+    if !config_path.is_file() {
+        return PostureResult::needs_input(
+            format!(
+                "rocky.toml not found at {} — fix the config, then re-run",
+                config_path.display()
+            ),
+            &block,
+        );
+    }
+    let config = match rocky_core::config::load_rocky_config(config_path) {
+        Ok(config) => config,
+        Err(err) => {
+            // A malformed `[policy]` hard-fails the engine's own config
+            // load (serde deny_unknown_fields, unsigned integer types), so
+            // nothing downstream may proceed on a guess. This is where the
+            // prototype's strict-parsing mirror dissolves: the refusal IS
+            // the engine's serde.
+            return PostureResult::needs_input(
+                format!(
+                    "{} does not parse under the engine's config schema: {err:#} — fix the \
+                     config, then re-run",
+                    config_path.display()
+                ),
+                &block,
+            );
+        }
+    };
+    let Some(policy) = config.policy.clone() else {
+        return PostureResult::needs_input(
+            "rocky.toml has no [policy] block. With no block, ENFORCEMENT allows agents \
+             everything (NotConfigured) even though `rocky policy check` predicts review — \
+             so the block must exist before any agent runs. Paste the block below into \
+             rocky.toml."
+                .to_string(),
+            &block,
+        );
+    };
+    let problems: Vec<String> = rocky_core::config::validate_policy(&config)
+        .into_iter()
+        .map(|problem| problem.to_string())
+        .collect();
+    if !problems.is_empty() {
+        return PostureResult::needs_input(
+            format!("[policy] is present but invalid: {}", problems.join("; ")),
+            &block,
+        );
+    }
+
+    let attrs = synthetic_post_image(parsed);
+    let propose = policy::evaluate(&policy, PolicyPrincipal::Agent, PolicyCapability::Propose, &attrs);
+    let apply = policy::evaluate(&policy, PolicyPrincipal::Agent, PolicyCapability::Apply, &attrs);
+
+    if policy.default_agent_effect != PolicyEffect::RequireReview {
+        return PostureResult {
+            status: VerifyStatus::NeedsInput,
+            reason: format!(
+                "default_agent_effect = '{:?}' is not the frozen propose_only posture \
+                 (require_review). A permissive default is global agent authority even when \
+                 this product's rules happen to resolve safely — no broader posture is \
+                 accepted. Use the block below.",
+                policy.default_agent_effect
+            ),
+            paste_block: Some(block),
+            propose_effect: Some(propose.effect),
+            apply_effect: Some(apply.effect),
+        };
+    }
+    if propose.effect != PolicyEffect::Allow {
+        return PostureResult {
+            status: VerifyStatus::NeedsInput,
+            reason: format!(
+                "agent propose for '{output_model}' resolves to {:?} ({}). Drafting would \
+                 stall: the draft tools are Propose-gated and return policy_review_required \
+                 STOP instructions under require_review. Add the scoped authoring-lane allow \
+                 below.",
+                propose.effect, propose.reason
+            ),
+            paste_block: Some(block),
+            propose_effect: Some(propose.effect),
+            apply_effect: Some(apply.effect),
+        };
+    }
+    let winning_rule = propose.matched_rule.and_then(|idx| policy.rules.get(idx));
+    let exact = winning_rule.is_some_and(|rule| is_exact_product_scope(&rule.scope, output_model));
+    if !exact {
+        let scope_text = match (propose.matched_rule, winning_rule) {
+            (Some(idx), Some(rule)) => format!(
+                "rule {idx} with scope {}",
+                serde_json::to_string(&rule.scope).unwrap_or_else(|_| "<unprintable>".to_string())
+            ),
+            _ => "the default posture".to_string(),
+        };
+        return PostureResult {
+            status: VerifyStatus::NeedsInput,
+            reason: format!(
+                "agent propose for '{output_model}' resolves to allow via {scope_text}, \
+                 which is broader than the frozen posture. The authoring-lane allow must be \
+                 scoped to exactly this product's output model (models = ['{output_model}'] \
+                 — no any, no glob, no attribute predicates); authority that reaches past \
+                 the product is rejected. Use the block below."
+            ),
+            paste_block: Some(block),
+            propose_effect: Some(propose.effect),
+            apply_effect: Some(apply.effect),
+        };
+    }
+    if let Some(budget) = winning_rule.and_then(|rule| rule.autonomy_budget.as_ref()) {
+        return PostureResult {
+            status: VerifyStatus::NeedsInput,
+            reason: format!(
+                "agent propose for '{output_model}' resolves to allow via rule {}, but that \
+                 rule carries autonomy_budget = {{ failures = {}, window = '{}' }}. A \
+                 budgeted allow is not the frozen posture: the live engine degrades it to \
+                 require_review once the budget is exhausted, so this static verification \
+                 cannot prove the posture that will actually run. Remove the budget and use \
+                 the block below.",
+                propose
+                    .matched_rule
+                    .map(|idx| idx.to_string())
+                    .unwrap_or_default(),
+                budget.failures,
+                budget.window,
+            ),
+            paste_block: Some(block),
+            propose_effect: Some(propose.effect),
+            apply_effect: Some(apply.effect),
+        };
+    }
+    if apply.effect == PolicyEffect::Allow {
+        let rule_text = apply
+            .matched_rule
+            .map(|idx| format!("rule {idx}"))
+            .unwrap_or_else(|| "the default posture".to_string());
+        return PostureResult {
+            status: VerifyStatus::Fail,
+            reason: format!(
+                "agent APPLY for '{output_model}' resolves to allow via {rule_text} ({}). \
+                 propose_only requires apply to stay a human decision — remove or narrow \
+                 that rule.",
+                apply.reason
+            ),
+            paste_block: None,
+            propose_effect: Some(propose.effect),
+            apply_effect: Some(apply.effect),
+        };
+    }
+    PostureResult {
+        status: VerifyStatus::Pass,
+        reason: format!(
+            "propose → allow ({}); apply → {:?} ({})",
+            propose.reason, apply.effect, apply.reason
+        ),
+        paste_block: None,
+        propose_effect: Some(propose.effect),
+        apply_effect: Some(apply.effect),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Classification-tag resolution (spec-compile error where W004 only warns)
+// ---------------------------------------------------------------------------
+
+/// Tags with a masking strategy or an explicit unmasked allowance.
+///
+/// Mirrors W004's completeness rule: a tag resolves if it appears as a
+/// top-level `[mask]` strategy, as a key inside ANY `[mask.<env>]`
+/// override table (not gated on the active env), or in
+/// `[classifications].allow_unmasked`.
+fn resolved_classification_tags(config: &RockyConfig) -> BTreeSet<String> {
+    let mut resolved: BTreeSet<String> = BTreeSet::new();
+    for (key, entry) in &config.mask {
+        match entry {
+            MaskEntry::Strategy(_) => {
+                resolved.insert(key.clone());
+            }
+            MaskEntry::EnvOverride(overrides) => {
+                resolved.extend(overrides.keys().cloned());
+            }
+        }
+    }
+    resolved.extend(config.classifications.allow_unmasked.iter().cloned());
+    resolved
+}
+
+/// REJECT the spec unless every classification tag resolves.
+///
+/// The engine only warns (W004); the product verbs make an unresolved
+/// tag a spec-compile error. Stated plainly: this closes tag RESOLUTION
+/// only — masking APPLICATION is warehouse-dependent (Databricks-only
+/// today), so a resolved tag is a declared intent, not an enforcement
+/// guarantee.
+pub(crate) fn check_classifications(config: &RockyConfig, parsed: &ParsedSpec) -> SpecResult<()> {
+    let declared: BTreeSet<&String> = parsed.product().output.classifications.values().collect();
+    if declared.is_empty() {
+        return Ok(());
+    }
+    let resolved = resolved_classification_tags(config);
+    let unresolved: Vec<&str> = declared
+        .iter()
+        .filter(|tag| !resolved.contains(tag.as_str()))
+        .map(|tag| tag.as_str())
+        .collect();
+    if unresolved.is_empty() {
+        return Ok(());
+    }
+    Err(SpecRejected::new(
+        "classification-unresolved",
+        format!(
+            "classification tag(s) {} resolve to no [mask] / [mask.<env>] strategy and are \
+             not in [classifications].allow_unmasked. Add a strategy or the explicit \
+             allowance. (Resolution only: masking application is warehouse-dependent — \
+             Databricks-only today.)",
+            unresolved.join(", ")
+        ),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Collision checks against other products' state dirs
+// ---------------------------------------------------------------------------
+
+/// REJECT on identity collisions with existing fulfillment state.
+///
+/// - Duplicate product name: this product's state dir already carries a
+///   committed manifest recorded from a DIFFERENT spec file.
+/// - Duplicate output model: ANOTHER product's committed manifest
+///   already claims the same `output.model`.
+pub(crate) fn check_product_collisions(
+    project_root: &Path,
+    parsed: &ParsedSpec,
+    spec_path: &str,
+) -> SpecResult<()> {
+    let product_name = &parsed.product().name;
+    if let Some(own) = committed_manifest(project_root, product_name)?
+        && own.spec_path != spec_path
+    {
+        return Err(SpecRejected::new(
+            "duplicate-product-name",
+            format!(
+                "product name '{product_name}' is already claimed by the spec at '{}' \
+                 (state dir {}); two spec files must not share a name",
+                own.spec_path,
+                state_dir_rel(product_name)
+            ),
+        ));
+    }
+    let fulfillment_root = project_root.join(".rocky").join("fulfillment");
+    let Ok(entries) = std::fs::read_dir(&fulfillment_root) else {
+        return Ok(());
+    };
+    let mut state_dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    state_dirs.sort();
+    for state_dir in state_dirs {
+        let dir_name = state_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if dir_name == *product_name {
+            continue;
+        }
+        let other_manifest_path = state_dir.join(MANIFEST_FILENAME);
+        if !other_manifest_path.is_file() {
+            continue;
+        }
+        let raw = std::fs::read(&other_manifest_path).map_err(|err| {
+            SpecRejected::new(
+                "manifest-unreadable",
+                format!("{} is unreadable: {err}", other_manifest_path.display()),
+            )
+        })?;
+        let other = Manifest::from_json_bytes(&raw)?;
+        if other.output_model == parsed.output_model() {
+            return Err(SpecRejected::new(
+                "duplicate-output-model",
+                format!(
+                    "output model '{}' is already claimed by product '{dir_name}' ({}); one \
+                     model has one owning product",
+                    parsed.output_model(),
+                    other.product_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Output shapes
+// ---------------------------------------------------------------------------
+
+/// JSON output of `rocky product verify`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductVerifyOutput {
+    pub version: String,
+    pub command: String,
+    /// `product:<name>`.
+    pub product_id: String,
+    /// `sha256:<hex>` over the spec's raw bytes.
+    pub spec_digest: String,
+    /// The resolved output model name.
+    pub output_model: String,
+    /// `pass`, `needs_input`, or `fail` — also the exit code (0 / 1 / 2).
+    pub status: VerifyStatus,
+    /// Why, in plain language.
+    pub reason: String,
+    /// The corrected `[policy]` block to paste, on a posture
+    /// `needs_input`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paste_block: Option<String>,
+    /// The resolved agent-propose effect, when evaluation ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub propose_effect: Option<PolicyEffect>,
+    /// The resolved agent-apply effect, when evaluation ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply_effect: Option<PolicyEffect>,
+}
+
+/// One emitted artifact, as reported by `rocky product compile`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductArtifactOutput {
+    /// Project-root-relative POSIX path.
+    pub path: String,
+    /// `sha256:<hex>` over the committed bytes.
+    pub sha256: String,
+}
+
+/// The approval record, as echoed by compile/status output.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductApprovalOutput {
+    /// The approved `sha256:<hex>` spec digest.
+    pub spec_digest: String,
+    /// Best-effort approver identity.
+    pub approver: String,
+    /// RFC3339 approval instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<String>,
+    /// Project-root-relative path of the immutable snapshot file.
+    pub snapshot_path: String,
+}
+
+/// JSON output of `rocky product compile`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductCompileOutput {
+    pub version: String,
+    pub command: String,
+    /// `product:<name>`.
+    pub product_id: String,
+    /// `sha256:<hex>` over the compiled spec's raw bytes.
+    pub spec_digest: String,
+    /// Project-root-relative spec path.
+    pub spec_path: String,
+    /// The resolved output model name.
+    pub output_model: String,
+    /// Which lowering phase this run committed: `lowered_contract`
+    /// (Phase A) or `merged` (Phase B).
+    pub phase: String,
+    /// The artifacts this phase committed (manifest excluded).
+    pub artifacts: Vec<ProductArtifactOutput>,
+    /// Project-root-relative path of the committed lowering manifest.
+    pub manifest_path: String,
+    /// The current approval record, when one exists. Compile is a READER
+    /// of the approval: when present, the snapshot bytes were re-verified
+    /// against the record digest before this output was produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ProductApprovalOutput>,
+    /// Whether the compiled spec's digest equals the approved digest.
+    /// `null` when no approval exists. `false` is not an error at
+    /// compile time — it means the working spec has moved past the
+    /// approval (the loop's supersession trigger).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_matches_approval: Option<bool>,
+}
+
+/// JSON output of `rocky product approve`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductApproveOutput {
+    pub version: String,
+    pub command: String,
+    /// `product:<name>`.
+    pub product_id: String,
+    /// The approved `sha256:<hex>` spec digest.
+    pub spec_digest: String,
+    /// The resolved output model name.
+    pub output_model: String,
+    /// Best-effort approver identity recorded on the approval.
+    pub approver: String,
+    /// RFC3339 approval instant.
+    pub approved_at: String,
+    /// Project-root-relative path of the immutable snapshot file.
+    pub snapshot_path: String,
+    /// The fulfillment state tag before this approval, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_state: Option<String>,
+    /// The fulfillment state after this approval (`spec_approved`).
+    pub state: String,
+    /// True when this exact digest was already approved and nothing was
+    /// re-written.
+    pub already_approved: bool,
+}
+
+/// JSON output of `rocky product status`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ProductStatusOutput {
+    pub version: String,
+    pub command: String,
+    /// The product name the status was asked for.
+    pub product: String,
+    /// Whether `products/<name>.toml` exists and parses.
+    pub spec_present: bool,
+    /// `product:<name>`, when the spec parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// The working spec's digest, when it parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
+    /// The resolved output model, when the spec parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_model: Option<String>,
+    /// Why the spec failed to parse, when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_error: Option<String>,
+    /// The committed lowering phase, when a manifest exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_phase: Option<String>,
+    /// The committed manifest's spec digest, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_spec_digest: Option<String>,
+    /// Byte-verification problems against the committed manifest
+    /// (empty = every committed artifact matches its recorded hash).
+    #[serde(default)]
+    pub artifact_problems: Vec<String>,
+    /// Whether an uncommitted staging journal is pending. Status never
+    /// mutates; the next compile resolves it.
+    pub staging_journal_present: bool,
+    /// The approval record, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ProductApprovalOutput>,
+    /// Whether the approval snapshot's bytes still digest to the
+    /// recorded value. `null` without an approval; `false` is tamper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_intact: Option<bool>,
+    /// Whether the working spec equals the approved revision. `null`
+    /// when either side is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_matches_approval: Option<bool>,
+    /// The persisted fulfillment state tag, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fulfill_state: Option<String>,
+    /// Number of fulfillment journal rows recorded for this product.
+    pub journal_rows: u64,
+}
+
+// ---------------------------------------------------------------------------
+// verify
+// ---------------------------------------------------------------------------
+
+/// Run every verification: the D5 posture, classification resolution,
+/// and identity collisions — in that order, first refusal wins after the
+/// posture (the posture result carries its own status).
+pub(crate) fn product_verify_outcome(
+    root: &Path,
+    config_path: &Path,
+    product_name: &str,
+) -> Result<(ParsedSpec, PostureResult)> {
+    let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
+    let posture = verify_policy_posture(config_path, &parsed);
+    if posture.status != VerifyStatus::Pass {
+        return Ok((parsed, posture));
+    }
+    // The posture passed, so the config loads — a failure here would have
+    // been a needs_input above.
+    let config = rocky_core::config::load_rocky_config(config_path)
+        .context("the posture verification passed but the config no longer loads")?;
+    if let Err(reject) = check_classifications(&config, &parsed) {
+        let posture = PostureResult {
+            status: VerifyStatus::Fail,
+            reason: format!("[{}] {}", reject.code, reject.message),
+            paste_block: None,
+            propose_effect: posture.propose_effect,
+            apply_effect: posture.apply_effect,
+        };
+        return Ok((parsed, posture));
+    }
+    if let Err(reject) = check_product_collisions(root, &parsed, &spec_rel(product_name)) {
+        let posture = PostureResult {
+            status: VerifyStatus::Fail,
+            reason: format!("[{}] {}", reject.code, reject.message),
+            paste_block: None,
+            propose_effect: posture.propose_effect,
+            apply_effect: posture.apply_effect,
+        };
+        return Ok((parsed, posture));
+    }
+    Ok((parsed, posture))
+}
+
+fn verify_output(parsed: &ParsedSpec, posture: &PostureResult) -> ProductVerifyOutput {
+    ProductVerifyOutput {
+        version: VERSION.to_string(),
+        command: "product_verify".to_string(),
+        product_id: parsed.product_id(),
+        spec_digest: parsed.digest.clone(),
+        output_model: parsed.output_model().to_string(),
+        status: posture.status,
+        reason: posture.reason.clone(),
+        paste_block: posture.paste_block.clone(),
+        propose_effect: posture.propose_effect,
+        apply_effect: posture.apply_effect,
+    }
+}
+
+fn print_verify(output: &ProductVerifyOutput, output_json: bool) -> Result<()> {
+    if output_json {
+        print_json(output)?;
+        return Ok(());
+    }
+    let label = match output.status {
+        VerifyStatus::Pass => "PASS",
+        VerifyStatus::NeedsInput => "NEEDS INPUT",
+        VerifyStatus::Fail => "FAIL",
+    };
+    println!("product {} ({})", output.product_id, output.spec_digest);
+    println!("verify: {label}");
+    println!("  {}", output.reason);
+    if let Some(block) = &output.paste_block {
+        println!("\nPaste this into rocky.toml:\n\n{block}");
+    }
+    Ok(())
+}
+
+/// Execute `rocky product verify <name>`.
+///
+/// Exits 0 on `pass`, 1 on `needs_input`, 2 on `fail` — after printing
+/// the full report.
+pub fn run_product_verify(config_path: &Path, product_name: &str, output_json: bool) -> Result<()> {
+    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let (parsed, posture) = product_verify_outcome(&root, config_path, product_name)?;
+    let output = verify_output(&parsed, &posture);
+    print_verify(&output, output_json)?;
+    match posture.status {
+        VerifyStatus::Pass => Ok(()),
+        VerifyStatus::NeedsInput => std::process::exit(1),
+        VerifyStatus::Fail => std::process::exit(2),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compile
+// ---------------------------------------------------------------------------
+
+/// The inner compile: verify, then run the next lowering phase through
+/// the staged commit protocol.
+///
+/// Phase selection: Phase A when no committed manifest exists (or when
+/// one exists but the drafted sidecar does not — a Phase-A resume);
+/// Phase B once the drafted sidecar exists. Both orchestrators recover a
+/// crashed prior commit before staging, refuse cold-start collisions,
+/// tampering, and cross-generation mixing, and commit with the manifest
+/// rename as the marker.
+pub(crate) fn product_compile_in(
+    root: &Path,
+    config_path: &Path,
+    state_path: Option<&Path>,
+    product_name: &str,
+) -> Result<ProductCompileOutput> {
+    let (parsed, posture) = product_verify_outcome(root, config_path, product_name)?;
+    if posture.status != VerifyStatus::Pass {
+        let block = posture
+            .paste_block
+            .as_deref()
+            .map(|block| format!("\n\nPaste this into rocky.toml:\n\n{block}"))
+            .unwrap_or_default();
+        bail!(
+            "refusing to compile product '{product_name}': verification did not pass \
+             ({:?}): {}{block}",
+            posture.status,
+            posture.reason
+        );
+    }
+    let spec_path = spec_rel(product_name);
+
+    // Compile is a READER of the approval (when one exists): the snapshot
+    // bytes must still digest to the recorded value, or the approval is
+    // tampered and nothing proceeds.
+    let state_store = match state_path {
+        Some(path) if path.exists() => Some(open_state_store(path)?),
+        _ => None,
+    };
+    let approval = match &state_store {
+        Some(store) => store.product_approval_get(product_name)?,
+        None => None,
+    };
+    let mut approval_echo = None;
+    let mut spec_matches_approval = None;
+    if let Some(record) = &approval {
+        verify_approval_snapshot(root, record)?;
+        spec_matches_approval = Some(record.spec_digest == parsed.digest);
+        approval_echo = Some(approval_output(record));
+    }
+
+    let sidecar_present = root.join(sidecar_rel(&parsed)).is_file();
+    let has_committed = committed_manifest(root, product_name)?.is_some();
+    let lowering = if has_committed && sidecar_present {
+        run_phase_b(root, &spec_path, &parsed)
+    } else {
+        run_phase_a(root, &spec_path, &parsed)
+    }
+    .map_err(|reject| anyhow::anyhow!("{reject}"))?;
+
+    Ok(ProductCompileOutput {
+        version: VERSION.to_string(),
+        command: "product_compile".to_string(),
+        product_id: parsed.product_id(),
+        spec_digest: parsed.digest.clone(),
+        spec_path,
+        output_model: parsed.output_model().to_string(),
+        phase: match lowering.manifest.phase {
+            ManifestPhase::LoweredContract => "lowered_contract".to_string(),
+            ManifestPhase::Merged => "merged".to_string(),
+        },
+        artifacts: lowering
+            .artifacts
+            .iter()
+            .map(|artifact| ProductArtifactOutput {
+                path: artifact.relpath.clone(),
+                sha256: content_digest(&artifact.content),
+            })
+            .collect(),
+        manifest_path: manifest_rel(product_name),
+        approval: approval_echo,
+        spec_matches_approval,
+    })
+}
+
+/// Execute `rocky product compile <name>`.
+pub fn run_product_compile(
+    config_path: &Path,
+    product_name: &str,
+    state_path: &Path,
+    output_json: bool,
+) -> Result<()> {
+    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let output = product_compile_in(&root, config_path, Some(state_path), product_name)?;
+    if output_json {
+        print_json(&output)?;
+    } else {
+        println!(
+            "product {} compiled: phase {} (spec {})",
+            output.product_id, output.phase, output.spec_digest
+        );
+        for artifact in &output.artifacts {
+            println!("  wrote {} ({})", artifact.path, artifact.sha256);
+        }
+        println!("  manifest {}", output.manifest_path);
+        if let Some(false) = output.spec_matches_approval {
+            println!(
+                "  note: the working spec differs from the approved revision — re-approve \
+                 before the loop proposes"
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// approve
+// ---------------------------------------------------------------------------
+
+/// Best-effort approver identity — the same convention the review marker
+/// uses (git identity when available), with the same honesty caveat: it
+/// is an attribution, not an authentication.
+fn approver_string() -> String {
+    match super::branch::approver_identity_pub() {
+        Ok(identity) => identity.email,
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+/// Write the immutable digest-addressed snapshot file, tmp+rename.
+///
+/// A digest-named file is never overwritten — no reader can observe
+/// new-digest-old-bytes. When the file already exists its bytes must
+/// still digest to the name it carries; anything else is tamper and the
+/// approval refuses.
+pub(crate) fn write_approval_snapshot(
+    root: &Path,
+    parsed: &ParsedSpec,
+) -> Result<String> {
+    let rel = approval_snapshot_rel(&parsed.product().name, &parsed.digest);
+    let path = root.join(&rel);
+    if path.is_file() {
+        let existing = std::fs::read(&path)
+            .with_context(|| format!("failed to read existing snapshot {}", path.display()))?;
+        if content_digest(&existing) != parsed.digest {
+            bail!(
+                "[approval-snapshot-tampered] {rel} exists but its bytes do not digest to \
+                 {} — a digest-addressed snapshot is immutable; refusing to overwrite or \
+                 approve over it",
+                parsed.digest
+            );
+        }
+        return Ok(rel);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &parsed.raw)
+        .with_context(|| format!("failed to stage snapshot at {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("failed to commit snapshot at {}", path.display()))?;
+    Ok(rel)
+}
+
+/// Verify an approval record's snapshot bytes against its digest.
+fn verify_approval_snapshot(root: &Path, record: &ProductApprovalRecord) -> Result<()> {
+    let path = root.join(&record.snapshot_path);
+    let bytes = std::fs::read(&path).with_context(|| {
+        format!(
+            "[approval-snapshot-missing] the approval record points at {} but the file is \
+             unreadable — the record proves an approval happened, never what the bytes now \
+             say, so nothing proceeds without them",
+            record.snapshot_path
+        )
+    })?;
+    if content_digest(&bytes) != record.spec_digest {
+        bail!(
+            "[approval-snapshot-tampered] {} no longer digests to the approved {} — \
+             tampered snapshot; refusing",
+            record.snapshot_path,
+            record.spec_digest
+        );
+    }
+    Ok(())
+}
+
+fn approval_output(record: &ProductApprovalRecord) -> ProductApprovalOutput {
+    ProductApprovalOutput {
+        spec_digest: record.spec_digest.clone(),
+        approver: record.approver.clone(),
+        approved_at: record.approved_at.clone(),
+        snapshot_path: record.snapshot_path.clone(),
+    }
+}
+
+/// Open the product state store (`models/.rocky-state.redb` resolution is
+/// the caller's; the product verbs receive the resolved path).
+fn open_state_store(state_path: &Path) -> Result<StateStore> {
+    StateStore::open(state_path).with_context(|| {
+        format!(
+            "failed to open the state store at {} for the product records",
+            state_path.display()
+        )
+    })
+}
+
+/// The E4 authority transition, as one function the CLI wraps.
+///
+/// 1. Snapshot bytes first, immutable and digest-addressed (tmp+rename;
+///    never overwritten).
+/// 2. Then ONE state-store write transaction that CASes the approval
+///    record, CASes the fulfillment state to `spec_approved`, and
+///    appends the journal row. A crash between 1 and 2 leaves only an
+///    orphan snapshot file (harmless, GC-able); the transaction itself
+///    is all-or-nothing.
+///
+/// Approving the digest that is already approved is a no-op success
+/// (`already_approved = true`) — nothing is re-written, no journal row
+/// is appended. A lost CAS (another approver won the race between this
+/// process's read and its write) is a clean error naming the winning
+/// digest.
+pub(crate) fn product_approve_in(
+    root: &Path,
+    state_path: &Path,
+    product_name: &str,
+) -> Result<ProductApproveOutput> {
+    let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
+    let store = open_state_store(state_path)?;
+
+    let observed_approval = store.product_approval_get(product_name)?;
+    let observed_state = store.fulfill_state_get(product_name)?;
+    let previous_state = observed_state.as_ref().map(|record| record.state.tag().to_string());
+
+    if let Some(existing) = &observed_approval
+        && existing.spec_digest == parsed.digest
+    {
+        // Idempotent re-approve: the digest is already the approved one.
+        // Verify the snapshot is intact and report, writing nothing.
+        verify_approval_snapshot(root, existing)?;
+        return Ok(ProductApproveOutput {
+            version: VERSION.to_string(),
+            command: "product_approve".to_string(),
+            product_id: parsed.product_id(),
+            spec_digest: parsed.digest.clone(),
+            output_model: parsed.output_model().to_string(),
+            approver: existing.approver.clone(),
+            approved_at: existing.approved_at.clone().unwrap_or_default(),
+            snapshot_path: existing.snapshot_path.clone(),
+            previous_state,
+            state: "spec_approved".to_string(),
+            already_approved: true,
+        });
+    }
+
+    // 1. The immutable snapshot file, before any record.
+    let snapshot_path = write_approval_snapshot(root, &parsed)?;
+
+    // 2. One all-or-nothing transaction.
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let approver = approver_string();
+    let approval = ProductApprovalRecord {
+        product_id: parsed.product_id(),
+        spec_digest: parsed.digest.clone(),
+        approver: approver.clone(),
+        approved_at: Some(now.clone()),
+        snapshot_path: snapshot_path.clone(),
+    };
+    let new_state = FulfillStateRecord {
+        state: FulfillState::SpecApproved,
+        product_id: parsed.product_id(),
+        spec_digest: Some(parsed.digest.clone()),
+        journal_seq: 0, // allocated inside the transaction
+        updated_at: Some(now.clone()),
+    };
+    let journal_row = FulfillJournalRow {
+        seq: 0, // allocated inside the transaction
+        at: Some(now.clone()),
+        event: "spec approved".to_string(),
+        from_state: previous_state.clone(),
+        to_state: "spec_approved".to_string(),
+        spec_digest: Some(parsed.digest.clone()),
+    };
+    match store.product_approval_cas(
+        product_name,
+        observed_approval.as_ref(),
+        &approval,
+        observed_state.as_ref(),
+        &new_state,
+        &journal_row,
+    )? {
+        rocky_core::fulfill::FulfillCas::Won => Ok(ProductApproveOutput {
+            version: VERSION.to_string(),
+            command: "product_approve".to_string(),
+            product_id: parsed.product_id(),
+            output_model: parsed.output_model().to_string(),
+            spec_digest: parsed.digest.clone(),
+            approver,
+            approved_at: now,
+            snapshot_path,
+            previous_state,
+            state: "spec_approved".to_string(),
+            already_approved: false,
+        }),
+        rocky_core::fulfill::FulfillCas::Lost {
+            current_approval, ..
+        } => {
+            let winner = current_approval
+                .map(|record| record.spec_digest)
+                .unwrap_or_else(|| "<none>".to_string());
+            bail!(
+                "[approval-cas-lost] another process moved product '{product_name}' between \
+                 this approve's read and its write (the currently approved digest is \
+                 {winner}); nothing was recorded — re-run to approve on top of the current \
+                 state"
+            )
+        }
+    }
+}
+
+/// Execute `rocky product approve <name>`.
+pub fn run_product_approve(
+    _config_path: &Path,
+    product_name: &str,
+    state_path: &Path,
+    output_json: bool,
+) -> Result<()> {
+    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let output = product_approve_in(&root, state_path, product_name)?;
+    if output_json {
+        print_json(&output)?;
+    } else if output.already_approved {
+        println!(
+            "product {} spec {} was already approved (snapshot {})",
+            output.product_id, output.spec_digest, output.snapshot_path
+        );
+    } else {
+        println!(
+            "product {} spec {} approved by {} (snapshot {})",
+            output.product_id, output.spec_digest, output.approver, output.snapshot_path
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// status
+// ---------------------------------------------------------------------------
+
+/// The read-only status report. Never mutates: a pending staging journal
+/// is REPORTED, not recovered — the next compile resolves it.
+pub(crate) fn product_status_in(
+    root: &Path,
+    state_path: Option<&Path>,
+    product_name: &str,
+) -> Result<ProductStatusOutput> {
+    let mut output = ProductStatusOutput {
+        version: VERSION.to_string(),
+        command: "product_status".to_string(),
+        product: product_name.to_string(),
+        spec_present: false,
+        product_id: None,
+        spec_digest: None,
+        output_model: None,
+        spec_error: None,
+        committed_phase: None,
+        committed_spec_digest: None,
+        artifact_problems: Vec::new(),
+        staging_journal_present: false,
+        approval: None,
+        snapshot_intact: None,
+        spec_matches_approval: None,
+        fulfill_state: None,
+        journal_rows: 0,
+    };
+
+    let parsed = match load_spec(root, product_name) {
+        Ok(parsed) => {
+            output.spec_present = true;
+            output.product_id = Some(parsed.product_id());
+            output.spec_digest = Some(parsed.digest.clone());
+            output.output_model = Some(parsed.output_model().to_string());
+            Some(parsed)
+        }
+        Err(reject) => {
+            output.spec_error = Some(format!("{reject}"));
+            None
+        }
+    };
+
+    if let Some(manifest) = committed_manifest(root, product_name)
+        .map_err(|reject| anyhow::anyhow!("{reject}"))?
+    {
+        output.committed_phase = Some(
+            match manifest.phase {
+                ManifestPhase::LoweredContract => "lowered_contract",
+                ManifestPhase::Merged => "merged",
+            }
+            .to_string(),
+        );
+        output.committed_spec_digest = Some(manifest.spec_digest.clone());
+        output.artifact_problems = verify_artifact_hashes(root, &manifest);
+    }
+    output.staging_journal_present = root
+        .join(state_dir_rel(product_name))
+        .join(rocky_core::product::commit::STAGING_JOURNAL)
+        .is_file();
+
+    let store = match state_path {
+        Some(path) if path.exists() => Some(open_state_store(path)?),
+        _ => None,
+    };
+    if let Some(store) = store {
+        if let Some(record) = store.product_approval_get(product_name)? {
+            let intact = root
+                .join(&record.snapshot_path)
+                .is_file()
+                .then(|| {
+                    std::fs::read(root.join(&record.snapshot_path))
+                        .map(|bytes| content_digest(&bytes) == record.spec_digest)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            output.snapshot_intact = Some(intact);
+            output.spec_matches_approval = parsed
+                .as_ref()
+                .map(|parsed| parsed.digest == record.spec_digest);
+            output.approval = Some(approval_output(&record));
+        }
+        if let Some(record) = store.fulfill_state_get(product_name)? {
+            output.fulfill_state = Some(record.state.tag().to_string());
+            output.journal_rows = record.journal_seq;
+        }
+    }
+    Ok(output)
+}
+
+/// Execute `rocky product status <name>`.
+pub fn run_product_status(
+    _config_path: &Path,
+    product_name: &str,
+    state_path: &Path,
+    output_json: bool,
+) -> Result<()> {
+    let root = std::env::current_dir().context("failed to get current working directory")?;
+    let output = product_status_in(&root, Some(state_path), product_name)?;
+    if output_json {
+        print_json(&output)?;
+    } else {
+        println!("product {}", output.product);
+        match (&output.product_id, &output.spec_error) {
+            (Some(id), _) => println!(
+                "  spec: {} ({})",
+                id,
+                output.spec_digest.as_deref().unwrap_or("")
+            ),
+            (None, Some(err)) => println!("  spec: unreadable — {err}"),
+            (None, None) => println!("  spec: missing"),
+        }
+        match &output.committed_phase {
+            Some(phase) => println!("  lowering: committed phase {phase}"),
+            None => println!("  lowering: none committed"),
+        }
+        for problem in &output.artifact_problems {
+            println!("  artifact drift: {problem}");
+        }
+        if output.staging_journal_present {
+            println!("  staging journal: PENDING (the next compile recovers it)");
+        }
+        match &output.approval {
+            Some(approval) => {
+                println!(
+                    "  approval: {} by {} (snapshot {}, intact: {})",
+                    approval.spec_digest,
+                    approval.approver,
+                    approval.snapshot_path,
+                    output
+                        .snapshot_intact
+                        .map(|intact| intact.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                );
+                if let Some(false) = output.spec_matches_approval {
+                    println!("  note: the working spec differs from the approved revision");
+                }
+            }
+            None => println!("  approval: none"),
+        }
+        match &output.fulfill_state {
+            Some(state) => println!("  state: {state} ({} journal rows)", output.journal_rows),
+            None => println!("  state: none recorded"),
+        }
+    }
+    Ok(())
+}
+
+/// Recovery surface for tests: expose whether a pending journal would
+/// roll back or forward without running a full compile.
+#[allow(dead_code)]
+pub(crate) fn product_recover_in(root: &Path, product_name: &str) -> Result<RecoveryAction> {
+    let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
+    recover_generation(root, &parsed).map_err(|reject| anyhow::anyhow!("{reject}"))
+}
