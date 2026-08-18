@@ -1212,6 +1212,12 @@ enum Command {
         /// Output file path (default: docs/catalog.html)
         #[arg(long = "output-path", default_value = "docs/catalog.html")]
         output_path: PathBuf,
+        /// Per-run variable substituted into model SQL (repeatable), as in
+        /// `rocky compile --var`. Column metadata comes from an offline
+        /// compile; a required `@var(name)` left unset is a compile error,
+        /// and docs then render without column tables.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        var: Vec<String>,
     },
 
     /// Inspect or manage the state store.
@@ -3641,7 +3647,20 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Docs {
             models,
             output_path,
-        } => rocky_cli::commands::run_docs(&cli.config, &models, &output_path, json),
+            var,
+        } => {
+            let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            rocky_cli::commands::run_docs(
+                &cli.config,
+                &models,
+                &output_path,
+                &state_path,
+                cli.cache_ttl,
+                &run_vars,
+                json,
+            )
+        }
         Command::State { action } => match action {
             None | Some(StateAction::Show) => rocky_cli::commands::state_show(&state_path, json),
             Some(StateAction::ClearSchemaCache { dry_run }) => {
