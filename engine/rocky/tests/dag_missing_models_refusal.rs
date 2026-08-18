@@ -4,12 +4,12 @@
 //! When the configured models root did not exist, `rocky dag` exited 0 with
 //! zero nodes, and the dagster component cached that as a clean empty asset
 //! graph — `dag_status: "success"`, zero assets, indistinguishable from a
-//! project with no models. The guard keys on the FINAL node set, not on any
-//! one root: a seed-only pipeline, a replication pipeline, or a sibling root
-//! holding the models all still produce nodes and stay untouched. That
+//! project with no models. The refusal fires only when the whole graph is
+//! empty AND a declared transformation root does not exist: a seed-only
+//! pipeline, a replication pipeline, a sibling root holding the models, and
+//! an existing-but-empty root (a supported no-op) all keep working. The
 //! per-root tolerance is deliberate (see
-//! `dag_column_lineage_ignores_roots_that_contribute_nothing`); the refusal
-//! fires only when the whole graph would be empty.
+//! `dag_column_lineage_ignores_roots_that_contribute_nothing`).
 
 use std::fs;
 use std::process::{Command, Output};
@@ -89,8 +89,34 @@ fn a_missing_models_root_refuses_instead_of_reporting_an_empty_dag() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("zero nodes") && stderr.contains("transformation"),
-        "the refusal must say the graph is empty and why that is wrong, got: {stderr}"
+        stderr.contains("zero nodes")
+            && stderr.contains("does not exist")
+            && stderr.contains("'t'"),
+        "the refusal must say the graph is empty and name the missing root's pipeline, got: {stderr}"
+    );
+}
+
+/// An EXISTING empty root with nothing else is a supported no-op — a fresh
+/// scaffold, an intentionally empty pipeline. Zero nodes at exit 0 is the
+/// honest answer there; only a root that does not EXIST refuses. This is the
+/// tolerance the first cut of this guard broke (red-team HIGH finding).
+#[test]
+fn an_existing_empty_root_is_a_no_op_not_a_refusal() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    fs::write(dir.join("rocky.toml"), TRANSFORMATION_TOML).expect("write config");
+    fs::create_dir(dir.join("models")).expect("create empty models dir");
+
+    let out = run_dag(dir, &[]);
+    assert!(
+        out.status.success(),
+        "an existing empty root must stay a no-op; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("dag output is JSON");
+    assert!(
+        json["nodes"].as_array().expect("nodes array").is_empty(),
+        "the no-op graph is genuinely empty"
     );
 }
 

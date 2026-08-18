@@ -487,6 +487,9 @@ pub(super) fn load_transformation_models(
     // a root that resolves but contributes nothing is not a root the lineage
     // compile needs to cover.
     let mut contributing_roots: Vec<PathBuf> = Vec::new();
+    // Declared transformation pipelines whose models root does not exist,
+    // in `cfg.pipelines` order. See the Absent arm below.
+    let mut missing_roots: Vec<(String, PathBuf)> = Vec::new();
     let mut canonical_roots: Vec<PathBuf> = Vec::new();
     // model name -> the canonical FILE it was first loaded from.
     //
@@ -502,8 +505,18 @@ pub(super) fn load_transformation_models(
         let PipelineConfig::Transformation(t) = pipeline else {
             continue;
         };
-        let Some(dir) = crate::models_loader::resolve_models_dir(&t.models, config_path)? else {
-            continue;
+        let dir = match crate::models_loader::locate_models_dir(&t.models, config_path)? {
+            crate::models_loader::ModelsDir::Present(dir) => dir,
+            crate::models_loader::ModelsDir::Absent(path) => {
+                // Still a skip, as it always was — but the absence is
+                // RECORDED, so `rocky dag` can refuse an all-missing project
+                // instead of exporting an empty graph as success (#1397).
+                // An existing-but-empty root is deliberately NOT recorded:
+                // creating the directory is an explicit act, and an empty
+                // transformation pipeline is a supported no-op.
+                missing_roots.push((pipeline_name.clone(), path));
+                continue;
+            }
         };
         let models_glob = crate::models_loader::resolved_models_glob(&t.models, config_path);
 
@@ -557,6 +570,7 @@ pub(super) fn load_transformation_models(
     Ok(TransformationModels {
         by_pipeline,
         contributing_roots,
+        missing_roots,
     })
 }
 
@@ -565,6 +579,11 @@ pub(super) fn load_transformation_models(
 #[derive(Debug)]
 pub(super) struct TransformationModels {
     pub by_pipeline: rocky_core::unified_dag::ModelsByPipeline,
+    /// Declared transformation pipelines whose configured models root does
+    /// not exist, with the path that failed to resolve. Recorded during the
+    /// same pass that loads the others — a second resolver walk could
+    /// disagree with this one whenever the filesystem changes underneath.
+    pub missing_roots: Vec<(String, PathBuf)>,
     /// The distinct directories that contributed at least one model, in
     /// `cfg.pipelines` order. A pipeline whose directory is absent, or present
     /// but empty, contributes nothing and is not listed — so "how many roots
