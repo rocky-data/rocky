@@ -17,11 +17,14 @@ use rocky_ir::ColumnInfo;
 use crate::output::{DocsOutput, print_json};
 
 /// Execute `rocky docs`: discover models and generate HTML documentation.
+#[allow(clippy::too_many_arguments)]
 pub fn run_docs(
     config_path: &Path,
     models_dir: &Path,
     output_path: &Path,
     state_path: &Path,
+    cache_ttl_override: Option<u64>,
+    run_vars: &rocky_core::run_vars::RunVars,
     json: bool,
 ) -> Result<()> {
     let start = Instant::now();
@@ -33,6 +36,10 @@ pub fn run_docs(
     ))?;
 
     // Discover models (top level + subdirs, including `.rocky` DSL files).
+    // This load is strict: a model file that cannot be parsed — including a
+    // malformed `.rocky` — fails the docs build here, before any rendering.
+    // Only COMPILE failures degrade below; a docs page silently missing an
+    // unparseable model would misrepresent the project.
     let models = crate::models_loader::load_project_models(models_dir)?;
 
     let models_count = models.len();
@@ -51,24 +58,37 @@ pub fn run_docs(
     // inference `rocky compile` reports. No warehouse connection: source
     // schemas load from the TTL-filtered schema cache when enabled, and a
     // cold cache degrades leaf models to `UNKNOWN` types instead of
-    // failing. A project that does not compile degrades to no column
-    // tables, which is what every project got before this map was wired
-    // up (#1444).
-    let column_map = infer_column_map(&rocky_cfg, models_dir, state_path);
+    // failing. A project that loads but does not compile degrades to no
+    // column tables, which is what every project got before this map was
+    // wired up (#1444).
+    let column_map = infer_column_map(
+        &rocky_cfg,
+        models.clone(),
+        models_dir,
+        state_path,
+        cache_ttl_override,
+        run_vars,
+    );
     let index = build_doc_index(&models, &rocky_cfg, column_map.as_ref(), Some(&column_docs));
 
     // A `[columns]` description whose column the compile step cannot see
     // has nowhere to render. That was this command's silent-drop bug
-    // (#1444) — when it still happens for one column, say so.
+    // (#1444) — when it still happens for one column, say so. Matching is
+    // ASCII-case-insensitive, like every other column lookup in Rocky
+    // (`rocky_core::column_map`).
     for model in &index.models {
         let Some(docs) = column_docs.get(&model.name) else {
             continue;
         };
-        let rendered: HashSet<&str> = model.columns.iter().map(|c| c.name.as_str()).collect();
+        let rendered: HashSet<String> = model
+            .columns
+            .iter()
+            .map(|c| c.name.to_ascii_lowercase())
+            .collect();
         let mut orphaned: Vec<&str> = docs
             .keys()
+            .filter(|name| !rendered.contains(&name.to_ascii_lowercase()))
             .map(String::as_str)
-            .filter(|name| !rendered.contains(*name))
             .collect();
         if !orphaned.is_empty() {
             orphaned.sort_unstable();
@@ -125,40 +145,68 @@ pub fn run_docs(
 /// step ([`build_doc_index`]'s documented `column_map` source).
 ///
 /// Mirrors `rocky compile`'s source-schema tiers minus the `--with-seed`
-/// opt-in: the TTL-filtered schema cache when `[cache.schemas]` enables it,
-/// otherwise empty (typecheck degrades to `UNKNOWN`, it does not fail).
+/// opt-in: the TTL-filtered schema cache when `[cache.schemas]` enables it
+/// (honouring the global `--cache-ttl` override), otherwise empty
+/// (typecheck degrades to `UNKNOWN`, it does not fail).
 ///
-/// Returns `None` when the project does not compile at all — `rocky docs`
-/// is a reporting command, so it renders without column tables rather than
-/// refusing.
+/// Returns `None` — and warns — when the project does not compile cleanly.
+/// That covers both a hard compile error and a result carrying error
+/// diagnostics: an errored compile can hold sentinel-derived types (a
+/// missing `@var` becomes a parseable `NULL`, E028), and publishing those
+/// as the model's documented schema would be wrong, not merely incomplete.
+/// `rocky docs` is a reporting command, so it renders without column tables
+/// rather than refusing.
 fn infer_column_map(
     rocky_cfg: &rocky_core::config::RockyConfig,
+    models: Vec<rocky_core::models::Model>,
     models_dir: &Path,
     state_path: &Path,
+    cache_ttl_override: Option<u64>,
+    run_vars: &rocky_core::run_vars::RunVars,
 ) -> Option<HashMap<String, Vec<ColumnInfo>>> {
+    let schema_cache_cfg = rocky_cfg
+        .cache
+        .schemas
+        .clone()
+        .with_ttl_override(cache_ttl_override);
     let compiler_cfg = CompilerConfig {
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: crate::source_schemas::load_cached_source_schemas(
-            &rocky_cfg.cache.schemas,
+            &schema_cache_cfg,
             state_path,
         ),
         source_column_info: HashMap::new(),
         mask: rocky_cfg.mask.clone(),
         allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
         project_freshness_default: rocky_cfg.freshness.has_default(),
-        run_vars: rocky_core::run_vars::RunVars::new(),
+        run_vars: run_vars.clone(),
     };
-    let result = match compile::compile(&compiler_cfg) {
+    // The models are already loaded (and were loaded strictly), so compile
+    // them directly instead of re-reading the directory — one load, and the
+    // compile describes exactly the set the docs page lists.
+    let result = match compile::compile_preloaded_models(models, &compiler_cfg) {
         Ok(result) => result,
         Err(error) => {
-            // Project load is all-or-nothing (matching `rocky compile`), so
-            // one unparseable model costs every model its column table.
+            // Compilation is all-or-nothing (matching `rocky compile`), so
+            // one failing model costs every model its column table.
             // Degrading silently is this command's original bug — name it.
             warn!(%error, "project does not compile; docs render without column metadata");
             return None;
         }
     };
+    if result.has_errors {
+        let first = result
+            .diagnostics
+            .iter()
+            .find(|d| d.is_error())
+            .map_or_else(String::new, |d| format!(": {}", d.message));
+        warn!(
+            "project compiles with errors; docs render without column metadata{first} \
+             (pass --var NAME=VALUE if a run variable is required)"
+        );
+        return None;
+    }
     Some(
         result
             .type_check

@@ -106,6 +106,20 @@ pub fn build_doc_index(
                 m.config.target.catalog, m.config.target.schema, m.config.target.table
             );
             let model_docs = column_docs.and_then(|cd| cd.get(&m.config.name));
+            // Column identity is ASCII-case-insensitive throughout Rocky
+            // (see `column_map`); description lookup folds case to match.
+            // Keys are folded in sorted order, so if two sidecar keys
+            // collide case-insensitively the lexicographically later one
+            // wins, deterministically.
+            let folded_docs: Option<std::collections::HashMap<String, &String>> =
+                model_docs.map(|md| {
+                    let mut entries: Vec<(&String, &String)> = md.iter().collect();
+                    entries.sort_unstable_by_key(|(k, _)| *k);
+                    entries
+                        .into_iter()
+                        .map(|(k, v)| (k.to_ascii_lowercase(), v))
+                        .collect()
+                });
             let columns = column_map
                 .and_then(|cm| cm.get(&m.config.name))
                 .map(|cols| {
@@ -114,7 +128,10 @@ pub fn build_doc_index(
                             name: c.name.clone(),
                             data_type: c.data_type.clone(),
                             nullable: c.nullable,
-                            description: model_docs.and_then(|md| md.get(&c.name)).cloned(),
+                            description: folded_docs
+                                .as_ref()
+                                .and_then(|md| md.get(&c.name.to_ascii_lowercase()))
+                                .map(|d| (*d).clone()),
                         })
                         .collect()
                 })

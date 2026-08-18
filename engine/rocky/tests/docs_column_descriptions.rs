@@ -178,3 +178,153 @@ fn a_broken_sibling_model_degrades_loudly_and_docs_still_build() {
         "the compile failure must be named on stderr, got: {stderr}"
     );
 }
+
+/// Red-team finding on the first cut of this fix: `.rocky` DSL models carry
+/// the same companion `.toml` sidecar, but the description loader scanned
+/// `.sql` files only — so a DSL model's descriptions kept vanishing.
+#[test]
+fn dsl_model_column_descriptions_render_too() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let models = dir.join("models");
+    fs::create_dir(&models).expect("create models");
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write config");
+    fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").expect("write model sql");
+    write_sidecar(&models, "orders", "");
+    fs::write(models.join("summary.rocky"), "from orders\nselect { id }\n")
+        .expect("write dsl model");
+    write_sidecar(
+        &models,
+        "summary",
+        &format!("[columns.id]\ndescription = \"{GHOST_MARKER}\"\n"),
+    );
+
+    let out = run_docs(dir);
+    assert!(
+        out.status.success(),
+        "rocky docs must succeed; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let html = read_html(dir);
+    assert!(
+        html.contains(GHOST_MARKER),
+        "a .rocky model's [columns] description must render"
+    );
+}
+
+/// The strict-load boundary, pinned deliberately: an unparseable `.rocky`
+/// file fails the docs build at load. Only COMPILE failures degrade — a docs
+/// page silently missing an unparseable model would misrepresent the project.
+#[test]
+fn an_unparseable_dsl_model_fails_docs_at_load() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let models = dir.join("models");
+    fs::create_dir(&models).expect("create models");
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write config");
+    fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").expect("write model sql");
+    write_sidecar(&models, "orders", "");
+    fs::write(models.join("broken.rocky"), "frobnicate !!!\n").expect("write broken dsl");
+    write_sidecar(&models, "broken", "");
+
+    let out = run_docs(dir);
+    assert!(
+        !out.status.success(),
+        "an unparseable model must fail the docs build, not vanish from it; stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A required `@var` with no value is a compile error, and an errored compile
+/// can carry sentinel-derived types (the missing var becomes a parseable
+/// NULL). Docs must not publish that as the model's schema: without the var
+/// they degrade loudly; with `--var` the real column renders.
+#[test]
+fn a_missing_run_var_degrades_and_passing_it_renders() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let models = dir.join("models");
+    fs::create_dir(&models).expect("create models");
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write config");
+    fs::write(
+        models.join("thresholds.sql"),
+        "SELECT @var(threshold) AS threshold\n",
+    )
+    .expect("write model sql");
+    write_sidecar(
+        &models,
+        "thresholds",
+        &format!("[columns.threshold]\ndescription = \"{MARKER}\"\n"),
+    );
+
+    let without = run_docs(dir);
+    assert!(
+        without.status.success(),
+        "a missing var degrades, it does not fail docs; stderr: {}",
+        String::from_utf8_lossy(&without.stderr)
+    );
+    let html = read_html(dir);
+    assert!(
+        !html.contains(MARKER),
+        "sentinel-derived metadata must not be published as the schema"
+    );
+    let stderr = String::from_utf8_lossy(&without.stderr);
+    assert!(
+        stderr.contains("compiles with errors"),
+        "the degrade must be named on stderr, got: {stderr}"
+    );
+
+    let with_var = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("--config")
+        .arg(dir.join("rocky.toml"))
+        .arg("docs")
+        .arg("--models")
+        .arg(dir.join("models"))
+        .arg("--output-path")
+        .arg(dir.join("catalog.html"))
+        .args(["--var", "threshold=42"])
+        .current_dir(dir)
+        .env("RUST_LOG", "warn")
+        .output()
+        .expect("spawn rocky docs --var");
+    assert!(
+        with_var.status.success(),
+        "docs --var must succeed; stderr: {}",
+        String::from_utf8_lossy(&with_var.stderr)
+    );
+    let html = read_html(dir);
+    assert!(
+        html.contains(MARKER),
+        "with the var supplied, the described column must render"
+    );
+}
+
+/// Column identity is ASCII-case-insensitive throughout Rocky; description
+/// matching must fold case too. `[columns.ID]` documents `AS id`.
+#[test]
+fn description_matching_folds_ascii_case() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    let models = dir.join("models");
+    fs::create_dir(&models).expect("create models");
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write config");
+    fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").expect("write model sql");
+    write_sidecar(
+        &models,
+        "orders",
+        &format!("[columns.ID]\ndescription = \"{MARKER}\"\n"),
+    );
+
+    let out = run_docs(dir);
+    assert!(out.status.success());
+    let html = read_html(dir);
+    assert!(
+        html.contains(MARKER),
+        "a case-differing description must attach, matching Rocky's column identity"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("are not rendered") && !stderr.contains("do not match"),
+        "no orphan warning for a case-only difference, got: {stderr}"
+    );
+}
