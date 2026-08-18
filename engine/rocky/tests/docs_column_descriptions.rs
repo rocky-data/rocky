@@ -62,8 +62,11 @@ fn sidecar_column_descriptions_render_in_the_html() {
     let models = dir.join("models");
     fs::create_dir(&models).expect("create models");
     fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write config");
-    fs::write(models.join("orders.sql"), "SELECT 1 AS id, 'open' AS status\n")
-        .expect("write model sql");
+    fs::write(
+        models.join("orders.sql"),
+        "SELECT 1 AS id, 'open' AS status\n",
+    )
+    .expect("write model sql");
     write_sidecar(
         &models,
         "orders",
@@ -110,10 +113,16 @@ fn an_unknown_column_description_warns_and_the_rest_still_render() {
     );
 
     let out = run_docs(dir);
-    assert!(out.status.success(), "an orphaned description is a warning, not an error");
+    assert!(
+        out.status.success(),
+        "an orphaned description is a warning, not an error"
+    );
 
     let html = read_html(dir);
-    assert!(html.contains(MARKER), "the matching description must still render");
+    assert!(
+        html.contains(MARKER),
+        "the matching description must still render"
+    );
     assert!(
         !html.contains(GHOST_MARKER),
         "a description without a column must not be invented into the table"
@@ -159,7 +168,10 @@ fn a_broken_sibling_model_degrades_loudly_and_docs_still_build() {
     // The docs page still builds, minus column metadata for everyone —
     // and the degradation is named on stderr rather than silent.
     let html = read_html(dir);
-    assert!(html.contains("orders"), "the healthy model must still be listed");
+    assert!(
+        html.contains("orders"),
+        "the healthy model must still be listed"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("docs render without column metadata"),

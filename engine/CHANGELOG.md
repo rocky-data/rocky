@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rocky docs` renders sidecar `[columns]` descriptions.** The docs page's column map was hardcoded to `None` at the only production call site, and descriptions only attach to columns from that map — so every `[columns]` description was parsed, then rendered nowhere, with exit 0 and no warning. Column schemas now come from the offline compile step's type inference (no warehouse connection; the schema cache supplies source types when `[cache.schemas]` is enabled, and a cold cache renders leaf models as `UNKNOWN`). A description whose column the compile cannot see warns on stderr instead of vanishing, and a project that does not compile still builds docs — minus column tables, with the compile failure named. (#1444)
+
 ## [1.71.0] — 2026-08-18
 
 ### Added
