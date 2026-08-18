@@ -1305,3 +1305,836 @@ pub(crate) fn product_recover_in(root: &Path, product_name: &str) -> Result<Reco
     let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
     recover_generation(root, &parsed).map_err(|reject| anyhow::anyhow!("{reject}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rocky_core::product::spec::parse_spec_bytes;
+
+    /// The answer key's spec fixture, shared with the rocky-core lowering
+    /// tests (same bytes, same digest, embedded in the goldens).
+    const SPEC_FIXTURE: &[u8] =
+        include_bytes!("../../../rocky-core/src/product/testdata/revenue_daily.spec.toml");
+
+    /// A minimal ENGINE-VALID config. The prototype's fixture omitted the
+    /// pipeline target because its mirror read only the `[policy]` table;
+    /// the real verifier loads the whole config through the engine's
+    /// schema, which requires one.
+    const BASE_CONFIG: &str = r#"
+[adapter]
+type = "duckdb"
+path = "test.duckdb"
+
+[pipeline.main]
+type = "transformation"
+models = "models/**"
+
+[pipeline.main.target.governance]
+auto_create_schemas = true
+"#;
+
+    /// The FF-DESIGN D5 block, verbatim — the paste-ready posture.
+    const D5_BLOCK: &str = r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+# Authoring lane: the agent may draft and propose WITHIN the product's scope…
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { models = ["<output_model>"] }
+effect = "allow"
+
+# …but applying stays a human decision (explicit, though the default already covers it).
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { models = ["<output_model>"] }
+effect = "require_review"
+"#;
+
+    fn parsed_d3() -> ParsedSpec {
+        parse_spec_bytes(SPEC_FIXTURE, "products/revenue_daily.toml").expect("fixture parses")
+    }
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    /// A project root carrying the spec fixture and a config assembled
+    /// from `BASE_CONFIG` plus `extra`.
+    fn project_with_config(dir: &Path, extra: &str) -> (PathBuf, PathBuf) {
+        let root = dir.join("project");
+        write_file(&root.join("products/revenue_daily.toml"), SPEC_FIXTURE);
+        std::fs::create_dir_all(root.join("models")).expect("mkdir");
+        let config = root.join("rocky.toml");
+        write_file(&config, format!("{BASE_CONFIG}{extra}").as_bytes());
+        (root, config)
+    }
+
+    fn posture(dir: &Path, extra: &str) -> PostureResult {
+        let (_root, config) = project_with_config(dir, extra);
+        verify_policy_posture(&config, &parsed_d3())
+    }
+
+    // ----- the paste block IS the FF-DESIGN D5 block -----
+
+    #[test]
+    fn paste_block_matches_ff_design_d5_exactly() {
+        assert_eq!(paste_block("<output_model>"), D5_BLOCK);
+        assert_eq!(
+            paste_block("revenue_daily"),
+            D5_BLOCK.replace("<output_model>", "revenue_daily")
+        );
+    }
+
+    // ----- the three-check posture verification (checks 1 + 2) -----
+
+    #[test]
+    fn absent_policy_block_needs_input_with_paste_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(dir.path(), "");
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert_eq!(result.paste_block.as_deref(), Some(&*paste_block("revenue_daily")));
+        // The trap named: enforcement allows on an absent block even
+        // though `policy check` predicts review — existence is checked
+        // directly.
+        assert!(result.reason.contains("ENFORCEMENT allows"), "{}", result.reason);
+    }
+
+    #[test]
+    fn bare_default_require_review_block_is_not_a_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(
+            dir.path(),
+            "\n[policy]\nversion = 1\ndefault_agent_effect = \"require_review\"\n",
+        );
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert_eq!(result.propose_effect, Some(PolicyEffect::RequireReview));
+        assert!(result.reason.contains("stall"), "{}", result.reason);
+        assert!(result.paste_block.is_some());
+    }
+
+    #[test]
+    fn full_corrected_block_passes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(dir.path(), &format!("\n{}", paste_block("revenue_daily")));
+        assert_eq!(result.status, VerifyStatus::Pass, "{}", result.reason);
+        assert_eq!(result.propose_effect, Some(PolicyEffect::Allow));
+        assert_eq!(result.apply_effect, Some(PolicyEffect::RequireReview));
+    }
+
+    #[test]
+    fn explicit_agent_allow_apply_reaching_scope_fails_naming_the_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let block = r#"
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { models = ["revenue_daily"] }
+effect = "allow"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { models = ["revenue_*"] }
+effect = "allow"
+"#;
+        let result = posture(dir.path(), block);
+        assert_eq!(result.status, VerifyStatus::Fail);
+        assert_eq!(result.apply_effect, Some(PolicyEffect::Allow));
+        assert!(result.reason.contains("rule 1"), "{}", result.reason);
+    }
+
+    #[test]
+    fn corrected_block_defends_against_a_broader_apply_allow() {
+        // With the explicit scoped require_review in place, a broad `any`
+        // apply-allow is dominated (strict-superset specificity) — the
+        // corrected posture is defense in depth, exactly why D5 spells
+        // the apply rule out despite the default covering it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let broad_allow = r#"
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
+"#;
+        let result = posture(
+            dir.path(),
+            &format!("\n{}{broad_allow}", paste_block("revenue_daily")),
+        );
+        assert_eq!(result.status, VerifyStatus::Pass, "{}", result.reason);
+        assert_eq!(result.apply_effect, Some(PolicyEffect::RequireReview));
+    }
+
+    // ----- the frozen posture is required EXACTLY -----
+
+    #[test]
+    fn permissive_default_with_scoped_review_rule_is_rejected() {
+        // Adversarial: default_agent_effect = "allow" + a scoped
+        // apply-review rule RESOLVES safely for this product — and is
+        // still rejected: the permissive default is global agent
+        // authority.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let block = r#"
+[policy]
+version = 1
+default_agent_effect = "allow"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { models = ["revenue_daily"] }
+effect = "require_review"
+"#;
+        let result = posture(dir.path(), block);
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(result.reason.contains("default_agent_effect"), "{}", result.reason);
+        assert_eq!(result.paste_block.as_deref(), Some(&*paste_block("revenue_daily")));
+    }
+
+    #[test]
+    fn any_true_propose_allow_is_rejected() {
+        // The allow flows through global scope, not the exactly-scoped
+        // authoring rule — rejected even though it DOES resolve allow.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let block = r#"
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "allow"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { models = ["revenue_daily"] }
+effect = "require_review"
+"#;
+        let result = posture(dir.path(), block);
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert_eq!(result.propose_effect, Some(PolicyEffect::Allow));
+        assert!(result.reason.contains("broader"), "{}", result.reason);
+        assert_eq!(result.paste_block.as_deref(), Some(&*paste_block("revenue_daily")));
+    }
+
+    #[test]
+    fn broader_glob_propose_allow_is_rejected() {
+        // A glob that happens to match the output model is still broader
+        // than the frozen posture's literal scope.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let block = paste_block("revenue_daily").replace(
+            "scope = { models = [\"revenue_daily\"] }\neffect = \"allow\"",
+            "scope = { models = [\"revenue_*\"] }\neffect = \"allow\"",
+        );
+        let result = posture(dir.path(), &format!("\n{block}"));
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(result.reason.contains("broader"), "{}", result.reason);
+    }
+
+    #[test]
+    fn extra_predicate_on_the_authoring_rule_is_rejected() {
+        // The frozen posture's scope is the literal model list and
+        // NOTHING else — an added predicate is a different posture, not a
+        // variant.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let block = paste_block("revenue_daily").replace(
+            "scope = { models = [\"revenue_daily\"] }\neffect = \"allow\"",
+            "scope = { models = [\"revenue_daily\"], contracted = true }\neffect = \"allow\"",
+        );
+        let result = posture(dir.path(), &format!("\n{block}"));
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+    }
+
+    #[test]
+    fn budgeted_exact_propose_allow_is_rejected_naming_the_budget() {
+        // A budgeted allow is not the frozen posture: the live engine
+        // degrades it once the budget exhausts, so a static verification
+        // cannot prove the posture that will actually run.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let block = paste_block("revenue_daily").replacen(
+            "scope = { models = [\"revenue_daily\"] }\neffect = \"allow\"\n",
+            "scope = { models = [\"revenue_daily\"] }\neffect = \"allow\"\n\
+             autonomy_budget = { failures = 2, window = \"7d\" }\n",
+            1,
+        );
+        let result = posture(dir.path(), &format!("\n{block}"));
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert_eq!(result.propose_effect, Some(PolicyEffect::Allow));
+        assert!(result.reason.contains("autonomy_budget"), "{}", result.reason);
+        assert!(result.reason.contains("failures = 2"), "{}", result.reason);
+        assert!(result.reason.contains("7d"), "{}", result.reason);
+        assert_eq!(result.paste_block.as_deref(), Some(&*paste_block("revenue_daily")));
+    }
+
+    #[test]
+    fn ceiling_on_the_authoring_rule_fails_closed_via_unproved_reachability() {
+        // A max_downstreams ceiling on the propose allow degrades under
+        // the post-image's UNPROVED reachability (None, never
+        // 0-by-assumption), so the posture fails closed instead of
+        // assuming a dependent-free model.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let block = paste_block("revenue_daily").replacen(
+            "scope = { models = [\"revenue_daily\"] }\neffect = \"allow\"\n",
+            "scope = { models = [\"revenue_daily\"], max_downstreams = 5 }\neffect = \"allow\"\n",
+            1,
+        );
+        let result = posture(dir.path(), &format!("\n{block}"));
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert_eq!(result.propose_effect, Some(PolicyEffect::RequireReview));
+    }
+
+    #[test]
+    fn wrong_policy_version_needs_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(dir.path(), "\n[policy]\nversion = 2\n");
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(result.reason.contains("version"), "{}", result.reason);
+    }
+
+    // ----- strict parsing IS the engine's serde (the mirror dissolved) -----
+    //
+    // The prototype mirrored serde's strictness in pydantic and pinned it
+    // per shape. Here the config parser under test IS the engine's serde:
+    // each shape it refuses turns into a needs_input carrying the parse
+    // error. One test per answer-key node keeps the parity mapping 1:1.
+
+    #[test]
+    fn unknown_policy_key_needs_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(dir.path(), "\n[policy]\nversion = 1\nmode = \"strict\"\n");
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+    }
+
+    #[test]
+    fn string_policy_version_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(dir.path(), "\n[policy]\nversion = \"1\"\n");
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(result.reason.contains("does not parse"), "{}", result.reason);
+    }
+
+    #[test]
+    fn negative_policy_version_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(dir.path(), "\n[policy]\nversion = -1\n");
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(result.reason.contains("does not parse"), "{}", result.reason);
+    }
+
+    #[test]
+    fn integer_where_bool_expected_in_scope_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(
+            dir.path(),
+            "\n[policy]\nversion = 1\n\n[[policy.rules]]\nprincipal = \"agent\"\n\
+             capability = \"propose\"\nscope = { any = 1 }\neffect = \"allow\"\n",
+        );
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(result.reason.contains("does not parse"), "{}", result.reason);
+    }
+
+    #[test]
+    fn string_budget_failures_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(
+            dir.path(),
+            "\n[policy]\nversion = 1\n\n[[policy.rules]]\nprincipal = \"agent\"\n\
+             capability = \"apply\"\nscope = { any = true }\neffect = \"allow\"\n\
+             autonomy_budget = { failures = \"2\", window = \"7d\" }\n",
+        );
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(result.reason.contains("does not parse"), "{}", result.reason);
+    }
+
+    // ----- autonomy-budget validation is the engine's validate_policy -----
+
+    fn budget_rule(failures: &str, window: &str) -> String {
+        format!(
+            "\n[policy]\nversion = 1\n\n[[policy.rules]]\nprincipal = \"agent\"\n\
+             capability = \"apply\"\nscope = {{ any = true }}\neffect = \"allow\"\n\
+             autonomy_budget = {{ failures = {failures}, window = {window} }}\n"
+        )
+    }
+
+    #[test]
+    fn budget_zero_failures_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(dir.path(), &budget_rule("0", "\"7d\""));
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(result.reason.contains("failures"), "{}", result.reason);
+    }
+
+    #[test]
+    fn budget_invalid_window_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(dir.path(), &budget_rule("2", "\"banana\""));
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert!(result.reason.contains("banana"), "{}", result.reason);
+    }
+
+    #[test]
+    fn valid_budget_is_not_flagged() {
+        // A well-formed budget passes shape validation (the posture still
+        // fails on OTHER grounds here — the rule is a global apply-allow —
+        // so assert the budget itself raised no problem).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = posture(dir.path(), &budget_rule("2", "\"7d\""));
+        assert!(!result.reason.contains("autonomy_budget"), "{}", result.reason);
+    }
+
+    #[test]
+    fn missing_config_needs_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        write_file(&root.join("products/revenue_daily.toml"), SPEC_FIXTURE);
+        let result = verify_policy_posture(&root.join("rocky.toml"), &parsed_d3());
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+    }
+
+    #[test]
+    fn synthetic_post_image_shape() {
+        let attrs = synthetic_post_image(&parsed_d3());
+        assert_eq!(attrs.name, "revenue_daily");
+        assert_eq!(attrs.tags.get("product").map(String::as_str), Some("revenue_daily"));
+        assert!(attrs.classifications.contains("pii"));
+        assert!(attrs.contracted, "Phase A writes the sibling contract");
+        // Reachability is UNPROVED, never 0-by-assumption: an existing
+        // model can already reference this name, and resumes exist. None
+        // makes any max_downstreams ceiling fail closed.
+        assert_eq!(attrs.reachable_downstreams, None);
+    }
+
+    #[test]
+    fn posture_evaluates_the_post_image_not_the_pre_image() {
+        // A deny scoped to the POST-image attributes (the product tag the
+        // merge will stamp) must bite at verification time, before
+        // anything is written — the gate reads what the change creates,
+        // not what exists.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let block = format!(
+            "\n{}\n[[policy.rules]]\nprincipal = \"agent\"\ncapability = \"propose\"\n\
+             scope = {{ tags = {{ product = \"revenue_daily\" }} }}\neffect = \"deny\"\n",
+            paste_block("revenue_daily")
+        );
+        let result = posture(dir.path(), &block);
+        assert_eq!(result.status, VerifyStatus::NeedsInput);
+        assert_eq!(result.propose_effect, Some(PolicyEffect::Deny));
+    }
+
+    // ----- classification-tag resolution (REJECT where W004 warns) -----
+
+    fn classification_check(dir: &Path, extra: &str) -> SpecResult<()> {
+        let (_root, config_path) = project_with_config(dir, extra);
+        let config = rocky_core::config::load_rocky_config(&config_path).expect("config loads");
+        check_classifications(&config, &parsed_d3())
+    }
+
+    #[test]
+    fn unresolved_classification_tag_rejects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = classification_check(dir.path(), "").expect_err("unresolved");
+        assert_eq!(error.code, "classification-unresolved");
+        assert!(error.message.contains("pii"), "{error}");
+        // The honesty clause: resolution is closed, application is not.
+        assert!(error.message.contains("warehouse-dependent"), "{error}");
+    }
+
+    #[test]
+    fn top_level_mask_strategy_resolves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        classification_check(dir.path(), "\n[mask]\npii = \"hash\"\n").expect("resolves");
+    }
+
+    #[test]
+    fn env_override_mask_resolves_without_env_gating() {
+        // Mirrors W004: a tag defined only under [mask.prod] still
+        // resolves — the check is compile-time completeness, not
+        // env-scoped.
+        let dir = tempfile::tempdir().expect("tempdir");
+        classification_check(dir.path(), "\n[mask.prod]\npii = \"none\"\n").expect("resolves");
+    }
+
+    #[test]
+    fn allow_unmasked_resolves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        classification_check(dir.path(), "\n[classifications]\nallow_unmasked = [\"pii\"]\n")
+            .expect("resolves");
+    }
+
+    // ----- collision checks against fulfillment state dirs -----
+
+    fn committed_manifest_for(
+        root: &Path,
+        product_name: &str,
+        output_model: &str,
+        spec_path: &str,
+    ) {
+        let manifest = Manifest {
+            product_id: format!("product:{product_name}"),
+            spec_digest: format!("sha256:{}", "0".repeat(64)),
+            spec_path: spec_path.to_string(),
+            output_model: output_model.to_string(),
+            phase: ManifestPhase::LoweredContract,
+            fields: std::collections::BTreeMap::new(),
+            artifacts: std::collections::BTreeMap::new(),
+        };
+        write_file(
+            &root.join(manifest_rel(product_name)),
+            &manifest.to_json_bytes(),
+        );
+    }
+
+    #[test]
+    fn duplicate_product_name_vs_existing_state_dir_rejects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        committed_manifest_for(&root, "revenue_daily", "revenue_daily", "products/other_file.toml");
+        let error = check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
+            .expect_err("collision");
+        assert_eq!(error.code, "duplicate-product-name");
+        assert!(error.message.contains("products/other_file.toml"), "{error}");
+    }
+
+    #[test]
+    fn same_spec_path_is_not_a_name_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        committed_manifest_for(
+            &root,
+            "revenue_daily",
+            "revenue_daily",
+            "products/revenue_daily.toml",
+        );
+        check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
+            .expect("clean");
+    }
+
+    #[test]
+    fn duplicate_output_model_across_products_rejects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        committed_manifest_for(&root, "other_product", "revenue_daily", "products/other.toml");
+        let error = check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
+            .expect_err("collision");
+        assert_eq!(error.code, "duplicate-output-model");
+        assert!(error.message.contains("other_product"), "{error}");
+    }
+
+    #[test]
+    fn distinct_output_models_do_not_collide() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        committed_manifest_for(&root, "other_product", "another_model", "products/other.toml");
+        check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
+            .expect("clean");
+    }
+
+    #[test]
+    fn no_state_dirs_is_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
+            .expect("clean");
+    }
+
+    #[test]
+    fn collision_check_reads_the_layout_lower_writes() {
+        // Guard the seam: the collision check must read the same
+        // state-dir/manifest layout the commit protocol writes — pin it
+        // by writing through the real commit path, not a hand-built dir.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(root.join("models")).expect("mkdir");
+        let parsed = parsed_d3();
+        rocky_core::product::commit::run_phase_a(&root, "products/revenue_daily.toml", &parsed)
+            .expect("phase A");
+        check_product_collisions(&root, &parsed, "products/revenue_daily.toml").expect("clean");
+        let error = check_product_collisions(&root, &parsed, "products/renamed.toml")
+            .expect_err("renamed spec file collides");
+        assert_eq!(error.code, "duplicate-product-name");
+    }
+
+    // ----- the verbs end to end -----
+
+    /// A pass-verification config: the D5 posture plus a pii mask.
+    fn passing_config() -> String {
+        format!("\n[mask]\npii = \"hash\"\n\n{}", paste_block("revenue_daily"))
+    }
+
+    #[test]
+    fn spec_file_name_must_match_its_product_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("project");
+        // The fixture declares revenue_daily; park it under another name.
+        write_file(&root.join("products/misnamed.toml"), SPEC_FIXTURE);
+        let error = load_spec(&root, "misnamed").expect_err("mismatch");
+        assert_eq!(error.code, "product-name-mismatch");
+    }
+
+    #[test]
+    fn compile_refuses_until_verification_passes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), "");
+        let error = product_compile_in(&root, &config, None, "revenue_daily")
+            .expect_err("no policy block");
+        let message = format!("{error:#}");
+        assert!(message.contains("verification did not pass"), "{message}");
+        assert!(message.contains("[policy]"), "the paste block rides along: {message}");
+        assert!(
+            !root.join("models/revenue_daily.contract.toml").exists(),
+            "nothing lowers before verification passes"
+        );
+    }
+
+    #[test]
+    fn compile_runs_phase_a_then_phase_b_and_verifies_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+
+        let first = product_compile_in(&root, &config, None, "revenue_daily").expect("phase A");
+        assert_eq!(first.phase, "lowered_contract");
+        assert_eq!(first.artifacts.len(), 1);
+        assert!(root.join("models/revenue_daily.contract.toml").is_file());
+
+        // Draft the model (the worker's half), then compile again → B.
+        write_file(&root.join("models/revenue_daily.sql"), b"SELECT 1\n");
+        write_file(
+            &root.join("models/revenue_daily.toml"),
+            b"name = \"revenue_daily\"\n",
+        );
+        let second = product_compile_in(&root, &config, None, "revenue_daily").expect("phase B");
+        assert_eq!(second.phase, "merged");
+        assert_eq!(second.artifacts.len(), 1);
+        assert_eq!(second.artifacts[0].path, "models/revenue_daily.toml");
+
+        // The committed manifest byte-verifies everything it lists.
+        let manifest = rocky_core::product::commit::committed_manifest(&root, "revenue_daily")
+            .expect("readable")
+            .expect("committed");
+        assert!(verify_artifact_hashes(&root, &manifest).is_empty());
+
+        // Compile is idempotent once merged.
+        let third = product_compile_in(&root, &config, None, "revenue_daily").expect("again");
+        assert_eq!(third.phase, "merged");
+    }
+
+    fn temp_state_path(dir: &Path) -> PathBuf {
+        dir.join("state.redb")
+    }
+
+    #[test]
+    fn approve_writes_snapshot_then_records_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        let parsed = parsed_d3();
+
+        let output = product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+        assert!(!output.already_approved);
+        assert_eq!(output.spec_digest, parsed.digest);
+        assert_eq!(output.state, "spec_approved");
+        assert_eq!(output.previous_state, None);
+
+        // The snapshot file holds exactly the approved bytes.
+        let snapshot = root.join(&output.snapshot_path);
+        assert_eq!(std::fs::read(&snapshot).expect("snapshot"), SPEC_FIXTURE);
+
+        // The records landed together: approval + state + one journal row.
+        let store = StateStore::open(&state_path).expect("opens");
+        let approval = store
+            .product_approval_get("revenue_daily")
+            .expect("reads")
+            .expect("recorded");
+        assert_eq!(approval.spec_digest, parsed.digest);
+        assert_eq!(approval.snapshot_path, output.snapshot_path);
+        let state = store
+            .fulfill_state_get("revenue_daily")
+            .expect("reads")
+            .expect("recorded");
+        assert_eq!(state.state.tag(), "spec_approved");
+        assert_eq!(state.journal_seq, 1);
+        assert_eq!(store.fulfill_journal_rows("revenue_daily").expect("reads").len(), 1);
+    }
+
+    #[test]
+    fn approving_the_same_digest_twice_is_a_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+
+        let first = product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+        let second = product_approve_in(&root, &state_path, "revenue_daily").expect("no-op");
+        assert!(second.already_approved);
+        assert_eq!(second.spec_digest, first.spec_digest);
+        let store = StateStore::open(&state_path).expect("opens");
+        assert_eq!(
+            store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded")
+                .journal_seq,
+            1,
+            "a no-op re-approve appends no journal row"
+        );
+    }
+
+    #[test]
+    fn a_crash_between_snapshot_and_transaction_leaves_only_the_orphan_file() {
+        // The E4 crash drill at the file/txn boundary: run ONLY the first
+        // half (the snapshot write). The world must show the orphan file
+        // and NOTHING in the store — harmless, GC-able, and a re-run
+        // completes the approval over it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        let parsed = parsed_d3();
+
+        let snapshot_rel = write_approval_snapshot(&root, &parsed).expect("snapshot");
+        assert!(root.join(&snapshot_rel).is_file());
+        let store = StateStore::open(&state_path).expect("opens");
+        assert!(store.product_approval_get("revenue_daily").expect("reads").is_none());
+        assert!(store.fulfill_state_get("revenue_daily").expect("reads").is_none());
+        drop(store);
+
+        // The re-run completes over the orphan (never overwriting it).
+        let output = product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+        assert_eq!(output.snapshot_path, snapshot_rel);
+        assert!(!output.already_approved);
+    }
+
+    #[test]
+    fn a_tampered_snapshot_refuses_re_approval_and_compile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+
+        let output = product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+        write_file(&root.join(&output.snapshot_path), b"tampered bytes");
+
+        let error = product_approve_in(&root, &state_path, "revenue_daily")
+            .expect_err("tampered snapshot");
+        assert!(format!("{error:#}").contains("approval-snapshot-tampered"), "{error:#}");
+
+        // Compile is a reader of the approval and refuses the same way.
+        let error = product_compile_in(&root, &config, Some(&state_path), "revenue_daily")
+            .expect_err("tampered snapshot");
+        assert!(format!("{error:#}").contains("approval-snapshot-tampered"), "{error:#}");
+    }
+
+    #[test]
+    fn re_approving_a_new_digest_supersedes_and_journals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+
+        product_approve_in(&root, &state_path, "revenue_daily").expect("approves v1");
+
+        // Edit the spec (a new revision) and approve again.
+        let edited = String::from_utf8(SPEC_FIXTURE.to_vec())
+            .expect("utf-8")
+            .replace("revenue_eur >= 0", "revenue_eur > 0");
+        write_file(&root.join("products/revenue_daily.toml"), edited.as_bytes());
+        let output = product_approve_in(&root, &state_path, "revenue_daily").expect("approves v2");
+        assert!(!output.already_approved);
+        assert_eq!(output.previous_state.as_deref(), Some("spec_approved"));
+
+        let store = StateStore::open(&state_path).expect("opens");
+        let rows = store.fulfill_journal_rows("revenue_daily").expect("reads");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].seq, 2);
+        // Both snapshots exist — digest-addressed files are never
+        // overwritten, so the history of approved bytes accumulates.
+        let state_dir = root.join(".rocky/fulfillment/revenue_daily");
+        let snapshots = std::fs::read_dir(&state_dir)
+            .expect("state dir")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("approved-")
+            })
+            .count();
+        assert_eq!(snapshots, 2);
+    }
+
+    #[test]
+    fn status_reports_the_whole_surface() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+
+        // Cold: spec parses, nothing else exists.
+        let cold =
+            product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
+        assert!(cold.spec_present);
+        assert_eq!(cold.committed_phase, None);
+        assert!(cold.approval.is_none());
+        assert!(!cold.staging_journal_present);
+
+        // After approve + compile: everything reported and intact.
+        product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+        product_compile_in(&root, &config, Some(&state_path), "revenue_daily").expect("compiles");
+        let status =
+            product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
+        assert_eq!(status.committed_phase.as_deref(), Some("lowered_contract"));
+        assert!(status.artifact_problems.is_empty());
+        assert_eq!(status.snapshot_intact, Some(true));
+        assert_eq!(status.spec_matches_approval, Some(true));
+        assert_eq!(status.fulfill_state.as_deref(), Some("spec_approved"));
+        assert_eq!(status.journal_rows, 1);
+
+        // Tamper with the committed contract: status names the drift.
+        let contract = root.join("models/revenue_daily.contract.toml");
+        let tampered = std::fs::read_to_string(&contract)
+            .expect("contract")
+            .replace("Int64", "String");
+        write_file(&contract, tampered.as_bytes());
+        let status =
+            product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
+        assert_eq!(status.artifact_problems.len(), 1);
+        assert!(status.artifact_problems[0].contains("drift"));
+    }
+
+    #[test]
+    fn status_reports_a_pending_journal_without_resolving_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+        product_compile_in(&root, &config, None, "revenue_daily").expect("phase A");
+        // Park a (well-formed but uncommitted) journal in the state dir.
+        let journal = root
+            .join(state_dir_rel("revenue_daily"))
+            .join(rocky_core::product::commit::STAGING_JOURNAL);
+        write_file(
+            &journal,
+            format!(
+                r#"{{"entries": [{{"final": "{}", "staged_sha": "sha256:{}", "has_prev": true}}], "manifest": "{}"}}"#,
+                manifest_rel("revenue_daily"),
+                "0".repeat(64),
+                manifest_rel("revenue_daily"),
+            )
+            .as_bytes(),
+        );
+        let status = product_status_in(&root, None, "revenue_daily").expect("status");
+        assert!(status.staging_journal_present);
+        assert!(journal.is_file(), "status never mutates");
+    }
+}
