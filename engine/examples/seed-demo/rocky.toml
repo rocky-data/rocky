@@ -8,6 +8,10 @@
 
 [adapter.local]
 type = "duckdb"
+# File-backed so the `warehouse` catalog exists: a DuckDB file's catalog is
+# its file stem. In-memory DuckDB only has `memory`, and every documented
+# command then failed with `Catalog "warehouse" does not exist` (#1445).
+path = "warehouse.duckdb"
 
 [pipeline.seed_demo]
 type = "replication"

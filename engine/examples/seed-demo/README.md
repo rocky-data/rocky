@@ -52,11 +52,6 @@ more columns therefore becomes one column name, and the `CREATE TABLE` fails.
 
 ## Run it
 
-Every command in this section exits 1 on the example as shipped. The pipeline
-targets a catalog named `warehouse`, and the in-memory database does not have
-it. The fix is below, under
-[This example needs a catalog that exists](#this-example-needs-a-catalog-that-exists).
-
 ```bash
 cd engine/examples/seed-demo
 rocky seed --seeds seeds/
@@ -109,50 +104,33 @@ Caused by:
     ...
 ```
 
-## This example needs a catalog that exists
+## The catalog must exist
 
-`rocky.toml` declares a DuckDB adapter with no `path`, so Rocky opens an
-in-memory database. Its catalog is called `memory`. The pipeline's
-`catalog_template` is `warehouse`, so `rocky seed` targets
-`warehouse.seeds.customers` and DuckDB rejects it:
+The command succeeds because the config points DuckDB at a file:
 
 ```
-Seed complete: 0 loaded, 2 failed (5 ms)
-  [FAIL] customers -> warehouse.seeds.customers (0 rows, 0 cols, 0 ms)
-       DDL execution failed for customers: DuckDB error: Binder Error: Catalog "warehouse" does not exist!
-  [FAIL] products -> warehouse.seeds.products (0 rows, 0 cols, 0 ms)
-       DDL execution failed for products: DuckDB error: Binder Error: Catalog "warehouse" does not exist!
-Error: 2 seed(s) failed
+path = "warehouse.duckdb"   ->   the file's catalog is `warehouse`
+catalog_template            ->   `warehouse`   (they match)
 ```
 
-Name a catalog that exists and the load succeeds. One sidecar covers one seed,
-so write one next to each CSV. A sidecar for `customers.csv` alone leaves
-`products.csv` failing, and the command still exits 1.
+A file-backed DuckDB names its catalog after the database file. An adapter
+with no `path` opens an in-memory database whose only catalog is `memory` —
+with the same config, every seed then fails with
+`Catalog "warehouse" does not exist`. A real warehouse uses its own catalog
+names. Match `catalog_template` to whichever you use.
+
+To redirect a single seed, put a `[target]` block in its sidecar. One sidecar
+covers one seed, so write one next to each CSV you want to move:
 
 ```toml
 # seeds/customers.toml
 [target]
-catalog = "memory"
-schema = "seeds"
+catalog = "warehouse"
+schema = "reference"
 ```
 
-```toml
-# seeds/products.toml
-[target]
-catalog = "memory"
-schema = "seeds"
-```
-
-Run the command again:
-
-```
-Seed complete: 2 loaded, 0 failed (5 ms)
-  [OK] customers -> memory.seeds.customers (8 rows, 5 cols, 1 ms)
-  [OK] products -> memory.seeds.products (7 rows, 4 cols, 0 ms)
-```
-
-A file-backed DuckDB names its catalog after the database file, and a real
-warehouse uses its own catalog names. Match the config to whichever you use.
+The first run creates `warehouse.duckdb` next to `rocky.toml`. Delete it to
+start over; git ignores it.
 
 ## Type inference
 

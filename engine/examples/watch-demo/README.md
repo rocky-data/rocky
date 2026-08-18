@@ -10,6 +10,8 @@ watch-demo/
   rocky.toml                   # DuckDB adapter, one replication pipeline
   models/
     orders_summary.rocky       # the model to edit while a watcher runs
+  seeds/
+    raw_orders.csv             # source rows for `rocky run --watch`
     orders_summary.toml        # sidecar: name, strategy, target
 ```
 
@@ -99,7 +101,7 @@ For the model as shipped, that prints:
 
 ```sql
 -- model: orders_summary
-CREATE OR REPLACE TABLE warehouse.analytics.orders_summary AS
+CREATE OR REPLACE TABLE warehouse.main.orders_summary AS
 SELECT status, COUNT() AS order_count, SUM(amount) AS total_revenue
 FROM raw_orders
 GROUP BY status
@@ -110,48 +112,44 @@ Add `--out-dir <dir>` to write one `.sql` file per model instead of printing.
 
 ## `rocky run --watch` — re-run on save
 
+This one does connect to the warehouse, so the source table has to exist
+first. Load it once from the shipped seed:
+
 ```bash
+rocky seed --seeds seeds/
 rocky run --watch --models models/
 ```
 
-This one does connect to the warehouse. It watches `rocky.toml` and the models
-directory, coalesces saves over the same 200 ms window, and re-runs the entire
-pipeline each time. It reloads `rocky.toml` on every pass, so an edit to the
-config takes effect on the next run.
+The seed puts `raw_orders` into `warehouse.main`, where the model's bare
+`FROM raw_orders` resolves. The first run creates `warehouse.duckdb` next to
+`rocky.toml`; git ignores it, and deleting it starts over.
 
-Each pass fails on this example. `rocky.toml` declares a DuckDB adapter with no
-`path`, so Rocky opens an in-memory database. The model targets a `warehouse`
-catalog, which that database does not have. One save produces this:
+The watcher watches `rocky.toml` and the models directory, coalesces saves
+over the same 200 ms window, and re-runs the entire pipeline each time. It
+reloads `rocky.toml` on every pass, so an edit to the config takes effect on
+the next run. One save produces this:
 
 ```
 [watch] watching /path/to/watch-demo/rocky.toml, /path/to/watch-demo/models (Ctrl-C to stop)
-[watch] run failed in 115ms: 1 table(s) failed during parallel execution (run_id: run-20260816-143748-426, use --resume run-20260816-143748-426 to retry)
+[watch] run completed in 118ms
 [watch] detected change: /path/to/watch-demo/models/orders_summary.rocky
-[watch] run failed in 102ms: 1 table(s) failed during parallel execution (run_id: run-20260816-143751-638, use --resume run-20260816-143751-638 to retry)
+[watch] run completed in 104ms
 
 [watch] stopped
 ```
 
-The loop itself is doing its job: it re-ran on the save and stopped on Ctrl-C
-with status 0. The model is what fails, and two things have to change.
-
-Point the config at a catalog the database really has. Until you do, every pass
-stops on `Catalog with name warehouse does not exist!`. Then put a `raw_orders`
-table in that catalog. Without it the next pass stops on
-`Table with name raw_orders does not exist!`.
-
-Change both and each pass prints `[watch] run completed in <n>ms` instead.
-`rocky watch` needs neither change and works as shipped.
+Skip the seed and every pass fails instead:
+`Table with name raw_orders does not exist!`. The loop keeps waiting either
+way — a failing run is reported, not fatal. `rocky watch` needs no seed and
+no warehouse, and works as shipped.
 
 Banner lines go to stderr. With `--output json`, each pass writes one compact
 `RunOutput` object on its own line to stdout, so you can pipe the stream into
 `jq`.
 
-A Ctrl-C that lands between runs stops the watcher at once. A Ctrl-C that lands
-during a run reaches the run first. The watcher stops once that run reports the
-interrupt back to it. On this example every pass fails on its own before it can
-report anything. A mid-run Ctrl-C therefore leaves the watcher waiting, and you
-need a second one.
+A Ctrl-C that lands between runs stops the watcher at once. A Ctrl-C that
+lands during a run reaches the run first, and the watcher stops once that run
+reports the interrupt back to it.
 
 `--watch` is rejected at parse time alongside `--dag`, `--resume`,
 `--resume-latest`, `--idempotency-key`, `--model`, and `--assume-fresh-state`.

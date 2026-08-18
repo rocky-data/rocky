@@ -9,6 +9,11 @@
 
 [adapter.local]
 type = "duckdb"
+# File-backed so the `warehouse` catalog exists: a DuckDB file's catalog is
+# its file stem. In-memory DuckDB only has `memory`, and every
+# `rocky run --watch` pass then failed (#1445). `rocky watch` never opens
+# the adapter and works either way.
+path = "warehouse.duckdb"
 
 [pipeline.watch_demo]
 type = "replication"
@@ -25,7 +30,7 @@ components = ["source"]
 [pipeline.watch_demo.target]
 adapter = "local"
 catalog_template = "warehouse"
-schema_template = "analytics"
+schema_template = "main"
 
 [pipeline.watch_demo.target.governance]
 auto_create_catalogs = false
