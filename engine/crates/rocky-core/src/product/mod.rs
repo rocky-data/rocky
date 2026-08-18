@@ -10,11 +10,14 @@
 //! # Modules
 //!
 //! - [`spec`] — the strict parser and the identity (digest) rules.
+//! - [`lowering`] — the two lowering phases: the contract render and
+//!   the sidecar metadata merge.
 //! - [`manifest`] — the per-run manifest that accounts for every spec
 //!   field, and its mechanized totality check.
 //! - [`toml_compat`] — the order-preserving reader and the byte-stable
 //!   writer the lowered artifacts are rendered through.
 
+pub mod lowering;
 pub mod manifest;
 pub mod spec;
 pub mod toml_compat;
