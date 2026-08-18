@@ -2727,6 +2727,38 @@ pub async fn run(
         )?;
     }
 
+    // ONE source-table read per connector, taken here and reused by BOTH the
+    // collision preflight and the collection loop below.
+    //
+    // They used to call `list_tables` separately. Two reads mean two answers: a
+    // table created between them is absent from the preflight and present at
+    // collection, so a collision it should have caught early is caught by the
+    // in-loop backstop instead — after catalogs, schemas and grants have been
+    // written. Sharing one snapshot removes that window. Every other input the
+    // two use (discovered `conn.tables`, `parsed_filter`, `table_overrides`) is
+    // already shared, so with this they evaluate the same pure conditions over
+    // identical data and cannot disagree.
+    let source_tables_by_schema: HashMap<String, std::collections::HashSet<String>> = {
+        let mut m = HashMap::new();
+        for conn in &connectors {
+            let source_catalog = pipeline.source.catalog.as_deref().unwrap_or("").to_string();
+            let tables: std::collections::HashSet<String> = warehouse_adapter
+                .list_tables(&source_catalog, &conn.schema)
+                .await
+                .map(|v| v.into_iter().map(|t| t.to_lowercase()).collect())
+                .unwrap_or_else(|e| {
+                    warn!(
+                        schema = conn.schema.as_str(),
+                        error = %e,
+                        "failed to list source tables, will process all discovered tables"
+                    );
+                    conn.tables.iter().map(|t| t.name.to_lowercase()).collect()
+                });
+            m.insert(conn.schema.clone(), tables);
+        }
+        m
+    };
+
     // #1461 preflight: refuse a target collision BEFORE any warehouse mutation.
     //
     // The authoritative check still runs at the collection site below, where the
@@ -2754,18 +2786,8 @@ pub async fn run(
             {
                 continue;
             }
-            let source_catalog = pipeline.source.catalog.as_deref().unwrap_or("").to_string();
-            // Same fallback as the collection loop: on a list failure fall back
-            // to the discovered tables so both process the same set. An
-            // `unwrap_or_default()` here would differ when `list_tables`
-            // legitimately returns EMPTY — the loop then skips every table as
-            // missing-from-source, so counting them here would refuse a run the
-            // loop would have skipped.
-            let source_tables: std::collections::HashSet<String> = warehouse_adapter
-                .list_tables(&source_catalog, &conn.schema)
-                .await
-                .map(|v| v.into_iter().map(|t| t.to_lowercase()).collect())
-                .unwrap_or_else(|_| conn.tables.iter().map(|t| t.name.to_lowercase()).collect());
+            let empty = std::collections::HashSet::new();
+            let source_tables = source_tables_by_schema.get(&conn.schema).unwrap_or(&empty);
             let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
             let target_schema = if let Some(cfg) = shadow_config {
                 cfg.schema_override
@@ -3146,23 +3168,21 @@ pub async fn run(
             // Collect tables to process in parallel
             let source_catalog = pipeline.source.catalog.as_deref().unwrap_or("").to_string();
 
-            // Pre-fetch source table list to skip tables that no longer exist
-            // in the source (e.g. Fivetran stopped syncing them). One
+            // Source table list, used to skip tables that no longer exist in the
+            // source (e.g. Fivetran stopped syncing them). One
             // information_schema query per schema avoids N wasted DESCRIBE +
             // CTAS round-trips for stale tables.
-            // Use the generic WarehouseAdapter::list_tables (Plan 02 trait method)
-            let source_tables: std::collections::HashSet<String> = warehouse_adapter
-                .list_tables(&source_catalog, &conn.schema)
-                .await
-                .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect())
-                .unwrap_or_else(|e| {
-                    warn!(
-                        schema = conn.schema.as_str(),
-                        error = %e,
-                        "failed to list source tables, will process all discovered tables"
-                    );
-                    conn.tables.iter().map(|t| t.name.to_lowercase()).collect()
-                });
+            //
+            // Taken from the ONE snapshot read before the collision preflight,
+            // not re-read here. A second read could return a different set, and
+            // a table appearing between the two would be absent from the
+            // preflight and present here — so the collision would be caught by
+            // the backstop below, after catalogs, schemas and grants had already
+            // been written.
+            let empty_source_tables = std::collections::HashSet::new();
+            let source_tables = source_tables_by_schema
+                .get(&conn.schema)
+                .unwrap_or(&empty_source_tables);
 
             let mut skipped_source_missing = 0usize;
             for table in &conn.tables {
@@ -12913,6 +12933,34 @@ mod tests {
     // the `Succeeded` assertion fails because the entry is still
     // `InFlight`.
     // -----------------------------------------------------------------------
+    /// #1461 follow-up: the collision preflight and the collection loop must
+    /// read the source table list ONCE, not twice.
+    ///
+    /// Two reads mean two answers. A table created between them is absent from
+    /// the preflight and present at collection, so a collision the preflight
+    /// exists to catch early is caught by the in-loop backstop instead — after
+    /// catalogs, schemas and grants have been written. That is the failure the
+    /// preflight was added to prevent, reachable through a race.
+    ///
+    /// A source-property assertion, because the invariant IS structural: there
+    /// is no runtime observation that distinguishes "read once and shared" from
+    /// "read twice and happened to agree". Reintroducing a second call is the
+    /// regression, and only counting the calls catches it.
+    #[test]
+    fn the_replication_path_reads_source_tables_exactly_once() {
+        let src = include_str!("run.rs");
+        // Built from parts so this test's own source does not match the needle
+        // it counts.
+        let needle = format!(".{}(&source_catalog, &conn.schema)", "list_tables");
+        let calls = src.matches(needle.as_str()).count();
+        assert_eq!(
+            calls, 1,
+            "the replication path must read source tables once and share the \
+             snapshot; {calls} call sites found. A second read reopens the \
+             window where the preflight and the collection loop disagree."
+        );
+    }
+
     /// #1460: the reviewed source state must be re-checked where the work is
     /// BUILT, not only in the apply path before `run` is called.
     ///
