@@ -3641,7 +3641,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Docs {
             models,
             output_path,
-        } => rocky_cli::commands::run_docs(&cli.config, &models, &output_path, json),
+        } => rocky_cli::commands::run_docs(&cli.config, &models, &output_path, &state_path, json),
         Command::State { action } => match action {
             None | Some(StateAction::Show) => rocky_cli::commands::state_show(&state_path, json),
             Some(StateAction::ClearSchemaCache { dry_run }) => {
