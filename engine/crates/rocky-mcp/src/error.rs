@@ -283,3 +283,93 @@ impl ToolError {
         Self::wrap(ToolErrorCode::Internal, message, hint)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FF-WP1 fix round 2 (item 4) — the wire contract of the recorded-plan
+    /// handoff, pinned at the SCHEMA level: `plan_id` / `product_id` /
+    /// `spec_digest` are FLAT optional properties of the `ToolError`
+    /// envelope, not nested under a `recorded_plan` struct key. The
+    /// `#[serde(flatten)]` on `Option<Box<RecordedPlanHandoff>>` is what a
+    /// fulfillment runner's field access depends on; this test fails if a
+    /// refactor un-flattens it (schemars derives from the same serde
+    /// attributes the wire serialization uses).
+    #[test]
+    fn recorded_plan_handoff_fields_are_flat_optional_properties() {
+        let schema = schemars::schema_for!(ToolError);
+        let schema = serde_json::to_value(&schema).expect("schema serializes");
+
+        let properties = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .unwrap_or_else(|| panic!("ToolError schema has top-level properties: {schema:#}"));
+        for field in ["plan_id", "product_id", "spec_digest"] {
+            assert!(
+                properties.contains_key(field),
+                "`{field}` must be a FLAT top-level property of the ToolError schema; \
+                 got properties {:?} in {schema:#}",
+                properties.keys().collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            !properties.contains_key("recorded_plan"),
+            "the handoff must be flattened — `recorded_plan` may not appear as a struct key: \
+             {schema:#}"
+        );
+
+        // Optional means: never in `required`. The envelope's own three
+        // always-present fields are, which proves `required` is populated and
+        // the absence below is meaningful.
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for field in ["code", "message", "remediation_hint"] {
+            assert!(
+                required.contains(&field),
+                "`{field}` is an always-present envelope field; required = {required:?}"
+            );
+        }
+        for field in ["plan_id", "product_id", "spec_digest", "policy_rule"] {
+            assert!(
+                !required.contains(&field),
+                "`{field}` must stay OPTIONAL on the wire; required = {required:?}"
+            );
+        }
+    }
+
+    /// The serialized VALUE agrees with the schema pin above: a
+    /// `policy_review_required_for_plan` envelope carries the three handoff
+    /// fields flat, and a plain envelope carries none of them.
+    #[test]
+    fn recorded_plan_handoff_serializes_flat() {
+        let err = ToolError::policy_review_required_for_plan(
+            "m",
+            "h",
+            Some("0".to_string()),
+            "abc123",
+            Some("product:x".to_string()),
+            Some("sha256:abc".to_string()),
+        );
+        let value = serde_json::to_value(&err.0).expect("serializes");
+        assert_eq!(value["plan_id"], serde_json::json!("abc123"));
+        assert_eq!(value["product_id"], serde_json::json!("product:x"));
+        assert_eq!(value["spec_digest"], serde_json::json!("sha256:abc"));
+        assert!(
+            value.get("recorded_plan").is_none(),
+            "no nested struct key on the wire: {value:#}"
+        );
+
+        let plain = ToolError::internal("m", "h");
+        let value = serde_json::to_value(&plain.0).expect("serializes");
+        for field in ["plan_id", "product_id", "spec_digest"] {
+            assert!(
+                value.get(field).is_none(),
+                "`{field}` is absent (not null) on a plain envelope: {value:#}"
+            );
+        }
+    }
+}
