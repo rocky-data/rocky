@@ -13,6 +13,16 @@ A real answer names the weakest assumption, the stale justification, or the hidd
 
 These questions are also red-team bait, deliberately. Give every substantive analysis or plan, plus these two answers, to an independent red team — a genuinely different model, never the authoring model or a same-model agent — because an independent model is better placed than the author to see what's missing. Substantive means it can change behavior, a decision, or standing policy; a small or docs-only diff never exempts a change, only mechanical, behavior-neutral corrections are exempt. Name the reviewer and address or rebut its findings on the record; that disposition closes the loop (the red-team pass itself doesn't recurse). If no independent red team is available, say so in the output rather than skipping silently. Code changes additionally follow the [`AGENT_REVIEW.md`](AGENT_REVIEW.md) adversarial-review profile.
 
+## How agents communicate
+
+Write for a person who is busy. These rules apply to chat replies, PR descriptions, and reports. For public documentation pages, [`docs/STYLE.md`](docs/STYLE.md) is the full contract.
+
+- Lead with the outcome. One to three short lines. Detail comes after, and only if it changes a decision.
+- Short sentences. One idea per sentence. Aim for under 25 words.
+- No jargon. If a technical term must appear, explain it in plain words the first time.
+- Draw flows, orders, and state changes as ASCII diagrams. Delete the prose the diagram replaces.
+- Keep code, commands, flags, paths, and error codes exact. Never simplify those. A shorter sentence that loses a condition is a defect.
+
 ## Subprojects
 
 | Path | Language | What it is |
