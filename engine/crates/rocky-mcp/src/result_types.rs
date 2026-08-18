@@ -327,6 +327,15 @@ pub struct ProposeResult {
     pub plan_id: String,
     /// The models this plan would materialize.
     pub models: Vec<String>,
+    /// Product identity the plan is bound to, echoed verbatim when the
+    /// propose carried one. A product-bound plan refuses a bare
+    /// `rocky apply` — the applier must pass `--expect-spec-digest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// Approved-spec digest the plan is bound to, echoed verbatim when the
+    /// propose carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
 }
 
 /// `draft_model` result — the draft was written to the working tree and

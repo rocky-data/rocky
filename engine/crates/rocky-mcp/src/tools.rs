@@ -118,6 +118,25 @@ pub struct ProposeArgs {
     /// Single model to materialize. When unset, the plan covers every model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Product identity this plan fulfils (e.g. `"product:revenue_daily"`).
+    /// Opaque to the engine — carried in the hashed plan payload and echoed
+    /// back; never parsed. Must be set together with `spec_digest` or not at
+    /// all. A plan carrying it refuses a bare `rocky apply` — the applier
+    /// must pass `--expect-spec-digest`.
+    #[serde(default)]
+    pub product_id: Option<String>,
+    /// Digest of the approved product spec this plan was authored against
+    /// (e.g. `"sha256:<hex>"`). Opaque to the engine. Must be set together
+    /// with `product_id` or not at all.
+    #[serde(default)]
+    pub spec_digest: Option<String>,
+    /// Caller-supplied idempotency key threaded into the plan payload so a
+    /// re-apply of the same key dedups. When absent and the product fields
+    /// are present, the engine derives `"<product_id>@<spec_digest>"` — note
+    /// that derived key aliases every attempt for the same spec revision, so
+    /// a runner that re-proposes should supply its own per-attempt key.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -2393,9 +2412,33 @@ impl RockyMcpServer {
         description = "Propose materializing the model(s) as an AI-AUTHORED plan. This does NOT \
          execute anything. It records a plan that a human must review and approve \
          (`rocky review <plan_id> --approve`) before `rocky apply <plan_id>` will run it. Surface \
-         the plan_id and the review/apply path to the user; never approve on their behalf."
+         the plan_id and the review/apply path to the user; never approve on their behalf. \
+         Optionally binds the plan to a product identity (`product_id` + `spec_digest`, both or \
+         neither): a product-bound plan additionally refuses a bare apply — the applier must pass \
+         `rocky apply --expect-spec-digest <digest>`."
     )]
     async fn propose(&self, params: Parameters<ProposeArgs>) -> ToolResult<ProposeResult> {
+        let args = params.0;
+        // Product identity is all-or-nothing: exactly one of the pair is a
+        // caller bug, and an empty string is not an identity. Validated before
+        // any compile work so the refusal is immediate and structured.
+        match (args.product_id.as_deref(), args.spec_digest.as_deref()) {
+            (Some(p), _) | (_, Some(p)) if p.trim().is_empty() => {
+                return Err(ToolError::invalid_argument(
+                    "product_id / spec_digest must be non-empty when present",
+                    "Pass both fields with real values (e.g. product_id = \
+                     \"product:revenue_daily\", spec_digest = \"sha256:<hex>\"), or omit both.",
+                ));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ToolError::invalid_argument(
+                    "product_id and spec_digest must be set together or not at all",
+                    "Pass both fields (the plan binds to a product AND its approved spec \
+                     revision), or omit both for a non-product plan.",
+                ));
+            }
+            _ => {}
+        }
         let result = self
             .compile_full()
             .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
@@ -2413,13 +2456,29 @@ impl RockyMcpServer {
 
         // If a model filter was given, assert it exists so we don't write a
         // plan that applies to nothing.
-        if let Some(model) = params.0.model.as_deref()
+        if let Some(model) = args.model.as_deref()
             && !models.iter().any(|m| m == model)
         {
             return Err(ToolError::model_not_found(model));
         }
 
-        let run_plan = build_ai_run_plan(params.0.model.clone(), &result);
+        // Runner-supplied idempotency key wins; when the product pair is
+        // present and no key was supplied, derive the documented
+        // attempt-aliasing fallback so a product propose never bypasses dedup
+        // (`None` would — the run path skips dedup entirely without a key).
+        let idempotency_key = args.idempotency_key.clone().or_else(|| {
+            args.product_id
+                .as_deref()
+                .zip(args.spec_digest.as_deref())
+                .map(|(p, s)| format!("{p}@{s}"))
+        });
+        let run_plan = build_ai_run_plan(
+            args.model.clone(),
+            &result,
+            args.product_id.clone(),
+            args.spec_digest.clone(),
+            idempotency_key,
+        );
 
         // The `propose` tool is the sole MCP writer of plans; it always authors
         // an AI-authored plan and therefore always acts as the `agent`
@@ -2557,7 +2616,12 @@ impl RockyMcpServer {
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 let plan_id = write_plan()?;
-                Ok(Json(ProposeResult { plan_id, models }))
+                Ok(Json(ProposeResult {
+                    plan_id,
+                    models,
+                    product_id: args.product_id,
+                    spec_digest: args.spec_digest,
+                }))
             }
             rocky_cli::commands::PolicyGate::RequireReview {
                 model,
@@ -3777,7 +3841,18 @@ fn render_cell(v: serde_json::Value) -> String {
 /// inline (the `rocky plan` builder is private + entangled with discovery);
 /// every field is set explicitly so a future field addition is a compile error
 /// rather than a silent default.
-fn build_ai_run_plan(model: Option<String>, result: &CompilerResult) -> rocky_cli::output::RunPlan {
+///
+/// `product_id` / `spec_digest` are the opaque product identity the propose
+/// carried (validated both-or-neither by the caller); `idempotency_key` is the
+/// already-resolved key (runner-supplied, or the derived
+/// `"<product_id>@<spec_digest>"` fallback).
+fn build_ai_run_plan(
+    model: Option<String>,
+    result: &CompilerResult,
+    product_id: Option<String>,
+    spec_digest: Option<String>,
+    idempotency_key: Option<String>,
+) -> rocky_cli::output::RunPlan {
     let models: Vec<String> = result
         .project
         .models
@@ -3806,12 +3881,12 @@ fn build_ai_run_plan(model: Option<String>, result: &CompilerResult) -> rocky_cl
         shadow_suffix: None,
         shadow_schema: None,
         dag: false,
-        idempotency_key: None,
+        idempotency_key,
         governance_override: None,
         models,
         execution_layers,
-        product_id: None,
-        spec_digest: None,
+        product_id,
+        spec_digest,
     }
 }
 

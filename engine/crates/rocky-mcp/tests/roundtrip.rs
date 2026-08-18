@@ -238,6 +238,160 @@ async fn propose_writes_ai_authored_plan() {
     client.cancel().await.unwrap();
 }
 
+/// FF-WP1: a propose carrying the product pair binds the identity into the
+/// hashed plan payload, derives the documented idempotency-key fallback, gets
+/// a DIFFERENT plan_id than the identical propose without the pair, and echoes
+/// the pair in the result.
+#[tokio::test]
+async fn propose_with_product_fields_binds_identity_and_derives_key() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Baseline: a bare propose (no product identity).
+    let bare = client
+        .call_tool(CallToolRequestParams::new("propose"))
+        .await
+        .expect("bare propose");
+    let bare_plan_id = bare.structured_content.expect("result")["plan_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Product-bound propose.
+    let args = serde_json::json!({
+        "product_id": "product:revenue_daily",
+        "spec_digest": "sha256:abc123",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let bound = client
+        .call_tool(CallToolRequestParams::new("propose").with_arguments(args))
+        .await
+        .expect("product propose");
+    assert_ne!(bound.is_error, Some(true), "product propose succeeds");
+    let sc = bound.structured_content.expect("structured content");
+    let plan_id = sc["plan_id"].as_str().unwrap();
+    assert_ne!(
+        plan_id, bare_plan_id,
+        "the product identity is part of the hashed payload, so the id moves"
+    );
+    assert_eq!(sc["product_id"], serde_json::json!("product:revenue_daily"));
+    assert_eq!(sc["spec_digest"], serde_json::json!("sha256:abc123"));
+
+    // The persisted payload carries the pair + the derived idempotency key.
+    let plan_path = dir
+        .path()
+        .join(".rocky")
+        .join("plans")
+        .join(format!("{plan_id}.json"));
+    let plan: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&plan_path).unwrap()).unwrap();
+    assert_eq!(
+        plan["payload"]["product_id"],
+        serde_json::json!("product:revenue_daily")
+    );
+    assert_eq!(
+        plan["payload"]["spec_digest"],
+        serde_json::json!("sha256:abc123")
+    );
+    assert_eq!(
+        plan["payload"]["idempotency_key"],
+        serde_json::json!("product:revenue_daily@sha256:abc123"),
+        "absent a runner key, the engine derives the attempt-aliasing fallback"
+    );
+    // The bare plan carries none of them.
+    let bare_path = dir
+        .path()
+        .join(".rocky")
+        .join("plans")
+        .join(format!("{bare_plan_id}.json"));
+    let bare_plan: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bare_path).unwrap()).unwrap();
+    assert!(bare_plan["payload"].get("product_id").is_none());
+    assert!(bare_plan["payload"].get("idempotency_key").is_none());
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1: a runner-supplied idempotency key WINS over the derived fallback.
+#[tokio::test]
+async fn propose_runner_supplied_idempotency_key_wins() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({
+        "product_id": "product:revenue_daily",
+        "spec_digest": "sha256:abc123",
+        "idempotency_key": "product:revenue_daily@sha256:abc123@seq-7",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("propose").with_arguments(args))
+        .await
+        .expect("propose");
+    let plan_id = res.structured_content.expect("result")["plan_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plan: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            dir.path()
+                .join(".rocky")
+                .join("plans")
+                .join(format!("{plan_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        plan["payload"]["idempotency_key"],
+        serde_json::json!("product:revenue_daily@sha256:abc123@seq-7"),
+        "the runner's per-attempt key must not be replaced by the derived fallback"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1 ⟦RTL-4⟧: exactly one product field (or an empty one) is an
+/// `invalid_argument` refusal, and no plan is written.
+#[tokio::test]
+async fn propose_with_partial_product_identity_is_refused() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    for args in [
+        serde_json::json!({ "product_id": "product:revenue_daily" }),
+        serde_json::json!({ "spec_digest": "sha256:abc123" }),
+        serde_json::json!({ "product_id": "  ", "spec_digest": "sha256:abc123" }),
+    ] {
+        let res = client
+            .call_tool(
+                CallToolRequestParams::new("propose")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await
+            .expect("refusal is a tool result, not a transport error");
+        assert_eq!(res.is_error, Some(true), "partial identity must refuse");
+        let err = res.structured_content.expect("structured envelope");
+        assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    }
+    assert!(
+        plan_files(dir.path()).is_empty(),
+        "a refused propose must not write a plan file"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 /// Like [`write_project`] but appends a `[policy]` block so the `propose`
 /// agent-policy gate is exercised. The single `orders` model is unclassified
 /// and uncontracted, so an `{ any = true }` rule is the deterministic lever.
