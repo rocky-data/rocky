@@ -10,9 +10,10 @@ watch-demo/
   rocky.toml                   # DuckDB adapter, one replication pipeline
   models/
     orders_summary.rocky       # the model to edit while a watcher runs
+    orders_summary.toml        # sidecar: name, strategy, target
   seeds/
     raw_orders.csv             # source rows for `rocky run --watch`
-    orders_summary.toml        # sidecar: name, strategy, target
+    raw_orders.toml            # sidecar: land the seed in schema `main`
 ```
 
 ## `rocky watch` — recompile on save
@@ -22,8 +23,9 @@ cd engine/examples/watch-demo
 rocky watch --models models/
 ```
 
-`rocky watch` never opens `rocky.toml` and never connects to a warehouse. It
-works on a project that has no adapter configured at all.
+`rocky watch` never uses the adapter and never connects to a warehouse. It
+works on a project that has no adapter configured at all. (The CLI still
+reads `rocky.toml` once at startup, to namespace the state store.)
 
 ```
      start
