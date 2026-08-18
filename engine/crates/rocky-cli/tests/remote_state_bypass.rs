@@ -957,8 +957,21 @@ fn backfill_fixture_with(model_sql: &str, with_policy: bool) -> (ModelProject, S
     .expect("persist backfill plan");
     let marker = root.join(".rocky").join("plans");
     std::fs::create_dir_all(&marker).expect("plans dir");
-    std::fs::write(marker.join(format!("{plan_id}.reviewed.json")), "{}")
-        .expect("write review marker");
+    // A WELL-FORMED marker naming the plan: the apply gate parses and
+    // matches the marker (FF-WP1), so a bare `{}` no longer approves.
+    std::fs::write(
+        marker.join(format!("{plan_id}.reviewed.json")),
+        format!(
+            r#"{{
+  "plan_id": "{plan_id}",
+  "reviewed_at": "2026-08-18T00:00:00Z",
+  "base_ref": "HEAD",
+  "breaking_change_count": 0,
+  "approver": {{ "email": "dev@example.com", "host": "localhost", "source": "local" }}
+}}"#
+        ),
+    )
+    .expect("write review marker");
     (project, plan_id)
 }
 

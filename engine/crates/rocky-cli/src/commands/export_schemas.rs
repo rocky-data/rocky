@@ -31,9 +31,9 @@ use crate::output::{
     PreviewCostOutput, PreviewCreateOutput, PreviewDiffOutput, PreviewRowsOutput, ProfileOutput,
     ProfileStorageOutput, PromotePlan, RecipeHistoryOutput, ReplayCheckOutput, ReplayExecuteOutput,
     ReplayOutput, RestoreApplyOutput, RestorePlanOutput, RetentionStatusOutput,
-    RetentionSweepOutput, ReviewOutput, ReviewQueueOutput, RunOutput, ScheduleHoldOutput,
-    ScheduleStatusOutput, SeedOutput, StateOutput, TestAdapterOutput, TestOutput, TickOutput,
-    TraceOutput, ValidateMigrationOutput, ValidateOutput,
+    RetentionSweepOutput, ReviewOutput, ReviewQueueOutput, ReviewStatusOutput, RunOutput,
+    ScheduleHoldOutput, ScheduleStatusOutput, SeedOutput, StateOutput, TestAdapterOutput,
+    TestOutput, TickOutput, TraceOutput, ValidateMigrationOutput, ValidateOutput,
 };
 
 /// Top-level command output types currently covered by schemars.
@@ -137,6 +137,7 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<RetentionSweepOutput>("state_retention_sweep"),
         entry::<ReviewOutput>("review"),
         entry::<ReviewQueueOutput>("review_queue"),
+        entry::<ReviewStatusOutput>("review_status"),
         entry::<PolicyCheckOutput>("policy_check"),
         entry::<PolicyTestOutput>("policy_test"),
         entry::<PolicyFreezeOutput>("policy_freeze"),

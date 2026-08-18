@@ -3010,9 +3010,7 @@ auto_create_schemas = true
         }
 
         // Write the review marker (as `rocky review --approve` would) → proceed.
-        let marker = crate::commands::apply::review_marker_path(dir.path(), &plan_id);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "{}").unwrap();
+        crate::commands::review::write_test_review_marker(dir.path(), &plan_id);
         run_gc_apply_in_with(
             dir.path(),
             &config,
@@ -3057,9 +3055,7 @@ auto_create_schemas = true
         std::fs::write(&config, "[state]\nbackend = \"s3\"\n").unwrap();
 
         // Satisfy the unconditional review gate so we reach the sync seam.
-        let marker = crate::commands::apply::review_marker_path(dir.path(), &plan_id);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "{}").unwrap();
+        crate::commands::review::write_test_review_marker(dir.path(), &plan_id);
 
         let oracle: std::sync::Arc<dyn LivenessOracle> =
             std::sync::Arc::new(FixedLivenessOracle::reclaimable());
@@ -3764,9 +3760,7 @@ auto_create_schemas = true
         };
         // Approve the plan so the review gate passes and we reach the config
         // check (proving the error is the physical_delete gate, not review).
-        let marker = crate::commands::apply::review_marker_path(dir.path(), &plan_id);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "{}").unwrap();
+        crate::commands::review::write_test_review_marker(dir.path(), &plan_id);
 
         let config = dir.path().join("rocky.toml");
         std::fs::write(&config, "[gc]\nphysical_delete = true\n").unwrap();
@@ -3811,9 +3805,7 @@ auto_create_schemas = true
             write_plan_with_principal(dir.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
                 .unwrap()
         };
-        let marker = crate::commands::apply::review_marker_path(dir.path(), &plan_id);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "{}").unwrap();
+        crate::commands::review::write_test_review_marker(dir.path(), &plan_id);
 
         // An unknown key under `[gc]` → deny_unknown_fields deserialization
         // error. Pre-fix, `unwrap_or(false)` swallowed this and continued as if
@@ -4084,9 +4076,7 @@ auto_create_schemas = true
             write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
                 .unwrap()
         };
-        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "{}").unwrap();
+        crate::commands::review::write_test_review_marker(root.path(), &plan_id);
 
         // Publish G0 (candidate present, no winner rows yet).
         rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
@@ -4175,9 +4165,7 @@ auto_create_schemas = true
             write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
                 .unwrap()
         };
-        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "{}").unwrap();
+        crate::commands::review::write_test_review_marker(root.path(), &plan_id);
         rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
             .await
             .unwrap();
@@ -4245,9 +4233,7 @@ auto_create_schemas = true
             write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
                 .unwrap()
         };
-        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "{}").unwrap();
+        crate::commands::review::write_test_review_marker(root.path(), &plan_id);
         rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
             .await
             .unwrap();
@@ -4492,9 +4478,7 @@ auto_create_schemas = true
             write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
                 .unwrap()
         };
-        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "{}").unwrap();
+        crate::commands::review::write_test_review_marker(root.path(), &plan_id);
         rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
             .await
             .unwrap();
@@ -4607,9 +4591,7 @@ auto_create_schemas = true
             write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
                 .unwrap()
         };
-        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "{}").unwrap();
+        crate::commands::review::write_test_review_marker(root.path(), &plan_id);
         rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
             .await
             .unwrap();
@@ -4703,9 +4685,7 @@ auto_create_schemas = true
             write_plan_with_principal(root.path(), PlanKind::Gc, &plan, PolicyPrincipal::Human)
                 .unwrap()
         };
-        let marker = crate::commands::apply::review_marker_path(root.path(), &plan_id);
-        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        std::fs::write(&marker, "{}").unwrap();
+        crate::commands::review::write_test_review_marker(root.path(), &plan_id);
         rocky_core::state_sync::upload_state(&harness.pod_b.cfg, &harness.pod_b.state_path)
             .await
             .unwrap();

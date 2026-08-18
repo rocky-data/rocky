@@ -165,7 +165,10 @@ pub use publish_ir::run_publish_ir;
 pub use replay::{run_replay, run_replay_check, run_replay_execute, run_replay_execute_warehouse};
 pub use restore::run_restore_plan;
 pub use retention_status::run_retention_status;
-pub use review::{compute_review, compute_review_queue, run_review, run_review_queue};
+pub use review::{
+    compute_review, compute_review_queue, compute_review_status, run_review, run_review_queue,
+    run_review_status,
+};
 pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.

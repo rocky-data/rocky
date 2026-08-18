@@ -479,6 +479,12 @@ enum Command {
         /// List the pending-review queue instead of reviewing a single plan.
         #[arg(long)]
         queue: bool,
+        /// Report the plan's review state (typed, read-only): whether a
+        /// well-formed sign-off marker naming it exists, who approved it and
+        /// when, and its product binding. A malformed or mismatched marker
+        /// is an error, never a status.
+        #[arg(long, conflicts_with_all = ["approve", "queue"])]
+        status: bool,
         /// Models directory used to rank the queue by downstream blast radius.
         #[arg(long, default_value = "models")]
         models: PathBuf,
@@ -3049,10 +3055,16 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             base,
             approve,
             queue,
+            status,
             models,
         } => {
             if queue {
                 rocky_cli::commands::run_review_queue(&cli.config, &state_path, &models, json)
+            } else if status {
+                let Some(plan_id) = plan_id else {
+                    anyhow::bail!("`rocky review --status` needs a <plan-id>");
+                };
+                rocky_cli::commands::run_review_status(&cli.config, &plan_id, json)
             } else {
                 let Some(plan_id) = plan_id else {
                     anyhow::bail!(
@@ -4779,6 +4791,44 @@ mod tests {
                 expect_spec_digest, ..
             } => assert_eq!(expect_spec_digest, None),
             _ => panic!("expected Apply subcommand"),
+        }
+    }
+
+    /// FF-WP1: `rocky review --status` parses by its literal flag name, and
+    /// clap rejects combining it with `--approve` / `--queue`.
+    #[test]
+    fn review_status_flag_parses_and_conflicts() {
+        let cli = try_parse_with_big_stack(&["rocky", "review", "abc123", "--status"]);
+        match cli.command {
+            Command::Review {
+                plan_id,
+                status,
+                approve,
+                queue,
+                ..
+            } => {
+                assert_eq!(plan_id.as_deref(), Some("abc123"));
+                assert!(status);
+                assert!(!approve);
+                assert!(!queue);
+            }
+            _ => panic!("expected Review subcommand"),
+        }
+
+        for conflicting in [
+            vec!["rocky", "review", "abc123", "--status", "--approve"],
+            vec!["rocky", "review", "--status", "--queue"],
+        ] {
+            let parsed = std::thread::scope(|s| {
+                let owned: Vec<String> = conflicting.iter().map(|s| s.to_string()).collect();
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn_scoped(s, move || Cli::try_parse_from(&owned).is_ok())
+                    .expect("spawn parser thread")
+                    .join()
+                    .expect("parser thread panicked")
+            });
+            assert!(!parsed, "{conflicting:?} must be a clap conflict");
         }
     }
 

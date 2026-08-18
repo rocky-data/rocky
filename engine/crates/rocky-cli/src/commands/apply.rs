@@ -878,18 +878,40 @@ async fn execute_run_plan(
 /// Path to the review marker for an AI-authored plan:
 /// `<root>/.rocky/plans/<plan_id>.reviewed.json`.
 ///
-/// The marker is written by `rocky review <plan-id> --approve` and is the
-/// human sign-off that unblocks `rocky apply` for an AI-authored plan. Its
-/// presence (not its contents) is what the apply gate checks.
+/// The marker is written by `rocky review <plan-id> --approve` (staged
+/// tmp-then-rename) and is the human sign-off that unblocks `rocky apply`
+/// for an AI-authored plan. The gate checks its CONTENTS, not just its
+/// presence — see [`ai_plan_is_reviewed`].
 pub(crate) fn review_marker_path(root: &Path, plan_id: &str) -> std::path::PathBuf {
     root.join(".rocky")
         .join("plans")
         .join(format!("{plan_id}.reviewed.json"))
 }
 
-/// True when an approved review marker exists for `plan_id` under `root`.
+/// True when a WELL-FORMED review marker naming exactly `plan_id` exists
+/// under `root` — parse-and-match, not existence: a truncated, malformed, or
+/// mispasted marker (one approving a different plan) never counts as
+/// reviewed. The apply gates additionally distinguish that invalid state
+/// with its own refusal via [`super::review::review_marker_state`].
 pub(crate) fn ai_plan_is_reviewed(root: &Path, plan_id: &str) -> bool {
-    review_marker_path(root, plan_id).exists()
+    matches!(
+        super::review::review_marker_state(root, plan_id),
+        super::review::ReviewMarkerState::Approved(_)
+    )
+}
+
+/// The distinct refusal for a marker that exists but does not approve —
+/// malformed bytes, or a marker naming a different plan. Kept apart from the
+/// "has not been reviewed" message so an operator whose approval was
+/// truncated or mispasted is told the marker is broken, not that they never
+/// approved.
+fn invalid_review_marker_error(plan_id: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refusing to apply plan '{plan_id}': its review marker is INVALID — {reason}. A \
+         truncated or mispasted marker never approves. Re-approve with \
+         `rocky review {plan_id} --approve` to rewrite the marker atomically, then re-run \
+         `rocky apply {plan_id}`."
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2777,10 +2799,12 @@ pub(crate) fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) ->
             model,
             rule_id,
             reason,
-        } => {
-            if ai_plan_is_reviewed(root, plan_id) {
-                Ok(())
-            } else {
+        } => match super::review::review_marker_state(root, plan_id) {
+            super::review::ReviewMarkerState::Approved(_) => Ok(()),
+            super::review::ReviewMarkerState::Invalid { reason } => {
+                Err(invalid_review_marker_error(plan_id, &reason))
+            }
+            super::review::ReviewMarkerState::Absent => {
                 let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
                 bail!(
                     "policy requires human review for plan '{plan_id}': model '{model}'{rule} \
@@ -2789,7 +2813,7 @@ pub(crate) fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) ->
                      then re-run `rocky apply {plan_id}`."
                 )
             }
-        }
+        },
         PolicyGate::Deny {
             model,
             rule_id,
@@ -3114,14 +3138,25 @@ async fn run_apply_ai_authored_plan(
     // The marker check then runs unconditionally, catching the case policy lets
     // through: `Allow` (and `NotConfigured`) return `Ok(())` without consulting
     // the marker. Policy can therefore only TIGHTEN this gate, never waive it.
+    //
+    // The check is `review_marker_state`, not a bare existence probe: a marker
+    // that exists but does not parse, or names a different plan, REFUSES with
+    // its own error instead of approving — a truncated or mispasted marker
+    // must never stand in for a human sign-off.
     apply_policy_gate(root, plan_id, gate)?;
-    if !ai_plan_is_reviewed(root, plan_id) {
-        bail!(
-            "AI-authored plan '{plan_id}' has not been reviewed and approved. \
-             An AI agent authored this change, so it cannot be applied directly. \
-             Review the breaking-change report and approve it first with \
-             `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
-        );
+    match super::review::review_marker_state(root, plan_id) {
+        super::review::ReviewMarkerState::Approved(_) => {}
+        super::review::ReviewMarkerState::Invalid { reason } => {
+            return Err(invalid_review_marker_error(plan_id, &reason));
+        }
+        super::review::ReviewMarkerState::Absent => {
+            bail!(
+                "AI-authored plan '{plan_id}' has not been reviewed and approved. \
+                 An AI agent authored this change, so it cannot be applied directly. \
+                 Review the breaking-change report and approve it first with \
+                 `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
+            );
+        }
     }
 
     // Resolve the post-apply verification checks before the run plan is moved.
@@ -3244,14 +3279,18 @@ async fn run_apply_backfill_plan(
         .context("failed to deserialize backfill plan payload")?;
 
     // HARD RULE: a backfill is always review-gated, regardless of policy.
-    if !ai_plan_is_reviewed(root, plan_id) {
-        bail!(
+    match super::review::review_marker_state(root, plan_id) {
+        super::review::ReviewMarkerState::Approved(_) => {}
+        super::review::ReviewMarkerState::Invalid { reason } => {
+            return Err(invalid_review_marker_error(plan_id, &reason));
+        }
+        super::review::ReviewMarkerState::Absent => bail!(
             "backfill plan '{plan_id}' has not been reviewed and approved. \
              A backfill re-runs recipes over a scoped window and can hide blast \
              radius, so it always requires a human sign-off — a permissive policy \
              does not waive it. Review the scope and approve it with \
              `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
-        );
+        ),
     }
 
     // Policy can only tighten the gate: a `deny` hard-refuses even a reviewed
@@ -4879,13 +4918,102 @@ mod tests {
             "fresh AI-authored plan must not count as reviewed"
         );
 
-        // Write the marker (what `rocky review --approve` does) → reviewed.
+        // FF-WP1 parse-and-match: an empty/truncated marker file no longer
+        // counts as reviewed — existence alone stopped being an approval.
         let marker = super::review_marker_path(dir.path(), &plan_id);
         std::fs::create_dir_all(marker.parent().unwrap())?;
         std::fs::write(&marker, b"{}")?;
         assert!(
+            !super::ai_plan_is_reviewed(dir.path(), &plan_id),
+            "a marker that does not parse as a ReviewMarker must not approve"
+        );
+
+        // A well-formed marker naming THIS plan (what `rocky review --approve`
+        // writes) → reviewed.
+        std::fs::write(&marker, well_formed_marker_json(&plan_id))?;
+        assert!(
             super::ai_plan_is_reviewed(dir.path(), &plan_id),
-            "AI-authored plan with a marker present must count as reviewed"
+            "a well-formed matching marker must count as reviewed"
+        );
+
+        // The same well-formed marker naming a DIFFERENT plan → not reviewed.
+        std::fs::write(&marker, well_formed_marker_json(&"9".repeat(64)))?;
+        assert!(
+            !super::ai_plan_is_reviewed(dir.path(), &plan_id),
+            "a marker approving a different plan must not approve this one"
+        );
+        Ok(())
+    }
+
+    /// The exact byte shape `rocky review --approve` persists, for tests that
+    /// need a valid marker naming `plan_id` (the `ReviewMarker` type itself is
+    /// module-private to `review.rs` on purpose).
+    fn well_formed_marker_json(plan_id: &str) -> String {
+        format!(
+            r#"{{
+  "plan_id": "{plan_id}",
+  "reviewed_at": "2026-08-18T00:00:00Z",
+  "base_ref": "HEAD",
+  "breaking_change_count": 0,
+  "approver": {{ "email": "dev@example.com", "host": "localhost", "source": "local" }}
+}}"#
+        )
+    }
+
+    /// FF-WP1 ⟦RTL-6⟧: an INVALID marker (malformed or mismatched) refuses
+    /// the apply with its own distinct error — not the "has not been
+    /// reviewed" message — so a truncated or mispasted approval is surfaced
+    /// as marker corruption rather than as a missing review.
+    #[tokio::test]
+    async fn ai_authored_apply_with_invalid_marker_is_refused_distinctly() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rp = minimal_run_plan();
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter.db]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n",
+        )?;
+        let marker = super::review_marker_path(dir.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap())?;
+        std::fs::write(&marker, b"{\"plan_id\": tru")?;
+
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            std::path::Path::new("models/.rocky-state.redb"),
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("INVALID"),
+            "the refusal names the invalid marker: {msg}"
+        );
+        assert!(
+            !msg.contains("has not been reviewed"),
+            "an invalid marker is NOT reported as a missing review: {msg}"
+        );
+
+        // The mispaste variant: a well-formed marker for another plan.
+        std::fs::write(&marker, well_formed_marker_json(&"9".repeat(64)))?;
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            std::path::Path::new("models/.rocky-state.redb"),
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("INVALID") && msg.contains(&"9".repeat(64)),
+            "the mismatch refusal names the plan the marker actually approves: {msg}"
         );
         Ok(())
     }
@@ -7496,7 +7624,15 @@ schema_template = "s__{source}"
         assert!(super::apply_policy_gate(dir.path(), "p", review()).is_err());
         let marker = super::review_marker_path(dir.path(), "p");
         std::fs::create_dir_all(marker.parent().unwrap())?;
+        // FF-WP1 parse-and-match: an unparseable marker is a DISTINCT refusal.
         std::fs::write(&marker, b"{}")?;
+        let err = super::apply_policy_gate(dir.path(), "p", review())
+            .expect_err("an unparseable marker must not satisfy require_review");
+        assert!(
+            err.to_string().contains("INVALID"),
+            "the invalid-marker refusal is distinct: {err}"
+        );
+        std::fs::write(&marker, well_formed_marker_json("p"))?;
         assert!(super::apply_policy_gate(dir.path(), "p", review()).is_ok());
 
         // Allow and NotConfigured always pass.
