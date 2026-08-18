@@ -60,7 +60,6 @@ nullable = false
 [rules]
 required = ["customer_id", "total_revenue"]
 protected = ["customer_id"]
-no_new_nullable = true
 ```
 
 ### Column constraints
@@ -84,7 +83,7 @@ The `[rules]` section enforces schema-level constraints:
 |------|-------------|
 | `required` | Columns that must exist in the model's output. Missing required columns produce error `E010`. |
 | `protected` | Columns that must never be removed. If a protected column disappears from the output, it produces error `E013`. |
-| `no_new_nullable` | If `true`, no new nullable columns may be added to the model's output. |
+| `no_new_nullable` | Parsed but not enforced today. The compiler accepts the key and checks nothing ([#1467](https://github.com/rocky-data/rocky/issues/1467)). Leave it out. |
 
 ### Diagnostic codes
 
