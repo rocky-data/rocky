@@ -154,7 +154,9 @@ async fn worker_profile_tools_list_is_the_minimal_allowlist() {
         "the worker profile is an exhaustive allowlist — nothing else may appear"
     );
 
-    // The prompts are served unchanged in both profiles.
+    // The prompt NAMES are served in both profiles; the workflow prompts'
+    // CONTENT branches on the profile (worker variants end at the runner
+    // handoff — pinned by `worker_profile_prompts_end_at_the_runner_handoff`).
     let prompts = client.list_all_prompts().await.expect("list prompts");
     let mut prompt_names: Vec<String> = prompts.iter().map(|p| p.name.clone()).collect();
     prompt_names.sort();
@@ -167,7 +169,7 @@ async fn worker_profile_tools_list_is_the_minimal_allowlist() {
             "fix_failing_test",
             "summarize_project",
         ],
-        "the worker profile keeps the full prompt set"
+        "the worker profile keeps the full prompt-name set"
     );
 
     client.cancel().await.unwrap();
@@ -509,27 +511,38 @@ effect = "require_review"
         .await
         .expect("bound propose");
     let bound_err = bound.structured_content.expect("review-required envelope");
-    let bound_plan_id = bound_err["message"]
+    // FF-WP1 fix round (finding 4): the recorded plan reference is TYPED —
+    // `plan_id` + the product binding ride as envelope fields, so the runner
+    // reads them structurally instead of scraping prose.
+    assert_eq!(bound_err["code"], serde_json::json!("policy_review_required"));
+    let bound_plan_id = bound_err["plan_id"]
         .as_str()
-        .unwrap()
-        .split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_ascii_hexdigit()))
-        .find(|w| w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit()))
-        .expect("the recorded plan_id is surfaced")
+        .expect("the recorded plan_id is a typed envelope field")
         .to_string();
+    assert_eq!(
+        bound_plan_id.len(),
+        64,
+        "the typed plan_id is the 64-char blake3 id"
+    );
+    assert_eq!(
+        bound_err["product_id"],
+        serde_json::json!("product:revenue_daily"),
+        "the product binding rides typed on the handoff: {bound_err:?}"
+    );
+    assert_eq!(bound_err["spec_digest"], serde_json::json!("sha256:abc"));
     let bare = client
         .call_tool(CallToolRequestParams::new("propose"))
         .await
         .expect("bare propose");
     let bare_err = bare.structured_content.expect("review-required envelope");
-    let bare_plan_id = bare_err["message"]
+    let bare_plan_id = bare_err["plan_id"]
         .as_str()
-        .unwrap()
-        .split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_ascii_hexdigit()))
-        .find(|w| w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit()))
-        .expect("the recorded plan_id is surfaced")
+        .expect("the recorded plan_id is a typed envelope field")
         .to_string();
+    assert!(
+        bare_err.get("product_id").is_none() || bare_err["product_id"].is_null(),
+        "an unbound propose carries no product fields on the handoff: {bare_err:?}"
+    );
     assert_ne!(bound_plan_id, bare_plan_id);
 
     // Unfiltered: both pending.
@@ -1330,6 +1343,221 @@ effect = "require_review"
     assert!(
         dir.path().join("models").join("reviewed.toml").is_file(),
         "the sidecar persists too"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// A sidecar for the `orders` fixture carrying the spec-owned metadata a
+/// worker must never be able to erase: a PII classification, a freshness
+/// block, a test, tags, and explicit strategy/target.
+const SPEC_OWNED_ORDERS_SIDECAR: &str = r#"name = "orders"
+intent = "original spec-owned intent"
+
+[tags]
+layer = "gold"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "out"
+table = "orders"
+
+[classification]
+status = "pii"
+
+[freshness]
+expected_lag_seconds = 3600
+time_column = "id"
+
+[[tests]]
+type = "not_null"
+column = "id"
+"#;
+
+/// FF-WP1 fix round (finding 2) — `draft_model` on an EXISTING model is a
+/// preserve-merge: the SQL body is replaced and ONLY `name` / `intent` change
+/// in the sidecar; classification, freshness, tests, tags, strategy, and
+/// target all survive the redraft. Before the fix, the sidecar was replaced
+/// wholesale with the minimal name+intent document.
+#[tokio::test]
+async fn draft_model_on_existing_model_preserves_spec_owned_metadata() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sidecar_path = dir.path().join("models").join("orders.toml");
+    std::fs::write(&sidecar_path, SPEC_OWNED_ORDERS_SIDECAR).unwrap();
+    let before: toml::Table = toml::from_str(SPEC_OWNED_ORDERS_SIDECAR).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id, 'REDRAFTED' AS status",
+                "redrafted intent",
+            )),
+        )
+        .await
+        .expect("draft_model call");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "redrafting an existing model succeeds: {:?}",
+        result.structured_content
+    );
+
+    // The SQL body was replaced.
+    let sql = std::fs::read_to_string(dir.path().join("models").join("orders.sql")).unwrap();
+    assert!(sql.contains("REDRAFTED"), "the SQL body is the new draft");
+
+    // The sidecar changed in EXACTLY `name` + `intent`; everything else is
+    // preserved value-for-value (the merge re-serializes, so the comparison
+    // is over parsed tables, not raw bytes).
+    let after_text = std::fs::read_to_string(&sidecar_path).unwrap();
+    let mut after: toml::Table = toml::from_str(&after_text).unwrap();
+    assert_eq!(
+        after.remove("name"),
+        Some(toml::Value::String("orders".to_string()))
+    );
+    assert_eq!(
+        after.remove("intent"),
+        Some(toml::Value::String("redrafted intent".to_string())),
+        "the intent is the redraft's"
+    );
+    let mut expected = before.clone();
+    expected.remove("name");
+    expected.remove("intent");
+    assert_eq!(
+        after, expected,
+        "every key except name/intent is preserved exactly"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1 fix round (finding 2) — an existing sidecar that does not parse as
+/// TOML REFUSES the redraft (mirroring draft_metadata): spec-owned metadata
+/// is never clobbered just because it is malformed. Both files stay
+/// byte-identical.
+#[tokio::test]
+async fn draft_model_refuses_to_clobber_an_unparseable_sidecar() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sidecar_path = dir.path().join("models").join("orders.toml");
+    std::fs::write(&sidecar_path, "name = \"orders\"\n[strategy\nbroken !!").unwrap();
+    let sidecar_before = std::fs::read(&sidecar_path).unwrap();
+    let sql_path = dir.path().join("models").join("orders.sql");
+    let sql_before = std::fs::read(&sql_path).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id",
+                "should not land",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+    assert_eq!(result.is_error, Some(true), "an unparseable sidecar refuses");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("models/orders.toml"),
+        "the error names the sidecar: {err:?}"
+    );
+
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap(),
+        sidecar_before,
+        "the unparseable sidecar is byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(&sql_path).unwrap(),
+        sql_before,
+        "the SQL body is untouched too"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1 fix round (finding 2) — THE de-scope pin: with a rule denying agent
+/// authorship on `classifications = ["pii"]`, redrafting a PII-classified
+/// model via `draft_model` is DENIED, and the rollback restores BOTH files
+/// byte-for-byte. Before the fix, the redraft replaced the sidecar with the
+/// minimal name+intent document — erasing the `pii` classification the deny
+/// rule matches on — and the policy evaluation (which runs post-write, on the
+/// on-disk image) resolved to the default posture instead of the deny.
+#[tokio::test]
+async fn draft_model_redraft_of_pii_model_is_denied_and_byte_restored() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { classifications = ["pii"] }
+effect = "deny"
+"#,
+    );
+    let sidecar_path = dir.path().join("models").join("orders.toml");
+    std::fs::write(&sidecar_path, SPEC_OWNED_ORDERS_SIDECAR).unwrap();
+    let sidecar_before = std::fs::read(&sidecar_path).unwrap();
+    let sql_path = dir.path().join("models").join("orders.sql");
+    let sql_before = std::fs::read(&sql_path).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id, 'X' AS status",
+                "attempt to redraft a pii model",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+
+    assert_eq!(result.is_error, Some(true), "the redraft is refused");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("policy_denied"),
+        "the pii-scoped DENY decides — not the default require_review: {err:?}"
+    );
+    assert_eq!(
+        err["policy_rule"],
+        serde_json::json!("0"),
+        "the deciding rule is the classification-scoped deny: {err:?}"
+    );
+
+    // Byte-restore: the deny rolled back BOTH files exactly.
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap(),
+        sidecar_before,
+        "the deny restores the prior sidecar bytes"
+    );
+    assert_eq!(
+        std::fs::read(&sql_path).unwrap(),
+        sql_before,
+        "the deny restores the prior SQL bytes"
     );
 
     client.cancel().await.unwrap();
@@ -2386,6 +2614,129 @@ async fn authoring_trajectories_orchestrate_tools_and_stop_at_the_gate() {
     assert!(
         !haystack.contains("plan_id"),
         "summarize_project is read-only and must not drive a propose/plan flow:\n{haystack}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1 fix round (finding 7) — the worker-profile GOLDEN prompt surface:
+/// every workflow prompt served under `--profile worker` (1) never mentions a
+/// tool the profile excludes (`propose`, `draft_contract`, `draft_metadata`,
+/// `ai_test`, `ai_contract`, `review_queue`, `pause_schedule`) and (2) ends
+/// at an explicit hand-off to the trusted runner. The default-profile golden
+/// tests above pin the other surface, so a prompt edit must consciously pick
+/// its profiles.
+#[tokio::test]
+async fn worker_profile_prompts_end_at_the_runner_handoff() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    );
+    let client = connect(server).await;
+
+    // Tools the worker profile excludes — no worker prompt may instruct them.
+    // (`ai_test`/`ai_contract` also cover the excluded-generator class.)
+    const EXCLUDED_TOOL_MENTIONS: &[&str] = &[
+        "propose",
+        "draft_contract",
+        "draft_metadata",
+        "ai_test",
+        "ai_contract",
+        "review_queue",
+        "pause_schedule",
+    ];
+
+    let build_args = serde_json::json!({ "intent": "daily revenue" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let model_args = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let prompts: Vec<(&str, Option<serde_json::Map<String, serde_json::Value>>)> = vec![
+        ("build_model", Some(build_args)),
+        ("find_untested_models", None),
+        ("add_tests_to_pks", Some(model_args)),
+        ("fix_failing_test", None),
+    ];
+
+    for (name, args) in prompts {
+        let mut params = GetPromptRequestParams::new(name);
+        if let Some(args) = args {
+            params = params.with_arguments(args);
+        }
+        let result = client
+            .get_prompt(params)
+            .await
+            .unwrap_or_else(|e| panic!("get_prompt {name}: {e}"));
+        let haystack = prompt_text(&result);
+
+        for excluded in EXCLUDED_TOOL_MENTIONS {
+            assert!(
+                !haystack.contains(excluded),
+                "worker-profile `{name}` must not instruct excluded tool `{excluded}`; \
+                 full text:\n{haystack}"
+            );
+        }
+        assert!(
+            haystack.contains("HAND OFF") && haystack.contains("trusted runner"),
+            "worker-profile `{name}` must end at the trusted-runner handoff; \
+             full text:\n{haystack}"
+        );
+        // The drafting loop itself survives: the worker still grounds and
+        // verifies with in-profile tools.
+        for allowed in ["profile_column", "test"] {
+            assert!(
+                haystack.contains(allowed),
+                "worker-profile `{name}` still orchestrates in-profile tool `{allowed}`; \
+                 full text:\n{haystack}"
+            );
+        }
+    }
+
+    // The read-only summary prompt is profile-invariant.
+    let summary = client
+        .get_prompt(GetPromptRequestParams::new("summarize_project"))
+        .await
+        .expect("get_prompt summarize_project");
+    let haystack = prompt_text(&summary);
+    assert!(
+        haystack.to_lowercase().contains("read-only"),
+        "summarize_project stays the read-only orientation under the worker profile"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The default profile's `build_model` still ends at `propose` — the worker
+/// variant did not leak into the default surface (both golden pins together
+/// force a conscious per-profile choice on any prompt edit).
+#[tokio::test]
+async fn default_profile_build_model_still_ends_at_propose() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({ "intent": "daily revenue" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .get_prompt(GetPromptRequestParams::new("build_model").with_arguments(args))
+        .await
+        .expect("get_prompt build_model");
+    let haystack = prompt_text(&result);
+    assert!(
+        haystack.contains("propose") && haystack.contains("STOP at propose"),
+        "the DEFAULT build_model still stops at propose:\n{haystack}"
+    );
+    assert!(
+        !haystack.contains("HAND OFF to the trusted runner"),
+        "the worker handoff text must not leak into the default profile:\n{haystack}"
     );
 
     client.cancel().await.unwrap();

@@ -87,6 +87,23 @@ pub struct ToolError {
     /// error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_rule: Option<String>,
+    /// The RECORDED plan behind a `propose` that resolved to
+    /// [`ToolErrorCode::PolicyReviewRequired`] — the plan was persisted for a
+    /// human reviewer, and this is its id, typed, so a runner never scrapes
+    /// it out of `message` prose. Absent on every other error (a draft-tool
+    /// require-review persists a draft file, not a plan).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// Product identity the recorded plan is bound to, echoed verbatim when
+    /// the propose carried one. Rides with `plan_id` on the
+    /// `policy_review_required` handoff; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// Approved-spec digest the recorded plan is bound to, echoed verbatim
+    /// when the propose carried one. Rides with `plan_id` on the
+    /// `policy_review_required` handoff; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
 }
 
 impl ToolError {
@@ -103,6 +120,9 @@ impl ToolError {
             message: message.into(),
             remediation_hint: remediation_hint.into(),
             policy_rule: None,
+            plan_id: None,
+            product_id: None,
+            spec_digest: None,
         })
     }
 
@@ -184,6 +204,9 @@ impl ToolError {
             message: message.into(),
             remediation_hint: remediation_hint.into(),
             policy_rule,
+            plan_id: None,
+            product_id: None,
+            spec_digest: None,
         })
     }
 
@@ -212,6 +235,32 @@ impl ToolError {
             hint,
             policy_rule,
         )
+    }
+
+    /// [`Self::policy_review_required`] carrying the typed reference to the
+    /// RECORDED plan — used by `propose`, which persists the plan on a
+    /// require-review verdict. `plan_id` is the persisted plan's id;
+    /// `product_id` / `spec_digest` echo the plan's product binding when the
+    /// propose carried one, so a fulfillment runner reads the whole handoff
+    /// from typed fields instead of parsing prose.
+    pub fn policy_review_required_for_plan(
+        message: impl Into<String>,
+        hint: impl Into<String>,
+        policy_rule: Option<String>,
+        plan_id: impl Into<String>,
+        product_id: Option<String>,
+        spec_digest: Option<String>,
+    ) -> Json<Self> {
+        let mut wrapped = Self::wrap_policy(
+            ToolErrorCode::PolicyReviewRequired,
+            message,
+            hint,
+            policy_rule,
+        );
+        wrapped.0.plan_id = Some(plan_id.into());
+        wrapped.0.product_id = product_id;
+        wrapped.0.spec_digest = spec_digest;
+        wrapped
     }
 
     /// An unexpected internal failure.
