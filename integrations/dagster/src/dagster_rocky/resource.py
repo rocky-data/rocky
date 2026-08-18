@@ -66,6 +66,7 @@ from .types import (
     PlanResult,
     PromotePlan,
     RetentionStatusOutput,
+    ReviewStatusOutput,
     RunResult,
     StateHealthResult,
     StateResult,
@@ -819,16 +820,31 @@ class RockyResource(dg.ConfigurableResource):
         with _translating():
             return self._get_client().plan(filter, pipeline=pipeline, env=env)
 
-    def apply(self, plan_id: str) -> ApplyResult:
+    def apply(self, plan_id: str, *, expect_spec_digest: str | None = None) -> ApplyResult:
         """Run ``rocky apply <plan-id>`` and return the parsed result.
 
         ``rocky apply`` prints the plan-kind's own output (no wrapping
         envelope), so the return type is the :data:`~rocky_sdk.client.ApplyResult`
         union: run-shaped plans yield a :class:`RunResult`, a ``gc`` plan a
         ``GcApplyOutput``, compact / archive / promote plans their own outputs.
+
+        ``expect_spec_digest`` passes ``--expect-spec-digest``: the engine
+        refuses unless the plan payload's ``spec_digest`` equals it exactly. A
+        product-bound plan requires it; read the digest from
+        :meth:`review_status`.
         """
         with _translating():
-            return self._get_client().apply(plan_id)
+            return self._get_client().apply(plan_id, expect_spec_digest=expect_spec_digest)
+
+    def review_status(self, plan_id: str) -> ReviewStatusOutput:
+        """Run ``rocky review <plan-id> --status`` — the typed marker oracle.
+
+        Reports whether a well-formed sign-off marker naming the plan exists,
+        who approved it and when, and the plan's product binding. A malformed
+        or mismatched marker is an error, never ``reviewed=False``.
+        """
+        with _translating():
+            return self._get_client().review_status(plan_id)
 
     def run(
         self,

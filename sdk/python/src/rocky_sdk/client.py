@@ -77,6 +77,7 @@ from rocky_sdk.types import (
     PromotePlan,
     RestoreApplyOutput,
     RetentionStatusOutput,
+    ReviewStatusOutput,
     RunResult,
     StateResult,
     TestResult,
@@ -977,7 +978,7 @@ class RockyClient:
             args.extend(["--env", env])
         return _parse_rocky_json(self.run_cli(args), PlanResult, command="plan")
 
-    def apply(self, plan_id: str) -> ApplyResult:
+    def apply(self, plan_id: str, *, expect_spec_digest: str | None = None) -> ApplyResult:
         """Run ``rocky apply <plan-id>`` and return the parsed result.
 
         Reads ``.rocky/plans/<plan_id>.json`` and dispatches by kind. Each plan
@@ -987,6 +988,15 @@ class RockyClient:
         ``gc`` plans yield :class:`RestoreApplyOutput` and :class:`GcApplyOutput`,
         respectively; compact / archive / promote plans yield their respective
         outputs. See :func:`_parse_apply`.
+
+        Args:
+            plan_id: The 64-char blake3 plan identifier.
+            expect_spec_digest: Passes ``--expect-spec-digest``: the engine
+                refuses unless the plan payload's ``spec_digest`` equals this
+                exact string. The gate is fail-closed both ways — a
+                product-bound plan REQUIRES it (a bare apply is refused), and
+                passing it against a plan with no ``spec_digest`` is refused
+                too. Read the digest from :meth:`review_status`.
 
         Example:
 
@@ -1005,7 +1015,35 @@ class RockyClient:
                     # gc / restore / compact / archive / promote plan kinds.
                     print(type(result).__name__)
         """
-        return _parse_apply(self.run_cli(["apply", plan_id], allow_partial=True))
+        args = ["apply", plan_id]
+        if expect_spec_digest is not None:
+            args.extend(["--expect-spec-digest", expect_spec_digest])
+        return _parse_apply(self.run_cli(args, allow_partial=True))
+
+    def review_status(self, plan_id: str) -> ReviewStatusOutput:
+        """Run ``rocky review <plan-id> --status`` and return the typed state.
+
+        The read-only marker oracle: whether a well-formed sign-off marker
+        naming the plan exists (``reviewed``), who approved it and when, and
+        the plan's product binding (``product_id`` / ``spec_digest``) when it
+        carries one. Poll this instead of probing the marker file — the marker
+        is an engine-internal artifact, and a malformed or mismatched marker
+        is a command ERROR here (raised as :class:`RockyCommandError`), never
+        a silent ``reviewed=False``.
+
+        Example:
+
+            Wait for the human sign-off, then apply with the digest gate::
+
+                status = client.review_status(plan_id)
+                if status.reviewed and status.spec_digest is not None:
+                    client.apply(plan_id, expect_spec_digest=status.spec_digest)
+        """
+        return _parse_rocky_json(
+            self.run_cli(["review", plan_id, "--status"]),
+            ReviewStatusOutput,
+            command="review_status",
+        )
 
     def run(
         self,

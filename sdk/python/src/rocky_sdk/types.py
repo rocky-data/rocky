@@ -1325,6 +1325,7 @@ from .types_generated import (  # noqa: E402, F401
     ReplayOutput,
     RestoreApplyOutput,
     RetentionStatusOutput,
+    ReviewStatusOutput,
     RunHistoryRecord,
     RunOutput,
     SignatureAlgorithm,
@@ -1465,6 +1466,7 @@ RockyOutput = (
     | PromotePlan
     | CompactApplyOutput
     | ArchiveApplyOutput
+    | ReviewStatusOutput
 )
 
 
@@ -1503,6 +1505,7 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "plan promote": PromotePlan,
     "compact apply": CompactApplyOutput,
     "archive apply": ArchiveApplyOutput,
+    "review_status": ReviewStatusOutput,
 }
 
 

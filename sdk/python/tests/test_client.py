@@ -774,6 +774,80 @@ def test_apply_restore_plan_returns_restore_apply_output():
     assert result.bytes_restored == 2048
 
 
+def test_apply_expect_spec_digest_appends_the_literal_flag():
+    """``expect_spec_digest`` appends ``--expect-spec-digest <digest>`` to the
+    argv; the default keeps the previous argv byte-for-byte (no flag)."""
+    client = _client()
+    with patch.object(client, "run_cli", return_value=_RUN_APPLY_JSON) as run_cli:
+        client.apply("a" * 64, expect_spec_digest="sha256:feed")
+    args = run_cli.call_args[0][0]
+    assert args == ["apply", "a" * 64, "--expect-spec-digest", "sha256:feed"], args
+
+    with patch.object(client, "run_cli", return_value=_RUN_APPLY_JSON) as run_cli:
+        client.apply("a" * 64)
+    args = run_cli.call_args[0][0]
+    assert args == ["apply", "a" * 64], args
+
+
+_REVIEW_STATUS_JSON = json.dumps(
+    {
+        "version": "1.70.1",
+        "command": "review_status",
+        "plan_id": "a" * 64,
+        "kind": "ai_authored",
+        "reviewed": True,
+        "reviewed_at": "2026-08-18T09:00:00Z",
+        "approver": {
+            "email": "dev@example.com",
+            "host": "localhost",
+            "source": "local",
+        },
+        "breaking_change_count": 0,
+        "product_id": "product:revenue_daily",
+        "spec_digest": "sha256:0123abcd",
+    }
+)
+
+
+def test_review_status_argv_and_typed_parse():
+    """``review_status`` shells ``review <plan-id> --status`` and parses the
+    typed marker oracle, including the product pair the applier echoes back
+    via ``expect_spec_digest``."""
+    from rocky_sdk.types import ReviewStatusOutput
+
+    client = _client()
+    with patch.object(client, "run_cli", return_value=_REVIEW_STATUS_JSON) as run_cli:
+        status = client.review_status("a" * 64)
+    args = run_cli.call_args[0][0]
+    assert args == ["review", "a" * 64, "--status"], args
+    assert isinstance(status, ReviewStatusOutput)
+    assert status.reviewed is True
+    assert status.product_id == "product:revenue_daily"
+    assert status.spec_digest == "sha256:0123abcd"
+
+
+def test_review_status_pending_accepts_absent_optionals():
+    """The pending shape skip-serializes every marker-derived field."""
+    from rocky_sdk.types import ReviewStatusOutput
+
+    pending = json.dumps(
+        {
+            "version": "1.70.1",
+            "command": "review_status",
+            "plan_id": "b" * 64,
+            "kind": "backfill",
+            "reviewed": False,
+        }
+    )
+    client = _client()
+    with patch.object(client, "run_cli", return_value=pending):
+        status = client.review_status("b" * 64)
+    assert isinstance(status, ReviewStatusOutput)
+    assert status.reviewed is False
+    assert status.approver is None
+    assert status.spec_digest is None
+
+
 def test_apply_unknown_shape_raises_named_parse_error():
     """An unrecognized apply shape raises a clear parse error naming the
     received command instead of silently mis-parsing."""

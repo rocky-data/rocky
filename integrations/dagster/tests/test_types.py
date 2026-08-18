@@ -21,6 +21,7 @@ from dagster_rocky.types import (
     ModelLineageResult,
     OptimizeResult,
     PlanResult,
+    ReviewStatusOutput,
     RunResult,
     Severity,
     StateResult,
@@ -430,6 +431,37 @@ def test_parse_apply(apply_json: str):
     assert result.evicted_count == 1
     assert result.evicted[0].model_name == "stale_model"
     assert isinstance(parse_rocky_output(apply_json), GcApplyOutput)
+
+
+def test_parse_review_status(review_status_json: str):
+    """``rocky review <plan-id> --status`` — the FF-WP1 marker oracle: an
+    approved, product-bound plan carries the approver identity and the
+    product pair the applier must echo via ``--expect-spec-digest``."""
+    result = ReviewStatusOutput.model_validate_json(review_status_json)
+    assert result.command == "review_status"
+    assert result.plan_id == "a" * 64
+    assert result.kind == "ai_authored"
+    assert result.reviewed is True
+    assert result.reviewed_at is not None
+    assert result.approver is not None
+    assert result.approver.email == "dev@example.com"
+    assert result.breaking_change_count == 0
+    assert result.product_id == "product:revenue_daily"
+    assert result.spec_digest == "sha256:0123abcd"
+    assert isinstance(parse_rocky_output(review_status_json), ReviewStatusOutput)
+
+
+def test_parse_review_status_pending(review_status_pending_json: str):
+    """The pending half: optional fields are skip-serialized by the engine,
+    so the model must accept their absence."""
+    result = ReviewStatusOutput.model_validate_json(review_status_pending_json)
+    assert result.reviewed is False
+    assert result.reviewed_at is None
+    assert result.approver is None
+    assert result.breaking_change_count is None
+    assert result.product_id is None
+    assert result.spec_digest is None
+    assert isinstance(parse_rocky_output(review_status_pending_json), ReviewStatusOutput)
 
 
 def test_parse_state(state_json: str):

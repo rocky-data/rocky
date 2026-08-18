@@ -156,6 +156,11 @@ _PLAN_JSON=$("$ROCKY" plan --filter source=orders 2>/dev/null || true)
 _PLAN_ID=$(printf '%s' "$_PLAN_JSON" \
     | python3 -c "import sys, json; print(json.load(sys.stdin).get('plan_id', ''))" 2>/dev/null || true)
 if [[ -n "$_PLAN_ID" ]]; then
+    # review_status: the typed marker oracle (`rocky review <plan-id> --status`),
+    # captured BEFORE the apply so the fixture pins the pending shape
+    # (reviewed:false; the marker/approver/product fields skip-serialized).
+    "$ROCKY" review "$_PLAN_ID" --status 2>/dev/null > "$DEST/review_status.json" || true
+    python3 "$NORMALIZER" "$DEST/review_status.json"
     "$ROCKY" apply "$_PLAN_ID" 2>/dev/null > "$DEST/apply.json" || true
     python3 "$NORMALIZER" "$DEST/apply.json"
 else
