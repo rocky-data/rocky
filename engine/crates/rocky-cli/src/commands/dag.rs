@@ -377,6 +377,29 @@ fn build_dag_output(
             (true, LineageSource::NoModels) => (vec![], None),
         };
 
+    // A configured project must produce SOME graph. A zero-node "success"
+    // is how a transformation project whose models root does not exist fed
+    // the dagster component a clean empty asset graph — cached with
+    // `dag_status: "success"` and indistinguishable from a project that has
+    // no models (#1397). Keyed on the final node set, not on any one root:
+    // a seed-only pipeline, a replication pipeline, or a sibling root that
+    // holds the models all still produce nodes and stay untouched — that
+    // per-root tolerance is deliberate and was litigated before this guard
+    // (`dag_column_lineage_ignores_roots_that_contribute_nothing`).
+    if nodes.is_empty()
+        && cfg
+            .pipelines
+            .values()
+            .any(|p| matches!(p, rocky_core::config::PipelineConfig::Transformation(_)))
+    {
+        anyhow::bail!(
+            "the DAG has zero nodes, but the config declares a transformation \
+             pipeline — its models root is missing or empty. Check each \
+             `models = ...` glob in rocky.toml (default \"models/**\") against \
+             the project directory, or the --models override if one was passed"
+        );
+    }
+
     Ok(DagOutput {
         version: VERSION.to_string(),
         schema_version: DAG_SCHEMA_VERSION.to_string(),

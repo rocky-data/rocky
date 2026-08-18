@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`rocky dag` refuses to report an empty graph as success when the config declares a transformation pipeline.** A pipeline whose models root did not exist produced a zero-node DAG at exit 0, which the Dagster component then cached as a clean empty asset graph with `dag_status: "success"` — indistinguishable from a project that has no models (#1397). The guard keys on the final node set, so every deliberate tolerance survives: a seed-only transformation pipeline still dags on its seed nodes, replication-only projects are untouched (with and without the `--models` override the SDK sends by default), and an empty sibling root next to a populated one still contributes nothing without refusing the project. With the refusal in place, the Dagster component's existing failure machinery records `dag_status: "failed"` — or fails the deploy under `strict_build` — instead of shipping zero assets. `rocky serve`'s `GET /api/v1/dag` shares the same core and now answers an error for the same case.
+
+
 ## [1.71.0] — 2026-08-18
 
 ### Added
