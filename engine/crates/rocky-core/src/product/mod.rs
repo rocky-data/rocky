@@ -10,5 +10,8 @@
 //! # Modules
 //!
 //! - [`spec`] — the strict parser and the identity (digest) rules.
+//! - [`toml_compat`] — the order-preserving reader and the byte-stable
+//!   writer the lowered artifacts are rendered through.
 
 pub mod spec;
+pub mod toml_compat;
