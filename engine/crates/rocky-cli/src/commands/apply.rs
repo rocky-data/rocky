@@ -220,16 +220,79 @@ pub(crate) async fn run_apply_in(
     }
 }
 
+/// How a persisted plan's raw payload binds (or fails to bind) to a product.
+///
+/// Produced by [`classify_product_binding`] from the raw payload JSON — never
+/// from a typed deserialize, which would silently discard the keys.
+enum ProductBinding<'a> {
+    /// Neither `product_id` nor `spec_digest` appears in the payload.
+    Unbound,
+    /// Both keys are present as non-empty strings.
+    Bound {
+        product_id: &'a str,
+        spec_digest: &'a str,
+    },
+}
+
+/// Classify the product-identity keys on a raw plan payload, fail-closed.
+///
+/// The pair is valid in exactly two shapes: BOTH `product_id` and
+/// `spec_digest` present as non-empty JSON strings, or NEITHER key present.
+/// Every other shape — a lone key, an empty string, a non-string value
+/// (`null` and numbers included) — is a malformed binding and refuses with an
+/// error, regardless of any `--expect-spec-digest` flag: `propose` can never
+/// write those shapes, so they are hand-authored or tampered by definition,
+/// and a gate that projects them through `as_str()` would silently collapse
+/// them to "absent" and execute ungated.
+fn classify_product_binding<'a>(
+    payload: &'a serde_json::Value,
+    plan_id: &str,
+) -> Result<ProductBinding<'a>> {
+    let malformed = |detail: &str| -> anyhow::Error {
+        anyhow::anyhow!(
+            "plan '{plan_id}' carries a malformed product binding: {detail}. A product-bound \
+             plan must carry BOTH `product_id` and `spec_digest` as non-empty strings (or \
+             neither). This shape cannot come from `propose` — re-propose the plan through \
+             the governed chain instead of applying a hand-authored payload."
+        )
+    };
+    let product = payload.get("product_id");
+    let digest = payload.get("spec_digest");
+    match (product, digest) {
+        (None, None) => Ok(ProductBinding::Unbound),
+        (Some(product), Some(digest)) => match (product.as_str(), digest.as_str()) {
+            (Some(product_id), Some(spec_digest)) => {
+                if product_id.is_empty() {
+                    return Err(malformed("`product_id` is an empty string"));
+                }
+                if spec_digest.is_empty() {
+                    return Err(malformed("`spec_digest` is an empty string"));
+                }
+                Ok(ProductBinding::Bound {
+                    product_id,
+                    spec_digest,
+                })
+            }
+            (None, _) => Err(malformed("`product_id` is not a JSON string")),
+            (_, None) => Err(malformed("`spec_digest` is not a JSON string")),
+        },
+        (Some(_), None) => Err(malformed("`product_id` is present without `spec_digest`")),
+        (None, Some(_)) => Err(malformed("`spec_digest` is present without `product_id`")),
+    }
+}
+
 /// FF-WP1 ⟦RTL-4⟧ — `rocky apply --expect-spec-digest`, fail-closed both ways.
 ///
 /// Reads the product-identity keys straight off the raw payload JSON (never a
 /// typed deserialize), so the gate covers every plan kind and hand-authored
 /// payloads alike:
 ///
-/// - Plan carries `spec_digest` (or even a lone `product_id`) + no flag →
-///   **refuse**: a product-bound plan cannot be applied by a bare
-///   `rocky apply` — the runtime's expectation must be stated.
-/// - Flag given + payload has no `spec_digest` → **refuse**: the caller
+/// - Malformed binding (a lone key, an empty string, a non-string value) →
+///   **refuse**, regardless of flags — see [`classify_product_binding`].
+/// - Plan is product-bound + no flag → **refuse**: a product-bound plan
+///   cannot be applied by a bare `rocky apply` — the runtime's expectation
+///   must be stated.
+/// - Flag given + payload carries no binding → **refuse**: the caller
 ///   expected a product binding this plan does not carry.
 /// - Flag given + digests differ → **refuse**, naming both digests.
 /// - No product keys + no flag → today's behavior, untouched.
@@ -239,52 +302,88 @@ pub(crate) async fn run_apply_in(
 /// payload* — it cannot prove the spec file on disk still holds those bytes
 /// (that is the runtime's snapshot linearization).
 ///
-/// Boundary: the standalone `rocky compact apply` / `rocky archive apply`
-/// verbs do not cross this seam, but they can only execute compact/archive
-/// plans (kind-checked), which the fulfillment chain never authors.
+/// Boundary: the standalone `rocky compact apply` / `rocky archive apply` /
+/// `rocky branch promote --plan` verbs do not cross this seam; they refuse
+/// ANY payload carrying product keys via
+/// [`refuse_product_bound_alias_apply`] and direct callers here.
 fn enforce_spec_digest_expectation(
     plan: &PersistedPlan,
     plan_id: &str,
     expect_spec_digest: Option<&str>,
 ) -> Result<()> {
-    let payload_product = plan.payload.get("product_id").and_then(|v| v.as_str());
-    let payload_digest = plan.payload.get("spec_digest").and_then(|v| v.as_str());
-    match (expect_spec_digest, payload_digest) {
-        (None, Some(digest)) => bail!(
-            "plan '{plan_id}' is product-bound{}: its payload carries spec digest '{digest}', \
-             so a bare `rocky apply` is refused. Pass \
+    // Malformed half-bindings refuse FIRST, before the flag is even looked
+    // at — a matching flag must never launder a payload `propose` could not
+    // have written.
+    let binding = classify_product_binding(&plan.payload, plan_id)?;
+    match (expect_spec_digest, binding) {
+        (
+            None,
+            ProductBinding::Bound {
+                product_id,
+                spec_digest,
+            },
+        ) => bail!(
+            "plan '{plan_id}' is product-bound (product '{product_id}'): its payload carries \
+             spec digest '{spec_digest}', so a bare `rocky apply` is refused. Pass \
              `rocky apply {plan_id} --expect-spec-digest <digest>` with the digest of the \
              approved spec you intend to fulfil.",
-            payload_product
-                .map(|p| format!(" (product '{p}')"))
-                .unwrap_or_default(),
         ),
-        (None, None) => {
-            // A payload with `product_id` but no `spec_digest` cannot come from
-            // `propose` (which validates the pair) — only from a hand-authored
-            // plan. Fail closed on it rather than treating it as unbound.
-            if let Some(product) = payload_product {
-                bail!(
-                    "plan '{plan_id}' names product '{product}' but carries no spec_digest — \
-                     a product-bound plan must carry both, and applying it requires \
-                     `--expect-spec-digest`. Re-propose the plan with both fields."
-                );
-            }
-            Ok(())
-        }
-        (Some(_), None) => bail!(
+        (None, ProductBinding::Unbound) => Ok(()),
+        (Some(_), ProductBinding::Unbound) => bail!(
             "--expect-spec-digest was given, but plan '{plan_id}' carries no spec_digest in \
              its payload. The caller expected a product-bound plan; this one is not. Verify \
              the plan id, or drop the flag only if applying a non-product plan is intended."
         ),
-        (Some(expected), Some(actual)) if expected != actual => bail!(
-            "spec digest mismatch for plan '{plan_id}': the plan was authored against \
-             '{actual}' but the applier expected '{expected}'. The approved spec has moved \
-             since this plan was proposed — re-propose against the current approved spec \
-             instead of applying a stale plan."
-        ),
-        (Some(_), Some(_)) => Ok(()),
+        (Some(expected), ProductBinding::Bound { spec_digest, .. }) if expected != spec_digest => {
+            bail!(
+                "spec digest mismatch for plan '{plan_id}': the plan was authored against \
+                 '{spec_digest}' but the applier expected '{expected}'. The approved spec has \
+                 moved since this plan was proposed — re-propose against the current approved \
+                 spec instead of applying a stale plan."
+            )
+        }
+        (Some(_), ProductBinding::Bound { .. }) => Ok(()),
     }
+}
+
+/// FF-WP1 alias gate — persisted-plan verbs that bypass [`run_apply_in`].
+///
+/// `rocky compact apply`, `rocky archive apply`, and `rocky branch promote
+/// --plan` execute persisted plans WITHOUT crossing the
+/// [`enforce_spec_digest_expectation`] seam above, and their typed payload
+/// deserializations do not deny unknown fields — so a correctly rehashed
+/// payload carrying `product_id` / `spec_digest` would pass integrity, have
+/// the binding silently DROPPED by the typed deserialize, and execute under
+/// an Allow / NotConfigured policy. This helper reads the keys off the RAW
+/// persisted payload BEFORE any typed deserialization and refuses when either
+/// is present — in any shape, well-formed or malformed. The aliases
+/// deliberately grow no `--expect-spec-digest` of their own: canonical
+/// `rocky apply` is the one seam that enforces the product expectation, so
+/// product-bound plans are directed there.
+pub(crate) fn refuse_product_bound_alias_apply(
+    plan: &PersistedPlan,
+    plan_id: &str,
+    alias_verb: &str,
+) -> Result<()> {
+    let present: Vec<&str> = ["product_id", "spec_digest"]
+        .into_iter()
+        .filter(|key| plan.payload.get(key).is_some())
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "plan '{plan_id}' carries the product-identity field{plural} {fields} in its payload, \
+         and `{alias_verb}` does not enforce the product-identity gate. Apply it through \
+         canonical `rocky apply {plan_id} --expect-spec-digest <digest>` instead, with the \
+         digest of the approved spec you intend to fulfil.",
+        plural = if present.len() == 1 { "" } else { "s" },
+        fields = present
+            .iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(" + "),
+    )
 }
 
 /// Apply a `PlanKind::Run` plan by re-executing `commands::run::run` with
@@ -1360,11 +1459,91 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
 ) -> PolicyGate {
-    let (policy, attrs_map) =
+    evaluate_apply_policy_with_policy_matching_union(
+        policy,
+        plan_id,
+        principal,
+        touched,
+        models_dir,
+        models_glob,
+        state_path,
+        marker_freezes,
+        None,
+    )
+}
+
+/// [`evaluate_apply_policy`] with per-model EXTRA classifications unioned into
+/// the on-disk attribute resolution before rule matching.
+///
+/// FF-WP1 fix round (finding 2): `draft_model` on an existing model evaluates
+/// its policy over the PRE/POST UNION of the model's classifications — the
+/// on-disk (post-write) attributes plus the classifications the PRIOR sidecar
+/// carried — so an edit that erased a classification could never de-scope a
+/// classification-matched deny. The union only ever WIDENS what a
+/// `scope.classifications` rule can match; models without extra entries are
+/// evaluated exactly as [`evaluate_apply_policy`] would.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_apply_policy_with_extra_classifications(
+    config_path: &Path,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    state_path: &Path,
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
+    extra_classifications: &BTreeMap<String, Vec<String>>,
+) -> PolicyGate {
+    let policy = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .and_then(|cfg| cfg.policy);
+    evaluate_apply_policy_with_policy_matching_union(
+        policy.as_ref(),
+        plan_id,
+        principal,
+        touched,
+        models_dir,
+        None,
+        state_path,
+        marker_freezes,
+        Some(extra_classifications),
+    )
+}
+
+/// The shared body behind [`evaluate_apply_policy_with_policy_matching`] and
+/// [`evaluate_apply_policy_with_extra_classifications`] — resolves attributes,
+/// applies the optional classification union, then runs the ledger-aware core.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_apply_policy_with_policy_matching_union(
+    policy: Option<&rocky_core::config::PolicyConfig>,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    state_path: &Path,
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
+    extra_classifications: Option<&BTreeMap<String, Vec<String>>>,
+) -> PolicyGate {
+    let (policy, mut attrs_map) =
         match resolve_policy_and_attrs(policy, touched, models_dir, models_glob) {
             Ok(pair) => pair,
             Err(gate) => return gate,
         };
+
+    // Union in the caller-supplied classifications (widening only). A model
+    // the compile did not resolve still gets an entry, so a rule scoped on
+    // these classifications matches it rather than falling to bare defaults.
+    if let Some(extra) = extra_classifications {
+        for (model, classes) in extra {
+            let attrs = attrs_map.entry(model.clone()).or_insert_with(|| ModelAttributes {
+                name: model.clone(),
+                ..Default::default()
+            });
+            for class in classes {
+                attrs.classifications.insert(class.clone());
+            }
+        }
+    }
 
     // Snapshot the decision ledger *before* this apply writes any rows, so the
     // dynamic breakers (autonomy-budget burn, active freezes) reflect only
@@ -5491,6 +5670,77 @@ effect = "deny"
         Ok(())
     }
 
+    /// FF-WP1 fix round (finding 2) — the classification-UNION threading:
+    /// `evaluate_apply_policy_with_extra_classifications` matches a
+    /// `classifications = ["pii"]` deny even when the ON-DISK model carries no
+    /// `pii` classification, because the caller-supplied extra set is unioned
+    /// into the resolved attributes before rule matching. This is the seam
+    /// `draft_model` uses to evaluate over the pre/post union — the control
+    /// half proves the SAME call WITHOUT the extra set resolves to the default
+    /// posture, so the deny provably came from the union.
+    #[test]
+    fn extra_classifications_union_widens_rule_matching() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { classifications = ["pii"] }
+effect = "deny"
+"#,
+        )?;
+        // The on-disk model carries NO pii classification.
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models)?;
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            models.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"warehouse\"\nschema = \"out\"\n",
+        )?;
+        let state = dir.path().join("state.redb");
+
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::Propose);
+
+        // Control: without the extra set, the pii deny does not match — the
+        // default posture (require_review) decides.
+        let plain = super::evaluate_apply_policy(
+            &config,
+            "draft:m",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+            &[],
+        );
+        assert!(
+            matches!(plain, PolicyGate::RequireReview { .. }),
+            "without the union the deny must NOT match (default posture decides); got {plain:?}"
+        );
+
+        // With the extra set (the pre-image classifications), the deny matches.
+        let extra: BTreeMap<String, Vec<String>> =
+            std::iter::once(("m".to_string(), vec!["pii".to_string()])).collect();
+        let unioned = super::evaluate_apply_policy_with_extra_classifications(
+            &config,
+            "draft:m",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+            &[],
+            &extra,
+        );
+        assert!(
+            matches!(unioned, PolicyGate::Deny { .. }),
+            "the unioned classification must match the pii-scoped deny; got {unioned:?}"
+        );
+        Ok(())
+    }
+
     /// The #1328 review's F2 (CONFIRMED): a models dir whose compile FAILS —
     /// here a malformed sidecar, in the review's scenario the walk's new
     /// depth-ceiling error from an irrelevant deep subtree — used to degrade
@@ -7865,8 +8115,96 @@ schema_template = "s__{source}"
         .await
         .expect_err("a lone product_id must fail closed");
         assert!(
-            format!("{err:#}").contains("carries no spec_digest"),
+            format!("{err:#}").contains("malformed product binding")
+                && format!("{err:#}").contains("without `spec_digest`"),
             "distinct half-bound refusal: {err:#}"
+        );
+        Ok(())
+    }
+
+    /// FF-WP1 fix round (finding 3) — the malformed-binding matrix: a lone
+    /// digest, an empty string, and a non-string value must ALL refuse,
+    /// REGARDLESS of the flag. The lone-digest case is checked with a
+    /// MATCHING `--expect-spec-digest`: before the fix, `as_str()` projection
+    /// collapsed the lone field into "present" and the matching flag
+    /// executed it — the exact half-binding bypass.
+    #[tokio::test]
+    async fn malformed_product_bindings_refuse_regardless_of_flag() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = root.join("rocky.toml");
+        let state = root.join("state.redb");
+
+        // Hand-authored raw payloads: shapes the typed `RunPlan` cannot even
+        // express, written through the real (rehashing) plan store — so each
+        // passes integrity and the refusal provably comes from the binding
+        // classification, not the integrity check.
+        let cases: Vec<(&str, serde_json::Value, Option<&str>)> = vec![
+            (
+                "lone spec_digest + MATCHING flag",
+                serde_json::json!({ "spec_digest": "sha256:abc" }),
+                Some("sha256:abc"),
+            ),
+            (
+                "lone spec_digest + no flag",
+                serde_json::json!({ "spec_digest": "sha256:abc" }),
+                None,
+            ),
+            (
+                "empty-string product_id + matching flag",
+                serde_json::json!({ "product_id": "", "spec_digest": "sha256:abc" }),
+                Some("sha256:abc"),
+            ),
+            (
+                "empty-string spec_digest",
+                serde_json::json!({ "product_id": "product:x", "spec_digest": "" }),
+                None,
+            ),
+            (
+                "numeric product_id + matching flag",
+                serde_json::json!({ "product_id": 42, "spec_digest": "sha256:abc" }),
+                Some("sha256:abc"),
+            ),
+            (
+                "numeric spec_digest + no flag",
+                serde_json::json!({ "product_id": "product:x", "spec_digest": 42 }),
+                None,
+            ),
+            (
+                "null product_id",
+                serde_json::json!({ "product_id": null, "spec_digest": "sha256:abc" }),
+                Some("sha256:abc"),
+            ),
+        ];
+
+        for (label, payload, flag) in cases {
+            let plan_id = crate::plan_store::write_plan(root, PlanKind::AiAuthored, &payload)?;
+            let err = run_apply_in(
+                root,
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Human,
+                flag,
+                false,
+            )
+            .await
+            .expect_err(&format!("case '{label}' must refuse"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("malformed product binding"),
+                "case '{label}' refuses as a malformed binding: {msg}"
+            );
+        }
+
+        // No policy gate ever ran (there is no config on disk): the refusals
+        // all fired at the binding classification, before any gate arm.
+        assert!(
+            !state.exists()
+                || StateStore::open(&state)?
+                    .list_policy_decisions()?
+                    .is_empty(),
+            "no custody row may exist for a pre-gate refusal"
         );
         Ok(())
     }
