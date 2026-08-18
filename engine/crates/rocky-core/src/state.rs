@@ -234,6 +234,34 @@ const SCHEDULE_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("sched
 /// **Local-only** (listed in [`LOCAL_ONLY_TABLE_NAMES`]): like the cursor above,
 /// claims are per-instance reconciler state.
 const SCHEDULE_CLAIMS: TableDefinition<&str, &[u8]> = TableDefinition::new("schedule_claims");
+/// Per-product fulfillment reconciler records and their journal rows.
+///
+/// One table, two key forms: the current record at `product:<name>`
+/// (serialized [`crate::fulfill::FulfillStateRecord`]) and append-only
+/// journal rows at `product:<name>#<seq:08>` (serialized
+/// [`crate::fulfill::FulfillJournalRow`]), with `seq` allocated inside the
+/// same CAS write transaction that moves the record — a torn record/journal
+/// pair is impossible by construction.
+///
+/// **Local-only** (listed in [`LOCAL_ONLY_TABLE_NAMES`]): loop state is
+/// per-machine, the [`SCHEDULE_CLAIMS`] posture.
+const FULFILL_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("fulfill_state");
+/// Product spec-approval records: key `product:<name>`, value a serialized
+/// [`crate::fulfill::ProductApprovalRecord`].
+///
+/// redb stores the RECORD only — the approved spec bytes live on disk at
+/// the record's digest-addressed `snapshot_path`, and every reader
+/// re-verifies file-bytes digest == record digest before trusting them.
+///
+/// **Local-only for now** (listed in [`LOCAL_ONLY_TABLE_NAMES`]): a
+/// replicated approval record would point at snapshot BYTES that state
+/// replication does not transport (`.rocky/fulfillment/...` files are
+/// outside the export), so another pod could receive a valid-looking
+/// approval with no spec behind it. Revisit to replicated only when
+/// snapshot bytes gain durable replicated storage — the v22 stanza on
+/// [`CURRENT_SCHEMA_VERSION`] records this posture and its revisit
+/// condition.
+const PRODUCT_APPROVALS: TableDefinition<&str, &[u8]> = TableDefinition::new("product_approvals");
 /// Key/value store for internal metadata (e.g. `"schema_version"`).
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 
@@ -252,8 +280,19 @@ const METADATA: TableDefinition<&str, &str> = TableDefinition::new("metadata");
 /// - `schedule_state` / `schedule_claims` — per-instance reconciler cursors and
 ///   claims (see [`SCHEDULE_STATE`], [`SCHEDULE_CLAIMS`]). One scheduler
 ///   instance per project; the catch-up policy covers restarts.
-pub const LOCAL_ONLY_TABLE_NAMES: &[&str] =
-    &["schema_cache", "jobs", "schedule_state", "schedule_claims"];
+/// - `fulfill_state` — per-machine fulfillment loop state (see
+///   [`FULFILL_STATE`]; the `schedule_claims` posture).
+/// - `product_approvals` — approval records point at snapshot bytes state
+///   replication does not transport (see [`PRODUCT_APPROVALS`]; the v22
+///   stanza records the revisit condition).
+pub const LOCAL_ONLY_TABLE_NAMES: &[&str] = &[
+    "schema_cache",
+    "jobs",
+    "schedule_state",
+    "schedule_claims",
+    "fulfill_state",
+    "product_approvals",
+];
 
 /// The redb key/value shape of a state table, for the logical snapshot export.
 ///
@@ -306,6 +345,8 @@ const SNAPSHOT_TABLE_REGISTRY: &[(&str, TableShape)] = &[
     ("tombstones", TableShape::StrBytes),
     ("schedule_state", TableShape::StrBytes),
     ("schedule_claims", TableShape::StrBytes),
+    ("fulfill_state", TableShape::StrBytes),
+    ("product_approvals", TableShape::StrBytes),
     ("metadata", TableShape::StrStr),
 ];
 
@@ -472,7 +513,25 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   migration needed; existing tables are untouched. Both tables stay empty
 ///   until a scheduled pipeline is evaluated, so pre-existing state resumes
 ///   unchanged.
-const CURRENT_SCHEMA_VERSION: u32 = 21;
+/// - **v22** — adds the [`FULFILL_STATE`] + [`PRODUCT_APPROVALS`] tables for
+///   the `rocky product` verbs (spec approval and, later, the fulfillment
+///   loop). Pure additive schema change (same shape as the v21 add): v21
+///   databases auto-create both empty tables on next open and stamp
+///   themselves as v22. No blob migration needed; existing tables are
+///   untouched. Both tables stay empty until `rocky product approve` runs,
+///   so pre-existing state resumes unchanged. Guarded by
+///   `test_v22_opens_and_creates_fulfill_tables`.
+///
+///   **Replication posture, decided here:** both tables are in
+///   [`LOCAL_ONLY_TABLE_NAMES`]. `fulfill_state` is per-machine loop state
+///   (the `schedule_claims` posture). `product_approvals` is local-only for
+///   a sharper reason: an approval record points at approved snapshot
+///   BYTES on disk (`.rocky/fulfillment/<name>/approved-<digest>.toml`),
+///   and state replication does not transport those files — a replicated
+///   record would let another pod observe a valid-looking approval whose
+///   spec it cannot read or verify. Revisit to replicated only when
+///   snapshot bytes gain durable replicated storage of their own.
+const CURRENT_SCHEMA_VERSION: u32 = 22;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -1076,6 +1135,8 @@ impl StateStore {
             let _table = txn.open_table(TOMBSTONES)?;
             let _table = txn.open_table(SCHEDULE_STATE)?;
             let _table = txn.open_table(SCHEDULE_CLAIMS)?;
+            let _table = txn.open_table(FULFILL_STATE)?;
+            let _table = txn.open_table(PRODUCT_APPROVALS)?;
         }
         // Construction-time commit: this runs on the raw `db` handle before any
         // `StateStore` (and thus any `write_epoch`) exists, so it deliberately
@@ -3584,6 +3645,149 @@ impl StateStore {
         }
     }
 
+    /// Read a product's current fulfillment record.
+    pub fn fulfill_state_get(
+        &self,
+        product_name: &str,
+    ) -> Result<Option<crate::fulfill::FulfillStateRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FULFILL_STATE)?;
+        let key = crate::fulfill::fulfill_state_key(product_name);
+        match table.get(key.as_str())? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read a product's spec-approval record.
+    ///
+    /// The record is a POINTER: `snapshot_path` names the approved bytes
+    /// on disk, and callers must re-verify their digest against
+    /// `spec_digest` before trusting them — a record proves an approval
+    /// happened, never what the bytes now say.
+    pub fn product_approval_get(
+        &self,
+        product_name: &str,
+    ) -> Result<Option<crate::fulfill::ProductApprovalRecord>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(PRODUCT_APPROVALS)?;
+        let key = crate::fulfill::fulfill_state_key(product_name);
+        match table.get(key.as_str())? {
+            Some(value) => Ok(Some(serde_json::from_slice(value.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// A product's fulfillment journal rows, in append order.
+    ///
+    /// The zero-padded sequence in the key makes the lexicographic range
+    /// scan return numeric order.
+    pub fn fulfill_journal_rows(
+        &self,
+        product_name: &str,
+    ) -> Result<Vec<crate::fulfill::FulfillJournalRow>, StateError> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(FULFILL_STATE)?;
+        let prefix = format!("{}#", crate::fulfill::fulfill_state_key(product_name));
+        let mut rows = Vec::new();
+        for entry in table.iter()? {
+            let (key, value) = entry?;
+            if key.value().starts_with(prefix.as_str()) {
+                rows.push(serde_json::from_slice(value.value())?);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The authority transition of `rocky product approve`: ONE write
+    /// transaction that compare-and-swaps the approval record, CASes the
+    /// fulfillment record, and appends the journal row — all-or-nothing.
+    ///
+    /// The caller writes the immutable digest-addressed snapshot file
+    /// FIRST; only then does this transaction run. A crash before it
+    /// leaves an orphan snapshot file (harmless, GC-able); a crash after
+    /// leaves a fully consistent world. There is no intermediate state in
+    /// which record and bytes disagree.
+    ///
+    /// Both CASes assert the stored value still equals the caller's
+    /// observed prior (`None` = expect absent). The journal sequence is
+    /// allocated HERE, inside the transaction, from the current record's
+    /// `journal_seq` — the caller's `new_state.journal_seq` and
+    /// `journal_row.seq` are overwritten — so a torn record/journal pair
+    /// cannot exist. On any mismatch nothing is written and the caller
+    /// must stop: another process moved the record.
+    pub fn product_approval_cas(
+        &self,
+        product_name: &str,
+        expected_approval: Option<&crate::fulfill::ProductApprovalRecord>,
+        new_approval: &crate::fulfill::ProductApprovalRecord,
+        expected_state: Option<&crate::fulfill::FulfillStateRecord>,
+        new_state: &crate::fulfill::FulfillStateRecord,
+        journal_row: &crate::fulfill::FulfillJournalRow,
+    ) -> Result<crate::fulfill::FulfillCas, StateError> {
+        use crate::fulfill::{FulfillCas, FulfillStateRecord, ProductApprovalRecord};
+
+        let key = crate::fulfill::fulfill_state_key(product_name);
+        let txn = self.db.begin_write()?;
+        let current_approval: Option<ProductApprovalRecord>;
+        let current_state: Option<FulfillStateRecord>;
+        let won;
+        {
+            let mut approvals = txn.open_table(PRODUCT_APPROVALS)?;
+            current_approval = match approvals.get(key.as_str())? {
+                Some(value) => Some(serde_json::from_slice(value.value())?),
+                None => None,
+            };
+            let mut states = txn.open_table(FULFILL_STATE)?;
+            current_state = match states.get(key.as_str())? {
+                Some(value) => Some(serde_json::from_slice(value.value())?),
+                None => None,
+            };
+            let approvals_match = match (expected_approval, &current_approval) {
+                (None, None) => true,
+                (Some(e), Some(c)) => e == c,
+                _ => false,
+            };
+            let states_match = match (expected_state, &current_state) {
+                (None, None) => true,
+                (Some(e), Some(c)) => e == c,
+                _ => false,
+            };
+            if approvals_match && states_match {
+                let seq = current_state
+                    .as_ref()
+                    .map(|record| record.journal_seq + 1)
+                    .unwrap_or(1);
+                let approval_bytes = serde_json::to_vec(new_approval)?;
+                approvals.insert(key.as_str(), approval_bytes.as_slice())?;
+
+                let mut stamped_state = new_state.clone();
+                stamped_state.journal_seq = seq;
+                let state_bytes = serde_json::to_vec(&stamped_state)?;
+                states.insert(key.as_str(), state_bytes.as_slice())?;
+
+                let mut stamped_row = journal_row.clone();
+                stamped_row.seq = seq;
+                let journal_key = crate::fulfill::fulfill_journal_key(product_name, seq);
+                let row_bytes = serde_json::to_vec(&stamped_row)?;
+                states.insert(journal_key.as_str(), row_bytes.as_slice())?;
+                won = true;
+            } else {
+                won = false;
+            }
+        }
+        if won {
+            self.commit_write(txn)?;
+            Ok(FulfillCas::Won)
+        } else {
+            drop(txn);
+            Ok(FulfillCas::Lost {
+                current_approval,
+                current_state,
+            })
+        }
+    }
+
     /// Find the newest terminal run record carrying `submission_id`, used by the
     /// stuck-claim resolver to derive an outcome. Skip statuses (which did no
     /// work) are ignored.
@@ -6063,6 +6267,196 @@ mod tests {
             store.get_schedule_claim("nonexistent").unwrap().is_none(),
             "a fresh store has an empty schedule claims table"
         );
+    }
+
+    #[test]
+    fn test_v22_opens_and_creates_fulfill_tables() {
+        // A store freshly opened under the current binary materializes the
+        // `fulfill_state` + `product_approvals` tables (part of the eager
+        // EXPECTED_TABLES set) and stamps itself at v22. Reads succeed
+        // against empty tables.
+        let (store, _dir) = temp_store();
+        assert!(
+            current_schema_version() >= 22,
+            "fulfillment tables exist from schema v22 onward"
+        );
+        assert!(
+            store.fulfill_state_get("nonexistent").unwrap().is_none(),
+            "a fresh store has an empty fulfill_state table"
+        );
+        assert!(
+            store.product_approval_get("nonexistent").unwrap().is_none(),
+            "a fresh store has an empty product_approvals table"
+        );
+        assert!(store.fulfill_journal_rows("nonexistent").unwrap().is_empty());
+    }
+
+    #[test]
+    fn product_approval_cas_writes_record_state_and_journal_atomically() {
+        use crate::fulfill::{
+            FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord,
+            ProductApprovalRecord,
+        };
+        let (store, _dir) = temp_store();
+        let approval = ProductApprovalRecord {
+            product_id: "product:revenue_daily".to_string(),
+            spec_digest: "sha256:aa".to_string(),
+            approver: "hugo".to_string(),
+            approved_at: Some("2026-08-19T00:00:00Z".to_string()),
+            snapshot_path: ".rocky/fulfillment/revenue_daily/approved-sha256:aa.toml".to_string(),
+        };
+        let state = FulfillStateRecord {
+            state: FulfillState::SpecApproved,
+            product_id: "product:revenue_daily".to_string(),
+            spec_digest: Some("sha256:aa".to_string()),
+            journal_seq: 0, // overwritten inside the transaction
+            updated_at: Some("2026-08-19T00:00:00Z".to_string()),
+        };
+        let row = FulfillJournalRow {
+            seq: 0, // overwritten inside the transaction
+            at: Some("2026-08-19T00:00:00Z".to_string()),
+            event: "spec approved".to_string(),
+            from_state: None,
+            to_state: "spec_approved".to_string(),
+            spec_digest: Some("sha256:aa".to_string()),
+        };
+        let outcome = store
+            .product_approval_cas("revenue_daily", None, &approval, None, &state, &row)
+            .unwrap();
+        assert_eq!(outcome, FulfillCas::Won);
+
+        let stored_approval = store.product_approval_get("revenue_daily").unwrap().unwrap();
+        assert_eq!(stored_approval, approval);
+        let stored_state = store.fulfill_state_get("revenue_daily").unwrap().unwrap();
+        assert_eq!(stored_state.state, FulfillState::SpecApproved);
+        assert_eq!(stored_state.journal_seq, 1, "seq allocated in the txn");
+        let rows = store.fulfill_journal_rows("revenue_daily").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[0].to_state, "spec_approved");
+
+        // A second approval (a re-approve under a new digest) CASes on the
+        // observed priors and appends seq 2 — record and journal move
+        // together.
+        let mut approval2 = approval.clone();
+        approval2.spec_digest = "sha256:bb".to_string();
+        let mut state2 = stored_state.clone();
+        state2.spec_digest = Some("sha256:bb".to_string());
+        let outcome = store
+            .product_approval_cas(
+                "revenue_daily",
+                Some(&approval),
+                &approval2,
+                Some(&stored_state),
+                &state2,
+                &row,
+            )
+            .unwrap();
+        assert_eq!(outcome, FulfillCas::Won);
+        assert_eq!(
+            store
+                .fulfill_state_get("revenue_daily")
+                .unwrap()
+                .unwrap()
+                .journal_seq,
+            2
+        );
+        assert_eq!(store.fulfill_journal_rows("revenue_daily").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn product_approval_cas_lost_writes_nothing() {
+        use crate::fulfill::{
+            FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord,
+            ProductApprovalRecord,
+        };
+        let (store, _dir) = temp_store();
+        let approval = ProductApprovalRecord {
+            product_id: "product:revenue_daily".to_string(),
+            spec_digest: "sha256:aa".to_string(),
+            approver: "hugo".to_string(),
+            approved_at: None,
+            snapshot_path: "x".to_string(),
+        };
+        let state = FulfillStateRecord {
+            state: FulfillState::SpecApproved,
+            product_id: "product:revenue_daily".to_string(),
+            spec_digest: Some("sha256:aa".to_string()),
+            journal_seq: 0,
+            updated_at: None,
+        };
+        let row = FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: "spec approved".to_string(),
+            from_state: None,
+            to_state: "spec_approved".to_string(),
+            spec_digest: None,
+        };
+        // Expecting a prior approval that does not exist: the CAS loses and
+        // NOTHING is written — not the approval, not the state, not a
+        // journal row (the two-humans race: the second approver stands
+        // down cleanly).
+        let outcome = store
+            .product_approval_cas(
+                "revenue_daily",
+                Some(&approval),
+                &approval,
+                None,
+                &state,
+                &row,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            FulfillCas::Lost {
+                current_approval: None,
+                current_state: None,
+            }
+        );
+        assert!(store.product_approval_get("revenue_daily").unwrap().is_none());
+        assert!(store.fulfill_state_get("revenue_daily").unwrap().is_none());
+        assert!(store.fulfill_journal_rows("revenue_daily").unwrap().is_empty());
+    }
+
+    #[test]
+    fn fulfill_journal_rows_are_scoped_to_their_product() {
+        use crate::fulfill::{
+            FulfillJournalRow, FulfillState, FulfillStateRecord, ProductApprovalRecord,
+        };
+        let (store, _dir) = temp_store();
+        for name in ["revenue", "revenue2"] {
+            let approval = ProductApprovalRecord {
+                product_id: format!("product:{name}"),
+                spec_digest: "sha256:aa".to_string(),
+                approver: "hugo".to_string(),
+                approved_at: None,
+                snapshot_path: "x".to_string(),
+            };
+            let state = FulfillStateRecord {
+                state: FulfillState::SpecApproved,
+                product_id: format!("product:{name}"),
+                spec_digest: None,
+                journal_seq: 0,
+                updated_at: None,
+            };
+            let row = FulfillJournalRow {
+                seq: 0,
+                at: None,
+                event: format!("approved {name}"),
+                from_state: None,
+                to_state: "spec_approved".to_string(),
+                spec_digest: None,
+            };
+            store
+                .product_approval_cas(name, None, &approval, None, &state, &row)
+                .unwrap();
+        }
+        // `revenue`'s scan must not pick up `revenue2`'s rows: the `#`
+        // separator ends the prefix, so a name-prefix sibling stays out.
+        let rows = store.fulfill_journal_rows("revenue").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event, "approved revenue");
     }
 
     #[test]
@@ -9961,12 +10355,18 @@ mod tests {
         // serde-additive `RunRecord::pipeline` / `submission_id` fields do not
         // change the table set; guarded by
         // `test_v20_run_record_forward_deserializes_schedule_fields_none`.
-        const EXPECTED_VERSION: u32 = 21;
+        // v22 adds the `fulfill_state` + `product_approvals` tables (`rocky
+        // product` verbs) — new tables, so they ARE in EXPECTED_TABLES below;
+        // guarded by `test_v22_opens_and_creates_fulfill_tables`. Both are
+        // local-only (the approval record points at snapshot bytes replication
+        // does not transport — see the v22 stanza on CURRENT_SCHEMA_VERSION).
+        const EXPECTED_VERSION: u32 = 22;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",
             "dag_snapshots",
             "discover_snapshots",
+            "fulfill_state",
             "grace_periods",
             "idempotency_keys",
             "input_index",
@@ -9977,6 +10377,7 @@ mod tests {
             "output_artifacts",
             "partitions",
             "policy_decisions",
+            "product_approvals",
             "quality_history",
             "run_history",
             "run_progress",
