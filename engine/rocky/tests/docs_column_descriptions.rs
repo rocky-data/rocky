@@ -328,3 +328,38 @@ fn description_matching_folds_ascii_case() {
         "no orphan warning for a case-only difference, got: {stderr}"
     );
 }
+
+/// Fix-delta red-team finding: the preloaded compile has no `NoModels`
+/// rejection, so without this guard a typo'd `--models` renders a blank
+/// catalog at exit 0 — the selector-matched-nothing shape #1428 closed for
+/// test/estimate/retention. Docs refuses it with the same wording.
+#[test]
+fn docs_refuse_a_missing_or_empty_models_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write config");
+
+    // Missing directory.
+    let missing = run_docs(dir);
+    assert!(
+        !missing.status.success(),
+        "a missing models dir must refuse, not render an empty catalog"
+    );
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("no models found in"),
+        "the refusal must match the sibling commands' wording, got: {stderr}"
+    );
+    assert!(
+        !dir.join("catalog.html").exists(),
+        "no catalog may be written for a refused run"
+    );
+
+    // Existing but empty directory: same answer.
+    fs::create_dir(dir.join("models")).expect("create empty models dir");
+    let empty = run_docs(dir);
+    assert!(
+        !empty.status.success(),
+        "an empty models dir must refuse the same way"
+    );
+}

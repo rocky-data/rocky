@@ -42,6 +42,16 @@ pub fn run_docs(
     // unparseable model would misrepresent the project.
     let models = crate::models_loader::load_project_models(models_dir)?;
 
+    // Zero models is a refusal, not an empty page. The loader treats a
+    // missing directory as empty, so a typo'd `--models` would render a
+    // blank "catalog" at exit 0 — the selector-matched-nothing shape
+    // #1428 closed for test/estimate/retention. Same wording as those
+    // siblings. This also guards the preloaded compile below, which —
+    // unlike `compile()` — has no `NoModels` rejection of its own.
+    if models.is_empty() {
+        anyhow::bail!("no models found in {}", models_dir.display());
+    }
+
     let models_count = models.len();
 
     info!(
