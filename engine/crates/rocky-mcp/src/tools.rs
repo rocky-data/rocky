@@ -2150,6 +2150,30 @@ impl RockyMcpServer {
             DraftRollback::snapshot_async(vec![paths.sql_path.clone(), paths.sidecar_path.clone()])
                 .await;
 
+        // FF-WP1 fix round 2 (item 2): an EXISTS-but-unreadable sidecar must
+        // REFUSE, mirroring the unparseable refusal below. The snapshot
+        // converts read errors to "absent", so without this guard the draft
+        // would treat the model as NEW — overwriting the sidecar's spec-owned
+        // metadata, evaluating policy with no prior classifications, and, on
+        // a deny, "restoring" the absent prior by DELETING the file. Checked
+        // against the same snapshot read the merge decision uses. Nothing has
+        // been written yet, so the guard is defused rather than dropped — a
+        // drop would perform exactly the deletion this refusal prevents.
+        if rollback.prior(&paths.sidecar_path).is_none()
+            && std::fs::metadata(&paths.sidecar_path).is_ok()
+        {
+            rollback.defuse();
+            return Err(ToolError::invalid_argument(
+                format!(
+                    "the sidecar at {} exists but cannot be read; refusing to rewrite it",
+                    rel_display(&self.root, &paths.sidecar_path)
+                ),
+                "Fix the sidecar file's permissions (it must be readable so its spec-owned \
+                 metadata can be preserved), then retry. draft_model never overwrites a sidecar \
+                 it cannot read.",
+            ));
+        }
+
         // FF-WP1 fix round (finding 2): build the sidecar to write, and
         // collect the PRIOR sidecar's classifications for the policy
         // pre-image/post-image dual evaluation below.

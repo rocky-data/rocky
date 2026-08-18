@@ -1498,6 +1498,88 @@ async fn draft_model_refuses_to_clobber_an_unparseable_sidecar() {
     client.cancel().await.unwrap();
 }
 
+/// FF-WP1 fix round 2 (item 2) — an EXISTS-but-unreadable sidecar refuses the
+/// redraft instead of being treated as a NEW model. The rollback snapshot
+/// converts read errors to "absent"; before the guard, the draft would
+/// overwrite the sidecar's spec-owned metadata and a policy-denied rollback
+/// would DELETE the file. The refusal names the path and the file survives
+/// untouched.
+#[cfg(unix)]
+#[tokio::test]
+async fn draft_model_refuses_an_existing_but_unreadable_sidecar() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sidecar_path = dir.path().join("models").join("orders.toml");
+    let sidecar_before = std::fs::read(&sidecar_path).unwrap();
+    let sql_path = dir.path().join("models").join("orders.sql");
+    let sql_before = std::fs::read(&sql_path).unwrap();
+
+    // Make the sidecar exist-but-unreadable, restoring permissions on every
+    // exit path so cleanup (and the byte comparison) can read it again.
+    let readable = std::fs::Permissions::from_mode(0o644);
+    std::fs::set_permissions(&sidecar_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    struct RestorePerms(std::path::PathBuf, std::fs::Permissions);
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+    let _restore = RestorePerms(sidecar_path.clone(), readable);
+
+    // Probe the condition the test needs: running as root (e.g. a container
+    // CI), mode 0o000 does not make the file unreadable, so the guard under
+    // test cannot fire — skip rather than assert a condition this
+    // environment cannot exhibit.
+    if std::fs::read(&sidecar_path).is_ok() {
+        eprintln!("skipping: chmod 0o000 does not make files unreadable here (running as root?)");
+        return;
+    }
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id",
+                "should not land",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an existing-but-unreadable sidecar refuses"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/orders.toml") && message.contains("cannot be read"),
+        "the error names the unreadable sidecar: {err:?}"
+    );
+
+    client.cancel().await.unwrap();
+
+    // The file SURVIVES — neither overwritten nor deleted by a rollback —
+    // and the SQL body is untouched.
+    drop(_restore);
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap(),
+        sidecar_before,
+        "the unreadable sidecar is byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(&sql_path).unwrap(),
+        sql_before,
+        "the SQL body is untouched too"
+    );
+}
+
 /// FF-WP1 fix round (finding 2) — THE de-scope pin: with a rule denying agent
 /// authorship on `classifications = ["pii"]`, redrafting a PII-classified
 /// model via `draft_model` is DENIED, and the rollback restores BOTH files
