@@ -1,20 +1,33 @@
 # Compare Demo — shadow table validation
 #
-# Demonstrates `rocky compare` for validating shadow copies against
-# production tables. Used when testing pipeline changes safely.
+# Demonstrates `rocky compare`: run a pipeline twice — once for real, once
+# into shadow tables — then compare the pairs before promoting a change.
 #
-# Usage:
-#   rocky --config engine/examples/compare-demo/rocky.toml run --shadow --shadow-suffix _shadow
-#   rocky --config engine/examples/compare-demo/rocky.toml compare --shadow-suffix _shadow
+# `rocky compare` pairs tables from REPLICATION source discovery, so this
+# example is a replication pipeline. Its source data bootstraps with
+# `rocky seed` (see seeds/), which lands a CSV in the raw__shopify schema
+# that discovery then finds.
+#
+# Usage (from this directory):
+#   rocky seed --seeds seeds/
+#   rocky run
+#   rocky run --shadow --shadow-suffix _shadow
+#   rocky compare --shadow-suffix _shadow
 
 [adapter.local]
 type = "duckdb"
+# File-backed so the `warehouse` catalog exists: a DuckDB file's catalog is
+# its file stem (#1445).
+path = "warehouse.duckdb"
 
 [pipeline.compare_demo]
 type = "replication"
 strategy = "full_refresh"
 
 [pipeline.compare_demo.source]
+adapter = "local"
+
+[pipeline.compare_demo.source.discovery]
 adapter = "local"
 
 [pipeline.compare_demo.source.schema_pattern]
@@ -25,18 +38,15 @@ components = ["source"]
 [pipeline.compare_demo.target]
 adapter = "local"
 catalog_template = "warehouse"
-schema_template = "analytics"
+schema_template = "staging__{source}"
 
 [pipeline.compare_demo.target.governance]
 auto_create_catalogs = false
-auto_create_schemas = false
+auto_create_schemas = true
 
 [pipeline.compare_demo.checks]
 row_count = true
 column_match = true
-
-[pipeline.compare_demo.execution]
-concurrency = 4
 
 [state]
 backend = "local"

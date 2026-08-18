@@ -1,0 +1,7 @@
+id,customer,amount,status,ordered_at
+1,acme,120.50,paid,2026-01-05
+2,globex,80.00,paid,2026-01-06
+3,initech,35.25,refunded,2026-01-07
+4,acme,210.00,paid,2026-01-08
+5,hooli,99.99,pending,2026-01-09
+6,globex,150.00,paid,2026-01-10

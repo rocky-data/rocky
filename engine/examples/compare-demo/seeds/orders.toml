@@ -1,0 +1,4 @@
+# Land the seed where source discovery looks: the schema_pattern
+# matches raw__<source>, so raw__shopify becomes source "shopify".
+[target]
+schema = "raw__shopify"
