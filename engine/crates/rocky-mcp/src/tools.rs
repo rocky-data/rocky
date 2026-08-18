@@ -5541,8 +5541,7 @@ mod tests {
             "pause_schedule",
         ] {
             assert!(
-                banner_lower.contains(tool)
-                    && banner_lower.contains("not available"),
+                banner_lower.contains(tool) && banner_lower.contains("not available"),
                 "the banner names `{tool}` as not available"
             );
         }
