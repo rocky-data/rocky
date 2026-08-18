@@ -23,17 +23,27 @@ def test_spec_version_is_frozen() -> None:
     assert SPEC_VERSION == "0"
 
 
-def test_min_rocky_version_parses_as_major_minor_patch() -> None:
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", MIN_ROCKY_VERSION)
-    assert match is not None
-    major, minor, patch = (int(part) for part in match.groups())
-    # The manifest below was verified against released rocky 1.70.1; the
-    # floor may only move forward from there.
-    assert (major, minor, patch) >= (1, 70, 1)
+def test_min_rocky_version_is_frozen() -> None:
+    # Exact, not a floor: the docstring's contract is that raising this pin is
+    # a deliberate diff made alongside the change that needs the newer engine.
+    # A `>=` here would let the pin drift without a visible test change.
+    assert MIN_ROCKY_VERSION == "1.70.1"
 
 
-def test_manifest_is_non_empty() -> None:
-    assert len(REQUIRED_MCP_TOOLS) > 0
+def test_manifest_is_frozen_exactly() -> None:
+    # The golden manifest: every name and every argument field, frozen. Any
+    # add, removal, or argument change is a deliberate, visible diff here.
+    assert {req.name: req.args for req in REQUIRED_MCP_TOOLS} == {
+        "list": frozenset({"kind"}),
+        "inspect_schema": frozenset(),
+        "sample_rows": frozenset({"model"}),
+        "compile": frozenset({"model"}),
+        "test": frozenset(),
+        "breaking_change": frozenset({"base"}),
+        "dependents": frozenset({"model"}),
+        "draft_model": frozenset({"name", "sql", "intent"}),
+        "draft_check": frozenset({"model", "spec"}),
+    }
 
 
 def test_manifest_entries_are_well_formed() -> None:
