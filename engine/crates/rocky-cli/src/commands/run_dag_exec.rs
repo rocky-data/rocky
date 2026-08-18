@@ -163,6 +163,7 @@ fn default_sub_runner() -> SubRunner {
                     None, // #1460: DAG sub-run, no persisted plan
                 )
                 .await
+                .map(|_| ())
                 .map_err(|e| format!("{e:#}"))
             })
         },
