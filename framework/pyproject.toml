@@ -28,11 +28,12 @@ dev = [
 rocky-sdk = { path = "../sdk/python", editable = true }
 
 [build-system]
-# Bounded on purpose — same reason as `sdk/python/pyproject.toml`: an
-# unbounded hatchling builds with whatever was just published, and a newer
-# hatchling's Metadata-Version output has already broken the pinned PyPI
-# publish action's twine once (#1395). Keep this bound in lockstep with the
-# sibling Python subprojects.
+# Bounded on purpose — same reason as `sdk/python/pyproject.toml`, which
+# carries the full story: hatchling 1.30.0 and 1.32.0 both shipped a
+# Metadata-Version bump, and the 1.32.0 one broke the pinned PyPI publish
+# action at the publish step (#1395). The ceiling turns the next such bump
+# into a caught failure instead of a broken publish. Keep the bound in
+# lockstep with the sibling Python subprojects.
 requires = ["hatchling>=1.30.1,<1.33"]
 build-backend = "hatchling.build"
 
