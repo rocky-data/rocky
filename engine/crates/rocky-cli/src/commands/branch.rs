@@ -3573,6 +3573,7 @@ effect = "deny"
             &shared_plan_id,
             &state_path,
             PolicyPrincipal::Agent,
+            None,
             false,
         )
         .await;
@@ -3637,6 +3638,7 @@ effect = "deny"
             &shared_plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            None,
             false,
         )
         .await

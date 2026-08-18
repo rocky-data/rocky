@@ -974,6 +974,7 @@ async fn drive_backfill_apply(project: &ModelProject, plan_id: &str) -> anyhow::
         plan_id,
         &project.state_path,
         rocky_core::config::PolicyPrincipal::Human, // kind-forces Agent anyway
+        None,
         false,
     )
     .await;

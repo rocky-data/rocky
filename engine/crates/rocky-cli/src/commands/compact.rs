@@ -1859,6 +1859,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                None,
                 true,
             )
             .await

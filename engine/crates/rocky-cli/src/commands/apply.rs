@@ -70,6 +70,7 @@ pub async fn run_apply(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
@@ -79,6 +80,7 @@ pub async fn run_apply(
         plan_id,
         state_path,
         runtime_principal,
+        expect_spec_digest,
         output_json,
     )
     .await
@@ -98,10 +100,16 @@ pub(crate) async fn run_apply_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
     let plan =
         read_plan(root, plan_id).with_context(|| format!("failed to read plan '{plan_id}'"))?;
+
+    // The product-identity equality gate runs HERE — the one seam every
+    // `rocky apply` dispatch crosses — before any per-kind gate arm (policy
+    // `Allow` / `NotConfigured` included), so no gate outcome can bypass it.
+    enforce_spec_digest_expectation(&plan, plan_id, expect_spec_digest)?;
 
     match plan.kind {
         PlanKind::Compact => {
@@ -209,6 +217,73 @@ pub(crate) async fn run_apply_in(
             )
             .await
         }
+    }
+}
+
+/// FF-WP1 ⟦RTL-4⟧ — `rocky apply --expect-spec-digest`, fail-closed both ways.
+///
+/// Reads the product-identity keys straight off the raw payload JSON (never a
+/// typed deserialize), so the gate covers every plan kind and hand-authored
+/// payloads alike:
+///
+/// - Plan carries `spec_digest` (or even a lone `product_id`) + no flag →
+///   **refuse**: a product-bound plan cannot be applied by a bare
+///   `rocky apply` — the runtime's expectation must be stated.
+/// - Flag given + payload has no `spec_digest` → **refuse**: the caller
+///   expected a product binding this plan does not carry.
+/// - Flag given + digests differ → **refuse**, naming both digests.
+/// - No product keys + no flag → today's behavior, untouched.
+///
+/// The comparison is equality over opaque strings; the engine never parses
+/// spec content. Honesty note: this proves *caller expectation == plan
+/// payload* — it cannot prove the spec file on disk still holds those bytes
+/// (that is the runtime's snapshot linearization).
+///
+/// Boundary: the standalone `rocky compact apply` / `rocky archive apply`
+/// verbs do not cross this seam, but they can only execute compact/archive
+/// plans (kind-checked), which the fulfillment chain never authors.
+fn enforce_spec_digest_expectation(
+    plan: &PersistedPlan,
+    plan_id: &str,
+    expect_spec_digest: Option<&str>,
+) -> Result<()> {
+    let payload_product = plan.payload.get("product_id").and_then(|v| v.as_str());
+    let payload_digest = plan.payload.get("spec_digest").and_then(|v| v.as_str());
+    match (expect_spec_digest, payload_digest) {
+        (None, Some(digest)) => bail!(
+            "plan '{plan_id}' is product-bound{}: its payload carries spec digest '{digest}', \
+             so a bare `rocky apply` is refused. Pass \
+             `rocky apply {plan_id} --expect-spec-digest <digest>` with the digest of the \
+             approved spec you intend to fulfil.",
+            payload_product
+                .map(|p| format!(" (product '{p}')"))
+                .unwrap_or_default(),
+        ),
+        (None, None) => {
+            // A payload with `product_id` but no `spec_digest` cannot come from
+            // `propose` (which validates the pair) — only from a hand-authored
+            // plan. Fail closed on it rather than treating it as unbound.
+            if let Some(product) = payload_product {
+                bail!(
+                    "plan '{plan_id}' names product '{product}' but carries no spec_digest — \
+                     a product-bound plan must carry both, and applying it requires \
+                     `--expect-spec-digest`. Re-propose the plan with both fields."
+                );
+            }
+            Ok(())
+        }
+        (Some(_), None) => bail!(
+            "--expect-spec-digest was given, but plan '{plan_id}' carries no spec_digest in \
+             its payload. The caller expected a product-bound plan; this one is not. Verify \
+             the plan id, or drop the flag only if applying a non-product plan is intended."
+        ),
+        (Some(expected), Some(actual)) if expected != actual => bail!(
+            "spec digest mismatch for plan '{plan_id}': the plan was authored against \
+             '{actual}' but the applier expected '{expected}'. The approved spec has moved \
+             since this plan was proposed — re-propose against the current approved spec \
+             instead of applying a stale plan."
+        ),
+        (Some(_), Some(_)) => Ok(()),
     }
 }
 
@@ -7520,6 +7595,141 @@ schema_template = "s__{source}"
         assert!(decoded.governance_override.is_some());
         assert_eq!(decoded.product_id.as_deref(), Some("product:revenue_daily"));
         assert_eq!(decoded.spec_digest.as_deref(), Some("sha256:abc123"));
+        Ok(())
+    }
+
+    /// FF-WP1 ⟦RTL-4⟧ — the `--expect-spec-digest` matrix, fail-closed both
+    /// ways, checked at the one seam every `rocky apply` crosses.
+    #[tokio::test]
+    async fn expect_spec_digest_gate_is_fail_closed_both_ways() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        // A deliberately nonexistent config: every per-kind arm hard-loads the
+        // config before its policy gate, so any refusal that mentions the
+        // product identity provably fired BEFORE any gate arm ran.
+        let config = root.join("rocky.toml");
+        let state = root.join("state.redb");
+
+        let bound = RunPlan {
+            product_id: Some("product:revenue_daily".to_string()),
+            spec_digest: Some("sha256:abc".to_string()),
+            ..minimal_run_plan()
+        };
+        let bound_id = crate::plan_store::write_plan(root, PlanKind::AiAuthored, &bound)?;
+        let unbound_id =
+            crate::plan_store::write_plan(root, PlanKind::AiAuthored, &minimal_run_plan())?;
+
+        // (a) product-bound plan + NO flag → refused, naming the binding.
+        let err = run_apply_in(
+            root,
+            &config,
+            &bound_id,
+            &state,
+            PolicyPrincipal::Human,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a product-bound plan must refuse a bare apply");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("product-bound") && msg.contains("--expect-spec-digest"),
+            "the refusal names the binding and the required flag: {msg}"
+        );
+
+        // (b) flag given + plan lacks the field → refused.
+        let err = run_apply_in(
+            root,
+            &config,
+            &unbound_id,
+            &state,
+            PolicyPrincipal::Human,
+            Some("sha256:abc"),
+            false,
+        )
+        .await
+        .expect_err("the flag against an unbound plan must refuse");
+        assert!(
+            format!("{err:#}").contains("carries no spec_digest"),
+            "distinct unbound-plan refusal: {err:#}"
+        );
+
+        // (c) mismatch → refused, naming BOTH digests.
+        let err = run_apply_in(
+            root,
+            &config,
+            &bound_id,
+            &state,
+            PolicyPrincipal::Human,
+            Some("sha256:other"),
+            false,
+        )
+        .await
+        .expect_err("a digest mismatch must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sha256:abc") && msg.contains("sha256:other"),
+            "the mismatch error carries both digests: {msg}"
+        );
+
+        // (d) match → the digest gate passes; the apply then fails LATER on
+        // the missing config, proving the gate sits before the per-kind arms
+        // (and therefore before every policy gate arm) rather than after.
+        let err = run_apply_in(
+            root,
+            &config,
+            &bound_id,
+            &state,
+            PolicyPrincipal::Human,
+            Some("sha256:abc"),
+            false,
+        )
+        .await
+        .expect_err("no config exists, so the apply fails past the digest gate");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("spec digest") && !msg.contains("product-bound"),
+            "a matching digest must clear the gate — the later failure is config-shaped: {msg}"
+        );
+
+        // No policy gate ever ran: the decision ledger has no rows (there is
+        // no config to gate with; a gate that ran would have errored first).
+        assert!(
+            !state.exists()
+                || StateStore::open(&state)?.list_policy_decisions()?.is_empty(),
+            "no custody row may exist for a pre-gate refusal"
+        );
+        Ok(())
+    }
+
+    /// A hand-authored payload naming a product WITHOUT a spec digest is not
+    /// treated as unbound — it fails closed (propose can never write this
+    /// shape, so it is tampered-or-authored-outside-the-chain by definition).
+    #[tokio::test]
+    async fn lone_product_id_without_digest_fails_closed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let half_bound = RunPlan {
+            product_id: Some("product:revenue_daily".to_string()),
+            spec_digest: None,
+            ..minimal_run_plan()
+        };
+        let plan_id = crate::plan_store::write_plan(root, PlanKind::AiAuthored, &half_bound)?;
+        let err = run_apply_in(
+            root,
+            &root.join("rocky.toml"),
+            &plan_id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Human,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a lone product_id must fail closed");
+        assert!(
+            format!("{err:#}").contains("carries no spec_digest"),
+            "distinct half-bound refusal: {err:#}"
+        );
         Ok(())
     }
 

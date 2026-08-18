@@ -443,6 +443,15 @@ enum Command {
         /// Plan identifier (64-char blake3 hex) returned by `rocky plan`,
         /// `rocky compact`, or `rocky archive`.
         plan_id: String,
+        /// Refuse unless the plan payload's `spec_digest` equals this value
+        /// (an opaque string compare — e.g. "sha256:<hex>").
+        ///
+        /// The gate is fail-closed both ways: a plan that carries a product
+        /// identity refuses a bare apply (this flag is REQUIRED for it), and
+        /// passing the flag against a plan with no `spec_digest` refuses
+        /// too. Checked before any policy gate arm.
+        #[arg(long)]
+        expect_spec_digest: Option<String>,
     },
 
     /// Review an AI-authored plan before it can be applied, or list the queue.
@@ -2989,7 +2998,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
 
     let result: Result<()> = match cli.command {
         Command::Init { path, template } => rocky_cli::commands::init(&path, Some(&template)),
-        Command::Apply { plan_id } => {
+        Command::Apply {
+            plan_id,
+            expect_spec_digest,
+        } => {
             // The enforcement principal is the apply-time runtime identity
             // (`--principal` / `ROCKY_PRINCIPAL`), NOT the plan's stored field:
             // an agent running `rocky apply` is gated as agent regardless of the
@@ -3001,6 +3013,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &plan_id,
                 &state_path,
                 runtime_principal,
+                expect_spec_digest.as_deref(),
                 json,
             )
             .await
@@ -4706,6 +4719,40 @@ mod tests {
                 idempotency_key, ..
             } => idempotency_key,
             _ => panic!("expected Run subcommand"),
+        }
+    }
+
+    /// FF-WP1: the wire contract is the LITERAL flag string
+    /// `--expect-spec-digest` — clap derives it from the `expect_spec_digest`
+    /// field, and a field rename would silently rename the flag the
+    /// fulfillment runner (and the SDK) shell out with. Pin it.
+    #[test]
+    fn apply_expect_spec_digest_flag_parses_by_its_literal_name() {
+        let cli = try_parse_with_big_stack(&[
+            "rocky",
+            "apply",
+            "abc123",
+            "--expect-spec-digest",
+            "sha256:feed",
+        ]);
+        match cli.command {
+            Command::Apply {
+                plan_id,
+                expect_spec_digest,
+            } => {
+                assert_eq!(plan_id, "abc123");
+                assert_eq!(expect_spec_digest.as_deref(), Some("sha256:feed"));
+            }
+            _ => panic!("expected Apply subcommand"),
+        }
+
+        // And the flag stays optional: a bare apply parses with None.
+        let cli = try_parse_with_big_stack(&["rocky", "apply", "abc123"]);
+        match cli.command {
+            Command::Apply {
+                expect_spec_digest, ..
+            } => assert_eq!(expect_spec_digest, None),
+            _ => panic!("expected Apply subcommand"),
         }
     }
 
