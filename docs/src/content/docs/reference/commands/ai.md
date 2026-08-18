@@ -443,6 +443,7 @@ Three rules keep that boundary in place:
 | `draft_model` | Write `models/<name>.sql` + sidecar and compile it. |
 | `draft_contract` | Write `models/<model>.contract.toml` (your `spec`) and compile-validate it against the model's schema. |
 | `draft_check` | Merge declarative `[[tests]]` checks (your `spec`) into the model's sidecar and compile. |
+| `draft_metadata` | Parse-merge a structured freshness / classification patch into the model's sidecar and compile. The policy check runs against the sidecar as patched. |
 
 A `draft_*` call made without its content `spec` returns an actionable error pointing at the matching `ai_*` generator.
 
