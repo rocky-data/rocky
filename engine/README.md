@@ -132,7 +132,7 @@ starts where this one ended, so `rocky brief` writes state. The other windows,
 ```bash
 rocky serve          # HTTP API over the compiler's semantic graph
 rocky lsp            # Language Server Protocol for IDEs
-rocky mcp            # Model Context Protocol server (30 agent tools, 6 write)
+rocky mcp            # Model Context Protocol server (31 agent tools, 7 write)
 rocky load           # Load CSV, Parquet, or JSONL files from a directory
 rocky ai "<intent>"  # Generate a model from a natural-language description
 ```
@@ -161,10 +161,11 @@ check did not run at all, not only when a check fails. The write has already
 landed by then, so that failure halts and alerts you. It does not roll the
 write back.
 
-Most of the 30 MCP tools only read. Six can write. Four go through that same
-policy evaluator: `draft_model`, `draft_contract`, `draft_check`, and
-`propose`. In a governed scope the evaluator returns a denial or a review
-requirement, and a denied draft leaves nothing on disk.
+Most of the 31 MCP tools only read. Seven can write. Five go through that same
+policy evaluator: `draft_model`, `draft_contract`, `draft_check`,
+`draft_metadata`, and `propose`. In a governed scope the evaluator returns a
+denial or a review requirement, and a denied draft leaves nothing new on disk
+(`draft_metadata` restores the sidecar it patched).
 
 The other two carry their own guard. `pause_schedule` needs `confirm: true`.
 Only a human can resume a schedule, with

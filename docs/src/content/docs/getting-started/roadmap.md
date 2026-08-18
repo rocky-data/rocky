@@ -99,7 +99,7 @@ else.
   byte-identical to the CLI's `--output json`, an async job model, and a
   generated OpenAPI 3.1 document. The [Embedding guide](/guides/embedding/)
   covers the four integration patterns. `rocky mcp` is the agent-facing surface
-  (30 tools). The [recipe-manifest spec](/reference/rocky-manifest-spec/) and
+  (31 tools). The [recipe-manifest spec](/reference/rocky-manifest-spec/) and
   the standalone `rocky-verify` binary let a third party check a manifest
   offline, with no engine installed.
 

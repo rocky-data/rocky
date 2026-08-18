@@ -229,7 +229,7 @@ compose rather than compete.
 | Schema sync | **Yes** | No | No |
 | Code explanation | **Yes** | No | No |
 | Test generation | **Yes** | No | No |
-| Agent authoring surface | **MCP (30 tools)** | No | No |
+| Agent authoring surface | **MCP (31 tools)** | No | No |
 
 ## CLI Commands
 

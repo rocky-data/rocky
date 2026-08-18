@@ -216,7 +216,7 @@ A rule can also name checks that must pass in that run. If one fails, or never r
 - **A plan written by AI waits for a human.** The engine enforces this. It is not a convention you can forget.
 - **You can test the rules.** `[[policy.tests]]` scenarios run through the real evaluator, so `rocky policy test` catches an edit that opens a hole.
 - **You can ask what happened.** `rocky audit --for <table>` says who changed what, and under whose authority. `rocky review --queue` ranks what waits on you.
-- **Agents connect over MCP.** `rocky mcp` exposes 30 tools. Six of them write, and those six pass the same rules.
+- **Agents connect over MCP.** `rocky mcp` exposes 31 tools. Seven of them write, and those seven pass the same rules.
 
 <p align="center">
   <img src="docs/public/demo-policy-enforce.gif" alt="an agent's change to a contracted model is planned, rocky apply run as the agent principal is denied by the policy plane with the rule named, and rocky audit shows the recorded decision" width="900" />

@@ -54,9 +54,9 @@ In the recording below, a PII-classified model flags a column left unmasked. Col
 
 **AI generate**: `Rocky: Generate Model from Intent` turns a description in plain English into a model. Rocky compiles each attempt and retries up to three times. It writes the model and its sidecar into `models/` only when the model type-checks. The command opens the result in a new tab, including the path of each file it wrote.
 
-**Agent mode**: the extension registers `rocky mcp` as a Model Context Protocol server for each workspace folder that has a `rocky.toml` at its root. Agent mode then drives Rocky through the engine's 30 tools. Most of them only read: compile, lineage, schema, row samples, and run history. Six of them write.
+**Agent mode**: the extension registers `rocky mcp` as a Model Context Protocol server for each workspace folder that has a `rocky.toml` at its root. Agent mode then drives Rocky through the engine's 31 tools. Most of them only read: compile, lineage, schema, row samples, and run history. Seven of them write.
 
-`draft_model`, `draft_contract`, and `draft_check` write files under `models/`. `propose` records a plan for a human to review, and applies nothing itself. `pause_schedule` pauses a pipeline's schedule, and `review_queue` can sign off a pending plan. Those last two refuse to act unless the agent passes `confirm: true`.
+`draft_model`, `draft_contract`, and `draft_check` write files under `models/`, and `draft_metadata` patches a model's sidecar metadata. `propose` records a plan for a human to review, and applies nothing itself. `pause_schedule` pauses a pipeline's schedule, and `review_queue` can sign off a pending plan. Those last two refuse to act unless the agent passes `confirm: true`.
 
 A `@rocky` chat participant handles four single-shot requests: `/generate`, `/explain`, `/sync`, and `/test`.
 

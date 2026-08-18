@@ -2251,12 +2251,16 @@ enum Command {
 
     /// Run the Model Context Protocol (MCP) server over stdio.
     ///
-    /// Exposes Rocky's read-only verification and data-grounding tools
-    /// (compile, plan_preview, lineage, test, list, inspect_schema,
-    /// sample_rows, profile_column, propose) so any MCP-capable agent harness
-    /// can drive Rocky. Long-running: serves until the client disconnects.
-    /// Materialization stays human-gated — the `propose` tool only writes an
-    /// AI-authored plan; a human runs `rocky review --approve` + `rocky apply`.
+    /// Exposes Rocky's verification and data-grounding tools (compile,
+    /// plan_preview, lineage, test, list, inspect_schema, sample_rows,
+    /// profile_column), the policy-gated write path (draft_model,
+    /// draft_contract, draft_check, draft_metadata, propose), and the
+    /// governor surface (estate_brief, review_queue, audit_query, ...) so
+    /// any MCP-capable agent harness can drive Rocky. Long-running: serves
+    /// until the client disconnects. Materialization stays human-gated — the
+    /// `propose` tool only writes an AI-authored plan; a human runs
+    /// `rocky review --approve` + `rocky apply`. Use `--profile worker` to
+    /// serve only the minimal drafting allowlist to an untrusted worker.
     Mcp {
         /// Pipeline config file the server resolves the project from.
         #[arg(long, default_value = "rocky.toml")]

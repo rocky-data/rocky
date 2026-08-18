@@ -1,11 +1,16 @@
 //! `rocky-mcp` — a Model Context Protocol (MCP) server exposing Rocky's
-//! read-only verification and data-grounding capabilities over stdio.
+//! verification, data-grounding, drafting, and governor capabilities over
+//! stdio.
 //!
 //! The differentiated value is the **typed** verification surface
 //! (`compile` / `plan_preview` / `lineage` / `test` / `inspect_schema`) — a
-//! harness can't reproduce these with a raw shell. Materialization stays
-//! human-gated: the agent can only *propose* an AI-authored plan; a human
-//! runs `rocky review --approve` + `rocky apply`.
+//! harness can't reproduce these with a raw shell — plus the policy-gated
+//! write path (`draft_model` / `draft_contract` / `draft_check` /
+//! `draft_metadata`). Materialization stays human-gated: the agent can only
+//! *propose* an AI-authored plan; a human runs `rocky review --approve` +
+//! `rocky apply` (a product-bound plan additionally requires
+//! `--expect-spec-digest`). `rocky mcp --profile worker` serves a minimal
+//! drafting allowlist for untrusted workers ([`McpProfile`]).
 //!
 //! ## Statelessness
 //!
@@ -17,7 +22,7 @@
 //!
 //! ## schemars dual-major note
 //!
-//! rmcp 2.2 pulls schemars 1.x; the rest of the Rocky workspace uses
+//! rmcp 3.x pulls schemars 1.x; the rest of the Rocky workspace uses
 //! schemars 0.8. The two `JsonSchema` traits are disjoint. Every result
 //! struct returned inside `Json<T>` therefore derives schemars **1.x** and is
 //! built from "pure" types only (`String`, `usize`, `bool`, `Vec<_>`, local

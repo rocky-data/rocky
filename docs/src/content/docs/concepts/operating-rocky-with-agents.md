@@ -38,6 +38,7 @@ does. The tools are named so the loop reads in sequence.
    │    │  draft_model   │
    │    │  draft_contract│
    │    │  draft_check   │
+   │    │  draft_metadata│
    │    └───────┬────────┘
    │            ▼
    │    ┌────────────────┐

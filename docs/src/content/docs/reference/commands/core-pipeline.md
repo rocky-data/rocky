@@ -455,7 +455,11 @@ rocky apply <plan-id>
 
 ### Flags
 
-No command-specific flags. Uses [global flags](#global-flags) only.
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--expect-spec-digest <DIGEST>` | `string` | *(none)* | Refuse unless the plan payload's `spec_digest` equals this value. The compare is an exact string compare; Rocky never parses the spec itself. |
+
+The check is fail-closed in both directions, and it runs before any policy gate. A plan that carries a product identity (`product_id` + `spec_digest` in its payload) refuses a bare `rocky apply` — the flag is required for it. The flag against a plan with no `spec_digest` refuses too. A mismatch refuses and names both digests. A plan without product fields, applied without the flag, behaves exactly as before.
 
 ### What each plan kind executes
 

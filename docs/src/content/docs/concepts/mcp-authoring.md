@@ -1,12 +1,12 @@
 ---
 title: MCP Authoring
-description: "The 30 tools rocky mcp exposes to an AI agent: what each one reads or writes, which ones call a language model under your own key, and what data leaves your machine."
+description: "The 31 tools rocky mcp exposes to an AI agent: what each one reads or writes, which ones call a language model under your own key, and what data leaves your machine."
 sidebar:
   order: 9.4
 ---
 
 `rocky mcp` runs Rocky as a [Model Context Protocol](https://modelcontextprotocol.io)
-server. It exposes 30 typed tools that an MCP-capable agent can call to author and
+server. It exposes 31 typed tools that an MCP-capable agent can call to author and
 evolve Rocky models against your real warehouse. Claude Desktop, an IDE assistant,
 or your own client all connect the same way.
 
@@ -136,6 +136,7 @@ rules. A `draft_*` tool never applies a change to the warehouse.
 | `draft_model` | `models/<name>.sql` + a sidecar carrying the intent. |
 | `draft_contract` | `models/<model>.contract.toml`, compile-validated against the model's inferred schema (a column the model doesn't produce comes back as a `W010` diagnostic). |
 | `draft_check` | one or more declarative `[[tests]]` blocks merged into the model's sidecar; run the `test` tool to execute them. |
+| `draft_metadata` | a structured freshness / classification patch, parse-merged into the model's sidecar as TOML. `freshness` replaces the `[freshness]` table; `classifications` merges per-column tags into `[classification]`. Comments in the sidecar are dropped on re-serialize; an unparseable sidecar is never overwritten. The policy check runs against the sidecar **as patched**, so a patch that adds the first `pii` tag is judged by that tag. |
 
 The split from the generators is deliberate. The `ai_*` generators *propose*
 content with a language model. The `draft_*` tools *write* content, yours or a
@@ -158,6 +159,19 @@ one ends at a proposed plan or an enumerated gap, never at an applied change.
 
 A prompt is a recommended sequence, not a privileged path. It calls exactly the
 tools listed above and it stops at the same gate.
+
+## Two profiles
+
+`rocky mcp` serves the full 31-tool surface by default. `rocky mcp --profile
+worker` serves a smaller, fixed list meant for an untrusted drafting worker: the
+read and inspect tools (`plan_preview`, `lineage`, `list`, `inspect_schema`,
+`catalog`, `sample_rows`, `profile_column`), the verification loop (`compile`,
+`test`, `breaking_change`, `dependents`), `draft_model` + `draft_check`, and the
+prompts. Everything else — `draft_contract`, `draft_metadata`, `propose`,
+`review_queue`, `pause_schedule`, the governor reads, and the generators — is
+absent from the listing, and calling one returns tool-not-found. The list is an
+allowlist: a tool added in a future release stays out of the worker profile
+unless it is added deliberately.
 
 ## The gates on the write path
 

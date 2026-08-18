@@ -177,6 +177,7 @@ The human sign-off that unblocks a gated plan.
 rocky review --queue                 # pending escalations, ranked, each with its approve command
 rocky review <plan-id>               # dry-run review: diff + breaking-change findings
 rocky review <plan-id> --approve     # record the sign-off that unblocks rocky apply
+rocky review <plan-id> --status      # typed, read-only: is the sign-off marker in place?
 ```
 
 ### Flags
@@ -186,6 +187,9 @@ rocky review <plan-id> --approve     # record the sign-off that unblocks rocky a
 | `--queue` | `bool` | `false` | List pending `require_review` escalations, ranked by blast radius, change class, and staleness. |
 | `--base <REF>` | `string` | `HEAD` | Git ref to diff the working-tree models against. |
 | `--approve` | `bool` | `false` | Record the sign-off marker. Without it, the review is a dry run. |
+| `--status` | `bool` | `false` | Report the plan's review state without changing it: whether a well-formed marker naming the plan exists, who approved it and when, and the plan's product binding. Conflicts with `--approve` and `--queue`. |
 | `--models <DIR>` | `path` | `models` | Models directory used to rank the queue by downstream blast radius. |
 
 `rocky apply` refuses an AI-authored, policy-escalated, `gc`, `backfill`, or `restore` plan until a review marker exists for it. Approving records who signed off, and when, into the same ledger `rocky audit` reads.
+
+The marker must do more than exist. Apply parses it and checks that it names the exact plan; a truncated marker, or one copied from another plan, is refused with its own distinct error. The marker is written atomically (staged, then renamed), so a crash mid-approval leaves no marker at all. `--status` reads the same oracle and reports it as typed JSON — a tool that polls for approval should use it instead of probing the marker file.
