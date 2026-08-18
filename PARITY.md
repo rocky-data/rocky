@@ -12,16 +12,15 @@ Source list: `uv run pytest --collect-only -q` in that worktree.
 | Module | Python nodes | MAPPED | DEFERRED-PART2 | DISSOLVED |
 |---|---|---|---|---|
 | `spec/parse.py` | 53 | 53 | 0 | 0 |
-| `spec/lower.py` | 50 | 22 | 28 | 0 |
+| `spec/lower.py` | 50 | 50 | 0 | 0 |
 | `spec/manifest.py` | 12 | 12 | 0 | 0 |
 | `spec/verify.py` | pending (part 2) | — | — | — |
-| **Total so far** | **115** | **87** | **28** | **0** |
+| **Total so far** | **115** | **115** | **0** | **0** |
 
-`DEFERRED-PART2` here is exactly one thing: the filesystem half of
+Nothing remains deferred: part 2 ported the filesystem half of
 `spec/lower.py` — staged writes, the staging journal, crash recovery, and the
-two orchestrators (`run_phase_a` / `run_phase_b`) that drive them. The port so
-far is the pure half. No lowering node is deferred for any other reason, and
-none is dissolved.
+two orchestrators (`run_phase_a` / `run_phase_b`) — into
+`rocky-core/src/product/commit.rs`. No lowering node is dissolved.
 
 ## `spec/parse.py` -> `rocky-core/src/product/spec.rs`
 
@@ -126,34 +125,34 @@ authority, not the name similarity.
 | `test_merge_fills_intent_only_when_absent` | MAPPED | `product::lowering::tests::the_merge_fills_intent_only_when_it_is_absent` |
 | `test_merge_rejects_unparseable_sidecar_naming_the_path` | MAPPED | `product::lowering::tests::the_merge_rejects_an_unparseable_sidecar_naming_the_path` |
 | `test_worker_test_identical_to_generated_is_absorbed_once` | MAPPED | `product::lowering::tests::a_worker_test_identical_to_a_generated_one_is_absorbed_once` |
-| `test_phase_a_refuses_cold_start_over_existing_model_files` | DEFERRED-PART2 | `run_phase_a` collision check — filesystem |
-| `test_phase_a_resumes_over_its_own_committed_lowering` | DEFERRED-PART2 | `run_phase_a` resume — reads the committed manifest |
-| `test_phase_b_requires_phase_a` | DEFERRED-PART2 | `run_phase_b` precondition — filesystem |
-| `test_phase_b_requires_the_drafted_sidecar` | DEFERRED-PART2 | `run_phase_b` precondition — filesystem |
-| `test_phase_b_refuses_after_a_spec_edit_supersedes_phase_a` | DEFERRED-PART2 | the orchestrated form; the pure boundary is MAPPED above |
-| `test_phase_b_refuses_a_foreign_generation_identity` | DEFERRED-PART2 | the orchestrated form; the pure boundary is MAPPED above |
-| `test_phase_b_detects_phase_a_tampering` | DEFERRED-PART2 | byte-verification against disk inside `run_phase_b` |
-| `test_full_two_phase_flow_commits_everything` | DEFERRED-PART2 | commit protocol |
-| `test_crash_between_staged_renames_rolls_back\[2\]` | DEFERRED-PART2 | recovery drill |
-| `test_crash_between_staged_renames_rolls_back\[3\]` | DEFERRED-PART2 | recovery drill |
-| `test_crash_before_journal_leaves_priors_untouched` | DEFERRED-PART2 | recovery drill |
-| `test_recovery_is_idempotent` | DEFERRED-PART2 | recovery drill |
-| `test_crash_after_commit_marker_rolls_forward` | DEFERRED-PART2 | recovery drill |
-| `test_forged_journal_with_traversal_path_is_refused_and_target_untouched` | DEFERRED-PART2 | journal containment |
-| `test_symlink_at_an_allowed_final_path_is_refused_and_target_untouched` | DEFERRED-PART2 | journal containment |
-| `test_symlinked_staging_residue_is_refused_before_any_mutation` | DEFERRED-PART2 | journal containment |
-| `test_forged_journal_with_absolute_path_is_refused` | DEFERRED-PART2 | journal containment |
-| `test_forged_journal_with_symlink_escape_is_refused` | DEFERRED-PART2 | journal containment |
-| `test_forged_journal_entry_outside_the_generation_namespace_is_refused` | DEFERRED-PART2 | journal authority |
-| `test_journal_entry_naming_the_journal_itself_is_refused` | DEFERRED-PART2 | journal authority |
-| `test_journal_entry_naming_a_foreign_manifest_path_is_refused` | DEFERRED-PART2 | journal authority |
-| `test_case_aliased_duplicate_finals_are_refused` | DEFERRED-PART2 | journal authority |
-| `test_forged_staged_manifest_grants_no_recovery_authority` | DEFERRED-PART2 | journal authority |
-| `test_contained_final_path_returns_the_resolved_absolute` | DEFERRED-PART2 | path-containment helper |
-| `test_malformed_journal_is_refused_without_mutation` | DEFERRED-PART2 | journal parsing |
-| `test_journal_naming_a_foreign_manifest_is_refused` | DEFERRED-PART2 | journal parsing |
-| `test_sigkilled_child_between_staged_renames_rolls_back` | DEFERRED-PART2 | process-death drill |
-| `test_recovery_runs_automatically_on_the_next_phase` | DEFERRED-PART2 | recovery wiring |
+| `test_phase_a_refuses_cold_start_over_existing_model_files` | MAPPED | `product::commit::tests::phase_a_refuses_cold_start_over_existing_model_files` |
+| `test_phase_a_resumes_over_its_own_committed_lowering` | MAPPED | `product::commit::tests::phase_a_resumes_over_its_own_committed_lowering` |
+| `test_phase_b_requires_phase_a` | MAPPED | `product::commit::tests::phase_b_requires_phase_a` |
+| `test_phase_b_requires_the_drafted_sidecar` | MAPPED | `product::commit::tests::phase_b_requires_the_drafted_sidecar` |
+| `test_phase_b_refuses_after_a_spec_edit_supersedes_phase_a` | MAPPED | `product::commit::tests::phase_b_refuses_after_a_spec_edit_supersedes_phase_a` |
+| `test_phase_b_refuses_a_foreign_generation_identity` | MAPPED | `product::commit::tests::phase_b_refuses_a_foreign_generation_identity` |
+| `test_phase_b_detects_phase_a_tampering` | MAPPED | `product::commit::tests::phase_b_detects_phase_a_tampering` |
+| `test_full_two_phase_flow_commits_everything` | MAPPED | `product::commit::tests::full_two_phase_flow_commits_everything` |
+| `test_crash_between_staged_renames_rolls_back\[2\]` | MAPPED | `product::commit::tests::crash_between_staged_renames_rolls_back (both bomb positions in one loop)` |
+| `test_crash_between_staged_renames_rolls_back\[3\]` | MAPPED | `product::commit::tests::crash_between_staged_renames_rolls_back (both bomb positions in one loop)` |
+| `test_crash_before_journal_leaves_priors_untouched` | MAPPED | `product::commit::tests::crash_before_journal_leaves_priors_untouched` |
+| `test_recovery_is_idempotent` | MAPPED | `product::commit::tests::recovery_is_idempotent` |
+| `test_crash_after_commit_marker_rolls_forward` | MAPPED | `product::commit::tests::crash_after_commit_marker_rolls_forward` |
+| `test_forged_journal_with_traversal_path_is_refused_and_target_untouched` | MAPPED | `product::commit::tests::forged_journal_with_traversal_path_is_refused_and_target_untouched` |
+| `test_symlink_at_an_allowed_final_path_is_refused_and_target_untouched` | MAPPED | `product::commit::tests::symlink_at_an_allowed_final_path_is_refused_and_target_untouched` |
+| `test_symlinked_staging_residue_is_refused_before_any_mutation` | MAPPED | `product::commit::tests::symlinked_staging_residue_is_refused_before_any_mutation` |
+| `test_forged_journal_with_absolute_path_is_refused` | MAPPED | `product::commit::tests::forged_journal_with_absolute_path_is_refused` |
+| `test_forged_journal_with_symlink_escape_is_refused` | MAPPED | `product::commit::tests::forged_journal_with_symlink_escape_is_refused` |
+| `test_forged_journal_entry_outside_the_generation_namespace_is_refused` | MAPPED | `product::commit::tests::forged_journal_entry_outside_the_generation_namespace_is_refused` |
+| `test_journal_entry_naming_the_journal_itself_is_refused` | MAPPED | `product::commit::tests::journal_entry_naming_the_journal_itself_is_refused` |
+| `test_journal_entry_naming_a_foreign_manifest_path_is_refused` | MAPPED | `product::commit::tests::journal_entry_naming_a_foreign_manifest_path_is_refused` |
+| `test_case_aliased_duplicate_finals_are_refused` | MAPPED | `product::commit::tests::case_aliased_duplicate_finals_are_refused` |
+| `test_forged_staged_manifest_grants_no_recovery_authority` | MAPPED | `product::commit::tests::forged_staged_manifest_grants_no_recovery_authority` |
+| `test_contained_final_path_returns_the_resolved_absolute` | MAPPED | `product::commit::tests::contained_final_path_returns_the_resolved_absolute` |
+| `test_malformed_journal_is_refused_without_mutation` | MAPPED | `product::commit::tests::malformed_journal_is_refused_without_mutation` |
+| `test_journal_naming_a_foreign_manifest_is_refused` | MAPPED | `product::commit::tests::journal_naming_a_foreign_manifest_is_refused` |
+| `test_sigkilled_child_between_staged_renames_rolls_back` | MAPPED | `product::commit::tests::sigkilled_child_between_staged_renames_rolls_back` |
+| `test_recovery_runs_automatically_on_the_next_phase` | MAPPED | `product::commit::tests::recovery_runs_automatically_on_the_next_phase` |
 
 ## `spec/manifest.py` -> `rocky-core/src/product/manifest.rs`
 
@@ -188,6 +187,8 @@ Beyond the parser's own added tests, listed further up.
 | `product::lowering::tests::a_preserved_scalar_survives_and_stays_above_the_tables` | A preserved scalar other than name/intent, which no Python test carried. |
 | `product::lowering::tests::a_nullable_column_gets_no_not_null_test` | Every column in the fixture is non-nullable, so the guard was invisible to the goldens. |
 | `product::lowering::tests::a_freshness_budget_too_wide_for_toml_is_refused` | The added refusal below. |
+| `product::commit::tests::crash_during_a_cold_phase_a_removes_the_renamed_new_files` | A mutation pass showed rollback's brand-new-file removal branch was live but unreached: every Phase-B drill replaces files that exist. A cold Phase-A crash is the shape that needs it. |
+| `product::commit::tests::half_canonical_path_aliases_are_refused_as_unsafe` | A mutation pass showed the canonical-spelling gate was unpinned: `a//b`-style aliases normalize inside `Path::components` and would fall through to a different refusal. |
 | `product::manifest::tests::the_instance_walk_covers_every_row_the_schema_declares` | The mechanization the answer key lacks — see divergence 6. |
 | `product::manifest::tests::json_escapes_everything_outside_printable_ascii` | The hand-written JSON writer's escaping, including surrogate pairs. |
 | `product::manifest::tests::leaf_derivation_recurses_through_a_nested_unit_model` | Unreachable in today's schema, and a hole waiting for the first model that nests another. |
@@ -222,7 +223,14 @@ Beyond the parser's own added tests, listed further up.
    is not a drift from the answer key — it is two producers with two spellings,
    and both are pinned by tests.
 
-5. **The renderer is new code with no Python counterpart, and that is the
+5. **Duplicate-final folding uses `str::to_lowercase`, not Unicode
+   casefolding.** Python's `str.casefold` also folds shapes like `ß` → `ss`;
+   Rust's standard library has no casefold. Artifact paths in this protocol
+   are ASCII (`models/<identifier>.toml` and the state dir), where the two
+   are identical, and the check exists for case-insensitive filesystems,
+   whose own folding is closer to `to_lowercase` than to full casefolding.
+
+6. **The renderer is new code with no Python counterpart, and that is the
    largest residual risk in this port.** The answer key delegated its output to
    a library; the port reimplements that library's layout rules (four-space
    indent, the 100-character inline budget counted in characters rather than
