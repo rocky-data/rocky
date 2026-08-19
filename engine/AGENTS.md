@@ -270,6 +270,14 @@ rocky product status <name>      # Read-only: spec, lowering, artifact verificat
 
 Product specs live at `products/<name>.toml`; `rocky validate` checks them offline (V050–V053). Reference: `../docs/src/content/docs/reference/commands/products.md`.
 
+### Fulfillment (spec-driven fulfillment, loop side — EXPERIMENTAL)
+```bash
+rocky fulfill <name> [--retry]     # Drive the reconciler: elicit → approve → lower → draft (agent) → verify → propose → review → apply → observe
+rocky fulfill approve-spec <name>  # Same authority transition as `rocky product approve` (one implementation, two spellings)
+```
+
+The loop lives in `crates/rocky-fulfill` (state machine + subprocess agent driver) and consumes `rocky-cli` ONLY through `commands/fulfill_api.rs`; configure it via `[fulfill.driver]` in `rocky.toml`. Reference: `../docs/src/content/docs/reference/commands/fulfill.md`.
+
 ### Administration
 ```bash
 rocky history                        # Run history with trend analysis
