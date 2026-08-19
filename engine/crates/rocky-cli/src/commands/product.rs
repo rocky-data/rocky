@@ -955,6 +955,16 @@ fn approver_string() -> String {
 pub(crate) fn write_approval_snapshot(root: &Path, parsed: &ParsedSpec) -> Result<String> {
     let rel = approval_snapshot_rel(&parsed.product().name, &parsed.digest);
     let path = root.join(&rel);
+    // A digest-addressed snapshot is an engine-written regular file — a
+    // symlink sitting at it is tamper. Refuse before the read below (which
+    // follows a link) and before the write path (whose `rename` would
+    // otherwise replace a link at the final).
+    if is_symlink(&path) {
+        bail!(
+            "[approval-snapshot-tampered] {rel} is a symlink — a digest-addressed snapshot \
+             is an immutable regular file; refusing to read or approve through it"
+        );
+    }
     if path.is_file() {
         let existing = std::fs::read(&path)
             .with_context(|| format!("failed to read existing snapshot {}", path.display()))?;
@@ -972,12 +982,80 @@ pub(crate) fn write_approval_snapshot(root: &Path, parsed: &ParsedSpec) -> Resul
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+    // Stage the snapshot bytes into a scratch temp. A plain `std::fs::write`
+    // FOLLOWS a symlink planted at the temp path (a malicious spec repo or a
+    // lower-privilege process could park one at `approved-<hex>.toml.tmp`
+    // pointing out of the project), writing the spec bytes through it. This
+    // refuses a symlinked temp as tamper and creates the file with O_EXCL so
+    // a link swapped in during the race is refused too, never followed.
     let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, &parsed.raw)
-        .with_context(|| format!("failed to stage snapshot at {}", tmp.display()))?;
+    stage_snapshot_temp(&tmp, &rel, &parsed.raw)?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("failed to commit snapshot at {}", path.display()))?;
     Ok(rel)
+}
+
+/// True when `path` is a symlink itself (never following it).
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// Write the snapshot bytes to a brand-new scratch temp, refusing a symlink.
+///
+/// A plain `std::fs::write` follows a symlink at `tmp`; this does not.
+/// `create_new` (O_CREAT|O_EXCL) refuses to follow a link at the final
+/// component and refuses to clobber, so a link an attacker plants — even
+/// one swapped in after the pre-check, during the race — is refused rather
+/// than written through. The only legitimate `AlreadyExists` is our own
+/// stale scratch from a crashed approve: a regular file is removed
+/// (`unlink` never follows a link) and the O_EXCL create retried once; a
+/// symlink is refused as tamper.
+fn stage_snapshot_temp(tmp: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    let tamper = || {
+        anyhow::anyhow!(
+            "[approval-snapshot-tampered] the snapshot staging temp for {rel} is a symlink — \
+             refusing to write the approved bytes through it"
+        )
+    };
+    if is_symlink(tmp) {
+        bail!(tamper());
+    }
+    let open = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)
+    };
+    let mut file = match open() {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A link swapped in during the race is caught by O_EXCL (it
+            // returned AlreadyExists rather than following) — refuse it.
+            if is_symlink(tmp) {
+                bail!(tamper());
+            }
+            // Our own stale regular-file scratch: unlink (never follows a
+            // link) and retry once. A second AlreadyExists means a racer
+            // re-planted — refuse rather than loop.
+            std::fs::remove_file(tmp)
+                .with_context(|| format!("failed to clear stale snapshot temp {}", tmp.display()))?;
+            open().map_err(|err| {
+                if err.kind() == std::io::ErrorKind::AlreadyExists {
+                    tamper()
+                } else {
+                    anyhow::Error::from(err)
+                        .context(format!("failed to stage snapshot at {}", tmp.display()))
+                }
+            })?
+        }
+        Err(err) => {
+            return Err(anyhow::Error::from(err)
+                .context(format!("failed to stage snapshot at {}", tmp.display())));
+        }
+    };
+    file.write_all(bytes)
+        .with_context(|| format!("failed to stage snapshot at {}", tmp.display()))
 }
 
 /// Verify an approval record's snapshot bytes against its digest.
@@ -2121,6 +2199,44 @@ effect = "require_review"
         let output = product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
         assert_eq!(output.snapshot_path, snapshot_rel);
         assert!(!output.already_approved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approve_refuses_a_symlinked_snapshot_temp_and_leaves_it_untouched() {
+        // The same class as the commit staging vector: `write_approval_snapshot`
+        // stages the approved bytes into `approved-<hex>.toml.tmp`. A plain
+        // `std::fs::write` there follows an attacker-planted symlink out of the
+        // project and writes the spec bytes through it. Plant the link, approve,
+        // assert refusal and an untouched target.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"bytes the approval temp must never overwrite").expect("write");
+
+        let parsed = parsed_d3();
+        // The snapshot temp is `<snapshot>.toml.tmp` — `with_extension`
+        // replaces the final `.toml`, exactly as the writer derives it.
+        let snapshot = root.join(approval_snapshot_rel("revenue_daily", &parsed.digest));
+        let tmp = snapshot.with_extension("toml.tmp");
+        std::fs::create_dir_all(tmp.parent().expect("parent")).expect("mkdir");
+        std::os::unix::fs::symlink(&secret, &tmp).expect("symlink");
+
+        let error = product_approve_in(&root, &state_path, "revenue_daily")
+            .expect_err("symlinked snapshot temp");
+        assert!(
+            format!("{error:#}").contains("approval-snapshot-tampered"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&secret).expect("still there"),
+            b"bytes the approval temp must never overwrite",
+            "the out-of-project target must be untouched"
+        );
+        // Nothing was recorded — the transition never reached the store.
+        let store = StateStore::open(&state_path).expect("opens");
+        assert!(store.product_approval_get("revenue_daily").expect("reads").is_none());
     }
 
     #[test]
