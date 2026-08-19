@@ -1038,8 +1038,9 @@ fn stage_snapshot_temp(tmp: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
             // Our own stale regular-file scratch: unlink (never follows a
             // link) and retry once. A second AlreadyExists means a racer
             // re-planted — refuse rather than loop.
-            std::fs::remove_file(tmp)
-                .with_context(|| format!("failed to clear stale snapshot temp {}", tmp.display()))?;
+            std::fs::remove_file(tmp).with_context(|| {
+                format!("failed to clear stale snapshot temp {}", tmp.display())
+            })?;
             open().map_err(|err| {
                 if err.kind() == std::io::ErrorKind::AlreadyExists {
                     tamper()
@@ -2236,7 +2237,12 @@ effect = "require_review"
         );
         // Nothing was recorded — the transition never reached the store.
         let store = StateStore::open(&state_path).expect("opens");
-        assert!(store.product_approval_get("revenue_daily").expect("reads").is_none());
+        assert!(
+            store
+                .product_approval_get("revenue_daily")
+                .expect("reads")
+                .is_none()
+        );
     }
 
     #[test]

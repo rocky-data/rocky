@@ -1304,7 +1304,8 @@ mod tests {
         // copied to `<final>.ff-prev` — a symlink there is written through.
         let dir = tempfile::tempdir().expect("tempdir");
         let secret = dir.path().join("outside-secret");
-        std::fs::write(&secret, b"private bytes the backup copy must not overwrite").expect("write");
+        std::fs::write(&secret, b"private bytes the backup copy must not overwrite")
+            .expect("write");
         let project = seeded_project(dir.path());
         let parsed = parsed_d3();
         // First commit: the contract final now exists, so the next commit
@@ -1363,7 +1364,10 @@ mod tests {
         plant_symlink(&project.join("models/revenue_daily.contract.toml"), &secret);
         let error = run_phase_a(&project, SPEC_PATH, &parsed).expect_err("symlinked final");
         assert_eq!(error.code, "commit-symlinked-target");
-        assert_eq!(std::fs::read(&secret).expect("still there"), b"final-target bytes");
+        assert_eq!(
+            std::fs::read(&secret).expect("still there"),
+            b"final-target bytes"
+        );
     }
 
     // --------------- the journal is untrusted: forgeries refused ------------
