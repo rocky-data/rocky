@@ -568,10 +568,13 @@ fn run_watch_exits_on_sigterm() {
         }
     }
 
+    // Reap on every path: `try_wait` only reaps when it returns `Some`, so a
+    // watcher that ignored the signal must be killed AND waited on, or the
+    // test leaves a zombie behind (clippy::zombie_processes).
     if exited.is_none() {
         let _ = child.kill();
-        let _ = child.wait();
     }
+    let _ = child.wait();
     assert!(
         exited.is_some(),
         "rocky run --watch ignored SIGTERM for {:?} — before #1405 the watch \
