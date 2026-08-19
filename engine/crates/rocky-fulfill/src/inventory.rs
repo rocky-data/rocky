@@ -9,6 +9,15 @@
 //! enumerated in a golden, so an addition is a deliberate,
 //! reviewer-visible diff — and a handful of forbidden shapes are
 //! grepped for outright.
+//!
+//! Honest limits: this is a TEXT scanner, not a resolver. It refuses
+//! every alias/rename shape it can see (bare crate tokens, `use … as`
+//! on rocky paths, group renames), and it scans code only (comments and
+//! string literals are stripped before extraction) — but a macro that
+//! ASSEMBLES a path, or generated code, is invisible to it. That class
+//! is covered by the structural wall, which is the authoritative one:
+//! no public rocky-cli symbol can mint or persist a plan outside the
+//! governed helper, and the compile-fail suite pins it.
 
 #![cfg(test)]
 
@@ -83,26 +92,87 @@ fn crate_sources() -> Vec<(PathBuf, String)> {
     out
 }
 
-/// Extract every `rocky_cli::…` / `rocky_core::…` path mentioned in the
-/// sources, expanding one level of `use path::{A, B::C}` groups so the
-/// golden names full items, not just group prefixes. This file itself is
-/// excluded (the golden would otherwise read its own pin list).
-fn consumed_paths() -> BTreeSet<String> {
+/// Blank out everything that is not code: line comments, block
+/// comments, string literals (escape-aware), and raw string literals
+/// (`r"…"` through `r###"…"###`). Citations in docs and paths inside
+/// error strings are neither consumption nor violations; the golden
+/// pins CODE.
+fn strip_comments_and_strings(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = vec![b' '; bytes.len()];
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            b'r' if matches!(bytes.get(i + 1), Some(&b'"') | Some(&b'#')) => {
+                // Raw string: r"…" or r#"…"# (count the hashes).
+                let mut hashes = 0;
+                let mut j = i + 1;
+                while bytes.get(j) == Some(&b'#') {
+                    hashes += 1;
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b'"') {
+                    j += 1;
+                    let terminator: Vec<u8> = std::iter::once(b'"')
+                        .chain(std::iter::repeat_n(b'#', hashes))
+                        .collect();
+                    while j < bytes.len() && !bytes[j..].starts_with(&terminator) {
+                        j += 1;
+                    }
+                    i = (j + terminator.len()).min(bytes.len());
+                } else {
+                    out[i] = bytes[i];
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1; // skip the escaped byte (incl. \")
+                    }
+                    i += 1;
+                }
+                i = (i + 1).min(bytes.len());
+            }
+            other => {
+                out[i] = other;
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Extract every `rocky_cli::…` / `rocky_core::…` path the CODE
+/// consumes (comments and string literals stripped first), expanding
+/// one level of `use path::{A, B::C}` groups so the golden names full
+/// items, not just group prefixes — plus every rename VIOLATION the
+/// walk saw (`use <rocky path> as x`, group renames). This file itself
+/// is excluded (the golden would otherwise read its own pin list).
+fn scan_sources() -> (BTreeSet<String>, Vec<String>) {
     let mut found = BTreeSet::new();
+    let mut violations = Vec::new();
     for (path, text) in crate_sources() {
         if path.ends_with("inventory.rs") {
             continue;
         }
-        // Comment lines cite paths (machine.rs cites schedule::claim by
-        // instruction) without consuming them: the golden pins CODE.
-        let code_only: String = text
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        collect_from(&code_only, &mut found);
+        let code_only = strip_comments_and_strings(&text);
+        collect_from(&code_only, &mut found, &mut violations);
     }
-    found
+    (found, violations)
 }
 
 /// Alias shapes that would let engine paths hide from the golden:
@@ -135,8 +205,9 @@ fn alias_violations(text: &str) -> Vec<String> {
     violations
 }
 
-fn collect_from(text: &str, found: &mut BTreeSet<String>) {
+fn collect_from(text: &str, found: &mut BTreeSet<String>, violations: &mut Vec<String>) {
     let bytes = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut i = 0;
     while let Some(offset) = text[i..]
         .find("rocky_cli::")
@@ -166,10 +237,29 @@ fn collect_from(text: &str, found: &mut BTreeSet<String>) {
             }
         }
         let base = normalize(text[start..end].trim_end_matches("::"));
+        // A qualified rename (`use rocky_cli::commands::fulfill_api as
+        // gate;`) would let every later `gate::X` consumption hide from
+        // the golden — refused outright, exactly like the bare-token
+        // alias.
+        {
+            let mut after = end;
+            while after < bytes.len() && (bytes[after] as char).is_whitespace() {
+                after += 1;
+            }
+            let renames = text[after..].starts_with("as")
+                && bytes.get(after + 2).is_none_or(|b| !is_ident(*b));
+            if renames {
+                violations.push(format!(
+                    "qualified rename of `{}` (`… as …`) hides consumption from the \
+                     golden — name engine paths in full",
+                    text[start..end].trim_end_matches("::")
+                ));
+            }
+        }
         // A `use base::{A, B as X, C::D}` group: expand one level, at
         // SYMBOL granularity — façade items included, so a NEW façade
-        // consumption is a golden diff. A rename inside the group is an
-        // alias violation, reported via `alias_violations`-style text.
+        // consumption is a golden diff. A rename inside the group is a
+        // violation for the same reason as the qualified rename.
         if bytes.get(end) == Some(&b'{') {
             let close = text[end..].find('}').map(|c| end + c);
             if let Some(close) = close {
@@ -178,11 +268,12 @@ fn collect_from(text: &str, found: &mut BTreeSet<String>) {
                     if item.is_empty() {
                         continue;
                     }
-                    assert!(
-                        !item.contains(" as "),
-                        "use-group rename `{item}` hides a path from the golden — name \
-                         engine items in full"
-                    );
+                    if item.contains(" as ") {
+                        violations.push(format!(
+                            "use-group rename `{item}` hides a path from the golden — \
+                             name engine items in full"
+                        ));
+                    }
                     let item = item.split_whitespace().next().unwrap_or(item);
                     if item == "self" {
                         found.insert(base.clone());
@@ -263,21 +354,30 @@ fn names_identifier_prefix(text: &str, prefix: &str) -> bool {
 }
 
 /// Alias shapes hide paths from the golden — none may exist anywhere
-/// in the crate (comments included: a commented alias is a recipe).
+/// in the crate: bare crate tokens, qualified renames
+/// (`use rocky_cli::… as gate;`), and use-group renames, all checked on
+/// the code the extraction scan walks (comments and strings stripped —
+/// prose cannot compile, and paths inside error strings are neither
+/// consumption nor evasion).
 #[test]
 fn no_engine_crate_is_aliased_or_bare() {
     for (path, text) in crate_sources() {
         if path.ends_with("inventory.rs") {
             continue;
         }
-        let violations = alias_violations(&text);
+        let violations = alias_violations(&strip_comments_and_strings(&text));
         assert!(violations.is_empty(), "{}: {violations:?}", path.display());
     }
+    let (_, rename_violations) = scan_sources();
+    assert!(
+        rename_violations.is_empty(),
+        "rename violations: {rename_violations:?}"
+    );
 }
 
 #[test]
 fn the_route_inventory_golden_matches_the_source() {
-    let consumed = consumed_paths();
+    let (consumed, _) = scan_sources();
     let pinned: BTreeSet<String> = CONSUMED_ENGINE_PATHS
         .iter()
         .map(ToString::to_string)
