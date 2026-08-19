@@ -56,10 +56,23 @@ pub async fn run_estimate(
         })
         .collect();
 
+    // An unknown `--model` is a mistake, not an empty result: refuse it the
+    // way `rocky compile --model` does, rather than reporting zero estimates
+    // at exit 0 (#1428).
+    if let Some(filter) = model_filter
+        && !all_models.iter().any(|m| m.config.name == filter)
+    {
+        return Err(anyhow::Error::new(super::ModelNotFound(filter.to_string())));
+    }
+
     if models_to_estimate.is_empty() {
         info!("no models found to estimate");
         if output_json {
-            print_json(&EstimateOutput::new(vec![]))?;
+            // Carries the same explanation the text path prints. Previously
+            // the human was told "No models found." and the JSON consumer got
+            // a bare empty array with no way to tell "nothing to estimate"
+            // from "the command did not run" (#1428).
+            print_json(&EstimateOutput::empty("no models found to estimate"))?;
         } else {
             println!("No models found.");
         }
@@ -101,7 +114,19 @@ pub async fn run_estimate(
 
     // 4. Report.
     if output_json {
-        print_json(&EstimateOutput::new(estimates))?;
+        // Models were selected but none produced an estimate — every SQL-gen
+        // or EXPLAIN failed (both are `debug!`-only above, and the per-model
+        // "explain failed" line is printed on the text path only). Without
+        // this, the payload is `{"estimates": [], "total_models": 0}`: the
+        // same silent-empty shape as a project with nothing to estimate, and
+        // a contract violation of `EstimateOutput::message`, which promises
+        // to say why an empty result is empty (#1428).
+        let output = if estimates.is_empty() {
+            EstimateOutput::empty("no model produced an estimate")
+        } else {
+            EstimateOutput::new(estimates)
+        };
+        print_json(&output)?;
     } else {
         print!(
             "{}",

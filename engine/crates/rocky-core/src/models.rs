@@ -133,7 +133,7 @@ pub struct ModelConfig {
     #[serde(default)]
     pub adapter: Option<String>,
     /// Natural language description of what this model does.
-    /// Used by `rocky ai sync` to propose updates when upstream schemas change.
+    /// Used by `rocky ai-sync` to propose updates when upstream schemas change.
     #[serde(default)]
     pub intent: Option<String>,
     /// Per-model freshness expectation. Declarative-only — the compiler does
@@ -1661,7 +1661,11 @@ pub fn load_column_docs_from_dir(
     }
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+        // `.rocky` DSL models carry the same companion `.toml` sidecar as
+        // `.sql` models; scanning only `.sql` silently dropped every DSL
+        // model's descriptions (#1444).
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext != Some("sql") && ext != Some("rocky") {
             continue;
         }
         let stem = path
@@ -1672,6 +1676,10 @@ pub fn load_column_docs_from_dir(
         let toml_path = path.with_extension("toml");
         let toml_src = if toml_path.exists() {
             std::fs::read_to_string(&toml_path)?
+        } else if ext == Some("rocky") {
+            // DSL files have no `-- name:` frontmatter convention; without a
+            // sidecar there is nowhere a `[columns]` table could live.
+            continue;
         } else {
             let content = std::fs::read_to_string(&path)?;
             match split_frontmatter(&content) {

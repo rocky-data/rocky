@@ -804,6 +804,38 @@ RETENTION_STATUS: dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------------
+# review_status — the `rocky review <plan-id> --status` marker oracle for an
+# approved, product-bound AI-authored plan (FF-WP1).
+# ---------------------------------------------------------------------------
+
+REVIEW_STATUS: dict[str, Any] = {
+    "version": "1.70.1",
+    "command": "review_status",
+    "plan_id": "a" * 64,
+    "kind": "ai_authored",
+    "reviewed": True,
+    "reviewed_at": "2026-08-18T09:00:00Z",
+    "approver": {
+        "email": "dev@example.com",
+        "name": "Dev",
+        "host": "localhost",
+        "source": "local",
+    },
+    "breaking_change_count": 0,
+    "product_id": "product:revenue_daily",
+    "spec_digest": "sha256:0123abcd",
+}
+
+# The pending half: no marker yet, optional fields absent (skip-serialized).
+REVIEW_STATUS_PENDING: dict[str, Any] = {
+    "version": "1.70.1",
+    "command": "review_status",
+    "plan_id": "b" * 64,
+    "kind": "ai_authored",
+    "reviewed": False,
+}
+
+# ---------------------------------------------------------------------------
 # catalog — project-wide column-lineage snapshot covering one source and
 # two derived models. Mirrors what `rocky catalog` would emit against the
 # playground POC.

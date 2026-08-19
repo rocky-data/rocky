@@ -5,16 +5,19 @@ sidebar:
   order: 20
 ---
 
-`dagster-rocky` ships **`RockyResource.run_streaming()`**, a
-Pipes-style alternative to `RockyResource.run()` that spawns the binary
-via `subprocess.Popen`, forwards rocky's stderr (where the engine's
-Rust `tracing` layer writes `info!()` / `warn!()` macros) to
-`context.log.info` line-by-line as the run progresses, and parses the
-final stdout JSON into a `RunResult` after the subprocess exits.
+**`RockyResource.run_streaming()`** is a Pipes-style alternative to
+`RockyResource.run()`. It spawns the binary with `subprocess.Popen`
+rather than waiting for the whole process to finish.
 
-This gives long-running pipelines live progress: instead of the run
-viewer dumping the whole log only after a 30-minute `rocky run` finishes,
-users see each model copy / contract check / drift action as it happens.
+While the run proceeds, `run_streaming` forwards rocky's stderr to
+`context.log.info` one line at a time. That stderr is where the engine's
+Rust `tracing` layer writes its `info!()` and `warn!()` output. After the
+subprocess exits, `run_streaming` parses the final stdout JSON into a
+`RunResult`.
+
+The payoff is live progress on a long pipeline. You see each model copy,
+contract check, and drift action as it happens. You do not wait for one
+log dump after a 30-minute `rocky run` finishes.
 
 ## Quickstart
 
@@ -60,17 +63,16 @@ result = rocky.run_streaming(
 )
 ```
 
-The first positional argument is the Dagster execution context (an
-`AssetExecutionContext` from a `@multi_asset` or an `OpExecutionContext`
-from a `@op`). All the partition selection flags from the
-[partitions guide](/dagster/partitions/) work identically.
+The first positional argument is the Dagster execution context. It is an
+`AssetExecutionContext` inside a `@multi_asset`, or an
+`OpExecutionContext` inside a `@op`. Every partition selection flag from
+the [partitions guide](/dagster/partitions/) works the same way here.
 
 ## Automatic wiring in `RockyComponent`
 
-When you use `RockyComponent`, the component already calls
-`run_streaming` by default; every multi-asset materialization gets
-live log streaming for free. No configuration needed — wire it up as a
-component in your `defs.yaml`:
+`RockyComponent` calls `run_streaming` by default. Every multi-asset
+materialization therefore streams its logs. There is nothing to
+configure. Wire the component up in your `defs.yaml`:
 
 ```yaml
 type: dagster_rocky.RockyComponent
@@ -78,10 +80,10 @@ attributes:
   config_path: rocky.toml
 ```
 
-Inside the component's asset factory (`_make_rocky_asset`), the
-`_run_filters` helper passes the execution context through to
-`run_streaming` for every filter pass. Users see progress in the run
-viewer as the materialization runs.
+Inside the component's asset factory, `_make_rocky_asset`, the
+`_run_filters` helper passes the execution context to `run_streaming` on
+every filter pass. Progress appears in the run viewer while the
+materialization runs.
 
 ## Failure handling
 
@@ -95,20 +97,20 @@ viewer as the materialization runs.
 | Binary missing | Raises `dg.Failure` with installation instructions |
 | Subprocess timeout | Kills the process, joins the reader thread, raises `dg.Failure` with the configured timeout in the message and the stderr tail |
 
-The `stderr_tail` metadata on failures captures the actual progress
-lines the engine emitted before crashing, much more useful for
-debugging than a bare exit code.
+The `stderr_tail` metadata on a failure holds the progress lines the
+engine printed before it crashed. That tells you more than a bare exit
+code.
 
 ## How it works under the hood
 
 ```
-+-------------------+         +----------------------+
-|  Dagster context  |         |  rocky subprocess    |
-|                   |         |                      |
++-------------------+         +-----------------------+
+|  Dagster context  |         |  rocky subprocess     |
+|                   |         |                       |
 |  context.log <----+---<<<---+ stderr (line-buffered)|
-|                   |         |                      |
-|       buffer  <---+---<<<---+ stdout (JSON output) |
-+-------------------+         +----------------------+
+|                   |         |                       |
+|       buffer  <---+---<<<---+ stdout (JSON output)  |
++-------------------+         +-----------------------+
         |                              |
         |                              v
         |                         exit code
@@ -124,10 +126,11 @@ debugging than a bare exit code.
 2. Two daemon threads drain the pipes concurrently: a stderr-forwarder
    that sends each non-empty line to `context.log.info` with a `rocky:`
    prefix, and a stdout-accumulator that collects the JSON payload.
-3. The main thread blocks on a plain `proc.wait()` (no timeout on
-   `wait()` — `communicate(timeout=)` raced with the stderr reader on
-   the same pipe FD). A separate watchdog thread enforces the timeout by
-   `SIGKILL`-ing the process group if `wait()` hasn't returned in time.
+3. The main thread blocks on a plain `proc.wait()`, with no timeout on
+   `wait()` itself. `communicate(timeout=)` raced with the stderr reader
+   on the same pipe FD, so it is not used. A separate watchdog thread
+   enforces the timeout instead. It `SIGKILL`s the process group if
+   `wait()` has not returned in time.
 4. After the subprocess exits, the reader threads join (with a 2-second
    grace period for any in-flight lines).
 5. If exit is clean or partial-success, the captured stdout is parsed
@@ -163,7 +166,7 @@ def my_asset(context, rocky: RockyResource):
     return result.tables_copied
 ```
 
-Live progress with a batch result. Doesn't depend on Pipes message
+Live progress with a batch result. It does not depend on Pipes message
 emission, so it works against any rocky binary.
 
 ### `run_pipes()`: full Dagster Pipes (structured events)
@@ -174,32 +177,32 @@ def my_asset(context: dg.AssetExecutionContext, rocky: RockyResource):
     yield from rocky.run_pipes(context, filter="tenant=acme").get_results()
 ```
 
-Spawns rocky via [`dg.PipesSubprocessClient`](https://docs.dagster.io/api/dagster/pipes#dagster.PipesSubprocessClient)
-which sets `DAGSTER_PIPES_CONTEXT` and `DAGSTER_PIPES_MESSAGES` env vars.
-As of `dagster-rocky` v1.30, the client invokes `rocky plan` first to
-write `.rocky/plans/<plan-id>.json`, then runs `rocky apply <plan-id>`
-as the Pipes subprocess. The plan id is passed via `extras={"plan_id":
-plan_id}`, so the Dagster run viewer surfaces it as run metadata and
-reviewers can click straight from the materialization back to the plan
-artifact that produced it.
+Spawns rocky via [`dg.PipesSubprocessClient`](https://docs.dagster.io/api/dagster/pipes#dagster.PipesSubprocessClient),
+which sets the `DAGSTER_PIPES_CONTEXT` and `DAGSTER_PIPES_MESSAGES` env
+vars. As of `dagster-rocky` v1.30, the client runs `rocky plan` first to
+write `.rocky/plans/<plan-id>.json`. It then runs `rocky apply <plan-id>`
+as the Pipes subprocess. The plan id travels along as
+`extras={"plan_id": plan_id}`, so the run viewer shows it as run
+metadata. A reviewer can click from the materialization straight back to
+the plan artifact that produced it.
 
-The rocky engine (≥1.34, verified by the SDK's `MIN_ROCKY_VERSION` floor)
-detects the Pipes env vars and emits structured
-Pipes messages on the messages channel; see [Engine-side
+The rocky engine detects those env vars and emits structured Pipes
+messages on the messages channel. This needs engine ≥1.34, which the
+SDK's `MIN_ROCKY_VERSION` floor verifies. See [Engine-side
 emission](#engine-side-dagster-pipes-message-emission) for the message
-types. In the run viewer these surface as `MaterializationEvent`s (with
-strategy, duration_ms, rows_copied, sql_hash, partition_key) and
+types. In the run viewer they arrive as `MaterializationEvent`s, carrying
+strategy, duration_ms, rows_copied, sql_hash, and partition_key, plus
 `AssetCheckEvaluation`s.
 
 Returns a `PipesClientCompletedInvocation`. Call `.get_results()` to
-extract the materialization events Dagster constructed from the Pipes
+extract the materialization events Dagster built from the Pipes
 messages.
 
-`run_pipes` requires engine ≥1.34, which content-addresses and persists
-a plan for every project shape — including replication-only projects
-(no `models/` directory). There is no fallback: if `rocky plan` does not
-emit a `plan_id`, `run_pipes` raises `dg.Failure` rather than running
-without one.
+`run_pipes` requires engine ≥1.34. That version content-addresses and
+persists a plan for every project shape, including replication-only
+projects with no `models/` directory. There is no fallback. If
+`rocky plan` emits no `plan_id`, `run_pipes` raises `dg.Failure` rather
+than running without one.
 
 ## Engine-side: Dagster Pipes message emission
 
@@ -221,22 +224,22 @@ no external dependency. On a run it:
 4. When env vars are not set, the entire path is a no-op; zero
    overhead for non-Dagster callers.
 
-The current engine emission is **batch at end of run** (events emit
-right before the JSON output payload, not as each table completes). A
-future engine release can upgrade to per-event streaming with no
-wire-protocol or consumer changes.
+The current engine emission is **batch at end of run**. Events emit right
+before the JSON output payload, not as each table completes. A future
+engine release can move to per-event streaming without changing the wire
+protocol or any consumer.
 
 ## RockyComponent default
 
-`RockyComponent` streams by default (`execution_mode: streaming`), where
-each `rocky run` is buffered by `run_streaming` and the component's own
+`RockyComponent` streams by default, with `execution_mode: streaming`.
+Each `rocky run` is buffered by `run_streaming`, and the component's own
 result-emitter translates Rocky's JSON output into Dagster events.
 
-To get full Pipes integration with structured engine events instead, set
-`execution_mode: pipes` on the component — each run goes through
-`run_pipes`, the engine emits materialization / check events directly
-over the Pipes wire, and asset-key translation and subset filtering
-happen at the reader layer:
+For full Pipes integration with structured engine events, set
+`execution_mode: pipes` on the component. Each run then goes through
+`run_pipes`. The engine emits materialization and check events directly
+over the Pipes wire. Asset-key translation and subset filtering happen at
+the reader layer:
 
 ```yaml
 type: dagster_rocky.RockyComponent

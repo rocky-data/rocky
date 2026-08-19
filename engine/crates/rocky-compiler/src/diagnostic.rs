@@ -222,7 +222,10 @@ pub const W031: &str = "W031";
 // Info
 /// Model dependency inferred from SQL.
 pub const I001: &str = "I001";
-/// Model compiled with SELECT *.
+/// Some columns have unknown types — source schemas would complete the check.
+///
+/// Emitted only on *partial* inference (some columns typed, some not), not for
+/// `SELECT *` as such: see the sole emitter in `typecheck.rs`.
 pub const I002: &str = "I002";
 
 // Lints — portability + blast-radius

@@ -5,12 +5,15 @@ sidebar:
   order: 17
 ---
 
-`dagster-rocky` surfaces Rocky's compile-time contract validation as
-native Dagster [`AssetCheckSpec`](https://docs.dagster.io/api/dagster/asset-checks#dagster.AssetCheckSpec)
+A [compile-time contract](/reference/glossary/#compile-time-contract) is a
+schema agreement that Rocky enforces before it writes a single row.
+`dagster-rocky` surfaces that validation as native Dagster
+[`AssetCheckSpec`](https://docs.dagster.io/api/dagster/asset-checks#dagster.AssetCheckSpec)
 and [`AssetCheckResult`](https://docs.dagster.io/api/dagster/asset-checks#dagster.AssetCheckResult)
-events. Each model with a `.contract.toml` file gets one or more contract
-specs pre-declared at load time, visible in the asset detail page before
-any compile or run.
+events.
+
+Every model with a `.contract.toml` file gets one or more contract check specs
+at load time. They show on the asset detail page before any compile or run.
 
 ## Quickstart
 
@@ -20,7 +23,7 @@ any compile or run.
 project/
 ├── rocky.toml
 ├── models/
-│   └── orders.toml
+│   ├── orders.toml
 │   └── orders.sql
 └── contracts/
     └── orders.contract.toml
@@ -56,18 +59,18 @@ attributes:
   contracts_dir: contracts  # ← enables contract checks
 ```
 
-After deployment, every model with a contract file shows up to three new
-contract checks in the asset detail page (depending on which rule kinds
-are declared in the contract):
+After you deploy, each model with a contract file shows up to three contract
+checks on its asset detail page. Which of the three appear depends on the rule
+kinds the contract declares:
 
-- `contract_required_columns`: passes when no E010 diagnostics
-- `contract_protected_columns`: passes when no E013 diagnostics
-- `contract_column_constraints`: passes when no E011/E012/W010 diagnostics
+- `contract_required_columns`: passes when there are no E010 diagnostics
+- `contract_protected_columns`: passes when there are no E013 diagnostics
+- `contract_column_constraints`: passes when there are no E011/E012/W010 diagnostics
 
 ## Diagnostic code mapping
 
-Rocky's compiler emits stable diagnostic codes for contract violations.
-`dagster-rocky` translates them into the corresponding asset check kind:
+Rocky's compiler emits a stable code for each kind of contract violation.
+`dagster-rocky` maps each code to one asset check:
 
 | Code | Severity | Meaning | Maps to check |
 |---|---|---|---|
@@ -86,7 +89,7 @@ When a check fails, the `AssetCheckResult` includes:
 
 ## Standalone helpers
 
-The translation logic is exposed as pure functions you can use without
+The translation logic is exposed as pure functions. Use them without
 `RockyComponent`:
 
 ```python
@@ -117,18 +120,17 @@ results = list(
 )
 ```
 
-## Why pre-declare specs?
+## Why the specs exist before the first run
 
-Pre-declaring `AssetCheckSpec` instances at load time means the Dagster
-UI shows contract slots **before any compile or run**. Users see at a
-glance which models have contracts and which contract kinds are
-expected, even on a fresh deployment.
+The specs are declared at load time, so the Dagster UI shows the contract slots
+**before any compile or run**. On a fresh deployment you can still see which
+models have contracts, and which contract kinds each one declares.
 
-## When does the wiring fire?
+## Which assets get contract checks
 
-`RockyComponent` matches contracts to assets by **table name**: a
-contract file `orders.contract.toml` attaches to any asset whose key
-ends with `orders`. This applies to:
+`RockyComponent` matches contracts to assets by **table name**. A contract file
+`orders.contract.toml` attaches to any asset whose key ends with `orders`. Two
+kinds of asset qualify:
 
 - **Derived-model assets** — set `surface_derived_models: true` (or
   `dag_mode: true`) and every silver-layer model is surfaced as its own
@@ -137,7 +139,7 @@ ends with `orders`. This applies to:
 - **Source-replication tables** whose table name happens to match a
   contract file — the fallback when derived models are not surfaced.
 
-## Defensive parsing
+## How `discover_contract_rules` handles bad input
 
 `discover_contract_rules` is defensive against:
 
@@ -146,5 +148,5 @@ ends with `orders`. This applies to:
 - **Malformed TOML:** raises `ContractParseError` with the offending
   file path in the message, so users can find and fix the file.
 
-This means you can pass `contracts_dir="contracts"` unconditionally
-without guarding the existence of the directory.
+So you can pass `contracts_dir="contracts"` without first checking that the
+directory exists.

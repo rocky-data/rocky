@@ -443,6 +443,15 @@ enum Command {
         /// Plan identifier (64-char blake3 hex) returned by `rocky plan`,
         /// `rocky compact`, or `rocky archive`.
         plan_id: String,
+        /// Refuse unless the plan payload's `spec_digest` equals this value
+        /// (an opaque string compare — e.g. "sha256:<hex>").
+        ///
+        /// The gate is fail-closed both ways: a plan that carries a product
+        /// identity refuses a bare apply (this flag is REQUIRED for it), and
+        /// passing the flag against a plan with no `spec_digest` refuses
+        /// too. Checked before any policy gate arm.
+        #[arg(long)]
+        expect_spec_digest: Option<String>,
     },
 
     /// Review an AI-authored plan before it can be applied, or list the queue.
@@ -470,6 +479,12 @@ enum Command {
         /// List the pending-review queue instead of reviewing a single plan.
         #[arg(long)]
         queue: bool,
+        /// Report the plan's review state (typed, read-only): whether a
+        /// well-formed sign-off marker naming it exists, who approved it and
+        /// when, and its product binding. A malformed or mismatched marker
+        /// is an error, never a status.
+        #[arg(long, conflicts_with_all = ["approve", "queue"])]
+        status: bool,
         /// Models directory used to rank the queue by downstream blast radius.
         #[arg(long, default_value = "models")]
         models: PathBuf,
@@ -1197,6 +1212,12 @@ enum Command {
         /// Output file path (default: docs/catalog.html)
         #[arg(long = "output-path", default_value = "docs/catalog.html")]
         output_path: PathBuf,
+        /// Per-run variable substituted into model SQL (repeatable), as in
+        /// `rocky compile --var`. Column metadata comes from an offline
+        /// compile; a required `@var(name)` left unset is a compile error,
+        /// and docs then render without column tables.
+        #[arg(long = "var", value_name = "NAME=VALUE")]
+        var: Vec<String>,
     },
 
     /// Inspect or manage the state store.
@@ -2236,17 +2257,47 @@ enum Command {
 
     /// Run the Model Context Protocol (MCP) server over stdio.
     ///
-    /// Exposes Rocky's read-only verification and data-grounding tools
-    /// (compile, plan_preview, lineage, test, list, inspect_schema,
-    /// sample_rows, profile_column, propose) so any MCP-capable agent harness
-    /// can drive Rocky. Long-running: serves until the client disconnects.
-    /// Materialization stays human-gated — the `propose` tool only writes an
-    /// AI-authored plan; a human runs `rocky review --approve` + `rocky apply`.
+    /// Exposes Rocky's verification and data-grounding tools (compile,
+    /// plan_preview, lineage, test, list, inspect_schema, sample_rows,
+    /// profile_column), the policy-gated write path (draft_model,
+    /// draft_contract, draft_check, draft_metadata, propose), and the
+    /// governor surface (estate_brief, review_queue, audit_query, ...) so
+    /// any MCP-capable agent harness can drive Rocky. Long-running: serves
+    /// until the client disconnects. Materialization stays human-gated — the
+    /// `propose` tool only writes an AI-authored plan; a human runs
+    /// `rocky review --approve` + `rocky apply`. Use `--profile worker` to
+    /// serve only the minimal drafting allowlist to an untrusted worker.
     Mcp {
         /// Pipeline config file the server resolves the project from.
         #[arg(long, default_value = "rocky.toml")]
         config: PathBuf,
+        /// Tool surface to serve. `default` exposes every tool; `worker` is
+        /// the minimal drafting allowlist for untrusted workers: the
+        /// read/inspect grounding tools, compile / test / breaking_change /
+        /// dependents, draft_model + draft_check, and the prompts — no
+        /// contract, metadata, propose, review, or schedule surface.
+        #[arg(long, value_enum, default_value_t = McpProfileArg::Default)]
+        profile: McpProfileArg,
     },
+}
+
+/// Clap-facing mirror of [`rocky_mcp::McpProfile`], kept CLI-local so the
+/// rocky-mcp crate stays clap-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum McpProfileArg {
+    /// Full tool surface (unchanged behavior).
+    Default,
+    /// Minimal drafting-worker allowlist.
+    Worker,
+}
+
+impl From<McpProfileArg> for rocky_mcp::McpProfile {
+    fn from(value: McpProfileArg) -> Self {
+        match value {
+            McpProfileArg::Default => rocky_mcp::McpProfile::Default,
+            McpProfileArg::Worker => rocky_mcp::McpProfile::Worker,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -2989,7 +3040,10 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
 
     let result: Result<()> = match cli.command {
         Command::Init { path, template } => rocky_cli::commands::init(&path, Some(&template)),
-        Command::Apply { plan_id } => {
+        Command::Apply {
+            plan_id,
+            expect_spec_digest,
+        } => {
             // The enforcement principal is the apply-time runtime identity
             // (`--principal` / `ROCKY_PRINCIPAL`), NOT the plan's stored field:
             // an agent running `rocky apply` is gated as agent regardless of the
@@ -3001,6 +3055,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 &plan_id,
                 &state_path,
                 runtime_principal,
+                expect_spec_digest.as_deref(),
                 json,
             )
             .await
@@ -3010,10 +3065,16 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             base,
             approve,
             queue,
+            status,
             models,
         } => {
             if queue {
                 rocky_cli::commands::run_review_queue(&cli.config, &state_path, &models, json)
+            } else if status {
+                let Some(plan_id) = plan_id else {
+                    anyhow::bail!("`rocky review --status` needs a <plan-id>");
+                };
+                rocky_cli::commands::run_review_status(&cli.config, &plan_id, json)
             } else {
                 let Some(plan_id) = plan_id else {
                     anyhow::bail!(
@@ -3586,7 +3647,20 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
         Command::Docs {
             models,
             output_path,
-        } => rocky_cli::commands::run_docs(&cli.config, &models, &output_path, json),
+            var,
+        } => {
+            let run_vars = rocky_core::run_vars::RunVars::parse_pairs(&var)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            rocky_cli::commands::run_docs(
+                &cli.config,
+                &models,
+                &output_path,
+                &state_path,
+                cli.cache_ttl,
+                &run_vars,
+                json,
+            )
+        }
         Command::State { action } => match action {
             None | Some(StateAction::Show) => rocky_cli::commands::state_show(&state_path, json),
             Some(StateAction::ClearSchemaCache { dry_run }) => {
@@ -4538,7 +4612,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             rocky_cli::commands::run_completions::<Cli>(shell, &mut std::io::stdout());
             Ok(())
         }
-        Command::Mcp { config } => rocky_mcp::serve_stdio(config).await,
+        Command::Mcp { config, profile } => rocky_mcp::serve_stdio(config, profile.into()).await,
     };
 
     // SIGINT: map `commands::Interrupted` to the conventional shell exit
@@ -4706,6 +4780,78 @@ mod tests {
                 idempotency_key, ..
             } => idempotency_key,
             _ => panic!("expected Run subcommand"),
+        }
+    }
+
+    /// FF-WP1: the wire contract is the LITERAL flag string
+    /// `--expect-spec-digest` — clap derives it from the `expect_spec_digest`
+    /// field, and a field rename would silently rename the flag the
+    /// fulfillment runner (and the SDK) shell out with. Pin it.
+    #[test]
+    fn apply_expect_spec_digest_flag_parses_by_its_literal_name() {
+        let cli = try_parse_with_big_stack(&[
+            "rocky",
+            "apply",
+            "abc123",
+            "--expect-spec-digest",
+            "sha256:feed",
+        ]);
+        match cli.command {
+            Command::Apply {
+                plan_id,
+                expect_spec_digest,
+            } => {
+                assert_eq!(plan_id, "abc123");
+                assert_eq!(expect_spec_digest.as_deref(), Some("sha256:feed"));
+            }
+            _ => panic!("expected Apply subcommand"),
+        }
+
+        // And the flag stays optional: a bare apply parses with None.
+        let cli = try_parse_with_big_stack(&["rocky", "apply", "abc123"]);
+        match cli.command {
+            Command::Apply {
+                expect_spec_digest, ..
+            } => assert_eq!(expect_spec_digest, None),
+            _ => panic!("expected Apply subcommand"),
+        }
+    }
+
+    /// FF-WP1: `rocky review --status` parses by its literal flag name, and
+    /// clap rejects combining it with `--approve` / `--queue`.
+    #[test]
+    fn review_status_flag_parses_and_conflicts() {
+        let cli = try_parse_with_big_stack(&["rocky", "review", "abc123", "--status"]);
+        match cli.command {
+            Command::Review {
+                plan_id,
+                status,
+                approve,
+                queue,
+                ..
+            } => {
+                assert_eq!(plan_id.as_deref(), Some("abc123"));
+                assert!(status);
+                assert!(!approve);
+                assert!(!queue);
+            }
+            _ => panic!("expected Review subcommand"),
+        }
+
+        for conflicting in [
+            vec!["rocky", "review", "abc123", "--status", "--approve"],
+            vec!["rocky", "review", "--status", "--queue"],
+        ] {
+            let parsed = std::thread::scope(|s| {
+                let owned: Vec<String> = conflicting.iter().map(ToString::to_string).collect();
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn_scoped(s, move || Cli::try_parse_from(&owned).is_ok())
+                    .expect("spawn parser thread")
+                    .join()
+                    .expect("parser thread panicked")
+            });
+            assert!(!parsed, "{conflicting:?} must be a clap conflict");
         }
     }
 

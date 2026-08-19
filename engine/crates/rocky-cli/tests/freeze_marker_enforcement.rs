@@ -373,6 +373,7 @@ async fn drive_run(
         run_id_override,
         None,  // governed_ctx
         false, // assume_fresh_state
+        None,  // #1460
     )
     .await
 }

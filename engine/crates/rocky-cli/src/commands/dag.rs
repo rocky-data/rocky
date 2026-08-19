@@ -138,12 +138,19 @@ pub fn dag_output(
     // contributing root. Re-reading the directory here would ignore the
     // configured file glob and could emit lineage for a model absent from the
     // DAG, or lose all lineage to a malformed non-matching sidecar.
-    let (models, models_by_pipeline, lineage_source) = match models_dir {
+    let (models, models_by_pipeline, lineage_source, missing_roots) = match models_dir {
         // An explicit whole-project override: every transformation pipeline
         // genuinely does declare this one directory — and a project with two of
         // them is then refused by name, which is the honest answer to "these two
         // pipelines both build this model".
         Some(dir) => {
+            // The override replaces every pipeline's root, so "missing" is
+            // one question: does the named directory exist?
+            let missing_roots: Vec<(String, std::path::PathBuf)> = if dir.is_dir() {
+                Vec::new()
+            } else {
+                vec![("--models".to_string(), dir.to_path_buf())]
+            };
             let models = load_all_models(dir)?;
             let mut by_pipeline = rocky_core::unified_dag::ModelsByPipeline::new();
             for (name, pipeline) in &cfg.pipelines {
@@ -155,7 +162,12 @@ pub fn dag_output(
                 }
             }
             let lineage_models = models.clone();
-            (models, by_pipeline, LineageSource::Models(lineage_models))
+            (
+                models,
+                by_pipeline,
+                LineageSource::Models(lineage_models),
+                missing_roots,
+            )
         }
         // No override: each pipeline resolves its own directory, which is also
         // what `rocky run --dag` has always done. Before #1261, `rocky dag
@@ -183,7 +195,7 @@ pub fn dag_output(
             } else {
                 LineageSource::Models(models.clone())
             };
-            (models, loaded.by_pipeline, source)
+            (models, loaded.by_pipeline, source, loaded.missing_roots)
         }
     };
 
@@ -232,6 +244,7 @@ pub fn dag_output(
         &cfg,
         state_path,
         &schema_cache_cfg,
+        &missing_roots,
     )
 }
 
@@ -248,6 +261,7 @@ fn build_dag_output(
     cfg: &rocky_core::config::RockyConfig,
     state_path: &Path,
     schema_cache_cfg: &rocky_core::config::SchemaCacheConfig,
+    missing_roots: &[(String, std::path::PathBuf)],
 ) -> Result<DagOutput> {
     // Build lookup maps.
     let model_map: HashMap<&str, &Model> =
@@ -376,6 +390,28 @@ fn build_dag_output(
             // Nothing to compile — empty IS the complete answer here.
             (true, LineageSource::NoModels) => (vec![], None),
         };
+
+    // A configured project must produce SOME graph — unless every declared
+    // root exists and is simply empty, which is a supported no-op (a fresh
+    // scaffold, an intentionally empty pipeline). The refusal fires only
+    // when the graph is empty AND a declared transformation root does not
+    // exist: that is how a project whose models root went missing fed the
+    // dagster component a clean empty asset graph, cached with
+    // `dag_status: "success"` and indistinguishable from a project that
+    // has no models (#1397). Keyed on the final node set, so a seed-only
+    // pipeline, a replication pipeline, or a sibling root holding the
+    // models all still produce nodes and stay untouched.
+    if nodes.is_empty()
+        && let Some((pipeline, path)) = missing_roots.first()
+    {
+        anyhow::bail!(
+            "the DAG has zero nodes, and the models root {} ('{}') does not \
+             exist. Create the directory, fix the `models = ...` glob in \
+             rocky.toml, or fix the --models override if one was passed",
+            path.display(),
+            pipeline,
+        );
+    }
 
     Ok(DagOutput {
         version: VERSION.to_string(),

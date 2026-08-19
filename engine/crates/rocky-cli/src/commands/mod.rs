@@ -93,8 +93,9 @@ pub use ai::{
 };
 pub use ai_contract::run_ai_contract;
 pub use apply::{
-    PolicyGate, evaluate_apply_policy, evaluate_apply_policy_with_policy,
-    marker_freezes_before_gate, run_apply, run_apply_inline_for_run,
+    PolicyGate, evaluate_apply_policy, evaluate_apply_policy_with_extra_classifications,
+    evaluate_apply_policy_with_policy, marker_freezes_before_gate, run_apply,
+    run_apply_inline_for_run,
 };
 pub use archive::{run_archive, run_archive_apply, run_archive_catalog};
 pub use audit::{
@@ -165,7 +166,10 @@ pub use publish_ir::run_publish_ir;
 pub use replay::{run_replay, run_replay_check, run_replay_execute, run_replay_execute_warehouse};
 pub use restore::run_restore_plan;
 pub use retention_status::run_retention_status;
-pub use review::{compute_review, compute_review_queue, run_review, run_review_queue};
+pub use review::{
+    compute_review, compute_review_queue, compute_review_status, run_review, run_review_queue,
+    run_review_status,
+};
 pub use schedule_status::{ScheduleStatusError, schedule_status_output};
 // Re-exported so the `rocky` bin can build a clap ValueEnum for
 // `--target-dialect` without taking a direct dep on rocky-sql.

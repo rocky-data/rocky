@@ -6,7 +6,6 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 
-use rocky_core::models;
 use rocky_core::tests::{TestSeverity, TestType, generate_test_sql_with_dialect};
 use rocky_core::traits::WarehouseAdapter;
 
@@ -15,6 +14,8 @@ use crate::output::{
     UnitTestSummary, print_json,
 };
 use crate::registry::{self, AdapterRegistry};
+
+use super::ModelNotFound;
 
 /// Map the engine test runner's `ModelTestResult` to the JsonSchema-derived
 /// output shape. Centralized so `test_output` + `run_test` agree.
@@ -55,6 +56,23 @@ fn unit_summary(run: &rocky_engine::test_runner::UnitTestRun) -> Option<UnitTest
 /// (`rocky-mcp`) obtains the struct directly.
 // Reusable typed-output core for the in-process MCP server. `run_test`
 // re-runs the test runner so it can also render text.
+/// Refuse a `--model` selector that names no model in the project.
+///
+/// Every count on [`rocky_engine::test_runner::TestResult`] is post-filter, so
+/// without this an unknown name is reported as `total: 0` — byte-identical to
+/// a real model that declares no tests, and exit 0 either way (#1428). Mirrors
+/// the check `rocky compile --model` performs (`commands::compile`), and
+/// returns the same typed [`ModelNotFound`] so the message matches `rocky run
+/// --model` and the MCP layer can classify it as `model_not_found`.
+fn reject_unknown_model(model_filter: Option<&str>, all_models: &[String]) -> Result<()> {
+    if let Some(filter) = model_filter
+        && !all_models.iter().any(|name| name == filter)
+    {
+        return Err(anyhow::Error::new(ModelNotFound(filter.to_string())));
+    }
+    Ok(())
+}
+
 pub fn test_output(
     models_dir: &Path,
     contracts_dir: Option<&Path>,
@@ -66,6 +84,7 @@ pub fn test_output(
         model_filter,
         &rocky_core::run_vars::RunVars::new(),
     )?;
+    reject_unknown_model(model_filter, &result.all_models)?;
     let failures: Vec<TestFailure> = result
         .failures
         .iter()
@@ -94,6 +113,10 @@ pub fn run_test(
 ) -> Result<()> {
     let result =
         rocky_engine::test_runner::run_tests(models_dir, contracts_dir, model_filter, run_vars)?;
+    // `run_test` deliberately re-runs the engine rather than calling
+    // `test_output` (see that function's note), so the check has to be made
+    // here too — this is the path the CLI actually takes.
+    reject_unknown_model(model_filter, &result.all_models)?;
     let unit_run = rocky_engine::test_runner::run_unit_tests(models_dir, model_filter)?;
     let unit_failed = unit_run.total() - unit_run.passed();
 
@@ -177,24 +200,18 @@ pub fn run_test(
 // Declarative test runner (`rocky test --declarative`)
 // ---------------------------------------------------------------------------
 
-/// Load all models from a directory including one level of subdirectories.
-fn load_all_models(models_dir: &Path) -> Result<Vec<models::Model>> {
-    let mut all = models::load_models_from_dir(models_dir).context(format!(
-        "failed to load models from {}",
-        models_dir.display()
-    ))?;
-
-    if let Ok(entries) = std::fs::read_dir(models_dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Ok(sub) = models::load_models_from_dir(&entry.path())
-            {
-                all.extend(sub);
-            }
-        }
-    }
+/// Load every `.sql` and `.rocky` model beneath the models directory.
+fn load_all_models(models_dir: &Path) -> Result<Vec<rocky_core::models::Model>> {
+    let mut all = crate::models_loader::load_project_models(models_dir)?;
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(all)
+}
+
+/// Model names, for [`reject_unknown_model`] — which takes `&[String]` so it
+/// can serve both the declarative path (loaded `Model`s) and the compiled
+/// path (`TestResult::all_models`).
+fn model_names(models: &[rocky_core::models::Model]) -> Vec<String> {
+    models.iter().map(|m| m.config.name.clone()).collect()
 }
 
 /// Execute `rocky test --declarative`: run `[[tests]]` from model sidecars
@@ -217,6 +234,23 @@ pub async fn run_declarative_tests(
 
     // 2. Load all models.
     let all_models = load_all_models(models_dir)?;
+
+    // The loader is deliberately tolerant of a missing or empty directory
+    // (`models_loader::load_project_models` returns an empty Vec, pinned by
+    // its own `a_missing_directory_yields_no_models` test), so this path used
+    // to report `total: 0` and exit 0 for a models dir that does not exist —
+    // while `rocky test` WITHOUT `--declarative` compiles the project and
+    // fails with `no models found in <dir>`. One command, two answers to the
+    // same question. Refuse here so both paths agree (#1428).
+    if all_models.is_empty() {
+        anyhow::bail!("no models found in {}", models_dir.display());
+    }
+    // Checked against `all_models`, NOT the filtered set below: the filter and
+    // the has-tests predicate are fused in one closure, and `tests.is_empty()`
+    // short-circuits first, so a model that exists but declares no tests is
+    // indistinguishable there from a name that does not exist at all. The
+    // former must stay exit 0; only the latter is an error.
+    reject_unknown_model(model_filter, &model_names(&all_models))?;
 
     // 3. Filter to models that have [[tests]] declared.
     let models_with_tests: Vec<_> = all_models
@@ -517,5 +551,34 @@ fn test_type_label(tt: &TestType) -> &'static str {
         TestType::Composite { .. } => "composite",
         TestType::NotInFuture => "not_in_future",
         TestType::OlderThanNDays { .. } => "older_than_n_days",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_all_models;
+
+    #[test]
+    fn declarative_loader_includes_tests_from_rocky_models() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).expect("create models dir");
+        std::fs::write(
+            models.join("orders.rocky"),
+            "from raw_orders\nselect { id }\n",
+        )
+        .expect("write rocky model");
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n\n[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+        )
+        .expect("write model sidecar");
+
+        let loaded = load_all_models(&models).expect("load models");
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].config.name, "orders");
+        assert_eq!(loaded[0].config.tests.len(), 1);
+        assert_eq!(loaded[0].config.tests[0].column.as_deref(), Some("id"));
     }
 }

@@ -14,12 +14,11 @@ export function useColorMode(): ColorMode {
 export type OverlayKind =
   | "cost"
   | "freshness"
-  | "drift"
   | "breaking"
   | "lastRun"
   | "governance";
 
-/** The overlays currently decorating nodes (cost, freshness, drift, …). */
+/** The overlays currently decorating nodes (cost, freshness, …). */
 export const OverlaysContext = createContext<LineageOverlay[]>([]);
 
 export function useOverlays(): LineageOverlay[] {

@@ -58,6 +58,19 @@ pub async fn run_retention_status(
         None
     };
 
+    // An unknown `--model` is a mistake, not an empty result: refuse it the
+    // way `rocky compile --model` does, rather than reporting zero rows at
+    // exit 0 (#1428).
+    if let Some(filter) = model_filter
+        && !compile
+            .project
+            .models
+            .iter()
+            .any(|m| m.config.name == filter)
+    {
+        return Err(anyhow::Error::new(super::ModelNotFound(filter.to_string())));
+    }
+
     let mut rows: Vec<ModelRetentionStatus> = Vec::new();
     for model in &compile.project.models {
         if model_filter.is_some_and(|name| model.config.name != name) {
@@ -88,7 +101,23 @@ pub async fn run_retention_status(
     }
 
     if output_json {
-        print_json(&RetentionStatusOutput::new(rows))?;
+        // `rows` can only be empty under `--drift`, which retains just the
+        // models declaring a policy. Every other route is already closed: a
+        // project with no models fails in `compile::compile` above with
+        // `ProjectError::NoModels`, and an unknown `--model` was refused
+        // above — so there is no "project declares no models" case to report
+        // here. Say why the drift result is empty, and keep the claim scoped
+        // to what was actually examined: under `--model` this describes one
+        // model, not the project (#1428).
+        let output = if drift && rows.is_empty() {
+            RetentionStatusOutput::empty(match model_filter {
+                Some(name) => format!("model '{name}' declares no retention policy"),
+                None => "no models declare a retention policy".to_string(),
+            })
+        } else {
+            RetentionStatusOutput::new(rows)
+        };
+        print_json(&output)?;
     } else {
         println!(
             "{:<40} {:<16} {:<16} {:<8}",

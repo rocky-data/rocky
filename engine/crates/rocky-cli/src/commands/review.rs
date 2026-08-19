@@ -42,10 +42,13 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// On-disk review marker written by `rocky review <plan-id> --approve`.
 ///
 /// Internal artifact, not a CLI output — it only needs serde, not
-/// `JsonSchema`. Its presence (not its contents) is what the apply gate
-/// checks; the fields are recorded for an audit trail.
+/// `JsonSchema` (deliberate: the typed status surface is
+/// [`crate::output::ReviewStatusOutput`], projected from this). The apply
+/// gate checks it via [`review_marker_state`]: the marker must exist, parse,
+/// AND name the plan being applied — a truncated or mispasted marker never
+/// approves.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReviewMarker {
+pub(crate) struct ReviewMarker {
     /// The AI-authored plan this marker approves.
     plan_id: String,
     /// When the approval was recorded.
@@ -56,6 +59,54 @@ struct ReviewMarker {
     breaking_change_count: usize,
     /// Best-effort git identity of the approver.
     approver: ApproverIdentity,
+}
+
+/// What the on-disk review marker for a plan amounts to.
+///
+/// The single oracle behind the apply gates, the review queue's
+/// reviewed-filter, and `rocky review --status` — so "approved" means the
+/// same thing everywhere: the marker exists, parses as a [`ReviewMarker`],
+/// and its `plan_id` matches the plan being asked about.
+#[derive(Debug)]
+pub(crate) enum ReviewMarkerState {
+    /// No marker on disk — the plan awaits review.
+    Absent,
+    /// A well-formed marker naming this exact plan.
+    Approved(ReviewMarker),
+    /// A marker file exists but is unreadable, unparseable, or names a
+    /// DIFFERENT plan. Never approves; the apply gates refuse it with a
+    /// distinct error rather than reading it as "not reviewed".
+    Invalid { reason: String },
+}
+
+/// Read and classify the review marker for `plan_id` under `root`.
+pub(crate) fn review_marker_state(root: &Path, plan_id: &str) -> ReviewMarkerState {
+    let path = review_marker_path(root, plan_id);
+    let bytes = match std::fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReviewMarkerState::Absent,
+        Err(e) => {
+            return ReviewMarkerState::Invalid {
+                reason: format!("the marker at {} is unreadable: {e}", path.display()),
+            };
+        }
+        Ok(bytes) => bytes,
+    };
+    match serde_json::from_slice::<ReviewMarker>(&bytes) {
+        Err(e) => ReviewMarkerState::Invalid {
+            reason: format!(
+                "the marker at {} does not parse as a review marker: {e}",
+                path.display()
+            ),
+        },
+        Ok(marker) if marker.plan_id != plan_id => ReviewMarkerState::Invalid {
+            reason: format!(
+                "the marker at {} approves plan '{}', not '{plan_id}'",
+                path.display(),
+                marker.plan_id
+            ),
+        },
+        Ok(marker) => ReviewMarkerState::Approved(marker),
+    }
 }
 
 /// Execute `rocky review <plan-id>`.
@@ -468,6 +519,13 @@ fn compute_review_findings(
 
 /// Write the review marker to `<root>/.rocky/plans/<plan_id>.reviewed.json`.
 ///
+/// Staged write: the bytes go to a `.tmp` sibling in the same directory and
+/// land via an atomic rename, so a crash mid-write leaves NO marker (a
+/// half-written marker would otherwise exist-but-not-parse, and the marker is
+/// the human sign-off that unblocks `rocky apply`). A stale `.tmp` from a
+/// crashed writer is overwritten by the next approval and never read by the
+/// gate (only the exact `.reviewed.json` path is).
+///
 /// Factored out so the marker-writing logic is unit-testable without standing
 /// up a git repo or running the compiler.
 fn write_review_marker(root: &Path, plan_id: &str, marker: &ReviewMarker) -> Result<()> {
@@ -477,8 +535,119 @@ fn write_review_marker(root: &Path, plan_id: &str, marker: &ReviewMarker) -> Res
             .with_context(|| format!("failed to create plans directory at {}", parent.display()))?;
     }
     let bytes = serde_json::to_vec_pretty(marker).context("failed to serialize review marker")?;
-    std::fs::write(&path, bytes)
-        .with_context(|| format!("failed to write review marker to {}", path.display()))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)
+        .with_context(|| format!("failed to stage review marker at {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| {
+        format!(
+            "failed to move the staged review marker into place at {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Test-support: write a WELL-FORMED review marker naming `plan_id`, exactly
+/// as `rocky review --approve` would. Since the apply gate parses and matches
+/// the marker (FF-WP1), test fixtures can no longer plant a bare `{}` — they
+/// go through this so "approved" in a test means what it means in production.
+#[cfg(test)]
+pub(crate) fn write_test_review_marker(root: &Path, plan_id: &str) {
+    let marker = ReviewMarker {
+        plan_id: plan_id.to_string(),
+        reviewed_at: Utc::now(),
+        base_ref: "HEAD".to_string(),
+        breaking_change_count: 0,
+        approver: ApproverIdentity {
+            email: "dev@example.com".to_string(),
+            name: Some("Dev".to_string()),
+            host: "localhost".to_string(),
+            source: crate::output::ApproverSource::Local,
+        },
+    };
+    write_review_marker(root, plan_id, &marker).expect("test marker write");
+}
+
+/// Compute the typed `rocky review <plan-id> --status` payload — the runner's
+/// marker oracle.
+///
+/// Reads the plan (integrity-checked — a tampered plan file errors here, it
+/// does not report a status) and classifies the marker via
+/// [`review_marker_state`]. An absent marker is `reviewed: false`; a marker
+/// that is malformed or names a different plan is an ERROR (the same distinct
+/// refusal the apply gate raises), never a silent `false` a polling runner
+/// would wait on forever.
+pub fn compute_review_status(
+    root: &Path,
+    plan_id: &str,
+) -> Result<crate::output::ReviewStatusOutput> {
+    let plan = read_plan(root, plan_id)
+        .with_context(|| format!("failed to read plan '{plan_id}' for status"))?;
+    let product_id = plan
+        .payload
+        .get("product_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let spec_digest = plan
+        .payload
+        .get("spec_digest")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let (reviewed, reviewed_at, approver, breaking_change_count) =
+        match review_marker_state(root, plan_id) {
+            ReviewMarkerState::Absent => (false, None, None, None),
+            ReviewMarkerState::Approved(marker) => (
+                true,
+                Some(marker.reviewed_at),
+                Some(marker.approver),
+                Some(marker.breaking_change_count as u64),
+            ),
+            ReviewMarkerState::Invalid { reason } => bail!(
+                "review marker for plan '{plan_id}' is invalid: {reason}. A truncated or \
+                 mispasted marker never approves — re-approve with \
+                 `rocky review {plan_id} --approve` to rewrite it atomically."
+            ),
+        };
+
+    Ok(crate::output::ReviewStatusOutput {
+        version: VERSION.to_string(),
+        command: "review_status".to_string(),
+        plan_id: plan_id.to_string(),
+        kind: plan.kind.to_string(),
+        reviewed,
+        reviewed_at,
+        approver,
+        breaking_change_count,
+        product_id,
+        spec_digest,
+    })
+}
+
+/// Execute `rocky review <plan-id> --status`.
+pub fn run_review_status(config_path: &Path, plan_id: &str, output_json: bool) -> Result<()> {
+    let _ = config_path; // status is plan+marker only; kept for CLI symmetry.
+    let cwd = std::env::current_dir().context("failed to get current working directory")?;
+    let output = compute_review_status(&cwd, plan_id)?;
+    if output_json {
+        crate::output::print_json(&output)?;
+    } else {
+        let state = if output.reviewed {
+            format!(
+                "approved{}",
+                output
+                    .reviewed_at
+                    .map(|t| format!(" at {t}"))
+                    .unwrap_or_default()
+            )
+        } else {
+            "pending review".to_string()
+        };
+        println!("plan {} ({}): {state}", output.plan_id, output.kind);
+        if let (Some(product), Some(digest)) = (&output.product_id, &output.spec_digest) {
+            println!("  product: {product} @ {digest}");
+        }
+    }
     Ok(())
 }
 
@@ -880,6 +1049,136 @@ mod tests {
             marker_path.exists(),
             "approve must create the marker file that unblocks apply"
         );
+        Ok(())
+    }
+
+    /// FF-WP1 ⟦RTL-6⟧ marker atomicity: the crash window between the tmp
+    /// write and the rename leaves NO marker — the on-disk residue of that
+    /// crash (a staged `.tmp`, no `.reviewed.json`) reads as Absent, so apply
+    /// still refuses. And once renamed, the marker is whole by construction.
+    #[test]
+    fn a_crashed_staged_write_leaves_no_marker() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let plan_id = "c".repeat(64);
+        let marker_path = review_marker_path(dir.path(), &plan_id);
+
+        // The exact bytes write_review_marker stages, parked at the exact tmp
+        // path it uses — the disk state of a crash between write and rename.
+        let tmp = marker_path.with_extension("json.tmp");
+        std::fs::create_dir_all(marker_path.parent().unwrap())?;
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&dummy_marker(&plan_id))?)?;
+
+        assert!(!marker_path.exists(), "no marker may exist mid-crash");
+        assert!(
+            matches!(
+                review_marker_state(dir.path(), &plan_id),
+                ReviewMarkerState::Absent
+            ),
+            "the staged tmp is never read as an approval"
+        );
+        assert!(
+            !ai_plan_is_reviewed(dir.path(), &plan_id),
+            "apply's gate still refuses"
+        );
+
+        // The completed write lands atomically over the same path.
+        write_review_marker(dir.path(), &plan_id, &dummy_marker(&plan_id))?;
+        assert!(marker_path.exists());
+        assert!(
+            matches!(
+                review_marker_state(dir.path(), &plan_id),
+                ReviewMarkerState::Approved(_)
+            ),
+            "the renamed marker approves"
+        );
+        Ok(())
+    }
+
+    /// FF-WP1 ⟦RTL-6⟧ parse-and-match: a marker that is malformed, or that
+    /// names a DIFFERENT plan, is Invalid — never Approved, never Absent.
+    #[test]
+    fn malformed_or_mismatched_markers_are_invalid_not_approved() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let plan_id = "d".repeat(64);
+        let marker_path = review_marker_path(dir.path(), &plan_id);
+        std::fs::create_dir_all(marker_path.parent().unwrap())?;
+
+        // Truncated / malformed bytes.
+        std::fs::write(&marker_path, b"{\"plan_id\": \"dddd")?;
+        let state = review_marker_state(dir.path(), &plan_id);
+        assert!(
+            matches!(&state, ReviewMarkerState::Invalid { reason } if reason.contains("parse")),
+            "malformed marker must be Invalid: {state:?}"
+        );
+        assert!(!ai_plan_is_reviewed(dir.path(), &plan_id));
+
+        // Well-formed marker approving a DIFFERENT plan, copied to this
+        // plan's marker path (the mispaste / copy attack).
+        let other_id = "e".repeat(64);
+        std::fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&dummy_marker(&other_id))?,
+        )?;
+        let state = review_marker_state(dir.path(), &plan_id);
+        assert!(
+            matches!(&state, ReviewMarkerState::Invalid { reason } if reason.contains(&other_id)),
+            "a mismatched marker must be Invalid and name the plan it actually approves: {state:?}"
+        );
+        assert!(
+            !ai_plan_is_reviewed(dir.path(), &plan_id),
+            "a copied marker from another plan never approves this one"
+        );
+        Ok(())
+    }
+
+    /// FF-WP1: `rocky review --status` — the runner's typed marker oracle.
+    /// Pending → reviewed:false with the product binding surfaced from the
+    /// plan payload; approved → the marker's identity fields; a malformed
+    /// marker is an ERROR, never a silent false.
+    #[test]
+    fn review_status_reports_pending_then_approved_and_errors_on_invalid() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let payload = serde_json::json!({
+            "parallel": 1,
+            "product_id": "product:revenue_daily",
+            "spec_digest": "sha256:abc",
+        });
+        let plan_id = crate::plan_store::write_plan(dir.path(), PlanKind::AiAuthored, &payload)?;
+
+        // Pending.
+        let status = compute_review_status(dir.path(), &plan_id)?;
+        assert_eq!(status.command, "review_status");
+        assert_eq!(status.plan_id, plan_id);
+        assert_eq!(status.kind, "ai_authored");
+        assert!(!status.reviewed);
+        assert!(status.reviewed_at.is_none());
+        assert!(status.approver.is_none());
+        assert_eq!(status.product_id.as_deref(), Some("product:revenue_daily"));
+        assert_eq!(status.spec_digest.as_deref(), Some("sha256:abc"));
+
+        // Approved.
+        write_review_marker(dir.path(), &plan_id, &dummy_marker(&plan_id))?;
+        let status = compute_review_status(dir.path(), &plan_id)?;
+        assert!(status.reviewed);
+        assert!(status.reviewed_at.is_some());
+        assert_eq!(
+            status.approver.as_ref().map(|a| a.email.as_str()),
+            Some("dev@example.com")
+        );
+        assert_eq!(status.breaking_change_count, Some(0));
+
+        // Invalid marker → hard error (a polling runner must not wait on a
+        // silent false), naming the marker problem.
+        std::fs::write(review_marker_path(dir.path(), &plan_id), b"garbage")?;
+        let err = compute_review_status(dir.path(), &plan_id)
+            .expect_err("an invalid marker is an error, not a status");
+        assert!(
+            format!("{err:#}").contains("invalid"),
+            "the error says the marker is invalid: {err:#}"
+        );
+
+        // And an unknown plan errors at the integrity-checked read.
+        assert!(compute_review_status(dir.path(), &"f".repeat(64)).is_err());
         Ok(())
     }
 

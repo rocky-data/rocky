@@ -5,13 +5,63 @@ sidebar:
   order: 8
 ---
 
-All data returned by `RockyResource` methods is parsed into Pydantic v2 models. These models provide type safety, validation, and IDE autocompletion.
+Most `RockyResource` methods return a Pydantic v2 model, not a dictionary. The model validates the JSON while it parses it, and your editor completes the field names. This page is the field-by-field reference for the models you read most often.
+
+You do not need to construct these models yourself. The `rocky` binary prints JSON on stdout, and the resource parses that JSON into the matching model before it returns.
+
+## Where these types come from
+
+These types come from two places. Most models on this page are hand-written Pydantic classes in `rocky_sdk.types`, which is the SDK's public API. Others, such as `TestOutput` and `CiOutput`, are generated from the engine's JSON schemas and re-exported from that same module.
+
+```
+  Rust output struct           one per rocky CLI command, in the engine
+        │
+        │  exported to
+        ▼
+  JSON schema                  the wire contract for --output json
+        │
+        │  just codegen
+        ▼
+  rocky_sdk.types_generated    the generated Pydantic v2 models
+        │
+        │  re-exported by
+        ▼
+  rocky_sdk.types              alongside the hand-written models
+        │
+        │  re-exported by
+        ▼
+  dagster_rocky.types          what your Dagster code imports
+```
+
+The `codegen-drift` CI job re-runs `just codegen` and fails the build when the committed bindings drift from the engine's schemas.
+
+## How you read one
+
+Call a method, then read its fields. Each method's return type is named in the [RockyResource reference](/dagster/resource/).
+
+```python
+from dagster_rocky import RockyResource
+
+rocky = RockyResource(config_path="rocky.toml")
+
+result = rocky.run(filter="tenant=acme")   # result is a RunResult
+print(result.tables_copied)                # int
+print(result.drift.tables_drifted)         # int
+```
+
+Nested fields are typed too. `RunResult.drift` is a `DriftInfo`, the summary of schema [drift](/reference/glossary/#drift) that Rocky found in your sources. Its `actions_taken` field is a list of `DriftAction`. Follow the type names down the tables below to see what each level holds.
 
 :::tip[Source of truth]
-These types are generated from the engine's JSON schemas via `just codegen`; the generated [`rocky_sdk.types_generated`](https://github.com/rocky-data/rocky/tree/main/sdk/python/src/rocky_sdk/types_generated) module is the canonical, complete definition. `dagster_rocky.types` (and the `dagster_rocky.types_generated` shim) re-export it with Python-flavored names for backward compatibility. This page documents the types you consume most (discover, run, compile, test, ci, doctor) plus `parse_rocky_output`. The field tables below are curated to the fields consumers branch on most; some models carry additional wire fields, so consult the generated module for the exhaustive shape. For any type not shown here, consult the generated module or the [JSON Output reference](/reference/json-output/).
+The generated [`rocky_sdk.types_generated`](https://github.com/rocky-data/rocky/tree/main/sdk/python/src/rocky_sdk/types_generated) module is the canonical, complete definition. `dagster_rocky.types` (and the `dagster_rocky.types_generated` shim) re-export it with Python-flavored names for backward compatibility.
+
+This page documents the types you consume most: discover, run, compile, test, ci, doctor, plus `parse_rocky_output`. The field tables below are curated. They list the fields consumers branch on most, and some models carry extra wire fields that are not shown. Read the generated module for the exhaustive shape.
+
+For any type not on this page, read the generated module or the [JSON Output reference](/reference/json-output/).
 :::
 
 ## Discover types
+
+`rocky.discover()` asks each source adapter what tables exist. The types below describe that answer.
 
 ### `DiscoverResult`
 
@@ -53,6 +103,8 @@ A single table within a source.
 ---
 
 ## Run types
+
+A run returns a `RunResult`. The types below describe that result and the records nested inside it.
 
 ### `RunResult`
 
@@ -270,6 +322,8 @@ A single contract violation.
 
 ## Compile types
 
+`rocky.compile()` type-checks the project without touching the warehouse. The types below carry its diagnostics and one entry per model.
+
 ### `CompileResult`
 
 Top-level result from `rocky compile`.
@@ -313,7 +367,11 @@ Per-model summary from compilation.
 
 ## Test and CI types
 
-`TestResult` and `CiResult` are import-compatible aliases for the generated `TestOutput` and `CiOutput`. `parse_rocky_output` dispatches the `"test"` command to `TestOutput` and the `"ci"` command to `CiOutput`. Both share the same `TestFailure` shape for the `failures` list. The nested sub-types (`ModelTestResult`, `DeclarativeTestSummary`, `UnitTestSummary`, and their per-item types) are not re-exported at the top level; import them from `rocky_sdk.types_generated.test_schema` when you need to type-annotate those fields.
+`rocky.test()` runs your model tests. By default it runs them in DuckDB, so no warehouse is needed. `rocky.ci()` compiles first, then tests. The types below carry the results of both.
+
+`TestResult` and `CiResult` are import-compatible aliases for the generated `TestOutput` and `CiOutput`. `parse_rocky_output` dispatches the `"test"` command to `TestOutput` and the `"ci"` command to `CiOutput`. Both share the same `TestFailure` shape for the `failures` list.
+
+Some nested sub-types are not re-exported at the top level: `ModelTestResult`, `DeclarativeTestSummary`, `UnitTestSummary`, and their per-item types. Import those from `rocky_sdk.types_generated.test_schema` when you need to type-annotate a field.
 
 ### `TestOutput`
 
@@ -395,6 +453,8 @@ Top-level result from `rocky ci`. Also exported as `CiResult`.
 
 ## Doctor types
 
+`rocky.doctor()` checks your Rocky installation and configuration. The types below carry each check and its verdict.
+
 ### `DoctorResult`
 
 Health check results from `rocky doctor`.
@@ -422,9 +482,13 @@ A single health check result.
 
 ## Utility
 
+Use this helper when you have a saved Rocky JSON payload and want the right model back.
+
 ### `parse_rocky_output(json_str) -> RockyOutput`
 
-Auto-detects the command type from the JSON `command` field and returns the appropriate Pydantic model. Supported commands include `discover`, `run`, `plan`, `state`, `compile`, `lineage`, `history`, `test`, `ci`, `metrics`, `optimize`, `ai`, `ai_sync`, `ai_explain`, `ai_test`, `validate-migration`, and `doctor` (see `_SIMPLE_DISPATCH` in `rocky_sdk.types` for the full table). There is no `test-adapter` dispatch entry — reach that output via `RockyClient.test_adapter()` — and no `drift` command; schema drift is surfaced on `RunResult.drift`.
+Reads the JSON `command` field, then returns the matching Pydantic model. Supported commands include `discover`, `run`, `plan`, `state`, `compile`, `lineage`, `history`, `test`, `ci`, `metrics`, `optimize`, `ai`, `ai_sync`, `ai_explain`, `ai_test`, `validate-migration`, and `doctor`. See `_SIMPLE_DISPATCH` in `rocky_sdk.types` for the full table.
+
+Two outputs are not on that list. There is no `test-adapter` dispatch entry, so reach that output through `RockyClient.test_adapter()` instead. There is no `drift` command either, because schema drift is reported on `RunResult.drift`.
 
 ```python
 from dagster_rocky import parse_rocky_output

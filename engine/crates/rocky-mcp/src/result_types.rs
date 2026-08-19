@@ -38,7 +38,11 @@ pub struct CompileResult {
     pub error_count: usize,
     /// Count of warning-severity diagnostics.
     pub warning_count: usize,
-    /// Number of models in the project.
+    /// Number of models this result describes — the whole project, or `1`
+    /// when a `model` selector was passed. Not a project-wide total under a
+    /// selector, and `has_errors` / the counts above are scoped the same way:
+    /// they describe the selected model's own validity, not whether its
+    /// upstreams can be rebuilt.
     pub model_count: usize,
     /// All diagnostics (errors + warnings + info).
     pub diagnostics: Vec<DiagnosticLite>,
@@ -323,6 +327,15 @@ pub struct ProposeResult {
     pub plan_id: String,
     /// The models this plan would materialize.
     pub models: Vec<String>,
+    /// Product identity the plan is bound to, echoed verbatim when the
+    /// propose carried one. A product-bound plan refuses a bare
+    /// `rocky apply` — the applier must pass `--expect-spec-digest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// Approved-spec digest the plan is bound to, echoed verbatim when the
+    /// propose carried one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
 }
 
 /// `draft_model` result — the draft was written to the working tree and
@@ -415,6 +428,33 @@ pub struct DraftCheckResult {
     pub diagnostics: Vec<DiagnosticLite>,
     /// The authoring-loop reminder: a draft is not applied. It restates the flow
     /// (write → compile → `test` → `propose` → human review → apply).
+    pub next_steps: String,
+}
+
+/// `draft_metadata` result — a structured freshness/classification patch
+/// merged into the model's sidecar and compile-validated in the same call.
+///
+/// The governed metadata write path: the agent supplies a typed patch, the
+/// tool parse-merges it into `models/<model>.toml` (never string-appends,
+/// never overwrites a sidecar it cannot parse), compiles, and gates the write
+/// through the agent-policy plane — evaluated against the model's attributes
+/// AS PATCHED, so a patch that first adds a governed classification is gated
+/// by that classification. A denied patch restores the prior sidecar bytes.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct DraftMetadataResult {
+    /// The model the metadata was patched for.
+    pub model: String,
+    /// Repo-relative path the patch was merged into (`models/<model>.toml`).
+    pub sidecar_path: String,
+    /// Whether the immediate compile produced any error-severity diagnostics.
+    pub has_errors: bool,
+    /// Count of error-severity diagnostics.
+    pub error_count: usize,
+    /// Count of warning-severity diagnostics.
+    pub warning_count: usize,
+    /// The immediate compile's diagnostics, scoped to the model.
+    pub diagnostics: Vec<DiagnosticLite>,
+    /// The authoring-loop reminder: a draft is not applied.
     pub next_steps: String,
 }
 
@@ -828,7 +868,9 @@ pub struct ReviewQueueResult {
     /// The ranked pending escalations, each carrying its `decision_ref`,
     /// `plan_id`, `blast_radius`, `score`, and `approve_command` citation — the
     /// shipped `ReviewQueueOutput.pending` serialized verbatim so no citation is
-    /// dropped.
+    /// dropped. Under a `product_id` filter, a pending plan whose file cannot
+    /// be read integrity-checked appears as a `{plan_id, warning}` entry
+    /// instead of being silently dropped.
     pub pending: serde_json::Value,
     /// Present only when this call approved a plan.
     #[serde(skip_serializing_if = "Option::is_none")]

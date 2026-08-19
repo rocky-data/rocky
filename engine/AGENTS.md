@@ -16,7 +16,7 @@ Rocky is a typed-program layer above the warehouse. It owns the DAG: compile-tim
 
 ## Engine Repository Structure
 
-Cargo workspace with 23 library crates + 2 binary crates (`rocky` + `rocky-lsp`) — 25 members total. Rust edition 2024, MSRV 1.88:
+Cargo workspace: the library crates under `crates/` plus the `rocky` and `rocky-lsp` binary crates. Rust edition 2024, MSRV 1.88:
 
 The legacy `Plan` enum is gone; `ModelIr` is the sole transformation intermediate, dispatched via `ModelIrVariant`. The IR data types (`ModelIr`, `ModelIrVariant`, `ProjectIr`, lakehouse format/options, column lineage, masks, time grains, `RockyType`) live in their own `rocky-ir` crate; `rocky-core` keeps the runtime surface (adapter traits, DAG executor, state store, drift, SQL generation, breaking-change classifier, ci-diff).
 
@@ -310,7 +310,7 @@ GitHub Actions workflows live at the monorepo root in `../.github/workflows/`, p
 - `engine-ci.yml` — Tests, clippy, fmt (on push/PR to main). Note: `CARGO_BUILD_JOBS=4` due to DuckDB C++ memory constraints.
 - `engine-weekly.yml` — Coverage (tarpaulin) + security audit, runs Monday 08:00 UTC + manual dispatch.
 - `engine-release.yml` — Full 5-target matrix build on tag `engine-v*` (macOS ARM64/Intel, Linux x86_64/ARM64, Windows). `scripts/release.sh` is a local-build fallback.
-- `engine-bench.yml` — Benchmark on PRs labeled `perf` touching `engine/crates/**` or `engine/Cargo.*` (120% alert threshold).
+- `engine-bench.yml` — Benchmark on PRs labeled `perf` touching `engine/crates/**` or `engine/Cargo.*`; uploads raw bencher output as an artifact (no baseline comparison — there is deliberately no main-branch bench history).
 - `engine-docs.yml` — Build + deploy Astro docs from `../docs/` to GitHub Pages.
 
 ## Schema Pattern
@@ -361,7 +361,6 @@ Every Rocky CLI command that emits `--output json` has a typed Rust output struc
 | `rocky plan --output json` | `PlanOutput` |
 | `rocky state --output json` | `StateOutput` (watermarks) |
 | `rocky doctor --output json` | `DoctorOutput` (config, state, adapters, pipelines, state_sync) |
-| `rocky drift --output json` | `DriftOutput` |
 | `rocky compile --output json` | `CompileOutput` (typed model schemas, diagnostics, per-phase timings) |
 | `rocky test --output json` | `TestOutput` (DuckDB-backed assertions) |
 | `rocky ci --output json` | `CiOutput` (compile + test combined) |

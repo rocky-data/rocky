@@ -164,9 +164,8 @@ _LAZY: dict[str, tuple[str, str]] = {
     "DiffSummary": ("ci_diff_schema", "DiffSummary"),
     "DiscoverOutput": ("discover_schema", "DiscoverOutput"),
     "DoctorOutput": ("doctor_schema", "DoctorOutput"),
-    "DriftActionOutput": ("drift_schema", "DriftActionOutput"),
-    "DriftOutput": ("drift_schema", "DriftOutput"),
-    "DriftSummary": ("drift_schema", "DriftSummary"),
+    "DriftActionOutput": ("run_schema", "DriftActionOutput"),
+    "DriftSummary": ("run_schema", "DriftSummary"),
     "EdgeConfidence": ("catalog_schema", "EdgeConfidence"),
     "EncodingRecommendationOutput": ("profile_storage_schema", "EncodingRecommendationOutput"),
     "EnvMaskingStatus": ("compliance_schema", "EnvMaskingStatus"),
@@ -291,6 +290,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "RetentionStatusOutput": ("retention_status_schema", "RetentionStatusOutput"),
     "RetentionSweepOutput": ("state_retention_sweep_schema", "RetentionSweepOutput"),
     "ReviewOutput": ("review_schema", "ReviewOutput"),
+    "ReviewStatusOutput": ("review_status_schema", "ReviewStatusOutput"),
     "ReviewQueueEntry": ("review_queue_schema", "ReviewQueueEntry"),
     "ReviewQueueOutput": ("review_queue_schema", "ReviewQueueOutput"),
     "RunHistoryRecord": ("history_schema", "RunHistoryRecord"),
@@ -414,11 +414,6 @@ if TYPE_CHECKING:
         HealthCheck,
         HealthStatus,
     )
-    from .drift_schema import (
-        DriftActionOutput,
-        DriftOutput,
-        DriftSummary,
-    )
     from .history_schema import (
         HistoryOutput,
         RunHistoryRecord,
@@ -460,6 +455,8 @@ if TYPE_CHECKING:
         AnomalyOutput,
         BudgetBreachOutput,
         ContainedModelOutput,
+        DriftActionOutput,
+        DriftSummary,
         ExcludedTableOutput,
         ExecutionSummary,
         MaterializationMetadata,
@@ -712,6 +709,7 @@ if TYPE_CHECKING:
         PolicyFreezeOutput,
     )
     from .review_schema import ReviewOutput
+    from .review_status_schema import ReviewStatusOutput
     from .review_queue_schema import (
         ReviewQueueEntry,
         ReviewQueueOutput,
@@ -809,7 +807,6 @@ __all__ = [
     "DoctorOutput",
     "HealthCheck",
     "HealthStatus",
-    "DriftOutput",
     "DriftSummary",
     "DriftActionOutput",
     "HistoryOutput",
@@ -1013,6 +1010,7 @@ __all__ = [
     "PolicyFreezeEntry",
     "ReviewOutput",
     "ReviewQueueOutput",
+    "ReviewStatusOutput",
     "ReviewQueueEntry",
     "SeedOutput",
     "SeedTableOutput",

@@ -70,6 +70,7 @@ pub async fn run_apply(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
@@ -79,6 +80,7 @@ pub async fn run_apply(
         plan_id,
         state_path,
         runtime_principal,
+        expect_spec_digest,
         output_json,
     )
     .await
@@ -98,10 +100,16 @@ pub(crate) async fn run_apply_in(
     plan_id: &str,
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
+    expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
     let plan =
         read_plan(root, plan_id).with_context(|| format!("failed to read plan '{plan_id}'"))?;
+
+    // The product-identity equality gate runs HERE — the one seam every
+    // `rocky apply` dispatch crosses — before any per-kind gate arm (policy
+    // `Allow` / `NotConfigured` included), so no gate outcome can bypass it.
+    enforce_spec_digest_expectation(&plan, plan_id, expect_spec_digest)?;
 
     match plan.kind {
         PlanKind::Compact => {
@@ -210,6 +218,179 @@ pub(crate) async fn run_apply_in(
             .await
         }
     }
+}
+
+/// How a persisted plan's raw payload binds (or fails to bind) to a product.
+///
+/// Produced by [`classify_product_binding`] from the raw payload JSON — never
+/// from a typed deserialize, which would silently discard the keys.
+enum ProductBinding<'a> {
+    /// Neither `product_id` nor `spec_digest` appears in the payload.
+    Unbound,
+    /// Both keys are present as non-empty strings.
+    Bound {
+        product_id: &'a str,
+        spec_digest: &'a str,
+    },
+}
+
+/// Classify the product-identity keys on a raw plan payload, fail-closed.
+///
+/// The pair is valid in exactly two shapes: BOTH `product_id` and
+/// `spec_digest` present as JSON strings that are non-empty after trimming,
+/// or NEITHER key present. Every other shape — a lone key, an empty or
+/// whitespace-only string, a non-string value (`null` and numbers included) —
+/// is a malformed binding and refuses with an error, regardless of any
+/// `--expect-spec-digest` flag: `propose` can never write those shapes (it
+/// trims before its non-empty check), so they are hand-authored or tampered
+/// by definition, and a gate that projects them through `as_str()` would
+/// silently collapse them to "absent" and execute ungated.
+fn classify_product_binding<'a>(
+    payload: &'a serde_json::Value,
+    plan_id: &str,
+) -> Result<ProductBinding<'a>> {
+    let malformed = |detail: &str| -> anyhow::Error {
+        anyhow::anyhow!(
+            "plan '{plan_id}' carries a malformed product binding: {detail}. A product-bound \
+             plan must carry BOTH `product_id` and `spec_digest` as non-empty strings (or \
+             neither). This shape cannot come from `propose` — re-propose the plan through \
+             the governed chain instead of applying a hand-authored payload."
+        )
+    };
+    let product = payload.get("product_id");
+    let digest = payload.get("spec_digest");
+    match (product, digest) {
+        (None, None) => Ok(ProductBinding::Unbound),
+        (Some(product), Some(digest)) => match (product.as_str(), digest.as_str()) {
+            (Some(product_id), Some(spec_digest)) => {
+                // Trimmed emptiness, mirroring `propose`'s validation: a
+                // whitespace-only value is not an identity, and `propose`
+                // refuses to write one — so a payload carrying it is
+                // hand-authored by definition and refuses here even when a
+                // matching whitespace `--expect-spec-digest` is passed
+                // (FF-WP1 fix round 2, item 3).
+                if product_id.trim().is_empty() {
+                    return Err(malformed("`product_id` is empty or whitespace-only"));
+                }
+                if spec_digest.trim().is_empty() {
+                    return Err(malformed("`spec_digest` is empty or whitespace-only"));
+                }
+                Ok(ProductBinding::Bound {
+                    product_id,
+                    spec_digest,
+                })
+            }
+            (None, _) => Err(malformed("`product_id` is not a JSON string")),
+            (_, None) => Err(malformed("`spec_digest` is not a JSON string")),
+        },
+        (Some(_), None) => Err(malformed("`product_id` is present without `spec_digest`")),
+        (None, Some(_)) => Err(malformed("`spec_digest` is present without `product_id`")),
+    }
+}
+
+/// FF-WP1 ⟦RTL-4⟧ — `rocky apply --expect-spec-digest`, fail-closed both ways.
+///
+/// Reads the product-identity keys straight off the raw payload JSON (never a
+/// typed deserialize), so the gate covers every plan kind and hand-authored
+/// payloads alike:
+///
+/// - Malformed binding (a lone key, an empty string, a non-string value) →
+///   **refuse**, regardless of flags — see [`classify_product_binding`].
+/// - Plan is product-bound + no flag → **refuse**: a product-bound plan
+///   cannot be applied by a bare `rocky apply` — the runtime's expectation
+///   must be stated.
+/// - Flag given + payload carries no binding → **refuse**: the caller
+///   expected a product binding this plan does not carry.
+/// - Flag given + digests differ → **refuse**, naming both digests.
+/// - No product keys + no flag → today's behavior, untouched.
+///
+/// The comparison is equality over opaque strings; the engine never parses
+/// spec content. Honesty note: this proves *caller expectation == plan
+/// payload* — it cannot prove the spec file on disk still holds those bytes
+/// (that is the runtime's snapshot linearization).
+///
+/// Boundary: the standalone `rocky compact apply` / `rocky archive apply` /
+/// `rocky branch promote --plan` verbs do not cross this seam; they refuse
+/// ANY payload carrying product keys via
+/// [`refuse_product_bound_alias_apply`] and direct callers here.
+fn enforce_spec_digest_expectation(
+    plan: &PersistedPlan,
+    plan_id: &str,
+    expect_spec_digest: Option<&str>,
+) -> Result<()> {
+    // Malformed half-bindings refuse FIRST, before the flag is even looked
+    // at — a matching flag must never launder a payload `propose` could not
+    // have written.
+    let binding = classify_product_binding(&plan.payload, plan_id)?;
+    match (expect_spec_digest, binding) {
+        (
+            None,
+            ProductBinding::Bound {
+                product_id,
+                spec_digest,
+            },
+        ) => bail!(
+            "plan '{plan_id}' is product-bound (product '{product_id}'): its payload carries \
+             spec digest '{spec_digest}', so a bare `rocky apply` is refused. Pass \
+             `rocky apply {plan_id} --expect-spec-digest <digest>` with the digest of the \
+             approved spec you intend to fulfil.",
+        ),
+        (None, ProductBinding::Unbound) => Ok(()),
+        (Some(_), ProductBinding::Unbound) => bail!(
+            "--expect-spec-digest was given, but plan '{plan_id}' carries no spec_digest in \
+             its payload. The caller expected a product-bound plan; this one is not. Verify \
+             the plan id, or drop the flag only if applying a non-product plan is intended."
+        ),
+        (Some(expected), ProductBinding::Bound { spec_digest, .. }) if expected != spec_digest => {
+            bail!(
+                "spec digest mismatch for plan '{plan_id}': the plan was authored against \
+                 '{spec_digest}' but the applier expected '{expected}'. The approved spec has \
+                 moved since this plan was proposed — re-propose against the current approved \
+                 spec instead of applying a stale plan."
+            )
+        }
+        (Some(_), ProductBinding::Bound { .. }) => Ok(()),
+    }
+}
+
+/// FF-WP1 alias gate — persisted-plan verbs that bypass [`run_apply_in`].
+///
+/// `rocky compact apply`, `rocky archive apply`, and `rocky branch promote
+/// --plan` execute persisted plans WITHOUT crossing the
+/// [`enforce_spec_digest_expectation`] seam above, and their typed payload
+/// deserializations do not deny unknown fields — so a correctly rehashed
+/// payload carrying `product_id` / `spec_digest` would pass integrity, have
+/// the binding silently DROPPED by the typed deserialize, and execute under
+/// an Allow / NotConfigured policy. This helper reads the keys off the RAW
+/// persisted payload BEFORE any typed deserialization and refuses when either
+/// is present — in any shape, well-formed or malformed. The aliases
+/// deliberately grow no `--expect-spec-digest` of their own: canonical
+/// `rocky apply` is the one seam that enforces the product expectation, so
+/// product-bound plans are directed there.
+pub(crate) fn refuse_product_bound_alias_apply(
+    plan: &PersistedPlan,
+    plan_id: &str,
+    alias_verb: &str,
+) -> Result<()> {
+    let present: Vec<&str> = ["product_id", "spec_digest"]
+        .into_iter()
+        .filter(|key| plan.payload.get(key).is_some())
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "plan '{plan_id}' carries the product-identity field{plural} {fields} in its payload, \
+         and `{alias_verb}` does not enforce the product-identity gate. Apply it through \
+         canonical `rocky apply {plan_id} --expect-spec-digest <digest>` instead, with the \
+         digest of the approved spec you intend to fulfil.",
+        plural = if present.len() == 1 { "" } else { "s" },
+        fields = present
+            .iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(" + "),
+    )
 }
 
 /// Apply a `PlanKind::Run` plan by re-executing `commands::run::run` with
@@ -790,6 +971,7 @@ async fn execute_run_plan(
         // `--assume-fresh-state` is a `rocky run` runtime flag, never part of
         // a persisted plan — the two-step apply path always runs without it.
         false,
+        None, // #1460: not a replication plan
     )
     .await
     .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))?;
@@ -802,18 +984,40 @@ async fn execute_run_plan(
 /// Path to the review marker for an AI-authored plan:
 /// `<root>/.rocky/plans/<plan_id>.reviewed.json`.
 ///
-/// The marker is written by `rocky review <plan-id> --approve` and is the
-/// human sign-off that unblocks `rocky apply` for an AI-authored plan. Its
-/// presence (not its contents) is what the apply gate checks.
+/// The marker is written by `rocky review <plan-id> --approve` (staged
+/// tmp-then-rename) and is the human sign-off that unblocks `rocky apply`
+/// for an AI-authored plan. The gate checks its CONTENTS, not just its
+/// presence — see [`ai_plan_is_reviewed`].
 pub(crate) fn review_marker_path(root: &Path, plan_id: &str) -> std::path::PathBuf {
     root.join(".rocky")
         .join("plans")
         .join(format!("{plan_id}.reviewed.json"))
 }
 
-/// True when an approved review marker exists for `plan_id` under `root`.
+/// True when a WELL-FORMED review marker naming exactly `plan_id` exists
+/// under `root` — parse-and-match, not existence: a truncated, malformed, or
+/// mispasted marker (one approving a different plan) never counts as
+/// reviewed. The apply gates additionally distinguish that invalid state
+/// with its own refusal via [`super::review::review_marker_state`].
 pub(crate) fn ai_plan_is_reviewed(root: &Path, plan_id: &str) -> bool {
-    review_marker_path(root, plan_id).exists()
+    matches!(
+        super::review::review_marker_state(root, plan_id),
+        super::review::ReviewMarkerState::Approved(_)
+    )
+}
+
+/// The distinct refusal for a marker that exists but does not approve —
+/// malformed bytes, or a marker naming a different plan. Kept apart from the
+/// "has not been reviewed" message so an operator whose approval was
+/// truncated or mispasted is told the marker is broken, not that they never
+/// approved.
+fn invalid_review_marker_error(plan_id: &str, reason: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "refusing to apply plan '{plan_id}': its review marker is INVALID — {reason}. A \
+         truncated or mispasted marker never approves. Re-approve with \
+         `rocky review {plan_id} --approve` to rewrite the marker atomically, then re-run \
+         `rocky apply {plan_id}`."
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,11 +1466,111 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     state_path: &Path,
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
 ) -> PolicyGate {
+    evaluate_apply_policy_with_policy_matching_dual(
+        policy,
+        plan_id,
+        principal,
+        touched,
+        models_dir,
+        models_glob,
+        state_path,
+        marker_freezes,
+        None,
+    )
+}
+
+/// [`evaluate_apply_policy`] evaluated over BOTH the pre-image and the
+/// post-image classification state, returning the most restrictive verdict.
+///
+/// FF-WP1 fix round 2 (item 1): `draft_model` on an existing model passes the
+/// classifications the PRIOR sidecar carried; the policy is evaluated once
+/// with the on-disk (post-write) attributes and once with those
+/// classifications substituted in (the pre-image), and the most restrictive
+/// of the two verdicts governs (deny > require_review > allow). So an edit
+/// through this seam can neither de-scope a `classifications`-matched rule
+/// by ERASING a classification (the pre-image still matches it) nor escape
+/// an `exclude_classifications`-matched rule by ADDING one (the pre-image
+/// still matches that too). The earlier pre/post UNION got only the first
+/// half right: unioned classifications could stop an `exclude_classifications`
+/// rule from matching — fail-open in the exclusion direction. Models without
+/// a prior entry are evaluated exactly as [`evaluate_apply_policy`] would.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_apply_policy_with_extra_classifications(
+    config_path: &Path,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    state_path: &Path,
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
+    prior_classifications: &BTreeMap<String, Vec<String>>,
+) -> PolicyGate {
+    let policy = rocky_core::config::load_rocky_config(config_path)
+        .ok()
+        .and_then(|cfg| cfg.policy);
+    evaluate_apply_policy_with_policy_matching_dual(
+        policy.as_ref(),
+        plan_id,
+        principal,
+        touched,
+        models_dir,
+        None,
+        state_path,
+        marker_freezes,
+        Some(prior_classifications),
+    )
+}
+
+/// The shared body behind [`evaluate_apply_policy_with_policy_matching`] and
+/// [`evaluate_apply_policy_with_extra_classifications`] — resolves attributes,
+/// runs the optional pre-image/post-image dual evaluation, then the
+/// ledger-aware core.
+///
+/// With `prior_classifications` set, the policy is evaluated over two
+/// attribute sets: the resolved on-disk attributes (the post-image) and a
+/// copy with each listed model's classifications REPLACED by its prior set
+/// (the pre-image — an empty prior list is a real pre-image: the model
+/// carried NO classifications). Both candidate evaluations are PURE probes
+/// (no ledger rows); the more restrictive one picks the attribute set the
+/// single RECORDING evaluation then runs over, so the decision rows in the
+/// ledger always describe the verdict this function returns, exactly one row
+/// per touched model — same as a plain evaluation. Ties keep the post-image
+/// (today's exact behavior).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_apply_policy_with_policy_matching_dual(
+    policy: Option<&rocky_core::config::PolicyConfig>,
+    plan_id: &str,
+    principal: PolicyPrincipal,
+    touched: &BTreeMap<String, PolicyCapability>,
+    models_dir: &Path,
+    models_glob: Option<&str>,
+    state_path: &Path,
+    marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
+    prior_classifications: Option<&BTreeMap<String, Vec<String>>>,
+) -> PolicyGate {
     let (policy, attrs_map) =
         match resolve_policy_and_attrs(policy, touched, models_dir, models_glob) {
             Ok(pair) => pair,
             Err(gate) => return gate,
         };
+
+    // The pre-image attribute set: the post-image attributes with each listed
+    // model's classifications replaced by the set its prior sidecar carried.
+    // A model the compile did not resolve still gets an entry, so a rule
+    // scoped on classifications matches it rather than falling to bare
+    // defaults.
+    let pre_attrs_map: Option<BTreeMap<String, ModelAttributes>> =
+        prior_classifications.map(|prior| {
+            let mut pre = attrs_map.clone();
+            for (model, classes) in prior {
+                let attrs = pre.entry(model.clone()).or_insert_with(|| ModelAttributes {
+                    name: model.clone(),
+                    ..Default::default()
+                });
+                attrs.classifications = classes.iter().cloned().collect();
+            }
+            pre
+        });
 
     // Snapshot the decision ledger *before* this apply writes any rows, so the
     // dynamic breakers (autonomy-budget burn, active freezes) reflect only
@@ -1296,6 +1600,38 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     let snapshot_unreadable = prior_snapshot.is_none();
     let prior_decisions: Vec<PolicyDecisionRecord> = prior_snapshot.unwrap_or_default();
 
+    // Dual evaluation (FF-WP1 fix round 2, item 1): probe BOTH candidate
+    // attribute sets purely (no rows written) and let the more restrictive
+    // verdict pick the set the recording evaluation below runs over. Ties —
+    // including the common case where the redraft changed no classification —
+    // keep the post-image, so behavior without a strictly-tighter pre-image
+    // is byte-identical to a plain evaluation.
+    let (eval_attrs, pre_image_won) = match &pre_attrs_map {
+        None => (&attrs_map, false),
+        Some(pre_attrs) => {
+            let probe = |attrs: &BTreeMap<String, ModelAttributes>| {
+                evaluate_apply_policy_core(
+                    &policy,
+                    plan_id,
+                    principal,
+                    touched,
+                    attrs,
+                    &prior_decisions,
+                    marker_freezes,
+                    snapshot_unreadable,
+                    |_| {},
+                )
+            };
+            let post_gate = probe(&attrs_map);
+            let pre_gate = probe(pre_attrs);
+            if gate_rank(&pre_gate) > gate_rank(&post_gate) {
+                (pre_attrs, true)
+            } else {
+                (&attrs_map, false)
+            }
+        }
+    };
+
     // Tracks a failed budget-relevant decision-row write so we can fail closed
     // after the evaluation loop (the record sink returns `()`).
     let budget_write_failed = std::cell::Cell::new(false);
@@ -1305,7 +1641,7 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
         plan_id,
         principal,
         touched,
-        &attrs_map,
+        eval_attrs,
         &prior_decisions,
         marker_freezes,
         snapshot_unreadable,
@@ -1353,7 +1689,38 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
             "a budget-relevant decision row could not be persisted",
         );
     }
-    gate
+    if !pre_image_won {
+        return gate;
+    }
+    // The pre-image evaluation was strictly more restrictive — say so, so the
+    // surfaced reason explains why a rule matched classifications the on-disk
+    // sidecar no longer (or does not yet) shows.
+    let pre_image_suffix = "; pre-image evaluation: this verdict matched the classifications the \
+                            model's PRIOR sidecar carried — an edit through this seam is governed \
+                            by the most restrictive of its before and after states, so a redraft \
+                            can neither erase its way out of a classification-matched rule nor \
+                            add its way out of an exclusion-matched one";
+    match gate {
+        PolicyGate::RequireReview {
+            model,
+            rule_id,
+            reason,
+        } => PolicyGate::RequireReview {
+            model,
+            rule_id,
+            reason: format!("{reason}{pre_image_suffix}"),
+        },
+        PolicyGate::Deny {
+            model,
+            rule_id,
+            reason,
+        } => PolicyGate::Deny {
+            model,
+            rule_id,
+            reason: format!("{reason}{pre_image_suffix}"),
+        },
+        other => other,
+    }
 }
 
 /// Open the decision ledger for writing with a bounded retry on transient
@@ -2701,10 +3068,12 @@ pub(crate) fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) ->
             model,
             rule_id,
             reason,
-        } => {
-            if ai_plan_is_reviewed(root, plan_id) {
-                Ok(())
-            } else {
+        } => match super::review::review_marker_state(root, plan_id) {
+            super::review::ReviewMarkerState::Approved(_) => Ok(()),
+            super::review::ReviewMarkerState::Invalid { reason } => {
+                Err(invalid_review_marker_error(plan_id, &reason))
+            }
+            super::review::ReviewMarkerState::Absent => {
                 let rule = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
                 bail!(
                     "policy requires human review for plan '{plan_id}': model '{model}'{rule} \
@@ -2713,7 +3082,7 @@ pub(crate) fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) ->
                      then re-run `rocky apply {plan_id}`."
                 )
             }
-        }
+        },
         PolicyGate::Deny {
             model,
             rule_id,
@@ -3016,18 +3385,47 @@ async fn run_apply_ai_authored_plan(
         state_path,
         &marker_freezes,
     );
-    match gate {
-        PolicyGate::NotConfigured => {
-            if !ai_plan_is_reviewed(root, plan_id) {
-                bail!(
-                    "AI-authored plan '{plan_id}' has not been reviewed and approved. \
-                     An AI agent authored this change, so it cannot be applied directly. \
-                     Review the breaking-change report and approve it first with \
-                     `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
-                );
-            }
+    // #1459: human review is a FLOOR for an AI-authored plan, not a
+    // policy-dependent extra. This used to run only under
+    // `PolicyGate::NotConfigured`; every other gate went straight to
+    // `apply_policy_gate`, which returns `Ok(())` for `Allow` without
+    // consulting the marker. So configuring a `[policy]` block that resolved
+    // to `Allow` waived human review entirely — the protection was strongest
+    // with governance switched OFF, which is the opposite of what an operator
+    // would predict.
+    //
+    // `Allow` answers "may this principal do this?". The review gate answers
+    // "did a human read this machine-written change?". One is not an answer to
+    // the other, and `PolicyGate::RequireReview` already exists for estates
+    // that want policy to drive review.
+    //
+    // Order matters. The policy gate runs FIRST so its own refusals keep their
+    // wording and precedence: `Deny` still denies, and `RequireReview` without a
+    // marker still reports "policy requires human review" — which is what proves
+    // the kind-aware `ai_authored => agent` default is load-bearing.
+    //
+    // The marker check then runs unconditionally, catching the case policy lets
+    // through: `Allow` (and `NotConfigured`) return `Ok(())` without consulting
+    // the marker. Policy can therefore only TIGHTEN this gate, never waive it.
+    //
+    // The check is `review_marker_state`, not a bare existence probe: a marker
+    // that exists but does not parse, or names a different plan, REFUSES with
+    // its own error instead of approving — a truncated or mispasted marker
+    // must never stand in for a human sign-off.
+    apply_policy_gate(root, plan_id, gate)?;
+    match super::review::review_marker_state(root, plan_id) {
+        super::review::ReviewMarkerState::Approved(_) => {}
+        super::review::ReviewMarkerState::Invalid { reason } => {
+            return Err(invalid_review_marker_error(plan_id, &reason));
         }
-        gate => apply_policy_gate(root, plan_id, gate)?,
+        super::review::ReviewMarkerState::Absent => {
+            bail!(
+                "AI-authored plan '{plan_id}' has not been reviewed and approved. \
+                 An AI agent authored this change, so it cannot be applied directly. \
+                 Review the breaking-change report and approve it first with \
+                 `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
+            );
+        }
     }
 
     // Resolve the post-apply verification checks before the run plan is moved.
@@ -3112,13 +3510,21 @@ async fn run_apply_ai_authored_plan(
 /// plans written by an OLDER binary, and a plan payload is on-disk JSON that
 /// the gc apply path already treats as possibly hand-authored.
 ///
-/// It is safe because this arm never READS those fields. It consumes
-/// `models_dir`, `models`, `partition_from`, `partition_to`, and `parallel`,
-/// so the DAG runner is never reached and DAG-precedence cannot widen the
-/// authorized scope. That guarantee is structural, not enforced: routing a
-/// backfill through the shared `execute_run_plan` (as `Run` and `AiAuthored`
-/// already do) would reintroduce the exposure with no test failing. Add the
-/// shape validation here if this arm ever grows a consumer of either field.
+/// It is safe because this arm never READS `dag` or `model`. It consumes
+/// `models_dir`, `models`, `partition_from`, `partition_to`, `parallel`, and
+/// `env` — the last feeding the governance fingerprint gate, not model
+/// selection — so the DAG runner is never reached and DAG-precedence cannot
+/// widen the authorized scope.
+///
+/// This list is the whole basis of that claim, so keep it exhaustive: it read
+/// `env` for three weeks while enumerating only the first five, which made the
+/// tripwire below unreliable on the day it shipped. If you add a field read
+/// here, add it here too.
+///
+/// That guarantee is structural, not enforced: routing a backfill through the
+/// shared `execute_run_plan` (as `Run` and `AiAuthored` already do) would
+/// reintroduce the exposure with no test failing. Add the shape validation
+/// here if this arm ever grows a consumer of `dag` or `model`.
 async fn run_apply_backfill_plan(
     root: &Path,
     config_path: &Path,
@@ -3142,14 +3548,18 @@ async fn run_apply_backfill_plan(
         .context("failed to deserialize backfill plan payload")?;
 
     // HARD RULE: a backfill is always review-gated, regardless of policy.
-    if !ai_plan_is_reviewed(root, plan_id) {
-        bail!(
+    match super::review::review_marker_state(root, plan_id) {
+        super::review::ReviewMarkerState::Approved(_) => {}
+        super::review::ReviewMarkerState::Invalid { reason } => {
+            return Err(invalid_review_marker_error(plan_id, &reason));
+        }
+        super::review::ReviewMarkerState::Absent => bail!(
             "backfill plan '{plan_id}' has not been reviewed and approved. \
              A backfill re-runs recipes over a scoped window and can hide blast \
              radius, so it always requires a human sign-off — a permissive policy \
              does not waive it. Review the scope and approve it with \
              `rocky review {plan_id} --approve`, then re-run `rocky apply {plan_id}`."
-        );
+        ),
     }
 
     // Policy can only tighten the gate: a `deny` hard-refuses even a reviewed
@@ -3329,8 +3739,12 @@ async fn run_apply_backfill_plan(
             (Some(ctx), Some(l)) => {
                 // Fail-closed (#4/#5): verify the routing identity before executing.
                 ctx.verify_routing_identity(&l.config)?;
-                // The governance identity resolves the plan's persisted `--env` (a
-                // backfill persists `None`), matching the plan-side fingerprint.
+                // The governance identity resolves the plan's persisted `--env`,
+                // matching the plan-side fingerprint. Deliberately reads whatever
+                // the payload carries rather than assuming what `build_run_plan`
+                // writes today: the same reasoning #1173 rejected for `dag` /
+                // `model` applies here, since a plan on disk may come from an
+                // older binary or be hand-authored.
                 Some(ctx.exec_fingerprint_gate(&l.config, run_plan.env.as_deref()))
             }
             // Fail-closed (#7): a governed backfill whose config would not load
@@ -3415,6 +3829,55 @@ async fn run_apply_backfill_plan(
 /// the adapter surfaces them) is treated as drift and aborts the apply with
 /// a clear "re-plan and re-apply" error. The check happens BEFORE any SQL
 /// is emitted to the warehouse.
+/// Rebuild the shadow routing a [`ReplicationPlan`] captured (#1403).
+///
+/// Deliberately the same shape as the `RunPlan` arm's reconstruction, branch
+/// lookup included. `--branch` is internally `--shadow --shadow-schema
+/// <branch.schema_prefix>` and clap rejects it alongside the shadow flags, so a
+/// branch plan carries `shadow == false` — consulting only `shadow` would
+/// replay it as a PRODUCTION run.
+///
+/// Extracted rather than inlined so the mapping is testable without standing up
+/// an apply. The defect this fixes was invisible precisely because the decision
+/// lived inside a long async function as a literal `None`.
+///
+/// `state_path` is read ONLY on the branch arm; the other arms never open the
+/// store, so a caller with no branch cannot fail here on an unreadable path.
+fn replication_shadow_config(
+    replication_plan: &ReplicationPlan,
+    state_path: &Path,
+) -> Result<Option<rocky_core::shadow::ShadowConfig>> {
+    // Mirrors the `RunPlan` arm: clap gives `--shadow-suffix` a default, and
+    // the CLI drops it before it reaches a plan unless shadow was requested, so
+    // a `None` here means "not a shadow plan" rather than "defaulted".
+    let suffix = replication_plan
+        .shadow_suffix
+        .clone()
+        .unwrap_or_else(|| "_rocky_shadow".to_string());
+
+    if let Some(ref name) = replication_plan.branch {
+        let store = rocky_core::state::StateStore::open_read_only(state_path)
+            .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
+        let record = store.get_branch(name)?.with_context(|| {
+            format!("branch '{name}' not found — create it with `rocky branch create {name}`")
+        })?;
+        return Ok(Some(rocky_core::shadow::ShadowConfig {
+            suffix,
+            schema_override: Some(record.schema_prefix),
+            cleanup_after: false,
+        }));
+    }
+    Ok(if replication_plan.shadow {
+        Some(rocky_core::shadow::ShadowConfig {
+            suffix,
+            schema_override: replication_plan.shadow_schema.clone(),
+            cleanup_after: false,
+        })
+    } else {
+        None
+    })
+}
+
 async fn run_apply_replication_plan(
     root: &Path,
     config_path: &Path,
@@ -3446,6 +3909,97 @@ async fn run_apply_replication_plan(
             .with_context(|| format!("failed to load config from {}", config_path.display()))?,
     );
     let rocky_cfg = &loaded.config;
+
+    // #1460: the plan's config snapshot had no reader. It was written at plan
+    // time and never compared, so changing the adapter, database path, schema
+    // template or strategy between plan and apply re-routed an approved plan to
+    // unreviewed SQL or a different destination, with the source-state check
+    // still passing because discovery was unchanged.
+    //
+    // Compared whole, deliberately. The field's own doc rejects extracting a
+    // "replication-relevant subset" as a footgun: a runtime dependency on a
+    // field outside the subset would silently break replay. So any config
+    // change invalidates the plan and you re-plan.
+    //
+    // TWO LIMITS worth knowing, because this comparison looks stronger than it
+    // is:
+    //
+    // 1. Secrets serialize as `"***"` by construction (`rocky_core::redacted`),
+    //    so this compares routing and shape, NOT credentials. Swapping the
+    //    password behind the same host is invisible.
+    // 2. It does not bind the STATE authority. `StateConfig.valkey_url` is
+    //    redacted whole, and the plan stores neither the resolved
+    //    `--state-path` nor the CLI state namespace — both come from the
+    //    caller at apply time. So a plan can compare equal here and still run
+    //    against a different watermark/freeze/budget ledger, which can mean an
+    //    unexpected full refresh or a freeze the reviewed authority recorded
+    //    going unseen.
+    //
+    // Closing (2) needs a credential-free state-authority identity persisted in
+    // the plan (backend, host/port/database, key prefix, resolved namespace).
+    // That is a payload change, tracked separately rather than bolted on here.
+    let live_config_snapshot = serde_json::to_value(rocky_cfg)
+        .context("failed to serialize the live config for the plan comparison")?;
+    if live_config_snapshot != replication_plan.config_snapshot {
+        let changed =
+            changed_config_sections(&replication_plan.config_snapshot, &live_config_snapshot);
+        bail!(
+            "config has changed since plan '{plan_id}' was created{}.\n\
+             The plan is the reviewed artifact, so applying it against a \
+             different config would run SQL nobody approved — a changed \
+             adapter, path, schema template or strategy redirects the write \
+             while the source state still matches.\n\
+             Nothing was written. Re-plan with `rocky plan` and apply the new \
+             plan_id.\n\
+             Note: credentials are redacted in the snapshot, so a changed \
+             secret is not detected here.",
+            if changed.is_empty() {
+                String::new()
+            } else {
+                format!(" (differing sections: {})", changed.join(", "))
+            }
+        );
+    }
+
+    // #1460: the config comparison above cannot see the state authority —
+    // `valkey_url` is redacted whole and the resolved `--state-path` is a
+    // caller argument, absent from the config. Compare the recorded identity so
+    // a plan cannot pass the config check and still apply against a different
+    // watermark/freeze/budget ledger.
+    //
+    // Absent means the plan predates this field; skip rather than refuse every
+    // older plan. New plans always record it.
+    //
+    // Warn rather than skip silently. A gate that disappears without a word is
+    // how an unbound plan reaches a different ledger unnoticed, and the absence
+    // is not self-announcing anywhere else. Whether an unbound plan should be
+    // refused outright is a policy question, not one to settle by default.
+    if replication_plan.state_authority.is_none() {
+        warn!(
+            target = "rocky::replication::state_authority",
+            plan_id = plan_id,
+            "plan records no state authority (written before that field existed); \
+             applying WITHOUT verifying the state store matches the reviewed one"
+        );
+    }
+    if let Some(reviewed_authority) = replication_plan.state_authority.as_deref() {
+        let live_authority =
+            crate::commands::plan::state_authority_identity(&rocky_cfg.state, state_path);
+        if live_authority != reviewed_authority {
+            bail!(
+                "state authority has changed since plan '{plan_id}' was created.\n\
+                 reviewed: {reviewed_authority}\n\
+                 now:      {live_authority}\n\
+                 Watermarks, freezes, budgets and idempotency keys live in the \
+                 state store, so applying against a different one can redo work \
+                 the reviewed ledger recorded as done, or miss a freeze it \
+                 recorded.\n\
+                 Nothing was written. Re-plan against the intended state store, \
+                 or re-run with the state path the plan was created with."
+            );
+        }
+    }
+
     let (_pipeline_name, pipeline) = crate::registry::resolve_replication_pipeline(
         rocky_cfg,
         replication_plan.pipeline.as_deref(),
@@ -3546,6 +4100,8 @@ async fn run_apply_replication_plan(
     // plan's policy checks.
     let apply_run_id = new_apply_run_id();
 
+    let replication_shadow_config = replication_shadow_config(&replication_plan, state_path)?;
+
     crate::commands::run::run(
         config_path,
         // Execute-from-owned: the SAME snapshot the drift check read (#1120).
@@ -3563,9 +4119,10 @@ async fn run_apply_replication_plan(
         false,
         replication_plan.resume.as_deref(),
         replication_plan.resume_latest,
-        // No shadow config — branch promote and shadow paths are
-        // independent of replication-plan replay.
-        None,
+        // Shadow routing replays, exactly as it does for a `RunPlan` (#1403).
+        // Passing `None` here meant `rocky plan --shadow` was accepted and then
+        // applied against PRODUCTION, reporting Success — the #1272 shape.
+        replication_shadow_config.as_ref(),
         &partition_opts,
         // No model filter — replication runs every discovered table.
         None,
@@ -3584,6 +4141,7 @@ async fn run_apply_replication_plan(
         // `--assume-fresh-state` is a `rocky run` runtime flag, never part of
         // a persisted plan — the replication apply path always runs without it.
         false,
+        Some((plan_id, replication_plan.source_state_snapshot.as_slice())), // #1460
     )
     .await
     .with_context(|| format!("rocky apply replication plan '{plan_id}' failed"))?;
@@ -3613,7 +4171,7 @@ async fn run_apply_replication_plan(
 /// under steady-state source-system churn. Unfiltered applies keep the
 /// strict semantics because any drift is structurally undefined.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DriftScope {
+pub(crate) enum DriftScope {
     /// Snapshots match — proceed normally.
     None,
     /// Drift exists but the active filter excludes every drifted connector
@@ -3668,7 +4226,7 @@ enum DriftScope {
 /// matches today (live) and every connector that matched at plan time
 /// (persisted) — that way a removed in-scope connector is correctly
 /// surfaced as in-scope drift even though `live` no longer carries it.
-fn decide_drift_scope(
+pub(crate) fn decide_drift_scope(
     persisted: &[ReplicationConnectorSnapshot],
     live: &[ReplicationConnectorSnapshot],
     filter: Option<&str>,
@@ -3778,7 +4336,22 @@ fn connector_matches_filter(
 /// source-state snapshot and the live one. Surfaced inside the
 /// stale-source bail message so operators see what changed without
 /// having to inspect the plan file by hand.
-fn summarize_source_state_drift(
+/// Top-level config sections that differ between two snapshots, so a refusal can
+/// say *what* changed instead of only that something did. Names only — values may
+/// contain redacted secrets and site-specific paths.
+fn changed_config_sections(persisted: &serde_json::Value, live: &serde_json::Value) -> Vec<String> {
+    let (Some(p), Some(l)) = (persisted.as_object(), live.as_object()) else {
+        return Vec::new();
+    };
+    let mut keys: std::collections::BTreeSet<&String> = p.keys().collect();
+    keys.extend(l.keys());
+    keys.into_iter()
+        .filter(|k| p.get(*k) != l.get(*k))
+        .map(ToString::to_string)
+        .collect()
+}
+
+pub(crate) fn summarize_source_state_drift(
     persisted: &[ReplicationConnectorSnapshot],
     live: &[ReplicationConnectorSnapshot],
 ) -> String {
@@ -4023,6 +4596,7 @@ pub async fn run_apply_inline_for_run(
         // `--assume-fresh-state` threads through from the CLI (main.rs
         // validated it against the configured `[state]` backend).
         assume_fresh_state,
+        None, // #1460: inline `rocky run`, not a persisted plan
     )
     .await
 }
@@ -4518,6 +5092,8 @@ mod tests {
             governance_override: None,
             models: vec!["schema.orders".to_string()],
             execution_layers: vec![vec!["schema.orders".to_string()]],
+            product_id: None,
+            spec_digest: None,
         }
     }
 
@@ -4611,13 +5187,102 @@ mod tests {
             "fresh AI-authored plan must not count as reviewed"
         );
 
-        // Write the marker (what `rocky review --approve` does) → reviewed.
+        // FF-WP1 parse-and-match: an empty/truncated marker file no longer
+        // counts as reviewed — existence alone stopped being an approval.
         let marker = super::review_marker_path(dir.path(), &plan_id);
         std::fs::create_dir_all(marker.parent().unwrap())?;
         std::fs::write(&marker, b"{}")?;
         assert!(
+            !super::ai_plan_is_reviewed(dir.path(), &plan_id),
+            "a marker that does not parse as a ReviewMarker must not approve"
+        );
+
+        // A well-formed marker naming THIS plan (what `rocky review --approve`
+        // writes) → reviewed.
+        std::fs::write(&marker, well_formed_marker_json(&plan_id))?;
+        assert!(
             super::ai_plan_is_reviewed(dir.path(), &plan_id),
-            "AI-authored plan with a marker present must count as reviewed"
+            "a well-formed matching marker must count as reviewed"
+        );
+
+        // The same well-formed marker naming a DIFFERENT plan → not reviewed.
+        std::fs::write(&marker, well_formed_marker_json(&"9".repeat(64)))?;
+        assert!(
+            !super::ai_plan_is_reviewed(dir.path(), &plan_id),
+            "a marker approving a different plan must not approve this one"
+        );
+        Ok(())
+    }
+
+    /// The exact byte shape `rocky review --approve` persists, for tests that
+    /// need a valid marker naming `plan_id` (the `ReviewMarker` type itself is
+    /// module-private to `review.rs` on purpose).
+    fn well_formed_marker_json(plan_id: &str) -> String {
+        format!(
+            r#"{{
+  "plan_id": "{plan_id}",
+  "reviewed_at": "2026-08-18T00:00:00Z",
+  "base_ref": "HEAD",
+  "breaking_change_count": 0,
+  "approver": {{ "email": "dev@example.com", "host": "localhost", "source": "local" }}
+}}"#
+        )
+    }
+
+    /// FF-WP1 ⟦RTL-6⟧: an INVALID marker (malformed or mismatched) refuses
+    /// the apply with its own distinct error — not the "has not been
+    /// reviewed" message — so a truncated or mispasted approval is surfaced
+    /// as marker corruption rather than as a missing review.
+    #[tokio::test]
+    async fn ai_authored_apply_with_invalid_marker_is_refused_distinctly() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rp = minimal_run_plan();
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+        let config_path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            "[adapter.db]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n",
+        )?;
+        let marker = super::review_marker_path(dir.path(), &plan_id);
+        std::fs::create_dir_all(marker.parent().unwrap())?;
+        std::fs::write(&marker, b"{\"plan_id\": tru")?;
+
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            std::path::Path::new("models/.rocky-state.redb"),
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("INVALID"),
+            "the refusal names the invalid marker: {msg}"
+        );
+        assert!(
+            !msg.contains("has not been reviewed"),
+            "an invalid marker is NOT reported as a missing review: {msg}"
+        );
+
+        // The mispaste variant: a well-formed marker for another plan.
+        std::fs::write(&marker, well_formed_marker_json(&"9".repeat(64)))?;
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &config_path,
+            &plan_id,
+            std::path::Path::new("models/.rocky-state.redb"),
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("INVALID") && msg.contains(&"9".repeat(64)),
+            "the mismatch refusal names the plan the marker actually approves: {msg}"
         );
         Ok(())
     }
@@ -4682,6 +5347,31 @@ auto_create_schemas = true
 
 [policy]
 version = 1
+"#;
+
+    /// #1459: a configured `[policy]` that resolves to `allow` for the agent
+    /// principal. This is the shape that used to waive human review entirely.
+    const ALLOW_POLICY_TOML: &str = r#"
+[adapter]
+type = "duckdb"
+path = "x.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+[policy]
+version = 1
+default_agent_effect = "allow"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "allow"
 "#;
 
     /// Config with an adapter + pipeline and NO `[policy]` block.
@@ -4769,6 +5459,48 @@ auto_create_schemas = true
         assert!(
             msg.contains("policy requires human review"),
             "must be refused by the policy plane (not just the marker gate), got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// #1459: a configured policy resolving to `allow` must NOT waive human
+    /// review for a machine-authored plan.
+    ///
+    /// The marker check used to run only under `PolicyGate::NotConfigured`.
+    /// Every other gate went to `apply_policy_gate`, which returns `Ok(())` for
+    /// `Allow` without consulting the marker — so configuring a `[policy]` block
+    /// switched the review gate OFF. The protection was strongest with
+    /// governance absent, which is backwards.
+    ///
+    /// `Allow` answers "may this principal do this?". Review answers "did a
+    /// human read this machine-written change?". Policy may tighten the gate
+    /// (`Deny`, `RequireReview`) but never waive it.
+    #[tokio::test]
+    async fn configured_allow_policy_does_not_waive_ai_review() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("rocky.toml"), ALLOW_POLICY_TOML)?;
+        let models_dir = dir.path().join("models");
+        write_min_model(&models_dir, "orders");
+        let mut rp = minimal_run_plan();
+        rp.models_dir = Some(models_dir.to_string_lossy().into_owned());
+        rp.models = vec!["orders".to_string()];
+        let plan_id = write_plan(dir.path(), PlanKind::AiAuthored, &rp)?;
+
+        let state = dir.path().join("state.redb");
+        let err = super::run_apply_ai_authored_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            PolicyPrincipal::Agent,
+            true,
+        )
+        .await
+        .expect_err("an allow policy must not let an unreviewed AI plan apply");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has not been reviewed and approved"),
+            "must be refused by the review gate even though policy allowed it, got: {msg}"
         );
         Ok(())
     }
@@ -5024,6 +5756,211 @@ effect = "deny"
         assert!(
             matches!(gate_none, PolicyGate::NotConfigured),
             "no policy passed ⇒ NotConfigured (no disk reload); got {gate_none:?}"
+        );
+        Ok(())
+    }
+
+    /// FF-WP1 fix round (finding 2) — the prior-classifications threading:
+    /// `evaluate_apply_policy_with_extra_classifications` matches a
+    /// `classifications = ["pii"]` deny even when the ON-DISK model carries no
+    /// `pii` classification, because the caller-supplied prior set drives a
+    /// pre-image evaluation whose verdict wins when more restrictive. This is
+    /// the seam `draft_model` uses — the control half proves the SAME call
+    /// WITHOUT the prior set resolves to the default posture, so the deny
+    /// provably came from the pre-image evaluation.
+    #[test]
+    fn extra_classifications_pre_image_widens_rule_matching() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { classifications = ["pii"] }
+effect = "deny"
+"#,
+        )?;
+        // The on-disk model carries NO pii classification.
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models)?;
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            models.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"warehouse\"\nschema = \"out\"\n",
+        )?;
+        let state = dir.path().join("state.redb");
+
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::Propose);
+
+        // Control: without the extra set, the pii deny does not match — the
+        // default posture (require_review) decides.
+        let plain = super::evaluate_apply_policy(
+            &config,
+            "draft:m",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+            &[],
+        );
+        assert!(
+            matches!(plain, PolicyGate::RequireReview { .. }),
+            "without the prior set the deny must NOT match (default posture decides); got {plain:?}"
+        );
+
+        // With the prior set (the pre-image classifications), the deny matches.
+        let prior: BTreeMap<String, Vec<String>> =
+            std::iter::once(("m".to_string(), vec!["pii".to_string()])).collect();
+        let gate = super::evaluate_apply_policy_with_extra_classifications(
+            &config,
+            "draft:m",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+            &[],
+            &prior,
+        );
+        assert!(
+            matches!(gate, PolicyGate::Deny { .. }),
+            "the prior classification must match the pii-scoped deny via the pre-image \
+             evaluation; got {gate:?}"
+        );
+        Ok(())
+    }
+
+    /// FF-WP1 fix round 2 (item 1a) — the erase direction, stated as the
+    /// redraft scenario: a `classifications = ["pii"]` deny, an on-disk model
+    /// whose redraft REMOVED the pii classification (the sidecar carries
+    /// none), and a prior set that still carries it. The pre-image evaluation
+    /// matches the deny, and the most restrictive verdict governs: still
+    /// Deny. (The union got this direction right too; the sibling exclusion
+    /// test is the one the union failed.)
+    #[test]
+    fn redraft_removing_a_classification_still_matches_the_deny() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { classifications = ["pii"] }
+effect = "deny"
+"#,
+        )?;
+        // Post-image: the redrafted sidecar carries NO classification.
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models)?;
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id\n")?;
+        std::fs::write(
+            models.join("m.toml"),
+            "name = \"m\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"warehouse\"\nschema = \"out\"\n",
+        )?;
+        let state = dir.path().join("state.redb");
+
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::Propose);
+
+        // Pre-image: the prior sidecar carried pii.
+        let prior: BTreeMap<String, Vec<String>> =
+            std::iter::once(("m".to_string(), vec!["pii".to_string()])).collect();
+        let gate = super::evaluate_apply_policy_with_extra_classifications(
+            &config,
+            "draft:m",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+            &[],
+            &prior,
+        );
+        let PolicyGate::Deny { reason, .. } = gate else {
+            panic!("removing pii in the redraft must not de-scope the deny; got {gate:?}");
+        };
+        assert!(
+            reason.contains("pre-image evaluation"),
+            "the surfaced reason must say the pre-image evaluation decided it: {reason}"
+        );
+        Ok(())
+    }
+
+    /// FF-WP1 fix round 2 (item 1b) — the exclusion direction the UNION
+    /// failed: a deny scoped `exclude_classifications = ["pii"]` (deny when
+    /// the model carries NO pii), an on-disk model whose redraft ADDED a pii
+    /// classification, and an empty prior set (the model carried none). The
+    /// union {pii} stopped the exclude rule from matching — fail-open. Dual
+    /// evaluation still matches it on the pre-image, and the most restrictive
+    /// verdict governs: Deny. The control half proves the post-image alone
+    /// resolves to the default posture.
+    #[test]
+    fn redraft_adding_a_classification_cannot_escape_an_exclusion_deny() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = write_config(
+            dir.path(),
+            r#"
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { exclude_classifications = ["pii"] }
+effect = "deny"
+"#,
+        )?;
+        // Post-image: the redrafted sidecar ADDS a pii classification.
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models)?;
+        std::fs::write(models.join("m.sql"), "SELECT 1 AS id, 2 AS email\n")?;
+        std::fs::write(
+            models.join("m.toml"),
+            "name = \"m\"\n\n[classification]\nemail = \"pii\"\n\n\
+             [strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"warehouse\"\nschema = \"out\"\n",
+        )?;
+        let state = dir.path().join("state.redb");
+
+        let mut touched = BTreeMap::new();
+        touched.insert("m".to_string(), PolicyCapability::Propose);
+
+        // Control: the post-image alone does NOT match the exclusion deny
+        // (pii present), so the default posture decides.
+        let plain = super::evaluate_apply_policy(
+            &config,
+            "draft:m",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+            &[],
+        );
+        assert!(
+            matches!(plain, PolicyGate::RequireReview { .. }),
+            "post-image alone must resolve to the default posture; got {plain:?}"
+        );
+
+        // Pre-image: the prior sidecar carried NO classifications — an empty
+        // prior list is a real pre-image, not a no-op.
+        let prior: BTreeMap<String, Vec<String>> =
+            std::iter::once(("m".to_string(), Vec::new())).collect();
+        let gate = super::evaluate_apply_policy_with_extra_classifications(
+            &config,
+            "draft:m",
+            PolicyPrincipal::Agent,
+            &touched,
+            &models,
+            &state,
+            &[],
+            &prior,
+        );
+        let PolicyGate::Deny { reason, .. } = gate else {
+            panic!("adding pii in the redraft must not escape the exclusion deny; got {gate:?}");
+        };
+        assert!(
+            reason.contains("pre-image evaluation"),
+            "the surfaced reason must say the pre-image evaluation decided it: {reason}"
         );
         Ok(())
     }
@@ -7161,7 +8098,15 @@ schema_template = "s__{source}"
         assert!(super::apply_policy_gate(dir.path(), "p", review()).is_err());
         let marker = super::review_marker_path(dir.path(), "p");
         std::fs::create_dir_all(marker.parent().unwrap())?;
+        // FF-WP1 parse-and-match: an unparseable marker is a DISTINCT refusal.
         std::fs::write(&marker, b"{}")?;
+        let err = super::apply_policy_gate(dir.path(), "p", review())
+            .expect_err("an unparseable marker must not satisfy require_review");
+        assert!(
+            err.to_string().contains("INVALID"),
+            "the invalid-marker refusal is distinct: {err}"
+        );
+        std::fs::write(&marker, well_formed_marker_json("p"))?;
         assert!(super::apply_policy_gate(dir.path(), "p", review()).is_ok());
 
         // Allow and NotConfigured always pass.
@@ -7242,6 +8187,8 @@ schema_template = "s__{source}"
             }),
             models: vec!["db.s.orders".to_string()],
             execution_layers: vec![vec!["db.s.orders".to_string()]],
+            product_id: Some("product:revenue_daily".to_string()),
+            spec_digest: Some("sha256:abc123".to_string()),
         };
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let persisted = read_plan(dir.path(), &plan_id)?;
@@ -7256,6 +8203,249 @@ schema_template = "s__{source}"
         assert_eq!(decoded.idempotency_key.as_deref(), Some("my_idem_key"));
         assert_eq!(decoded.models_dir.as_deref(), Some("custom_models"));
         assert!(decoded.governance_override.is_some());
+        assert_eq!(decoded.product_id.as_deref(), Some("product:revenue_daily"));
+        assert_eq!(decoded.spec_digest.as_deref(), Some("sha256:abc123"));
+        Ok(())
+    }
+
+    /// FF-WP1 ⟦RTL-4⟧ — the `--expect-spec-digest` matrix, fail-closed both
+    /// ways, checked at the one seam every `rocky apply` crosses.
+    #[tokio::test]
+    async fn expect_spec_digest_gate_is_fail_closed_both_ways() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        // A deliberately nonexistent config: every per-kind arm hard-loads the
+        // config before its policy gate, so any refusal that mentions the
+        // product identity provably fired BEFORE any gate arm ran.
+        let config = root.join("rocky.toml");
+        let state = root.join("state.redb");
+
+        let bound = RunPlan {
+            product_id: Some("product:revenue_daily".to_string()),
+            spec_digest: Some("sha256:abc".to_string()),
+            ..minimal_run_plan()
+        };
+        let bound_id = crate::plan_store::write_plan(root, PlanKind::AiAuthored, &bound)?;
+        let unbound_id =
+            crate::plan_store::write_plan(root, PlanKind::AiAuthored, &minimal_run_plan())?;
+
+        // (a) product-bound plan + NO flag → refused, naming the binding.
+        let err = run_apply_in(
+            root,
+            &config,
+            &bound_id,
+            &state,
+            PolicyPrincipal::Human,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a product-bound plan must refuse a bare apply");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("product-bound") && msg.contains("--expect-spec-digest"),
+            "the refusal names the binding and the required flag: {msg}"
+        );
+
+        // (b) flag given + plan lacks the field → refused.
+        let err = run_apply_in(
+            root,
+            &config,
+            &unbound_id,
+            &state,
+            PolicyPrincipal::Human,
+            Some("sha256:abc"),
+            false,
+        )
+        .await
+        .expect_err("the flag against an unbound plan must refuse");
+        assert!(
+            format!("{err:#}").contains("carries no spec_digest"),
+            "distinct unbound-plan refusal: {err:#}"
+        );
+
+        // (c) mismatch → refused, naming BOTH digests.
+        let err = run_apply_in(
+            root,
+            &config,
+            &bound_id,
+            &state,
+            PolicyPrincipal::Human,
+            Some("sha256:other"),
+            false,
+        )
+        .await
+        .expect_err("a digest mismatch must refuse");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sha256:abc") && msg.contains("sha256:other"),
+            "the mismatch error carries both digests: {msg}"
+        );
+
+        // (d) match → the digest gate passes; the apply then fails LATER on
+        // the missing config, proving the gate sits before the per-kind arms
+        // (and therefore before every policy gate arm) rather than after.
+        let err = run_apply_in(
+            root,
+            &config,
+            &bound_id,
+            &state,
+            PolicyPrincipal::Human,
+            Some("sha256:abc"),
+            false,
+        )
+        .await
+        .expect_err("no config exists, so the apply fails past the digest gate");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("spec digest") && !msg.contains("product-bound"),
+            "a matching digest must clear the gate — the later failure is config-shaped: {msg}"
+        );
+
+        // No policy gate ever ran: the decision ledger has no rows (there is
+        // no config to gate with; a gate that ran would have errored first).
+        assert!(
+            !state.exists()
+                || StateStore::open(&state)?
+                    .list_policy_decisions()?
+                    .is_empty(),
+            "no custody row may exist for a pre-gate refusal"
+        );
+        Ok(())
+    }
+
+    /// A hand-authored payload naming a product WITHOUT a spec digest is not
+    /// treated as unbound — it fails closed (propose can never write this
+    /// shape, so it is tampered-or-authored-outside-the-chain by definition).
+    #[tokio::test]
+    async fn lone_product_id_without_digest_fails_closed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let half_bound = RunPlan {
+            product_id: Some("product:revenue_daily".to_string()),
+            spec_digest: None,
+            ..minimal_run_plan()
+        };
+        let plan_id = crate::plan_store::write_plan(root, PlanKind::AiAuthored, &half_bound)?;
+        let err = run_apply_in(
+            root,
+            &root.join("rocky.toml"),
+            &plan_id,
+            &root.join("state.redb"),
+            PolicyPrincipal::Human,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a lone product_id must fail closed");
+        assert!(
+            format!("{err:#}").contains("malformed product binding")
+                && format!("{err:#}").contains("without `spec_digest`"),
+            "distinct half-bound refusal: {err:#}"
+        );
+        Ok(())
+    }
+
+    /// FF-WP1 fix round (finding 3) — the malformed-binding matrix: a lone
+    /// digest, an empty string, and a non-string value must ALL refuse,
+    /// REGARDLESS of the flag. The lone-digest case is checked with a
+    /// MATCHING `--expect-spec-digest`: before the fix, `as_str()` projection
+    /// collapsed the lone field into "present" and the matching flag
+    /// executed it — the exact half-binding bypass.
+    #[tokio::test]
+    async fn malformed_product_bindings_refuse_regardless_of_flag() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        let config = root.join("rocky.toml");
+        let state = root.join("state.redb");
+
+        // Hand-authored raw payloads: shapes the typed `RunPlan` cannot even
+        // express, written through the real (rehashing) plan store — so each
+        // passes integrity and the refusal provably comes from the binding
+        // classification, not the integrity check.
+        let cases: Vec<(&str, serde_json::Value, Option<&str>)> = vec![
+            (
+                "lone spec_digest + MATCHING flag",
+                serde_json::json!({ "spec_digest": "sha256:abc" }),
+                Some("sha256:abc"),
+            ),
+            (
+                "lone spec_digest + no flag",
+                serde_json::json!({ "spec_digest": "sha256:abc" }),
+                None,
+            ),
+            (
+                "empty-string product_id + matching flag",
+                serde_json::json!({ "product_id": "", "spec_digest": "sha256:abc" }),
+                Some("sha256:abc"),
+            ),
+            (
+                "empty-string spec_digest",
+                serde_json::json!({ "product_id": "product:x", "spec_digest": "" }),
+                None,
+            ),
+            (
+                "numeric product_id + matching flag",
+                serde_json::json!({ "product_id": 42, "spec_digest": "sha256:abc" }),
+                Some("sha256:abc"),
+            ),
+            (
+                "numeric spec_digest + no flag",
+                serde_json::json!({ "product_id": "product:x", "spec_digest": 42 }),
+                None,
+            ),
+            (
+                "null product_id",
+                serde_json::json!({ "product_id": null, "spec_digest": "sha256:abc" }),
+                Some("sha256:abc"),
+            ),
+            // FF-WP1 fix round 2 (item 3): whitespace-only values are not
+            // identities either — `propose` trims before its non-empty check,
+            // so this shape is hand-authored by definition. The pair case
+            // passes a MATCHING whitespace flag: before the trim, the
+            // byte-equal expectation satisfied the gate and the apply
+            // executed on a binding `propose` could never have written.
+            (
+                "whitespace product_id + matching flag",
+                serde_json::json!({ "product_id": "   ", "spec_digest": "sha256:abc" }),
+                Some("sha256:abc"),
+            ),
+            (
+                "whitespace pair + matching whitespace flag",
+                serde_json::json!({ "product_id": " \t ", "spec_digest": " \t " }),
+                Some(" \t "),
+            ),
+        ];
+
+        for (label, payload, flag) in cases {
+            let plan_id = crate::plan_store::write_plan(root, PlanKind::AiAuthored, &payload)?;
+            let err = run_apply_in(
+                root,
+                &config,
+                &plan_id,
+                &state,
+                PolicyPrincipal::Human,
+                flag,
+                false,
+            )
+            .await
+            .expect_err(&format!("case '{label}' must refuse"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("malformed product binding"),
+                "case '{label}' refuses as a malformed binding: {msg}"
+            );
+        }
+
+        // No policy gate ever ran (there is no config on disk): the refusals
+        // all fired at the binding classification, before any gate arm.
+        assert!(
+            !state.exists()
+                || StateStore::open(&state)?
+                    .list_policy_decisions()?
+                    .is_empty(),
+            "no custody row may exist for a pre-gate refusal"
+        );
         Ok(())
     }
 
@@ -7327,6 +8517,8 @@ schema_template = "s__{source}"
                 vec!["db.s.users".to_string()],
                 vec!["db.s.orders".to_string()],
             ],
+            product_id: None,
+            spec_digest: None,
         };
         let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
         let persisted = read_plan(dir.path(), &plan_id)?;
@@ -7347,6 +8539,119 @@ schema_template = "s__{source}"
     // Replication plan (Phase 5b)
     // ------------------------------------------------------------------
 
+    /// #1403: a non-shadow replication plan must serialize exactly as it did
+    /// before the shadow fields existed.
+    ///
+    /// `plan_id` is `blake3({kind, payload})` (`plan_store.rs`), so a field that
+    /// always emits — the shape `RunPlan.shadow` uses — would hand every
+    /// unchanged replication project a brand-new plan id on upgrade, for a
+    /// feature it does not use. `skip_serializing_if` is what prevents that,
+    /// and nothing else in the type system will notice if it is removed.
+    ///
+    /// Mutation that must turn this red: drop `skip_serializing_if` from any of
+    /// the four fields.
+    #[test]
+    fn a_non_shadow_replication_plan_serializes_without_the_shadow_keys() {
+        let value = serde_json::to_value(minimal_replication_plan()).unwrap();
+        let obj = value.as_object().expect("a plan payload is a JSON object");
+        for key in ["shadow", "shadow_suffix", "shadow_schema", "branch"] {
+            assert!(
+                !obj.contains_key(key),
+                "`{key}` must be absent from a non-shadow plan — its presence \
+                 changes plan_id for every existing project: {value}"
+            );
+        }
+    }
+
+    /// #1403: the routing a plan captured is what apply replays.
+    ///
+    /// Mutation that must turn this red: returning `None` unconditionally,
+    /// which is exactly what the replication arm did — `rocky plan --shadow`
+    /// was accepted, discarded, and applied against production at exit 0.
+    #[test]
+    fn a_shadow_replication_plan_replays_its_routing() {
+        let unused = std::path::Path::new("/nonexistent/state.redb");
+
+        let mut plan = minimal_replication_plan();
+        plan.shadow = true;
+        plan.shadow_suffix = Some("_pr".to_string());
+        let cfg = replication_shadow_config(&plan, unused)
+            .expect("no branch means the state store is never opened")
+            .expect("a shadow plan must replay a shadow config");
+        assert_eq!(cfg.suffix, "_pr");
+        assert_eq!(cfg.schema_override, None);
+
+        let mut schema_plan = minimal_replication_plan();
+        schema_plan.shadow = true;
+        schema_plan.shadow_schema = Some("shadow_s".to_string());
+        let cfg = replication_shadow_config(&schema_plan, unused)
+            .unwrap()
+            .expect("a schema-override shadow plan must replay a shadow config");
+        assert_eq!(cfg.schema_override.as_deref(), Some("shadow_s"));
+
+        // The control: a plan that did not ask for shadow must still apply
+        // against production. A fix that turned every replication apply into a
+        // shadow run would be worse than the bug.
+        assert!(
+            replication_shadow_config(&minimal_replication_plan(), unused)
+                .unwrap()
+                .is_none(),
+            "a non-shadow plan must not acquire a shadow config"
+        );
+    }
+
+    /// `--branch` is the case the other tests cannot reach, and the one most
+    /// likely to be got wrong: clap rejects it alongside the shadow flags, so a
+    /// branch plan carries `shadow == false` and looks like a production plan
+    /// to anything that only consults `shadow`.
+    ///
+    /// Needs a real state store because the schema prefix lives in the branch
+    /// record, not the plan — which is why this arm is unreachable from an
+    /// in-memory test, and why it had no coverage until red-team review asked.
+    ///
+    /// Mutations that must turn this red: persisting `branch: None`, or
+    /// returning `None` from the branch arm. Both leave the two tests above
+    /// green while restoring production routing for every branch plan.
+    #[test]
+    fn a_branch_replication_plan_replays_the_branch_schema() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state_path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .put_branch(&rocky_core::state::BranchRecord {
+                    name: "feature_x".to_string(),
+                    schema_prefix: "branch__feature_x".to_string(),
+                    created_by: "test".to_string(),
+                    created_at: chrono::Utc::now(),
+                    description: None,
+                })
+                .unwrap();
+        }
+
+        let mut plan = minimal_replication_plan();
+        plan.branch = Some("feature_x".to_string());
+        // A branch plan really does carry `shadow == false` — asserted rather
+        // than assumed, because the whole finding rests on it.
+        assert!(!plan.shadow);
+
+        let cfg = replication_shadow_config(&plan, &state_path)
+            .expect("the branch record exists")
+            .expect("a branch plan must replay as a shadow run, not production");
+        assert_eq!(cfg.schema_override.as_deref(), Some("branch__feature_x"));
+
+        // An unknown branch must fail loudly rather than silently degrade to a
+        // production run — the failure mode this whole PR is about.
+        let mut missing = minimal_replication_plan();
+        missing.branch = Some("no_such_branch".to_string());
+        let err = replication_shadow_config(&missing, &state_path)
+            .expect_err("an unknown branch must not resolve to production routing");
+        assert!(
+            err.to_string().contains("no_such_branch"),
+            "the error must name the branch: {err}"
+        );
+    }
+
     fn minimal_replication_plan() -> ReplicationPlan {
         ReplicationPlan {
             filter: Some("source=orders".to_string()),
@@ -7355,8 +8660,13 @@ schema_template = "s__{source}"
             idempotency_key: None,
             resume: None,
             resume_latest: false,
+            shadow: false,
+            shadow_suffix: None,
+            shadow_schema: None,
+            branch: None,
             governance_override: None,
             config_snapshot: serde_json::json!({"adapter": {"default": {"type": "duckdb"}}}),
+            state_authority: None,
             source_state_snapshot: vec![ReplicationConnectorSnapshot {
                 id: "raw__orders".to_string(),
                 schema: "raw__orders".to_string(),
@@ -7367,6 +8677,196 @@ schema_template = "s__{source}"
                 }],
             }],
         }
+    }
+
+    /// #1460: a plan must not apply against a different state store.
+    ///
+    /// The config comparison cannot catch this. `valkey_url` is redacted whole,
+    /// so a Valkey A-to-B swap compares equal, and the resolved `--state-path`
+    /// is a caller argument that never appears in the config at all. Yet
+    /// watermarks, freezes, budgets and idempotency keys all live there — so a
+    /// plan reviewed against one ledger and applied against another can redo
+    /// work the first recorded as done, or miss a freeze it recorded.
+    #[tokio::test]
+    async fn replication_apply_refuses_a_changed_state_authority() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let reviewed_state = dir.path().join("reviewed.redb");
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        rp.state_authority = Some(crate::commands::plan::state_authority_identity(
+            &planned.state,
+            &reviewed_state,
+        ));
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        // Same config, DIFFERENT state store — the case config equality misses.
+        let other_state = dir.path().join("other.redb");
+        let err = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &other_state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .expect_err("a different state store must not apply a plan reviewed against another");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("state authority has changed"),
+            "must refuse on the state-authority comparison, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// A plan written before the field existed must still apply. Absent means
+    /// "not recorded", not "mismatch" — otherwise this change would refuse
+    /// every plan already on disk.
+    #[tokio::test]
+    async fn replication_apply_tolerates_a_plan_without_a_state_authority() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        rp.state_authority = None; // pre-field plan
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        let res = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &dir.path().join("anywhere.redb"),
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await;
+
+        // Assert it got PAST the authority gate, not merely that it failed
+        // somewhere. Accepting any error would let this pass for an unrelated
+        // reason and prove nothing about legacy compatibility.
+        match res {
+            Ok(()) => {}
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    !msg.contains("state authority has changed"),
+                    "an unrecorded authority must not refuse, got: {msg}"
+                );
+                // It must fail LATER than the gate — the gate sits before
+                // pipeline resolution, so a failure here means execution was
+                // reached. A failure naming the plan payload or the gate would
+                // mean the test never exercised the path.
+                assert!(
+                    !msg.contains("failed to read replication plan")
+                        && !msg.contains("is a ")
+                        && !msg.contains("config has changed"),
+                    "must fail after the plan/config/authority gates, not at one \
+                     of them — got: {msg}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// #1460: the plan's `config_snapshot` had no reader, so a config change
+    /// between plan and apply went undetected. Discovery was unchanged, so the
+    /// source-state check still passed, and the approved plan ran against a
+    /// different adapter, path, schema template or strategy.
+    ///
+    /// Uses a snapshot taken from the real config, then changes the config —
+    /// so this fails for the intended reason, not because the stub snapshot in
+    /// `minimal_replication_plan` never matches anything.
+    #[tokio::test]
+    async fn replication_apply_refuses_a_changed_config() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        // Snapshot the config exactly as plan time does.
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        // Redirect the write: same discovery, different destination catalog.
+        std::fs::write(
+            &cfg_path,
+            REPLICATION_TOML.replace(r#"catalog_template = "c""#, r#"catalog_template = "other""#),
+        )?;
+
+        let state = dir.path().join("state.redb");
+        let err = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .expect_err("a changed config must not apply a plan reviewed against the old one");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("config has changed since plan"),
+            "must refuse on the config comparison, got: {msg}"
+        );
+        assert!(
+            msg.contains("Nothing was written"),
+            "the refusal must state nothing was written, got: {msg}"
+        );
+        Ok(())
+    }
+
+    /// The comparison must not fire when the config is untouched, or every
+    /// replication apply would refuse. Proves the refusal above is caused by
+    /// the change, not by the comparison always failing.
+    #[tokio::test]
+    async fn replication_apply_passes_the_config_check_when_unchanged() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cfg_path = dir.path().join("rocky.toml");
+        std::fs::write(&cfg_path, REPLICATION_TOML)?;
+
+        let planned = rocky_core::config::load_rocky_config(&cfg_path)?;
+        let mut rp = minimal_replication_plan();
+        rp.pipeline = Some("p".to_string());
+        rp.filter = None;
+        rp.config_snapshot = serde_json::to_value(&planned)?;
+        let plan_id = write_plan(dir.path(), PlanKind::Replication, &rp)?;
+
+        let state = dir.path().join("state.redb");
+        let res = super::run_apply_replication_plan(
+            dir.path(),
+            &cfg_path,
+            &plan_id,
+            &state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await;
+
+        // It may still fail further on (no live warehouse here). It must not
+        // fail on the config comparison.
+        if let Err(e) = res {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("config has changed since plan"),
+                "an unchanged config must pass the comparison, got: {msg}"
+            );
+        }
+        Ok(())
     }
 
     /// Round-trip: `ReplicationPlan` written to disk parses back into an

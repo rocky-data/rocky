@@ -552,8 +552,13 @@ def _make_dag_group_asset(
 
             if node.kind == "transformation":
                 context.log.info(f"Executing rocky run --model {node.label}")
+                # Scope execution to the node's own pipeline so it resolves the
+                # same models root discovery used. `pipeline` is Optional on the
+                # engine's node, and None falls back to the previous argv rather
+                # than silently dropping `--models`.
                 result = rocky.run_model(
                     node.label,
+                    pipeline=node.pipeline,
                     **partition_kwargs,  # type: ignore[arg-type]
                 )
                 context.log.info(

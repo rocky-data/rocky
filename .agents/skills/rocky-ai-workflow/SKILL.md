@@ -36,7 +36,7 @@ Write models as **raw SQL** (`models/<name>.sql` + a `<name>.toml` sidecar for m
 
 The path:
 
-1. **Propose.** Generate the plan that materializes your change (it is recorded as an *AI-authored* plan with a `plan_id`).
+1. **Propose.** Generate the plan that materializes your change (it is recorded as an *AI-authored* plan with a `plan_id`). A propose can also bind the plan to a product identity — `product_id` plus `spec_digest`, both together or neither. A product-bound plan refuses a bare `rocky apply`; the applier must pass `rocky apply <plan-id> --expect-spec-digest <digest>` with the digest of the approved spec. When you do not work for a product runner, omit both fields.
 2. **Review.** Run `rocky review <plan-id>`. This compiles your working tree against the base ref and runs the semantic breaking-change classifier, then reports the delta — added/removed/retyped columns, anything downstream consumers depend on. Read it.
 3. **Approve.** A human runs `rocky review <plan-id> --approve` to sign off. Approving over breaking changes is allowed, but the report makes those changes loud — the sign-off is informed, never silent.
 4. **Apply.** Only after the approval marker exists does `rocky apply <plan-id>` execute.
@@ -52,6 +52,10 @@ Your job ends at *propose* and at *surfacing the review report clearly*. The app
 ## Let the compiler hold the invariants
 
 When you learn something durable about the data while sampling — a column is never null, a status takes a fixed set of values, a key is unique — encode it as a **contract** (`required`/`protected` columns) or a **check** (assertion), not just as a `WHERE` clause. That moves the invariant into the typed substrate, so the human reviews *the invariant* and the compiler enforces it on every future run. This is the whole point of authoring on Rocky rather than emitting bare SQL: the guardrails are part of the artifact.
+
+## Metadata is a governed write too
+
+Freshness expectations and column classifications live in the model's sidecar (`models/<model>.toml`). To author them as an agent, use the `draft_metadata` MCP tool — never string-append to the sidecar. It takes a structured patch: a `freshness` block (`expected_lag_seconds`, optional `time_column` and `severity`), a `classifications` map (column → tag, e.g. `email = "pii"`), or both. The tool parses the sidecar as TOML and merges the patch (`freshness` replaces the whole table; `classifications` merges per column), compiles with the write, and checks your policy rules against the model **as patched** — a patch that adds the first `pii` tag is judged by that tag. A denied patch restores the prior sidecar exactly. A sidecar the tool cannot parse is never overwritten. Note the trade: comments in the sidecar are dropped when it is re-serialized.
 
 ## Anti-patterns
 

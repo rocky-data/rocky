@@ -1265,6 +1265,7 @@ mod tests {
             None,  // no run_id override — mint the usual timestamp id
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
+            None,  // #1460
         )
         .await
         .expect("full-DAG transformation run should succeed");
@@ -1400,6 +1401,7 @@ auto_create_schemas = true
             None,
             None,
             false,
+            None, // #1460
         )
         .await
         .expect("--model with --pipeline must resolve that pipeline's models dir");
@@ -1479,6 +1481,7 @@ auto_create_schemas = true
             None,
             None,
             false,
+            None, // #1460
         )
         .await
     }
@@ -1867,6 +1870,7 @@ auto_create_schemas = true
             None,  // no run_id override — mint the usual timestamp id
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
+            None,  // #1460
         )
         .await
         .expect("full-DAG transformation run with idempotency key should succeed");
@@ -2198,6 +2202,7 @@ auto_create_schemas = true
             None,  // no run_id override — mint the usual timestamp id
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
+            None,  // #1460
         )
         .await
         .expect("model-only run must reach the governance.tags apply path and succeed");
@@ -2278,6 +2283,7 @@ auto_create_schemas = true
             None,  // no run_id override — mint the usual timestamp id
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
+            None,  // #1460
         )
         .await;
 

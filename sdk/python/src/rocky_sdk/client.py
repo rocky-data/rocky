@@ -77,6 +77,7 @@ from rocky_sdk.types import (
     PromotePlan,
     RestoreApplyOutput,
     RetentionStatusOutput,
+    ReviewStatusOutput,
     RunResult,
     StateResult,
     TestResult,
@@ -108,6 +109,20 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = 30
 # :class:`RockyVersionError`. The floor is shared with the dagster-rocky adapter
 # (whose Pipes path content-addresses every plan, a 1.34+ guarantee).
 MIN_ROCKY_VERSION = "1.34.0"
+
+
+class _Unset:
+    """Sentinel distinguishing "argument omitted" from an explicit ``None``.
+
+    Needed where ``None`` is itself meaningful — see :meth:`RockyClient.dag`,
+    where omitting ``models_dir`` must keep the previous behaviour while an
+    explicit ``None`` opts in to per-pipeline resolution.
+    """
+
+    __slots__ = ()
+
+
+_UNSET = _Unset()
 
 # Bytes of an inner payload surfaced on an error so the cause is visible without
 # dumping potentially-MB blobs.
@@ -351,6 +366,9 @@ class RockyClient:
         self._mirror_stderr = mirror_stderr
         self._resolved_binary: str | None = None
         self._version_checked = False
+        # Parsed engine version, when it could be determined. Kept so a
+        # per-feature floor can be checked without re-running ``--version``.
+        self._engine_version: tuple[int, int, int] | None = None
 
     # ------------------------------------------------------------------ #
     # Binary resolution + version gate                                   #
@@ -432,11 +450,41 @@ class RockyClient:
         # would otherwise sort (1, 34) below (1, 34, 0) and reject it.
         detected += (0,) * (3 - len(detected))
         required += (0,) * (3 - len(required))
+        self._engine_version = detected  # type: ignore[assignment]
 
         if detected < required:
             raise RockyVersionError(version_str, MIN_ROCKY_VERSION, binary)
 
         self._version_checked = True
+
+    def _require_engine(self, minimum: str, feature: str) -> None:
+        """Refuse a *feature* whose floor is above :data:`MIN_ROCKY_VERSION`.
+
+        The package-wide minimum is deliberately low, so a method relying on
+        newer engine behaviour has to state its own floor. Without this, an
+        accepted-but-older binary silently does something different — the worst
+        outcome here being a model discovered from one models root and executed
+        from another.
+
+        Matches the surrounding fail-open policy: when the version could not be
+        determined the call proceeds with a warning, because a slow or unusual
+        environment should not block every command. A silently skipped gate is
+        how an incompatible binary reaches a confusing failure later, so the
+        skip is logged.
+        """
+        self._verify_engine_version()
+        if self._engine_version is None:
+            self._logger.warning(
+                "engine version unknown; proceeding with %s, which needs rocky >= %s",
+                feature,
+                minimum,
+            )
+            return
+        required = tuple(int(x) for x in minimum.split(".")[:3])
+        required += (0,) * (3 - len(required))
+        if self._engine_version < required:
+            detected = ".".join(str(x) for x in self._engine_version)
+            raise RockyVersionError(detected, minimum, self._resolve_binary())
 
     # ------------------------------------------------------------------ #
     # argv construction                                                  #
@@ -519,12 +567,25 @@ class RockyClient:
         defer: bool = False,
         defer_to: str | None = None,
     ) -> list[str]:
-        """Build the argv for ``rocky plan`` — identical flag plumbing to ``run``.
+        """Build the argv for ``rocky plan``.
 
         Used by the two-step plan + apply path (e.g. dagster Pipes) that needs the
         persisted ``plan_id``. ``--watch`` is intentionally omitted (no run-path
         counterpart; orchestrators own the re-run cadence).
+
+        Raises:
+            ValueError: ``defer`` or ``defer_to`` was supplied. Both flags exist
+                on ``rocky run`` only, so the CLI rejects them at argument
+                parsing and the plan never runs. Refused here, before spawning a
+                subprocess, matching how the client already handles ``env`` on
+                ``retention_status`` (#1404).
         """
+        if defer or defer_to is not None:
+            raise ValueError(
+                "defer/defer_to are not supported by rocky plan (the flags are "
+                "declared on `rocky run` only). Use run() for deferred "
+                "resolution, or drop the argument from the plan call."
+            )
         return self._build_run_or_plan_args(
             "plan",
             filter,
@@ -564,8 +625,15 @@ class RockyClient:
         defer: bool,
         defer_to: str | None,
     ) -> list[str]:
-        """Shared flag plumbing for ``run`` and ``plan`` (the engine backfilled
-        every ``run`` flag onto ``plan`` so the only difference is the verb)."""
+        """Shared flag plumbing for ``run`` and ``plan``.
+
+        The engine backfilled MOST ``run`` flags onto ``plan``, but not all:
+        ``--defer`` / ``--defer-to`` are declared on the ``Run`` clap variant
+        only. Callers building the ``plan`` verb must reject them before they
+        reach argv -- see :meth:`_build_plan_args` (#1404). Treating the two
+        verbs as flag-identical is what produced an argv the CLI refuses to
+        parse.
+        """
         args = [verb, "--filter", filter]
         if pipeline is not None:
             args.extend(["--pipeline", pipeline])
@@ -910,7 +978,7 @@ class RockyClient:
             args.extend(["--env", env])
         return _parse_rocky_json(self.run_cli(args), PlanResult, command="plan")
 
-    def apply(self, plan_id: str) -> ApplyResult:
+    def apply(self, plan_id: str, *, expect_spec_digest: str | None = None) -> ApplyResult:
         """Run ``rocky apply <plan-id>`` and return the parsed result.
 
         Reads ``.rocky/plans/<plan_id>.json`` and dispatches by kind. Each plan
@@ -920,6 +988,23 @@ class RockyClient:
         ``gc`` plans yield :class:`RestoreApplyOutput` and :class:`GcApplyOutput`,
         respectively; compact / archive / promote plans yield their respective
         outputs. See :func:`_parse_apply`.
+
+        Args:
+            plan_id: The 64-char blake3 plan identifier.
+            expect_spec_digest: Passes ``--expect-spec-digest``: the engine
+                refuses unless the plan payload's ``spec_digest`` equals this
+                exact string. The gate is fail-closed both ways — a
+                product-bound plan REQUIRES it (a bare apply is refused), and
+                passing it against a plan with no ``spec_digest`` is refused
+                too. The value MUST come from your own independently approved
+                product-spec source (the approved spec snapshot you intend to
+                fulfil) — NEVER from :meth:`review_status`. The plan carries
+                the digest it was authored against, so feeding
+                ``review_status.spec_digest`` back here compares the plan
+                against itself and always passes; the gate then proves
+                nothing. Use ``review_status.spec_digest`` only to DETECT what
+                the plan pinned, and compare it against your approved
+                snapshot's digest.
 
         Example:
 
@@ -938,7 +1023,53 @@ class RockyClient:
                     # gc / restore / compact / archive / promote plan kinds.
                     print(type(result).__name__)
         """
-        return _parse_apply(self.run_cli(["apply", plan_id], allow_partial=True))
+        args = ["apply", plan_id]
+        if expect_spec_digest is not None:
+            args.extend(["--expect-spec-digest", expect_spec_digest])
+        return _parse_apply(self.run_cli(args, allow_partial=True))
+
+    def review_status(self, plan_id: str) -> ReviewStatusOutput:
+        """Run ``rocky review <plan-id> --status`` and return the typed state.
+
+        The read-only marker oracle: whether a well-formed sign-off marker
+        naming the plan exists (``reviewed``), who approved it and when, and
+        the plan's product binding (``product_id`` / ``spec_digest``) when it
+        carries one. Poll this instead of probing the marker file — the marker
+        is an engine-internal artifact, and a malformed or mismatched marker
+        is a command ERROR here (raised as :class:`RockyCommandError`), never
+        a silent ``reviewed=False``.
+
+        ``spec_digest`` here is what the PLAN pinned — use it to detect the
+        plan's binding, never as the expectation you pass back to
+        :meth:`apply` (that comparison is the plan against itself, and always
+        passes). The apply-time expectation comes from your own approved
+        product-spec snapshot.
+
+        Example:
+
+            Wait for the human sign-off, verify the plan pinned the spec
+            revision YOU approved, then apply with that independently held
+            digest::
+
+                # The digest of the spec revision you approved, from your own
+                # source of truth — not read back from the plan.
+                approved_digest = my_product_spec.approved_digest
+
+                status = client.review_status(plan_id)
+                if not status.reviewed:
+                    raise RuntimeError("plan not signed off yet")
+                if status.spec_digest != approved_digest:
+                    raise RuntimeError(
+                        f"plan was authored against {status.spec_digest}, "
+                        f"not the approved {approved_digest} — re-propose"
+                    )
+                client.apply(plan_id, expect_spec_digest=approved_digest)
+        """
+        return _parse_rocky_json(
+            self.run_cli(["review", plan_id, "--status"]),
+            ReviewStatusOutput,
+            command="review_status",
+        )
 
     def run(
         self,
@@ -1044,6 +1175,7 @@ class RockyClient:
         self,
         model_name: str,
         *,
+        pipeline: str | None = None,
         filter: str | None = None,
         partition: str | None = None,
         partition_from: str | None = None,
@@ -1056,8 +1188,26 @@ class RockyClient:
         """Run ``rocky run --model <name>`` for a single compiled model.
 
         ``--model`` skips the replication phase and executes only the named model.
+
+        ``pipeline`` names the transformation pipeline the model belongs to. When
+        given, ``--models`` is **not** sent: the engine resolves that pipeline's
+        own configured root, which is what :meth:`dag` discovers against. On a
+        project with two or more transformation pipelines the engine refuses a
+        bare ``--model`` regardless of ``--models`` ("cannot know which pipeline
+        (and adapter) the model belongs to"), so ``--pipeline`` is the only way
+        to execute one — and passing both would override the pipeline's root
+        with a whole-project one, which is the discovery/execution split #1348
+        warns about.
+
+        Leaving ``pipeline`` at ``None`` keeps the previous argv exactly, for
+        single-pipeline callers.
         """
-        args = ["run", "--model", model_name, "--models", self.models_dir]
+        args = ["run", "--model", model_name]
+        if pipeline is not None:
+            self._require_engine("1.69.0", "run_model(pipeline=...)")
+            args.extend(["--pipeline", pipeline])
+        else:
+            args.extend(["--models", self.models_dir])
         if filter is not None:
             args.extend(["--filter", filter])
         if partition is not None:
@@ -1202,9 +1352,41 @@ class RockyClient:
             args.extend(["--out", out])
         return _parse_rocky_json(self.run_cli(args), CatalogOutput, command="catalog")
 
-    def dag(self, *, column_lineage: bool = False) -> DagResult:
-        """Run ``rocky dag`` and return the full unified DAG."""
-        args = ["dag", "--models", self.models_dir]
+    def dag(
+        self,
+        *,
+        column_lineage: bool = False,
+        models_dir: str | None | _Unset = _UNSET,
+    ) -> DagResult:
+        """Run ``rocky dag`` and return the full unified DAG.
+
+        ``--models`` is an explicit *whole-project* override: the engine gives
+        that one directory's models to **every** transformation pipeline, so a
+        project with two of them is refused outright (``model 'x' is claimed by
+        transformation pipelines a and b``), which made such projects
+        undiscoverable (#1348).
+
+        ``models_dir`` is three-state, so no existing caller changes:
+
+        * **omitted** — send ``--models <self.models_dir>``, exactly as before.
+        * ``None`` — *opt in* to per-pipeline resolution: omit the flag so each
+          pipeline resolves its own configured root, the branch
+          ``rocky run --dag`` already used. Needs engine >= 1.68.0.
+        * a string — that whole-project override, deliberately.
+
+        Opt in on both sides or neither. Pair ``models_dir=None`` with
+        ``run_model(pipeline=...)``: opting in here alone would have discovery
+        read a pipeline's own root while execution still forced
+        ``self.models_dir``, which is the split #1348 warns about — a model
+        discovered from one directory and materialized from another.
+        """
+        args = ["dag"]
+        if isinstance(models_dir, _Unset):
+            args.extend(["--models", self.models_dir])
+        elif models_dir is not None:
+            args.extend(["--models", models_dir])
+        else:
+            self._require_engine("1.68.0", "dag(models_dir=None)")
         if self.contracts_dir is not None:
             args.extend(["--contracts", self.contracts_dir])
         if column_lineage:
@@ -1325,7 +1507,7 @@ class RockyClient:
             args.extend(["--model", model])
         if with_intent:
             args.append("--with-intent")
-        return _parse_rocky_json(self.run_cli(args), AiSyncResult, command="ai sync")
+        return _parse_rocky_json(self.run_cli(args), AiSyncResult, command="ai-sync")
 
     def ai_explain(
         self, model: str | None = None, *, all: bool = False, save: bool = False
@@ -1338,7 +1520,7 @@ class RockyClient:
             args.append("--all")
         if save:
             args.append("--save")
-        return _parse_rocky_json(self.run_cli(args), AiExplainResult, command="ai explain")
+        return _parse_rocky_json(self.run_cli(args), AiExplainResult, command="ai-explain")
 
     def ai_test(
         self, model: str | None = None, *, all: bool = False, save: bool = False
@@ -1351,7 +1533,7 @@ class RockyClient:
             args.append("--all")
         if save:
             args.append("--save")
-        return _parse_rocky_json(self.run_cli(args), AiTestResult, command="ai test")
+        return _parse_rocky_json(self.run_cli(args), AiTestResult, command="ai-test")
 
     def ai_contract(self, model: str, *, save: bool = False) -> AiContractOutput:
         """AI-draft a data contract from a model's observed data (DuckDB only)."""

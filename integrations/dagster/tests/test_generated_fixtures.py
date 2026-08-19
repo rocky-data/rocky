@@ -44,6 +44,7 @@ from dagster_rocky.types import (
     ModelLineageResult,
     OptimizeResult,
     PlanResult,
+    ReviewStatusOutput,
     RunResult,
     StateResult,
     TestResult,
@@ -76,6 +77,7 @@ EXPECTED_TYPES: dict[str, type] = {
     "doctor": DoctorResult,
     "dag": DagResult,
     "cost": CostOutput,
+    "review_status": ReviewStatusOutput,
 }
 
 

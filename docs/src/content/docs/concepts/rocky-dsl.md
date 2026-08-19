@@ -1,11 +1,11 @@
 ---
 title: The Rocky DSL
-description: Pipeline-oriented syntax that lowers to SQL
+description: A pipeline syntax for transformation models that lowers to plain SQL
 sidebar:
   order: 8
 ---
 
-Rocky's DSL is a pipeline-oriented syntax for transformation models. `.rocky` files lower to standard SQL before execution; the warehouse only sees SQL.
+Rocky's DSL is a pipeline-oriented syntax for transformation models. A `.rocky` file lowers to standard SQL before execution. The warehouse only ever sees SQL.
 
 :::note[The DSL is optional]
 Rocky is **SQL-first**. Every feature works with plain `.sql` files. The DSL exists for teams that want a more readable shape for multi-step transformations. Mix and match freely: a DSL model can depend on a SQL model and vice versa.
@@ -13,7 +13,7 @@ Rocky is **SQL-first**. Every feature works with plain `.sql` files. The DSL exi
 
 ## Why a DSL
 
-A `SELECT` with multiple CTEs, window functions, and nested `CASE` expressions gets hard to follow. The DSL offers a top-to-bottom pipeline: each step transforms the rows flowing through, and the final shape is obvious from scanning the file.
+A `SELECT` with several CTEs, window functions, and nested `CASE` expressions gets hard to follow. The DSL gives you a top-to-bottom pipeline instead. Each step transforms the rows flowing through it, so you can read the final shape off the file.
 
 ## Pipeline syntax
 
@@ -96,7 +96,7 @@ derive {
 }
 ```
 
-A derived name can be referenced by a later step — a `group` aggregation, a `where`, a `select`, or another `derive` — where it inlines to its expression (`group c { revenue: sum(total) }` becomes `SUM(amount * quantity)`). A terminal `derive` keeps the source columns and appends the computed ones (`SELECT *, ...`).
+A later step can reference a derived name: a `group` aggregation, a `where`, a `select`, or another `derive`. Rocky inlines the name to its expression, so `group c { revenue: sum(total) }` becomes `SUM(amount * quantity)`. A `derive` at the end of a pipeline keeps the source columns and appends the computed ones (`SELECT *, ...`).
 
 ### select
 
@@ -190,7 +190,7 @@ CASE WHEN amount > 10000 THEN 'enterprise'
 
 ### replicate
 
-Shorthand for `SELECT *` -- used in bronze-layer models that pass data through unchanged:
+Shorthand for `SELECT *`. Use it in a bronze-layer model that passes data through unchanged:
 
 ```
 from source.fivetran.orders
@@ -212,14 +212,14 @@ Timestamps are also supported: `@2025-01-01T00:00:00Z`.
 
 ## NULL-safe operators
 
-Rocky's `!=` operator compiles to SQL's `IS DISTINCT FROM`, not the standard `!=`. This means comparisons involving `NULL` behave intuitively:
+Rocky's `!=` operator compiles to SQL's `IS DISTINCT FROM`, not the standard `!=`. A comparison against `NULL` therefore behaves the way you expect:
 
 | Rocky | SQL | NULL behavior |
 |-------|-----|---------------|
 | `a == b` | `a = b` | `NULL = NULL` is `NULL` (standard SQL) |
 | `a != b` | `a IS DISTINCT FROM b` | `NULL IS DISTINCT FROM NULL` is `FALSE` |
 
-This eliminates an entire class of bugs where `!= 'value'` silently excludes `NULL` rows.
+This removes a class of bug where `!= 'value'` silently drops every `NULL` row.
 
 `IS NULL` and `IS NOT NULL` work as expected:
 
@@ -255,11 +255,26 @@ where status == "completed"
 
 ## How lowering works
 
-DSL files go through two phases before the compiler sees them:
+A `.rocky` file goes through two phases before the compiler sees it.
 
-1. **Parse** — tokens → typed AST (one variant per pipeline step).
-2. **Lower** — AST → single SQL string, walked step by step with an accumulating clause context (`FROM`, joins, `WHERE`, `SELECT`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`).
+```
+  models/top_customers.rocky
+        │
+        │ 1. parse: tokens → typed AST, one variant per pipeline step
+        ▼
+    pipeline AST
+        │
+        │ 2. lower: walk the steps, accumulating clauses —
+        │    FROM, joins, WHERE, SELECT, GROUP BY, HAVING,
+        │    ORDER BY, LIMIT
+        ▼
+    a single SQL string   ◄──── a .sql model joins the path here
+        │
+        │ 3. compile: type check, resolve dependencies
+        ▼
+    dialect SQL ─────────► warehouse
+```
 
-The lowered SQL then flows into the compiler for type checking and dependency resolution, exactly as if you'd written it by hand. There's no runtime indirection; `.rocky` and `.sql` reach the warehouse identically.
+The lowered SQL flows into the compiler for type checking and dependency resolution, exactly as if you had written it by hand. There is no runtime indirection. A `.rocky` file and a `.sql` file reach the warehouse the same way.
 
 For the full language grammar, see the [Rocky language spec](https://github.com/rocky-data/rocky/blob/main/docs/rocky-lang-spec.md).

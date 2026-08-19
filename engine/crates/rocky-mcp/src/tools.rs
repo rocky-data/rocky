@@ -28,7 +28,66 @@ use crate::result_types::*;
 /// the single canonical skill so the MCP guidance never drifts from the
 /// `rocky-ai-workflow` skill. Path is relative to this source file:
 /// `crates/rocky-mcp/src` → repo root is four `..` segments.
+///
+/// The default profile serves this verbatim; the worker profile serves
+/// [`WORKER_INSTRUCTIONS_BANNER`] + this (see
+/// [`RockyMcpServer::get_info`]) — the skill file itself stays canonical and
+/// untouched.
 const INSTRUCTIONS: &str = include_str!("../../../../.claude/skills/rocky-ai-workflow/SKILL.md");
+
+/// Prepended to the served `instructions` under the worker profile (FF-WP1
+/// fix round 2, item 5a). The skill text below the banner is the FULL
+/// authoring workflow — including verbs this profile does not serve — so the
+/// banner re-frames it up front: name what is absent, and redirect every
+/// ending to the typed hand-off to the trusted runner.
+const WORKER_INSTRUCTIONS_BANNER: &str = "WORKER PROFILE ACTIVE: this server serves the minimal \
+drafting allowlist. The propose, review_queue, draft_contract, draft_metadata, and \
+pause_schedule tools are NOT available in this session, and the workflow below is the full \
+authoring map, parts of which belong to the trusted runner. Where it reaches contract or \
+metadata authorship, or the propose -> review -> apply chain, STOP: end every workflow at the \
+typed hand-off to the trusted runner instead — report the drafted files, the invariants you \
+encoded, and anything you flagged. The runner records, reviews, and applies.\n\n";
+
+/// Worker-profile `prompts/list` descriptions (FF-WP1 fix round 2, item 5b):
+/// the static `#[prompt(description = ...)]` strings instruct the DEFAULT
+/// workflow (they name `propose`, contract authorship, and the `ai_*`
+/// generators), so the worker profile rewrites every listed description at
+/// construction to the drafting-loop shape that ends at the trusted-runner
+/// hand-off. `summarize_project` is here too: its default description says
+/// "no propose", and the worker surface must not name excluded verbs at all.
+const WORKER_PROMPT_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        "build_model",
+        "Guide the authoring of one Rocky model from a plain-language intent: inspect schema -> \
+         sample rows -> profile columns -> draft_model -> compile-loop -> plan preview -> \
+         draft_check + test. Worker profile: ends at the typed hand-off to the trusted runner.",
+    ),
+    (
+        "find_untested_models",
+        "Find models with no declarative tests and draft tests for them: catalog -> identify \
+         untested models -> ground with sample_rows / profile_column -> author the checks -> \
+         draft_check -> test. Worker profile: ends at the typed hand-off to the trusted runner.",
+    ),
+    (
+        "add_tests_to_pks",
+        "Add uniqueness + not-null tests to a model's primary-key / unique columns: \
+         inspect_schema -> confirm the keys with profile_column -> author the checks -> \
+         draft_check -> test. Worker profile: ends at the typed hand-off to the trusted runner.",
+    ),
+    (
+        "summarize_project",
+        "Produce a structured, read-only summary of the Rocky project: catalog + lineage -> \
+         grouped overview of models, their grain, governance, tests, and DAG shape. Read-only — \
+         no edits, nothing recorded.",
+    ),
+    (
+        "fix_failing_test",
+        "Diagnose and fix failing declarative tests: run `test` -> for each failure \
+         profile_column the implicated columns to ground the cause -> redraft the model SQL \
+         with draft_model where the SQL is wrong. Worker profile: ends at the typed hand-off \
+         to the trusted runner.",
+    ),
+];
 
 /// Stateless Rocky MCP server. Holds only the project locators; every tool
 /// call recompiles from the current on-disk files (correctness over a warm
@@ -38,9 +97,57 @@ pub struct RockyMcpServer {
     config_path: PathBuf,
     models_dir: PathBuf,
     root: PathBuf,
+    /// Which tool surface this server serves. Also read by the workflow
+    /// prompts: the worker profile serves variants that end at the handoff to
+    /// the trusted runner instead of instructing tools the profile excludes.
+    profile: McpProfile,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
+
+/// Which tool surface `rocky mcp` serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum McpProfile {
+    /// The full tool surface — unchanged behavior for every existing agent.
+    #[default]
+    Default,
+    /// The minimal drafting-worker allowlist (`--profile worker`): read /
+    /// inspect grounding tools, the compile/test/breaking-change/dependents
+    /// verification loop, `draft_model` + `draft_check`, and the prompts.
+    /// Everything else — including `draft_contract`, `draft_metadata`,
+    /// `review_queue`, `pause_schedule`, `propose`, and any FUTURE tool not
+    /// explicitly allowlisted — is absent from the listing and returns
+    /// tool-not-found when called.
+    Worker,
+}
+
+/// The worker-profile tool ALLOWLIST — exhaustively enumerated, never derived
+/// by exclusion, so a future tool addition is excluded by default and must
+/// consciously opt in here (the golden profile tests pin both surfaces).
+///
+/// Rationale (FF-DESIGN D7 ⟦RTL-1,3⟧): the untrusted drafting worker needs
+/// grounding reads and the compile/test loop for `models/<model>.sql` plus
+/// append-only checks. Contracts and metadata are spec-owned in the
+/// fulfillment loop — a worker-writable contract detaches artifacts from the
+/// spec — and approval/propose/schedule surfaces must never reach it. The
+/// in-engine LLM generator tools (`ai_*`, `suggest_freshness_block`,
+/// `explain_model`) are omitted too: the worker brings its own model, and the
+/// governed metadata path is the runner's, not the worker's.
+const WORKER_PROFILE_TOOLS: &[&str] = &[
+    "breaking_change",
+    "catalog",
+    "compile",
+    "dependents",
+    "draft_check",
+    "draft_model",
+    "inspect_schema",
+    "lineage",
+    "list",
+    "plan_preview",
+    "profile_column",
+    "sample_rows",
+    "test",
+];
 
 // ---------------------------------------------------------------------------
 // Tool input parameter structs (schemars 1.x — rmcp's `Parameters<T>` bound).
@@ -48,8 +155,8 @@ pub struct RockyMcpServer {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct CompileArgs {
-    /// Optional single-model filter; compile-checks the whole project either
-    /// way but scopes the returned diagnostics to this model when set.
+    /// Optional single-model filter; compile-checks the whole project for type
+    /// context but scopes the returned result to this model when set.
     #[serde(default)]
     pub model: Option<String>,
     /// Optional portability target dialect — one of `"databricks"`,
@@ -114,10 +221,37 @@ pub struct ProfileColumnArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TestArgs {
+    /// Optional single-model scope: run only this model's declarative tests.
+    /// When unset, runs the whole project's tests (unchanged behavior).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ProposeArgs {
     /// Single model to materialize. When unset, the plan covers every model.
     #[serde(default)]
     pub model: Option<String>,
+    /// Product identity this plan fulfils (e.g. `"product:revenue_daily"`).
+    /// Opaque to the engine — carried in the hashed plan payload and echoed
+    /// back; never parsed. Must be set together with `spec_digest` or not at
+    /// all. A plan carrying it refuses a bare `rocky apply` — the applier
+    /// must pass `--expect-spec-digest`.
+    #[serde(default)]
+    pub product_id: Option<String>,
+    /// Digest of the approved product spec this plan was authored against
+    /// (e.g. `"sha256:<hex>"`). Opaque to the engine. Must be set together
+    /// with `product_id` or not at all.
+    #[serde(default)]
+    pub spec_digest: Option<String>,
+    /// Caller-supplied idempotency key threaded into the plan payload so a
+    /// re-apply of the same key dedups. When absent and the product fields
+    /// are present, the engine derives `"<product_id>@<spec_digest>"` — note
+    /// that derived key aliases every attempt for the same spec revision, so
+    /// a runner that re-proposes should supply its own per-attempt key.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -258,6 +392,40 @@ pub struct DraftCheckArgs {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DraftMetadataArgs {
+    /// The model whose sidecar metadata to patch. Its `.sql` (or `.rocky`)
+    /// source must already exist under `models/`; the patch is merged into
+    /// the model's sidecar (`models/<model>.toml`).
+    pub model: String,
+    /// Freshness expectation to set. Replaces the sidecar's whole
+    /// `[freshness]` table when present.
+    #[serde(default)]
+    pub freshness: Option<FreshnessPatch>,
+    /// Per-column classification tags to merge into the sidecar's
+    /// `[classification]` table. Keys are column names, values are tags
+    /// (e.g. `email = "pii"`). Listed columns are set/replaced; other
+    /// columns' existing tags are preserved.
+    #[serde(default)]
+    pub classifications: Option<std::collections::BTreeMap<String, String>>,
+}
+
+/// The `[freshness]` block `draft_metadata` writes.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct FreshnessPatch {
+    /// Maximum lag in seconds before the model counts as stale. Written to
+    /// the sidecar as `expected_lag_seconds`.
+    pub expected_lag_seconds: u64,
+    /// Timestamp column used to evaluate freshness at runtime. When unset
+    /// the runtime falls back to the last-materialization timestamp.
+    #[serde(default)]
+    pub time_column: Option<String>,
+    /// Severity when the freshness check trips: `"warning"` (the engine
+    /// default) or `"error"`.
+    #[serde(default)]
+    pub severity: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ExplainModelArgs {
     /// The model to draft an intent description for, from its SQL, output
     /// schema, and upstream dependencies.
@@ -333,6 +501,13 @@ pub struct ReviewQueueArgs {
     /// this exact plan — it stands in for that human intent.
     #[serde(default)]
     pub confirm: bool,
+    /// List mode only: keep only pending plans whose payload carries this
+    /// `product_id` (each candidate plan is read integrity-checked). A pending
+    /// plan whose file cannot be read or fails its integrity check surfaces as
+    /// a `warning` entry in `pending` — never silently dropped. `total`
+    /// reflects the filtered list. Mutually exclusive with `approve_plan_id`.
+    #[serde(default)]
+    pub product_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -378,23 +553,88 @@ const PROFILE_TOP_VALUES_MAX: usize = 25;
 impl RockyMcpServer {
     /// Build a server rooted at `config_path`'s directory; the models
     /// directory is `<config-dir>/models` (the CLI's top-level convention).
+    /// Serves the full default tool surface.
     pub fn new(config_path: PathBuf) -> Self {
+        Self::new_with_profile(config_path, McpProfile::Default)
+    }
+
+    /// Build a server serving `profile`'s tool surface.
+    ///
+    /// The worker profile filters the full router down to
+    /// [`WORKER_PROFILE_TOOLS`] by REMOVING every route not on the allowlist —
+    /// an excluded tool is absent from `tools/list` and a call to it gets
+    /// rmcp's standard tool-not-found error. The prompt NAMES are served in
+    /// both profiles, but the workflow prompts branch on the profile: the
+    /// worker variants end at the handoff to the trusted runner and never
+    /// instruct a tool the profile excludes, and the `prompts/list`
+    /// descriptions are rewritten here to the
+    /// [`WORKER_PROMPT_DESCRIPTIONS`] variants for the same reason.
+    pub fn new_with_profile(config_path: PathBuf, profile: McpProfile) -> Self {
         let root = config_path
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let models_dir = root.join("models");
+        let mut tool_router = Self::tool_router();
+        let mut prompt_router = Self::prompt_router();
+        if profile == McpProfile::Worker {
+            let all: Vec<String> = tool_router
+                .list_all()
+                .into_iter()
+                .map(|t| t.name.to_string())
+                .collect();
+            for name in all {
+                if !WORKER_PROFILE_TOOLS.contains(&name.as_str()) {
+                    tool_router.remove_route(&name);
+                }
+            }
+            // FF-WP1 fix round 2 (item 5b): the static prompt descriptions
+            // instruct the default workflow (they name tools this profile
+            // excludes) — swap in the worker descriptions. A rename that
+            // orphans an entry panics HERE, at construction, so every test
+            // that builds a worker server catches the drift.
+            for (name, description) in WORKER_PROMPT_DESCRIPTIONS {
+                prompt_router
+                    .map
+                    .get_mut(*name)
+                    .unwrap_or_else(|| {
+                        panic!("WORKER_PROMPT_DESCRIPTIONS names unrouted prompt '{name}'")
+                    })
+                    .attr
+                    .description = Some((*description).to_string());
+            }
+        }
         Self {
             config_path,
             models_dir,
             root,
-            tool_router: Self::tool_router(),
-            prompt_router: Self::prompt_router(),
+            profile,
+            tool_router,
+            prompt_router,
         }
     }
 
     fn state_path(&self) -> PathBuf {
         rocky_core::state::resolve_state_path(None, &self.models_dir).path
+    }
+
+    /// The `next_steps` reminder a successful `draft_model` result carries.
+    /// The worker profile's variant ends at the trusted-runner hand-off and
+    /// never instructs `propose` (FF-WP1 fix round 2, item 5c).
+    fn draft_model_next_steps(&self) -> &'static str {
+        match self.profile {
+            McpProfile::Default => DRAFT_NEXT_STEPS,
+            McpProfile::Worker => WORKER_DRAFT_NEXT_STEPS,
+        }
+    }
+
+    /// The `next_steps` reminder a successful `draft_check` result carries —
+    /// profile-selected like [`Self::draft_model_next_steps`].
+    fn draft_check_next_steps(&self) -> &'static str {
+        match self.profile {
+            McpProfile::Default => DRAFT_CHECK_NEXT_STEPS,
+            McpProfile::Worker => WORKER_DRAFT_CHECK_NEXT_STEPS,
+        }
     }
 
     /// Path to the project's `data/seed.sql`, if it exists. The playground
@@ -539,7 +779,10 @@ impl RockyMcpServer {
             with_seed,
             None,
         )
-        .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
+        .map_err(|e| match e.downcast_ref::<commands::ModelNotFound>() {
+            Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
+            None => ToolError::compile_failed(format!("{e:#}")),
+        })?;
         Ok(Json(project_compile_result(&output)))
     }
 
@@ -619,16 +862,25 @@ impl RockyMcpServer {
 
     #[tool(
         description = "Run the project's DuckDB-backed local tests (contracts + assertions) and \
-         return pass/fail counts plus per-failure detail. Use after writing or changing a model."
+         return pass/fail counts plus per-failure detail. Use after writing or changing a model. \
+         Pass `model` to scope the run to one model's tests."
     )]
-    async fn test(&self) -> ToolResult<TestResult> {
-        let output = commands::test_output(&self.models_dir, None, None).map_err(|e| {
-            ToolError::internal(
-                format!("{e:#}"),
-                "The local test runner could not execute; confirm the project compiles (the \
-                 `compile` tool) and any `data/seed.sql` the tests need is present.",
-            )
-        })?;
+    async fn test(&self, params: Parameters<TestArgs>) -> ToolResult<TestResult> {
+        let output = commands::test_output(&self.models_dir, None, params.0.model.as_deref())
+            .map_err(|e| {
+                // Preserve the stable taxonomy the way `compile` and
+                // `plan_preview` do: an unknown `model` filter is
+                // `model_not_found` (with its "list the models, retry" hint),
+                // not the generic internal bucket.
+                match e.downcast_ref::<commands::ModelNotFound>() {
+                    Some(commands::ModelNotFound(name)) => ToolError::model_not_found(name),
+                    None => ToolError::internal(
+                        format!("{e:#}"),
+                        "The local test runner could not execute; confirm the project compiles \
+                         (the `compile` tool) and any `data/seed.sql` the tests need is present.",
+                    ),
+                }
+            })?;
         let failures = output
             .failures
             .into_iter()
@@ -1958,7 +2210,12 @@ impl RockyMcpServer {
         description = "Draft a Rocky transformation model into the project working tree and \
          compile it in the SAME call — the safe write path for an agent. Writes the SQL to \
          models/<name>.sql plus a sidecar carrying the intent, then compiles and returns the \
-         diagnostics, so you get the type-check WITH the write (no separate round-trip). It does \
+         diagnostics, so you get the type-check WITH the write (no separate round-trip). On an \
+         EXISTING model it replaces the SQL body but PRESERVE-MERGES the sidecar: only `name` \
+         and `intent` are replaced, every other key (classification, freshness, tests, target, \
+         strategy, tags, ...) is kept — spec-owned metadata cannot be erased through this tool. \
+         The merge re-serializes the sidecar, so TOML comments in an existing sidecar are lost; \
+         an existing sidecar that does not parse as TOML refuses (never clobbered). It does \
          NOT run, apply, or touch the warehouse; a draft is inert until you `propose` it and a \
          human reviews it. Path-gated to the models directory (a name with separators/`..` is \
          refused) and policy-aware: authoring into a governed scope returns a structured \
@@ -1989,10 +2246,99 @@ impl RockyMcpServer {
             DraftRollback::snapshot_async(vec![paths.sql_path.clone(), paths.sidecar_path.clone()])
                 .await;
 
-        // Write the draft: the SQL body verbatim + a minimal sidecar that carries
-        // the intent. Target/strategy resolve from the project's conventions
-        // (rocky.toml pipeline + _defaults.toml), exactly as a hand-authored bare
-        // model — the draft tool never invents a target the agent didn't ask for.
+        // FF-WP1 fix round 2 (item 2): an EXISTS-but-unreadable sidecar must
+        // REFUSE, mirroring the unparseable refusal below. The snapshot
+        // converts read errors to "absent", so without this guard the draft
+        // would treat the model as NEW — overwriting the sidecar's spec-owned
+        // metadata, evaluating policy with no prior classifications, and, on
+        // a deny, "restoring" the absent prior by DELETING the file. Checked
+        // against the same snapshot read the merge decision uses. Nothing has
+        // been written yet, so the guard is defused rather than dropped — a
+        // drop would perform exactly the deletion this refusal prevents.
+        if rollback.prior(&paths.sidecar_path).is_none()
+            && std::fs::metadata(&paths.sidecar_path).is_ok()
+        {
+            rollback.defuse();
+            return Err(ToolError::invalid_argument(
+                format!(
+                    "the sidecar at {} exists but cannot be read; refusing to rewrite it",
+                    rel_display(&self.root, &paths.sidecar_path)
+                ),
+                "Fix the sidecar file's permissions (it must be readable so its spec-owned \
+                 metadata can be preserved), then retry. draft_model never overwrites a sidecar \
+                 it cannot read.",
+            ));
+        }
+
+        // FF-WP1 fix round (finding 2): build the sidecar to write, and
+        // collect the PRIOR sidecar's classifications for the policy
+        // pre-image/post-image dual evaluation below.
+        //
+        // - NO existing sidecar → the minimal `name` + `intent` document,
+        //   exactly as before (target/strategy resolve from the project's
+        //   conventions; the draft tool never invents routing).
+        // - EXISTING sidecar → preserve-merge: parse it as TOML (an
+        //   unparseable sidecar REFUSES — spec-owned metadata is never
+        //   clobbered, mirroring draft_metadata), replace ONLY `name` and
+        //   `intent`, and keep every other key (classification, freshness,
+        //   tests, target, strategy, tags, ...).
+        let (sidecar_bytes, prior_classifications): (String, Vec<String>) =
+            match rollback.prior(&paths.sidecar_path) {
+                None => (draft_sidecar(&paths.stem, args.intent.trim()), Vec::new()),
+                Some(prior_bytes) => {
+                    let text = std::str::from_utf8(prior_bytes).map_err(|_| {
+                        ToolError::invalid_argument(
+                            format!(
+                                "the sidecar at {} is not valid UTF-8; refusing to rewrite it",
+                                rel_display(&self.root, &paths.sidecar_path)
+                            ),
+                            "Fix the sidecar file by hand (it must be UTF-8 TOML), then retry. \
+                             draft_model never overwrites a sidecar it cannot parse.",
+                        )
+                    })?;
+                    let mut table: toml::Table = toml::from_str(text).map_err(|e| {
+                        ToolError::invalid_argument(
+                            format!(
+                                "the sidecar at {} does not parse as TOML ({e}); refusing to \
+                                 rewrite it",
+                                rel_display(&self.root, &paths.sidecar_path)
+                            ),
+                            "Fix the sidecar so it parses (rocky compile will point at the same \
+                             problem), then retry. draft_model never overwrites a sidecar it \
+                             cannot parse — an existing model's metadata is preserved, not \
+                             replaced.",
+                        )
+                    })?;
+                    let prior_classifications: Vec<String> = table
+                        .get("classification")
+                        .and_then(|v| v.as_table())
+                        .map(|t| {
+                            t.values()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    table.insert("name".to_string(), toml::Value::String(paths.stem.clone()));
+                    let intent = args.intent.trim();
+                    if intent.is_empty() {
+                        table.remove("intent");
+                    } else {
+                        table.insert(
+                            "intent".to_string(),
+                            toml::Value::String(intent.to_string()),
+                        );
+                    }
+                    let serialized = toml::to_string(&table).map_err(|e| {
+                        ToolError::internal(
+                            format!("failed to re-serialize the merged sidecar: {e}"),
+                            "Retry; if it persists this is an internal TOML serialization bug.",
+                        )
+                    })?;
+                    (ensure_trailing_newline(&serialized), prior_classifications)
+                }
+            };
+
+        // Write the draft: the SQL body verbatim + the sidecar built above.
         if let Err(e) = std::fs::write(&paths.sql_path, ensure_trailing_newline(&args.sql)) {
             return Err(ToolError::internal(
                 format!(
@@ -2002,10 +2348,7 @@ impl RockyMcpServer {
                 "Ensure the models directory is writable.",
             ));
         }
-        if let Err(e) = std::fs::write(
-            &paths.sidecar_path,
-            draft_sidecar(&paths.stem, args.intent.trim()),
-        ) {
+        if let Err(e) = std::fs::write(&paths.sidecar_path, sidecar_bytes) {
             return Err(ToolError::internal(
                 format!(
                     "failed to write draft sidecar to {}: {e}",
@@ -2057,7 +2400,17 @@ impl RockyMcpServer {
         // a frozen agent must not keep minting drafts. Fail-closed; bounded by
         // the shared guard (no `[policy]` ⇒ no LIST ⇒ zero behavior change).
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
-        let gate = rocky_cli::commands::evaluate_apply_policy(
+        // FF-WP1 fix round 2 (item 1): classification-sensitive scope is
+        // DUAL-evaluated — once over the on-disk (post-merge) attributes and
+        // once over the pre-image (the classifications the prior sidecar
+        // carried), with the most restrictive verdict governing — so no edit
+        // through this tool can de-scope a classification-matched rule NOR
+        // escape an exclusion-matched one. Under the preserve-merge above
+        // pre ⊆ post; the explicit dual evaluation keeps the property
+        // STRUCTURAL rather than an artifact of the merge staying correct.
+        let prior_classifications_by_model: std::collections::BTreeMap<String, Vec<String>> =
+            std::iter::once((paths.stem.clone(), prior_classifications)).collect();
+        let gate = rocky_cli::commands::evaluate_apply_policy_with_extra_classifications(
             &self.config_path,
             &decision_id,
             rocky_core::config::PolicyPrincipal::Agent,
@@ -2065,6 +2418,7 @@ impl RockyMcpServer {
             &self.models_dir,
             &state_path,
             &marker_freezes,
+            &prior_classifications_by_model,
         );
 
         match gate {
@@ -2079,7 +2433,7 @@ impl RockyMcpServer {
                     error_count: compiled.error_count,
                     warning_count: compiled.warning_count,
                     diagnostics: compiled.diagnostics,
-                    next_steps: DRAFT_NEXT_STEPS.to_string(),
+                    next_steps: self.draft_model_next_steps().to_string(),
                 }))
             }
             rocky_cli::commands::PolicyGate::RequireReview {
@@ -2333,7 +2687,7 @@ impl RockyMcpServer {
                     error_count: compiled.error_count,
                     warning_count: compiled.warning_count,
                     diagnostics: compiled.diagnostics,
-                    next_steps: DRAFT_CHECK_NEXT_STEPS.to_string(),
+                    next_steps: self.draft_check_next_steps().to_string(),
                 }))
             }
             rocky_cli::commands::PolicyGate::RequireReview {
@@ -2378,12 +2732,236 @@ impl RockyMcpServer {
     }
 
     #[tool(
+        description = "Write governed sidecar METADATA for an existing model — freshness and/or \
+         column classifications — as a structured patch, compile-validated in the SAME call. The \
+         sidecar (models/<model>.toml) is parsed as TOML and re-serialized: `freshness` replaces \
+         the whole [freshness] table, `classifications` merges per-column tags into \
+         [classification] (other columns' tags are preserved). Comments in the sidecar are \
+         dropped and key order may normalize on re-serialization; the data round-trips, the \
+         formatting does not. An unparseable sidecar is never clobbered — the call fails naming \
+         the file. At least one of `freshness` / `classifications` is required. Path-gated to the \
+         models directory and policy-aware: the policy gate evaluates the model's attributes AS \
+         PATCHED (a patch that first adds a governed classification is gated by that \
+         classification), and a denied patch restores the prior sidecar bytes. It does NOT run, \
+         apply, or touch the warehouse."
+    )]
+    async fn draft_metadata(
+        &self,
+        params: Parameters<DraftMetadataArgs>,
+    ) -> ToolResult<DraftMetadataResult> {
+        let args = params.0;
+        if args.freshness.is_none() && args.classifications.is_none() {
+            return Err(ToolError::invalid_argument(
+                "draft_metadata needs at least one of `freshness` / `classifications`",
+                "Pass `freshness` (expected_lag_seconds + optional time_column/severity), \
+                 `classifications` (column -> tag map), or both. An empty patch writes nothing.",
+            ));
+        }
+        // Validate the patch shape up front, before any filesystem access, so
+        // a malformed patch is a crisp invalid_argument rather than a compile
+        // diagnostic on a half-written sidecar.
+        let freshness_table = match &args.freshness {
+            Some(patch) => Some(build_freshness_table(patch)?),
+            None => None,
+        };
+        if let Some(classifications) = &args.classifications {
+            if classifications.is_empty() {
+                return Err(ToolError::invalid_argument(
+                    "draft_metadata `classifications` is present but empty",
+                    "List at least one column -> tag pair (e.g. { \"email\": \"pii\" }), or omit \
+                     the field.",
+                ));
+            }
+            for (column, tag) in classifications {
+                if column.trim().is_empty() || tag.trim().is_empty() {
+                    return Err(ToolError::invalid_argument(
+                        "draft_metadata classification columns and tags must be non-empty",
+                        "Every entry maps a real column name to a non-empty tag, e.g. \
+                         { \"email\": \"pii\" }.",
+                    ));
+                }
+            }
+        }
+        let paths = self.resolve_draft_paths(&args.model)?;
+        if !self.model_source_exists(&paths.stem) {
+            return Err(ToolError::model_not_found(&paths.stem));
+        }
+
+        // Snapshot the sidecar so a DENY (or a write/compile failure, or a
+        // panic before the verdict) restores the model's PRIOR sidecar bytes.
+        let rollback = DraftRollback::snapshot_async(vec![paths.sidecar_path.clone()]).await;
+
+        // Parse-merge, never string-append: the existing sidecar must parse as
+        // TOML or the call fails naming it — an unparseable sidecar is never
+        // clobbered (nothing has been written yet; the guard restores
+        // identical bytes).
+        let mut sidecar: toml::Table = match rollback.prior(&paths.sidecar_path) {
+            Some(bytes) => {
+                let text = std::str::from_utf8(bytes).map_err(|_| {
+                    ToolError::invalid_argument(
+                        format!(
+                            "the sidecar at {} is not valid UTF-8; refusing to rewrite it",
+                            rel_display(&self.root, &paths.sidecar_path)
+                        ),
+                        "Fix the sidecar file by hand (it must be UTF-8 TOML), then retry.",
+                    )
+                })?;
+                toml::from_str(text).map_err(|e| {
+                    ToolError::invalid_argument(
+                        format!(
+                            "the sidecar at {} does not parse as TOML ({e}); refusing to \
+                             rewrite it",
+                            rel_display(&self.root, &paths.sidecar_path)
+                        ),
+                        "Fix the sidecar so it parses (rocky compile will point at the same \
+                         problem), then retry. draft_metadata never overwrites a file it \
+                         cannot parse.",
+                    )
+                })?
+            }
+            None => {
+                // A bare `.sql`/`.rocky` model with no sidecar yet: seed the
+                // minimal sidecar `draft_check` also seeds.
+                let mut table = toml::Table::new();
+                table.insert("name".to_string(), toml::Value::String(paths.stem.clone()));
+                table
+            }
+        };
+
+        if let Some(fresh) = freshness_table {
+            sidecar.insert("freshness".to_string(), toml::Value::Table(fresh));
+        }
+        if let Some(classifications) = &args.classifications {
+            let entry = sidecar
+                .entry("classification".to_string())
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            let Some(class_table) = entry.as_table_mut() else {
+                return Err(ToolError::invalid_argument(
+                    format!(
+                        "the sidecar at {} declares `classification` as a non-table value; \
+                         refusing to rewrite it",
+                        rel_display(&self.root, &paths.sidecar_path)
+                    ),
+                    "Fix the sidecar so `[classification]` is a table of column = \"tag\" \
+                     pairs, then retry.",
+                ));
+            };
+            for (column, tag) in classifications {
+                class_table.insert(column.clone(), toml::Value::String(tag.clone()));
+            }
+        }
+
+        let serialized = toml::to_string(&sidecar).map_err(|e| {
+            ToolError::internal(
+                format!("failed to re-serialize the patched sidecar: {e}"),
+                "Retry; if it persists this is an internal TOML serialization bug.",
+            )
+        })?;
+        if let Err(e) = std::fs::write(&paths.sidecar_path, ensure_trailing_newline(&serialized)) {
+            return Err(ToolError::internal(
+                format!(
+                    "failed to write patched sidecar to {}: {e}",
+                    paths.sidecar_path.display()
+                ),
+                "Ensure the models directory is writable.",
+            ));
+        }
+
+        // Compile with the write — a hard failure rolls the patch back.
+        let compiled = self.compile_drafted(&paths.stem)?;
+
+        // ⟦RTL-2⟧ the policy gate runs AFTER the write, so the evaluation
+        // compiles the model's attributes AS PATCHED from disk — a patch that
+        // first ADDS a governed classification is gated by that
+        // classification, not by the pre-patch attribute set.
+        let decision_id = format!("draft-metadata:{}", paths.stem);
+        let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
+        match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+            rocky_cli::commands::PolicyGate::NotConfigured
+            | rocky_cli::commands::PolicyGate::Allow => {
+                rollback.defuse();
+                Ok(Json(DraftMetadataResult {
+                    model: paths.stem.clone(),
+                    sidecar_path: rel_display(&self.root, &paths.sidecar_path),
+                    has_errors: compiled.has_errors,
+                    error_count: compiled.error_count,
+                    warning_count: compiled.warning_count,
+                    diagnostics: compiled.diagnostics,
+                    next_steps: DRAFT_METADATA_NEXT_STEPS.to_string(),
+                }))
+            }
+            rocky_cli::commands::PolicyGate::RequireReview {
+                model,
+                rule_id,
+                reason,
+            } => {
+                rollback.defuse();
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_review_required(
+                    format!(
+                        "policy requires human review before authoring metadata in this scope: \
+                         model '{model}'{named} — {reason}. The patched sidecar was written to \
+                         {} for a human to review.",
+                        rel_display(&self.root, &paths.sidecar_path)
+                    ),
+                    "A human must review this metadata change before it goes further; do not \
+                     plan, propose, or apply it in this governed scope on your own."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+            rocky_cli::commands::PolicyGate::Deny {
+                model,
+                rule_id,
+                reason,
+            } => {
+                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                Err(ToolError::policy_denied(
+                    format!(
+                        "policy denies authoring metadata for this model: '{model}'{named} — \
+                         {reason}. A deny cannot be satisfied by human review, so the patch was \
+                         not kept (the model's prior sidecar is restored)."
+                    ),
+                    "Re-scope — patch a different, ungoverned model, or drop the change. A \
+                     denied authorship cannot be applied even after review."
+                        .to_string(),
+                    rule_id.map(|r| r.to_string()),
+                ))
+            }
+        }
+    }
+
+    #[tool(
         description = "Propose materializing the model(s) as an AI-AUTHORED plan. This does NOT \
          execute anything. It records a plan that a human must review and approve \
          (`rocky review <plan_id> --approve`) before `rocky apply <plan_id>` will run it. Surface \
-         the plan_id and the review/apply path to the user; never approve on their behalf."
+         the plan_id and the review/apply path to the user; never approve on their behalf. \
+         Optionally binds the plan to a product identity (`product_id` + `spec_digest`, both or \
+         neither): a product-bound plan additionally refuses a bare apply — the applier must pass \
+         `rocky apply --expect-spec-digest <digest>`."
     )]
     async fn propose(&self, params: Parameters<ProposeArgs>) -> ToolResult<ProposeResult> {
+        let args = params.0;
+        // Product identity is all-or-nothing: exactly one of the pair is a
+        // caller bug, and an empty string is not an identity. Validated before
+        // any compile work so the refusal is immediate and structured.
+        match (args.product_id.as_deref(), args.spec_digest.as_deref()) {
+            (Some(p), _) | (_, Some(p)) if p.trim().is_empty() => {
+                return Err(ToolError::invalid_argument(
+                    "product_id / spec_digest must be non-empty when present",
+                    "Pass both fields with real values (e.g. product_id = \
+                     \"product:revenue_daily\", spec_digest = \"sha256:<hex>\"), or omit both.",
+                ));
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ToolError::invalid_argument(
+                    "product_id and spec_digest must be set together or not at all",
+                    "Pass both fields (the plan binds to a product AND its approved spec \
+                     revision), or omit both for a non-product plan.",
+                ));
+            }
+            _ => {}
+        }
         let result = self
             .compile_full()
             .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
@@ -2401,13 +2979,29 @@ impl RockyMcpServer {
 
         // If a model filter was given, assert it exists so we don't write a
         // plan that applies to nothing.
-        if let Some(model) = params.0.model.as_deref()
+        if let Some(model) = args.model.as_deref()
             && !models.iter().any(|m| m == model)
         {
             return Err(ToolError::model_not_found(model));
         }
 
-        let run_plan = build_ai_run_plan(params.0.model.clone(), &result);
+        // Runner-supplied idempotency key wins; when the product pair is
+        // present and no key was supplied, derive the documented
+        // attempt-aliasing fallback so a product propose never bypasses dedup
+        // (`None` would — the run path skips dedup entirely without a key).
+        let idempotency_key = args.idempotency_key.clone().or_else(|| {
+            args.product_id
+                .as_deref()
+                .zip(args.spec_digest.as_deref())
+                .map(|(p, s)| format!("{p}@{s}"))
+        });
+        let run_plan = build_ai_run_plan(
+            args.model.clone(),
+            &result,
+            args.product_id.clone(),
+            args.spec_digest.clone(),
+            idempotency_key,
+        );
 
         // The `propose` tool is the sole MCP writer of plans; it always authors
         // an AI-authored plan and therefore always acts as the `agent`
@@ -2545,7 +3139,12 @@ impl RockyMcpServer {
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 let plan_id = write_plan()?;
-                Ok(Json(ProposeResult { plan_id, models }))
+                Ok(Json(ProposeResult {
+                    plan_id,
+                    models,
+                    product_id: args.product_id,
+                    spec_digest: args.spec_digest,
+                }))
             }
             rocky_cli::commands::PolicyGate::RequireReview {
                 model,
@@ -2554,9 +3153,13 @@ impl RockyMcpServer {
             } => {
                 // Headed to human review — persist the plan so a reviewer can
                 // approve it, then return a structured signal the agent parses.
+                // The recorded plan's id (and its product binding, when the
+                // propose carried one) ride as TYPED envelope fields — the
+                // machine handoff a fulfillment runner branches on; the prose
+                // repeats them for humans only.
                 let plan_id = write_plan()?;
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
-                Err(ToolError::policy_review_required(
+                Err(ToolError::policy_review_required_for_plan(
                     format!(
                         "policy requires human review before this change can apply: \
                          model '{model}'{named} — {reason}. The plan was recorded as {plan_id}."
@@ -2566,6 +3169,9 @@ impl RockyMcpServer {
                          `rocky apply {plan_id}`; never approve on the user's behalf."
                     ),
                     rule_id.map(|r| r.to_string()),
+                    plan_id,
+                    args.product_id,
+                    args.spec_digest,
                 ))
             }
             rocky_cli::commands::PolicyGate::Deny {
@@ -2894,20 +3500,44 @@ impl RockyMcpServer {
         })?;
 
         let Some(plan_id) = args.approve_plan_id.as_deref() else {
-            // Read mode.
-            let pending = serde_json::to_value(&queue.pending).map_err(|e| {
-                ToolError::internal(
-                    format!("failed to serialize the review queue: {e}"),
-                    "Retry; if it persists this is an internal serialization bug.",
-                )
-            })?;
+            // Read mode, optionally product-filtered.
+            let (pending, total) = match args.product_id.as_deref() {
+                None => {
+                    let pending = serde_json::to_value(&queue.pending).map_err(|e| {
+                        ToolError::internal(
+                            format!("failed to serialize the review queue: {e}"),
+                            "Retry; if it persists this is an internal serialization bug.",
+                        )
+                    })?;
+                    (pending, queue.total)
+                }
+                Some(product) => {
+                    if product.trim().is_empty() {
+                        return Err(ToolError::invalid_argument(
+                            "review_queue `product_id` must be non-empty when present",
+                            "Pass the product identity to filter on (e.g. \
+                             \"product:revenue_daily\"), or omit the field for the full queue.",
+                        ));
+                    }
+                    filter_pending_by_product(&self.root, &queue.pending, product)?
+                }
+            };
             return Ok(Json(ReviewQueueResult {
-                total: queue.total,
+                total,
                 ranking: queue.ranking,
                 pending,
                 approval: None,
             }));
         };
+
+        if args.product_id.is_some() {
+            return Err(ToolError::invalid_argument(
+                "`product_id` filters the queue LISTING; it cannot combine with \
+                 `approve_plan_id`",
+                "Approve by exact plan_id alone — list with the product filter first, then \
+                 approve the specific plan.",
+            ));
+        }
 
         // The plan must be an outstanding escalation in THIS queue — not an
         // arbitrary reviewable plan.
@@ -3083,6 +3713,61 @@ impl RockyMcpServer {
         _ctx: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, McpError> {
         let intent = args.intent.trim();
+        // FF-WP1 fix round (finding 7): the worker profile serves a variant
+        // that ends at the handoff to the trusted runner — it never instructs
+        // `propose`, contract authorship, or any tool the profile excludes.
+        if self.profile == McpProfile::Worker {
+            let messages = vec![
+                PromptMessage::new_text(
+                    Role::Assistant,
+                    "I'll author this Rocky model SQL-first, grounding every decision in the \
+                     real data, and end with a clean, tested draft handed off to the trusted \
+                     runner. I draft; the runner reviews and applies.",
+                ),
+                PromptMessage::new_text(
+                    Role::User,
+                    format!(
+                        "Build a Rocky model for this intent:\n\n  {intent}\n\n\
+                         Follow Rocky's authoring loop, using the MCP tools at each step:\n\n\
+                         1. inspect_schema — read every existing model and source table with \
+                         its typed columns. Never guess column names; select only what's \
+                         actually there.\n\
+                         2. sample_rows — look at real rows before writing any filter or cast. \
+                         The schema tells you a column exists; it does not tell you its literal \
+                         values, its units, or its null rate.\n\
+                         3. profile_column — for any column you filter, cast, or aggregate on, \
+                         check distinct values, null rate, and domain.\n\
+                         4. draft_model — write the model as raw SQL. SQL is first-class in \
+                         Rocky — do NOT reach for the .rocky DSL unless explicitly asked. The \
+                         draft compiles in the same call; on an existing model it preserves \
+                         the sidecar's spec-owned metadata.\n\
+                         5. compile — read the diagnostics (each carries a code, a span, and \
+                         often a suggestion), fix against them, and loop until clean.\n\
+                         6. plan_preview — read the exact SQL Rocky would execute and confirm \
+                         it matches the intent.\n\
+                         7. draft_check — encode what you learned while sampling as append-only \
+                         `[[tests]]` assertions (grain uniqueness, not-null, value domains), \
+                         then run them with the `test` tool. Contracts and metadata are \
+                         SPEC-OWNED in this profile — do not author them; note a \
+                         contract-shaped invariant in your handoff instead.\n\n\
+                         RECONCILE DISCIPLINE (the step that separates a model that compiles \
+                         from a model that is correct): check literal values and units against \
+                         the sampled data, not just the schema. A `WHERE status = 'completed'` \
+                         that returns zero rows because the data actually holds 'COMPLETE' \
+                         compiles perfectly and is wrong.\n\n\
+                         STOP when the draft compiles clean and its checks pass, and HAND OFF \
+                         to the trusted runner: report the drafted files, the invariants you \
+                         encoded, and anything you flagged. Do not record plans, approve \
+                         changes, or apply anything on your own — those verbs belong to the \
+                         trusted runner and are not served in this profile."
+                    ),
+                ),
+            ];
+            return Ok(GetPromptResult::new(messages).with_description(format!(
+                "Rocky model-drafting loop (worker profile, ends at the runner handoff) for: \
+                 {intent}"
+            )));
+        }
         let messages = vec![
             PromptMessage::new_text(
                 Role::Assistant,
@@ -3150,6 +3835,54 @@ impl RockyMcpServer {
         Parameters(_args): Parameters<NoArgs>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<GetPromptResult, McpError> {
+        // FF-WP1 fix round (finding 7): the worker variant drafts the checks
+        // itself (no LLM generator tools, no contract authorship — both are
+        // outside the profile) and ends at the handoff to the trusted runner.
+        if self.profile == McpProfile::Worker {
+            let messages = vec![
+                PromptMessage::new_text(
+                    Role::Assistant,
+                    "I'll find the models that carry no declarative tests, author tests \
+                     grounded in their real data, and end with the drafted checks handed off \
+                     to the trusted runner. I draft; the runner reviews and applies.",
+                ),
+                PromptMessage::new_text(
+                    Role::User,
+                    "Find the untested models in this Rocky project and draft tests for them, \
+                     using the MCP tools at each step:\n\n\
+                     1. catalog — enumerate every model with its declared tests, checks, and \
+                     contract. Treat a model with no checks, no contract, and no test files as \
+                     untested. Prioritise leaf/marts models and anything carrying a primary key \
+                     or a grain you can name.\n\
+                     2. For each untested model, ground before you assert: sample_rows to see \
+                     real values, and profile_column on any key, status, or amount column to \
+                     learn its null rate, distinct count, and domain. The schema says a column \
+                     exists; only the data tells you whether it is unique, non-null, or \
+                     bounded.\n\
+                     3. Author the checks YOURSELF from what you observed — grain uniqueness, \
+                     not-null, value ranges, referential integrity — and write them with \
+                     draft_check: it appends the `[[tests]]` blocks to the model and compiles \
+                     in the same call. Contracts are SPEC-OWNED in this profile — when an \
+                     invariant is contract-shaped (required/protected columns), note it in \
+                     your handoff instead of authoring it.\n\
+                     4. Run the new checks via the `test` tool. Fix against any diagnostic and \
+                     re-run until clean.\n\n\
+                     RECONCILE DISCIPLINE: a test that asserts the wrong invariant passes and \
+                     is still wrong. Confirm the grain, the not-null columns, and the value \
+                     domain against the sampled data before you encode them — do not assume \
+                     `id` is unique or `status` is non-null without checking.\n\n\
+                     STOP when the checks pass, and HAND OFF to the trusted runner: report \
+                     which models you covered, the invariants you encoded, and anything you \
+                     flagged as contract-shaped. Do not record plans, approve changes, or \
+                     apply anything on your own — those verbs belong to the trusted runner and \
+                     are not served in this profile.",
+                ),
+            ];
+            return Ok(GetPromptResult::new(messages).with_description(
+                "Find untested Rocky models and draft tests (worker profile, ends at the \
+                 runner handoff)",
+            ));
+        }
         let messages = vec![
             PromptMessage::new_text(
                 Role::Assistant,
@@ -3216,6 +3949,50 @@ impl RockyMcpServer {
             Some(m) if !m.is_empty() => format!("the model `{m}`"),
             _ => "every model".to_string(),
         };
+        // FF-WP1 fix round (finding 7): the worker variant authors the checks
+        // itself (no `ai_test`, no `propose` — both outside the profile) and
+        // ends at the handoff to the trusted runner.
+        if self.profile == McpProfile::Worker {
+            let messages = vec![
+                PromptMessage::new_text(
+                    Role::Assistant,
+                    "I'll identify the primary-key and unique columns, author uniqueness and \
+                     not-null tests grounded in the real data, and end with the drafted checks \
+                     handed off to the trusted runner. A declared key is a claim; the data is \
+                     what proves it.",
+                ),
+                PromptMessage::new_text(
+                    Role::User,
+                    format!(
+                        "Add uniqueness + not-null tests to the key columns of {scope} in this \
+                         Rocky project, using the MCP tools at each step:\n\n\
+                         1. inspect_schema — read the typed columns. Identify the primary-key / \
+                         unique / grain columns: an explicit key in the sidecar, an `id`-shaped \
+                         column, or the columns that define the model's grain.\n\
+                         2. profile_column — for each candidate key column, confirm it is \
+                         actually unique (distinct count == row count) and non-null before you \
+                         assert it. A column named `id` that has duplicates or nulls is not a \
+                         key — find that out now, from the data.\n\
+                         3. Author a uniqueness check and a not-null check for each confirmed \
+                         key column yourself, then write them with draft_check — it merges the \
+                         `[[tests]]` blocks into the model and compiles in the same call, \
+                         policy-gated.\n\
+                         4. Run the new checks via the `test` tool. Loop until clean.\n\n\
+                         RECONCILE DISCIPLINE: only assert uniqueness/not-null on columns the \
+                         profile actually shows to be unique/non-null. Encoding a wrong key \
+                         invariant is worse than none — it green-lights a future run that \
+                         should have failed.\n\n\
+                         STOP when the checks pass, and HAND OFF to the trusted runner: report \
+                         the key columns you confirmed and the tests you encoded. Do not \
+                         record plans, approve changes, or apply anything on your own — those \
+                         verbs belong to the trusted runner and are not served in this profile."
+                    ),
+                ),
+            ];
+            return Ok(GetPromptResult::new(messages).with_description(format!(
+                "Add key tests to {scope} (worker profile, ends at the runner handoff)"
+            )));
+        }
         let messages = vec![
             PromptMessage::new_text(
                 Role::Assistant,
@@ -3320,6 +4097,56 @@ impl RockyMcpServer {
             Some(m) if !m.is_empty() => format!("the model `{m}`"),
             _ => "the project".to_string(),
         };
+        // FF-WP1 fix round (finding 7): the worker variant fixes model SQL via
+        // draft_model, never weakens tests, and ends at the handoff to the
+        // trusted runner (no `propose` in this profile).
+        if self.profile == McpProfile::Worker {
+            let messages = vec![
+                PromptMessage::new_text(
+                    Role::Assistant,
+                    "I'll run the tests, ground each failure in the real data before changing \
+                     anything, and end with the fix drafted and handed off to the trusted \
+                     runner. A failing test is a signal — I will find out whether the test is \
+                     wrong or the data is wrong before I touch either.",
+                ),
+                PromptMessage::new_text(
+                    Role::User,
+                    format!(
+                        "Diagnose and fix the failing tests in {scope}, using the MCP tools at \
+                         each step:\n\n\
+                         1. test — run the declarative tests and read which assertions fail, on \
+                         which model, and the failing-row count.\n\
+                         2. For each failure, ground the cause before deciding the fix: \
+                         profile_column the implicated columns to see their actual null rate, \
+                         distinct count, and value domain, and sample_rows to look at offending \
+                         rows. The failure tells you WHAT broke; the data tells you WHY.\n\
+                         3. Decide which side is wrong. If the model SQL is wrong (it produces \
+                         duplicates / nulls / out-of-domain values it shouldn't), redraft it \
+                         with draft_model — on an existing model it replaces the SQL and \
+                         preserves the sidecar's metadata. If the TEST encodes a wrong \
+                         invariant, do NOT weaken or rewrite it in this profile: test edits \
+                         beyond append-only checks are the trusted runner's — record the \
+                         finding (which assertion, what the data actually holds) in your \
+                         handoff.\n\
+                         4. compile, then re-run the `test` tool. Loop until the failure is \
+                         genuinely resolved, not silenced.\n\n\
+                         RECONCILE DISCIPLINE: the whole point is to check the data, not just \
+                         the schema. A uniqueness test failing because the grain is actually \
+                         composite (two columns, not one) is a real finding you can only see \
+                         in the rows.\n\n\
+                         STOP when the tests pass (or the remaining failures are diagnosed as \
+                         wrong tests), and HAND OFF to the trusted runner: report what you \
+                         fixed and what you diagnosed. Do not record plans, approve changes, \
+                         or apply anything on your own — those verbs belong to the trusted \
+                         runner and are not served in this profile."
+                    ),
+                ),
+            ];
+            return Ok(GetPromptResult::new(messages).with_description(format!(
+                "Diagnose and fix failing tests in {scope} (worker profile, ends at the \
+                 runner handoff)"
+            )));
+        }
         let messages = vec![
             PromptMessage::new_text(
                 Role::Assistant,
@@ -3370,6 +4197,15 @@ impl RockyMcpServer {
 #[prompt_handler(router = self.prompt_router)]
 impl ServerHandler for RockyMcpServer {
     fn get_info(&self) -> ServerInfo {
+        // FF-WP1 fix round 2 (item 5a): the compiled skill is the FULL
+        // authoring workflow, served to both profiles so the guidance never
+        // forks from the canonical file — but under the worker profile it is
+        // prefixed with the banner naming the tools this session does not
+        // serve and redirecting every ending to the trusted-runner hand-off.
+        let instructions = match self.profile {
+            McpProfile::Default => INSTRUCTIONS.to_string(),
+            McpProfile::Worker => format!("{WORKER_INSTRUCTIONS_BANNER}{INSTRUCTIONS}"),
+        };
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -3378,7 +4214,7 @@ impl ServerHandler for RockyMcpServer {
         )
         .with_server_info(Implementation::from_build_env())
         .with_protocol_version(ProtocolVersion::V_2024_11_05)
-        .with_instructions(INSTRUCTIONS.to_string())
+        .with_instructions(instructions)
     }
 }
 
@@ -3765,7 +4601,18 @@ fn render_cell(v: serde_json::Value) -> String {
 /// inline (the `rocky plan` builder is private + entangled with discovery);
 /// every field is set explicitly so a future field addition is a compile error
 /// rather than a silent default.
-fn build_ai_run_plan(model: Option<String>, result: &CompilerResult) -> rocky_cli::output::RunPlan {
+///
+/// `product_id` / `spec_digest` are the opaque product identity the propose
+/// carried (validated both-or-neither by the caller); `idempotency_key` is the
+/// already-resolved key (runner-supplied, or the derived
+/// `"<product_id>@<spec_digest>"` fallback).
+fn build_ai_run_plan(
+    model: Option<String>,
+    result: &CompilerResult,
+    product_id: Option<String>,
+    spec_digest: Option<String>,
+    idempotency_key: Option<String>,
+) -> rocky_cli::output::RunPlan {
     let models: Vec<String> = result
         .project
         .models
@@ -3794,21 +4641,38 @@ fn build_ai_run_plan(model: Option<String>, result: &CompilerResult) -> rocky_cl
         shadow_suffix: None,
         shadow_schema: None,
         dag: false,
-        idempotency_key: None,
+        idempotency_key,
         governance_override: None,
         models,
         execution_layers,
+        product_id,
+        spec_digest,
     }
 }
 
 /// The authoring-loop reminder every successful `draft_model` response carries.
 /// A draft is written and compiled, never applied — this restates the flow so
 /// the agent never mistakes a written draft for a materialized change.
+/// Default profile only; the worker profile serves
+/// [`WORKER_DRAFT_NEXT_STEPS`].
 const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
      warehouse. Continue the authoring loop: fix any error diagnostics above and re-draft (or \
      `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, then `propose` \
      to record an AI-authored plan for a human to `rocky review <plan_id> --approve` and \
      `rocky apply`. Never apply a draft directly.";
+
+/// The worker-profile variant of [`DRAFT_NEXT_STEPS`] (FF-WP1 fix round 2,
+/// item 5c): the default reminder instructs `propose`, a tool this profile
+/// does not serve — the worker's loop ends at the typed hand-off to the
+/// trusted runner instead.
+const WORKER_DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
+     the warehouse. Continue the drafting loop: fix any error diagnostics above and re-draft \
+     (or `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, and \
+     encode what you verified as append-only checks with `draft_check`, executed via the `test` \
+     tool. When the draft is clean and its checks pass, STOP and end at the typed hand-off to \
+     the trusted runner: report the drafted files, the invariants you encoded, and anything you \
+     flagged. Recording, review, and apply belong to the trusted runner — never act on them \
+     yourself.";
 
 /// The authoring-loop reminder every successful `draft_contract` response
 /// carries. The contract is written and compile-validated, never applied.
@@ -3820,11 +4684,33 @@ const DRAFT_CONTRACT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT appli
 
 /// The authoring-loop reminder every successful `draft_check` response carries.
 /// The check is written and structurally compiled, then executed via `test`.
+/// Default profile only; the worker profile serves
+/// [`WORKER_DRAFT_CHECK_NEXT_STEPS`].
 const DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
      warehouse. The check is merged into the model's sidecar and the project compiles; run the \
      `test` tool to EXECUTE the check against the data and confirm it passes. When it is clean, \
      `propose` to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
      and `rocky apply`. Never apply a draft directly.";
+
+/// The worker-profile variant of [`DRAFT_CHECK_NEXT_STEPS`] (FF-WP1 fix
+/// round 2, item 5c): ends at the typed hand-off to the trusted runner
+/// instead of instructing `propose`.
+const WORKER_DRAFT_CHECK_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or \
+     touched the warehouse. The check is merged into the model's sidecar and the project \
+     compiles; run the `test` tool to EXECUTE the check against the data and confirm it passes. \
+     When it is clean, STOP and end at the typed hand-off to the trusted runner: report the \
+     model, the invariants you encoded, and anything you flagged. Recording, review, and apply \
+     belong to the trusted runner — never act on them yourself.";
+
+/// The authoring-loop reminder every successful `draft_metadata` response
+/// carries. The patched sidecar is written and compile-validated, never
+/// applied.
+const DRAFT_METADATA_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
+     the warehouse. The metadata patch is merged into the model's sidecar and the project \
+     compiles; freshness and classifications take effect when the model is next materialized \
+     and reconciled. If this metadata change should ship with a model change, continue the \
+     loop: `compile`, then `propose` for a human to `rocky review <plan_id> --approve` and \
+     `rocky apply`. Never apply a draft directly.";
 
 /// The validated on-disk targets a draft writes to.
 struct DraftPaths {
@@ -3927,6 +4813,99 @@ impl Drop for DraftRollback {
             restore_or_remove(path, prior.as_deref());
         }
     }
+}
+
+/// Filter the pending review queue to plans whose payload carries
+/// `product_id == product`, reading each candidate plan integrity-checked.
+///
+/// The queue's ledger rows do not carry plan payloads (`compute_review_queue`
+/// reads decisions + marker state only), so the product filter is the point
+/// where plan files get read. Fail-open is not an option here: a pending plan
+/// whose file is missing, unreadable, or fails its integrity re-hash CANNOT
+/// prove which product it belongs to, so it surfaces as a `warning` entry —
+/// never a silent drop that would hide a possibly-matching escalation from
+/// the runner. Returns the filtered `pending` value plus its entry count.
+fn filter_pending_by_product(
+    root: &Path,
+    pending: &[rocky_cli::output::ReviewQueueEntry],
+    product: &str,
+) -> Result<(serde_json::Value, u64), Json<ToolError>> {
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for entry in pending {
+        match rocky_cli::plan_store::read_plan(root, &entry.plan_id) {
+            Ok(plan) => {
+                if plan.payload.get("product_id").and_then(|v| v.as_str()) == Some(product) {
+                    let value = serde_json::to_value(entry).map_err(|e| {
+                        ToolError::internal(
+                            format!("failed to serialize a review queue entry: {e}"),
+                            "Retry; if it persists this is an internal serialization bug.",
+                        )
+                    })?;
+                    entries.push(value);
+                }
+            }
+            Err(e) => entries.push(serde_json::json!({
+                "plan_id": entry.plan_id,
+                "warning": format!(
+                    "pending plan could not be read for product filtering ({e:#}); it may or \
+                     may not belong to '{product}' — inspect it directly, it remains pending"
+                ),
+            })),
+        }
+    }
+    let total = entries.len() as u64;
+    Ok((serde_json::Value::Array(entries), total))
+}
+
+/// Build the `[freshness]` TOML table a validated [`FreshnessPatch`] writes.
+///
+/// Validates the patch shape (a positive lag that fits TOML's i64 integers, a
+/// non-empty `time_column`, a `severity` the engine's `TestSeverity` accepts)
+/// so a malformed patch refuses as `invalid_argument` before any file I/O.
+fn build_freshness_table(patch: &FreshnessPatch) -> Result<toml::Table, Json<ToolError>> {
+    if patch.expected_lag_seconds == 0 {
+        return Err(ToolError::invalid_argument(
+            "freshness.expected_lag_seconds must be greater than zero",
+            "Pass the maximum acceptable staleness in seconds (e.g. 86400 for 24h).",
+        ));
+    }
+    let lag: i64 = patch.expected_lag_seconds.try_into().map_err(|_| {
+        ToolError::invalid_argument(
+            "freshness.expected_lag_seconds exceeds the TOML integer range",
+            "Pass a realistic lag in seconds (TOML integers are 64-bit signed).",
+        )
+    })?;
+    let mut table = toml::Table::new();
+    table.insert(
+        "expected_lag_seconds".to_string(),
+        toml::Value::Integer(lag),
+    );
+    if let Some(time_column) = &patch.time_column {
+        if time_column.trim().is_empty() {
+            return Err(ToolError::invalid_argument(
+                "freshness.time_column must be non-empty when present",
+                "Name the model's timestamp column, or omit the field to fall back to the \
+                 last-materialization timestamp.",
+            ));
+        }
+        table.insert(
+            "time_column".to_string(),
+            toml::Value::String(time_column.clone()),
+        );
+    }
+    if let Some(severity) = &patch.severity {
+        if severity != "warning" && severity != "error" {
+            return Err(ToolError::invalid_argument(
+                format!("freshness.severity '{severity}' is not a valid severity"),
+                "Pass \"warning\" (non-blocking, the engine default) or \"error\".",
+            ));
+        }
+        table.insert(
+            "severity".to_string(),
+            toml::Value::String(severity.clone()),
+        );
+    }
+    Ok(table)
 }
 
 /// Structural gate for a `draft_check` spec: parse it as TOML and require
@@ -4165,6 +5144,39 @@ mod tests {
             "message should name the model: {:?}",
             err.0
         );
+    }
+
+    #[tokio::test]
+    async fn compile_unknown_model_is_model_not_found() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n",
+        )
+        .expect("write config");
+        let models = root.join("models");
+        std::fs::create_dir(&models).expect("create models");
+        std::fs::write(models.join("known.sql"), "SELECT 1 AS id").expect("write sql");
+        std::fs::write(
+            models.join("known.toml"),
+            "name = \"known\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"known\"\n",
+        )
+        .expect("write sidecar");
+
+        let server = RockyMcpServer::new(root.join("rocky.toml"));
+        let err = match server
+            .compile(Parameters(CompileArgs {
+                model: Some("missing".into()),
+                target_dialect: None,
+            }))
+            .await
+        {
+            Ok(_) => panic!("unknown model must error"),
+            Err(e) => e,
+        };
+        assert_eq!(err.0.code, crate::error::ToolErrorCode::ModelNotFound);
+        assert!(err.0.message.contains("missing"));
     }
 
     #[test]
@@ -4461,5 +5473,212 @@ mod tests {
         assert_eq!(lite.change, "model_removed");
         assert_eq!(lite.model, "c.s.orders");
         assert_eq!(lite.column, None);
+    }
+
+    // --- FF-WP1 fix round 2 (item 5) — worker-profile guidance surfaces ----
+
+    /// Tools the worker profile does not serve — no worker-served guidance
+    /// surface may name them (the instructions BANNER is the one deliberate
+    /// exception: naming them as absent is its job).
+    const WORKER_EXCLUDED_TOOL_MENTIONS: &[&str] = &[
+        "propose",
+        "review_queue",
+        "draft_contract",
+        "draft_metadata",
+        "pause_schedule",
+        "ai_test",
+        "ai_contract",
+    ];
+
+    fn server_with(profile: McpProfile) -> RockyMcpServer {
+        // `get_info` and the routers never touch the filesystem, so an
+        // arbitrary path is fine here.
+        RockyMcpServer::new_with_profile(PathBuf::from("rocky.toml"), profile)
+    }
+
+    /// Item 5a — served `instructions` per profile: the worker profile
+    /// prepends the banner (worker profile named, the five excluded tools
+    /// named as NOT available, the hand-off named as the ending) and serves
+    /// the skill text below it UNCHANGED; the default profile serves the
+    /// skill text verbatim, byte-identical to the compiled file.
+    #[test]
+    fn instructions_carry_the_worker_banner_and_stay_verbatim_by_default() {
+        let default_info = server_with(McpProfile::Default).get_info();
+        assert_eq!(
+            default_info.instructions.as_deref(),
+            Some(INSTRUCTIONS),
+            "default-profile instructions are the skill text, byte-unchanged"
+        );
+
+        let worker_info = server_with(McpProfile::Worker).get_info();
+        let worker = worker_info
+            .instructions
+            .as_deref()
+            .expect("worker profile serves instructions");
+        assert!(
+            worker.starts_with(WORKER_INSTRUCTIONS_BANNER),
+            "worker instructions start with the banner"
+        );
+        assert!(
+            worker.ends_with(INSTRUCTIONS),
+            "the skill text below the banner is byte-unchanged"
+        );
+        assert_eq!(
+            worker.len(),
+            WORKER_INSTRUCTIONS_BANNER.len() + INSTRUCTIONS.len(),
+            "banner + skill text and nothing else"
+        );
+        let banner_lower = WORKER_INSTRUCTIONS_BANNER.to_lowercase();
+        assert!(
+            banner_lower.contains("worker profile"),
+            "the banner says which profile is active"
+        );
+        for tool in [
+            "propose",
+            "review_queue",
+            "draft_contract",
+            "draft_metadata",
+            "pause_schedule",
+        ] {
+            assert!(
+                banner_lower.contains(tool) && banner_lower.contains("not available"),
+                "the banner names `{tool}` as not available"
+            );
+        }
+        assert!(
+            banner_lower.contains("hand-off") && banner_lower.contains("trusted runner"),
+            "the banner redirects every ending to the trusted-runner hand-off"
+        );
+    }
+
+    /// Item 5b — the worker `prompts/list` surface: EVERY listed prompt
+    /// description (the sweep is over the whole router, so a future prompt
+    /// cannot dodge it) names none of the excluded tools and the four
+    /// workflow prompts say they end at the trusted-runner hand-off.
+    #[test]
+    fn worker_prompt_descriptions_name_no_excluded_tool() {
+        let server = server_with(McpProfile::Worker);
+        let prompts = server.prompt_router.list_all();
+        assert_eq!(prompts.len(), 5, "the worker profile keeps all 5 prompts");
+        for prompt in &prompts {
+            let description = prompt
+                .description
+                .as_deref()
+                .unwrap_or_else(|| panic!("prompt '{}' has a description", prompt.name));
+            for excluded in WORKER_EXCLUDED_TOOL_MENTIONS {
+                assert!(
+                    !description.contains(excluded),
+                    "worker-profile description of '{}' must not name excluded tool \
+                     `{excluded}`: {description}",
+                    prompt.name
+                );
+            }
+            if prompt.name != "summarize_project" {
+                assert!(
+                    description.contains("hand-off to the trusted runner"),
+                    "worker-profile description of '{}' ends at the runner hand-off: \
+                     {description}",
+                    prompt.name
+                );
+            }
+        }
+    }
+
+    /// Item 5b, the other half — the DEFAULT `prompts/list` descriptions are
+    /// byte-unchanged: pinned against the exact pre-worker-profile strings,
+    /// so the worker rewrite provably never leaks into the default surface.
+    #[test]
+    fn default_prompt_descriptions_are_byte_unchanged() {
+        let expected: &[(&str, &str)] = &[
+            (
+                "add_tests_to_pks",
+                "Add uniqueness + not-null tests to a model's primary-key / unique columns: \
+                 inspect_schema -> identify key columns -> ai_test / author the checks -> \
+                 draft_check -> propose. Stops at the human approval gate.",
+            ),
+            (
+                "build_model",
+                "Guide the authoring of one Rocky model from a plain-language intent: inspect \
+                 schema -> sample rows -> profile columns -> write SQL -> compile-loop -> plan \
+                 preview -> propose. Stops at the human approval gate.",
+            ),
+            (
+                "find_untested_models",
+                "Find models with no declarative tests and draft tests for them: catalog -> \
+                 identify untested models -> ai_test / ai_contract -> draft_check / \
+                 draft_contract -> propose. Stops at the human approval gate.",
+            ),
+            (
+                "fix_failing_test",
+                "Diagnose and fix failing declarative tests: run `test` -> for each failure \
+                 profile_column the implicated columns to ground the cause -> propose a fix. \
+                 Stops at the human approval gate.",
+            ),
+            (
+                "summarize_project",
+                "Produce a structured, read-only summary of the Rocky project: catalog + \
+                 lineage -> grouped overview of models, their grain, governance, tests, and DAG \
+                 shape. Read-only — no edits, no propose.",
+            ),
+        ];
+        let server = server_with(McpProfile::Default);
+        let listed: std::collections::BTreeMap<String, Option<String>> = server
+            .prompt_router
+            .list_all()
+            .into_iter()
+            .map(|p| (p.name.to_string(), p.description.clone()))
+            .collect();
+        assert_eq!(listed.len(), expected.len(), "all prompts accounted for");
+        for (name, description) in expected {
+            assert_eq!(
+                listed.get(*name).and_then(|d| d.as_deref()),
+                Some(*description),
+                "default-profile description of '{name}' is byte-unchanged"
+            );
+        }
+    }
+
+    /// Item 5c — the profile-selected draft `next_steps`: the worker variants
+    /// name no excluded tool and end at the trusted-runner hand-off; the
+    /// default variants are byte-unchanged (pinned), still ending at
+    /// `propose` + human review.
+    #[test]
+    fn draft_next_steps_are_profile_selected() {
+        let default_server = server_with(McpProfile::Default);
+        assert_eq!(
+            default_server.draft_model_next_steps(),
+            "This is a draft — Rocky has NOT applied it or touched the warehouse. Continue the \
+             authoring loop: fix any error diagnostics above and re-draft (or `compile`) until \
+             it is clean, `plan_preview` to read the SQL Rocky would run, then `propose` to \
+             record an AI-authored plan for a human to `rocky review <plan_id> --approve` and \
+             `rocky apply`. Never apply a draft directly.",
+            "default draft_model next_steps are byte-unchanged"
+        );
+        assert_eq!(
+            default_server.draft_check_next_steps(),
+            "This is a draft — Rocky has NOT applied it or touched the warehouse. The check is \
+             merged into the model's sidecar and the project compiles; run the `test` tool to \
+             EXECUTE the check against the data and confirm it passes. When it is clean, \
+             `propose` to record an AI-authored plan for a human to `rocky review <plan_id> \
+             --approve` and `rocky apply`. Never apply a draft directly.",
+            "default draft_check next_steps are byte-unchanged"
+        );
+
+        let worker_server = server_with(McpProfile::Worker);
+        for next_steps in [
+            worker_server.draft_model_next_steps(),
+            worker_server.draft_check_next_steps(),
+        ] {
+            for excluded in WORKER_EXCLUDED_TOOL_MENTIONS {
+                assert!(
+                    !next_steps.contains(excluded),
+                    "worker next_steps must not name excluded tool `{excluded}`: {next_steps}"
+                );
+            }
+            assert!(
+                next_steps.contains("hand-off to the trusted runner"),
+                "worker next_steps end at the runner hand-off: {next_steps}"
+            );
+        }
     }
 }

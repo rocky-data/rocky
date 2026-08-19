@@ -1732,11 +1732,10 @@ mod tests {
         std::fs::write(dir.join(format!("{plan_id}.json")), "{}").unwrap();
     }
 
-    /// Write the sign-off marker `rocky review --approve` would leave.
+    /// Write the sign-off marker `rocky review --approve` would leave — a
+    /// well-formed one, since the reviewed-filter parses and matches it.
     fn seed_review_marker(root: &std::path::Path, plan_id: &str) {
-        let dir = root.join(".rocky").join("plans");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(format!("{plan_id}.reviewed.json")), "{}").unwrap();
+        crate::commands::review::write_test_review_marker(root, plan_id);
     }
 
     #[test]

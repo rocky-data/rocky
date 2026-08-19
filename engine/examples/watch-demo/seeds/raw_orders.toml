@@ -1,0 +1,5 @@
+# The model reads a bare `raw_orders`, which DuckDB resolves in the
+# warehouse catalog's default `main` schema - so the seed lands there,
+# not in the default `seeds` schema.
+[target]
+schema = "main"

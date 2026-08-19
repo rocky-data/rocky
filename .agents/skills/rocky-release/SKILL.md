@@ -9,7 +9,7 @@ Four artifacts ship independently from one monorepo, each with its own tag names
 
 | Artifact | Tag | Destination | Build path |
 |---|---|---|---|
-| Engine binary (`rocky`) | `engine-v<version>` | GitHub Release (5 platforms) | **CI** — `engine-release.yml` |
+| Engine binaries (`rocky` + `rocky-lsp`) | `engine-v<version>` | GitHub Release (5 targets x 2 binaries = 10 archives) | **CI** — `engine-release.yml` |
 | `rocky-sdk` wheel | `sdk-v<version>` | GitHub Release + PyPI | **CI** — `sdk-release.yml` (OIDC → PyPI) |
 | `dagster-rocky` wheel | `dagster-v<version>` | GitHub Release + PyPI | **CI** — `dagster-release.yml` (OIDC → PyPI) |
 | Rocky VS Code extension | `vscode-v<version>` | GitHub Release + VS Code Marketplace | **CI** — `vscode-release.yml` (`VSCE_PAT` secret → Marketplace) |
@@ -45,9 +45,12 @@ git push origin engine-v0.2.0
 
 That's it. The tag push triggers `engine-release.yml`, which:
 
-1. `ensure-release` — creates the `engine-v0.2.0` GitHub Release if missing (`--generate-notes`).
-2. `build` matrix — runs on macos-14, ubuntu-24.04, and windows-2022. Each produces a tarball (or `.zip` for Windows) named `rocky-<target>.tar.gz`.
-3. `checksums` — generates `SHA256SUMS` and uploads it alongside the binaries.
+1. `ensure-release` — creates the `engine-v0.2.0` GitHub Release if missing, as a **draft** (`--generate-notes --draft`).
+2. `build` matrix — runs on macos-14, ubuntu-24.04, and windows-2022 across 5 targets. Each target produces **two** archives, one per binary: `rocky-<target>.tar.gz` and `rocky-lsp-<target>.tar.gz` (`.zip` on Windows). **10 archives in total**, not 5.
+3. `checksums` — generates **`checksums.txt`** (not `SHA256SUMS`) from every platform archive and uploads it alongside them.
+4. `publish` — flips the release out of draft, once and only once every artifact is attached.
+
+The draft-until-complete ordering is load-bearing, not cosmetic: `install.sh` resolves "latest" by listing `/releases` and taking the highest `engine-v*` tag, and draft releases are omitted from that listing. Publishing up front would make the tag resolvable for the 15–25 min the matrix is still building, so a concurrent `install.sh` — a user's, or another PR's smoke job — would resolve a version whose binaries do not exist yet.
 
 Total elapsed: ~15–25 min. Watch with:
 
@@ -57,7 +60,7 @@ gh run watch $(gh run list --workflow=engine-release.yml --limit=1 --json databa
 
 After the run, verify:
 
-- `gh release view engine-v0.2.0 --repo rocky-data/rocky` shows 5 platform archives + `SHA256SUMS`
+- `gh release view engine-v0.2.0 --repo rocky-data/rocky` shows **11 assets**: 10 platform archives (`rocky-*` and `rocky-lsp-*`, one pair per target) + `checksums.txt`
 - `engine/install.sh` and `engine/install.ps1` resolve the new version (they filter releases by the `engine-v*` prefix)
 
 ### Engine fallback: local build (only when CI is unavailable)
@@ -212,7 +215,7 @@ Path-filtered workflows in `.github/workflows/`:
 - `engine-ci.yml` — test + clippy + fmt on every PR touching `engine/**`
 - `engine-weekly.yml` — coverage (tarpaulin) + cargo-audit, Monday schedule + manual dispatch
 - `engine-bench.yml` — only PRs labeled `perf` touching `engine/crates/**` or `engine/Cargo.*`
-- `engine-release.yml` — **full 5-target matrix build on tag `engine-v*` push**. Owns the GitHub Release creation + binary uploads + SHA256SUMS.
+- `engine-release.yml` — **full 5-target matrix build on tag `engine-v*` push**. Owns the GitHub Release creation + binary uploads + `checksums.txt`.
 - `sdk-release.yml` / `dagster-release.yml` / `vscode-release.yml` — tag-triggered (`sdk-v*` / `dagster-v*` / `vscode-v*`) release + publish
 - `engine-wasm-release.yml` — builds `rocky-wasm` and publishes to npm on `engine-wasm-v*` tags (independent of CLI releases)
 - `engine-docs.yml` — build + deploy Astro docs from `docs/` to GitHub Pages
@@ -220,7 +223,7 @@ Path-filtered workflows in `.github/workflows/`:
 
 ## Post-release checklist
 
-- [ ] `gh release view <tag>` shows all expected artifacts (5 for engine + SHA256SUMS; 2 for sdk; 2 for dagster; 1 for vscode)
+- [ ] `gh release view <tag>` shows all expected artifacts (**11 for engine**: 10 archives + `checksums.txt`; 2 for sdk; 2 for dagster; 1 for vscode)
 - [ ] Install script (`engine/install.sh` or `install.ps1`) resolves and installs the new version on a clean machine
 - [ ] Downstream consumers that vendor the binary + Python wheel atomically have been updated — see `scripts/vendor_rocky.sh` for the vendoring workflow
 - [ ] Changelog is on `main` (it merged with the release PR, but double-check)

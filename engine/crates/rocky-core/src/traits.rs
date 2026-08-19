@@ -305,11 +305,81 @@ pub enum SplitStrategy {
 // Warehouse
 // ---------------------------------------------------------------------------
 
+/// Whether the case of a **quoted** identifier is part of object identity.
+///
+/// ‼️ Read the scope narrowly; it is one of two axes, not the whole answer.
+/// This describes identifiers as Rocky renders its own targets — quoted. It
+/// says nothing about *unquoted* references, which several warehouses fold
+/// independently of this setting: Snowflake upper-cases them whatever
+/// `QUOTED_IDENTIFIERS_IGNORE_CASE` says, so under `Significant` the quoted
+/// `"orders"` and `"Orders"` are two objects while the unquoted `orders` and
+/// `ORDERS` remain one. A consumer deciding whether an arbitrary SQL reference
+/// names a routed target needs BOTH axes; the second is #1282. Treating this
+/// value alone as "does case separate these two names" is the exact mistake an
+/// earlier revision of #1281 made, and it produced a silent isolation break.
+///
+/// Deliberately two states and no `Unknown`. "Could not determine" is carried
+/// by the `Err` arm of [`WarehouseAdapter::identifier_case_significance`], so
+/// a caller cannot pattern-match a third variant and let it fall through a
+/// gate — the failure mode #1240 records, where an `Unknown` type satisfied a
+/// compatibility check unconditionally and the gate read as fail-open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseSignificance {
+    /// Two QUOTED spellings differing only by case name TWO objects.
+    Significant,
+    /// Two QUOTED spellings differing only by case name ONE object.
+    Insignificant,
+}
+
 /// Executes SQL against a warehouse and provides dialect information.
 #[async_trait]
 pub trait WarehouseAdapter: Send + Sync {
     /// Returns the SQL dialect for this warehouse.
     fn dialect(&self) -> &dyn SqlDialect;
+
+    /// Does the warehouse treat a QUOTED identifier's case as part of object
+    /// identity, as observed right now?
+    ///
+    /// Not a dialect question. Snowflake's `QUOTED_IDENTIFIERS_IGNORE_CASE` is
+    /// account/session state, and a BigQuery dataset carries its own
+    /// `is_case_insensitive` — so two connections to the same dialect can
+    /// legitimately disagree, and the answer has to be asked for rather than
+    /// looked up (#1281).
+    ///
+    /// **The answer describes the probe's own request, and does not extend to
+    /// a later one.** It is not durable connection state a caller may cache:
+    /// Snowflake's SQL API opens an independent session per POST, so a
+    /// subsequent statement can execute under a different value, and the
+    /// account-level setting can change between the two regardless. A consumer
+    /// that relaxes a safety decision on this answer must pin the setting for
+    /// the statement it is deciding about, or accept that it is deciding on
+    /// state that may no longer hold. This is not hypothetical caution — it is
+    /// why #1281 ships the probe without a consumer: the routing relaxation it
+    /// was written for could not honour it.
+    ///
+    /// **Nothing in the engine calls this yet.** #1281 lands the capability and
+    /// its Snowflake grounding; #1282 is the intended consumer, because routing
+    /// a reference correctly also needs the *unquoted*-uppercasing axis this
+    /// answer does not carry. Shipping the probe unwired is deliberate: it is
+    /// the half that is safe in every state, and it was live-verifiable while
+    /// the Snowflake trial still answered metadata queries.
+    ///
+    /// **The default is `Err`, and that is load-bearing** for whoever wires it.
+    /// An adapter that has not been grounded must not be read as reporting a
+    /// definite answer, so a new adapter inherits today's refusals rather than
+    /// silently acquiring a relaxation nobody verified. Adapters whose answer is
+    /// a dialect constant (DuckDB, Databricks, Trino) override with that
+    /// constant and issue no round trip.
+    ///
+    /// Callers MUST NOT relax a safety decision on `Err`. In particular a
+    /// transport failure, a permissions error, and "this adapter does not
+    /// implement the probe" are indistinguishable here **on purpose** — all
+    /// three mean the same thing to a gate.
+    async fn identifier_case_significance(&self) -> AdapterResult<CaseSignificance> {
+        Err(AdapterError::msg(
+            "this adapter does not report whether identifier case is part of object identity",
+        ))
+    }
 
     /// Execute a SQL statement (DDL/DML) without returning rows.
     async fn execute_statement(&self, sql: &str) -> AdapterResult<()>;

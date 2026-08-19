@@ -159,7 +159,9 @@ pub fn compute_audit_for(
         let d = store
             .list_policy_decisions()
             .context("failed to read the policy-decision ledger")?;
-        let r = store.list_runs(MAX_HISTORY_SCAN).unwrap_or_default();
+        let r = store
+            .list_runs(MAX_HISTORY_SCAN)
+            .context("failed to read run history")?;
         (d, r)
     } else {
         (Vec::new(), Vec::new())
@@ -1307,6 +1309,31 @@ mod tests {
         assert!(out.resolved, "a ledger-only plan id must resolve: {out:?}");
         assert_eq!(out.decisions.total, 1);
         assert_eq!(out.decisions.entries[0].plan_id, "freeze:global");
+    }
+
+    #[test]
+    fn audit_for_propagates_run_history_read_failure() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let state_path = root.join("state.redb");
+        {
+            let store = StateStore::open(&state_path).unwrap();
+            store.insert_corrupt_run_history_row("run-corrupt").unwrap();
+        }
+
+        let err = compute_audit_for(
+            root,
+            &root.join("rocky.toml"),
+            &state_path,
+            &root.join("models"),
+            "run-corrupt",
+        )
+        .expect_err("a corrupt run-history row must fail the custody chain");
+
+        assert!(
+            format!("{err:#}").contains("failed to read run history"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

@@ -6,9 +6,9 @@ Everything Rocky does, from the outside in, with ASCII diagrams.
 
 ## 1. What Is Rocky?
 
-Rocky is a **typed, compiled data platform**. You write SQL (or a SQL-like DSL). Rocky compiles it, checks it for mistakes, then runs it against your warehouse.
+Rocky is a **typed, compiled data platform**. You write SQL. Rocky compiles it, checks it for mistakes, then runs it against your warehouse. A SQL-like DSL is available for people who want it, but raw SQL is the primary input.
 
-The closest comparison is dbt Core — but Rocky has a real compiler. There's no Jinja templating, no string-substitution tricks. Rocky parses your SQL into a typed tree, checks types across the whole DAG at once, and only generates warehouse SQL after everything has been verified.
+Rocky has a real compiler. There is no Jinja templating and no string-substitution trick. Rocky parses your SQL into a typed tree. It then checks types across the whole DAG at once — the DAG being the graph of which model reads which. Only after every check passes does Rocky generate warehouse SQL.
 
 ```
 You write this:            Rocky does this:              Warehouse gets this:
@@ -23,7 +23,9 @@ GROUP BY order_id          5. Generate dialect SQL         SUM(amount) AS total
                                                          GROUP BY order_id
 ```
 
-Key idea: **Rocky is a program that compiles other programs** (your SQL models). The output of compilation is verified, typed SQL that gets sent to the warehouse. If there's a type mismatch, a missing column, or a broken dependency — you hear about it before anything runs.
+Key idea: **Rocky is a program that compiles other programs** (your SQL models). Compilation produces verified, typed SQL. Rocky sends that SQL to the warehouse. A type mismatch, a missing column, or a broken dependency stops the build before anything runs.
+
+Rocky's terms are collected in the [glossary](https://rocky-data.dev/reference/glossary/).
 
 ---
 
@@ -33,7 +35,7 @@ Key idea: **Rocky is a program that compiles other programs** (your SQL models).
 |---|---|
 | **Typed compiler** | Catches type mismatches and missing columns before any SQL runs |
 | **DAG-aware** | Knows which models depend on which; runs them in the right order |
-| **Multiple materialization strategies** | Table, view, incremental, merge, snapshot, partitioned, content-addressed |
+| **Multiple materialization strategies** | `full_refresh`, `incremental`, `merge`, `time_interval`, `microbatch`, `delete_insert`, `ephemeral`, `view`, `materialized_view`, `dynamic_table`, `content_addressed` |
 | **Incremental loads** | Only processes new rows since the last run (watermark-based) |
 | **Schema drift detection** | Notices when a source column changed type and handles it automatically |
 | **Data contracts** | Declare what columns must exist and what types they must be; enforced at compile time |
@@ -47,60 +49,80 @@ Key idea: **Rocky is a program that compiles other programs** (your SQL models).
 | **Hooks & webhooks** | Fire shell commands or HTTP calls on 18 lifecycle events |
 | **Column lineage** | Trace any output column back to its origin, through every transformation |
 | **Cost model** | Recommends the cheapest materialization strategy based on usage patterns |
-| **Dagster integration** | First-class orchestration via RockyResource and Dagster Pipes |
-| **VS Code extension** | Full LSP: hover types, go-to-definition, inline diagnostics, completion |
+| **Dagster integration** | Orchestration via RockyResource and Dagster Pipes |
+| **VS Code extension** | LSP client: hover types, go-to-definition, inline diagnostics, completion |
 | **AI intent layer** | Generate models from a plain-English description (`rocky ai "..."`) |
 
 ---
 
 ## 3. The Engine: How the Crates Fit Together
 
-Rocky's engine is a 23-crate Rust workspace. Each crate has one job.
+Rocky's engine is a Cargo workspace of small Rust crates. Each crate has one job.
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │                        rocky (binary)                          │
 │                    main.rs — wires it all                      │
-└───────────────────────────┬────────────────────────────────────┘
-                            │
-              ┌─────────────▼──────────────┐
-              │         rocky-cli          │
-              │  35+ commands, JSON output │
-              │  Dagster Pipes emitter     │
-              └──────┬──────────┬──────────┘
-                     │          │
-         ┌───────────▼──┐  ┌───▼────────────┐
-         │ rocky-compiler│  │  rocky-server  │
-         │ type checking │  │  HTTP + LSP    │
-         └──────┬────────┘  └───────────────┘
-                │
-         ┌──────▼────────┐
-         │  rocky-core   │  ← The main engine room
-         │  SQL gen      │    DAG, checks, contracts,
-         │  state store  │    state, schema patterns,
-         │  drift detect │    masking, permissions
-         └──────┬────────┘
-                │
-    ┌───────────▼────────────┐
-    │       rocky-ir         │  ← Typed blueprint of every model
-    │  ModelIr, Strategy,    │    (no runtime traits, no logic,
-    │  PartitionWindow       │     just data)
-    └───────────┬────────────┘
-                │
-   ┌────────────▼────────────────────────────┐
-   │           rocky-adapter-sdk             │
-   │   WarehouseAdapter / SqlDialect /       │
-   │   DiscoveryAdapter / GovernanceAdapter  │
-   └──┬──────────┬─────────────┬────────────┘
-      │          │             │
-  ┌───▼────┐ ┌──▼────────┐ ┌──▼─────────┐
-  │Databr. │ │ Snowflake │ │   DuckDB   │   ... + BigQuery, Trino
-  └────────┘ └───────────┘ └────────────┘
+└───────────────────────────┬───────────────────────┬────────────┘
+                            │                       │
+        ┌───────────────────▼────────────────────┐  │
+        │                rocky-cli               │  │
+        │        70 commands, JSON output        │  │
+        │          Dagster Pipes emitter         │  │
+        └───┬─────────────────┬──────────────────┘  │
+            │                 │      ┌──────────────▼─────────┐
+            │                 │      │       rocky-mcp        │
+            │                 │      │  MCP server over stdio │
+            │                 │      │  built on rocky-cli    │
+            │                 │      └────────────────────────┘
+    ┌───────▼────────┐  ┌─────▼──────┐
+    │ rocky-compiler │  │rocky-server│
+    │ type checking  │  │ HTTP + LSP │
+    └───────┬────────┘  └────────────┘
+            │
+     ┌──────▼────────┐
+     │  rocky-core   │  ← The main engine room
+     │  SQL gen      │    DAG, checks, contracts,
+     │  state store  │    state, schema patterns,
+     │  drift detect │    masking, permissions
+     └──────┬────────┘
+            │
+ ┌──────────▼─────────────┐
+ │       rocky-ir         │  ← Typed blueprint of every model
+ │  ModelIr, Strategy,    │    (no runtime traits, no logic,
+ │  PartitionWindow       │     just data)
+ └────────────────────────┘
 
-  ┌──────────────────────────────────────────┐
-  │  rocky-lang     rocky-sql   rocky-ai     │
-  │  (.rocky DSL)   (SQL AST)   (Claude API) │
-  └──────────────────────────────────────────┘
+ ADAPTER TRAITS — defined in rocky-core, implemented by the adapter crates.
+ The two labelled arrows below show which trait defines each family.
+ ┌──────────────────────────────────────────────────────────┐
+ │  WarehouseAdapter, SqlDialect, DiscoveryAdapter,         │
+ │  GovernanceAdapter, TypeMapper, BatchCheckAdapter        │
+ └──┬───────────────────────────────────┬───────────────────┘
+    │ WarehouseAdapter                  │ DiscoveryAdapter
+ ┌──▼────────────────────────┐  ┌───────▼─────────────────┐
+ │ rocky-databricks          │  │ rocky-fivetran          │
+ │ rocky-snowflake           │  │ rocky-airbyte           │
+ │ rocky-duckdb              │  │ rocky-iceberg           │
+ │ rocky-bigquery            │  │ rocky-duckdb            │
+ │ rocky-trino               │  │ rocky-bigquery          │
+ │                           │  │ manual (built-in)       │
+ │ run the generated SQL     │  │ list what tables exist  │
+ └───────────────────────────┘  └─────────────────────────┘
+
+ SUPPORTING CRATES — used from several layers, not on the spine
+ ┌───────────────────────────────────────────────────────────────┐
+ │ rocky-adapter-sdk   out-of-tree adapter traits, LoaderAdapter │
+ │ rocky-lang          .rocky DSL — lexer, parser, lowering      │
+ │ rocky-sql           SQL AST, lineage, identifier validation   │
+ │ rocky-ai            AI intent layer — plain English to model  │
+ │ rocky-engine        local DataFusion run for test / branch    │
+ │ rocky-cache         caching layer — in-memory LRU + shared    │
+ │ rocky-observe       structured logging, metrics, events       │
+ │ rocky-verify        offline verifier for rocky-manifest v0.1  │
+ │ rocky-catalog-core  Iceberg REST / Unity / Polaris / Nessie   │
+ │ rocky-wasm          WASM bindings for the compiler pipeline   │
+ └───────────────────────────────────────────────────────────────┘
 ```
 
 **The chain:** CLI command → compile config + models → produce IR → topological sort → generate SQL per adapter → execute against warehouse → update state store.
@@ -109,7 +131,7 @@ Rocky's engine is a 23-crate Rust workspace. Each crate has one job.
 
 ## 4. The Intermediate Representation (IR)
 
-The IR (`ModelIr`) is Rocky's internal "recipe card" for a single model. It's produced by the compiler and consumed by the SQL generator. Neither the compiler nor the SQL generator knows about the other — they just read and write IR.
+The [IR](https://rocky-data.dev/reference/glossary/) (`ModelIr`) is Rocky's internal "recipe card" for a single model. The compiler produces it. The SQL generator consumes it. Neither knows about the other. They only read and write IR.
 
 ```
 ModelIr (one per model)
@@ -146,7 +168,7 @@ raw_customers ──▶ orders_with_customers ──▶ orders_summary
 raw_products ──▶ product_stats ──────────────────▶│
 ```
 
-Rocky runs a **topological sort** (Kahn's algorithm) to find the right execution order, then groups models into **execution layers** — models in the same layer can run in parallel.
+Rocky runs a **topological sort** (Kahn's algorithm) to find the right execution order. It then groups models into **execution layers**. Models in the same layer can run in parallel.
 
 ```
 Layer 0 (no deps, run in parallel):
@@ -167,7 +189,7 @@ If there's a cycle (A depends on B depends on A), Rocky reports it clearly and s
 
 ## 6. The Compiler: Catching Bugs Before They Run
 
-The compiler is a 9-stage pipeline. It reads your models and produces a typed project description plus any diagnostics (errors/warnings).
+The compiler is a 10-stage pipeline. It reads your models. It produces a typed project description plus any diagnostics (errors and warnings).
 
 ```
 Stage 1: Load + resolve project
@@ -195,10 +217,14 @@ Stage 6: Classification-tag completeness (W004)
 Stage 7: Freshness coverage (W005)
   Warn on a model with temporal columns but no freshness block in scope
          ↓
-Stage 8: Merge diagnostics
+Stage 8: Managed-Iceberg format_options (E035)
+  Reject format_options the warehouse rejects at execution time,
+  so the error lands at compile time and names the bad option
+         ↓
+Stage 9: Merge diagnostics
   Collect all errors + warnings into a single list
          ↓
-Stage 9: Assemble result
+Stage 10: Assemble result
   CompileResult { models, diagnostics, semantic_graph, timings }
 ```
 
@@ -215,11 +241,12 @@ error[E011]: column 'id' type mismatch
 
 Every diagnostic has: `code`, `severity` (Error/Warning/Info), `message`, `span` (file + line + col), `model`, and `suggestion`.
 
-**Key codes** (the full set spans E001–E033, W001–W012, P001–P002):
+The full set spans E001–E036, W001–W031, P001–P002, and I001–I002. Those ranges have gaps, so not every number in them is in use. The codes you meet most often:
 - `E001` — Type-checking error (unresolved reference, type mismatch)
 - `E010`–`E013` — Contract violations (missing / retyped / nullability / protected-column removed)
 - `E020`–`E027` — Time-interval placeholders and budget ceiling
 - `E030` / `E033` — Cross-team import-contract violations
+- `E035` — Managed-Iceberg `format_options` the warehouse would reject
 - `W001`–`W012` — Warnings (unused model, duplicate column, classification + freshness gaps, …)
 - `P001` / `P002` — Dialect-portability and blast-radius lints
 
@@ -227,14 +254,17 @@ Every diagnostic has: `code`, `severity` (Error/Warning/Info), `message`, `span`
 
 ## 7. Adapters: Talking to Different Warehouses
 
-Rocky separates *what to do* (IR) from *how to talk to a specific warehouse* (adapters). There are three adapter types:
+Rocky separates *what to do* (the IR) from *how to talk to a specific warehouse* (the adapter). Adapters fall into two families. Source adapters answer "what tables exist?" Warehouse adapters run the SQL.
 
 ```
 SOURCE ADAPTERS (discovery only — "what exists?")
 ─────────────────────────────────────────────────
-Fivetran REST API ──▶ rocky-fivetran ──▶ list of tables
-DuckDB info_schema ─▶ rocky-duckdb  ──▶ list of tables
-Manual rocky.toml  ─▶ (built-in)   ──▶ list of tables
+Fivetran REST API    ──▶ rocky-fivetran ──▶ list of tables
+Airbyte Config API   ──▶ rocky-airbyte  ──▶ list of tables
+Iceberg REST Catalog ──▶ rocky-iceberg  ──▶ list of tables
+DuckDB info_schema   ──▶ rocky-duckdb   ──▶ list of tables
+BigQuery info_schema ──▶ rocky-bigquery ──▶ list of tables
+Manual rocky.toml    ──▶ (built-in)     ──▶ list of tables
 
 No data is extracted. The data is already in the warehouse.
 Source adapters only find out what's there.
@@ -249,6 +279,8 @@ rocky-core (SQL gen) ──▶ rocky-databricks ──▶ Databricks SQL API
                      ──▶ rocky-trino      ──▶ Trino /v1/statement
 ```
 
+Both families implement traits that `rocky-core` defines: `WarehouseAdapter`, `SqlDialect`, `DiscoveryAdapter`, `GovernanceAdapter`, `BatchCheckAdapter`, and `TypeMapper`. The `rocky-adapter-sdk` crate mirrors those traits for adapters built outside this repo. One crate can implement several traits. `rocky-duckdb` is both a source adapter and a warehouse adapter.
+
 Each warehouse adapter implements the `WarehouseAdapter` trait:
 - `execute_statement(sql)` — run DDL/DML
 - `execute_query(sql)` — run a SELECT and get rows back
@@ -262,16 +294,21 @@ Each warehouse adapter implements the `WarehouseAdapter` trait:
 Same operation:          Databricks:              Snowflake:
 ─────────────────        ──────────────────────   ─────────────────────
 Upsert rows      →       MERGE INTO t USING ...   MERGE INTO t USING ...
-                         WHEN MATCHED THEN         (same, but different
-                         UPDATE SET ...            IDENTIFIER quoting)
+                         WHEN MATCHED THEN        (same, but different
+                         UPDATE SET ...           IDENTIFIER quoting)
 
-Create partition →       INSERT OVERWRITE          Not supported natively;
--keyed table             PARTITION(dt='2024-01')   Rocky uses DELETE+INSERT
+Create partition →       INSERT OVERWRITE         Not supported natively;
+-keyed table             PARTITION(dt='2024-01')  Rocky uses DELETE+INSERT
 
-Materialized view →      CREATE OR REPLACE          CREATE OR REPLACE
-                         MATERIALIZED VIEW          DYNAMIC TABLE
-                                                    TARGET_LAG = '1 hour'
+Materialized     →       CREATE OR REPLACE        CREATE OR REPLACE
+view strategy            MATERIALIZED VIEW        MATERIALIZED VIEW
+
+Dynamic table    →       not supported;           CREATE OR REPLACE
+strategy                 SQL generation           DYNAMIC TABLE
+                         returns an error         TARGET_LAG = '1 hour'
 ```
+
+`materialized_view` and `dynamic_table` are two separate strategies. Databricks, Snowflake, and BigQuery support `materialized_view`, and all three emit `CREATE OR REPLACE MATERIALIZED VIEW`. DuckDB and Trino return a "not supported" error when Rocky generates the SQL. Only Snowflake supports `dynamic_table`. It needs a `target_lag` value, such as `"1 minute"` or `"downstream"`.
 
 ---
 
@@ -322,7 +359,9 @@ redb state file
      check_history, dag_snapshots, … — same file, one table each)
 ```
 
-**Watermarks** answer "where did I leave off?" The watermark is read *from the target table* (not the source), using `SELECT MAX(updated_at) FROM target.orders_summary`. Reading from the target prevents a race condition: if the source gets new data while we're running, we don't accidentally move the watermark past data we haven't processed.
+A **watermark** is the timestamp of the newest row Rocky has already loaded. It answers "where did I leave off?" Rocky keeps the value in the state store. It reads the value from there before it generates SQL, and uses it as a literal in the WHERE clause. After a successful load, Rocky computes the new value *from the target table*, using `SELECT MAX(updated_at) FROM target.orders_summary`.
+
+Computing the new value from the target, rather than the source, prevents a race. New rows can land in the source while a run is in flight. The target holds only what Rocky actually wrote, so the watermark never moves past unprocessed data.
 
 **run_progress_entries + idempotency_keys** make runs resumable. If a run is interrupted, Rocky can skip the models that already completed. `rocky run --resume-latest` uses this.
 
@@ -357,12 +396,12 @@ Step 6: For each model in each layer (in parallel within layer):
       If a column type changed unsafely → DROP + recreate target
       If a column was added → ALTER TABLE ADD COLUMN
 
-  6b. Skip-unchanged gate
-      blake3(model definition) == stored hash?
-      If yes AND no schema drift → SKIP this model entirely
+  6b. Skip-unchanged gate (off by default — see section 14)
+      When on, a model that passes every clause is skipped
+      and no SQL is sent for it
 
-  6c. Read watermark (incremental only)
-      SELECT MAX(ts_col) FROM target_table
+  6c. Read the prior watermark (incremental only)
+      Read it from the state store; it bounds the WHERE clause
 
   6d. Generate SQL
       ir + dialect + watermark → SQL string
@@ -373,12 +412,14 @@ Step 6: For each model in each layer (in parallel within layer):
   6f. Run quality checks
       SELECT COUNT(*) ... (row count, null rate, custom assertions)
 
-  6g. Defer watermark write
-      Don't write yet — wait until the whole layer succeeds
+  6g. Queue the watermark write
+      New value = SELECT MAX(ts_col) FROM target_table
+      A table queues it only when it succeeded.
+      A failed table queues nothing.
 
-Step 7: Commit watermarks (batch, after layer completes)
-  Write all watermarks for the layer in one transaction
-  (If any model failed, no watermarks are committed for that layer)
+Step 7: Commit the queued watermarks (one batch)
+  Write every queued watermark in one transaction.
+  A sibling's failure does not hold back a successful table.
 
 Step 8: Fire post-run hooks
   Shell commands or webhooks on "pipeline_complete" / "pipeline_error" events
@@ -388,7 +429,7 @@ Step 9: Emit JSON output
   Exit code 0 (all good) or 2 (partial success — some tables failed)
 ```
 
-The key insight in step 6g: watermarks are committed *after* the layer succeeds, not after each individual model. This means if two models in the same layer both run, but one fails, neither gets its watermark committed. Safe to re-run.
+The rule in step 6g is per table, not per layer. Rocky commits a watermark only for a table that succeeded. A failed table never queues one, so it keeps its old watermark and re-reads the same rows next time. A sibling's failure does not hold back a successful table's watermark. Holding it back would be the unsafe choice: the next run would load that table's rows a second time.
 
 ---
 
@@ -397,25 +438,26 @@ The key insight in step 6g: watermarks are committed *after* the layer succeeds,
 Most production tables are too big to rebuild from scratch every time. Incremental loads solve this by only processing *new* rows.
 
 ```
-First run (watermark = null):
-─────────────────────────────
-SELECT * FROM source.orders
-WHERE updated_at > NULL          ← null means "everything"
-INSERT INTO target.orders_summary ...
+First run (no target table, no prior watermark):
+────────────────────────────────────────────────
+CREATE TABLE target.orders_summary AS
+SELECT * FROM source.orders      ← no watermark filter at all
 
 State store: watermarks["orders_summary"] = "2024-01-10 23:59:59"
-
+                                            (MAX(updated_at) in the target)
 
 Second run (watermark = "2024-01-10 23:59:59"):
 ────────────────────────────────────────────────
+INSERT INTO target.orders_summary
 SELECT * FROM source.orders
 WHERE updated_at > '2024-01-10 23:59:59'  ← only new rows
-INSERT INTO target.orders_summary ...
 
 State store: watermarks["orders_summary"] = "2024-01-15 08:22:11"
 ```
 
-**Why read the watermark from the target, not the state store?**
+Rocky does a full refresh when the target table is missing, or when an incremental model has no prior watermark. It does not compare a timestamp against NULL. In SQL, `updated_at > NULL` evaluates to UNKNOWN, so such a filter would return no rows, not every row.
+
+**Why compute the new watermark from the target, not the source?**
 
 ```
 Race condition scenario (if you read from source):
@@ -467,15 +509,29 @@ CLI flags for time-interval models:
 
 ## 13. SCD-2 Snapshots (Slowly Changing Dimensions)
 
-Sometimes you want to track *history* — not just the current state, but every change over time. Rocky's snapshot strategy implements SCD Type 2 automatically.
+Sometimes you want to track *history*: not just the current state, but every change over time. A snapshot pipeline (`type = "snapshot"`, run with `rocky snapshot`) does this. It implements SCD Type 2 with a history-preserving MERGE. A snapshot is a pipeline type, not a materialization strategy.
 
 ```
-Source table (current state):          Target table (history):
-─────────────────────────────          ─────────────────────────────────────
-customer_id │ name    │ tier           customer_id │ name    │ tier   │ valid_from          │ valid_to            │ is_current │ snapshot_id
-────────────┼─────────┼────────        ────────────┼─────────┼────────┼─────────────────────┼─────────────────────┼────────────┼─────────────
-42          │ Alice   │ Gold           42          │ Alice   │ Silver │ 2024-01-01 00:00:00 │ 2024-06-01 00:00:00 │ false      │ abc123
-                                       42          │ Alice   │ Gold   │ 2024-06-01 00:00:00 │ 9999-12-31          │ true       │ def456
+SOURCE TABLE — current state only
+────────────┬───────┬──────
+customer_id │ name  │ tier
+────────────┼───────┼──────
+         42 │ Alice │ Gold
+
+              │ rocky snapshot
+              ▼
+
+TARGET TABLE — one row per version, with a validity window
+────────────┬───────┬────────┬────────────┬────────────┬────────────
+customer_id │ name  │ tier   │ valid_from │ valid_to   │ is_current
+────────────┼───────┼────────┼────────────┼────────────┼────────────
+         42 │ Alice │ Silver │ 2024-01-01 │ 2024-06-01 │ false
+         42 │ Alice │ Gold   │ 2024-06-01 │ NULL       │ true
+
+Each target row also carries a snapshot_id (abc123 for the closed
+row, def456 for the current one). valid_from and valid_to hold full
+timestamps; the dates above are shortened to fit. A current row's
+valid_to is NULL.
 ```
 
 When a row changes (Alice went from Silver → Gold), Rocky:
@@ -491,24 +547,42 @@ The change detection uses `IS DISTINCT FROM` (NULL-safe comparison) on the key c
 
 ## 14. The Skip-Unchanged Gate
 
-If a model's definition hasn't changed and the source schema hasn't changed, Rocky skips it entirely — no SQL sent to the warehouse.
+The gate lets `rocky run` skip a model when its logic and its upstream data both look unchanged. Rocky then sends no SQL to the warehouse for that model.
+
+The gate is off by default. Turn it on with `skip_unchanged = true` under `[run]` in `rocky.toml`, or with `--skip-unchanged` for a single run. With neither set, every selected model builds.
 
 ```
-Every run:
-───────────────────────────────────────────────────────────────────
-Compute blake3(normalize(SQL) + typed_columns + strategy + config)
-                    ↓
-Compare with stored hash in state store
-                    ↓
-  Same hash?              Different hash?
-      │                         │
-      ▼                         ▼
-  SKIP (no SQL run)       Run the model, store new hash
+Gate on, for each selected model:
+──────────────────────────────────────────────────────────
+Is the model eligible?            no ──▶ BUILD
+  plain strategy, deterministic
+  SQL, not [skip] eligible = false
+      │ yes
+      ▼
+Can Rocky list its upstreams?     no ──▶ BUILD
+      │ yes
+      ▼
+Did the last build succeed?       no ──▶ BUILD
+      │ yes
+      ▼
+Same logic hash as that build?    no ──▶ BUILD
+  blake3(normalize(SQL) + typed
+  columns + strategy + config)
+      │ yes
+      ▼
+Every upstream unchanged?         no ──▶ BUILD
+      │ yes
+      ▼
+    SKIP (no SQL sent)
 ```
 
-**Normalization matters:** `SELECT a,b` and `SELECT a, b` (extra space) would hash differently without normalization. Rocky normalizes whitespace and sorts order-independent clauses before hashing.
+Every clause must pass. The first one that fails builds the model, and Rocky records which clause it was.
 
-**Fail-safe:** If the SQL contains non-deterministic functions (`RAND()`, `NOW()`, `UUID()`), Rocky marks it as *volatile* and never skips it. The list of volatile functions is a compile-time constant; any unknown function is assumed volatile (fail-safe).
+The gate is a best-effort optimization. It is not a promise that a rebuild would have produced the same rows. Two more cases always build. `--force-rebuild` rebuilds every selected model. Shadow runs and branch runs never skip, because they write to different targets.
+
+**Normalization matters:** `SELECT a,b` and `SELECT a, b` (extra space) would hash differently without normalization. Rocky re-parses the SQL and re-emits it in a canonical form. That collapses whitespace, drops comments, and makes keyword case irrelevant. It also renames internal table and CTE aliases to positional tokens, so `orders AS a` and `orders AS b` produce the same hash. The normalizer does not reorder clauses, and it leaves output column aliases alone. It errs toward treating two queries as different. A missed match costs one extra rebuild. A wrong match would skip a model that really changed.
+
+**Fail-safe:** If the SQL contains a non-deterministic function (`RAND()`, `NOW()`, `UUID()`), Rocky treats the model as *volatile* and builds it. The list of volatile functions is a compile-time constant. Any function that is not on the known-pure allowlist is assumed volatile. A `LIMIT` with no `ORDER BY` is also treated as volatile, because the rows it returns are not fixed. The model's owner can override the scan with `deterministic = true` under `[skip]` in the model's sidecar TOML. That is the only way a flagged model becomes skip-eligible.
 
 ---
 
@@ -555,24 +629,28 @@ The breaking-change classifier lives in `rocky-core` (consumed by `rocky review`
 
 ## 16. Data Contracts
 
-A data contract is a promise about what a model will always contain. Other teams can depend on this promise.
+A [data contract](https://rocky-data.dev/reference/glossary/) is a promise about what a model will always contain. Other teams can depend on this promise.
+
+A contract is a TOML file named `{model_name}.contract.toml`. Rocky reads it from the contracts directory, or from next to the model's `.sql` file. It has two sections: `[[columns]]` and `[rules]`.
 
 ```
 contracts/orders_summary.contract.toml
 ───────────────────────────────────────
-[required]
-columns = ["order_id", "total"]    # These must always exist
+[[columns]]
+name = "order_id"
+type = "Int64"          # E011 if the model produces another type
+nullable = false        # E012 if the model can produce NULL
 
-[required.types]
-order_id = "Int64"                 # And must be these types
-total    = "Decimal"
+[[columns]]
+name = "total"
+type = "Decimal"
 
-[protected]
-columns = ["order_id"]             # This column can never be removed
-
-[allowed_type_changes]
-total = ["Int64 → Decimal"]        # Widening is OK; narrowing is not
+[rules]
+required  = ["order_id", "total"]   # E010 if missing from the output
+protected = ["order_id"]            # E013 if removed
 ```
+
+Use these exact key names. Rocky ignores a key it does not recognise, and both sections default to empty. A contract file with the wrong key names still parses, and it then checks nothing at all. The `[rules]` block also accepts `no_new_nullable`. The compiler parses that key, but it does not check it yet.
 
 At compile time, Rocky checks every model against its contract:
 
@@ -580,9 +658,9 @@ At compile time, Rocky checks every model against its contract:
 Compile time check:
 ───────────────────
 orders_summary outputs: { order_id: String, total: Decimal }
-contract requires:       { order_id: Int64,  total: Decimal }
+contract expects:       { order_id: Int64,  total: Decimal }
 
-E011: column 'order_id' type mismatch
+E011: column 'order_id' type mismatch:
       contract expects Int64, got String
       → compilation fails
 ```
@@ -591,7 +669,14 @@ The "validate → promote" workflow:
 ```
 Staging model (no contract) → validate shape → promote to prod (contract enforced)
 ```
-Once a model has a contract, any PR that breaks it fails at compile time — no warehouse run needed.
+Once a model has a contract, a PR that breaks it fails at compile time. No warehouse run is needed. Four things fail the compile:
+
+- a missing `required` column (E010)
+- a wrong type (E011)
+- a nullable column that the contract declares `nullable = false` (E012)
+- a removed `protected` column (E013)
+
+One case only warns. A column can appear under `[[columns]]` but not under `required`. If the model then stops producing it, Rocky reports W010 and the compile still passes.
 
 ---
 
@@ -616,11 +701,13 @@ Output: "***"
 Use when: the value must never appear in any environment
 
 
-Strategy: Partial (first + last 2 chars)
-─────────────────────────────────────────
+Strategy: Partial (first 2 + *** + last 2 chars)
+─────────────────────────────────────────────────
 Input:  "alice@example.com"
-Output: "al...om"
+Output: "al***om"
 Use when: you need enough context to identify the column but not the real value
+Note: a value shorter than 5 characters becomes "***" instead, so a
+      short string is never left effectively unmasked
 
 
 Strategy: None
@@ -630,7 +717,11 @@ Output: "alice@example.com"
 Use when: this environment gets full access (e.g., prod)
 ```
 
-Masking generates actual SQL expressions applied at the column level — not application-level filtering, but warehouse-level column masking (using Dynamic Data Masking on Databricks/Snowflake, or a `CASE/WHEN` expression on DuckDB).
+Masking generates real SQL, not application-level filtering. Rocky has two masking surfaces, and only one of them persists in the warehouse.
+
+Databricks is the only adapter that installs a masking policy. Rocky creates a Unity Catalog function named `rocky_mask_<strategy>_<env>` in the table's schema, then binds it to the column. The mask then applies to every reader of that table. Rocky namespaces the function by environment, so a `prod` policy does not overwrite a `dev` one.
+
+The second surface is preview only. `rocky preview rows` wraps a classified column in a masking expression, so a preview shows the value the masked target would show. Rocky can build that expression for Databricks, Snowflake, and DuckDB. For BigQuery and Trino it refuses to show the column instead, rather than return an unmasked value.
 
 ---
 
@@ -660,8 +751,13 @@ on = ["catalog.analytics.*"]
 
 ```
 analyst:         { SELECT on analytics.* }
-senior_analyst:  { SELECT on analytics.* } ∪ { INSERT on analytics.staging.* }
-lead:            { SELECT on analytics.* } ∪ { INSERT on analytics.staging.* } ∪ { CREATE, DROP on analytics.* }
+
+senior_analyst:  { SELECT on analytics.* }
+               ∪ { INSERT on analytics.staging.* }
+
+lead:            { SELECT on analytics.* }
+               ∪ { INSERT on analytics.staging.* }
+               ∪ { CREATE, DROP on analytics.* }
 ```
 
 **Reconciliation (desired vs current):**
@@ -682,10 +778,21 @@ Rocky only touches the minimum delta — it never rebuilds all grants from scrat
 
 ## 19. The VS Code Extension and LSP
 
-Rocky ships a Language Server Protocol (LSP) server (`rocky lsp`). VS Code's Rocky extension spawns it as a child process and communicates over stdio.
+Rocky ships a Language Server Protocol (LSP) server. LSP is the protocol an editor uses to ask a language tool for types, errors, and completions. VS Code's Rocky extension spawns the server as a child process and talks to it over stdio.
+
+The extension prefers the standalone `rocky-lsp` binary, which is smaller and starts faster. It falls back to `rocky lsp` when `rocky-lsp` is not installed.
 
 ```
-VS Code                              rocky lsp (child process)
+ extension                                 which server binary?
+ ─────────                                 ────────────────────
+ rocky.server.path is a full path ───────▶ rocky-lsp in the same
+                                           directory, if present
+ rocky.server.path is "rocky"     ───────▶ rocky-lsp on PATH
+ neither resolves                 ───────▶ rocky lsp  (fallback)
+```
+
+```
+VS Code                              language server (child process)
 ──────────────────────────────       ──────────────────────────────────
 User opens orders.sql
   → extension sends: textDocument/didOpen
@@ -716,7 +823,7 @@ Tooltip appears ←
 - Find references: all places a model is used
 - Rename symbol: rename a model everywhere at once
 - Completion: suggest column names and model names as you type
-- Inline diagnostics: red/yellow squiggles for E001-E033, W001-W012
+- Inline diagnostics: red/yellow squiggles for the E, W, P, and I codes
 - Inlay hints: show inferred types inline next to expressions
 - Semantic tokens: syntax highlighting that understands your schema
 - Code actions: "quick fix" suggestions from diagnostic hints
@@ -727,7 +834,7 @@ The extension also adds custom commands: "Preview SQL" (runs `rocky plan`), "Vie
 
 ## 20. The Rocky DSL
 
-Rocky supports a higher-level DSL for people who prefer it over raw SQL. It's a pipeline-oriented syntax that compiles down to SQL.
+Rocky supports a higher-level DSL for people who prefer it over raw SQL. It is a pipeline-oriented syntax that compiles down to SQL. It is an option, not a replacement. A `.rocky` model and a `.sql` model live in the same models directory and feed the same compiler.
 
 ```
 File: models/orders_summary.rocky
@@ -826,7 +933,7 @@ This mode lets Rocky report asset-level metadata
 directly into the Dagster asset catalog.
 ```
 
-**Exit code handling:** Rocky exits with code 2 on partial success (some models ran fine, some failed). Dagster integration explicitly handles this with `allow_partial=True` — it reads the JSON output to see which assets succeeded/failed rather than treating the exit code as a binary pass/fail.
+**Exit code handling:** Rocky exits with code 2 on partial success. Some models ran fine, some failed. The Dagster integration handles this with `allow_partial=True`. It reads the JSON output to see which assets succeeded and which failed, instead of treating the exit code as pass or fail.
 
 ---
 
@@ -840,12 +947,12 @@ from rocky_sdk import RockyClient
 client = RockyClient(config_path="rocky.toml")
 
 # Each method maps to a CLI command:
-result = client.run(filter={"source": "shopify"})
-print(result.tables_copied)   # typed Pydantic model
+result = client.run("source=shopify")   # one key=value filter, same as --filter
+print(result.tables_copied)             # typed Pydantic model
 
 discovery = client.discover()
-for connector in discovery.connectors:
-    print(connector.id, connector.tables)
+for source in discovery.sources:
+    print(source.id, source.tables)
 ```
 
 **Under the hood — the 3-thread subprocess model:**
@@ -862,14 +969,20 @@ client.run(...)
     reads stderr line by line
     logs to Python logger
   → start watchdog:
-    kills subprocess if
-    no progress for 30s
+    kills the process group
+    once the wall-clock
+    budget runs out
+    (default 3600s)
   → join all threads
-  → parse JSON → RunOutput (Pydantic)
+  → parse JSON → RunResult (Pydantic)
   → return typed result
 ```
 
-All 60+ output types (`RunOutput`, `DiscoverOutput`, `CompileOutput`, etc.) are Pydantic v2 models auto-generated from Rocky's Rust JSON schemas. When a Rust `*Output` struct changes, `just codegen` regenerates the Pydantic models. You always get the right shape.
+The watchdog measures wall-clock time, not progress. It does not restart the clock when the subprocess prints a line. Pass `timeout_seconds` to override the budget for one call, or set it on the client for every call.
+
+Most output types are Pydantic v2 models generated from Rocky's Rust JSON schemas. When a Rust `*Output` struct changes, `just codegen` regenerates them. A CI job called `codegen-drift` fails the build if the committed models no longer match the schemas.
+
+The SDK carries two naming conventions, and it helps to know which you are holding. The generated classes keep the Rust struct names (`RunOutput`, `DiscoverOutput`). The hand-written classes use Python-flavored names (`RunResult`, `DiscoverResult`) and are the public API. `client.run()` returns a `RunResult`.
 
 ---
 
@@ -980,7 +1093,7 @@ Rocky run complete ✓
   Models skipped: 3 (unchanged)
 ```
 
-Hooks receive a context payload (rendered into command args and webhook templates via `{{var}}` placeholders) carrying the run and model details — `run_id`, the model/table, error info, timings, and the active environment.
+Every hook receives a context payload. Rocky renders it into command arguments and webhook templates through `{{var}}` placeholders. The payload carries the `run_id`, the model or table, error details, timings, and the active environment.
 
 ---
 
@@ -993,13 +1106,13 @@ Everything Rocky does, in one ASCII map:
  ─────────                 ───────────────            ──────────────
 
  rocky.toml                ┌─────────────┐
- (config)     ──────────▶  │  Config +   │
-                           │  Discovery  │ ◀── Fivetran API / DuckDB info_schema
- models/*.sql              └──────┬──────┘
+ (config)     ──────────▶  │  Config +   │  ◀── source adapters: Fivetran,
+                           │  Discovery  │      Airbyte, Iceberg, DuckDB,
+ models/*.sql              └──────┬──────┘      BigQuery, manual
  models/*.toml ──────────▶        │
                            ┌──────▼──────┐
- contracts/*.toml ───────▶ │  Compiler   │ ── diagnostics (E001–E033, W001–W012)
-                           │  9 stages   │    ↓ errors → stop here
+ contracts/*.toml ───────▶ │  Compiler   │ ── diagnostics (E / W / P / I codes)
+                           │  10 stages  │    ↓ errors → stop here
                            └──────┬──────┘    ↓ clean → continue
                                   │
                            ┌──────▼──────┐
@@ -1026,6 +1139,7 @@ Everything Rocky does, in one ASCII map:
                            ┌──────▼──────┐
               Databricks ◀─┤ Warehouse   ├─▶ Snowflake
               DuckDB     ◀─┤ Adapter     ├─▶ BigQuery
+                           │             ├─▶ Trino
                            └──────┬──────┘
                                   │
                            ┌──────▼──────┐
@@ -1044,17 +1158,20 @@ Everything Rocky does, in one ASCII map:
  ─────────────────────────────────
  Column lineage ──▶ rocky lineage <model> [--column <col>]
  Cost model     ──▶ rocky optimize
- Schema drift   ──▶ rocky drift
+ Schema drift   ──▶ no separate command — drift detection is a step of
+                    rocky run; read the `drift` field on its JSON output
  Health checks  ──▶ rocky doctor
  Run history    ──▶ rocky history [--model <name>]
  Metrics        ──▶ rocky metrics <model>
- Unit tests     ──▶ rocky test --models models/  (runs [[test]] fixtures on DuckDB)
+ Unit tests     ──▶ rocky test --models models/
+                    ↳ runs [[test]] fixtures on DuckDB
 
 
  EXIT PATH (never a one-way door):
  ─────────────────────────────────
  Render SQL     ──▶ rocky emit-sql --models models/ [--out-dir sql/]
-                    ↳ dialect-correct SQL you can run by hand or hand to a hand-SQL / dbt Core fallback
+                    ↳ dialect-correct SQL you can run by hand or move
+                      into any other tool
 
 
  INTEGRATIONS:
@@ -1065,7 +1182,7 @@ Everything Rocky does, in one ASCII map:
  Python  ──▶ RockyClient (3-thread subprocess: stdout + stderr + watchdog)
              ↳ Typed Pydantic results auto-generated from Rust schemas
 
- VS Code ──▶ rocky lsp (child process over stdio)
+ VS Code ──▶ rocky-lsp, else rocky lsp (child process over stdio)
              ↳ hover types, diagnostics, completion, go-to-def, rename
 
 
@@ -1073,7 +1190,8 @@ Everything Rocky does, in one ASCII map:
  ─────────────
  AI plans:   propose → review (breaking-change classifier) → human approve → apply
  Contracts:  staging → validate types/columns → promote to prod
- SQL safety: all identifiers validated via regex before interpolation (no SQL injection)
+ SQL safety: every identifier is regex-validated before interpolation
+             (no SQL injection)
  Watermarks: read from target (not source) to prevent TOCTOU race
  Skips:      volatile functions (RAND, NOW, UUID) are never skipped — fail-safe
 ```
@@ -1097,7 +1215,7 @@ unique_key = ["id"]                       # schema comes from the group
 domain = "finance"                        region = "emea"   → schema "mart_emea"
 ```
 
-The group supplies a `schema_template`, a `strategy`, and `[tags]`. Each member fills the template's `{placeholder}`s from its own `[args]`. Resolution precedence is **per-model sidecar > group > `_defaults.toml`**: a model can pin its own schema or strategy to override the group, and the group in turn overrides directory defaults.
+The group supplies a `schema_template`, a `strategy`, and `[tags]`. Each member fills the template's `{placeholder}`s from its own `[args]`. Resolution precedence is **per-model sidecar > group > `_defaults.toml`**. A model can pin its own schema or strategy to override the group. The group in turn overrides directory defaults.
 
 **`enforce` turns a default into a guardrail.** By default a group is overridable. Set `enforce = true` and a member that locally pins a field the group controls (its target `schema` or its `strategy`) fails the load:
 
@@ -1107,7 +1225,7 @@ error: model 'fct_orders_emea' overrides 'target.schema', which its enforced
        group's enforce = false
 ```
 
-This is a compile-time governance check, not a runtime convention. A model in an enforced group cannot quietly route or materialize itself differently from the rest of the fan-out. A misfilled template (a `{region}` no model supplied, or an `[args]` value that isn't a valid SQL identifier) also fails the load rather than routing a model to the wrong place.
+This is a compile-time governance check, not a runtime convention. A model in an enforced group cannot quietly route or materialize itself differently from the rest of the fan-out. A misfilled template also fails the load rather than routing a model to the wrong place. Two cases count as misfilled: a `{region}` no model supplied, and an `[args]` value that is not a valid SQL identifier.
 
 ---
 
@@ -1135,7 +1253,7 @@ values = ["pending", "shipped"]           column = "order_status"  # bind here
 column = "status"
 ```
 
-A `[[use_test]]` reference resolves into an ordinary assertion at load and is appended to the model's inline `[[tests]]`. An unknown name fails the load; so does a mistyped key in the block, so a `colum =` typo never silently applies the test to the wrong column.
+A `[[use_test]]` reference resolves into an ordinary assertion at load. Rocky appends it to the model's inline `[[tests]]`. An unknown name fails the load. So does a mistyped key in the block, so a `colum =` typo never silently applies the test to the wrong column.
 
 **Unit tests (`[[test]]`)** check the model's SQL logic against inputs you write by hand. The block seeds mock upstream tables, runs the model SQL on an in-memory DuckDB, and compares the result to an expected row set. No warehouse needed.
 
@@ -1174,11 +1292,11 @@ tier = "gold"
 owner = "data-eng"
 ```
 
-Tags compose with config groups: a model inherits its group's `[tags]` as a shared baseline, and its own `[tags]` override per key (sidecar > group) without dropping the rest. One `domain = "finance"` on the group tags the whole fan-out.
+Tags compose with config groups. A model inherits its group's `[tags]` as a shared baseline. Its own `[tags]` override per key (sidecar > group) without dropping the rest. One `domain = "finance"` on the group tags the whole fan-out.
 
 Resolved tags land on `rocky compile --output json` as `models_detail[].tags`, and the `dagster-rocky` integration projects them onto each derived asset's Dagster tags. The same attribute drives both Rocky's view of the model and the orchestrator's, so a governed fan-out is visible end-to-end.
 
-**Per-column docs.** A `[columns.<name>]` table attaches a one-line description to an output column. Those descriptions surface in `rocky catalog --output json` as each asset's `CatalogColumn.description`. They do **not** appear in the `rocky docs` HTML catalog, which has no warehouse connection to introspect the column list; column descriptions reach consumers through `rocky catalog`, not the generated HTML.
+**Per-column docs.** A `[columns.<name>]` table attaches a one-line description to an output column. Those descriptions surface in `rocky catalog --output json` as each asset's `CatalogColumn.description`. They do **not** appear in the `rocky docs` HTML catalog, which has no warehouse connection to introspect the column list. Column descriptions reach consumers through `rocky catalog`, not the generated HTML.
 
 ---
 
@@ -1190,12 +1308,12 @@ Resolved tags land on `rocky compile --output json` as `models_detail[].tags`, a
 | Type-check your models | `rocky compile --models models/` |
 | See what SQL will run | `rocky plan -c rocky.toml` |
 | Run the pipeline | `rocky run -c rocky.toml` |
-| Run only changed models | `rocky run -c rocky.toml --filter source=shopify` |
+| Run only the sources matching one `key=value` | `rocky run -c rocky.toml --filter source=shopify` |
 | Resume a failed run | `rocky run -c rocky.toml --resume-latest` |
 | Run a single partition | `rocky run -c rocky.toml --partition 2024-01-15` |
 | Check watermark state | `rocky state -c rocky.toml` |
 | See run history | `rocky history` |
-| Check schema drift | `rocky drift -c rocky.toml` |
+| Check schema drift | Read the `drift` field on `rocky run -c rocky.toml --output json` |
 | Get optimization suggestions | `rocky optimize -c rocky.toml` |
 | Trace column lineage | `rocky lineage orders_summary --column total` |
 | Health check everything | `rocky doctor -c rocky.toml` |

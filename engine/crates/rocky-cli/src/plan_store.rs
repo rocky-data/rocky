@@ -56,6 +56,52 @@ use rocky_core::config::{PolicyCapability, PolicyPrincipal};
 use serde::{Deserialize, Serialize};
 
 /// The kind of plan — used to guard cross-apply mismatches.
+///
+/// # Which plan-time invariants survive a replay (#1325)
+///
+/// `rocky plan <verb>` persists a plan and `rocky apply <plan-id>` replays it.
+/// The plan is the *reviewed artifact*, so apply deliberately does not re-derive
+/// it. The rule that follows is narrower than it first looks:
+///
+/// > Payload **values** survive a replay. Any **invariant over** those values
+/// > must be re-evaluated explicitly at every apply sink, unless the sink
+/// > structurally cannot observe an invalid shape.
+///
+/// Persisting a value is not the same as replaying the check that validated it.
+/// `ReplicationPlan.config_snapshot` is the counterexample: it is written at
+/// plan time and no production apply-side code reads it, so a plan whose
+/// adapter or destination changed between plan and apply is not detected by it.
+/// Guards over *derived* state — discovery output, compiled models, live
+/// warehouse shape — are likewise only re-established where that derivation
+/// repeats at apply.
+///
+/// So when adding a plan-build-time check, ask *which entrypoints reach the
+/// line*, not whether the check is correct. That is how the duplicate
+/// physical-target refusal came to be absent from `branch promote --plan <id>`
+/// and `rocky apply <promote-plan>`: it sat inside discovery, which those
+/// paths never call (#1310). Such checks belong at the seam every entrypoint
+/// crosses.
+///
+/// Audited across all nine kinds. Two entries below record a gap rather than a
+/// guarantee; do not read this table as a certification.
+///
+/// | Kind | Load-bearing plan-time invariant | Re-established at apply? |
+/// |---|---|---|
+/// | `Run` | compile-time diagnostics | Yes — recompiles at apply |
+/// | `Promote` | duplicate physical target | **Was exposed**; now enforced at `run_promote_apply`, the shared seam (#1310) |
+/// | `Gc` | candidate is provably derivable | Yes — re-derives against the live store and takes derivability from the fresh candidate, never the payload; fail-closed on hash mismatch |
+/// | `Restore` | rebuilt bytes are hash-exact | Point-in-time only — the hash is verified *before* the ledger row is reinstated, and nothing fences the object between the two |
+/// | `Compact` / `Archive` | policy gate | Yes — the gate runs at apply; a denied apply never reaches `execute_statement` |
+/// | `Replication` | source state matches what was reviewed | **Partly — see #1460.** Apply discovers once for comparison, then `run` discovers again and builds work from the second result; `config_snapshot` has no production apply-side reader |
+/// | `AiAuthored` | human review before a machine-authored change executes | **No — see #1459.** The marker is only checked when policy is `NotConfigured`; a configured policy resolving to `Allow` reaches `apply_policy_gate`, which returns `Ok(())` without consulting it |
+/// | `Backfill` | reviewed closure + run-plan diagnostics | Yes for the closure — see the structural note on `run_apply_backfill_plan` |
+///
+/// `Backfill` is the one entry whose safety is **structural rather than
+/// enforced**: it deserializes the same `RunPlan` as `Run` and `AiAuthored` but
+/// does not call `validate_run_plan_execution_shape`. That is safe only because
+/// its apply path never reaches the DAG runner, and nothing enforces that it
+/// stays that way — the reasoning is written out at
+/// [`crate::commands::apply::run_apply_backfill_plan`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlanKind {
@@ -573,9 +619,9 @@ fn write_plan_inner<T: Serialize>(
     // (run/ai_authored); typed-IR compact/archive payloads never carry it.
     let payload_value = payload_with_capabilities(payload, capabilities)?;
 
-    // The authoring principal is part of the integrity digest (see
-    // `compute_plan_id`) so a later tamper of the stamped principal invalidates
-    // the id.
+    // The authoring principal is NOT part of the integrity digest (see
+    // `compute_plan_id`): it rides outside the hash as an advisory stamp, and
+    // enforcement evaluates the apply-time runtime principal instead.
     let plan_id = compute_plan_id(&kind, &payload_value);
 
     let record = PersistedPlan {
@@ -1446,6 +1492,105 @@ mod tests {
         let plan = read_plan(dir.path(), &plan_id)?;
         assert_eq!(plan.format_version, 1);
         assert_eq!(plan.kind, PlanKind::Compact);
+        Ok(())
+    }
+
+    /// Digest-stability golden (FF-WP1): a `RunPlan` that does not use the
+    /// optional product-identity fields must serialize to byte-identical JSON —
+    /// and therefore hash to the identical `plan_id` — as it did before those
+    /// fields existed. Every pre-existing plan id, and every id for a plan
+    /// authored without product identity, stays stable.
+    ///
+    /// The golden strings below were captured from the tree BEFORE the fields
+    /// were added (same literals, minus the two new `None`s). If this test
+    /// fails, a serialization-affecting change to `RunPlan` has broken plan-id
+    /// stability for existing plans — that is a release blocker, not a
+    /// fixture to refresh.
+    #[test]
+    fn run_plan_without_product_fields_keeps_legacy_bytes_and_plan_id() -> anyhow::Result<()> {
+        fn baseline() -> crate::output::RunPlan {
+            crate::output::RunPlan {
+                filter: None,
+                pipeline: None,
+                model: None,
+                branch: None,
+                partition: None,
+                partition_from: None,
+                partition_to: None,
+                latest: false,
+                missing: false,
+                lookback: None,
+                parallel: 1,
+                run_all: false,
+                env: None,
+                models_dir: None,
+                resume: None,
+                resume_latest: false,
+                shadow: false,
+                shadow_suffix: None,
+                shadow_schema: None,
+                dag: false,
+                idempotency_key: None,
+                governance_override: None,
+                models: Vec::new(),
+                execution_layers: Vec::new(),
+                product_id: None,
+                spec_digest: None,
+            }
+        }
+
+        const GOLDEN_MINIMAL_JSON: &str = "{\"latest\":false,\"missing\":false,\"parallel\":1,\
+             \"run_all\":false,\"resume_latest\":false,\"shadow\":false,\"dag\":false}";
+        const GOLDEN_MINIMAL_PLAN_ID: &str =
+            "e080be757638e10dfb65156f12342ee5b9b20f82b43468a37ffdd384949ec919";
+
+        let minimal = baseline();
+        assert_eq!(
+            serde_json::to_string(&minimal)?,
+            GOLDEN_MINIMAL_JSON,
+            "an unset-product RunPlan must serialize byte-identically to the pre-change shape"
+        );
+        let dir = tempfile::tempdir()?;
+        assert_eq!(
+            write_plan(dir.path(), PlanKind::Run, &minimal)?,
+            GOLDEN_MINIMAL_PLAN_ID,
+            "the plan_id over the legacy bytes must not move"
+        );
+
+        // A representative populated plan (model selection + informational
+        // model list — the shape `propose` writes) pins the field ordering
+        // around the insertion point too.
+        let populated = crate::output::RunPlan {
+            model: Some("orders".to_string()),
+            idempotency_key: Some("key-1".to_string()),
+            models: vec!["orders".to_string()],
+            execution_layers: vec![vec!["orders".to_string()]],
+            ..baseline()
+        };
+        const GOLDEN_POPULATED_JSON: &str = "{\"model\":\"orders\",\"latest\":false,\
+             \"missing\":false,\"parallel\":1,\"run_all\":false,\"resume_latest\":false,\
+             \"shadow\":false,\"dag\":false,\"idempotency_key\":\"key-1\",\
+             \"models\":[\"orders\"],\"execution_layers\":[[\"orders\"]]}";
+        const GOLDEN_POPULATED_PLAN_ID: &str =
+            "c193d5e0d41fd2b47197dec5f6b2c5e3b0e108a83d06b15a6c13583c96a31b77";
+        assert_eq!(serde_json::to_string(&populated)?, GOLDEN_POPULATED_JSON);
+        assert_eq!(
+            write_plan(dir.path(), PlanKind::Run, &populated)?,
+            GOLDEN_POPULATED_PLAN_ID,
+        );
+
+        // The discriminating half: SETTING the product fields must move the
+        // id — the hash binds the product identity, it does not ignore it.
+        let product_bound = crate::output::RunPlan {
+            product_id: Some("product:revenue_daily".to_string()),
+            spec_digest: Some("sha256:aaaa".to_string()),
+            ..baseline()
+        };
+        let bound_id = write_plan(dir.path(), PlanKind::Run, &product_bound)?;
+        assert_ne!(
+            bound_id, GOLDEN_MINIMAL_PLAN_ID,
+            "a product-bound plan must hash to a different id than its unbound twin"
+        );
         Ok(())
     }
 

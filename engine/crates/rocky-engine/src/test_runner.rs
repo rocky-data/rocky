@@ -49,6 +49,16 @@ pub struct TestResult {
     pub model_results: Vec<ModelTestResult>,
     /// Compilation diagnostics.
     pub diagnostics: Vec<rocky_compiler::diagnostic::Diagnostic>,
+    /// Every model the compile loaded, **pre-filter** — the only field here
+    /// that is not narrowed by `model_filter`.
+    ///
+    /// Exists so a caller can tell "the filter named a model that does not
+    /// exist" from "the filter matched a model with nothing to report": every
+    /// other field is post-filter, so both cases otherwise look like `total:
+    /// 0`. `rocky test --model <typo>` used to be indistinguishable from
+    /// `rocky test --model <a real model with no tests>` for exactly this
+    /// reason (#1428).
+    pub all_models: Vec<String>,
 }
 
 /// Run tests on a project.
@@ -85,6 +95,15 @@ pub fn run_tests(
         failures: Vec::new(),
         model_results: Vec::new(),
         diagnostics: compile_result.diagnostics.clone(),
+        // Captured before any filtering, and before the `has_errors` early
+        // return below, so an unknown `--model` is still detectable on a
+        // project that failed to compile.
+        all_models: compile_result
+            .project
+            .models
+            .iter()
+            .map(|m| m.config.name.clone())
+            .collect(),
     };
 
     // Check for compilation errors

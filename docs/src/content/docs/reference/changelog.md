@@ -5,7 +5,7 @@ sidebar:
   order: 8
 ---
 
-Rocky ships four artifacts on independent version numbers, so each keeps its own changelog. The canonical notes live in the repository and on the release pages below; this page just points you to them.
+Rocky ships four artifacts, each on its own version number, so each keeps its own changelog. The notes themselves live in the repository and on the release pages below. This page points you at them.
 
 ## The four artifacts
 
@@ -16,15 +16,24 @@ Rocky ships four artifacts on independent version numbers, so each keeps its own
 | `dagster-rocky` wheel | `dagster-v*` | [integrations/dagster/CHANGELOG.md](https://github.com/rocky-data/rocky/blob/main/integrations/dagster/CHANGELOG.md) | [PyPI](https://pypi.org/project/dagster-rocky/#history) |
 | Rocky VS Code extension | `vscode-v*` | [editors/vscode/CHANGELOG.md](https://github.com/rocky-data/rocky/blob/main/editors/vscode/CHANGELOG.md) | [Marketplace](https://marketplace.visualstudio.com/items?itemName=rocky-data.rocky) |
 
-Each changelog follows [Keep a Changelog](https://keepachangelog.com/) and the project uses [semantic versioning](https://semver.org/).
+Every changelog follows [Keep a Changelog](https://keepachangelog.com/), and the project uses [semantic versioning](https://semver.org/).
 
 ## Why four version numbers
 
-The CLI, the Python SDK, the Dagster integration, and the VS Code extension are released separately because they move at different speeds and depend on each other loosely. The SDK and the extension both call the `rocky` binary as a subprocess, and the Dagster integration is a thin adapter over the SDK, so a CLI release doesn't force a release of the others. Tagging `engine-v1.47.0` builds and publishes only the CLI; the SDK, Dagster, and extension releases work the same way under their own tags.
+The four artifacts move at different speeds and couple to each other loosely, so each ships on its own schedule. The SDK and the extension both call the `rocky` binary as a subprocess, and the Dagster integration is a thin adapter over the SDK. A CLI release therefore forces no release of the others.
+
+Tagging `engine-v1.47.0` builds and publishes the CLI alone. The SDK, Dagster, and extension releases work the same way under their own tags.
+
+```
+   engine-v*  ──►  rocky CLI binary        (GitHub Releases)
+   sdk-v*     ──►  rocky-sdk wheel         (PyPI)
+   dagster-v* ──►  dagster-rocky wheel     (PyPI)
+   vscode-v*  ──►  Rocky VSIX              (Marketplace)
+```
 
 ## Upgrading
 
-To upgrade the CLI to the latest release:
+Upgrade the CLI to the newest release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/rocky-data/rocky/main/engine/install.sh | bash

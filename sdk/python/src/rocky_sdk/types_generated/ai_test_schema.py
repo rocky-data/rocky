@@ -20,7 +20,7 @@ class AiTestModelResult(BaseModel):
 
 class AiTestOutput(BaseModel):
     """
-    JSON output for `rocky ai test`.
+    JSON output for `rocky ai-test`.
     """
 
     command: str

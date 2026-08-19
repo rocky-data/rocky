@@ -1,0 +1,137 @@
+{
+  "artifacts": {
+    "models/revenue_daily.contract.toml": "sha256:9ee6d468feaea622d994a4ec879e3faeeda27c8da783d51809c675a2d6a96854",
+    "models/revenue_daily.toml": "sha256:10fe4514859f94cc53411c102c850c0f9c97730aa701e85063ab4634a40eeb88"
+  },
+  "fields": {
+    "product.intent": {
+      "disposition": "artifact",
+      "locations": [
+        {
+          "detail": "intent (preserved when the draft carries one)",
+          "path": "models/revenue_daily.toml",
+          "phase": "B"
+        }
+      ],
+      "note": "delivered verbatim to the worker via the drafting brief (WP-3)"
+    },
+    "product.name": {
+      "disposition": "artifact",
+      "locations": [
+        {
+          "detail": "[tags] product",
+          "path": "models/revenue_daily.toml",
+          "phase": "B"
+        }
+      ],
+      "note": "also the identity input: product_id = 'product:revenue_daily'"
+    },
+    "product.output.checks": {
+      "disposition": "artifact",
+      "locations": [
+        {
+          "detail": "[[tests]] type=expression, severity=error",
+          "path": "models/revenue_daily.toml",
+          "phase": "B"
+        }
+      ],
+      "note": ""
+    },
+    "product.output.classifications": {
+      "disposition": "artifact",
+      "locations": [
+        {
+          "detail": "[classification] <column> = <tag>",
+          "path": "models/revenue_daily.toml",
+          "phase": "B"
+        }
+      ],
+      "note": "tag RESOLUTION is verified against [mask]/[classifications].allow_unmasked (spec-compile error, stricter than the engine's W004 warning); masking APPLICATION is warehouse-dependent \u2014 Databricks-only today"
+    },
+    "product.output.columns": {
+      "disposition": "artifact",
+      "locations": [
+        {
+          "detail": "[[columns]] {name, type, nullable}",
+          "path": "models/revenue_daily.contract.toml",
+          "phase": "A"
+        },
+        {
+          "detail": "[rules] required = [all listed columns]",
+          "path": "models/revenue_daily.contract.toml",
+          "phase": "A"
+        },
+        {
+          "detail": "[[tests]] not_null per nullable=false column",
+          "path": "models/revenue_daily.toml",
+          "phase": "B"
+        }
+      ],
+      "note": ""
+    },
+    "product.output.freshness": {
+      "disposition": "artifact",
+      "locations": [
+        {
+          "detail": "[freshness] expected_lag_seconds + time_column",
+          "path": "models/revenue_daily.toml",
+          "phase": "B"
+        }
+      ],
+      "note": "declared metadata plus runner observation \u2014 not an engine gate; severity is accepted for the runner's observation phase and NOT written to the sidecar (no engine path reads it; see the module docstring trace)"
+    },
+    "product.output.grain": {
+      "disposition": "artifact",
+      "locations": [
+        {
+          "detail": "[rules] required (grain \u2286 required)",
+          "path": "models/revenue_daily.contract.toml",
+          "phase": "A"
+        },
+        {
+          "detail": "[[tests]] type=composite kind=unique",
+          "path": "models/revenue_daily.toml",
+          "phase": "B"
+        }
+      ],
+      "note": "no first-class grain field exists in the engine \u2014 this fan-out is the lowering"
+    },
+    "product.output.model": {
+      "disposition": "artifact",
+      "locations": [
+        {
+          "detail": "file name (spec-owned, wholesale)",
+          "path": "models/revenue_daily.contract.toml",
+          "phase": "A"
+        },
+        {
+          "detail": "file name (metadata merged, agent content kept)",
+          "path": "models/revenue_daily.toml",
+          "phase": "B"
+        }
+      ],
+      "note": "names models/revenue_daily.sql too \u2014 agent-authored, never overwritten by lowering"
+    },
+    "product.source.tables": {
+      "disposition": "artifact",
+      "locations": [
+        {
+          "detail": "[[sources]] {catalog, schema, table}",
+          "path": "models/revenue_daily.toml",
+          "phase": "B"
+        }
+      ],
+      "note": "also the grounding list in the agent task brief (WP-3)"
+    },
+    "product.trust.agent": {
+      "disposition": "verified",
+      "locations": [],
+      "note": "verify, don't write (FF-DESIGN D5): the runtime never edits rocky.toml \u2014 the three-check posture verification ran before lowering"
+    }
+  },
+  "output_model": "revenue_daily",
+  "phase": "merged",
+  "product_id": "product:revenue_daily",
+  "spec_digest": "sha256:54df46b9278c1f265f64fd23203396ea69e68771197d5d0e5a7291cd6ffd82ff",
+  "spec_path": "products/revenue_daily.toml"
+}

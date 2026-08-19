@@ -1,0 +1,43 @@
+name: skills-mirror-drift
+
+# AGENTS.md requires .agents/skills/ and .claude/skills/ to stay byte-identical
+# (the same root task skills, discovered by different agent clients). If an
+# edit lands in one tree without the other, this workflow fails the PR.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.agents/skills/**'
+      - '.claude/skills/**'
+      - '.github/workflows/skills-mirror-drift.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.agents/skills/**'
+      - '.claude/skills/**'
+      - '.github/workflows/skills-mirror-drift.yml'
+
+# CI only reads the repo; restrict the token to the minimum (CodeQL ql-for-actions).
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Check the skill trees are byte-identical
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Diff .agents/skills against .claude/skills
+        run: |
+          if ! diff -r .agents/skills .claude/skills; then
+            echo ""
+            echo "❌ .agents/skills/ and .claude/skills/ have diverged."
+            echo "AGENTS.md requires the two trees to stay byte-identical."
+            echo "Apply the same edit to both trees (copy the changed file across) and commit."
+            exit 1
+          fi
+          echo "✓ Skill trees are byte-identical."

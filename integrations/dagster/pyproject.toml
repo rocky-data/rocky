@@ -1,6 +1,6 @@
 [project]
 name = "dagster-rocky"
-version = "1.61.1"
+version = "1.63.0"
 description = "Dagster integration for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -27,7 +27,14 @@ dependencies = [
     # freeze-marker and schedule/tick output types; an older SDK would be missing
     # them (and also the 0.8.3 `--models` forwarding + retention `env` guard fixes
     # the model-aware resource methods depend on).
-    "rocky-sdk>=0.9.1",
+    # 0.12.0 is the first release with `dag(models_dir=...)` and
+    # `run_model(pipeline=...)`. This resource passes both keywords
+    # unconditionally, so an older SDK — legal under the previous `>=0.9.1` —
+    # raises TypeError during DAG discovery and per-model execution. The
+    # monorepo path source masks that in dev and CI, so this floor is the only
+    # thing protecting the published wheel. Release rocky-sdk 0.12.0 BEFORE any
+    # dagster-rocky release carrying this floor. (#1348)
+    "rocky-sdk>=0.12.0",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.
@@ -61,7 +68,15 @@ rocky-sdk = { path = "../../sdk/python", editable = true }
 dagster_rocky = "dagster_rocky"
 
 [build-system]
-requires = ["hatchling"]
+# Bounded on purpose — same reason as `sdk/python/pyproject.toml`: hatchling
+# 1.32.0 (2026-08-11) emits `Metadata-Version: 2.5`, which the twine 6.1.0 in
+# our allow-listed `gh-action-pypi-publish` pin rejects at the publish step.
+# `dagster-release` uses the same action, so it would have failed identically.
+# Ceiling raised to `<1.33` in #1395 (2026-08-17), which bumped that action
+# to a build carrying twine 7.0.0. Still bounded, not open: 1.30.0 and 1.32.0
+# both shipped a metadata bump, so the ceiling is what turns the next one into
+# a caught failure instead of a broken publish.
+requires = ["hatchling>=1.30.1,<1.33"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]

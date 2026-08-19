@@ -1,15 +1,17 @@
 ---
 title: Permissions
-description: Declarative RBAC with automatic GRANT/REVOKE reconciliation for Databricks Unity Catalog
+description: Declare who gets access in rocky.toml, and let Rocky issue the GRANT and REVOKE that match
 sidebar:
   order: 10
 ---
 
-Rocky manages **Databricks Unity Catalog** permissions declaratively. Define grants inline in `rocky.toml` and Rocky reconciles them during each `rocky run`; there is no separate permissions command. Permissions are applied as part of the governance setup phase, before parallel table processing begins.
+Declare who should have access to your **Databricks Unity Catalog** objects, and Rocky issues the statements that make it so. You never write a `GRANT` by hand.
+
+This is a [declarative](/reference/glossary/#declarative) surface: you state the end result, and Rocky works out the steps. It [reconciles](/reference/glossary/#reconcile) the grants during every `rocky run`, before it starts processing tables in parallel. There is no separate permissions command.
 
 ## Inline Grants (Recommended)
 
-Define grants directly under the pipeline target in `rocky.toml`. These apply to **every** managed catalog and schema created by that pipeline:
+Declare grants under the pipeline target. They apply to **every** catalog and schema that pipeline manages:
 
 ```toml
 [pipeline.bronze.target.governance]
@@ -35,20 +37,33 @@ principal = "group:analysts"
 permissions = ["USE SCHEMA", "SELECT"]
 ```
 
-Inline grants are applied as best-effort during `rocky run`. If a grant fails (e.g., the principal doesn't exist), Rocky logs a warning and continues.
+Rocky applies inline grants on a best-effort basis during `rocky run`. When one fails — the principal does not exist, say — Rocky logs a warning and carries on with the run.
 
 ## Reconciliation Flow
 
-Permission reconciliation runs during `rocky run`, integrated into the catalog and schema creation sequence:
+Rocky never blindly re-issues every grant. It reads what the warehouse has now, compares that against what you declared, and emits only the difference:
 
-1. **Read** desired permissions from `[pipeline.<name>.target.governance.grants]` and `[pipeline.<name>.target.governance.schema_grants]` in config
-2. **Query** current state with Databricks `SHOW GRANTS ON CATALOG` and `SHOW GRANTS ON SCHEMA`
-3. **Compute diff**: determine which grants need to be added and which need to be revoked
-4. **Execute** the necessary Databricks `GRANT` and `REVOKE` statements
+```
+  rocky.toml                        Databricks Unity Catalog
+  ──────────                        ────────────────────────
+  [[…governance.grants]]            SHOW GRANTS ON CATALOG
+  [[…governance.schema_grants]]     SHOW GRANTS ON SCHEMA
+        │                                     │
+        │ desired state                       │ current state
+        ▼                                     ▼
+      ┌─────────────────────────────────────────┐
+      │              compute diff               │
+      └────────┬───────────────────────┬────────┘
+               │ missing               │ extra
+               ▼                       ▼
+          GRANT … TO `p`         REVOKE … FROM `p`
+```
+
+Rocky runs this during `rocky run`, inside the same sequence that creates catalogs and schemas.
 
 ## Workspace Isolation
 
-Rocky can isolate catalogs to specific Databricks workspaces using the **Databricks Unity Catalog** workspace bindings REST API (`PATCH /api/2.1/unity-catalog/bindings/catalog/{name}`). Each binding declares a workspace ID and an access level (`READ_WRITE` or `READ_ONLY`):
+Restrict a catalog to named Databricks workspaces so no other workspace can reach it. Rocky uses the Unity Catalog workspace-bindings API (`PATCH /api/2.1/unity-catalog/bindings/catalog/{name}`). Each binding names a workspace ID and an access level, `READ_WRITE` or `READ_ONLY`:
 
 ```toml
 [pipeline.bronze.target.governance.isolation]
@@ -63,15 +78,16 @@ id = 987654321
 binding_type = "READ_ONLY"
 ```
 
-`binding_type` defaults to `"READ_WRITE"` if omitted. When enabled, Rocky:
-1. Binds each managed catalog to the specified workspaces with their declared access level
-2. Sets the catalog's isolation mode to `ISOLATED`
+`binding_type` defaults to `"READ_WRITE"` when you omit it. With `enabled = true`, Rocky does two things to each managed catalog:
 
-This prevents other workspaces from accessing the catalog. Workspace binding and isolation are applied as best-effort: failures are logged but don't block the run.
+1. Binds it to the workspaces you listed, at the access level each one declares.
+2. Sets the catalog's isolation mode to `ISOLATED`.
+
+Binding and isolation are best-effort, like grants: Rocky logs a failure and the run continues.
 
 ## Managed Permissions
 
-Rocky manages the following permission types:
+Rocky manages these permission types:
 
 - `BROWSE`
 - `USE CATALOG`
@@ -82,7 +98,7 @@ Rocky manages the following permission types:
 
 ## Skipped Permissions
 
-The following permission types are ignored during reconciliation and will never be granted or revoked by Rocky:
+Rocky never grants or revokes these, and ignores them during reconciliation:
 
 - `OWNERSHIP`
 - `ALL PRIVILEGES`
@@ -90,7 +106,7 @@ The following permission types are ignored during reconciliation and will never 
 
 ## Principal Validation
 
-Principal names are validated against the pattern `^[a-zA-Z0-9_ \-\.@]+$`. In generated SQL, principals are always wrapped in backticks to handle spaces and special characters safely:
+Rocky checks every principal name against the pattern `^[a-zA-Z0-9_ \-\.@]+$`, then wraps it in backticks in the generated SQL so spaces and other characters are safe:
 
 ```sql
 GRANT USE CATALOG ON CATALOG acme_warehouse TO `group:data_engineers`
@@ -98,21 +114,24 @@ GRANT USE CATALOG ON CATALOG acme_warehouse TO `group:data_engineers`
 
 ## Tagging
 
-Rocky sets tags on catalogs, schemas, and tables using Databricks-specific `ALTER ... SET TAGS` SQL, combining parsed schema components with configured governance tags:
+Rocky labels the objects it manages with Databricks `ALTER … SET TAGS` SQL. It combines the components it parsed from the schema name with the tags you declare:
 
 ```toml
 [pipeline.bronze.target.governance.tags]
 managed_by = "rocky"
 ```
 
-Tags are applied at three levels:
-- **Catalogs**: `ALTER CATALOG ... SET TAGS (...)` — parsed components + governance tags
-- **Schemas**: `ALTER SCHEMA ... SET TAGS (...)` — parsed components + governance tags
-- **Tables**: `ALTER TABLE ... SET TAGS (...)` — governance tags applied to each replicated table
+Rocky tags at three levels:
+
+| Level | Statement | Tags applied |
+|---|---|---|
+| Catalog | `ALTER CATALOG … SET TAGS (…)` | parsed components + governance tags |
+| Schema | `ALTER SCHEMA … SET TAGS (…)` | parsed components + governance tags |
+| Table | `ALTER TABLE … SET TAGS (…)` | governance tags, on each replicated table |
 
 ## Output
 
-Permission reconciliation results are included in the `rocky run` output under the `permissions` key:
+`rocky run` reports what reconciliation did under the `permissions` key:
 
 ```json
 {

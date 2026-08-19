@@ -123,6 +123,16 @@ def catalog_json() -> str:
 
 
 @pytest.fixture
+def review_status_json() -> str:
+    return json.dumps(scenarios.REVIEW_STATUS)
+
+
+@pytest.fixture
+def review_status_pending_json() -> str:
+    return json.dumps(scenarios.REVIEW_STATUS_PENDING)
+
+
+@pytest.fixture
 def plan_with_run_spine_json() -> str:
     """PlanResult with Phase 2 plan_id / models / execution_layers fields."""
     return json.dumps(scenarios.PLAN_WITH_RUN_SPINE)

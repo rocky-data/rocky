@@ -1637,22 +1637,44 @@ pub struct RetentionAction {
     pub warehouse_preview: Option<String>,
 }
 
-/// JSON output for `rocky drift`.
-#[derive(Debug, Serialize, JsonSchema)]
-pub struct DriftOutput {
-    pub version: String,
-    pub command: String,
-    pub drift: DriftSummary,
-}
-
 /// JSON output for `rocky compile`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct CompileOutput {
     pub version: String,
     pub command: String,
+    /// Number of models this result describes — the whole project, or `1`
+    /// when `--model` selects one. Not a project-wide total under a selector.
     pub models: usize,
+    /// Number of execution layers this result describes.
+    ///
+    /// Under `--model` only the layers containing the selected model are
+    /// counted, so this reports `1`. It is not the selected model's depth in
+    /// the DAG, and not how many layers a rebuild of it would need — treat it
+    /// as informative only when no selector is passed.
     pub execution_layers: usize,
+    /// Diagnostics for the models this result describes. Under `--model`,
+    /// filtered to those whose owning model name equals the selector exactly —
+    /// so a diagnostic raised against a different model is absent even when
+    /// that model is an upstream of the selected one.
+    ///
+    /// Attribution is not always a model you can select: import diagnostics
+    /// (`E033`, `E034`, `W012`) carry the import name and `W011` carries a
+    /// contract name, none of which are valid `--model` values. A target
+    /// collision (`E036`) is attached to every participating model, so one
+    /// diagnostic can appear under several selectors.
     pub diagnostics: Vec<Diagnostic>,
+    /// Whether the diagnostics this result describes include error-severity
+    /// entries — and, for the CLI, whether the command exits non-zero.
+    ///
+    /// Under `--model` this is computed from the exact-attribution filter
+    /// above, so it says nothing about whether the selected model's upstreams
+    /// compile: an error attributed to another model is filtered out and
+    /// leaves this `false`, even though `rocky run` would classify that model
+    /// as a compile error and exclude it from execution. A failure that aborts
+    /// compilation outright rather than emitting a diagnostic — an unparseable
+    /// model, a semantic-graph or contract-load failure — fails the command
+    /// before any scoping applies. To learn whether a model can be built,
+    /// compile without a selector.
     pub has_errors: bool,
     pub compile_timings: PhaseTimings,
     /// Per-model details extracted from each model's TOML frontmatter.
@@ -2144,6 +2166,10 @@ impl OptimizeOutput {
 // ---------------------------------------------------------------------------
 
 /// JSON output for `rocky estimate`.
+///
+/// `estimates` is empty when the project declares no models; `message` is
+/// populated in that case to explain why, mirroring [`OptimizeOutput`]. An
+/// unknown `--model` is an error, not an empty result.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct EstimateOutput {
     pub version: String,
@@ -2154,6 +2180,20 @@ pub struct EstimateOutput {
     /// individual model produced a cost estimate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_estimated_cost_usd: Option<f64>,
+    /// Why `estimates` is empty, when it is. Absent whenever `estimates` is
+    /// non-empty.
+    ///
+    /// Populated for both empty cases: no model matched (`--model` is refused
+    /// outright, so this means the project declares none), and models matched
+    /// but none produced an estimate because SQL generation or `EXPLAIN`
+    /// failed for every one of them.
+    ///
+    /// Without this, an empty `estimates` array was the command's only signal
+    /// that it had nothing to report — and the text path said `No models
+    /// found.` while the JSON path said nothing at all, so the human was told
+    /// and the machine was not (#1428).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Cost estimate for a single model.
@@ -2188,6 +2228,15 @@ impl EstimateOutput {
             estimates,
             total_models: count,
             total_estimated_cost_usd: total_cost,
+            message: None,
+        }
+    }
+
+    /// An empty result that says why — see [`OptimizeOutput::empty`].
+    pub fn empty(message: impl Into<String>) -> Self {
+        EstimateOutput {
+            message: Some(message.into()),
+            ..EstimateOutput::new(vec![])
         }
     }
 }
@@ -2546,7 +2595,7 @@ pub struct AiGenerateOutput {
     pub sidecar_path: Option<String>,
 }
 
-/// JSON output for `rocky ai sync`.
+/// JSON output for `rocky ai-sync`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AiSyncOutput {
     pub version: String,
@@ -2562,7 +2611,7 @@ pub struct AiSyncProposal {
     pub proposed_source: String,
 }
 
-/// JSON output for `rocky ai explain`.
+/// JSON output for `rocky ai-explain`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AiExplainOutput {
     pub version: String,
@@ -2577,7 +2626,7 @@ pub struct AiExplanation {
     pub saved: bool,
 }
 
-/// JSON output for `rocky ai test`.
+/// JSON output for `rocky ai-test`.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct AiTestOutput {
     pub version: String,
@@ -3511,6 +3560,20 @@ pub struct RunPlan {
     /// Informational — re-derived at apply time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub execution_layers: Vec<Vec<String>>,
+    /// Product identity this plan fulfils (e.g. `"product:revenue_daily"`).
+    /// Opaque to the engine — never parsed, only carried in the hashed
+    /// payload and compared for equality. Set together with `spec_digest`
+    /// or not at all. When unset the serialized payload is byte-identical
+    /// to the pre-product shape, so every legacy plan_id stays stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// Digest of the approved product spec this plan was authored against
+    /// (e.g. `"sha256:<hex>"`). Opaque to the engine; `rocky apply
+    /// --expect-spec-digest` compares it for equality and a plan carrying
+    /// it refuses a bare apply. Set together with `product_id` or not at
+    /// all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
 }
 
 fn default_parallel() -> u32 {
@@ -3730,6 +3793,33 @@ pub struct ReplicationPlan {
     /// apply time, like `RunPlan.resume_latest`.
     #[serde(default)]
     pub resume_latest: bool,
+    /// Run in shadow mode (`--shadow`), with `shadow_suffix` / `shadow_schema`
+    /// describing the shadow target — the same contract as [`RunPlan`].
+    ///
+    /// Skipped when `false`, unlike `RunPlan.shadow` which always serializes.
+    /// `plan_id` is `blake3({kind, payload})`, so emitting `"shadow": false`
+    /// would give every unchanged replication project a new plan id purely
+    /// because these fields were added. The asymmetry with `RunPlan` is
+    /// deliberate and costs nothing: a plan that did not request shadow reads
+    /// back identically either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shadow: bool,
+    /// Suffix appended to table names in shadow mode (`--shadow-suffix`).
+    ///
+    /// `None` when shadow was not requested — the CLI normalises clap's
+    /// `_rocky_shadow` default away before it reaches the plan, so this never
+    /// carries a default nobody asked for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_suffix: Option<String>,
+    /// Override schema for shadow tables (`--shadow-schema`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow_schema: Option<String>,
+    /// `--branch <name>`. Internally equivalent to `--shadow --shadow-schema
+    /// <branch.schema_prefix>`, and clap rejects it combined with either, so
+    /// `shadow` is `false` when this is set — persisting it is what stops a
+    /// branch run from replaying as a production run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// Governance override resolved at plan time from
     /// `--governance-override`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3741,6 +3831,19 @@ pub struct ReplicationPlan {
     /// subset would silently break replay. Cheaper to keep the whole
     /// config and let the hash do its job.
     pub config_snapshot: serde_json::Value,
+    /// Credential-free identity of the state authority this plan was reviewed
+    /// against — which ledger holds its watermarks, freezes, budgets and
+    /// idempotency keys.
+    ///
+    /// `config_snapshot` cannot answer this: `valkey_url` is redacted whole, so
+    /// a Valkey A-to-B swap compares equal, and the resolved `--state-path`
+    /// comes from the caller and never appears in the config. Without this a
+    /// plan could pass the config comparison and still apply against a
+    /// different ledger. Optional so plans written before this field still
+    /// deserialize; absent means "not recorded", and apply skips the check
+    /// rather than refusing every older plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_authority: Option<String>,
     /// Discovered connectors sorted by `id`. Tables within each
     /// connector are sorted by `name`. Apply re-discovers and asserts
     /// byte-equality against this snapshot before running SQL.
@@ -6911,6 +7014,45 @@ pub struct PromotePlan {
     pub created_at: DateTime<Utc>,
 }
 
+/// JSON output for `rocky review <plan-id> --status` — the marker oracle.
+///
+/// A read-only projection of the plan's review state: whether a well-formed
+/// sign-off marker naming the plan exists, who approved it and when, and the
+/// plan's product binding when it carries one. The fulfillment runner polls
+/// this instead of probing the marker path (the marker file itself stays an
+/// engine-internal artifact).
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct ReviewStatusOutput {
+    pub version: String,
+    /// Always `"review_status"`.
+    pub command: String,
+    /// The plan whose review state was read (64-char blake3 hex).
+    pub plan_id: String,
+    /// The plan's kind (e.g. `"ai_authored"`, `"run"`, `"backfill"`).
+    pub kind: String,
+    /// Whether a well-formed sign-off marker naming this plan exists. `false`
+    /// means the plan awaits review; a malformed or mismatched marker is an
+    /// ERROR from the command, never reported as a status.
+    pub reviewed: bool,
+    /// When the approval was recorded, from the marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<DateTime<Utc>>,
+    /// Best-effort git identity of the approver, from the marker.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approver: Option<ApproverIdentity>,
+    /// Count of breaking-severity findings the approver signed off on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breaking_change_count: Option<u64>,
+    /// Product identity from the plan payload, when the plan is
+    /// product-bound (opaque; never parsed by the engine).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<String>,
+    /// Approved-spec digest from the plan payload, when product-bound.
+    /// Applying such a plan requires `rocky apply --expect-spec-digest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
+}
+
 /// JSON output for `rocky review <plan-id>`.
 ///
 /// `rocky review` is the human sign-off gate for an AI-authored plan. It
@@ -8970,6 +9112,18 @@ pub struct RetentionStatusOutput {
     pub version: String,
     pub command: String,
     pub models: Vec<ModelRetentionStatus>,
+    /// Why `models` is empty, when it is. Absent whenever `models` is
+    /// non-empty.
+    ///
+    /// Reachable only under `--drift`, which reports just the models that
+    /// declare a retention policy: a project with no models fails to compile
+    /// before reaching this output, and an unknown `--model` is refused
+    /// rather than returning an empty result. When `--model` scopes the run
+    /// the message describes that model, not the project — an empty `models`
+    /// array otherwise gave a project-wide impression from a single-model
+    /// query (#1428).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 /// Per-model retention declaration + (eventually) warehouse-observed value.
@@ -8998,6 +9152,15 @@ impl RetentionStatusOutput {
             version: VERSION.to_string(),
             command: "retention-status".to_string(),
             models,
+            message: None,
+        }
+    }
+
+    /// An empty result that says why — see [`OptimizeOutput::empty`].
+    pub fn empty(message: impl Into<String>) -> Self {
+        RetentionStatusOutput {
+            message: Some(message.into()),
+            ..RetentionStatusOutput::new(vec![])
         }
     }
 }

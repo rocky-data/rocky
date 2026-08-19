@@ -6,7 +6,7 @@
  */
 
 /**
- * JSON output for `rocky ai test`.
+ * JSON output for `rocky ai-test`.
  */
 export interface AiTestOutput {
   command: string;

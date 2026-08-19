@@ -5,12 +5,12 @@ sidebar:
   order: 10
 ---
 
-`dagster-rocky` ships `rocky_source_sensor()`, a factory that builds a
-Dagster [`SensorDefinition`](https://docs.dagster.io/api/dagster/sensors#dagster.SensorDefinition)
-that polls `rocky discover` and emits a `RunRequest` for any source whose
-upstream connector has produced new data since the previous tick.
+`rocky_source_sensor()` builds a Dagster
+[`SensorDefinition`](https://docs.dagster.io/api/dagster/sensors#dagster.SensorDefinition).
+The sensor polls `rocky discover` on a timer. It emits a `RunRequest` for
+any source whose upstream connector produced new data since the last tick.
 
-This lets pipelines kick off as soon as Fivetran finishes a sync, instead of
+Your pipeline then starts as soon as Fivetran finishes a sync, instead of
 waiting for the next scheduled run.
 
 ## Quickstart
@@ -43,23 +43,49 @@ defs = dg.Definitions(
 )
 ```
 
-The sensor:
+## What one tick does
 
-1. Calls `rocky.discover()` on each tick.
-2. Compares each source's `last_sync_at` timestamp to a per-source cursor.
-3. Emits a `RunRequest` for any source whose latest sync is newer than the cursor.
-4. Advances the cursor for the sources it processed.
-5. Logs a warning naming any ids the engine reported in `failed_sources`, and **does not** advance their cursor, so the next tick re-evaluates them.
+Each tick calls `rocky.discover()`, then decides per source what to do.
+
+```
+  sensor tick
+      │
+      ▼
+  rocky.discover()
+      │
+      ├──► ids in failed_sources ──► log a warning
+      │                              cursor NOT advanced
+      │                              (re-evaluated next tick)
+      ▼
+  each healthy source:
+  is last_sync_at newer than its cursor?
+      │
+      ├── no ───► nothing emitted
+      │
+      └── yes ──► backlog cap set and reached for this tag?
+                      │
+                      ├── yes ──► RunRequest suppressed
+                      │           cursor still advances
+                      │
+                      └── no ───► RunRequest emitted
+                                  cursor advances
+```
+
+The warning names every id the engine reported in `failed_sources`, so you
+can see which connector is misbehaving. The backlog cap is opt-in. Both
+branches under it are covered in [Backlog cap](#backlog-cap) below.
 
 ## Transient discover failures
 
-Source adapters can partially fail: a Fivetran 5xx or rate-limit window on a single connector, an Iceberg `list_tables` error on one namespace. From engine `1.17.4` onward, `rocky discover` surfaces these as `failed_sources` rather than silently dropping the connector from the output.
+Source adapters can fail one at a time. A Fivetran 5xx or rate-limit window hits a single connector. An Iceberg `list_tables` error hits one namespace. From engine `1.17.4` onward, `rocky discover` reports these in `failed_sources` instead of dropping the connector from the output.
 
-The sensor relies on this signal to avoid the asset-graph-shrinkage failure mode where a transient adapter error looks indistinguishable from "removed upstream" to a diff-based reconciler. By skipping cursor advance for failed ids, the sensor guarantees that a flapping connector keeps reappearing for evaluation until it either succeeds (cursor advances normally) or is genuinely removed upstream (drops out of both `sources` and `failed_sources`).
+That signal matters. Without it, a transient adapter error looks the same as a source that was removed upstream, and a diff-based reconciler would shrink the asset graph.
 
-Healthy sources in the same tick still produce `RunRequest`s; partial failure does not block the run.
+So the sensor skips the cursor advance for failed ids. A flapping connector keeps coming back for evaluation until one of two things happens. It succeeds, and the cursor advances normally. Or it is genuinely removed upstream, and it drops out of both `sources` and `failed_sources`.
 
-Requires engine `≥ 1.17.4`. Older engines omit the field; the sensor treats absence as "no failures reported".
+Healthy sources in the same tick still produce `RunRequest`s. A partial failure does not block the run.
+
+Requires engine `≥ 1.17.4`. Older engines omit the field, and the sensor reads an absent field as "no failures reported".
 
 ## Granularity
 
@@ -95,13 +121,9 @@ sensor = rocky_source_sensor(
 
 ## Cursor format
 
-The cursor is JSON-encoded `{source_id: ISO 8601 timestamp}`. Storing per-source
-state means each connector advances independently, so adding a new source
-doesn't replay history for the existing ones.
+The cursor is JSON-encoded `{source_id: ISO 8601 timestamp}`. State is stored per source, so each connector advances on its own. Adding a new source does not replay history for the existing ones.
 
-ISO comparisons are done by parsing into Python `datetime` objects (not
-lexicographic sort), so mixed timezone offsets in cursor and current sync work
-correctly.
+The sensor parses each timestamp into a Python `datetime` before it compares. It does not sort the strings. Mixed timezone offsets between the cursor and the current sync therefore compare correctly.
 
 ## RunRequest tags
 
@@ -118,8 +140,8 @@ sync triggered which materialization.
 
 `rocky_resource` accepts either form:
 
-- **String key** (default `"rocky"`): Dagster resolves the resource from `context.resources` at evaluation time. Per-deployment overrides apply, mock substitution via `dg.build_sensor_context(resources={...})` works without wrapping, and the resource doesn't need to exist before the sensor is built.
-- **`RockyResource` instance**: the legacy form, closure-captured at sensor-build time. Still supported indefinitely so existing call sites don't break, but the keyed form is recommended for new code.
+- **String key** (default `"rocky"`): Dagster resolves the resource from `context.resources` at evaluation time. Per-deployment overrides apply. Mock substitution through `dg.build_sensor_context(resources={...})` works without a wrapper. The resource does not need to exist before you build the sensor.
+- **`RockyResource` instance**: the legacy form. The sensor captures it in a closure at build time. It stays supported indefinitely so existing call sites keep working, but use the keyed form in new code.
 
 ```python
 # String-key form (recommended) — resolves "rocky" from context.resources
@@ -134,7 +156,7 @@ sensor = rocky_source_sensor(rocky_resource=rocky, target=...)
 
 ## Backlog cap
 
-Pass `backlog_cap=BacklogCap(...)` to suppress emits when too many in-flight Dagster runs already share a tag value. Useful when a hung downstream amplifies into a runaway queue; without back-pressure, a stuck run can pile up dozens of fresh `RunRequest`s tagged for the same client/tenant before anyone notices.
+Pass `backlog_cap=BacklogCap(...)` to suppress emits when too many in-flight Dagster runs already share a tag value. Use it when a hung downstream can turn into a runaway queue. Without back-pressure, one stuck run piles up dozens of fresh `RunRequest`s for the same tenant before anyone notices.
 
 ```python
 from dagster_rocky import BacklogCap, rocky_source_sensor
@@ -148,11 +170,11 @@ sensor = rocky_source_sensor(
 )
 ```
 
-Before each emit, the sensor counts in-flight runs matching `tag_key=<value>` in the non-terminal statuses (`QUEUED`, `NOT_STARTED`, `STARTING`, `STARTED` by default; override via `BacklogCap.statuses`). If the count is at or above `max_in_flight`, the `RunRequest` is suppressed.
+Before each emit, the sensor counts the in-flight runs tagged `tag_key=<value>`. It counts the non-terminal statuses, which are `QUEUED`, `NOT_STARTED`, `STARTING`, and `STARTED` by default. Override that set with `BacklogCap.statuses`. If the count is at or above `max_in_flight`, the sensor suppresses the `RunRequest`.
 
-The count is scoped to **this sensor's own runs**: every `RunRequest` the sensor emits carries a stable `rocky/sensor=<name>` tag, and the in-flight count filters on it, so a co-tagged run from an unrelated job never trips the cap. Pass `BacklogCap(scope_tags={...})` to narrow the count further with extra exact-match tag filters.
+The count covers **this sensor's own runs** only. Every `RunRequest` it emits carries a stable `rocky/sensor=<name>` tag, and the in-flight count filters on that tag. A co-tagged run from an unrelated job therefore never trips the cap. Pass `BacklogCap(scope_tags={...})` to narrow the count further with extra exact-match tag filters.
 
-**The cursor still advances on suppression**: the in-flight run picks up the latest data via Rocky's per-source state. Freezing the cursor would compound the failure: the next tick would re-detect the same sync, retry the same suppressed emit, and never recover until the queue drains below cap.
+**The cursor still advances on suppression.** The in-flight run picks up the latest data through Rocky's per-source state. Freezing the cursor would make the failure worse. The next tick would re-detect the same sync, retry the same suppressed emit, and never recover until the queue drained below the cap.
 
 `BacklogCap` is opt-in. Default behavior (no cap) is unchanged.
 

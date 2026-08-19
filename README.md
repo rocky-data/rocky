@@ -11,15 +11,47 @@
 [![VS Code CI](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml/badge.svg)](https://github.com/rocky-data/rocky/actions/workflows/vscode-ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**Rocky is a SQL transformation engine that type-checks your whole pipeline and catches breaking changes before they run.**
+**Rocky checks your whole SQL pipeline before it runs, and tells you what a change will break.**
 
-Works with Databricks, Snowflake, BigQuery, and DuckDB. You keep your warehouse and your existing SQL. Apache 2.0.
+Rocky works with Databricks, Snowflake, BigQuery, and DuckDB. You keep your warehouse and your existing SQL. Apache 2.0.
 
-The failures that cost data teams the most are the quiet ones: a source column type changes and breaks something downstream, a column gets renamed and three models stop working, a query runs fine in dev but fails in prod. Rocky catches all of these at check time, before anything runs.
+The failures that cost the most are the quiet ones. A source column changes type. Someone renames a column and three models stop working. A query works in dev and fails in production. Rocky finds all of these at check time.
+
+```
+   you edit SQL          rocky compile              rocky run
+        │                      │                        │
+        ▼                      ▼                        ▼
+   ┌─────────┐        ┌──────────────────┐        ┌───────────┐
+   │  model  │───────►│  check the whole │───────►│ warehouse │
+   │  files  │        │  pipeline: types,│        │  writes   │
+   └─────────┘        │  refs, contracts │        └───────────┘
+                      └──────────────────┘
+                               │
+                               │ a problem is found here,
+                               ▼ so nothing runs
+                        E010: required column
+                        `order_id` is missing
+```
 
 <p align="center">
   <img src="docs/public/demo-quickstart.gif" alt="Rocky quickstart: create a project, compile, and run 3 models in under 15s" width="900" />
 </p>
+
+That is what the GIF shows, in text:
+
+```
+$ rocky compile
+  ✓ raw_orders (6 columns)
+  ✓ customer_orders (4 columns)
+  ✓ revenue_summary (5 columns)
+  Compiled: 3 models, 0 errors, 0 warnings
+
+$ rocky run
+transformation pipeline complete: 3 model(s) executed in 20ms
+  playground.main.raw_orders (full_refresh)
+  playground.main.customer_orders (full_refresh)
+  playground.main.revenue_summary (full_refresh)
+```
 
 ## Try it in 60 seconds
 
@@ -43,113 +75,201 @@ For production deploys, use `rocky plan` (saves what will change) then `rocky ap
 
 ## Who Rocky is for
 
-Built first for **data engineers on Databricks** where silent failures cost real money and Dagster is the scheduler. **Snowflake and BigQuery** adapters are in Beta — see [Where Rocky is today](#where-rocky-is-today).
+Rocky is built first for **data engineers on Databricks**. That is where a silent failure costs the most, and where Dagster usually runs the schedule.
+
+Rocky also runs on Snowflake, BigQuery, Trino and DuckDB. See [Adapters](#adapters) for what each one does today.
 
 ## See it in action
 
-Each demo is in [`examples/playground/pocs/`](examples/playground/). `cd` in, run `./run.sh`.
+Each demo is in [`examples/playground/pocs/`](examples/playground/pocs/). Change into a demo directory and run `./run.sh`.
 
 ### See what breaks before you merge, with `rocky lineage-diff`
 
-Compare two versions of your project and get a list of which downstream tables and columns each change affects — ready to paste into a GitHub PR comment.
+Compare two versions of your project. Rocky lists the downstream tables and columns that each change affects. Paste the list into a GitHub pull request comment.
 
 <p align="center">
   <img src="docs/public/demo-lineage-diff.gif" alt="rocky lineage-diff main lists added and removed columns across two models with downstream consumers per change" width="900" />
 </p>
 
+The command writes Markdown, ready to paste. Abridged here to two of the six column changes:
+
+```
+$ rocky lineage-diff main
+
+### Rocky Lineage Diff
+
+**2 row(s) changed** (2 modified, 0 added, 0 removed, 0 unchanged)
+
+stg_orders — modified (3 column changes)
+
+| Column      | Change  | Downstream consumers      |
+|-------------|---------|---------------------------|
+| amount_usd  | added   | fct_revenue.total_revenue |
+| amount      | removed | (removed; not traceable)  |
+```
+
+The right-hand column is the part that matters. Renaming `amount` to `amount_usd`
+tells you `fct_revenue.total_revenue` reads it, before you merge.
+
 [POC: `06-developer-experience/11-lineage-diff`](examples/playground/pocs/06-developer-experience/11-lineage-diff/)
 
 ### More demos
 
-- [Schema drift recovery](examples/playground/pocs/02-performance/06-schema-drift-recover/): source column type changes upstream; Rocky detects it and rebuilds safely.
-- [Data contracts](examples/playground/pocs/01-quality/01-data-contracts-strict/): missing required columns, dropped protected columns, or unsafe type changes surface as errors (`E010`, `E011`, `E013`) before a row is written.
-- [BigQuery cost to the byte](examples/playground/pocs/07-adapters/05-bigquery-native-queries/): `bytes_scanned` in the run receipt matches BigQuery's billing number exactly (requires credentials).
-- [Named branches + replay](examples/playground/pocs/00-foundations/06-branches-replay-lineage/): run against an isolated schema copy, inspect, then drop or promote.
-- [Agent policy](examples/playground/pocs/03-ai/07-policy/): a `[policy]` block grades what an agent may do on its own; pinned scenarios catch a loosened rule in CI.
-- [Column lineage](examples/playground/pocs/06-developer-experience/01-lineage-column-level/): trace a column in a downstream model back to its source.
-- [Incremental loads](examples/playground/pocs/02-performance/01-incremental-watermark/): set `strategy = "incremental"` and Rocky only processes new rows each run.
-- [Data masking](examples/playground/pocs/04-governance/05-classification-masking-compliance/): tag PII columns, set masking per environment, fail the check if anything goes out unmasked.
-- [AI model generation](examples/playground/pocs/03-ai/01-model-generation/): describe what you want; Rocky writes the SQL, checks it, and retries if something's wrong.
+- [Schema drift recovery](examples/playground/pocs/02-performance/06-schema-drift-recover/): a source column changes type. Rocky spots it and rebuilds safely.
+- [Data contracts](examples/playground/pocs/01-quality/01-data-contracts-strict/): a missing or dropped column stops the build. You get `E010`, `E011` or `E013` before a row is written.
+- [BigQuery cost to the byte](examples/playground/pocs/07-adapters/05-bigquery-native-queries/): the run receipt matches your bill exactly. Needs credentials.
+- [Named branches and replay](examples/playground/pocs/00-foundations/06-branches-replay-lineage/): run against an isolated copy, look at it, then drop or promote it.
+- [Agent policy](examples/playground/pocs/03-ai/07-policy/): decide what an agent may do alone. CI catches a rule you loosen by accident.
+- [Column lineage](examples/playground/pocs/06-developer-experience/01-lineage-column-level/): trace one column back to its source.
+- [Incremental loads](examples/playground/pocs/02-performance/01-incremental-watermark/): set `strategy = "incremental"`. Rocky then reads only new rows.
+- [Data masking](examples/playground/pocs/04-governance/05-classification-masking-compliance/): tag the personal columns. The check fails if one goes out unmasked.
+- [AI model generation](examples/playground/pocs/03-ai/01-model-generation/): say what you want. Rocky writes the SQL, checks it, and retries if it is wrong.
 
 ## In your editor
 
-The checker runs as a language server in VS Code, so you see type mismatches and broken references while you write, not in CI. Column types show on hover, go-to-definition works across all your models.
+The checker runs as a language server in VS Code. You see type mismatches and broken references while you write, not later in CI. Column types show when you hover. Go-to-definition works across all your models.
 
-The Rocky Inspector shows a model's columns, where each came from, its tests, cost, and which columns hold sensitive data.
+The Rocky Inspector shows a model's columns, where each column came from, its tests, its cost, and which columns hold sensitive data.
 
 <p align="center">
   <img src="editors/vscode/media/demo-inspector.gif" alt="The Rocky Inspector's Overview as a model trust dashboard, its Governance card flagging two classified columns with one left unmasked" width="900" />
 </p>
 
+A sketch of that panel:
+
+```
+┌─ Rocky Inspector ─ fct_revenue ──────────────────────────┐
+│                                                          │
+│  Columns                                                 │
+│    order_id        BIGINT     from  stg_orders.id        │
+│    total_revenue   DECIMAL    from  stg_orders.amount    │
+│                                                          │
+│  Tests             2 passing                             │
+│  Cost              last run $0.04                        │
+│                                                          │
+│  Governance        2 columns hold personal data          │
+│                    ⚠ 1 of them is not masked             │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
 [Install the VS Code extension →](https://marketplace.visualstudio.com/items?itemName=rocky-data.rocky)
 
 ## When an AI agent writes your pipelines
 
-Agents already author real pipeline changes, and the failure mode is no longer hypothetical: an over-trusted agent with production access can destroy real data in seconds. Rocky treats an agent as a first-class operator with a governed path to production. Every change an agent drafts is type-checked on write. What comes out is a plan, and a plan never auto-applies: it clears the policy you declared, then lands in a ledger you can query.
+Agents now write real pipeline changes. An agent that is trusted too much, with production access, can destroy real data in seconds. Rocky treats an agent as an operator with a controlled path to production.
 
-```mermaid
-flowchart LR
-    A[agent drafts] --> B[compiler<br/>types + contracts]
-    B --> C[plan<br/>never auto-applies]
-    C --> D{policy plane}
-    D -->|allow| E[apply]
-    D -->|require review| F[human approves] --> E
-    D -->|deny| G[refused,<br/>write rolled back]
-    E --> H[verify-after checks]
-    H --> I[(custody ledger<br/>rocky audit · rocky brief)]
+Rocky type-checks every change an agent writes. The agent produces a plan. A plan never applies itself. It must first pass the rules you wrote, and every decision goes into a ledger you can query.
+
+```
+   an agent drafts a change
+              │
+              ▼
+   ┌─────────────────────┐
+   │ compiler            │   types and contracts are checked
+   │                     │   as the agent writes
+   └──────────┬──────────┘
+              ▼
+   ┌─────────────────────┐
+   │ plan                │   a plan never applies itself
+   └──────────┬──────────┘
+              ▼
+   ┌─────────────────────┐
+   │ rocky apply reads   │   this gate runs before any
+   │ your [policy] rules │   SQL reaches the warehouse
+   └──────────┬──────────┘
+              │
+     ┌────────┴────────┬──────────────────┐
+     │ require review  │ allow            │ deny
+     ▼                 │                  ▼
+  ┌──────────────┐     │        ┌───────────────────┐
+  │ a human      │     │        │ refused. No SQL   │
+  │ approves,    │     │        │ runs, so there is │
+  │ then applies │     │        │ nothing to undo.  │
+  └──────┬───────┘     │        └─────────┬─────────┘
+         │             │                  │
+         └──────┬──────┘                  │
+                ▼                         │
+     ┌────────────────────┐               │
+     │ the warehouse runs │               │
+     │ the plan           │               │
+     └─────────┬──────────┘               │
+               ▼                          │
+     ┌──────────────────────────┐         │
+     │ a rule can require that  │         │
+     │ named checks passed here │         │
+     └─────────┬────────────────┘         │
+               │                          │
+               └────────────┬─────────────┘
+                            ▼
+              ┌──────────────────────────────┐
+              │ every decision lands here:   │
+              │ rocky audit · rocky brief    │
+              └──────────────────────────────┘
 ```
 
-- **A policy plane in `rocky.toml`.** `[policy]` rules grade what a principal may do by capability and scope: allow, require review, or deny. A blast-radius ceiling degrades an allow back to review when a change touches too many downstream models, or when the radius can't be computed. Policies are themselves testable: `[[policy.tests]]` scenarios run through the real evaluator, so `rocky policy test` in CI catches a careless edit that would have opened a hole.
-- **AI-authored plans stop for a human by default.** An agent proposes; unless a `[policy]` rule you wrote explicitly grants that scope, `rocky apply` refuses an unapproved AI-authored plan at the engine level, not by convention.
-- **A queryable custody chain.** `rocky audit --for <table>` answers who changed what, under whose authority, with what verification. `rocky review --queue` ranks what's waiting on you. `rocky brief` is the morning digest, every line cited to the ledger.
-- **What an agent materializes on the content-addressed path is tracked to its recipe.** `rocky gc --derivable` inventories artifacts whose recorded recipe binds to their bytes, eviction is review-gated and leaves a tombstone, and `rocky restore` rebuilds the exact bytes or refuses. Restore covers recipes that read no recorded upstreams; a multi-input recipe cannot be rebuilt yet, so eviction is not reversible for every artifact.
-- **The agent surface is MCP.** `rocky mcp` exposes 28 tools: schema and data grounding, draft tools that compile in the same call, and propose. A denied draft leaves nothing on disk.
+The diagram shows the gate at `rocky apply`. The MCP `draft` and `propose` tools read the same rules earlier, before Rocky keeps a file or a plan. Rocky leaves no new file for a denied draft, and writes no plan for a denied proposal.
+
+A rule can also name checks that must pass in that run. If one fails, or never ran, Rocky stops and records the failure. It cannot undo the write: the change stays until a human reverts it.
+
+- **You write the rules.** A `[policy]` rule in `rocky.toml` says what each principal may do, and where. The answer is allow, require review, or deny. Set `max_downstreams` to cap how far one change may reach.
+- **A plan written by AI waits for a human.** The engine enforces this. It is not a convention you can forget.
+- **You can test the rules.** `[[policy.tests]]` scenarios run through the real evaluator, so `rocky policy test` catches an edit that opens a hole.
+- **You can ask what happened.** `rocky audit --for <table>` says who changed what, and under whose authority. `rocky review --queue` ranks what waits on you.
+- **Agents connect over MCP.** `rocky mcp` exposes 31 tools. Seven of them write, and those seven pass the same rules.
 
 <p align="center">
   <img src="docs/public/demo-policy-enforce.gif" alt="an agent's change to a contracted model is planned, rocky apply run as the agent principal is denied by the policy plane with the rule named, and rocky audit shows the recorded decision" width="900" />
 </p>
 
+You can ask the rules a question before an agent ever runs:
+
+```
+$ rocky policy check --principal agent --capability apply --model dim_customer
+policy check: agent / apply / dim_customer
+  effect: require_review
+  matched: (none)
+  reason: no rule matched; default_agent_effect = require_review
+  model: contracted=false layer=silver classifications=[pii] downstreams=0
+```
+
 [POC: `04-governance/11-agent-policy`](examples/playground/pocs/04-governance/11-agent-policy/) drives this end to end, and the policy itself is regression-tested: `rocky policy test` runs pinned scenarios in CI and fails when an edit loosens a rule ([POC: `03-ai/07-policy`](examples/playground/pocs/03-ai/07-policy/)).
 
-Autonomy is earned rung by rung: retrying a proven-transient failure is free, a provably additive schema change can be allowed to flow under policy, and everything else waits for review unless you explicitly grant it. Budgets tighten on repeated failure and recover only as those failures age out of the configured window; `rocky policy freeze` is the kill switch. How an agent authors, proposes, and clears the gates is in [Operating Rocky with agents](https://rocky-data.dev/concepts/operating-rocky-with-agents/).
+An agent earns freedom one step at a time. You grant each step. `rocky policy freeze` is the kill switch.
+
+Full detail: [Operating Rocky with agents](https://rocky-data.dev/concepts/operating-rocky-with-agents/).
 
 ## Where Rocky is today
 
-Core features are production-ready on Databricks: the checker, named branches, replay, column lineage, rule enforcement, per-model cost. Everything else is in progress.
+The checker, named branches, replay, column lineage, rule enforcement and per-model cost are the most complete parts. Here is what is still thin.
 
-- **Databricks is the 2026 focus.** Snowflake, BigQuery, and Trino work for the core loop but aren't as thorough yet. [Talk to us](https://github.com/rocky-data/rocky/discussions) if you need them in production now.
-- **AI features are early.** Generate → check → fix is shipped, and `rocky ai-test` writes assertions for a model from its intent. Mass refactoring and auto-migration on type changes are on the roadmap.
-- **Replay re-executes, with honest scoping.** Every run leaves a content-addressed record that `rocky replay` inspects and verifies against the ledger. For deterministic content-addressed models, `rocky replay --execute --verify` re-runs the recorded recipe and checks the output reproduces bit-for-bit, locally or on the live warehouse in an isolated replay schema. A model that reads a mutable source is classified as non-replayable instead of being silently re-run against current data, and nondeterministic SQL is flagged so its divergence is reported as expected rather than passed off as a failure.
-- **Iceberg.** Reading from a REST catalog is Beta. Content-addressed writes land as Iceberg-readable tables through Delta UniForm today; native Iceberg writes without the Delta intermediate are on the roadmap.
-- **No built-in metrics layer.** Use Cube, the dbt Semantic Layer, or whatever you have.
-- **Dagster is the one built-in scheduler integration** ([`dagster-rocky`](integrations/dagster/)). For anything else, use the [`rocky-sdk`](sdk/python/) Python client or `rocky serve`.
+- **AI features are early.** Generate, check and fix works. `rocky ai-test` writes assertions for a model from its stated intent. Large refactors are still on the roadmap.
+- **Replay says what it cannot re-run.** `rocky replay --execute --verify` runs a recorded recipe again and confirms the output is identical, byte for byte. If a model reads a source that can change, Rocky marks it non-replayable rather than re-running it against today's data.
+- **Iceberg.** Rocky reads tables from a REST catalog. Writes land as Iceberg-readable tables through Delta UniForm. Native Iceberg writes are on the roadmap.
+- **No built-in metrics layer.** Use Cube, or whichever metrics layer you already run.
+- **Dagster is the one built-in scheduler integration** ([`dagster-rocky`](integrations/dagster/)). For anything else, use the [`rocky-sdk`](sdk/python/) Python client or `rocky serve`. `rocky tick` runs cron and freshness schedules with no orchestrator, but it is experimental.
 
 [Open a discussion](https://github.com/rocky-data/rocky/discussions) if any of these are a blocker.
 
-## How it compares to dbt Core
+## You can leave
 
-| Problem | dbt Core | Rocky |
-|---|---|---|
-| Source column type changes | Silent | Detected at run, rebuilt safely |
-| Required column disappears | Opt-in `contract: enforced` | `E010` at check time, blocks PR |
-| Column renamed, unknown blast radius | Table-level lineage, post-hoc | `rocky lineage-diff` at PR time, column-level |
-| `SELECT *` pulls an unexpected column | Silent | `P002` warning, downstream models named |
-| Snowflake-only SQL in a Databricks project | No check | `P001` portability warning |
-| Run costs double, no one knows which model | Dig through warehouse history | `cost_summary` per model, every run |
-| Auditor asks what changed `fct_revenue.amount` | Run history, no code record | `rocky replay <run_id>` |
-| Pipeline fails at 3 AM, half already ran | `dbt retry` from failed model | `rocky run --resume-latest`, skips succeeded models |
+`rocky emit-sql` writes your models out as plain SQL, in dependency order. It runs offline. It is one command, not a rewrite.
 
-`rocky import-dbt` converts a vanilla dbt Core project in one command. Rocky also closes the dbt-Core feature gaps teams hit first: deterministic surrogate keys (`[[surrogate_key]]`, the same value `dbt_utils.generate_surrogate_key` produces on each warehouse), named data-quality tests defined once and reused by name (the analogue of dbt Core's generic tests), and fixture-driven unit tests that mock upstream inputs and assert the output. See the [model format reference](https://rocky-data.dev/reference/model-format/).
+Three limits to know:
 
-- **No vendor lock-in.** `rocky emit-sql` renders every transformation model as plain, dependency-ordered SQL, offline with no warehouse connection. It's a one-command export, not a rewrite, so adopting Rocky is never a one-way door. See [No lock-in](https://rocky-data.dev/guides/no-lock-in/).
+- **Some models produce no standalone SQL.** Rocky inlines an ephemeral model as a CTE. Others need a live warehouse to render, such as a Snowflake dynamic table. Rocky lists what it skipped on stderr.
+- **An incremental model exports only its steady-state `INSERT` or `MERGE`.** That statement assumes the table already exists. Rocky prefixes it with a note saying so.
+- **Every model renders in one dialect.** Rocky picks one dialect for the whole project. With no config it uses DuckDB.
 
-In June 2026 dbt Labs released Fusion (dbt Core v2.0, Rust, Apache 2.0, alpha) with SQL type-checking and column lineage, though it still templates with Jinja and safety checks are opt-in. Neither dbt Core v2.0 nor Fusion includes named branches, a code-and-output record per run, per-model cost as a built-in, a cross-database portability check, or declarative masking. Those are in dbt's paid platform; Rocky's are Apache 2.0.
+See [No lock-in](https://rocky-data.dev/guides/no-lock-in/).
+
+Already have a project in another tool? `rocky import-dbt` converts a dbt Core project in one command. See the [import guide](https://rocky-data.dev/guides/migrate-from-dbt/).
 
 ## Subprojects
 
 | Path | What ships | Language | What it does |
 |---|---|---|---|
-| [`engine/`](engine/) | `rocky` CLI | Rust | Core engine: SQL checking, drift detection, incremental loads, adapters |
+| [`engine/`](engine/) | `rocky` CLI and `rocky-lsp` | Rust | Core engine: SQL checking, drift detection, incremental loads, adapters |
 | [`sdk/python/`](sdk/python/) | `rocky-sdk` (PyPI) | Python | Python client wrapping the CLI, for notebooks and scripts |
 | [`integrations/dagster/`](integrations/dagster/) | `dagster-rocky` (PyPI) | Python | Dagster resource built on `rocky-sdk` |
 | [`editors/vscode/`](editors/vscode/) | Rocky VS Code extension | TypeScript | Live checking, syntax highlighting, AI commands |
@@ -157,17 +277,21 @@ In June 2026 dbt Labs released Fusion (dbt Core v2.0, Rust, Apache 2.0, alpha) w
 
 ## Adapters
 
-| Role | Adapter | Status |
-|------|---------|--------|
-| Warehouse | Databricks | Production |
-| Warehouse | Snowflake | Beta |
-| Warehouse | BigQuery | Beta |
-| Warehouse | DuckDB | Local / Testing |
-| Warehouse | Trino | Beta |
-| Source | Fivetran | Production |
-| Source | Airbyte | Beta |
-| Source | Iceberg | Beta |
-| Source | Manual | Production |
+Rocky **writes** to a warehouse. It **reads** from a source to learn what tables exist.
+
+| Adapter | Rocky uses it to | What works today |
+|---|---|---|
+| Databricks | write | Every feature in this README |
+| Snowflake | write | Check, plan, run, incremental and merge loads, cost per run |
+| BigQuery | write | Check, plan, run, incremental and merge loads, cost per run |
+| Trino | write | Check, plan, run. No merge yet, so `strategy = "merge"` is refused. |
+| DuckDB | write | Local work and tests. No account needed. |
+| Fivetran | read | Find your connectors and the tables they land |
+| Airbyte | read | Find your connections and the tables they land |
+| Iceberg | read | Find tables in a REST catalog |
+| Manual | read | You list the tables yourself in `rocky.toml` |
+
+The checker works the same everywhere, because Rocky checks your models before it talks to a warehouse. Databricks is the most complete on everything after that.
 
 Building a connector for ClickHouse, Redshift, or another warehouse? See the [Adapter SDK guide](https://rocky-data.dev/guides/adapter-sdk/) and the [skeleton POC](examples/playground/pocs/07-adapters/06-rust-native-adapter-skeleton/).
 

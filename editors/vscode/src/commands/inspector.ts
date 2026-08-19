@@ -22,7 +22,6 @@ import type { AiActionParam } from "../webviews/lineage/contract";
 import {
   buildGraph,
   loadBreaking,
-  loadDrift,
   loadGovernance,
   loadReplay,
   openModelFile,
@@ -49,7 +48,6 @@ export function registerInspectorView(context: vscode.ExtensionContext): void {
       h.onRequest("graph", () => buildGraph());
       h.onRequest("openFile", (p) => openModelFile((p as ModelParam).model));
       h.onRequest("ai", (p) => runAiAction(p as AiActionParam));
-      h.onRequest("drift", () => loadDrift());
       h.onRequest("breaking", () => loadBreaking());
       h.onRequest("replay", () => loadReplay());
       h.onRequest("governance", () => loadGovernance());

@@ -18,6 +18,8 @@ use rocky_sql::transpile::Dialect;
 
 use crate::output::{CompileOutput, CostHint, ModelDetail, print_json};
 
+use super::ModelNotFound;
+
 /// Execute `rocky compile`.
 ///
 /// `cache_ttl_override`: optional CLI flag value from the binary's
@@ -145,6 +147,13 @@ fn compile_inner(
 
     let mut result = compile::compile(&config)?;
 
+    if let Some(filter) = model_filter
+        && result.project.model(filter).is_none()
+    {
+        return Err(anyhow::Error::new(ModelNotFound(filter.to_string())));
+    }
+    let in_scope = |name: &str| model_filter.is_none_or(|filter| name == filter);
+
     // Portability lint. Effective target_dialect = CLI flag > [portability]
     // config > unset. Project-wide allow list and per-model `-- rocky-allow:`
     // pragmas suppress matching constructs before they become diagnostics.
@@ -199,9 +208,7 @@ fn compile_inner(
 
         let mut expanded = HashMap::new();
         for model in &result.project.models {
-            if let Some(filter) = model_filter
-                && model.config.name != filter
-            {
+            if !in_scope(&model.config.name) {
                 continue;
             }
             let sql = expand_macros(&model.sql, &macro_defs)?;
@@ -264,21 +271,18 @@ fn compile_inner(
     }
 
     // Re-apply model filter to diagnostics (may now include E027).
-    let diagnostics: Vec<_> = if let Some(filter) = model_filter {
-        result
-            .diagnostics
-            .iter()
-            .filter(|d| d.model == filter)
-            .cloned()
-            .collect()
-    } else {
-        result.diagnostics.clone()
-    };
+    let diagnostics: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| in_scope(&d.model))
+        .cloned()
+        .collect();
 
     let models_detail: Vec<ModelDetail> = result
         .project
         .models
         .iter()
+        .filter(|model| in_scope(&model.config.name))
         .map(|model| {
             let typed_cols = result
                 .type_check
@@ -320,26 +324,50 @@ fn compile_inner(
     // not carried on `CompileOutput`: execution order, per-model typed-column
     // counts, and the file_path -> SQL source map (for miette spans).
     let text_data = CompileTextData {
-        execution_order: result.project.execution_order.clone(),
+        execution_order: result
+            .project
+            .execution_order
+            .iter()
+            .filter(|name| in_scope(name))
+            .cloned()
+            .collect(),
         typed_column_counts: result
             .type_check
             .typed_models
             .iter()
+            .filter(|(name, _)| in_scope(name))
             .map(|(name, cols)| (name.clone(), cols.len()))
             .collect(),
         source_map: result
             .project
             .models
             .iter()
+            .filter(|model| in_scope(&model.config.name))
             .map(|m| (m.file_path.clone(), m.sql.clone()))
             .collect(),
     };
 
+    let execution_layers = if model_filter.is_some() {
+        result
+            .project
+            .layers
+            .iter()
+            .filter(|layer| layer.iter().any(|name| in_scope(name)))
+            .count()
+    } else {
+        result.project.layers.len()
+    };
+    let has_errors = if model_filter.is_some() {
+        diagnostics.iter().any(|d| d.severity == Severity::Error)
+    } else {
+        result.has_errors
+    };
+
     let output = CompileOutput::new(
-        result.project.model_count(),
-        result.project.layers.len(),
+        models_detail.len(),
+        execution_layers,
         diagnostics,
-        result.has_errors,
+        has_errors,
         result.timings.clone(),
     )
     .with_models_detail(models_detail)

@@ -1380,8 +1380,46 @@ pub async fn run_compact_apply(
     output_json: bool,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
-    run_compact_apply_in(
+    run_compact_apply_alias_in(
         &cwd,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        output_json,
+    )
+    .await
+}
+
+/// The alias route's raw-payload product gate — one function shared by the
+/// production entrypoint and the injectable test sink, so the shipped path
+/// and the tested path cannot drift.
+fn refuse_product_bound_compact_alias(root: &Path, plan_id: &str) -> Result<()> {
+    let plan = read_plan(root, plan_id)
+        .with_context(|| format!("failed to read compact plan '{plan_id}'"))?;
+    crate::commands::apply::refuse_product_bound_alias_apply(&plan, plan_id, "rocky compact apply")
+}
+
+/// The `rocky compact apply` ALIAS route with an explicit `root`.
+///
+/// Unlike the generic `rocky apply <plan-id>` dispatch (which crosses the
+/// product-identity seam in `run_apply_in` before delegating to
+/// [`run_compact_apply_in`]), this route enters the compact path directly —
+/// so it first reads the RAW persisted payload and refuses any plan carrying
+/// `product_id` / `spec_digest`, in any shape, before the typed
+/// `CompactPlanIr` deserialize and before any gate or warehouse work.
+/// Product-bound plans go through canonical `rocky apply`.
+pub(crate) async fn run_compact_apply_alias_in(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
+    output_json: bool,
+) -> Result<()> {
+    refuse_product_bound_compact_alias(root, plan_id)?;
+    run_compact_apply_in(
+        root,
         config_path,
         plan_id,
         state_path,
@@ -1643,6 +1681,35 @@ pub(crate) async fn run_compact_apply_in_with(
     execute_compact_apply(adapter, plan_id, &statements, output_json).await
 }
 
+/// [`run_compact_apply_alias_in`] with an injected warehouse adapter — the
+/// SAME alias-route product-binding refusal (the shared
+/// [`refuse_product_bound_compact_alias`]), then the injectable sink. Tests
+/// use this to prove a product-bound payload refuses on the alias route
+/// BEFORE any `execute_statement` reaches the adapter (zero recorded
+/// statements).
+#[cfg(test)]
+pub(crate) async fn run_compact_apply_alias_in_with(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    runtime_principal: rocky_core::config::PolicyPrincipal,
+    output_json: bool,
+    adapter: &dyn WarehouseAdapter,
+) -> Result<()> {
+    refuse_product_bound_compact_alias(root, plan_id)?;
+    run_compact_apply_in_with(
+        root,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        output_json,
+        adapter,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1816,6 +1883,112 @@ effect = "deny"
             );
         }
 
+        /// FF-WP1 fix round (finding 1) — the ALIAS route refuses a correctly
+        /// rehashed compact plan whose raw payload carries the product pair,
+        /// BEFORE the typed deserialize, the policy gate, or any warehouse
+        /// statement (zero recorded statements), directing the caller to
+        /// canonical `rocky apply`. The control half runs the IDENTICAL
+        /// payload minus the product keys through the same sink and proves it
+        /// executes — so the refusal is the product gate, nothing else.
+        #[tokio::test]
+        async fn compact_alias_refuses_product_bound_plan_before_any_execution() {
+            let dir = tempfile::tempdir().unwrap();
+            // Permissive posture: a human apply under this config EXECUTES,
+            // so a zero-statement refusal cannot be a policy artifact.
+            let config = write_config(dir.path(), "");
+            let state = fresh_state(dir.path());
+
+            // Hand-authored-but-rehashed payload: a valid v2 compact envelope
+            // PLUS the product pair (a shape the fulfillment chain never
+            // writes for compact plans). `write_plan_v2` hashes this exact
+            // payload, so integrity passes and any refusal is the gate's.
+            let bound_payload = serde_json::json!({
+                "model": "orders",
+                "catalog": null,
+                "scope": null,
+                "dry_run": false,
+                "target_size_mb": 256,
+                "plans": [CompactPlanIr::for_table("orders", 256)],
+                "product_id": "product:revenue_daily",
+                "spec_digest": "sha256:abc",
+            });
+            let bound_id = write_plan_v2(dir.path(), PlanKind::Compact, &bound_payload).unwrap();
+
+            let adapter = CountingAdapter::new();
+            let err = run_compact_apply_alias_in_with(
+                dir.path(),
+                &config,
+                &bound_id,
+                &state,
+                PolicyPrincipal::Human,
+                true,
+                &adapter,
+            )
+            .await
+            .expect_err("a product-bound plan must refuse on the alias route");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("product-identity")
+                    && msg.contains("rocky compact apply")
+                    && msg.contains("rocky apply")
+                    && msg.contains("--expect-spec-digest"),
+                "the refusal names the alias and directs to canonical apply: {msg}"
+            );
+            assert_eq!(
+                adapter.count(),
+                0,
+                "a refused product-bound compact apply must not reach execute_statement"
+            );
+
+            // A LONE product key (a malformed half-binding) refuses on the
+            // alias route too — presence, not well-formedness, is the trigger.
+            let half_payload = serde_json::json!({
+                "model": "orders",
+                "catalog": null,
+                "scope": null,
+                "dry_run": false,
+                "target_size_mb": 256,
+                "plans": [CompactPlanIr::for_table("orders", 256)],
+                "spec_digest": "sha256:abc",
+            });
+            let half_id = write_plan_v2(dir.path(), PlanKind::Compact, &half_payload).unwrap();
+            let err = run_compact_apply_alias_in_with(
+                dir.path(),
+                &config,
+                &half_id,
+                &state,
+                PolicyPrincipal::Human,
+                true,
+                &adapter,
+            )
+            .await
+            .expect_err("a half-bound plan must refuse on the alias route");
+            assert!(
+                format!("{err:#}").contains("product-identity"),
+                "got: {err:#}"
+            );
+            assert_eq!(adapter.count(), 0);
+
+            // Control: the identical payload WITHOUT product keys executes
+            // through the same sink — the refusal above is the product gate.
+            let clean_id = write_compact_plan(dir.path(), "orders");
+            run_compact_apply_alias_in_with(
+                dir.path(),
+                &config,
+                &clean_id,
+                &state,
+                PolicyPrincipal::Human,
+                true,
+                &adapter,
+            )
+            .await
+            .expect("an unbound compact plan still applies through the alias");
+            assert!(
+                adapter.count() > 0,
+                "the control apply must actually execute statements"
+            );
+        }
+
         /// Enforcement uses the runtime principal + plan kind, never the stored
         /// stamp: a plan stamped `human` (a downgrade) is STILL denied when an
         /// agent applies it.
@@ -1859,6 +2032,7 @@ effect = "deny"
                 &plan_id,
                 &state,
                 PolicyPrincipal::Agent,
+                None,
                 true,
             )
             .await

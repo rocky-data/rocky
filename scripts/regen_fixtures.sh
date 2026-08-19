@@ -56,6 +56,42 @@ if [[ ! -d "$POC" ]]; then
     exit 1
 fi
 
+# Every POC this script captures from must exist. Each capture section below
+# used to skip silently when its source was missing, and a skipped section
+# never clears its destination under fixtures_generated/ — so deleting a POC
+# left the previously committed fixtures in place, `git diff --exit-code` saw
+# no change, and codegen-drift passed while the fixtures no longer
+# corresponded to any source (#1432).
+#
+# Failing here makes a deliberate removal explicit: delete the POC and this
+# list in the same PR. Checked up front, so the run fails before it has spent
+# minutes capturing, and the message names every missing source at once
+# rather than one per re-run.
+readonly POCS_ROOT_PREFLIGHT="$WORKSPACE_ROOT/examples/playground/pocs"
+_missing_pocs=()
+for _p in \
+    "$PARTITION_POC" \
+    "$POCS_ROOT_PREFLIGHT/02-performance/06-schema-drift-recover" \
+    "$POCS_ROOT_PREFLIGHT/01-quality/01-data-contracts-strict" \
+    "$POCS_ROOT_PREFLIGHT/02-performance/01-incremental-watermark" \
+    "$POCS_ROOT_PREFLIGHT/02-performance/05-optimize-recommendations" \
+    "$POCS_ROOT_PREFLIGHT/06-developer-experience/01-lineage-column-level" \
+    "$POCS_ROOT_PREFLIGHT/06-developer-experience/05-doctor-and-ci" \
+    "$POCS_ROOT_PREFLIGHT/01-quality/03-anomaly-detection"; do
+    [[ -d "$_p" ]] || _missing_pocs+=("$_p")
+done
+if (( ${#_missing_pocs[@]} > 0 )); then
+    echo "Error: ${#_missing_pocs[@]} fixture-source POC(s) missing:" >&2
+    printf '  %s\n' "${_missing_pocs[@]}" >&2
+    echo >&2
+    echo "Fixtures are captured from these POCs. A missing source would be" >&2
+    echo "skipped silently, leaving stale committed fixtures that no source" >&2
+    echo "produces -- and codegen-drift would pass. If a POC was removed on" >&2
+    echo "purpose, drop it from this list and delete its fixtures in the same" >&2
+    echo "change." >&2
+    exit 1
+fi
+
 mkdir -p "$DEST"
 
 # --- Bootstrap the POC: clean state, seed duckdb, run rocky once for state ---
@@ -120,6 +156,11 @@ _PLAN_JSON=$("$ROCKY" plan --filter source=orders 2>/dev/null || true)
 _PLAN_ID=$(printf '%s' "$_PLAN_JSON" \
     | python3 -c "import sys, json; print(json.load(sys.stdin).get('plan_id', ''))" 2>/dev/null || true)
 if [[ -n "$_PLAN_ID" ]]; then
+    # review_status: the typed marker oracle (`rocky review <plan-id> --status`),
+    # captured BEFORE the apply so the fixture pins the pending shape
+    # (reviewed:false; the marker/approver/product fields skip-serialized).
+    "$ROCKY" review "$_PLAN_ID" --status 2>/dev/null > "$DEST/review_status.json" || true
+    python3 "$NORMALIZER" "$DEST/review_status.json"
     "$ROCKY" apply "$_PLAN_ID" 2>/dev/null > "$DEST/apply.json" || true
     python3 "$NORMALIZER" "$DEST/apply.json"
 else

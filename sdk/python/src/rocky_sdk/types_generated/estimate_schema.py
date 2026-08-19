@@ -33,10 +33,20 @@ class ModelEstimate(BaseModel):
 class EstimateOutput(BaseModel):
     """
     JSON output for `rocky estimate`.
+
+    `estimates` is empty when the project declares no models; `message` is populated in that case to explain why, mirroring [`OptimizeOutput`]. An unknown `--model` is an error, not an empty result.
     """
 
     command: str
     estimates: list[ModelEstimate]
+    message: str | None = None
+    """
+    Why `estimates` is empty, when it is. Absent whenever `estimates` is non-empty.
+
+    Populated for both empty cases: no model matched (`--model` is refused outright, so this means the project declares none), and models matched but none produced an estimate because SQL generation or `EXPLAIN` failed for every one of them.
+
+    Without this, an empty `estimates` array was the command's only signal that it had nothing to report — and the text path said `No models found.` while the JSON path said nothing at all, so the human was told and the machine was not (#1428).
+    """
     total_estimated_cost_usd: float | None = None
     """
     Total estimated cost in USD across all models. `None` when no individual model produced a cost estimate.

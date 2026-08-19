@@ -831,6 +831,26 @@ impl VisitorMut for DeferRewriter<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// Pins the equivalence a probe-driven `case_rules` will depend on (#1282).
+    ///
+    /// Nothing routes through the probe today — #1281 shipped the capability
+    /// only. But the moment a consumer maps an `Insignificant` observation to
+    /// `all_insensitive()`, DuckDB, Databricks and Trino change constructor:
+    /// `dialect_case_rules` hands them `uniform(false)` today. "No behaviour
+    /// change for the three folding dialects" is then a claim about these two
+    /// values being equal, which is a test rather than a PR-body assertion.
+    ///
+    /// If this ever fails, the consumer is the thing to fix — not this test.
+    #[test]
+    fn uniform_false_and_all_insensitive_are_the_same_rules() {
+        assert_eq!(
+            super::IdentifierCaseRules::uniform(false),
+            super::IdentifierCaseRules::all_insensitive(),
+            "a folding dialect's rules must not change depending on which \
+             constructor produced them"
+        );
+    }
+
     use super::*;
 
     fn target(catalog: &str, schema: &str, table: &str) -> DeferTarget {

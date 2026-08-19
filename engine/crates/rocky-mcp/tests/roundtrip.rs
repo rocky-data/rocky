@@ -87,6 +87,7 @@ async fn tools_list_returns_expected_set() {
             "dependents",
             "draft_check",
             "draft_contract",
+            "draft_metadata",
             "draft_model",
             "drift_preview",
             "estate_brief",
@@ -110,6 +111,110 @@ async fn tools_list_returns_expected_set() {
             "test",
         ]
     );
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1 golden worker-profile surface ⟦RTL-1,3⟧: `--profile worker` serves
+/// EXACTLY the drafting allowlist. This vec is the profile's contract — a
+/// future tool addition must consciously decide its profiles or it is
+/// excluded by default (the sibling default-profile golden pins the other
+/// surface).
+#[tokio::test]
+async fn worker_profile_tools_list_is_the_minimal_allowlist() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    );
+
+    let client = connect(server).await;
+    let tools = client.list_all_tools().await.expect("list tools");
+    let mut names: Vec<String> = tools.into_iter().map(|t| t.name.to_string()).collect();
+    names.sort();
+
+    assert_eq!(
+        names,
+        vec![
+            "breaking_change",
+            "catalog",
+            "compile",
+            "dependents",
+            "draft_check",
+            "draft_model",
+            "inspect_schema",
+            "lineage",
+            "list",
+            "plan_preview",
+            "profile_column",
+            "sample_rows",
+            "test",
+        ],
+        "the worker profile is an exhaustive allowlist — nothing else may appear"
+    );
+
+    // The prompt NAMES are served in both profiles; the workflow prompts'
+    // CONTENT branches on the profile (worker variants end at the runner
+    // handoff — pinned by `worker_profile_prompts_end_at_the_runner_handoff`).
+    let prompts = client.list_all_prompts().await.expect("list prompts");
+    let mut prompt_names: Vec<String> = prompts.iter().map(|p| p.name.clone()).collect();
+    prompt_names.sort();
+    assert_eq!(
+        prompt_names,
+        vec![
+            "add_tests_to_pks",
+            "build_model",
+            "find_untested_models",
+            "fix_failing_test",
+            "summarize_project",
+        ],
+        "the worker profile keeps the full prompt-name set"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The adversarial half: a worker-profile session CALLING an excluded tool
+/// gets rmcp's tool-not-found error — the route is absent, not merely
+/// unlisted — while an allowlisted tool still runs.
+#[tokio::test]
+async fn worker_profile_calling_an_excluded_tool_is_tool_not_found() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    );
+    let client = connect(server).await;
+
+    for excluded in [
+        "propose",
+        "draft_contract",
+        "draft_metadata",
+        "review_queue",
+        "pause_schedule",
+        "estate_brief",
+        "audit_query",
+    ] {
+        let err = client
+            .call_tool(CallToolRequestParams::new(excluded))
+            .await
+            .expect_err(&format!(
+                "calling excluded tool '{excluded}' must be a protocol error"
+            ));
+        assert!(
+            err.to_string().contains("tool not found"),
+            "'{excluded}' must be tool-not-found, got: {err}"
+        );
+    }
+
+    // Control: an allowlisted tool still routes and runs.
+    let compile = client
+        .call_tool(CallToolRequestParams::new("compile"))
+        .await
+        .expect("compile is allowlisted and must run under the worker profile");
+    assert_ne!(compile.is_error, Some(true), "compile runs");
 
     client.cancel().await.unwrap();
 }
@@ -234,6 +339,380 @@ async fn propose_writes_ai_authored_plan() {
     let plan: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&plan_path).unwrap()).unwrap();
     assert_eq!(plan["kind"], serde_json::json!("ai_authored"));
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1: a propose carrying the product pair binds the identity into the
+/// hashed plan payload, derives the documented idempotency-key fallback, gets
+/// a DIFFERENT plan_id than the identical propose without the pair, and echoes
+/// the pair in the result.
+#[tokio::test]
+async fn propose_with_product_fields_binds_identity_and_derives_key() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Baseline: a bare propose (no product identity).
+    let bare = client
+        .call_tool(CallToolRequestParams::new("propose"))
+        .await
+        .expect("bare propose");
+    let bare_plan_id = bare.structured_content.expect("result")["plan_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Product-bound propose.
+    let args = serde_json::json!({
+        "product_id": "product:revenue_daily",
+        "spec_digest": "sha256:abc123",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let bound = client
+        .call_tool(CallToolRequestParams::new("propose").with_arguments(args))
+        .await
+        .expect("product propose");
+    assert_ne!(bound.is_error, Some(true), "product propose succeeds");
+    let sc = bound.structured_content.expect("structured content");
+    let plan_id = sc["plan_id"].as_str().unwrap();
+    assert_ne!(
+        plan_id, bare_plan_id,
+        "the product identity is part of the hashed payload, so the id moves"
+    );
+    assert_eq!(sc["product_id"], serde_json::json!("product:revenue_daily"));
+    assert_eq!(sc["spec_digest"], serde_json::json!("sha256:abc123"));
+
+    // The persisted payload carries the pair + the derived idempotency key.
+    let plan_path = dir
+        .path()
+        .join(".rocky")
+        .join("plans")
+        .join(format!("{plan_id}.json"));
+    let plan: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&plan_path).unwrap()).unwrap();
+    assert_eq!(
+        plan["payload"]["product_id"],
+        serde_json::json!("product:revenue_daily")
+    );
+    assert_eq!(
+        plan["payload"]["spec_digest"],
+        serde_json::json!("sha256:abc123")
+    );
+    assert_eq!(
+        plan["payload"]["idempotency_key"],
+        serde_json::json!("product:revenue_daily@sha256:abc123"),
+        "absent a runner key, the engine derives the attempt-aliasing fallback"
+    );
+    // The bare plan carries none of them.
+    let bare_path = dir
+        .path()
+        .join(".rocky")
+        .join("plans")
+        .join(format!("{bare_plan_id}.json"));
+    let bare_plan: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bare_path).unwrap()).unwrap();
+    assert!(bare_plan["payload"].get("product_id").is_none());
+    assert!(bare_plan["payload"].get("idempotency_key").is_none());
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1: the `test` tool accepts an optional `model` scope; an unknown
+/// model is the stable `model_not_found` taxonomy, and the unscoped call is
+/// unchanged.
+#[tokio::test]
+async fn test_tool_scopes_to_a_model_and_refuses_unknown() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Unscoped: unchanged behavior.
+    let all = client
+        .call_tool(CallToolRequestParams::new("test"))
+        .await
+        .expect("unscoped test call");
+    assert_ne!(all.is_error, Some(true));
+
+    // Scoped to the real model: runs (it declares no tests — 0/0 is fine).
+    let scoped = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({ "model": "orders" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("scoped test call");
+    assert_ne!(scoped.is_error, Some(true), "a known model scope runs");
+
+    // Unknown model: the stable model_not_found envelope.
+    let missing = client
+        .call_tool(
+            CallToolRequestParams::new("test").with_arguments(
+                serde_json::json!({ "model": "nope" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("unknown-model test call returns a tool result");
+    assert_eq!(missing.is_error, Some(true));
+    let err = missing.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("model_not_found"), "{err:?}");
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1: `review_queue` filters the listing by `product_id` via
+/// integrity-checked plan reads — and a pending plan whose file no longer
+/// passes its integrity check surfaces as a WARNING entry, never a silent
+/// drop.
+#[tokio::test]
+async fn review_queue_product_filter_reads_plans_and_surfaces_corruption() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "require_review"
+"#,
+    );
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Two pending escalations: one product-bound, one bare.
+    let bound = client
+        .call_tool(
+            CallToolRequestParams::new("propose").with_arguments(
+                serde_json::json!({
+                    "product_id": "product:revenue_daily",
+                    "spec_digest": "sha256:abc",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await
+        .expect("bound propose");
+    let bound_err = bound.structured_content.expect("review-required envelope");
+    // FF-WP1 fix round (finding 4): the recorded plan reference is TYPED —
+    // `plan_id` + the product binding ride as envelope fields, so the runner
+    // reads them structurally instead of scraping prose.
+    assert_eq!(
+        bound_err["code"],
+        serde_json::json!("policy_review_required")
+    );
+    let bound_plan_id = bound_err["plan_id"]
+        .as_str()
+        .expect("the recorded plan_id is a typed envelope field")
+        .to_string();
+    assert_eq!(
+        bound_plan_id.len(),
+        64,
+        "the typed plan_id is the 64-char blake3 id"
+    );
+    assert_eq!(
+        bound_err["product_id"],
+        serde_json::json!("product:revenue_daily"),
+        "the product binding rides typed on the handoff: {bound_err:?}"
+    );
+    assert_eq!(bound_err["spec_digest"], serde_json::json!("sha256:abc"));
+    let bare = client
+        .call_tool(CallToolRequestParams::new("propose"))
+        .await
+        .expect("bare propose");
+    let bare_err = bare.structured_content.expect("review-required envelope");
+    let bare_plan_id = bare_err["plan_id"]
+        .as_str()
+        .expect("the recorded plan_id is a typed envelope field")
+        .to_string();
+    assert!(
+        bare_err.get("product_id").is_none() || bare_err["product_id"].is_null(),
+        "an unbound propose carries no product fields on the handoff: {bare_err:?}"
+    );
+    assert_ne!(bound_plan_id, bare_plan_id);
+
+    // Unfiltered: both pending.
+    let unfiltered = client
+        .call_tool(CallToolRequestParams::new("review_queue"))
+        .await
+        .expect("queue list");
+    let sc = unfiltered.structured_content.expect("result");
+    assert_eq!(sc["total"], serde_json::json!(2), "{sc:?}");
+
+    // Filtered: exactly the product-bound plan.
+    let filtered = client
+        .call_tool(
+            CallToolRequestParams::new("review_queue").with_arguments(
+                serde_json::json!({ "product_id": "product:revenue_daily" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("filtered queue list");
+    let sc = filtered.structured_content.expect("result");
+    assert_eq!(sc["total"], serde_json::json!(1), "{sc:?}");
+    assert_eq!(
+        sc["pending"][0]["plan_id"],
+        serde_json::json!(bound_plan_id)
+    );
+
+    // Corrupt the BARE plan's payload on disk (its integrity re-hash now
+    // fails). The filter cannot classify it, so it must surface as a
+    // warning entry — not vanish.
+    let bare_path = dir
+        .path()
+        .join(".rocky")
+        .join("plans")
+        .join(format!("{bare_plan_id}.json"));
+    let mut plan_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&bare_path).unwrap()).unwrap();
+    plan_json["payload"]["model"] = serde_json::json!("tampered");
+    std::fs::write(&bare_path, serde_json::to_vec_pretty(&plan_json).unwrap()).unwrap();
+
+    let filtered = client
+        .call_tool(
+            CallToolRequestParams::new("review_queue").with_arguments(
+                serde_json::json!({ "product_id": "product:revenue_daily" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .expect("filtered queue list over a corrupt plan");
+    let sc = filtered.structured_content.expect("result");
+    assert_eq!(
+        sc["total"],
+        serde_json::json!(2),
+        "match + warning — the corrupt plan is counted, not dropped: {sc:?}"
+    );
+    let pending = sc["pending"].as_array().unwrap();
+    let warning = pending
+        .iter()
+        .find(|e| e["plan_id"] == serde_json::json!(bare_plan_id))
+        .expect("the corrupt plan surfaces");
+    assert!(
+        warning["warning"]
+            .as_str()
+            .unwrap()
+            .contains("could not be read"),
+        "the entry says WHY it is unclassifiable: {warning:?}"
+    );
+
+    // The filter is list-only: combining it with an approve is refused.
+    let combined = client
+        .call_tool(
+            CallToolRequestParams::new("review_queue").with_arguments(
+                serde_json::json!({
+                    "product_id": "product:revenue_daily",
+                    "approve_plan_id": bound_plan_id,
+                    "confirm": true,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+        )
+        .await
+        .expect("combined call returns a result");
+    assert_eq!(combined.is_error, Some(true));
+    let err = combined.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1: a runner-supplied idempotency key WINS over the derived fallback.
+#[tokio::test]
+async fn propose_runner_supplied_idempotency_key_wins() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({
+        "product_id": "product:revenue_daily",
+        "spec_digest": "sha256:abc123",
+        "idempotency_key": "product:revenue_daily@sha256:abc123@seq-7",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let res = client
+        .call_tool(CallToolRequestParams::new("propose").with_arguments(args))
+        .await
+        .expect("propose");
+    let plan_id = res.structured_content.expect("result")["plan_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plan: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            dir.path()
+                .join(".rocky")
+                .join("plans")
+                .join(format!("{plan_id}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        plan["payload"]["idempotency_key"],
+        serde_json::json!("product:revenue_daily@sha256:abc123@seq-7"),
+        "the runner's per-attempt key must not be replaced by the derived fallback"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1 ⟦RTL-4⟧: exactly one product field (or an empty one) is an
+/// `invalid_argument` refusal, and no plan is written.
+#[tokio::test]
+async fn propose_with_partial_product_identity_is_refused() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    for args in [
+        serde_json::json!({ "product_id": "product:revenue_daily" }),
+        serde_json::json!({ "spec_digest": "sha256:abc123" }),
+        serde_json::json!({ "product_id": "  ", "spec_digest": "sha256:abc123" }),
+    ] {
+        let res = client
+            .call_tool(
+                CallToolRequestParams::new("propose")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await
+            .expect("refusal is a tool result, not a transport error");
+        assert_eq!(res.is_error, Some(true), "partial identity must refuse");
+        let err = res.structured_content.expect("structured envelope");
+        assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    }
+    assert!(
+        plan_files(dir.path()).is_empty(),
+        "a refused propose must not write a plan file"
+    );
 
     client.cancel().await.unwrap();
 }
@@ -872,6 +1351,307 @@ effect = "require_review"
     client.cancel().await.unwrap();
 }
 
+/// A sidecar for the `orders` fixture carrying the spec-owned metadata a
+/// worker must never be able to erase: a PII classification, a freshness
+/// block, a test, tags, and explicit strategy/target.
+const SPEC_OWNED_ORDERS_SIDECAR: &str = r#"name = "orders"
+intent = "original spec-owned intent"
+
+[tags]
+layer = "gold"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "warehouse"
+schema = "out"
+table = "orders"
+
+[classification]
+status = "pii"
+
+[freshness]
+expected_lag_seconds = 3600
+time_column = "id"
+
+[[tests]]
+type = "not_null"
+column = "id"
+"#;
+
+/// FF-WP1 fix round (finding 2) — `draft_model` on an EXISTING model is a
+/// preserve-merge: the SQL body is replaced and ONLY `name` / `intent` change
+/// in the sidecar; classification, freshness, tests, tags, strategy, and
+/// target all survive the redraft. Before the fix, the sidecar was replaced
+/// wholesale with the minimal name+intent document.
+#[tokio::test]
+async fn draft_model_on_existing_model_preserves_spec_owned_metadata() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sidecar_path = dir.path().join("models").join("orders.toml");
+    std::fs::write(&sidecar_path, SPEC_OWNED_ORDERS_SIDECAR).unwrap();
+    let before: toml::Table = toml::from_str(SPEC_OWNED_ORDERS_SIDECAR).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id, 'REDRAFTED' AS status",
+                "redrafted intent",
+            )),
+        )
+        .await
+        .expect("draft_model call");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "redrafting an existing model succeeds: {:?}",
+        result.structured_content
+    );
+
+    // The SQL body was replaced.
+    let sql = std::fs::read_to_string(dir.path().join("models").join("orders.sql")).unwrap();
+    assert!(sql.contains("REDRAFTED"), "the SQL body is the new draft");
+
+    // The sidecar changed in EXACTLY `name` + `intent`; everything else is
+    // preserved value-for-value (the merge re-serializes, so the comparison
+    // is over parsed tables, not raw bytes).
+    let after_text = std::fs::read_to_string(&sidecar_path).unwrap();
+    let mut after: toml::Table = toml::from_str(&after_text).unwrap();
+    assert_eq!(
+        after.remove("name"),
+        Some(toml::Value::String("orders".to_string()))
+    );
+    assert_eq!(
+        after.remove("intent"),
+        Some(toml::Value::String("redrafted intent".to_string())),
+        "the intent is the redraft's"
+    );
+    let mut expected = before.clone();
+    expected.remove("name");
+    expected.remove("intent");
+    assert_eq!(
+        after, expected,
+        "every key except name/intent is preserved exactly"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1 fix round (finding 2) — an existing sidecar that does not parse as
+/// TOML REFUSES the redraft (mirroring draft_metadata): spec-owned metadata
+/// is never clobbered just because it is malformed. Both files stay
+/// byte-identical.
+#[tokio::test]
+async fn draft_model_refuses_to_clobber_an_unparseable_sidecar() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sidecar_path = dir.path().join("models").join("orders.toml");
+    std::fs::write(&sidecar_path, "name = \"orders\"\n[strategy\nbroken !!").unwrap();
+    let sidecar_before = std::fs::read(&sidecar_path).unwrap();
+    let sql_path = dir.path().join("models").join("orders.sql");
+    let sql_before = std::fs::read(&sql_path).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id",
+                "should not land",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an unparseable sidecar refuses"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("models/orders.toml"),
+        "the error names the sidecar: {err:?}"
+    );
+
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap(),
+        sidecar_before,
+        "the unparseable sidecar is byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(&sql_path).unwrap(),
+        sql_before,
+        "the SQL body is untouched too"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1 fix round 2 (item 2) — an EXISTS-but-unreadable sidecar refuses the
+/// redraft instead of being treated as a NEW model. The rollback snapshot
+/// converts read errors to "absent"; before the guard, the draft would
+/// overwrite the sidecar's spec-owned metadata and a policy-denied rollback
+/// would DELETE the file. The refusal names the path and the file survives
+/// untouched.
+#[cfg(unix)]
+#[tokio::test]
+async fn draft_model_refuses_an_existing_but_unreadable_sidecar() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sidecar_path = dir.path().join("models").join("orders.toml");
+    let sidecar_before = std::fs::read(&sidecar_path).unwrap();
+    let sql_path = dir.path().join("models").join("orders.sql");
+    let sql_before = std::fs::read(&sql_path).unwrap();
+
+    // Make the sidecar exist-but-unreadable, restoring permissions on every
+    // exit path so cleanup (and the byte comparison) can read it again.
+    let readable = std::fs::Permissions::from_mode(0o644);
+    std::fs::set_permissions(&sidecar_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    struct RestorePerms(std::path::PathBuf, std::fs::Permissions);
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+    let _restore = RestorePerms(sidecar_path.clone(), readable);
+
+    // Probe the condition the test needs: running as root (e.g. a container
+    // CI), mode 0o000 does not make the file unreadable, so the guard under
+    // test cannot fire — skip rather than assert a condition this
+    // environment cannot exhibit.
+    if std::fs::read(&sidecar_path).is_ok() {
+        eprintln!("skipping: chmod 0o000 does not make files unreadable here (running as root?)");
+        return;
+    }
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id",
+                "should not land",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an existing-but-unreadable sidecar refuses"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/orders.toml") && message.contains("cannot be read"),
+        "the error names the unreadable sidecar: {err:?}"
+    );
+
+    client.cancel().await.unwrap();
+
+    // The file SURVIVES — neither overwritten nor deleted by a rollback —
+    // and the SQL body is untouched.
+    drop(_restore);
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap(),
+        sidecar_before,
+        "the unreadable sidecar is byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(&sql_path).unwrap(),
+        sql_before,
+        "the SQL body is untouched too"
+    );
+}
+
+/// FF-WP1 fix round (finding 2) — THE de-scope pin: with a rule denying agent
+/// authorship on `classifications = ["pii"]`, redrafting a PII-classified
+/// model via `draft_model` is DENIED, and the rollback restores BOTH files
+/// byte-for-byte. Before the fix, the redraft replaced the sidecar with the
+/// minimal name+intent document — erasing the `pii` classification the deny
+/// rule matches on — and the policy evaluation (which runs post-write, on the
+/// on-disk image) resolved to the default posture instead of the deny.
+#[tokio::test]
+async fn draft_model_redraft_of_pii_model_is_denied_and_byte_restored() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { classifications = ["pii"] }
+effect = "deny"
+"#,
+    );
+    let sidecar_path = dir.path().join("models").join("orders.toml");
+    std::fs::write(&sidecar_path, SPEC_OWNED_ORDERS_SIDECAR).unwrap();
+    let sidecar_before = std::fs::read(&sidecar_path).unwrap();
+    let sql_path = dir.path().join("models").join("orders.sql");
+    let sql_before = std::fs::read(&sql_path).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id, 'X' AS status",
+                "attempt to redraft a pii model",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+
+    assert_eq!(result.is_error, Some(true), "the redraft is refused");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("policy_denied"),
+        "the pii-scoped DENY decides — not the default require_review: {err:?}"
+    );
+    assert_eq!(
+        err["policy_rule"],
+        serde_json::json!("0"),
+        "the deciding rule is the classification-scoped deny: {err:?}"
+    );
+
+    // Byte-restore: the deny rolled back BOTH files exactly.
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap(),
+        sidecar_before,
+        "the deny restores the prior sidecar bytes"
+    );
+    assert_eq!(
+        std::fs::read(&sql_path).unwrap(),
+        sql_before,
+        "the deny restores the prior SQL bytes"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 // --- draft_contract / draft_check (agent-authored write path) ---------------
 
 /// The happy path: `draft_contract` writes the agent's `.contract.toml` next to
@@ -1173,6 +1953,414 @@ async fn draft_check_rejects_smuggled_sidecar_config() {
     // The sidecar is byte-for-byte untouched: the gate fires BEFORE the write.
     let after = std::fs::read_to_string(dir.path().join("models").join("orders.toml")).unwrap();
     assert_eq!(after, before, "a rejected spec writes nothing");
+
+    client.cancel().await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// draft_metadata (FF-WP1)
+// ---------------------------------------------------------------------------
+
+fn metadata_args(json: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    match json {
+        serde_json::Value::Object(map) => map,
+        other => panic!("metadata_args needs a JSON object, got {other}"),
+    }
+}
+
+/// Happy path: a structured patch merges `[freshness]` + `[classification]`
+/// into the sidecar via parse-merge, preserving the existing strategy/target,
+/// and the result carries the compile with the write.
+#[tokio::test]
+async fn draft_metadata_writes_freshness_and_classifications() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "freshness": {
+                        "expected_lag_seconds": 86400,
+                        "time_column": "status",
+                        "severity": "error",
+                    },
+                    "classifications": { "status": "internal" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata call");
+
+    assert_ne!(result.is_error, Some(true), "a valid patch is not an error");
+    let sc = result.structured_content.expect("structured content");
+    assert_eq!(sc["model"], serde_json::json!("orders"));
+    assert_eq!(sc["sidecar_path"], serde_json::json!("models/orders.toml"));
+    assert_eq!(sc["has_errors"], serde_json::json!(false));
+    assert!(
+        sc["next_steps"]
+            .as_str()
+            .unwrap()
+            .contains("Never apply a draft directly"),
+        "the reminder rides along"
+    );
+
+    // The sidecar re-parses and carries the patch AND the prior config.
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let parsed: toml::Table = toml::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    assert_eq!(
+        parsed["freshness"]["expected_lag_seconds"],
+        toml::Value::Integer(86400)
+    );
+    assert_eq!(
+        parsed["freshness"]["time_column"],
+        toml::Value::String("status".to_string())
+    );
+    assert_eq!(
+        parsed["freshness"]["severity"],
+        toml::Value::String("error".to_string())
+    );
+    assert_eq!(
+        parsed["classification"]["status"],
+        toml::Value::String("internal".to_string())
+    );
+    assert_eq!(
+        parsed["strategy"]["type"],
+        toml::Value::String("full_refresh".to_string()),
+        "the pre-existing strategy survives the parse-merge"
+    );
+    assert_eq!(
+        parsed["target"]["table"],
+        toml::Value::String("orders".to_string()),
+        "the pre-existing target survives the parse-merge"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The merge case that motivated parse-merge: a sidecar `draft_check`
+/// previously string-appended `[[tests]]` blocks into still round-trips —
+/// the tests survive, the patch lands, and a second freshness patch REPLACES
+/// the first rather than duplicating the table. Classification merges keep
+/// other columns' tags.
+#[tokio::test]
+async fn draft_metadata_merges_over_appended_checks_and_replaces_freshness() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    // Step 1: draft_check string-appends a [[tests]] block (the legacy merge).
+    let check = client
+        .call_tool(
+            CallToolRequestParams::new("draft_check").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+                }),
+            )),
+        )
+        .await
+        .expect("draft_check call");
+    assert_ne!(check.is_error, Some(true), "the check draft succeeds");
+
+    // Step 2: a first metadata patch.
+    let first = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "freshness": { "expected_lag_seconds": 3600 },
+                    "classifications": { "id": "internal" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata call");
+    assert_ne!(first.is_error, Some(true), "the first patch succeeds");
+
+    // Step 3: a second patch replaces [freshness] and merges a NEW column tag.
+    let second = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "freshness": { "expected_lag_seconds": 7200, "severity": "warning" },
+                    "classifications": { "status": "pii" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata call");
+    assert_ne!(second.is_error, Some(true), "the second patch succeeds");
+
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let text = std::fs::read_to_string(&sidecar).unwrap();
+    let parsed: toml::Table = toml::from_str(&text).unwrap();
+    // The appended check survived both parse-merges.
+    let tests = parsed["tests"].as_array().expect("[[tests]] survives");
+    assert_eq!(tests.len(), 1, "exactly the one appended check: {text}");
+    // [freshness] was REPLACED, not duplicated or unioned.
+    assert_eq!(
+        parsed["freshness"]["expected_lag_seconds"],
+        toml::Value::Integer(7200)
+    );
+    assert!(
+        parsed["freshness"].get("time_column").is_none(),
+        "replace semantics: the absent field does not linger from patch 1"
+    );
+    // Classification MERGED: both columns tagged.
+    assert_eq!(
+        parsed["classification"]["id"],
+        toml::Value::String("internal".to_string())
+    );
+    assert_eq!(
+        parsed["classification"]["status"],
+        toml::Value::String("pii".to_string())
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// Refusals: an unknown model, an empty patch, and a malformed-value patch
+/// each refuse with a structured envelope and write nothing.
+#[tokio::test]
+async fn draft_metadata_refuses_bad_arguments_without_writing() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let before = std::fs::read(dir.path().join("models").join("orders.toml")).unwrap();
+
+    for (args, expect_code) in [
+        (
+            serde_json::json!({ "model": "nope", "classifications": { "id": "pii" } }),
+            "model_not_found",
+        ),
+        (serde_json::json!({ "model": "orders" }), "invalid_argument"),
+        (
+            serde_json::json!({ "model": "orders", "classifications": {} }),
+            "invalid_argument",
+        ),
+        (
+            serde_json::json!({
+                "model": "orders",
+                "freshness": { "expected_lag_seconds": 0 },
+            }),
+            "invalid_argument",
+        ),
+        (
+            serde_json::json!({
+                "model": "orders",
+                "freshness": { "expected_lag_seconds": 60, "severity": "fatal" },
+            }),
+            "invalid_argument",
+        ),
+        (
+            serde_json::json!({
+                "model": "orders",
+                "classifications": { "  ": "pii" },
+            }),
+            "invalid_argument",
+        ),
+    ] {
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(args)),
+            )
+            .await
+            .expect("draft_metadata returns a result");
+        assert_eq!(result.is_error, Some(true));
+        let err = result.structured_content.expect("envelope");
+        assert_eq!(err["code"], serde_json::json!(expect_code), "{err:?}");
+    }
+
+    let after = std::fs::read(dir.path().join("models").join("orders.toml")).unwrap();
+    assert_eq!(after, before, "every refusal leaves the sidecar untouched");
+
+    client.cancel().await.unwrap();
+}
+
+/// An unparseable sidecar is NEVER clobbered: the call fails naming the file
+/// and the bytes on disk stay identical.
+#[tokio::test]
+async fn draft_metadata_never_clobbers_an_unparseable_sidecar() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    // Corrupt the sidecar AFTER project creation: model source still exists.
+    let sidecar = dir.path().join("models").join("orders.toml");
+    std::fs::write(&sidecar, "name = \"orders\"\n[strategy\nbroken !!").unwrap();
+    let before = std::fs::read(&sidecar).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "classifications": { "id": "pii" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata returns a result");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an unparseable sidecar refuses"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("invalid_argument"));
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("models/orders.toml"),
+        "the error names the sidecar: {err:?}"
+    );
+    let after = std::fs::read(&sidecar).unwrap();
+    assert_eq!(after, before, "the unparseable sidecar is byte-identical");
+
+    client.cancel().await.unwrap();
+}
+
+/// A patch whose merged sidecar fails to compile-load rolls back: the sidecar
+/// parses as TOML (so the parse gate passes) but is not a valid model config,
+/// the compile step hard-fails, and the guard restores the prior bytes.
+#[tokio::test]
+async fn draft_metadata_compile_failure_rolls_back() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    // TOML-valid but ModelConfig-invalid: `strategy` must be a table.
+    let sidecar = dir.path().join("models").join("orders.toml");
+    std::fs::write(&sidecar, "name = \"orders\"\nstrategy = \"full_refresh\"\n").unwrap();
+    let before = std::fs::read(&sidecar).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "classifications": { "id": "internal" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata returns a result");
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "the merged sidecar cannot load"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("compile_failed"),
+        "a config-invalid sidecar is a hard compile failure: {err:?}"
+    );
+    let after = std::fs::read(&sidecar).unwrap();
+    assert_eq!(
+        after, before,
+        "the compile failure restores the pre-patch sidecar bytes"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// ⟦RTL-2⟧ THE post-image gate proof: a rule denying the agent on
+/// `classifications = ["pii"]` must deny the very patch that ADDS the first
+/// `pii` tag — the gate reads the attributes AS PATCHED, not the pre-write
+/// ones (which carry no pii and would evade the rule). The deny restores the
+/// prior sidecar byte-for-byte. The control half: the same patch with a
+/// non-pii tag does NOT match the deny rule (it falls to the default
+/// require_review and persists), proving the deny came from the
+/// classification scope, not a blanket rule.
+#[tokio::test]
+async fn draft_metadata_newly_added_pii_is_denied_on_the_post_image() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { classifications = ["pii"] }
+effect = "deny"
+"#,
+    );
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let before = std::fs::read(&sidecar).unwrap();
+
+    // The attack shape: the model carries NO pii tag yet; the patch adds the
+    // first one. A pre-image gate would see zero classifications and let it
+    // through as require_review.
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "classifications": { "status": "pii" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata returns a result");
+    assert_eq!(result.is_error, Some(true));
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("policy_denied"),
+        "the pii-scoped rule must catch the patch that ADDS pii: {err:?}"
+    );
+    assert_eq!(err["policy_rule"], serde_json::json!("0"));
+    let after = std::fs::read(&sidecar).unwrap();
+    assert_eq!(
+        after, before,
+        "a denied patch restores the prior sidecar bytes exactly"
+    );
+
+    // Control: a non-pii tag does not match the deny scope; it resolves to
+    // the default require_review and the patched sidecar PERSISTS.
+    let control = client
+        .call_tool(
+            CallToolRequestParams::new("draft_metadata").with_arguments(metadata_args(
+                serde_json::json!({
+                    "model": "orders",
+                    "classifications": { "status": "internal" },
+                }),
+            )),
+        )
+        .await
+        .expect("draft_metadata returns a result");
+    assert_eq!(control.is_error, Some(true));
+    let control_err = control.structured_content.expect("envelope");
+    assert_eq!(
+        control_err["code"],
+        serde_json::json!("policy_review_required"),
+        "a non-pii patch falls to the default, not the pii deny: {control_err:?}"
+    );
+    let parsed: toml::Table = toml::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+    assert_eq!(
+        parsed["classification"]["status"],
+        toml::Value::String("internal".to_string()),
+        "the require_review patch persists as the reviewable artifact"
+    );
 
     client.cancel().await.unwrap();
 }
@@ -1515,6 +2703,214 @@ async fn authoring_trajectories_orchestrate_tools_and_stop_at_the_gate() {
     assert!(
         !haystack.contains("plan_id"),
         "summarize_project is read-only and must not drive a propose/plan flow:\n{haystack}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1 fix round (finding 7) — the worker-profile GOLDEN prompt surface:
+/// every workflow prompt served under `--profile worker` (1) never mentions a
+/// tool the profile excludes (`propose`, `draft_contract`, `draft_metadata`,
+/// `ai_test`, `ai_contract`, `review_queue`, `pause_schedule`) and (2) ends
+/// at an explicit hand-off to the trusted runner. The default-profile golden
+/// tests above pin the other surface, so a prompt edit must consciously pick
+/// its profiles.
+#[tokio::test]
+async fn worker_profile_prompts_end_at_the_runner_handoff() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    );
+    let client = connect(server).await;
+
+    // Tools the worker profile excludes — no worker prompt may instruct them.
+    // (`ai_test`/`ai_contract` also cover the excluded-generator class.)
+    const EXCLUDED_TOOL_MENTIONS: &[&str] = &[
+        "propose",
+        "draft_contract",
+        "draft_metadata",
+        "ai_test",
+        "ai_contract",
+        "review_queue",
+        "pause_schedule",
+    ];
+
+    let build_args = serde_json::json!({ "intent": "daily revenue" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let model_args = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let prompts: Vec<(&str, Option<serde_json::Map<String, serde_json::Value>>)> = vec![
+        ("build_model", Some(build_args)),
+        ("find_untested_models", None),
+        ("add_tests_to_pks", Some(model_args)),
+        ("fix_failing_test", None),
+    ];
+
+    for (name, args) in prompts {
+        let mut params = GetPromptRequestParams::new(name);
+        if let Some(args) = args {
+            params = params.with_arguments(args);
+        }
+        let result = client
+            .get_prompt(params)
+            .await
+            .unwrap_or_else(|e| panic!("get_prompt {name}: {e}"));
+        let haystack = prompt_text(&result);
+
+        for excluded in EXCLUDED_TOOL_MENTIONS {
+            assert!(
+                !haystack.contains(excluded),
+                "worker-profile `{name}` must not instruct excluded tool `{excluded}`; \
+                 full text:\n{haystack}"
+            );
+        }
+        assert!(
+            haystack.contains("HAND OFF") && haystack.contains("trusted runner"),
+            "worker-profile `{name}` must end at the trusted-runner handoff; \
+             full text:\n{haystack}"
+        );
+        // The drafting loop itself survives: the worker still grounds and
+        // verifies with in-profile tools.
+        for allowed in ["profile_column", "test"] {
+            assert!(
+                haystack.contains(allowed),
+                "worker-profile `{name}` still orchestrates in-profile tool `{allowed}`; \
+                 full text:\n{haystack}"
+            );
+        }
+    }
+
+    // The read-only summary prompt is profile-invariant.
+    let summary = client
+        .get_prompt(GetPromptRequestParams::new("summarize_project"))
+        .await
+        .expect("get_prompt summarize_project");
+    let haystack = prompt_text(&summary);
+    assert!(
+        haystack.to_lowercase().contains("read-only"),
+        "summarize_project stays the read-only orientation under the worker profile"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// FF-WP1 fix round 2 (item 5) — the worker-profile guidance surfaces ON THE
+/// WIRE: the `prompts/list` descriptions and the draft tools' `next_steps`
+/// name no tool the profile excludes and end at the trusted-runner hand-off.
+/// (The default surfaces are byte-pinned by the rocky-mcp unit goldens; the
+/// existing default-profile draft tests here pin the `propose` ending.)
+#[tokio::test]
+async fn worker_profile_descriptions_and_next_steps_end_at_the_handoff() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Worker,
+    );
+    let client = connect(server).await;
+
+    const EXCLUDED_TOOL_MENTIONS: &[&str] = &[
+        "propose",
+        "review_queue",
+        "draft_contract",
+        "draft_metadata",
+        "pause_schedule",
+        "ai_test",
+        "ai_contract",
+    ];
+
+    // Surface (b): every listed prompt description, as served over the wire.
+    let prompts = client.list_all_prompts().await.expect("list prompts");
+    assert_eq!(prompts.len(), 5, "the worker profile keeps all 5 prompts");
+    for prompt in &prompts {
+        let description = prompt.description.as_deref().unwrap_or_default();
+        for excluded in EXCLUDED_TOOL_MENTIONS {
+            assert!(
+                !description.contains(excluded),
+                "worker `prompts/list` description of '{}' must not name `{excluded}`: \
+                 {description}",
+                prompt.name
+            );
+        }
+    }
+
+    // Surface (c): the draft tools' next_steps.
+    let draft = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id, 'WORKER' AS status",
+                "worker redraft",
+            )),
+        )
+        .await
+        .expect("draft_model call");
+    assert_ne!(draft.is_error, Some(true), "draft_model succeeds");
+    let check_args = serde_json::json!({
+        "model": "orders",
+        "spec": "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n",
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    let check = client
+        .call_tool(CallToolRequestParams::new("draft_check").with_arguments(check_args))
+        .await
+        .expect("draft_check call");
+    assert_ne!(check.is_error, Some(true), "draft_check succeeds");
+
+    for (tool, result) in [("draft_model", &draft), ("draft_check", &check)] {
+        let next_steps = result.structured_content.as_ref().expect("structured")["next_steps"]
+            .as_str()
+            .expect("next_steps is a string")
+            .to_string();
+        for excluded in EXCLUDED_TOOL_MENTIONS {
+            assert!(
+                !next_steps.contains(excluded),
+                "worker `{tool}` next_steps must not name `{excluded}`: {next_steps}"
+            );
+        }
+        assert!(
+            next_steps.contains("hand-off to the trusted runner"),
+            "worker `{tool}` next_steps end at the runner hand-off: {next_steps}"
+        );
+    }
+
+    client.cancel().await.unwrap();
+}
+
+/// The default profile's `build_model` still ends at `propose` — the worker
+/// variant did not leak into the default surface (both golden pins together
+/// force a conscious per-profile choice on any prompt edit).
+#[tokio::test]
+async fn default_profile_build_model_still_ends_at_propose() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let args = serde_json::json!({ "intent": "daily revenue" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let result = client
+        .get_prompt(GetPromptRequestParams::new("build_model").with_arguments(args))
+        .await
+        .expect("get_prompt build_model");
+    let haystack = prompt_text(&result);
+    assert!(
+        haystack.contains("propose") && haystack.contains("STOP at propose"),
+        "the DEFAULT build_model still stops at propose:\n{haystack}"
+    );
+    assert!(
+        !haystack.contains("HAND OFF to the trusted runner"),
+        "the worker handoff text must not leak into the default profile:\n{haystack}"
     );
 
     client.cancel().await.unwrap();

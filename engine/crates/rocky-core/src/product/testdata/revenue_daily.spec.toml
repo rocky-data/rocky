@@ -1,0 +1,26 @@
+[product]
+name   = "revenue_daily"                 # → product_id "product:revenue_daily"
+intent = "Daily gross revenue per client in EUR, refunds excluded"
+
+[product.source]
+tables = ["poc.raw.stripe_charges"]      # exact catalog.schema.table refs ONLY.
+                                         # v0 has NO globs: `include = ["stripe.*"]` was
+                                         # falsified in review — no engine counterpart exists
+                                         # (PipelineSourceConfig has no include; CLI filters are
+                                         # single exact key=value).
+
+[product.output]
+model = "revenue_daily"                  # the one output model (default: product name)
+grain = ["client_id", "date"]
+columns = [
+  { name = "client_id",   type = "Int64",         nullable = false },
+  { name = "date",        type = "Date",          nullable = false },
+  { name = "revenue_eur", type = "Decimal(18,2)", nullable = false },
+]
+checks = ["revenue_eur >= 0"]
+freshness = { max_lag = "24h", time_column = "date", severity = "error" }
+classifications = { client_id = "pii" }
+
+[product.trust]
+agent = "propose_only"                   # the ONLY v0 value; "auto_apply" is rejected until
+                                         # the Phase-2.5 safety substrate exists (⟦RT-8⟧)

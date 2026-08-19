@@ -81,7 +81,7 @@ pub struct MacrosSummary {
 pub enum Recommendation {
     /// Run `rocky compile` to type-check imported models.
     RunCompile,
-    /// Run `rocky ai explain --all --save` to add intent metadata.
+    /// Run `rocky ai-explain --all --save` to add intent metadata.
     GenerateIntent,
     /// Run `rocky test` to validate with DuckDB.
     RunTests,
@@ -257,8 +257,18 @@ fn generate_recommendations(
     // Always recommend compile
     recs.push(Recommendation::RunCompile);
 
-    // Recommend generating intent
-    recs.push(Recommendation::GenerateIntent);
+    // Recommend generating intent only when a model actually lacks one.
+    // `ai-explain --all` selects models whose `intent` is None (ai.rs), so
+    // recommending it after an import that seeded every intent from dbt YAML
+    // descriptions sends the reader to a command that prints
+    // "No models to explain."
+    if import_result
+        .imported
+        .iter()
+        .any(|m| m.config.intent.is_none())
+    {
+        recs.push(Recommendation::GenerateIntent);
+    }
 
     // Recommend running tests if we converted any
     if tests.converted > 0 || tests.converted_custom > 0 {
@@ -433,7 +443,7 @@ pub fn format_report(report: &MigrationReport) -> String {
                     out.push_str(&format!("  {step}. rocky compile\n"));
                 }
                 Recommendation::GenerateIntent => {
-                    out.push_str(&format!("  {step}. rocky ai explain --all --save\n"));
+                    out.push_str(&format!("  {step}. rocky ai-explain --all --save\n"));
                 }
                 Recommendation::RunTests => {
                     out.push_str(&format!("  {step}. rocky test\n"));
@@ -682,6 +692,75 @@ mod tests {
             matches!(r, Recommendation::ManualReview { models, .. } if models.contains(&"bad_model".to_string()))
         });
         assert!(has_manual);
+    }
+
+    /// `ai-explain --all` selects only models whose `intent` is None. Offering
+    /// the step when every imported model already carries an intent sends the
+    /// reader to a command that prints "No models to explain."
+    #[test]
+    fn generate_intent_is_offered_only_when_a_model_lacks_intent() {
+        let with_intent = || {
+            let mut m = make_imported("has_intent", StrategyConfig::View);
+            m.config.intent = Some("already described by dbt YAML".to_string());
+            m
+        };
+        let without_intent = || make_imported("no_intent", StrategyConfig::View);
+
+        let offers_intent = |imported: Vec<ImportedModel>| {
+            let result = make_result(
+                imported,
+                vec![],
+                vec![],
+                ImportMethod::Regex,
+                Some("proj".to_string()),
+                None,
+                0,
+                0,
+            );
+            generate_report(&result, None, None)
+                .recommendations
+                .iter()
+                .any(|r| matches!(r, Recommendation::GenerateIntent))
+        };
+
+        assert!(
+            !offers_intent(vec![with_intent()]),
+            "every model already has an intent — the step would print \"No models to explain.\""
+        );
+        assert!(
+            offers_intent(vec![without_intent()]),
+            "a model without intent must still get the recommendation"
+        );
+        assert!(
+            offers_intent(vec![with_intent(), without_intent()]),
+            "a mixed import must still offer the step for the model that lacks intent"
+        );
+    }
+
+    /// The emitted step must be a command the CLI actually accepts. `rocky ai`
+    /// takes a positional INTENT, so `rocky ai explain --all` is parsed as the
+    /// intent "explain" and rejects `--all`.
+    #[test]
+    fn generate_intent_step_names_the_real_subcommand() {
+        let result = make_result(
+            vec![make_imported("m", StrategyConfig::View)],
+            vec![],
+            vec![],
+            ImportMethod::Regex,
+            Some("proj".to_string()),
+            None,
+            0,
+            0,
+        );
+        let out = format_report(&generate_report(&result, None, None));
+        assert!(
+            out.contains("rocky ai-explain --all --save"),
+            "next steps must name the real subcommand: {out}"
+        );
+        assert!(
+            !out.contains("rocky ai explain"),
+            "the space-separated form is not a valid command: {out}"
+        );
     }
 
     #[test]

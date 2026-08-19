@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`rocky dag` refuses to report an empty graph as success when a declared transformation pipeline's models root does not exist.** Such a pipeline produced a zero-node DAG at exit 0, which the Dagster component then cached as a clean empty asset graph with `dag_status: "success"` — indistinguishable from a project that has no models (#1397). The refusal fires only when the final graph is empty AND a declared root is missing, and it names the pipeline and the path. Every deliberate tolerance survives: an existing-but-empty models directory stays a supported no-op (a fresh scaffold still dags to an empty graph), a seed-only transformation pipeline still dags on its seed nodes, replication-only projects are untouched (with and without the `--models` override the SDK sends by default), and an empty sibling root next to a populated one still contributes nothing without refusing the project. With the refusal in place, the Dagster component's existing failure machinery records `dag_status: "failed"` — or fails the deploy under `strict_build` — instead of shipping zero assets. `rocky serve`'s `GET /api/v1/dag` shares the same core and now answers an error for the same case.
+
+### Fixed
+
+- **`rocky docs` renders sidecar `[columns]` descriptions — for `.sql` and `.rocky` models.** The docs page's column map was hardcoded to `None` at the only production call site, and descriptions only attach to columns from that map — so every `[columns]` description was parsed, then rendered nowhere, with exit 0 and no warning. The description loader also scanned `.sql` files only, so a `.rocky` DSL model's sidecar descriptions vanished even with the map wired. Column schemas now come from the offline compile step's type inference (no warehouse connection; the schema cache supplies source types when `[cache.schemas]` is enabled — honouring the global `--cache-ttl` override — and a cold cache renders leaf models as `UNKNOWN`). Description matching folds ASCII case, like every other column lookup in Rocky. `rocky docs` gains a repeatable `--var NAME=VALUE`, because column metadata is compile-derived and a required `@var` left unset is a compile error. A description whose column the compile cannot see warns on stderr instead of vanishing. A project that loads but does not compile — hard error or error diagnostics — still builds docs, minus column tables, with the failure named on stderr; an errored compile can carry sentinel-derived types (a missing `@var` becomes a parseable `NULL`), and publishing those as the documented schema would be wrong, not merely incomplete. A model file that cannot be parsed at all still fails the build, deliberately: a docs page silently missing a model would misrepresent the project. And zero models is now a refusal, not an empty page — a missing or empty models directory fails with `no models found in <dir>`, matching `rocky test`; previously a typo'd `--models` rendered a blank catalog at exit 0. (#1444)
+
+## [1.71.0] — 2026-08-18
+
+### Added
+
+- **Plans can carry a product identity, and `rocky apply` can require it.** `RunPlan` gains optional `product_id` / `spec_digest` — both or neither. Absent fields serialize exactly as before, so existing plan ids are unchanged. `rocky apply --expect-spec-digest <hex>` fails closed in both directions: a product-bound plan refuses a bare apply, and a mismatched or missing binding refuses before any policy arm runs. The `compact`, `archive` and `branch promote` plan aliases refuse product-bound payloads outright and point at canonical `rocky apply`. MCP `propose` accepts the pair plus an optional idempotency key, deriving `<product>@<digest>` when omitted. (#1472)
+
+- **`rocky review --status`** — a typed marker oracle, with a `review_status` schema, an SDK `review_status()` method and a Dagster resource method. Review markers are now written atomically and parse-and-match validated everywhere they gate, so a truncated or mispasted marker refuses instead of approving. `review_queue` gains a product filter, and a corrupt plan there surfaces as a warning rather than being dropped. (#1472)
+
+- **`draft_metadata` MCP tool** — governed, structured sidecar patches for freshness and classifications. Parse-merge only, rolled back on deny or compile failure, with policy evaluated over the post-image. `draft_model` on an existing model now preserve-merges the sidecar, replacing only `name` and `intent`, and its policy is evaluated over both the pre- and post-image classifications with the most restrictive verdict winning — so adding or erasing a classification can no longer de-scope a deny in either direction. A sidecar that exists but cannot be read is refused rather than clobbered. (#1472)
+
+- **`rocky mcp --profile worker`** — a minimal drafting allowlist that excludes `propose`, `review_queue`, `draft_contract`, `draft_metadata` and `pause_schedule`. Its prompts and next-steps end at a hand-off instead of naming tools the profile does not expose. (#1472)
+
+- **`JobRequest.expect_spec_digest`** threads the apply expectation through the serve API. (#1472)
+
+### Changed
+
+These three refuse where they previously proceeded. Each closes a path that
+reported success while doing less than asked, so the refusal is the fix — but
+an upgrade can turn a passing pipeline red, and that is deliberate.
+
+- **`--shadow-schema` refuses when two sources resolve to one target table.** The flag replaces the resolved target schema outright, so a schema template whose only distinguishing component is the connector (`staging__{source}`) collapsed every connector into one schema. Two sources holding a same-named table both wrote it, the second won, and the run still reported copying both — with `rocky compare` then reading that as a clean baseline. Only a real clash refuses; distinct table names still shadow fine. Use `--shadow-suffix`, which keeps the template and renames the table. Identifiers are compared case-insensitively, because DuckDB, Databricks and Trino resolve `Orders` and `orders` to one object. (#1461)
+
+- **A configured `[policy]` block no longer waives human review of an AI-authored plan.** The review marker was checked only when policy was absent; any configured policy resolving to `allow` reached the policy gate, which returns success without consulting it. So switching governance ON switched this protection OFF. `allow` answers "may this principal do this"; review answers "did a human read this machine-written change". Policy may now only tighten the gate — `deny` and `require_review` are unchanged. **If you relied on a permissive policy to auto-apply AI-authored plans, those applies now refuse** until `rocky review <plan-id> --approve` runs. (#1459)
+
+- **`rocky apply` on a replication plan refuses when the config or the state store has changed since the plan was written.** The plan's config snapshot had no reader, so changing the adapter, database path, schema template or strategy between plan and apply silently re-routed an approved plan to unreviewed SQL or a different destination. The state store was unbound too — watermarks, freezes, budgets and idempotency keys live there, so applying against a different one can redo work the reviewed ledger recorded as done, or miss a freeze it recorded. Both are now compared and nothing is written on a mismatch; re-plan to proceed. Two limits stated in the error rather than implied away: credentials are redacted in the snapshot, so a changed secret is not detected, and the state identity is credential-free by construction. (#1460)
+
+### Fixed
+
+- **The strict-scheduling refusal no longer tells you to omit a flag that does not exist.** When `[run] strict_scheduling` refused a run whose physical-read ordering could not be resolved, the error offered two remedies: declare `depends_on`, or "omit `--strict-scheduling`". There is no such CLI flag — `rocky run --strict-scheduling` fails with `unexpected argument`. Every real consumer reads the TOML key. The message now names only the key, and the doc comment says plainly that the setting is config-only. Whether to add the flag is tracked on #1357.
+
+
+- **`rocky import-dbt` no longer ends with a command the CLI rejects.** Its Next Steps block printed `rocky ai explain --all --save`, which does not parse — `rocky ai` takes a positional `INTENT`, so `explain` is consumed as the intent and the flags are refused with `error: unexpected argument '--all' found`. The real subcommand is `rocky ai-explain`. The same invalid spelling appeared in a second user-facing hint and in four doc comments, three of which publish as JSON-schema descriptions for the `ai_*` outputs.
+
+  The step is now also **gated**. `ai-explain --all` selects only models whose `intent` is unset, but the recommendation was emitted unconditionally — and the dbt importer seeds `intent` from dbt YAML `description` fields. Importing a documented project therefore produced a next step that, even spelled correctly, prints `No models to explain.` It is now offered only when an imported model actually lacks an intent, matching the predicate the command itself filters on. (#1443)
+
+
+- **`rocky test`, `rocky estimate` and `rocky retention-status` no longer report success for a selector that matched nothing.** `rocky test --declarative` accepted a models directory that does not exist — reporting `total: 0` and exiting 0 — while the same command *without* `--declarative` compiled the project and failed with `no models found in <dir>`. One command, one flag apart, two answers to the same question. That path now refuses a missing or empty models directory, matching its sibling.
+
+  Separately, **neither** `rocky test` path validated `--model`. Every count on the test runner's result is computed after the filter is applied, so an unknown model name produced `total: 0` — byte-identical to a real model that declares no tests, with the same exit code. A renamed or misspelled model silently stopped being tested, and because `RockyClient.test(model_filter=…)` forwards the flag, an SDK or Dagster caller asking "run the tests for model X" received a clean pass. The runner now carries the pre-filter model list so both paths can refuse an unknown name with the same typed `model not found` error `rocky compile --model` and `rocky run --model` already emit.
+
+  A model that exists but declares no tests is deliberately **not** an error and still exits 0; only a name that matches no model is refused. `rocky estimate` and `rocky retention-status` gain the same refusal, and their empty results now carry a `message` explaining why — previously the text output said `No models found.` while the JSON output said nothing at all, so the human was told and the machine was not. (#1428)
+
+- **`rocky test --declarative` now executes sidecar tests for `.rocky` DSL models.** The command's private model loader discovered `.sql` sources only, so DSL models' declared tests were silently skipped and the command exited successfully with `total: 0`. Declarative testing now uses the shared project loader and treats `.sql` and `.rocky` models consistently. (#1425)
+
+- **`rocky compile --model <name>` now reports exactly that model and rejects unknown names.** The selector previously filtered diagnostics and expanded SQL only: counts, execution layers, model details, text execution order, and `has_errors` still described the whole project. A healthy selected model could therefore exit nonzero with no visible diagnostic because an unrelated model was broken, while a misspelled model name exited 0 and returned the whole project. Rocky still compile-checks the full project internally for dependency and type context, but the returned report and exit status now share one exact-model scope; an unknown selector fails with `model not found`. (#1422)
+
+### Removed
+
+- **The `drift` JSON schema no longer ships for a command that does not exist.** `schemas/drift.schema.json` and its generated Pydantic/TypeScript bindings described the output of `rocky drift` — a subcommand the binary rejects with `unrecognized subcommand 'drift'`. Drift detection has always run inside `rocky run` / `rocky plan` and is surfaced on `RunOutput.drift`; there was never a command that could emit the standalone envelope. Downstream consumers importing the generated `DriftOutput` type will need to drop it. `DriftSummary` and `DriftActionOutput` are unaffected and now generate from the run schema, which is where drift is actually emitted. (#1431)
+
+## [1.70.1] - 2026-08-11
+
+### Changed
+
+- **Dependency refresh — 146 crates**, including `aws-lc-rs` 1.17 → 1.18 / `aws-lc-sys` 0.41 → 0.44, the `arrow` family 58.3 → 58.4, `clap` 4.6.4 → 4.6.6, `blake3` 1.8.5 → 1.8.6, `rmcp` and `salsa`. No source changes; the full suite passes at 5835 tests with clippy clean under `-D warnings`. (#1420)
+
+  One advisory is knowingly **not** closed by this: `thrift` stays at 0.17.0 (RUSTSEC memory-allocation advisory, patched in 0.23.0) because `parquet` 58.4.0 pins `thrift ^0.17`, so no in-range update reaches it. `parquet` 59.2.0 drops the dependency entirely, but that is an `arrow` 58 → 59 major migration and is tracked separately rather than folded into a patch release.
+
+### Fixed
+
+- **`fail_fast` recovery no longer duplicates a successful incremental table's last delta.** Warehouse writes commit independently per table, but a sibling failure previously suppressed every deferred watermark in the run. Recovery then read the successful table's old watermark and appended its already-committed rows again. Successful table watermarks now advance after the fan-out drains; failed tables retain their prior state. (#1410)
+
+## [1.70.0] - 2026-08-10
+
+### Fixed
+
+- **A shadow replication run read the table it was about to write.** This is a regression introduced in 1.69.0 and present in every 1.69.0 binary. #1280 split `TableTask`'s single `table_name` into `source_table_name` (always the production object) and `target_table_name` (suffixed under `--shadow`), and the copy's endpoints were split correctly — but the `ModelIr` the run actually generates SQL from kept `target_table_name` in its `SourceRef`. Nothing derived from the corrected endpoints reaches the emitted statement, so under `--shadow-suffix` the copy read `<table><suffix>` instead of `<table>`.
+
+  Normally that object does not exist and the run fails with a misleading "table not found". Where a table by that name did exist — a previous shadow run's output, most plausibly — the copy silently sourced the wrong one and reported success. The source name is now read through a single function shared by both paths, so the two cannot drift apart again, and the regression test binds to the *emitted SQL* rather than to an intermediate structure: the seam that was already covered is not the seam that was broken. (#1406)
+
+- **`rocky plan --shadow` was accepted, silently dropped, and then applied against production.** `ReplicationPlan` persisted no shadow routing at all — no `shadow`, `shadow_suffix`, `shadow_schema` or `branch` — although `RunPlan` has persisted exactly those fields for some time and `apply` reconstructs a `ShadowConfig` from them on the transformation path. So `rocky plan --shadow` on a replication-only project produced a plan indistinguishable from a production one, and the subsequent `rocky apply` wrote production and exited 0 reporting Success. Unlike #1406 this was not a 1.69.0 regression; the fields were absent in 1.68.0 too.
+
+  The four fields are now persisted and replayed, including branch routing, which resolves the branch's schema prefix from the state store at apply time. They are written only when the plan is genuinely a shadow or branch plan: `--shadow-schema` without `--shadow` is accepted by the argument parser and remains a production run, and persisting an inert descriptor would have shifted `plan_id` — a blake3 of the payload — for existing projects. (#1408)
+
+- **Row counts and checksums format their identifiers with the adapter's own dialect.** `rocky compare` counted an unquoted identifier, so on Snowflake, where an unquoted reference resolves uppercase, a table whose name is not already uppercase could be verified against a *different* object than the one named — or fail to resolve at all. Both the row-count and checksum paths now render table references through the dialect rather than by string interpolation. (#1400, closes #1396)
+
+- **`rocky doctor` named the wrong writers in its CAS-bypass check.** The diagnostic listed seams that do not bypass compare-and-swap and omitted ones that do, so an operator acting on its output would have hardened the wrong path. (#1398)
+
+### Added
+
+- **Adapters can report whether identifier case is part of object identity.** A new `identifier_case_significance` trait method lets an adapter answer, from the live connection, whether two identifiers differing only in case name the same object; the Snowflake implementation reads `QUOTED_IDENTIFIERS_IGNORE_CASE` from `SHOW PARAMETERS` rather than assuming a default.
+
+  **Nothing in the engine calls this yet** — it is the grounding probe for #1281, landed on its own so the warehouse-facing question can be answered and reviewed independently of any consumer. Its answer is deliberately scoped to *quoted* identifiers; Snowflake folds unquoted references to uppercase regardless of the parameter, which is a separate axis tracked as #1282. (#1390)
+
 ## [1.69.0] - 2026-08-06
 
 ### Added

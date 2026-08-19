@@ -13,13 +13,24 @@ A real answer names the weakest assumption, the stale justification, or the hidd
 
 These questions are also red-team bait, deliberately. Give every substantive analysis or plan, plus these two answers, to an independent red team — a genuinely different model, never the authoring model or a same-model agent — because an independent model is better placed than the author to see what's missing. Substantive means it can change behavior, a decision, or standing policy; a small or docs-only diff never exempts a change, only mechanical, behavior-neutral corrections are exempt. Name the reviewer and address or rebut its findings on the record; that disposition closes the loop (the red-team pass itself doesn't recurse). If no independent red team is available, say so in the output rather than skipping silently. Code changes additionally follow the [`AGENT_REVIEW.md`](AGENT_REVIEW.md) adversarial-review profile.
 
+## How agents communicate
+
+Write for a person who is busy. These rules apply to chat replies, PR descriptions, and reports. For public documentation pages, [`docs/STYLE.md`](docs/STYLE.md) is the full contract.
+
+- Lead with the outcome in one to three short lines. Put supporting detail afterward. Include detail needed to understand, verify, or act on the outcome.
+- Short sentences. One idea per sentence. Aim for under 25 words.
+- No jargon. If a technical term must appear, explain it in plain words the first time.
+- Use an ASCII diagram when it makes a flow, sequence, or state change clearer. Delete only prose the diagram makes redundant.
+- Keep code, commands, flags, paths, and error codes exact. Never simplify those. A shorter sentence that loses a condition is a defect.
+
 ## Subprojects
 
 | Path | Language | What it is |
 |---|---|---|
-| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. 23-crate Cargo workspace. |
+| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. Multi-crate Cargo workspace. |
 | `sdk/python/` | Python | `rocky-sdk` — standalone typed Python client (`RockyClient`) over the `rocky` CLI. Owns the generated Pydantic models. For notebooks, scripts, and orchestrators. |
 | `integrations/dagster/` | Python | Dagster integration — a thin `ConfigurableResource` adapter over `rocky-sdk`'s `RockyClient`; maps results to assets/checks. Depends on `rocky-sdk`. |
+| `framework/` | Python | `rocky-fulfillment` (working name) — spec-driven fulfillment runtime: lowers an approved product spec onto Rocky primitives and drives draft → verify → propose under human review gates. Depends on `rocky-sdk`. Scaffold; not yet published. |
 | `editors/vscode/` | TypeScript | VS Code extension — LSP client (stdio to `rocky lsp`), syntax highlighting, commands for AI features. |
 | `examples/playground/` | Config only | Self-contained DuckDB sample pipeline. Used as a smoke test and a benchmark fixture. No credentials needed. |
 
@@ -28,7 +39,8 @@ Each subproject has its own `AGENTS.md` with build commands, coding standards, a
 ## Agent-tool compatibility
 
 - `AGENTS.md` is the canonical, vendor-neutral source for persistent repository guidance. Tool-specific files and directories exist only for discovery compatibility.
-- Root task skills follow the Agent Skills format and are mirrored in `.agents/skills/` and `.claude/skills/`. Keep the two trees byte-identical and keep workflow text independent of any particular agent client, model, marketplace, or plugin.
+- Root task skills follow the Agent Skills format and are mirrored in `.agents/skills/` and `.claude/skills/`. Keep the two trees byte-identical (CI-checked by `skills-mirror-drift.yml`) and keep workflow text independent of any particular agent client, model, marketplace, or plugin.
+- Subproject-local skills (under `engine/.claude/skills/` and `editors/vscode/.claude/skills/`) currently exist only in the Claude Code discovery tree; the byte-identical rule above covers only the root trees. They are plain Markdown and their rules apply to any agent working in those subprojects — browse them directly if your client does not discover them.
 - If a client does not discover a relevant skill automatically, read its `SKILL.md` directly and follow the nearest applicable `AGENTS.md`.
 
 > **Adversarial / red-team code review** (regardless of agent client): read [`AGENT_REVIEW.md`](AGENT_REVIEW.md) before reviewing engine changes. It is the grounded correctness profile — Rocky's real compiler pipeline (surface → SQL string → single `ModelIr`, no HIR), the incremental-recompute surfaces, the enum-exhaustiveness rule, the nullability/3VL invariants, and the test-evidence bar.
@@ -64,13 +76,14 @@ Every Rocky CLI command that emits `--output json` is backed by a typed Rust out
 
 The `codegen-drift` CI workflow (`.github/workflows/codegen-drift.yml`) fails any PR where the committed bindings drift from what `just codegen` produces locally.
 
-Every CLI JSON output is covered — there are no hand-written bindings. The generated Pydantic models live in `rocky-sdk` (`sdk/python/`) and are re-exported by `dagster_rocky.types`; the vscode `rockyJson.ts` is a type-alias shim over the generated TypeScript — see [`sdk/python/AGENTS.md`](sdk/python/AGENTS.md) and [`integrations/dagster/AGENTS.md`](integrations/dagster/AGENTS.md). After shape-changing schema edits, `just regen-fixtures` recaptures the dagster test fixtures (a separate CI-checked drift surface). Full workflow and pitfalls: the `rocky-codegen` skill.
+Every CLI JSON output is covered by an exported schema and generated bindings. The generated Pydantic models live in `rocky-sdk` (`sdk/python/`) and are re-exported by `dagster_rocky.types`; the vscode `rockyJson.ts` is a type-alias shim over the generated TypeScript. The SDK **also** keeps hand-written runtime models in `rocky_sdk/types.py` — the `parse_rocky_output()` dispatch targets; `test_schema_parity.py` guards their top-level shape (not nested or typed parity), so a new output field must be added to them by hand; see [`sdk/python/AGENTS.md`](sdk/python/AGENTS.md) and [`integrations/dagster/AGENTS.md`](integrations/dagster/AGENTS.md). After shape-changing schema edits, `just regen-fixtures` recaptures the dagster test fixtures (a separate CI-checked drift surface). Full workflow and pitfalls: the `rocky-codegen` skill.
 
 **When modifying Rocky DSL syntax (`.rocky` files):**
 1. `engine/crates/rocky-lang/` (parser + lexer)
 2. `engine/crates/rocky-compiler/` (type checking)
 3. `editors/vscode/syntaxes/rocky.tmLanguage.json` (TextMate grammar)
 4. `editors/vscode/snippets/rocky.json` (snippets)
+5. `docs/src/content/docs/concepts/rocky-dsl.md` + `docs/rocky-lang-spec.md` (published DSL page + full spec)
 
 ## Build orchestration
 
@@ -93,10 +106,11 @@ Tag-namespaced — each artifact ships independently:
 - `sdk-v0.1.0` → `rocky-sdk` wheel on PyPI
 - `dagster-v0.1.0` → `dagster-rocky` wheel on PyPI
 - `vscode-v0.1.0` → Rocky VSIX on VS Code Marketplace
+- `framework-v0.1.0` → fulfillment framework wheel on the GitHub Release only (no registry publish yet)
 
 Release **`rocky-sdk` before any `dagster-rocky` release that raises its `rocky-sdk>=…` floor** — the published `dagster-rocky` wheel resolves the SDK from PyPI, not the monorepo path source.
 
-**Release workflow:** Tagging `engine-v*` triggers `engine-release.yml`, which builds all 5 platform targets (macOS ARM64/Intel, Linux x86_64/ARM64, Windows x86_64) via a CI matrix and attaches them to the GitHub Release. `scripts/release.sh` remains as a local-build hotfix fallback. Convenience recipes: `just release-engine <version>`, `just release-dagster <version> [--publish]`, `just release-vscode <version> [--publish]`.
+**Release workflow:** Tagging `engine-v*` triggers `engine-release.yml`, which builds all 5 platform targets (macOS ARM64/Intel, Linux x86_64/ARM64, Windows x86_64) via a CI matrix and attaches them to the GitHub Release. `scripts/release.sh` remains as a local-build hotfix fallback. Convenience recipes: `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, `just release-vscode <version> [--publish]`.
 
 The `engine/install.sh` and `engine/install.ps1` scripts filter releases by the `engine-v*` prefix when fetching the latest version.
 
@@ -108,7 +122,7 @@ The `engine/install.sh` and `engine/install.ps1` scripts filter releases by the 
 
 ## CI
 
-`.github/workflows/` contains path-filtered workflows. Touching `engine/**` triggers `engine-ci.yml` only; touching multiple subprojects triggers each relevant workflow independently.
+`.github/workflows/` contains path-filtered workflows. Touching a subproject triggers its own CI plus any cross-cutting gates whose path filters match — e.g. `engine/**` triggers both `engine-ci.yml` and `codegen-drift.yml`. Touching multiple subprojects triggers each relevant workflow independently.
 
 Cost-saving measures:
 - `engine-ci.yml` runs test + clippy + fmt on every PR. Coverage and security audit are in `engine-weekly.yml` (Monday schedule + manual dispatch).

@@ -27,5 +27,11 @@ class RetentionStatusOutput(BaseModel):
     """
 
     command: str
+    message: str | None = None
+    """
+    Why `models` is empty, when it is. Absent whenever `models` is non-empty.
+
+    Reachable only under `--drift`, which reports just the models that declare a retention policy: a project with no models fails to compile before reaching this output, and an unknown `--model` is refused rather than returning an empty result. When `--model` scopes the run the message describes that model, not the project — an empty `models` array otherwise gave a project-wide impression from a single-model query (#1428).
+    """
     models: list[ModelRetentionStatus]
     version: str

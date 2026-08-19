@@ -295,8 +295,9 @@ fn arm_hard_exit_on_second_signal() {
 /// #1352 derives ordering edges from physical `schema.table` reads and reports
 /// what it could not safely resolve as advisory warnings — the run still exits
 /// 0, so a consumer that ignores them can read a stale target and report
-/// success. `[run] strict_scheduling` (or `--strict-scheduling`) turns that into
-/// a refusal for estates that want fail-closed ordering (#1355).
+/// success. `[run] strict_scheduling` turns that into a refusal for estates
+/// that want fail-closed ordering (#1355). Config-only — there is no
+/// `--strict-scheduling` CLI flag; adding one is tracked on #1357.
 ///
 /// Shared by the plain and `--dag` paths deliberately. Two copies would let
 /// "strict" come to mean different things depending on how the run was started,
@@ -308,8 +309,8 @@ pub(crate) fn refuse_on_scheduling_warnings(strict: bool, warnings: &[String]) -
     anyhow::bail!(
         "strict scheduling is on and this run's physical-read ordering could not be fully \
          resolved, so execution order is not guaranteed:\n{}\n\nDeclare each upstream in \
-         `depends_on` to resolve it, or unset `[run] strict_scheduling` / omit \
-         `--strict-scheduling` to run with these as advisory warnings.",
+         `depends_on` to resolve it, or unset `[run] strict_scheduling` to run \
+         with these as advisory warnings.",
         warnings
             .iter()
             .map(|w| format!("  - {w}"))
@@ -330,6 +331,44 @@ fn copy_endpoints(task: &TableTask) -> (TableRef, TableRef) {
             schema: task.target_schema.clone(),
             table: task.target_table_name.clone(),
         },
+    )
+}
+
+/// Build the replication [`ModelIr`] the copy statement is generated from.
+///
+/// Extracted from `process_table` so the source/target split is testable at the
+/// seam that actually emits SQL. [`copy_endpoints`] above splits the two names
+/// correctly and has its own test, but **nothing derived from it reaches the
+/// copy statement** — its `source_table` feeds only the change marker, the
+/// describe, and the row-count check. The statement itself is built from this
+/// `ModelIr`, which is where #1280's split has to hold and where it did not.
+fn replication_model_ir(
+    task: &TableTask,
+    strategy: MaterializationStrategy,
+    governance: GovernanceConfig,
+) -> ModelIr {
+    ModelIr::replication(
+        TargetRef {
+            catalog: task.target_catalog.clone(),
+            schema: task.target_schema.clone(),
+            table: task.target_table_name.clone(),
+        },
+        strategy,
+        SourceRef {
+            catalog: task.source_catalog.clone(),
+            schema: task.source_schema.clone(),
+            // The read keeps the PRODUCTION name — see `TableTask::source_table_name`,
+            // whose doc comment specifies exactly this. #1280 split the field for it;
+            // #1383 then applied the split to `copy_endpoints` and to the target above
+            // but left this one on `target_table_name`, so a shadow-suffix run built
+            // `FROM <source_schema>.<table><suffix>`: normally absent, giving a
+            // misleading "table not found", and — where such a table happened to
+            // exist — silently copying it into the shadow target at exit 0.
+            table: task.source_table_name.clone(),
+        },
+        ColumnSelection::All,
+        task.metadata_columns.clone(),
+        governance,
     )
 }
 
@@ -1369,6 +1408,18 @@ pub async fn run(
     // Local backend); it never overrides the governed fail-closed bail. See
     // [`resolve_replication_authority`].
     assume_fresh_state: bool,
+    // #1460: the source state a persisted replication plan was reviewed
+    // against, plus that plan's id for the message. `None` for every direct
+    // `rocky run` — byte-identical behaviour.
+    //
+    // The replication apply path discovers once to compare against the plan,
+    // then calls this function, which discovers AGAIN and builds work from the
+    // second result. So the comparison ran on one set and the writes came from
+    // another: a connector appearing between them executed without ever being
+    // in the reviewed snapshot. Passing the reviewed state here re-applies the
+    // SAME `decide_drift_scope` rule at the point the work is actually built,
+    // which keeps the filter-scope tolerance identical.
+    reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
 ) -> Result<()> {
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
@@ -2539,6 +2590,45 @@ pub async fn run(
     }
     let connectors = discovery_result.connectors;
 
+    // #1460: re-apply the plan's source-state check HERE, against the set the
+    // work is built from. Same rule as the pre-check in the apply path, so
+    // out-of-filter-scope drift stays a warning and only in-scope or unfiltered
+    // drift refuses.
+    if let Some((plan_id, reviewed)) = reviewed_source_state {
+        let executed_snapshot = crate::commands::plan::build_source_state_snapshot(&connectors);
+        match crate::commands::apply::decide_drift_scope(
+            reviewed,
+            &executed_snapshot,
+            filter,
+            &pattern,
+        ) {
+            crate::commands::apply::DriftScope::None
+            | crate::commands::apply::DriftScope::OutOfScope { .. } => {}
+            crate::commands::apply::DriftScope::InScope {
+                in_scope_drifted,
+                filter: f,
+            } => {
+                let diff =
+                    crate::commands::apply::summarize_source_state_drift(reviewed, &executed_snapshot);
+                anyhow::bail!(
+                    "source state drifted between the check and execution of plan \
+                     '{plan_id}' (in-scope under filter={f}, affected=[{}]).\n{diff}\n\
+                     Nothing was written. Re-plan with `rocky plan` and apply the new plan_id.",
+                    in_scope_drifted.join(", ")
+                );
+            }
+            crate::commands::apply::DriftScope::Unfiltered => {
+                let diff =
+                    crate::commands::apply::summarize_source_state_drift(reviewed, &executed_snapshot);
+                anyhow::bail!(
+                    "source state drifted between the check and execution of plan \
+                     '{plan_id}'.\n{diff}\n\
+                     Nothing was written. Re-plan with `rocky plan` and apply the new plan_id."
+                );
+            }
+        }
+    }
+
     let concurrency = pipeline.execution.concurrency.max_concurrency();
     let mut output = RunOutput::new(filter.unwrap_or("").to_string(), 0, concurrency);
     output.shadow = shadow_config.is_some();
@@ -2566,6 +2656,16 @@ pub async fn run(
     let mut assertion_targets: Vec<(TableRef, Vec<String>)> = Vec::new();
     let mut pending_checks: HashMap<String, PendingCheck> = HashMap::new();
     let mut tables_to_process: Vec<TableTask> = Vec::new();
+    // Resolved target identity -> the source that claimed it. A shadow
+    // `--shadow-schema` replaces the resolved schema template outright, so a
+    // template whose only distinguishing component is the connector (e.g.
+    // `staging__{source}`) collapses every connector into one schema. Two
+    // connectors holding a same-named table then write the same object and the
+    // second silently wins, with `tables_copied` still counting both (#1461).
+    let mut claimed_targets: HashMap<
+        rocky_sql::defer::CollisionIdentity,
+        (String, String),
+    > = HashMap::new();
     // PR-B3: count how many `(connector, table)` pairs matched each
     // `[[table_overrides]]` rule. Rules with zero matches surface as
     // soft warnings on `RunOutput.override_warnings` (T2) so
@@ -2625,6 +2725,134 @@ pub async fn run(
             rocky_cfg,
             &entry_marker_freezes,
         )?;
+    }
+
+    // ONE source-table read per connector, taken here and reused by BOTH the
+    // collision preflight and the collection loop below.
+    //
+    // They used to call `list_tables` separately. Two reads mean two answers: a
+    // table created between them is absent from the preflight and present at
+    // collection, so a collision it should have caught early is caught by the
+    // in-loop backstop instead — after catalogs, schemas and grants have been
+    // written. Sharing one snapshot removes that window. Every other input the
+    // two use (discovered `conn.tables`, `parsed_filter`, `table_overrides`) is
+    // already shared, so with this they evaluate the same pure conditions over
+    // identical data and cannot disagree.
+    let source_tables_by_schema: HashMap<String, std::collections::HashSet<String>> = {
+        let mut m = HashMap::new();
+        for conn in &connectors {
+            let source_catalog = pipeline.source.catalog.as_deref().unwrap_or("").to_string();
+            let tables: std::collections::HashSet<String> = warehouse_adapter
+                .list_tables(&source_catalog, &conn.schema)
+                .await
+                .map(|v| v.into_iter().map(|t| t.to_lowercase()).collect())
+                .unwrap_or_else(|e| {
+                    warn!(
+                        schema = conn.schema.as_str(),
+                        error = %e,
+                        "failed to list source tables, will process all discovered tables"
+                    );
+                    conn.tables.iter().map(|t| t.name.to_lowercase()).collect()
+                });
+            m.insert(conn.schema.clone(), tables);
+        }
+        m
+    };
+
+    // #1461 preflight: refuse a target collision BEFORE any warehouse mutation.
+    //
+    // The authoritative check still runs at the collection site below, where the
+    // exact write set is known. This pass exists only to move the refusal
+    // earlier: the setup loop creates catalogs and schemas, binds workspaces and
+    // applies grants, so a collision caught during collection would refuse only
+    // after changing access control.
+    //
+    // Read-only: `list_tables` is a source read, and the three skip conditions
+    // call the SAME functions the collection loop calls. They must stay in sync
+    // — a condition added there and not here would refuse a run that is fine.
+    // `preflight_skips_a_disabled_table` pins the one most likely to drift.
+    {
+        let mut preflight_claims: HashMap<
+            rocky_sql::defer::CollisionIdentity,
+            (String, String),
+        > = HashMap::new();
+        for conn in &connectors {
+            let Ok(parsed) = pattern.parse(&conn.schema) else {
+                continue;
+            };
+            if !parsed_filter
+                .as_ref()
+                .is_none_or(|(k, v)| matches_filter(conn, &parsed, k, v))
+            {
+                continue;
+            }
+            let empty = std::collections::HashSet::new();
+            let source_tables = source_tables_by_schema.get(&conn.schema).unwrap_or(&empty);
+            let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
+            let target_schema = if let Some(cfg) = shadow_config {
+                cfg.schema_override
+                    .clone()
+                    .unwrap_or_else(|| parsed.resolve_template(target_schema_template, target_sep))
+            } else {
+                parsed.resolve_template(target_schema_template, target_sep)
+            };
+
+            for table in &conn.tables {
+                if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
+                    continue;
+                }
+                if !source_tables.contains(&table.name.to_lowercase()) {
+                    continue;
+                }
+                if rocky_core::config::resolve_table_override(
+                    &pipeline.table_overrides,
+                    &conn.id,
+                    &conn.schema,
+                    &table.name,
+                )
+                .enabled
+                    == Some(false)
+                {
+                    continue;
+                }
+                let target_table_name = if let Some(cfg) = shadow_config {
+                    if cfg.schema_override.is_none() {
+                        format!("{}{}", table.name, cfg.suffix)
+                    } else {
+                        table.name.clone()
+                    }
+                } else {
+                    table.name.clone()
+                };
+                let id = rocky_sql::defer::CollisionIdentity::of(
+                    &target_catalog,
+                    &target_schema,
+                    &target_table_name,
+                );
+                let this = (conn.schema.clone(), table.name.clone());
+                if let Some(prior) = preflight_claims.get(&id)
+                    && *prior != this
+                {
+                    anyhow::bail!(
+                        "two sources resolve to the same target table \
+                         '{target_catalog}.{target_schema}.{target_table_name}': \
+                         '{}.{}' and '{}.{}'. Writing both would leave whichever \
+                         ran last, and the run would still report copying two \
+                         tables. This happens when `--shadow-schema` replaces a \
+                         schema template whose only distinguishing component is \
+                         the connector (e.g. `staging__{{source}}`). Use \
+                         `--shadow-suffix` instead, which keeps the template and \
+                         renames the table, or give the sources distinct target \
+                         tables.",
+                        prior.0,
+                        prior.1,
+                        this.0,
+                        this.1,
+                    );
+                }
+                preflight_claims.insert(id, this);
+            }
+        }
     }
 
     // --- Sequential: catalog/schema setup + table collection ---
@@ -2940,23 +3168,21 @@ pub async fn run(
             // Collect tables to process in parallel
             let source_catalog = pipeline.source.catalog.as_deref().unwrap_or("").to_string();
 
-            // Pre-fetch source table list to skip tables that no longer exist
-            // in the source (e.g. Fivetran stopped syncing them). One
+            // Source table list, used to skip tables that no longer exist in the
+            // source (e.g. Fivetran stopped syncing them). One
             // information_schema query per schema avoids N wasted DESCRIBE +
             // CTAS round-trips for stale tables.
-            // Use the generic WarehouseAdapter::list_tables (Plan 02 trait method)
-            let source_tables: std::collections::HashSet<String> = warehouse_adapter
-                .list_tables(&source_catalog, &conn.schema)
-                .await
-                .map(|v| v.into_iter().map(|s| s.to_lowercase()).collect())
-                .unwrap_or_else(|e| {
-                    warn!(
-                        schema = conn.schema.as_str(),
-                        error = %e,
-                        "failed to list source tables, will process all discovered tables"
-                    );
-                    conn.tables.iter().map(|t| t.name.to_lowercase()).collect()
-                });
+            //
+            // Taken from the ONE snapshot read before the collision preflight,
+            // not re-read here. A second read could return a different set, and
+            // a table appearing between the two would be absent from the
+            // preflight and present here — so the collision would be caught by
+            // the backstop below, after catalogs, schemas and grants had already
+            // been written.
+            let empty_source_tables = std::collections::HashSet::new();
+            let source_tables = source_tables_by_schema
+                .get(&conn.schema)
+                .unwrap_or(&empty_source_tables);
 
             let mut skipped_source_missing = 0usize;
             for table in &conn.tables {
@@ -3065,6 +3291,44 @@ pub async fn run(
                 } else {
                     table.name.clone()
                 };
+
+                // Fail closed on two sources resolving to one target object.
+                // Refuses only on a real clash, so a multi-connector project
+                // whose table names differ still shadows fine (#1461).
+                // Keyed by `CollisionIdentity`, not raw strings. DuckDB,
+                // Databricks and Trino resolve identifiers case-insensitively,
+                // so `raw__a.Orders` and `raw__b.orders` are ONE object there.
+                // An exact-string key answers "different" and lets both write
+                // it — the unrecoverable direction this type exists to avoid.
+                let target_identity = rocky_sql::defer::CollisionIdentity::of(
+                    &target_catalog,
+                    &target_schema,
+                    &target_table_name,
+                );
+                let this_source = (conn.schema.clone(), table.name.clone());
+                if let Some(prior) = claimed_targets.get(&target_identity)
+                    && *prior != this_source
+                {
+                    anyhow::bail!(
+                        "two sources resolve to the same target table \
+                         '{}.{}.{}': '{}.{}' and '{}.{}'. Writing both would \
+                         leave whichever ran last, and the run would still \
+                         report copying two tables. This happens when \
+                         `--shadow-schema` replaces a schema template whose \
+                         only distinguishing component is the connector \
+                         (e.g. `staging__{{source}}`). Use `--shadow-suffix` \
+                         instead, which keeps the template and renames the \
+                         table, or give the sources distinct target tables.",
+                        target_catalog,
+                        target_schema,
+                        target_table_name,
+                        prior.0,
+                        prior.1,
+                        this_source.0,
+                        this_source.1,
+                    );
+                }
+                claimed_targets.insert(target_identity, this_source);
 
                 tables_to_process.push(TableTask {
                     source_catalog: source_catalog.clone(),
@@ -4106,50 +4370,41 @@ pub async fn run(
 
     // --- Batch watermark updates (no lock contention — sequential post-run) ---
     //
-    // Under `fail_fast = true` semantics, any table failure should prevent
-    // the surviving tables from advancing their watermarks — otherwise the
-    // next run resumes from a point that implies siblings succeeded. Under
-    // `fail_fast = false` (the default, partial-success semantics), commit
-    // whatever completed cleanly so forward progress isn't lost.
-    let skip_watermarks_due_to_failure = fail_fast && !table_errors.is_empty();
-    if skip_watermarks_due_to_failure {
-        tracing::warn!(
-            deferred = deferred_watermarks.len(),
-            failed_tables = table_errors.len(),
-            "fail_fast + partial failure: skipping {} pending watermark commits so the next run starts from the same baseline",
-            deferred_watermarks.len(),
-        );
-    } else {
-        // §P1.6: single redb transaction for every deferred watermark, run on
-        // the blocking pool so the commit fsync doesn't stall the async task.
-        let store = Arc::clone(&shared_state);
-        let owned: Vec<(String, WatermarkState)> = deferred_watermarks
-            .iter()
-            .map(|wm| {
-                (
-                    wm.state_key.clone(),
-                    WatermarkState {
-                        last_value: wm.timestamp,
-                        updated_at: wm.timestamp,
-                    },
-                )
-            })
-            .collect();
-        let count = owned.len();
-        let res = tokio::task::spawn_blocking(move || {
-            let entries: Vec<(&str, &WatermarkState)> =
-                owned.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            store.batch_set_watermarks(&entries)
+    // Successful table writes have already committed independently in the
+    // warehouse. Always advance their table-specific watermarks, even if a
+    // sibling failed under `fail_fast`; failed tables never enqueue one.
+    // Withholding a survivor's watermark makes recovery append its delta twice.
+    // §P1.6: single redb transaction for every deferred watermark, run on the
+    // blocking pool so the commit fsync doesn't stall the async task.
+    let store = Arc::clone(&shared_state);
+    let owned: Vec<(String, WatermarkState)> = deferred_watermarks
+        .iter()
+        .map(|wm| {
+            (
+                wm.state_key.clone(),
+                WatermarkState {
+                    last_value: wm.timestamp,
+                    updated_at: wm.timestamp,
+                },
+            )
         })
-        .await;
-        match res {
-            // `batch_set_watermarks` returns the count written; ignore it here.
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(error = %e, count, "failed to persist watermarks for run")
-            }
-            Err(e) => tracing::warn!(error = %e, "watermark flush task panicked"),
+        .collect();
+    let count = owned.len();
+    let res = tokio::task::spawn_blocking(move || {
+        let entries: Vec<(&str, &WatermarkState)> = owned
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        store.batch_set_watermarks(&entries)
+    })
+    .await;
+    match res {
+        // `batch_set_watermarks` returns the count written; ignore it here.
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, count, "failed to persist watermarks for run")
         }
+        Err(e) => tracing::warn!(error = %e, "watermark flush task panicked"),
     }
 
     // --- Batch table tagging (concurrent, outside the main processing loop) ---
@@ -6003,10 +6258,15 @@ pub(crate) fn dialect_case_rules(
         // resolution (see `defer.rs`'s
         // `snowflake_resolves_unquoted_identifiers_before_matching`), and
         // enabling it here is a one-line change. It is NOT enabled because doing
-        // so refuses every lowercase-configured Snowflake project — including
-        // this repo's own fixtures — and while the reasoning says such a project
-        // could not read its upstream in production either, that conclusion has
-        // not been verified against a live Snowflake account. Shipping it
+        // so refuses any lowercase-configured Snowflake project, and while the
+        // reasoning says such a project could not read its upstream in
+        // production either, that conclusion has not been verified against a
+        // live Snowflake account.
+        //
+        // The in-repo blast radius is one test fixture, not the examples: the
+        // only Snowflake POC (`05-orchestration/08-circuit-breaker`) is
+        // uppercase throughout (`catalog = "ANALYTICS"`), so it is unaffected.
+        // Do not read this deferral as "it would break our own examples". Shipping it
         // untested would trade a known, pre-existing and unchanged hazard for an
         // unmeasured break. Tracked as #1282; #1281 would settle it exactly.
         //
@@ -10986,20 +11246,9 @@ async fn process_table(
     let resolved_strategy =
         resolve_merge_update_columns(&strategy, &source_cols, &task.metadata_columns);
 
-    let model_ir = ModelIr::replication(
-        TargetRef {
-            catalog: task.target_catalog.clone(),
-            schema: task.target_schema.clone(),
-            table: task.target_table_name.clone(),
-        },
+    let model_ir = replication_model_ir(
+        task,
         resolved_strategy.clone(),
-        SourceRef {
-            catalog: task.source_catalog.clone(),
-            schema: task.source_schema.clone(),
-            table: task.target_table_name.clone(),
-        },
-        ColumnSelection::All,
-        task.metadata_columns.clone(),
         GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: pipeline.target.governance.auto_create_catalogs,
@@ -12684,6 +12933,155 @@ mod tests {
     // the `Succeeded` assertion fails because the entry is still
     // `InFlight`.
     // -----------------------------------------------------------------------
+    /// #1461 follow-up: the collision preflight and the collection loop must
+    /// read the source table list ONCE, not twice.
+    ///
+    /// Two reads mean two answers. A table created between them is absent from
+    /// the preflight and present at collection, so a collision the preflight
+    /// exists to catch early is caught by the in-loop backstop instead — after
+    /// catalogs, schemas and grants have been written. That is the failure the
+    /// preflight was added to prevent, reachable through a race.
+    ///
+    /// A source-property assertion, because the invariant IS structural: there
+    /// is no runtime observation that distinguishes "read once and shared" from
+    /// "read twice and happened to agree". Reintroducing a second call is the
+    /// regression, and only counting the calls catches it.
+    #[test]
+    fn the_replication_path_reads_source_tables_exactly_once() {
+        let src = include_str!("run.rs");
+        // Built from parts so this test's own source does not match the needle
+        // it counts.
+        let needle = format!(".{}(&source_catalog, &conn.schema)", "list_tables");
+        let calls = src.matches(needle.as_str()).count();
+        assert_eq!(
+            calls, 1,
+            "the replication path must read source tables once and share the \
+             snapshot; {calls} call sites found. A second read reopens the \
+             window where the preflight and the collection loop disagree."
+        );
+    }
+
+    /// #1460: the reviewed source state must be re-checked where the work is
+    /// BUILT, not only in the apply path before `run` is called.
+    ///
+    /// The apply path discovers once to compare against the plan, then calls
+    /// `run`, which discovers again and builds work from the second result. A
+    /// connector appearing between the two executed unreviewed. This drives
+    /// `run` directly with a reviewed snapshot that does not match what
+    /// discovery finds, and asserts the refusal fires before any DDL.
+    #[tokio::test]
+    async fn execution_refuses_when_discovery_differs_from_the_reviewed_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let db = dir.join("x.duckdb");
+        {
+            use rocky_core::traits::WarehouseAdapter;
+            let a = rocky_duckdb::adapter::DuckDbWarehouseAdapter::open(&db).unwrap();
+            a.execute_statement("CREATE SCHEMA raw__orders")
+                .await
+                .unwrap();
+            a.execute_statement("CREATE TABLE raw__orders.t AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+        let config_path = dir.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[state]
+backend = "local"
+
+[pipeline.p]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.p.source.discovery]
+adapter = "default"
+
+[pipeline.p.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.p.target]
+adapter = "default"
+catalog_template = "x"
+schema_template = "staging__{{source}}"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+"#,
+                db.display()
+            ),
+        )
+        .unwrap();
+
+        // A reviewed state naming a connector discovery will NOT find. That is
+        // the mismatch the sink has to catch.
+        let reviewed = vec![crate::output::ReplicationConnectorSnapshot {
+            id: "raw__ghost".to_string(),
+            schema: "raw__ghost".to_string(),
+            source_type: "duckdb".to_string(),
+            tables: vec![crate::output::ReplicationTableSnapshot {
+                name: "t".to_string(),
+                row_count: Some(1),
+            }],
+        }];
+
+        let state_path = dir.join("state.redb");
+        let opts = PartitionRunOptions::default();
+        let err = super::run(
+            &config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap(),
+            ),
+            None,
+            None,
+            &state_path,
+            None,
+            false,
+            None,
+            false,
+            None,
+            false,
+            None,
+            &opts,
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            Some(("plan-under-test", reviewed.as_slice())),
+        )
+        .await
+        .expect_err("a reviewed state that does not match discovery must refuse");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("drifted between the check and execution"),
+            "expected the execution-seam refusal, got: {msg}"
+        );
+        assert!(
+            msg.contains("Nothing was written"),
+            "the refusal must state nothing was written, got: {msg}"
+        );
+
+        // No DDL assertion needed: the guard sits immediately after discovery
+        // binds `connectors`, and every catalog/schema creation happens in the
+        // setup loop far below it. Refusing here is structurally before any
+        // warehouse statement.
+    }
+
     #[tokio::test]
     async fn transformation_success_stamps_idempotency_succeeded_not_inflight() {
         use rocky_core::idempotency::IdempotencyState;
@@ -12750,6 +13148,7 @@ adapter = "default"
             None,  // no run_id override — mint the usual timestamp id
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
+            None,  // #1460
         )
         .await
         .expect("transformation run should succeed");
@@ -12866,6 +13265,7 @@ adapter = "default"
                 None,
                 None,
                 false,
+                None, // #1460
             ))
             .expect("the run must succeed regardless of the trace context");
         }
@@ -13015,6 +13415,7 @@ schema = "mart"
             None,  // no run_id override — mint the usual timestamp id
             None,  // no governance ctx (test)
             false, // assume_fresh_state (test)
+            None,  // #1460
         )
         .await
         .expect(
@@ -13926,6 +14327,108 @@ merge_keys = ["id"]
             source_table.state_key(),
             target_table.state_key(),
             "shadow and production must not share a watermark key"
+        );
+    }
+
+    /// The same split, at the seam that actually EMITS the copy statement.
+    ///
+    /// The sibling test above asserts `copy_endpoints`, and its stated mutation
+    /// does turn it red — but nothing derived from `copy_endpoints` reaches the
+    /// copy SQL. Its `source_table` feeds only the change marker, the describe,
+    /// and the row-count check. The statement is generated from the `ModelIr`
+    /// built by `replication_model_ir`, whose `SourceRef` read
+    /// `target_table_name` from #1383 until this test existed — so the property
+    /// was asserted at one seam and violated at the other, and a test whose own
+    /// comment says "asserting the SOURCE side is the point" passed throughout.
+    ///
+    /// Mutation that must turn this red: `SourceRef.table:
+    /// task.target_table_name.clone()` in `replication_model_ir`. That is the
+    /// state shipped in engine-v1.69.0, where a shadow-suffix replication run
+    /// read `<source_schema>.<table><suffix>` — normally absent, so the run
+    /// failed with a misleading "table not found"; present, so it silently
+    /// copied an unrelated table into the shadow target and exited 0.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_suffix_copy_sql_reads_production_not_the_shadow_target() {
+        use rocky_core::traits::SqlDialect;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let task = TableTask {
+            source_catalog: "cat".into(),
+            source_schema: "raw".into(),
+            target_catalog: "cat".into(),
+            target_schema: "raw".into(),
+            source_table_name: "orders".into(),
+            target_table_name: "orders_rocky_shadow".into(),
+            asset_key_prefix: vec!["test".into()],
+            tenant: None,
+            check_column_match: false,
+            check_row_count: false,
+            check_freshness: false,
+            column_match_exclude: vec![],
+            metadata_columns: vec![],
+            governance_tags: BTreeMap::new(),
+            prefetched_source_cols: None,
+            prefetched_target_cols: None,
+            effective_override: ResolvedTableOverride::default(),
+            auto_apply_gate: None,
+        };
+
+        let model_ir = super::replication_model_ir(
+            &task,
+            MaterializationStrategy::FullRefresh,
+            GovernanceConfig {
+                permissions_file: None,
+                auto_create_catalogs: false,
+                auto_create_schemas: true,
+            },
+        );
+
+        assert_eq!(
+            model_ir
+                .source
+                .as_ref()
+                .expect("a replication IR always carries a source")
+                .table,
+            "orders",
+            "the IR the copy is generated from must READ the production table"
+        );
+        assert_eq!(model_ir.target.table, "orders_rocky_shadow");
+
+        // Bind to the emitted statement, not just the struct: this is the
+        // artifact the warehouse executes, and the bug was invisible in every
+        // assertion that stopped short of it.
+        let dialect = DuckDbSqlDialect;
+        let sql = rocky_core::sql_gen::generate_bootstrap_create_table_as_sql(
+            &model_ir,
+            &dialect as &dyn SqlDialect,
+        )
+        .expect("a full-refresh replication IR generates a bootstrap CTAS");
+
+        // Compare against the dialect's own rendering rather than parsing the
+        // statement. `generate_replication_create_table_as_sql` interpolates
+        // `format!("{select_clause}\nFROM {source_ref}")`, so the read is
+        // exactly `FROM ` + whatever `format_table_ref` produces — no quoting
+        // or whitespace assumption of this test's own can drift from it.
+        let rendered = |table: &str| {
+            dialect
+                .format_table_ref("cat", "raw", table)
+                .expect("the fixture identifiers are valid")
+        };
+        let production_read = format!("FROM {}", rendered("orders"));
+        let shadow_read = format!("FROM {}", rendered("orders_rocky_shadow"));
+
+        assert!(
+            sql.contains(&production_read),
+            "the copy must READ production ({production_read}): {sql}"
+        );
+        assert!(
+            !sql.contains(&shadow_read),
+            "the copy must not read its own shadow target ({shadow_read}): {sql}"
+        );
+        assert!(
+            sql.contains(&rendered("orders_rocky_shadow")),
+            "the shadow target must still be what the statement WRITES: {sql}"
         );
     }
 
@@ -14913,6 +15416,181 @@ timestamp_column = "ts"
             vec![1, 2, 3],
             "the appended row (id=3) must not be skipped"
         );
+    }
+
+    /// Regression for #1410: a sibling failure under `fail_fast` must not
+    /// withhold the watermark of an incremental table whose warehouse write
+    /// already committed. Otherwise the recovery run appends that delta twice.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn fail_fast_partial_failure_commits_successful_watermark() {
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_ir::TableRef;
+
+        async fn run_pipeline(
+            config_path: &std::path::Path,
+            state_path: &std::path::Path,
+            run_id: &str,
+        ) -> anyhow::Result<()> {
+            super::run(
+                config_path,
+                Arc::new(rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap()),
+                None,
+                Some("repro"),
+                state_path,
+                None,
+                true,
+                None,
+                false,
+                None,
+                false,
+                None,
+                &PartitionRunOptions::default(),
+                None,
+                None,
+                None,
+                None,
+                &DeferOptions::default(),
+                &SkipRunOptions::default(),
+                &rocky_core::run_vars::RunVars::new(),
+                Some(run_id),
+                None,
+                false,
+                None, // #1460
+            )
+            .await
+        }
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let db_path = tmp.path().join("repro.duckdb");
+        let config_path = tmp.path().join("rocky.toml");
+        let state_path = tmp.path().join("state.redb");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[pipeline.repro]
+strategy = "incremental"
+timestamp_column = "ts"
+
+[pipeline.repro.source.discovery]
+adapter = "default"
+
+[pipeline.repro.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.repro.target]
+catalog_template = "repro"
+schema_template = "staging__{{source}}"
+
+[pipeline.repro.target.governance]
+auto_create_schemas = true
+
+[pipeline.repro.checks]
+row_count = false
+column_match = false
+
+[pipeline.repro.execution]
+concurrency = 1
+fail_fast = true
+
+[state]
+backend = "local"
+"#,
+                db_path.display()
+            ),
+        )
+        .expect("write rocky.toml");
+
+        {
+            let db = DuckDbWarehouseAdapter::open(&db_path).expect("seed duckdb");
+            for sql in [
+                "CREATE SCHEMA raw__orders",
+                "CREATE TABLE raw__orders.a_good (id INTEGER, ts TIMESTAMP)",
+                "INSERT INTO raw__orders.a_good VALUES (1, TIMESTAMP '2026-01-01')",
+                "CREATE TABLE raw__orders.z_bad (id INTEGER, ts TIMESTAMP)",
+                "INSERT INTO raw__orders.z_bad VALUES (1, TIMESTAMP '2026-01-01')",
+            ] {
+                db.execute_statement(sql).await.unwrap();
+            }
+        }
+        run_pipeline(&config_path, &state_path, "bootstrap")
+            .await
+            .expect("bootstrap run");
+
+        {
+            let db = DuckDbWarehouseAdapter::open(&db_path).expect("mutate duckdb");
+            db.execute_statement(
+                "INSERT INTO raw__orders.a_good VALUES (2, TIMESTAMP '2026-01-02')",
+            )
+            .await
+            .unwrap();
+            db.execute_statement("ALTER TABLE raw__orders.z_bad DROP COLUMN ts")
+                .await
+                .unwrap();
+        }
+        let err = run_pipeline(&config_path, &state_path, "partial")
+            .await
+            .expect_err("the sibling table should fail");
+        assert!(
+            err.downcast_ref::<PartialFailure>().is_some(),
+            "one success plus one failure must be partial: {err:#}"
+        );
+
+        let key = TableRef {
+            catalog: "repro".into(),
+            schema: "staging__orders".into(),
+            table: "a_good".into(),
+        }
+        .state_key();
+        let watermark = StateStore::open(&state_path)
+            .expect("open state")
+            .get_watermark(&key)
+            .expect("read watermark")
+            .expect("successful table watermark");
+        assert_eq!(
+            watermark.last_value.to_rfc3339(),
+            "2026-01-02T00:00:00+00:00",
+            "state must match the already-committed successful table write"
+        );
+
+        {
+            let db = DuckDbWarehouseAdapter::open(&db_path).expect("repair duckdb");
+            db.execute_statement("ALTER TABLE raw__orders.z_bad ADD COLUMN ts TIMESTAMP")
+                .await
+                .unwrap();
+            db.execute_statement("UPDATE raw__orders.z_bad SET ts = TIMESTAMP '2026-01-01'")
+                .await
+                .unwrap();
+            db.execute_statement(
+                "INSERT INTO raw__orders.z_bad VALUES (2, TIMESTAMP '2026-01-02')",
+            )
+            .await
+            .unwrap();
+        }
+        run_pipeline(&config_path, &state_path, "recovery")
+            .await
+            .expect("recovery run");
+
+        let db = DuckDbWarehouseAdapter::open(&db_path).expect("verify duckdb");
+        let counts = db
+            .execute_query(
+                "SELECT COUNT(*), COUNT(DISTINCT id), COUNT(*) FILTER (WHERE id = 2) \
+                 FROM repro.staging__orders.a_good",
+            )
+            .await
+            .unwrap();
+        assert_eq!(counts.rows[0][0], "2", "recovery must not add a third row");
+        assert_eq!(counts.rows[0][1], "2", "both ids must remain distinct");
+        assert_eq!(counts.rows[0][2], "1", "the delta row must appear once");
     }
 
     /// Bad identifier rejected before any warehouse query is issued —

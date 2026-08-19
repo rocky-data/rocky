@@ -1477,9 +1477,7 @@ mod tests {
         }
 
         fn write_review_marker(root: &Path, plan_id: &str) {
-            let marker = crate::commands::apply::review_marker_path(root, plan_id);
-            std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
-            std::fs::write(&marker, "{}").unwrap();
+            crate::commands::review::write_test_review_marker(root, plan_id);
         }
 
         /// THE roundtrip proof, creds-free with REAL bytes: seed a real

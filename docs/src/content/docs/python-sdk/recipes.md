@@ -1,17 +1,18 @@
 ---
 title: Recipes
-description: Common rocky-sdk patterns — streaming, error handling, server mode, and orchestrator integration
+description: rocky-sdk patterns for streaming progress, handling failures, server mode, and orchestrators
 sidebar:
   order: 2
 ---
 
-Patterns that go past the [quickstart](/python-sdk/introduction/). Each uses
-`RockyClient` from `rocky-sdk`.
+Patterns that go past the [quickstart](/python-sdk/introduction/). Every example
+uses `RockyClient` from `rocky-sdk`.
 
 ## Stream live progress
 
-`run()` takes a `log_callback` that receives the engine's stderr line by line as
-the run executes. Route it to `print`, a logger, or your orchestrator's logging:
+`run()` takes a `log_callback`. It receives the engine's stderr one line at a
+time while the run executes. Point it at `print`, at a logger, or at your
+orchestrator's logging:
 
 ```python
 import logging
@@ -23,8 +24,8 @@ client = RockyClient(config_path="rocky.toml")
 client.run(filter="tenant=acme", log_callback=log.info)
 ```
 
-The typed `RunResult` still comes back when the run finishes; the callback is
-purely for live visibility.
+The typed `RunResult` still comes back when the run finishes. The callback only
+adds live visibility.
 
 ## Handle failures
 
@@ -43,10 +44,19 @@ except RockyCommandError as exc:
     print(f"exit {exc.returncode}: {exc.stderr_tail}")
 ```
 
+`timeout_seconds` is a wall-clock budget for one CLI invocation, and it defaults
+to 3600 seconds. Setting it on the client, as above, applies it to every call.
+Pass `timeout_seconds=` to a single `run()` when one run needs a larger budget
+than the rest:
+
+```python
+client.run(filter="tenant=acme", timeout_seconds=7200)
+```
+
 ### Partial success
 
-`run()` returns its `RunResult` even when some tables fail (it does not raise),
-so you can act on what landed and report the rest:
+`run()` returns its `RunResult` even when some tables fail. It does not raise.
+You can act on what landed and report the rest:
 
 ```python
 run = client.run(filter="tenant=acme")
@@ -57,17 +67,13 @@ if run.tables_failed:
 ```
 
 To make a non-zero run raise instead of returning a partial result, call the
-lower-level `run_cli(args, allow_partial=False)`, which raises
-`RockyPartialFailure` (the partial JSON is on `exc.stdout`).
+lower-level `run_cli(args, allow_partial=False)`. It raises
+`RockyPartialFailure`, and the partial JSON is on `exc.stdout`.
 
 ## Use a long-lived server
 
-For repeated read-only calls, point the client at a running `rocky serve` instead
-of spawning a subprocess per call. Only `compile`, `lineage`, and `metrics` honor
-`server_url`; `run()` and the write paths always use a subprocess. These endpoints
-serve each command's default output: `lineage`'s `column` is supported, but
-`compile`'s `model_filter` and `metrics`'s `trend`, `column`, or `alerts` raise
-`ValueError` rather than being silently ignored.
+For repeated read-only calls, point the client at a running `rocky serve`
+instead of spawning a subprocess per call. Set `server_url` on the client:
 
 ```python
 client = RockyClient(config_path="rocky.toml", server_url="http://localhost:8080")
@@ -75,11 +81,21 @@ client.compile()                    # served over HTTP
 client.lineage("revenue_summary")
 ```
 
+Three rules govern this mode.
+
+1. Only `compile`, `lineage`, and `metrics` honour `server_url`. `run()` and
+   every write path always spawn a subprocess.
+2. Each endpoint serves its command's default output. `lineage`'s `column`
+   argument is supported.
+3. Arguments the endpoints do not serve raise `ValueError` rather than being
+   ignored: `compile`'s `model_filter`, and `metrics`'s `trend`, `column`, and
+   `alerts`.
+
 ## Run inside any orchestrator
 
-`rocky-sdk` is how a non-Dagster orchestrator integrates with Rocky: construct a
-`RockyClient` in a task and branch on the typed result. (Dagster users get the
-turnkey [`dagster-rocky`](/dagster/introduction/) integration instead.)
+`rocky-sdk` is how a non-Dagster orchestrator integrates with Rocky. Construct a
+`RockyClient` inside a task and branch on the typed result. Dagster users get
+the [`dagster-rocky`](/dagster/introduction/) integration instead.
 
 **Airflow** — wrap a run in a `@task`:
 
@@ -118,5 +134,5 @@ def rocky_pipeline(tenants: list[str]):
         materialize(tenant)
 ```
 
-These are illustrative — they need `apache-airflow` / `prefect` installed and the
-`rocky` binary on `PATH`.
+Both examples are illustrative. They need `apache-airflow` or `prefect`
+installed, and the `rocky` binary on `PATH`.

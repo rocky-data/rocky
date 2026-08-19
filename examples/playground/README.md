@@ -1,10 +1,10 @@
 # Rocky Playground
 
-A curated catalog of small POCs that showcase the distinctive capabilities of [Rocky](https://github.com/rocky-data/rocky), plus the benchmark suite comparing Rocky against dbt-core, dbt-fusion, and PySpark.
+A catalog of small POCs, each isolating one [Rocky](https://github.com/rocky-data/rocky) feature. Each one is a complete project you can run.
 
-This catalog is a **learning / reference** companion to the official [rocky/engine/examples/](https://github.com/rocky-data/rocky/tree/main/engine/examples) starter projects. The starters show you the shape of a Rocky project; the POCs here show you *what Rocky can do that other tools can't*.
+This catalog is a **learning / reference** companion to the [rocky/engine/examples/](https://github.com/rocky-data/rocky/tree/main/engine/examples) starter projects. A starter shows you the shape of a Rocky project. A POC here isolates one feature and demonstrates it end to end.
 
-To start your own project, run `rocky playground my-project`: it scaffolds a throwaway DuckDB project you can iterate on freely (the recommended starting point). The [`quickstart`](https://github.com/rocky-data/rocky/tree/main/engine/examples/quickstart) example below is the same shape, checked into the repo as a fixed reference to read rather than scaffold.
+To start your own project, run `rocky playground my-project`. It scaffolds a throwaway DuckDB project you can change freely. The [`quickstart`](https://github.com/rocky-data/rocky/tree/main/engine/examples/quickstart) example is the same shape, checked into the repo to read rather than scaffold.
 
 ## When to look here vs `engine/examples/`
 
@@ -19,7 +19,19 @@ To start your own project, run `rocky playground my-project`: it scaffolds a thr
 
 ## Running a POC
 
-Each POC is a self-contained folder with its own `rocky.toml`, `models/`, and `run.sh`. Most POCs run on local DuckDB with zero credentials.
+Every POC is one self-contained folder. Two files are always there: a `README.md` and a `run.sh`. `run.sh` drives the whole demo, so you never assemble the pieces by hand.
+
+```
+pocs/<category>/<id>-<name>/
+├── README.md     always — the feature, and the output to expect
+├── run.sh        always ──► the one entry point: runs the demo end to end
+├── rocky.toml    the pipeline config, when the POC runs a pipeline
+├── models/       when the POC ships models: .sql / .rocky + .toml sidecars
+├── data/         when the POC needs seed rows, usually seed.sql
+└── contracts/    only when contracts are part of the feature
+```
+
+Clone the repo, then run any POC from the playground root:
 
 ```bash
 git clone https://github.com/rocky-data/rocky.git
@@ -29,14 +41,14 @@ cd rocky/examples/playground
 ./pocs/02-performance/01-incremental-watermark/run.sh
 ```
 
-Or, from inside a POC folder:
+Or run it from inside the POC folder:
 
 ```bash
 cd pocs/02-performance/01-incremental-watermark
 ./run.sh
 ```
 
-**Prerequisites:** Rocky CLI on PATH. Most POCs only need the [DuckDB CLI](https://duckdb.org) for seeding (`brew install duckdb`).
+**Prerequisites:** the Rocky CLI on your `PATH`. Many POCs also use the [DuckDB CLI](https://duckdb.org) to load seed data (`brew install duckdb`).
 
 **88 of 100 POCs run with no external credentials.** See each POC's README for prerequisites.
 
@@ -44,7 +56,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 ### 00 — Foundations (17 POCs · DuckDB)
 
-DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage primitives, file-format ingest and per-tenant routing, plus the plan/apply deployment workflow and project scaffolding.
+Start here. These POCs cover the language, the config layers, and the deploy loop you use in every project.
 
 | POC | Feature |
 |---|---|
@@ -68,7 +80,7 @@ DSL syntax, materialization basics, playground baseline, the trust-arc 1 storage
 
 ### 01 — Quality (11 POCs · DuckDB)
 
-Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, standalone quality pipeline, freshness SLAs, cross-source overlap.
+How Rocky catches bad data. These POCs cover contracts, inline checks, named and unit tests, freshness SLAs, anomaly alerts, and SCD-2 history.
 
 | POC | Feature |
 |---|---|
@@ -86,7 +98,7 @@ Contracts, inline checks, anomaly detection, local testing, SCD-2 snapshots, sta
 
 ### 02 — Performance (14 POCs · DuckDB)
 
-Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive concurrency, cost + budgets, side-by-side strategy showcase, per-table override rules, EXPLAIN-based cost estimation.
+How Rocky avoids rebuilding what has not changed. These POCs cover the incremental, merge, ephemeral, and delete_insert strategies, plus schema drift, cost controls, and concurrency.
 
 | POC | Feature |
 |---|---|
@@ -107,7 +119,7 @@ Incremental, merge, drift, optimization, ephemeral CTE, delete+insert, adaptive 
 
 ### 03 — AI (7 POCs · `ANTHROPIC_API_KEY` for 01–05, DuckDB for 06–07)
 
-AI-powered model generation, intent extraction, schema sync, test generation, schema-grounded validation, MCP data-grounding, and agent-policy testing.
+How Rocky keeps a language model honest. A generated model goes through the compiler first, and Rocky writes it only when it type-checks.
 
 | POC | Feature |
 |---|---|
@@ -121,7 +133,7 @@ AI-powered model generation, intent extraction, schema sync, test generation, sc
 
 ### 04 — Governance (11 POCs · Databricks / DuckDB)
 
-Unity Catalog grants, schema patterns, workspace isolation, tagging, classification + masking, retention, auto-create schemas.
+Who may read what, and who proved it. The Databricks POCs need credentials; the rest run on local DuckDB.
 
 | POC | Feature | Credentials |
 |---|---|---|
@@ -139,7 +151,7 @@ Unity Catalog grants, schema patterns, workspace isolation, tagging, classificat
 
 ### 05 — Orchestration (12 POCs · DuckDB / docker)
 
-Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode, circuit breaker, idempotency.
+How a run starts, where its state lives, and what happens when it fails. Some POCs need Docker for a local backing service.
 
 | POC | Feature |
 |---|---|
@@ -154,10 +166,11 @@ Hooks, webhooks, remote state, checkpoint/resume, Valkey cache, Dagster DAG mode
 | [09-idempotency-key](pocs/05-orchestration/09-idempotency-key) | `rocky run --idempotency-key` dedup — second run with the same key yields `status = "skipped_idempotent"` |
 | [10-state-retention-sweep](pocs/05-orchestration/10-state-retention-sweep) | `[state.retention]` + `rocky state retention sweep` — manual + end-of-run auto-sweep of run history / lineage / audit domains |
 | [11-state-namespacing](pocs/05-orchestration/11-state-namespacing) | `rocky --state-namespace <key>` routes each pipeline/client to its own `<models>/.rocky-state/<key>.redb` (own single-writer lock) — opt-in, byte-identical when off |
+| [12-webhook-ingress](pocs/05-orchestration/12-webhook-ingress) | `rocky serve --scheduler` exposes `POST /api/v1/hooks/trigger/{pipeline}`; an `X-Rocky-Signature` HMAC-SHA256 body signature queues a durable at-most-once run demand, and an `X-Rocky-Delivery` id deduplicates a redelivery |
 
 ### 06 — Developer Experience (21 POCs · DuckDB)
 
-Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, portability lint, SQL types, PR-preview, lineage-diff, run-watch, dbt-import failure modes, view strategy, dbt unit-test import.
+The daily loop: edit, check, review, ship. Lineage, previews, CI gates, dbt import, and the plain-SQL exit path.
 
 | POC | Feature |
 |---|---|
@@ -185,7 +198,7 @@ Lineage, HTTP API, dbt import, shadow mode, CI, hybrid workflows, trace Gantt, p
 
 ### 07 — Adapters (7 POCs · mixed)
 
-Snowflake, Databricks, Fivetran, custom process adapter, BigQuery, Rust-native adapter skeleton, Trino-via-Docker.
+One POC each for Snowflake, Databricks, BigQuery, Trino, and Fivetran, plus two starters for writing your own adapter. Rocky ships more adapters than this section covers. Check the Credentials column before you run one.
 
 | POC | Feature | Credentials |
 |---|---|---|
@@ -199,20 +212,29 @@ Snowflake, Databricks, Fivetran, custom process adapter, BigQuery, Rust-native a
 
 ## Benchmarks
 
-The [`benchmarks/`](benchmarks/) folder contains a reproducible suite comparing Rocky against dbt-core, dbt-fusion, and PySpark on identical transformation workloads. See [`benchmarks/REPORT_CURRENT.md`](benchmarks/REPORT_CURRENT.md) for the latest numbers.
+The [`benchmarks/`](benchmarks/) folder holds a suite that compares Rocky against dbt-core and dbt-fusion on a generated transformation DAG. `make bench` measures compile time and DAG resolution, and records peak memory for each. Startup, lineage, warm compile, and config validation are separate targets. Run `make help` to list them.
 
-Headline (50k models): Rocky compiles in **10.5s**, **15× faster** than dbt-core, **21× faster** than dbt-fusion, with **5.3× less memory**.
+The suite uses the engine's release binary from this repository, and builds it when it is missing. So it needs the repository and a Rust toolchain, not just the Rocky CLI on your `PATH`. It also needs dbt-core installed. dbt-fusion is optional: the run warns and skips it when it is absent.
 
 ```bash
 cd benchmarks
-make bench          # Run the full suite
+pip install -r requirements.txt   # dbt-core, dbt-duckdb, matplotlib, psutil
+make bench                        # Compile + DAG, at SCALE=10000 models
 ```
+
+[`benchmarks/REPORT_CURRENT.md`](benchmarks/REPORT_CURRENT.md) records one past run. It is dated, and it names the Rocky version it measured. Treat it as a snapshot, not as the current performance of the engine.
 
 ## Adding a POC
 
+Scaffold the folder, write the POC, then update the counts on this page.
+
 ```bash
-./scripts/new-poc.sh 02-performance 10-my-new-feature
+./scripts/new-poc.sh 02-performance 15-my-new-feature
+# ... write models/, run.sh, README.md ...
+bash ../../scripts/update-poc-counts.sh
 ```
+
+The second command rewrites every count in this file from the folders on disk. Never edit those numbers by hand. CI recomputes them and fails the pull request if they drift.
 
 See the monorepo [CONTRIBUTING.md](../../CONTRIBUTING.md) for conventions.
 

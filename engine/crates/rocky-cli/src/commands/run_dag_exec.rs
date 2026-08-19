@@ -160,6 +160,7 @@ fn default_sub_runner() -> SubRunner {
                     None,
                     // `--assume-fresh-state` is not surfaced on the DAG path.
                     false,
+                    None, // #1460: DAG sub-run, no persisted plan
                 )
                 .await
                 .map_err(|e| format!("{e:#}"))
@@ -320,7 +321,7 @@ pub async fn run_with_dag(
     // #1272 was filed because `--dag --shadow` silently wrote production. The
     // obvious repair — thread `shadow_config` into every sub-run — is necessary
     // but NOT sufficient, and shipping it alone would have replaced a visible
-    // wrong with an invisible one. Four independent reasons, each verified:
+    // wrong with an invisible one. Three independent reasons, each verified:
     //
     // 1. **Cross-model reads are not routed.** The DAG dispatches each
     //    transformation model as its own ONE-model sub-run, so
@@ -335,10 +336,15 @@ pub async fn run_with_dag(
     // 2. **Seeds are not routed.** A seed node dispatches to `seed::run_seed`,
     //    which takes no shadow config and DROPs, recreates and repopulates its
     //    CONFIGURED target.
-    // 3. **Replication suffix mode corrupts the SOURCE.** `TableTask` carries one
-    //    `table_name` for both sides and `run()` stores the SUFFIXED name in it,
-    //    so the copy reads `<source_schema>.<table>_rocky_shadow`.
-    // 4. **Snapshot and load are unrouted** and already refuse inside `run()`.
+    // 3. **Snapshot and load are unrouted** and already refuse inside `run()`.
+    //
+    // A fourth reason stood here until the source/target split was finished:
+    // replication suffix mode read `<source_schema>.<table><suffix>`, i.e. its
+    // own shadow target. #1280 split `TableTask` into `source_table_name` /
+    // `target_table_name` and #1383 applied the split, but the replication
+    // `ModelIr`'s `SourceRef` kept the target name until it was fixed, so the
+    // claim outlived the field it described. The three reasons above are
+    // independent of it and the refusal is unchanged.
     //
     // Refusing whole rather than carving out the narrow survivors (a
     // single-model DAG; replication under `schema_override`) is deliberate:
@@ -353,10 +359,9 @@ pub async fn run_with_dag(
              as its own sub-run, so a model's reads of an upstream built by this same run are \
              NOT redirected to that upstream's shadow target — the downstream shadow table would \
              be built from production data and the run would still report success. Seed, \
-             snapshot and load nodes are not routed at all, and replication's suffix mode \
-             rewrites the source it reads. Run the shadow pipeline without `--dag` (a single \
-             `rocky run --shadow` routes every selected model and rewrites the reads between \
-             them), or run the DAG without the flag"
+             snapshot and load nodes are not routed at all. Run the shadow pipeline without \
+             `--dag` (a single `rocky run --shadow` routes every selected model and rewrites \
+             the reads between them), or run the DAG without the flag"
         );
     }
 
@@ -482,6 +487,9 @@ pub(super) fn load_transformation_models(
     // a root that resolves but contributes nothing is not a root the lineage
     // compile needs to cover.
     let mut contributing_roots: Vec<PathBuf> = Vec::new();
+    // Declared transformation pipelines whose models root does not exist,
+    // in `cfg.pipelines` order. See the Absent arm below.
+    let mut missing_roots: Vec<(String, PathBuf)> = Vec::new();
     let mut canonical_roots: Vec<PathBuf> = Vec::new();
     // model name -> the canonical FILE it was first loaded from.
     //
@@ -497,8 +505,18 @@ pub(super) fn load_transformation_models(
         let PipelineConfig::Transformation(t) = pipeline else {
             continue;
         };
-        let Some(dir) = crate::models_loader::resolve_models_dir(&t.models, config_path)? else {
-            continue;
+        let dir = match crate::models_loader::locate_models_dir(&t.models, config_path)? {
+            crate::models_loader::ModelsDir::Present(dir) => dir,
+            crate::models_loader::ModelsDir::Absent(path) => {
+                // Still a skip, as it always was — but the absence is
+                // RECORDED, so `rocky dag` can refuse an all-missing project
+                // instead of exporting an empty graph as success (#1397).
+                // An existing-but-empty root is deliberately NOT recorded:
+                // creating the directory is an explicit act, and an empty
+                // transformation pipeline is a supported no-op.
+                missing_roots.push((pipeline_name.clone(), path));
+                continue;
+            }
         };
         let models_glob = crate::models_loader::resolved_models_glob(&t.models, config_path);
 
@@ -552,6 +570,7 @@ pub(super) fn load_transformation_models(
     Ok(TransformationModels {
         by_pipeline,
         contributing_roots,
+        missing_roots,
     })
 }
 
@@ -560,6 +579,11 @@ pub(super) fn load_transformation_models(
 #[derive(Debug)]
 pub(super) struct TransformationModels {
     pub by_pipeline: rocky_core::unified_dag::ModelsByPipeline,
+    /// Declared transformation pipelines whose configured models root does
+    /// not exist, with the path that failed to resolve. Recorded during the
+    /// same pass that loads the others — a second resolver walk could
+    /// disagree with this one whenever the filesystem changes underneath.
+    pub missing_roots: Vec<(String, PathBuf)>,
     /// The distinct directories that contributed at least one model, in
     /// `cfg.pipelines` order. A pipeline whose directory is absent, or present
     /// but empty, contributes nothing and is not listed — so "how many roots

@@ -1,66 +1,134 @@
 # Dagster Integration
 
-Orchestrate a Rocky pipeline with Dagster using the `dagster-rocky` package.
+Configuration for orchestrating this Rocky project from Dagster with the
+`dagster-rocky` package. It holds a `rocky.toml`, two models, a `defs.yaml`,
+and a `definitions.py`.
 
-## Architecture
+## How dagster-rocky reaches the engine
 
 ```
-Dagster (orchestrator)
-  |
-  +-- dagster-rocky.RockyComponent
-  |     |
-  |     +-- rocky discover  -->  AssetSpecs (cached, no API calls on reload)
-  |     +-- rocky dag       -->  Full unified DAG (dag_mode)
-  |     +-- rocky run       -->  Execute pipeline
-  |
-  +-- rocky.toml (Rocky config)
-  +-- models/ (Rocky models)
+  Dagster process
+      │
+      ├── RockyComponent  ── builds assets from a cached state file
+      │        │                  at code-location load time
+      │        │
+      │        └── write_state_to_path()  ── runs the CLI, caches JSON
+      │                   │
+      │                   ├──► rocky discover   sources → AssetSpecs
+      │                   ├──► rocky compile    diagnostics → asset checks
+      │                   ├──► rocky optimize   strategy hints → metadata
+      │                   │                     (surface_optimize_metadata, on by default)
+      │                   └──► rocky dag        full graph (dag_mode=True only)
+      │
+      └── RockyResource   ── runs the CLI inside an asset body
+                   └──► rocky run / plan / apply / discover
 ```
 
-## Project Structure
+`RockyComponent` splits the work in two. `write_state_to_path(state_path)`
+shells out to the CLI and writes the JSON. `build_defs_from_state()` reads
+that JSON on every code-location reload and builds the assets from it.
+
+One opt-in changes that. With `discover_on_missing_state: true`, a load that
+finds no state file calls `write_state_to_path` first, so that load does shell
+out. The attribute defaults to `false` and `defs.yaml` here leaves it unset.
+
+`RockyResource` is the imperative alternative. You call `rocky.run(...)` or
+`rocky.plan(...)` from inside an `@dg.asset` function.
+
+## Files
 
 ```
 dagster-integration/
-  rocky.toml              # Rocky pipeline config
-  defs.yaml                  # Dagster component config
-  definitions.py             # Dagster code location
+  rocky.toml               # Rocky pipeline config
+  defs.yaml                # RockyComponent attributes
+  definitions.py           # RockyResource assets
   models/
-    stg_orders.rocky         # Staging model
-    stg_orders.toml
-    fct_order_summary.rocky  # Fact model
-    fct_order_summary.toml
+    stg_orders.rocky       + stg_orders.toml
+    fct_order_summary.rocky + fct_order_summary.toml
 ```
 
-## How It Works
+`defs.yaml` sets three attributes:
 
-### RockyComponent (recommended)
+```yaml
+type: dagster_rocky.RockyComponent
+attributes:
+  binary_path: rocky
+  config_path: rocky.toml
+  state_path: .rocky-state.redb
+```
 
-`RockyComponent` is a state-backed Dagster component that caches `rocky discover` output. Assets appear in the Dagster UI instantly on code location reload without calling any external APIs.
+## Check the Rocky side first
 
-1. **`write_state_to_path()`** calls `rocky discover`, serializes to JSON, and saves to a state file
-2. **`build_defs_from_state()`** reads the cached JSON and creates `AssetSpec` objects without API calls
-
-With `dag_mode=True`, the component also calls `rocky dag` to build a fully connected asset graph where every pipeline stage (source, load, transformation) becomes a Dagster asset with resolved dependencies.
-
-### RockyResource
-
-`RockyResource` wraps the Rocky CLI binary. Use it inside asset functions to run discover, plan, and run commands.
-
-## Setup
+Run these from the repository root. Rocky reads `rocky.toml` from the working
+directory by default, so the `cd` is what lets the rest omit `--config`.
 
 ```bash
-# Install dagster-rocky
-uv add dagster-rocky
-
-# Ensure rocky binary is on PATH
-rocky --version
-
-# Start Dagster dev server
-uv run dg dev
+cd engine/examples/dagster-integration
+rocky compile
+rocky dag
 ```
 
-## Running
+`rocky compile` reports two models. `rocky dag` prints the unified graph.
+
+## This directory is not a runnable Dagster project
+
+There is no `pyproject.toml` here, and none in any parent directory. So
+`uv add dagster-rocky` fails from this directory:
+
+```
+error: No `pyproject.toml` found in current directory or any parent directory
+```
+
+`uv run dg dev` fails too, for a different reason. `uv run` does not need a
+`pyproject.toml`. It fails because `dg` is not installed here:
+
+```
+error: Failed to spawn: `dg`
+  Caused by: No such file or directory (os error 2)
+```
+
+Treat these files as fragments to copy into a Dagster project you have already
+scaffolded.
+
+To use them, create a `dg` project and add `dagster-rocky` to it. Copy
+`rocky.toml`, `models/`, and `defs.yaml` across. Then point `config_path` at
+your copy of `rocky.toml`.
+
+## `rocky discover` returns nothing here
+
+`RockyComponent` builds its assets from `rocky discover`. This example's
+pipeline is a replication pipeline whose source schema pattern needs a
+`raw__*` schema in DuckDB. A fresh database has none, so discover reports
+zero sources and the component builds zero assets:
 
 ```bash
-uv run dg dev
+rocky --output json discover
 ```
+
+```json
+{
+  "version": "...",
+  "command": "discover",
+  "sources": []
+}
+```
+
+Point the pipeline at a warehouse that holds `raw__*` schemas to see assets
+appear.
+
+## Where `--config` goes
+
+`--config` is a top-level flag, not a per-command flag. It comes before the
+subcommand, never after:
+
+```bash
+rocky --config rocky.toml compile   # works
+rocky compile --config rocky.toml   # error: unexpected argument '--config' found
+```
+
+The commands above omit it, because `--config` already defaults to
+`rocky.toml` in the working directory.
+
+`RockyComponent` and `RockyResource` build the argument list through
+`rocky-sdk`, which places `--config` first. Set `config_path` and let the SDK
+order the flags.

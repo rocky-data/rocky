@@ -5,5 +5,5 @@ type = "full_refresh"
 
 [target]
 catalog = "warehouse"
-schema = "analytics"
+schema = "main"
 table = "orders_summary"

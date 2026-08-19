@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-08-18
+
+### Added
+
+- **`review_status()`** — a typed read of a plan's review marker, backed by the new `review_status` schema. Markers are parse-and-match validated, so a truncated or mispasted one reports unapproved rather than approving. (#1472)
+
+### Fixed
+
+- **`dag()` no longer forces a whole-project models override, which made multi-transformation projects undiscoverable.** It always sent `--models <models_dir>`. The engine reads that as an explicit *whole-project* override and assigns that one directory's models to **every** transformation pipeline, so a project with two of them was refused outright — `model 'x' is claimed by transformation pipelines a and b` — before any caller could see a DAG. `models_dir` now defaults to `None` and the flag is omitted, so each pipeline resolves its own configured root (the branch `rocky run --dag` already used). Pass `models_dir=` to ask for the override deliberately. (#1348)
+
+- **`run_model()` accepts `pipeline=`, so execution resolves the same root discovery did.** With `pipeline` set, `--pipeline` is sent and `--models` is not: the engine resolves that pipeline's own root. This has to move together with the change above — a node discovered in one root but built from another is silently different SQL for the same asset. Note `--models` never helped here: the engine refuses a bare `--model` on a multi-transformation project whether or not it is passed. Leaving `pipeline` at `None` keeps the previous argv byte-for-byte. (#1348, #1292)
+
+  If you construct `RockyClient(models_dir=…)` with a value that disagrees with the root your `rocky.toml` pipelines declare, `dag()` now follows the config rather than the client field. That is the intended direction, but it is a behaviour change worth knowing about.
+
+### Fixed
+
+- **AI parse errors now name a command the CLI accepts.** `RockyParseError` from `ai_sync()`, `ai_explain()`, and `ai_test()` reported the command as `ai sync` / `ai explain` / `ai test`. Those forms are rejected by the CLI — `rocky ai` takes a positional intent — so anyone diagnosing malformed output was handed a command that fails. They now read `ai-sync`, `ai-explain`, and `ai-test`. (#1443)
+
+### Removed
+
+- **BREAKING: `DriftOutput` is no longer exported.** It modelled the output of a `rocky drift` command that does not exist, so nothing could ever produce a payload for it to parse. `DriftSummary` and `DriftActionOutput` remain available and are unchanged — drift is reported on `RunResult.drift`. (#1431)
+
+  `DriftOutput` was importable from `rocky_sdk.types` and `rocky_sdk.types_generated` in the released `sdk-v0.11.0`, so removing it breaks any code that imports the name — even though no code could obtain an instance of it. **This must ship as a minor bump (`0.12.0`), not a patch**: pre-1.0, minor is the only signal available for a breaking change, and a changelog note alone does not stop an existing resolver from picking the new version up.
+
+  **The surviving types also move module.** `DriftSummary` and `DriftActionOutput` keep their field shapes and their top-level exports from `rocky_sdk.types` / `rocky_sdk.types_generated`, but in `0.11.0` the barrel resolved them from `rocky_sdk.types_generated.drift_schema`, and that module is deleted here — they now resolve from `run_schema`. Two consequences beyond the `DriftOutput` name:
+
+  - `from rocky_sdk.types_generated.drift_schema import DriftSummary` (a direct submodule import) raises `ModuleNotFoundError`.
+  - Pickles of `0.11.0` instances record `drift_schema` as the defining module, so they fail to load — including instances obtained through the top-level export.
+
+  No compatibility shim is offered, because it could not survive: `just codegen-sdk` runs `rm -rf src/rocky_sdk/types_generated` and restores only `__init__.py` from git, so a hand-written `drift_schema.py` would be deleted by the next codegen run. Import the two types from `rocky_sdk.types` instead, which is stable across this change.
+
+  `dagster-rocky` is unaffected — it references `DriftOutput` nowhere, and `import dagster_rocky.types` succeeds against this change.
+
+## [0.11.0] — 2026-08-11
+
+### Added
+
+- **New generated result models.** `state_schedule_hold_schema` covers the runtime schedule pause/resume surface, and `brief_schema` gains the scheduler section. Both are additive — no existing model changed shape — but they are new public types, which is why this is a minor rather than a patch. (#1334, #1339)
+
+- **Worked examples on `RockyClient`'s four core methods, executed in CI.** `run()`, `plan()`, `apply()` and `dag()` carry runnable docstring examples, and a new test module executes them so the documentation cannot drift from the client's actual signatures. (#1387)
+
+### Changed
+
+- Regenerated types pick up engine-side additions to the run, dag, ci-diff, promote-plan, preview-diff, project and tick schemas. (#1352, #1356, #1360, #1384, #1385)
+
+- **The build backend is now bounded: `hatchling>=1.30.1,<1.32`.** It was previously unbounded, so each release built against whatever had just been published. hatchling 1.32.0 landed on 2026-08-11 and emits `Metadata-Version: 2.5`, which the twine bundled in our pinned publish action rejects — the wheel built cleanly and failed at upload. The bound is a range rather than a single pin because the transition is not monotonic: 1.30.0 emitted 2.5, 1.30.1 reverted to 2.4, and 1.32.0 re-landed it. Runtime dependencies are unaffected; this constrains only how the wheel is built. (#1420)
+
+- Development dependencies refreshed (ruff 0.15.18 → 0.16.2, `typing-extensions`, `packaging`, `platformdirs`, `typeguard`). (#1420)
+
 ## [0.10.0] — 2026-07-24
 
 ### Added

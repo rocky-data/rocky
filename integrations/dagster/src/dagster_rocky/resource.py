@@ -66,6 +66,7 @@ from .types import (
     PlanResult,
     PromotePlan,
     RetentionStatusOutput,
+    ReviewStatusOutput,
     RunResult,
     StateHealthResult,
     StateResult,
@@ -819,16 +820,42 @@ class RockyResource(dg.ConfigurableResource):
         with _translating():
             return self._get_client().plan(filter, pipeline=pipeline, env=env)
 
-    def apply(self, plan_id: str) -> ApplyResult:
+    def apply(self, plan_id: str, *, expect_spec_digest: str | None = None) -> ApplyResult:
         """Run ``rocky apply <plan-id>`` and return the parsed result.
 
         ``rocky apply`` prints the plan-kind's own output (no wrapping
         envelope), so the return type is the :data:`~rocky_sdk.client.ApplyResult`
         union: run-shaped plans yield a :class:`RunResult`, a ``gc`` plan a
         ``GcApplyOutput``, compact / archive / promote plans their own outputs.
+
+        ``expect_spec_digest`` passes ``--expect-spec-digest``: the engine
+        refuses unless the plan payload's ``spec_digest`` equals it exactly. A
+        product-bound plan requires it. The value MUST come from your own
+        independently approved product-spec source (the approved snapshot) —
+        NEVER from :meth:`review_status`: the plan carries the digest it was
+        authored against, so feeding ``review_status.spec_digest`` back here
+        compares the plan against itself and always passes. Use
+        ``review_status.spec_digest`` only to DETECT what the plan pinned,
+        and compare it against your approved snapshot's digest before
+        applying.
         """
         with _translating():
-            return self._get_client().apply(plan_id)
+            return self._get_client().apply(plan_id, expect_spec_digest=expect_spec_digest)
+
+    def review_status(self, plan_id: str) -> ReviewStatusOutput:
+        """Run ``rocky review <plan-id> --status`` — the typed marker oracle.
+
+        Reports whether a well-formed sign-off marker naming the plan exists,
+        who approved it and when, and the plan's product binding. A malformed
+        or mismatched marker is an error, never ``reviewed=False``.
+
+        ``spec_digest`` here is what the PLAN pinned — compare it against
+        your independently approved product-spec snapshot; never feed it back
+        to :meth:`apply` as the expectation (that compares the plan against
+        itself).
+        """
+        with _translating():
+            return self._get_client().review_status(plan_id)
 
     def run(
         self,
@@ -1080,8 +1107,11 @@ class RockyResource(dg.ConfigurableResource):
             context: Dagster execution context (required for Pipes injection).
             filter: Component filter (e.g. ``"tenant=acme"``).
             governance_override / run_models / partition / shadow_suffix / …:
-                Same as :meth:`run`. Threaded into the rocky CLI via
-                :meth:`_build_plan_args`.
+                Same as :meth:`run`, with one exception: ``defer`` / ``defer_to``
+                are ``run``-only flags, so supplying them here raises
+                ``ValueError`` -- the plan step builds the ``rocky plan`` verb,
+                which the CLI parses without them (#1404). Threaded into the
+                rocky CLI via :meth:`_build_plan_args`.
             pipes_client: Optional pre-configured ``PipesSubprocessClient``. When
                 supplied, ``asset_key_fn`` / ``include_keys`` are ignored.
             asset_key_fn: Optional transform applied to each Pipes event's asset
@@ -1236,15 +1266,25 @@ class RockyResource(dg.ConfigurableResource):
         with _translating():
             return self._get_client().catalog(out=out)
 
-    def dag(self, *, column_lineage: bool = False) -> DagResult:
-        """Run ``rocky dag`` and return the full unified DAG."""
+    def dag(self, *, column_lineage: bool = False, models_dir: str | None = None) -> DagResult:
+        """Run ``rocky dag`` and return the full unified DAG.
+
+        Defaults to ``models_dir=None``, which **opts in** to per-pipeline
+        resolution. A whole-project ``--models`` makes the engine refuse any
+        project with two transformation pipelines, so the component could not
+        build definitions at all (#1348). Pass a string to force the override.
+
+        This opt-in pairs with :meth:`run_model` passing ``pipeline=``; the two
+        must move together, or discovery and execution resolve different roots.
+        """
         with _translating():
-            return self._get_client().dag(column_lineage=column_lineage)
+            return self._get_client().dag(column_lineage=column_lineage, models_dir=models_dir)
 
     def run_model(
         self,
         model_name: str,
         *,
+        pipeline: str | None = None,
         filter: str | None = None,
         partition: str | None = None,
         partition_from: str | None = None,
@@ -1258,6 +1298,7 @@ class RockyResource(dg.ConfigurableResource):
         with _translating():
             return self._get_client().run_model(
                 model_name,
+                pipeline=pipeline,
                 filter=filter,
                 partition=partition,
                 partition_from=partition_from,

@@ -517,6 +517,7 @@ pub async fn plan(
             pipeline_name,
             env,
             run_options,
+            state_path,
         ) {
             Ok((_replication_plan, plan_id, persisted_at)) => {
                 output.plan_id = Some(plan_id);
@@ -1037,6 +1038,11 @@ fn build_and_persist_run_plan(
         governance_override: run_options.governance_override.clone(),
         models,
         execution_layers,
+        // Product identity is authored by the fulfillment runtime through the
+        // MCP `propose` tool; the CLI `rocky plan` verb deliberately writes
+        // none, so its plans keep today's bytes and ids.
+        product_id: None,
+        spec_digest: None,
     };
 
     let cwd = std::env::current_dir().context("failed to get current working directory")?;
@@ -1306,6 +1312,99 @@ pub(crate) fn build_source_state_snapshot(
 /// the project has no `models/` directory or when compile produced
 /// zero models. Discovery has already happened earlier in `plan()`;
 /// this function only canonicalizes the result and persists.
+/// Keep a shadow descriptor only when shadow routing is actually requested.
+///
+/// `--shadow-suffix` / `--shadow-schema` are accepted without `--shadow`, where
+/// they are inert. Returning `None` there keeps a production plan's payload —
+/// and therefore its `plan_id` — exactly as it was before these fields existed.
+fn shadow_descriptor(run_options: &PlanRunOptions, value: Option<&String>) -> Option<String> {
+    if run_options.shadow || run_options.branch.is_some() {
+        value.cloned()
+    } else {
+        None
+    }
+}
+
+/// A credential-free identity for the state authority a plan was reviewed
+/// against: which ledger holds its watermarks, freezes, budgets and
+/// idempotency keys.
+///
+/// Needed because the plan's `config_snapshot` cannot answer this. `valkey_url`
+/// is a `RedactedString` and serializes whole as `"***"`, so a Valkey A-to-B
+/// swap compares equal; and the resolved `--state-path` never appears in the
+/// config at all, because it comes from the caller. A plan could therefore pass
+/// the config comparison and still apply against a different ledger — meaning an
+/// unexpected full refresh, or a freeze recorded in the reviewed authority going
+/// unseen.
+///
+/// Credential-free on purpose. For Valkey this keeps scheme, host, port and
+/// database and drops any `user:password@`, so the identity is comparable
+/// without the plan payload carrying a secret. `expose()` is the audited
+/// accessor; the exposed value is parsed and discarded, never stored.
+pub(crate) fn state_authority_identity(
+    state: &rocky_core::config::StateConfig,
+    state_path: &std::path::Path,
+) -> String {
+    use rocky_core::config::StateBackend;
+    // The remote ledger key embeds the state schema version
+    // (`state_sync.rs`: `format!("v{}", current_schema_version())`), so two
+    // versions are two different objects. Without this, a plan made before a
+    // schema upgrade compares equal afterwards while the new binary reads a
+    // different ledger — losing the reviewed watermarks, budgets and freezes.
+    let mut parts = vec![
+        format!("backend={:?}", state.backend),
+        format!("schema=v{}", rocky_core::state::current_schema_version()),
+    ];
+    match state.backend {
+        StateBackend::S3 => {
+            parts.push(format!(
+                "bucket={}",
+                state.s3_bucket.as_deref().unwrap_or("")
+            ));
+            parts.push(format!(
+                "prefix={}",
+                state.s3_prefix.as_deref().unwrap_or("")
+            ));
+        }
+        StateBackend::Gcs => {
+            parts.push(format!(
+                "bucket={}",
+                state.gcs_bucket.as_deref().unwrap_or("")
+            ));
+            parts.push(format!(
+                "prefix={}",
+                state.gcs_prefix.as_deref().unwrap_or("")
+            ));
+        }
+        _ => {}
+    }
+    if let Some(url) = state.valkey_url.as_ref() {
+        // Keep only where it points. Two secret carriers to remove, not one:
+        //
+        //   redis://user:pass@host:6379/0   -> userinfo before the LAST '@'
+        //                                      (last, because a password may
+        //                                       itself contain '@')
+        //   redis://host:6379?password=xyz  -> query string
+        //
+        // Stripping only the userinfo would write the second form's secret into
+        // a plan file on disk.
+        let raw = url.expose();
+        let (scheme, rest) = raw.split_once("://").unwrap_or(("", raw));
+        let no_userinfo = rest.rsplit_once('@').map_or(rest, |(_creds, host)| host);
+        let no_query = no_userinfo
+            .split_once('?')
+            .map_or(no_userinfo, |(host, _query)| host);
+        let no_fragment = no_query
+            .split_once('#')
+            .map_or(no_query, |(host, _frag)| host);
+        parts.push(format!("valkey={scheme}://{no_fragment}"));
+    }
+    // The local ledger is identified by its resolved path, which the config
+    // never carries.
+    parts.push(format!("path={}", state_path.display()));
+    parts.join(" ")
+}
+
 fn build_and_persist_replication_plan(
     rocky_cfg: &rocky_core::config::RockyConfig,
     connectors: &[DiscoveredConnector],
@@ -1313,9 +1412,11 @@ fn build_and_persist_replication_plan(
     pipeline: Option<&str>,
     env: Option<&str>,
     run_options: &PlanRunOptions,
+    state_path: &std::path::Path,
 ) -> Result<(ReplicationPlan, String, chrono::DateTime<Utc>)> {
     let config_snapshot = serde_json::to_value(rocky_cfg)
         .context("failed to serialize RockyConfig for replication plan")?;
+    let state_authority = state_authority_identity(&rocky_cfg.state, state_path);
     let source_state_snapshot = build_source_state_snapshot(connectors);
 
     let replication_plan = ReplicationPlan {
@@ -1325,8 +1426,28 @@ fn build_and_persist_replication_plan(
         idempotency_key: run_options.idempotency_key.clone(),
         resume: run_options.resume.clone(),
         resume_latest: run_options.resume_latest,
+        // Shadow routing IS part of a persisted plan's contract — the same
+        // reason the `RunPlan` branch captures it. Dropping it here was #1403:
+        // `rocky plan --shadow` was accepted, silently discarded, and
+        // `rocky apply` then wrote the PRODUCTION targets and reported
+        // Success. That is the #1272 defect shape, one plan kind over.
+        shadow: run_options.shadow,
+        // Only carry the descriptors when the plan is actually a shadow plan.
+        // `--shadow-schema` and `--shadow-suffix` are accepted WITHOUT
+        // `--shadow` (only `--branch` conflicts with them), and such a run is
+        // still a production run. Persisting an inert flag would add a payload
+        // key — and so a new `plan_id` — to a plan whose behaviour is
+        // unchanged. `main.rs` already applies exactly this normalisation to
+        // `shadow_suffix` before it reaches `PlanRunOptions`, and for the same
+        // stated reason; `shadow_schema` is not normalised there, so it is
+        // handled here rather than widening that path and shifting `RunPlan`
+        // ids too.
+        shadow_suffix: shadow_descriptor(run_options, run_options.shadow_suffix.as_ref()),
+        shadow_schema: shadow_descriptor(run_options, run_options.shadow_schema.as_ref()),
+        branch: run_options.branch.clone(),
         governance_override: run_options.governance_override.clone(),
         config_snapshot,
+        state_authority: Some(state_authority),
         source_state_snapshot,
     };
 
@@ -2203,10 +2324,119 @@ pub(crate) async fn build_promote_plan_inner(
 
 #[cfg(test)]
 mod tests {
+
+    /// The identity must change across a state-schema version bump, because the
+    /// remote ledger key embeds it. Without this a plan made under one version
+    /// compares equal under the next while reading a different object.
+    #[test]
+    fn state_authority_identity_includes_the_state_schema_version() {
+        use rocky_core::config::StateConfig;
+        let st = StateConfig::default();
+        let got = super::state_authority_identity(&st, std::path::Path::new("/s.redb"));
+        assert!(
+            got.contains(&format!(
+                "schema=v{}",
+                rocky_core::state::current_schema_version()
+            )),
+            "identity must record the state schema version, got: {got}"
+        );
+    }
+
+    /// The state-authority identity is persisted to a plan file on disk, so it
+    /// must carry no secret in ANY valkey URL form. Stripping only the
+    /// `user:pass@` userinfo leaves a `?password=` query intact.
+    #[test]
+    fn state_authority_identity_strips_every_credential_form() {
+        use rocky_core::config::{StateBackend, StateConfig};
+        let ident = |url: &str| {
+            let st = StateConfig {
+                backend: StateBackend::Valkey,
+                valkey_url: Some(rocky_core::redacted::RedactedString::new(url.to_string())),
+                ..Default::default()
+            };
+            super::state_authority_identity(&st, std::path::Path::new("/s.redb"))
+        };
+
+        for (url, secret) in [
+            ("redis://user:hunter2@h:6379/0", "hunter2"),
+            ("redis://:hunter2@h:6379", "hunter2"),
+            ("redis://user:p@ss@h:6379", "p@ss"),
+            ("redis://h:6379?password=hunter2", "hunter2"),
+            ("redis://h:6379/0#hunter2", "hunter2"),
+        ] {
+            let got = ident(url);
+            assert!(
+                !got.contains(secret),
+                "identity for {url} leaked the secret: {got}"
+            );
+            assert!(
+                got.contains("h:6379"),
+                "identity for {url} lost the host it exists to compare: {got}"
+            );
+        }
+
+        assert_ne!(
+            ident("redis://a:6379/0"),
+            ident("redis://b:6379/0"),
+            "different hosts must produce different identities"
+        );
+    }
     use std::sync::Arc;
 
     use super::*;
     use rocky_ir::MaskStrategy;
+
+    /// #1403: an inert shadow descriptor must not reach the payload.
+    ///
+    /// `--shadow-suffix` / `--shadow-schema` are accepted WITHOUT `--shadow`
+    /// (only `--branch` conflicts with them), and such a run is a production
+    /// run. Persisting the flag anyway adds a payload key to a plan whose
+    /// behaviour is unchanged, and `plan_id` is `blake3({kind, payload})` — so
+    /// an existing project's plan id would move for a flag that does nothing.
+    ///
+    /// Found by red-team review: the first revision of this fix persisted
+    /// `shadow_schema` unconditionally and shifted exactly that id.
+    ///
+    /// Mutation that must turn this red: returning `value.cloned()`
+    /// unconditionally from `shadow_descriptor`.
+    #[test]
+    fn an_inert_shadow_descriptor_is_not_persisted() {
+        let schema = "shadow_s".to_string();
+
+        let inert = PlanRunOptions {
+            shadow: false,
+            branch: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            shadow_descriptor(&inert, Some(&schema)),
+            None,
+            "without --shadow or --branch the descriptor is inert and must not \
+             enter the payload"
+        );
+
+        let shadowed = PlanRunOptions {
+            shadow: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            shadow_descriptor(&shadowed, Some(&schema)).as_deref(),
+            Some("shadow_s"),
+            "under --shadow the descriptor must be persisted"
+        );
+
+        let branched = PlanRunOptions {
+            shadow: false,
+            branch: Some("feature_x".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            shadow_descriptor(&branched, Some(&schema)).as_deref(),
+            Some("shadow_s"),
+            "a branch plan carries shadow == false, so branch must also keep \
+             the descriptor"
+        );
+    }
 
     // ------------------------------------------------------------------
     // replication copy preview — strategy / override fidelity (bug fix:

@@ -1588,6 +1588,17 @@ pub async fn run_branch_promote_from_plan(
     let plan =
         read_plan(root, plan_id).with_context(|| format!("failed to read plan '{plan_id}'"))?;
 
+    // FF-WP1 alias gate: `branch promote --plan` does not cross the generic
+    // apply's product-identity seam, and the typed `PromotePlan` deserialize
+    // below silently drops unknown fields — so refuse any RAW payload
+    // carrying product keys BEFORE the kind check and the deserialize.
+    // Product-bound plans go through canonical `rocky apply`.
+    crate::commands::apply::refuse_product_bound_alias_apply(
+        &plan,
+        plan_id,
+        "rocky branch promote --plan",
+    )?;
+
     if plan.kind != PlanKind::Promote {
         anyhow::bail!(
             "plan '{plan_id}' is a {} plan, not a promote plan. \
@@ -2774,6 +2785,79 @@ mod tests {
         assert_ne!(persisted.kind, PlanKind::Promote);
     }
 
+    /// FF-WP1 fix round (finding 1) — `rocky branch promote --plan` refuses a
+    /// correctly rehashed Promote plan whose RAW payload carries the product
+    /// pair, BEFORE the typed `PromotePlan` deserialize, before the config
+    /// load / policy gate, and therefore before any warehouse work. The
+    /// payload here is deliberately garbage apart from the product keys: had
+    /// the route reached its typed deserialize, the error would have been
+    /// "failed to deserialize promote plan payload" — the control half proves
+    /// exactly that for the same payload WITHOUT the product keys. The config
+    /// path is nonexistent, so nothing after the gate could have succeeded
+    /// quietly either.
+    #[tokio::test]
+    async fn branch_promote_from_plan_refuses_product_bound_payload_pre_deserialize() {
+        use crate::plan_store::{PlanKind, write_plan};
+
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let missing_config = dir.join("rocky.toml"); // never written
+        let state_path = dir.join("state.redb");
+
+        // Correctly rehashed (write_plan hashes this payload) but NOT a valid
+        // PromotePlan shape — plus the product pair.
+        let bound_payload = serde_json::json!({
+            "product_id": "product:revenue_daily",
+            "spec_digest": "sha256:abc",
+        });
+        let bound_id = write_plan(dir, PlanKind::Promote, &bound_payload).unwrap();
+
+        let err = crate::commands::run_branch_promote_from_plan(
+            dir,
+            &missing_config,
+            &bound_id,
+            None,
+            None,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect_err("a product-bound payload must refuse on the --plan route");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("product-identity")
+                && msg.contains("rocky branch promote --plan")
+                && msg.contains("--expect-spec-digest"),
+            "the refusal names the alias and directs to canonical apply: {msg}"
+        );
+        assert!(
+            !msg.contains("failed to deserialize"),
+            "the refusal must fire BEFORE the typed deserialize: {msg}"
+        );
+
+        // Control: the same garbage payload WITHOUT product keys reaches the
+        // typed deserialize and fails THERE — placing the product refusal
+        // strictly before it.
+        let clean_id = write_plan(dir, PlanKind::Promote, &serde_json::json!({})).unwrap();
+        let err = crate::commands::run_branch_promote_from_plan(
+            dir,
+            &missing_config,
+            &clean_id,
+            None,
+            None,
+            &state_path,
+            rocky_core::config::PolicyPrincipal::Human,
+            false,
+        )
+        .await
+        .expect_err("the garbage control payload fails at the typed deserialize");
+        assert!(
+            format!("{err:#}").contains("failed to deserialize promote plan payload"),
+            "control failure is the deserialize, got: {err:#}"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Transformation-pipeline model-glob walk — closes the v1 promote
     // limitation that the enumeration was replication-only.
@@ -3573,6 +3657,7 @@ effect = "deny"
             &shared_plan_id,
             &state_path,
             PolicyPrincipal::Agent,
+            None,
             false,
         )
         .await;
@@ -3637,6 +3722,7 @@ effect = "deny"
             &shared_plan_id,
             &state_path,
             PolicyPrincipal::Human,
+            None,
             false,
         )
         .await

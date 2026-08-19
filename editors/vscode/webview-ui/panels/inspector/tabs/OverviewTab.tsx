@@ -3,7 +3,6 @@ import { ElPopover } from "@tailwindplus/elements/react";
 import type { InspectorModelData } from "../../../../src/webviews/inspector/contract";
 import type {
   BreakingData,
-  DriftData,
   GovernanceData,
   ReplayData,
 } from "../../../../src/webviews/lineage/contract";
@@ -64,12 +63,11 @@ function BlastRadiusValue({ downstream }: { downstream: string[] }) {
 /**
  * Overview = the model trust dashboard. Headline cost + blast-radius, then a
  * grid of the trust-plane signals dbt has no engine for — contract, freshness,
- * drift, governance, last run — fetched once the tab opens (project-wide, then
+ * governance, last run — fetched once the tab opens (project-wide, then
  * sliced to this model). Each card degrades to a muted state when its source
  * has no data yet (no runs, no base ref, no classified columns).
  */
 export function OverviewTab({ data }: { data: InspectorModelData }) {
-  const [drift, setDrift] = useState<DriftData | null>(null);
   const [gov, setGov] = useState<GovernanceData | null>(null);
   const [breaking, setBreaking] = useState<BreakingData | null>(null);
   const [replay, setReplay] = useState<ReplayData | null>(null);
@@ -82,7 +80,6 @@ export function OverviewTab({ data }: { data: InspectorModelData }) {
         .then((v) => active && set(v))
         .catch(() => {});
     };
-    req<DriftData>("drift", setDrift);
     req<GovernanceData>("governance", setGov);
     req<BreakingData>("breaking", setBreaking);
     req<ReplayData>("replay", setReplay);
@@ -95,12 +92,6 @@ export function OverviewTab({ data }: { data: InspectorModelData }) {
   const lastRun = replay?.models.find((m) => m.model === data.modelName);
   const breakingFinding = breaking?.findings.find(
     (f) => f.model === data.modelName,
-  );
-  const driftAction = drift?.actions.find(
-    (a) =>
-      a.table === data.modelName ||
-      a.table === data.fqn ||
-      a.table.endsWith(`.${data.modelName}`),
   );
 
   return (
@@ -156,21 +147,6 @@ export function OverviewTab({ data }: { data: InspectorModelData }) {
           title="Declared freshness SLA for this model."
           value={freshnessLabel(data.freshness) ?? "Not declared"}
           tone={data.freshness ? "ok" : "muted"}
-        />
-        <StatusCard
-          label="Drift"
-          title="Schema drift Rocky reconciled on the last run."
-          value={driftAction ? driftAction.action : drift ? "None" : "…"}
-          tone={
-            driftAction
-              ? driftAction.action.toUpperCase().includes("REFRESH")
-                ? "risk"
-                : "warn"
-              : drift
-                ? "ok"
-                : "pending"
-          }
-          sub={driftAction?.reason}
         />
         <StatusCard
           label="Governance"

@@ -1015,7 +1015,12 @@ fn write_migration_notes(path: &Path, ctx: &MigrationContext<'_>) -> Result<(), 
         "2. Run `rocky compile` from the output directory to type-check the translated models.\n",
     );
     out.push_str("3. Run `rocky test` to exercise any seed data.\n");
-    out.push_str("4. See the [migration guide](https://rocky-data.github.io/rocky/guides/migrate-from-dbt/) for the long tail.\n");
+    // Host is `rocky-data.dev` (docs/astro.config.mjs), not the old GitHub
+    // Pages address. This string is compiled into the binary and written to a
+    // user's disk as MIGRATION-NOTES.md, so a docs-side redirect cannot fix an
+    // already-emitted note — and the `guides/migrate-from-dbt/` path must stay
+    // stable for the same reason (#1433).
+    out.push_str("4. See the [migration guide](https://rocky-data.dev/guides/migrate-from-dbt/) for the long tail.\n");
 
     std::fs::write(path, out).map_err(|e| format!("failed to write {}: {e}", path.display()))
 }

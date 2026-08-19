@@ -15,7 +15,7 @@ class AiSyncProposal(BaseModel):
 
 class AiSyncOutput(BaseModel):
     """
-    JSON output for `rocky ai sync`.
+    JSON output for `rocky ai-sync`.
     """
 
     command: str

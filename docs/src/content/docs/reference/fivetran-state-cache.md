@@ -5,19 +5,34 @@ sidebar:
   order: 11
 ---
 
-Rocky's Fivetran adapter can be configured with a persistent state cache so concurrent `rocky` processes against a single Fivetran org share their discover fetches. The first process pays the API cost; every subsequent process within the cache window reads the canonical envelope from the cache layer.
+Stop every `rocky` process from re-fetching the same Fivetran metadata. Give the adapter a persistent cache and concurrent processes against one Fivetran org share their discover fetches: the first process pays the API cost, and every process after it reads the same envelope from the cache until the window closes.
 
 ## Why
 
-Without a shared cache, every `rocky` process boots cold:
+Without a shared cache, every `rocky` process starts from nothing:
 
-1. `GET /v1/destinations/{id}`
-2. `GET /v1/groups/{id}/connectors` (paginated)
-3. `GET /v1/connectors/{conn_id}/schemas` for each connector
+```
+   process 1        process 2        process 3
+       │                │                │
+       ▼                ▼                ▼
+   GET /destinations/{id}                       ─┐
+   GET /groups/{id}/connectors  (paginated)      │  ~50+ calls
+   GET /connectors/{id}/schemas × N connectors  ─┘  per process
 
-For a 50-connector tenant this is ~50+ calls per cold start. When several processes converge in a window (e.g. a sensor fan-out), the org's rate-limit budget gets exhausted and Fivetran responds with 429s.
+                    Fivetran API  ──►  429 Too Many Requests
+```
 
-The state cache dedupes (1)-(3) so a steady-state tenant pays one discover cycle per cache window, not N per cold start. Combined with the per-host rate-limit budget (shipped in engine-v1.37.0), this is the cold-start equivalent of an asset cache.
+For a 50-connector tenant that is more than 50 calls per cold start. When several processes converge in one window — a sensor fan-out, say — they exhaust the org's rate-limit budget and Fivetran answers with 429s.
+
+The cache removes the repetition. A steady-state tenant pays one discover cycle per cache window instead of one per process:
+
+```
+   process 1 ──► cache MISS ──► Fivetran API ──► write envelope
+   process 2 ──► cache HIT  ──► envelope
+   process 3 ──► cache HIT  ──► envelope
+```
+
+Together with the per-host rate-limit budget (engine-v1.37.0), this is the cold-start equivalent of an asset cache.
 
 ## Configuration
 
@@ -39,17 +54,17 @@ valkey_url = "rediss://valkey.internal:6379/"
 valkey_ttl_seconds = 600
 ```
 
-When the `[adapter.<name>.cache]` block is absent the cache layer defaults to `backend = "none"` and the adapter behaves exactly as it did before the cache layer landed: every fetch goes straight to the Fivetran API.
+Omit the `[adapter.<name>.cache]` block and the backend defaults to `"none"`. The adapter then behaves exactly as it did before the cache existed: every fetch goes straight to the Fivetran API.
 
 ## Backends
 
 ### `none` (default)
 
-No persistent cache. Every fetch goes to the Fivetran API. Useful for local development where the API budget isn't a concern.
+No cache at all. Every fetch hits the Fivetran API. Fine for local development, where the API budget does not matter.
 
 ### `file`
 
-Local-filesystem JSON files under `file_root`. Cheapest backend: no external dependency, no credentials. Suitable for single-process deployments and CI runs that want to dedupe a single discover across multiple Rocky invocations on the same host.
+JSON files on the local filesystem under `file_root`. The cheapest backend: no external service, no credentials. Use it for a single-host deployment, or for a CI run that wants several Rocky invocations on one machine to share a single discover.
 
 ```toml
 [adapter.fivetran_main.cache]
@@ -57,11 +72,11 @@ backend = "file"
 file_root = ".rocky/fivetran-state/"
 ```
 
-The directory layout under `file_root` is `<account_hash>/<destination_id>.json`. `account_hash` is a short SHA-256-derived token of the Fivetran API key, so different orgs sharing one root never collide on a destination id.
+Files land at `<account_hash>/<destination_id>.json` under `file_root`. The `account_hash` is a short token derived from the Fivetran API key with SHA-256. Two orgs sharing one root therefore never collide on the same destination id.
 
 ### `object_store`
 
-S3 / GCS / Azure / `file://`-backed cache via the [`object_store`](https://docs.rs/object_store/) crate. Cross-process, durable, no separate cache process to run.
+S3, GCS, Azure, or a `file://` path, through the [`object_store`](https://docs.rs/object_store/) crate. It works across processes and machines, it is durable, and it needs no cache service of its own.
 
 ```toml
 [adapter.fivetran_main.cache]
@@ -78,13 +93,13 @@ Supported URL schemes:
 | `az://container/prefix/` | Azure Blob Storage |
 | `file:///absolute/path/` | Local filesystem (mainly for testing) |
 
-**Credentials** are resolved through each SDK's default provider chain: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / IAM role / `~/.aws/credentials` for S3, `GOOGLE_APPLICATION_CREDENTIALS` for GCS, and so on. Rocky doesn't introduce its own credential surface for cloud storage.
+**Credentials** come from each SDK's own default provider chain: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, an IAM role, or `~/.aws/credentials` for S3; `GOOGLE_APPLICATION_CREDENTIALS` for GCS; and so on. Rocky adds no credential surface of its own for cloud storage.
 
-The backend writes single-part PUTs and uses the response ETag (MD5 for single-part) to dedupe re-writes of identical envelopes: no PUT goes over the wire when the bytes haven't changed. The serialized envelope is capped at 5 MB to keep dedupe safe; real envelopes for a 57-connector tenant land around 60-120 KB.
+The backend writes single-part PUTs. It compares the response ETag, an MD5 for a single part, against the new bytes. No PUT crosses the wire when the envelope has not changed. It caps the serialized envelope at 5 MB to keep that comparison safe. Real envelopes for a 57-connector tenant land between 60 and 120 KB.
 
 ### `valkey`
 
-Redis / Valkey backend. Sub-millisecond reads, the hot path for sensors and sync detection that need fresh-ish data fast. Gated by the `valkey` Cargo feature.
+Redis or Valkey. Sub-millisecond reads, so this is the hot path for sensors and sync detection that need fresh-ish data fast. The `valkey` Cargo feature gates it.
 
 ```toml
 [adapter.fivetran_main.cache]
@@ -93,11 +108,11 @@ valkey_url = "rediss://valkey.internal:6379/"
 valkey_ttl_seconds = 600
 ```
 
-Keys are namespaced under `fivetran-state:` so operator-side inspection is trivial (`KEYS fivetran-state:*`). Every `SET` carries the configured TTL so the layer never accumulates stale envelopes.
+Every key sits under the `fivetran-state:` namespace, so you can list them with `KEYS fivetran-state:*`. Every `SET` carries the configured TTL, so the layer never accumulates stale envelopes.
 
 ### `tiered`
 
-Composes Valkey (primary, fast) + object-store (secondary, durable). Reads hit Valkey first; on miss they fall through to the object store and write back to Valkey. Writes go to both layers.
+Valkey in front, an object store behind. A read tries Valkey first; on a miss it falls through to the object store and writes the result back into Valkey. A write goes to both.
 
 ```toml
 [adapter.fivetran_main.cache]
@@ -107,32 +122,32 @@ valkey_url = "rediss://valkey.internal:6379/"
 valkey_ttl_seconds = 600
 ```
 
-This is the recommended production configuration: Valkey gives operators fast hot-path reads while S3 keeps the canonical envelope durable across Valkey outages and pod restarts.
+Use this in production. Valkey serves the hot path fast, and the object store keeps the envelope through a Valkey outage or a pod restart.
 
 ## `--no-cache` flag
 
-`rocky discover --no-cache` skips the cache read on the current invocation and forces a fresh API fetch. The fresh envelope is still written back to the cache so a subsequent invocation sees the up-to-date data.
+`rocky discover --no-cache` skips the cache read for this one invocation and fetches from the API. Rocky still writes the fresh envelope back, so the next invocation sees the up-to-date data.
 
 ```bash
 rocky discover --emit-fivetran-state-to /tmp/state.json --no-cache
 ```
 
-Useful when an operator suspects the cache is stale (e.g. after rolling a Fivetran credential) and wants the next envelope to come straight from the wire.
+Reach for it when you suspect the cache has gone stale, after rolling a Fivetran credential for instance. It gives you the next envelope straight from the wire.
 
 ## Hash-dedupe
 
-Every backend's write path computes the envelope hash (excluding `fetched_at`) and compares it with the prior cached value. If the hashes match the write is a no-op:
+Every backend hashes the envelope before writing it, excluding `fetched_at`, and compares that [digest](/reference/glossary/#digest) against what is already cached. Matching hashes mean the write does nothing:
 
 - `FileCache` — skips the rename entirely; on-disk mtime stays stable.
 - `ObjectStoreCache` — HEAD the existing object; if its ETag matches `MD5(new_bytes)`, skip the PUT.
 - `ValkeyCache` — `GET` the prior value; if hashes match, skip the `SET`.
 - `TieredCache` — both layers run their own dedupe.
 
-This is the cold-start herd protection: N processes converging on identical envelopes write at most once per cache window.
+This is the herd protection: however many processes converge on an identical envelope, the cache is written at most once per window.
 
 ## Observability
 
-Every cache decision emits an OTLP span event on the active trace, also published on the in-process pipeline event bus:
+Every cache decision emits a span event over [OTLP](/reference/glossary/#otlp-opentelemetry-protocol), the wire format OpenTelemetry uses, and publishes the same event on the in-process pipeline event bus:
 
 | Event | Fields |
 |---|---|
@@ -142,8 +157,8 @@ Every cache decision emits an OTLP span event on the active trace, also publishe
 | `fivetran.cache_write_skipped` | `backend`, `key`, `reason` (`"hash-match"`) |
 | `fivetran.cache_write_failed` | `backend`, `key`, `error` |
 
-Cache failures are fail-open: the HTTP path runs regardless. Failures show up as `cache_write_failed` events plus a `warn!` log line so ops can alert on a pathologically failing backend.
+The cache fails open. When a backend is unreachable Rocky still fetches over HTTP, so a broken cache slows a run down but never stops it. Each failure emits a `cache_write_failed` event and a warning log line, so you can alert on a backend that fails consistently.
 
 ## Volume reduction
 
-For a 57-connector tenant with 5 active processes and 2-8 sensor triggers per hour, the combined effect cuts steady-state Fivetran call volume from ~600-2400 calls/hour to ~80 calls/hour.
+Take a 57-connector tenant running 5 processes with 2 to 8 sensor triggers an hour. The cache plus the rate-limit budget cut steady-state Fivetran calls from roughly 600–2400 an hour to roughly 80.

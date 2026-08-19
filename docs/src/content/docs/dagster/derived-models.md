@@ -5,13 +5,15 @@ sidebar:
   order: 18
 ---
 
-`dagster-rocky` historically surfaced only source-replication tables
-(one `AssetSpec` per discovered Fivetran/connector table), leaving derived
-models (the `*.sql` / `*.rocky` files Rocky compiles from your `models/`
-directory) off the asset graph. The **`surface_derived_models`** flag on
-`RockyComponent` makes every entry in `compile.models_detail` its own
-Dagster asset, grouped by partitioning shape so each multi-asset has a
-single consistent `PartitionsDefinition`.
+By default, `dagster-rocky` surfaces only source-replication tables: one
+`AssetSpec` per discovered Fivetran or connector table. Derived models stay off
+the asset graph. A derived model is a `*.sql` or `*.rocky` file that Rocky
+compiles from your `models/` directory.
+
+Set the **`surface_derived_models`** flag on `RockyComponent` and every entry in
+`compile.models_detail` becomes its own Dagster asset. The assets are grouped by
+partitioning shape, so each group carries one consistent
+`PartitionsDefinition`.
 
 ## Quickstart
 
@@ -39,13 +41,11 @@ Each derived-model asset gets:
   `get_model_group_name`). Models in the same target schema share a
   group, which usually corresponds to a logical layer (`raw` /
   `staging` / `marts`).
-- **Tags:** `rocky/strategy`, `rocky/target_catalog`,
-  `rocky/target_schema`, `rocky/model_name`, plus the model's resolved
-  `[tags]` (its own block merged over any config-group baseline)
-  projected as first-class Dagster tags via
-  `RockyDagsterTranslator.get_model_tags`, so a governance tag is usable
-  in asset selection (`dagster asset materialize --select
-  tag:domain=finance`).
+- **Tags:** `rocky/strategy`, `rocky/target_catalog`, `rocky/target_schema`,
+  and `rocky/model_name`. The model's resolved `[tags]` are added through
+  `RockyDagsterTranslator.get_model_tags`. Resolved means the model's own
+  block merged over any config-group baseline. A governance tag then works
+  in asset selection: `dagster asset materialize --select tag:domain=finance`.
 - **Kinds:** `{"rocky", "model"}` for UI badges.
 - **Freshness policy:** from `model.freshness` (`[freshness]
   max_lag_seconds` in the model's TOML frontmatter).
@@ -61,31 +61,27 @@ Each derived-model asset gets:
 
 ## Group splitting by partitioning shape
 
-Dagster's `multi_asset` requires every spec inside it to share **one**
-`PartitionsDefinition`. A project that mixes daily models with
-unpartitioned models cannot put them in the same multi-asset.
-`dagster-rocky` splits automatically:
+A `multi_asset` is one Dagster definition that produces several assets. Dagster
+requires every spec inside a `multi_asset` to share **one**
+`PartitionsDefinition`. A project that mixes daily models with unpartitioned
+models cannot put them in the same one. `dagster-rocky` splits them for you:
 
 ```
-models/
-├── fct_daily_orders.toml      → time_interval, daily
-├── fct_hourly_metrics.toml     → time_interval, hourly
-├── dim_customers.toml          → full_refresh
-└── dim_products.toml           → incremental
+models/                   partition shape     multi-asset
+────────────────────────  ────────────────    ──────────────────────────────
+fct_daily_orders.toml     time_interval,   →  rocky_models_daily
+                          daily               (DailyPartitionsDefinition)
+
+fct_hourly_metrics.toml   time_interval,   →  rocky_models_hourly
+                          hourly              (HourlyPartitionsDefinition)
+
+dim_customers.toml        full_refresh     →  rocky_models_unpartitioned
+dim_products.toml         incremental      →  rocky_models_unpartitioned
+                                              (no partition definition)
 ```
 
-After loading, the code location has **three** derived-model
-multi-assets:
-
-- `rocky_models_daily`: contains `fct_daily_orders`, with a
-  `DailyPartitionsDefinition`.
-- `rocky_models_hourly`: contains `fct_hourly_metrics`, with an
-  `HourlyPartitionsDefinition`.
-- `rocky_models_unpartitioned`: contains `dim_customers` and
-  `dim_products`, no partition definition.
-
-Each multi-asset's name is derived from the partition shape so they
-coexist without collision.
+Four models produce three multi-assets. Each takes its name from its partition
+shape, so the three coexist without a name collision.
 
 ## Materialization
 
@@ -95,12 +91,11 @@ Materializing any derived-model asset invokes:
 rocky run --filter <sentinel> --models <models_dir> --all [partition flags]
 ```
 
-The `<sentinel>` filter targets the first discovered source so `rocky run`
-accepts the command (the engine requires `--filter`). Source-replication
-materializations from that filter pass DO run on the warehouse but
-**Dagster only sees the derived-model events** because the multi-asset
-declares only derived-model `AssetSpec` instances. The source-replication
-events are dropped naturally by `_emit_results`.
+The engine requires `--filter`, so `<sentinel>` targets the first discovered
+source and the command is accepted. That filter pass does run its
+source-replication materializations on the warehouse. **Dagster only sees the
+derived-model events**, because the multi-asset declares only derived-model
+`AssetSpec` instances. `_emit_results` drops the source-replication events.
 
 For partitioned multi-assets, the partition flags are threaded from
 Dagster's execution context:
@@ -111,30 +106,27 @@ Dagster's execution context:
 ## Per-model execution with `dag_mode`
 
 With `dag_mode=True` on `RockyComponent`, derived-model multi-assets use
-`can_subset=True` and execute individual models via
-`rocky run --model <name>`. Dagster controls the execution order based on
-the DAG, and each model runs independently.
+`can_subset=True` and execute individual models via `rocky run --model <name>`.
+Dagster controls the execution order from the DAG, and each model runs on its
+own.
 
-This is the recommended approach for new projects. See
+Use this for new projects. See
 [RockyComponent DAG mode](/dagster/component/#dag-mode) for setup.
 
 ## Legacy: `surface_derived_models` with `can_subset=False`
 
-When using `surface_derived_models=True` (without `dag_mode`),
-derived-model multi-assets use `can_subset=False` because this path runs
-`rocky run --models <dir> --all` which executes all models at once.
-Selecting any subset of a derived-model multi-asset's keys materializes
-the **whole group**.
+`surface_derived_models=True` without `dag_mode` runs
+`rocky run --models <dir> --all`, which executes every model at once. The
+multi-assets therefore use `can_subset=False`. Select any subset of a
+derived-model multi-asset's keys and Dagster materializes the **whole group**.
 
-If you need fine-grained subset materialization without `dag_mode`,
-split your models across multiple `RockyComponent` instances with
-different `models_dir` values.
+To get fine-grained subset materialization without `dag_mode`, split your models
+across several `RockyComponent` instances with different `models_dir` values.
 
 ## Standalone helpers
 
-Three pure-function builders are exported for users with hand-rolled
-multi-assets who want to use the same logic without
-`RockyComponent`:
+Three pure-function builders are exported. Use them when you hand-roll your own
+multi-assets and want the same logic without `RockyComponent`:
 
 ```python
 from dagster_rocky import (
@@ -161,9 +153,9 @@ for group in groups:
 
 ## Customizing the translator
 
-Override the `RockyDagsterTranslator.get_model_*` methods to control
-asset key derivation, group naming, tags, and metadata. The defaults are
-reasonable but most teams will want to namespace asset keys differently:
+Override the `RockyDagsterTranslator.get_model_*` methods to control asset key
+derivation, group naming, tags, and metadata. The defaults are reasonable, but
+most teams want to namespace asset keys differently:
 
 ```python
 from dagster_rocky import RockyDagsterTranslator
@@ -181,8 +173,8 @@ class MyTranslator(RockyDagsterTranslator):
         ])
 ```
 
-Wire the translator into `RockyComponent` via the `translator_class`
-attribute in `defs.yaml`:
+Wire the translator into `RockyComponent` with the `translator_class` attribute
+in `defs.yaml`:
 
 ```yaml
 # defs.yaml

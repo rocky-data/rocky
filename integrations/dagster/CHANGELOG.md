@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.63.0] — 2026-08-18
+
+### Added
+
+- **`RockyResource.review_status()`** — mirrors the SDK method, so a Dagster op can check whether a plan is approved before applying it. (#1472)
+
+### Fixed
+
+- **A project with two or more transformation pipelines can now produce an asset graph.** `RockyComponent` caches `rocky.dag(...)`, and that call forced a whole-project `--models`, which the engine refuses on a multi-transformation project — so definitions failed to build at all. The DAG call now lets each pipeline resolve its own models root. (#1348)
+
+- **Transformation assets execute under their own pipeline.** `run_model` is called with `pipeline=node.pipeline`, so the engine resolves the pipeline the node was discovered in rather than a project-wide root. A node whose `pipeline` is unset falls back to the previous behaviour. (#1348, #1292)
+
+## [1.62.0] — 2026-08-11
+
+### Changed
+
+- **The build backend is now bounded: `hatchling>=1.30.1,<1.32`.** Same reason as `rocky-sdk`: hatchling 1.32.0 (2026-08-11) emits `Metadata-Version: 2.5`, which the twine in our pinned publish action rejects at upload. `dagster-release` uses that same action, so it would have failed identically. Runtime dependencies are unaffected — this constrains only how the wheel is built. (#1420)
+
+- Development dependencies refreshed (ruff 0.15.18 → 0.16.2, `tqdm`, `tomlkit`, `pytz`, `tzdata`, `typing-extensions`, `platformdirs`). The `rocky-sdk>=0.9.1` floor is unchanged. (#1420)
+
 ### Fixed
 
 - **`run_streaming()` and `run_pipes()` can select a pipeline.** Both methods now
@@ -15,8 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   This restores both execution modes for projects with multiple pipelines. (#1401)
 
 - **Two DAG nodes resolving to one Dagster asset key are refused, with a message that names them.** The engine deliberately permits the same `catalog.schema.table` on two different adapters — `reject_duplicate_physical_targets` keys on `(adapter, target)` — while the default translator keys a transformation asset on the target triple alone, and neither `DagNodeOutput` nor `TargetConfig` carries the adapter, so the collision cannot be expressed in an asset key at all. Dagster did catch this, but only at repository build and only because the specs differ (`rocky/node_id` is stamped into each), and its `Received conflicting AssetSpecs with the same key` names neither the models, nor their pipelines, nor the adapters that make the project legal upstream. `build_dag_specs` now refuses as soon as the keys are known, listing each colliding key with its node ids and pipelines. The check runs **after** the translator, keyed on what it returned, so a project that already disambiguates with a custom `get_dag_node_asset_key` is unaffected. (#1349)
-
-### Fixed
 
 - **A failing `rocky dag` no longer loads the legacy graph in its place.** `_dag_payload` caught every exception and omitted the DAG slot, and the loader read a missing slot as "this cache predates DAG mode" and fell back to the discover-based graph. That fallback is not a degraded version of the real graph — it has different assets and different dependencies — so a project whose DAG could not be built got a code location that loaded, looked plausible, and materialized a plan the project does not describe, behind a log warning.
 

@@ -774,6 +774,80 @@ def test_apply_restore_plan_returns_restore_apply_output():
     assert result.bytes_restored == 2048
 
 
+def test_apply_expect_spec_digest_appends_the_literal_flag():
+    """``expect_spec_digest`` appends ``--expect-spec-digest <digest>`` to the
+    argv; the default keeps the previous argv byte-for-byte (no flag)."""
+    client = _client()
+    with patch.object(client, "run_cli", return_value=_RUN_APPLY_JSON) as run_cli:
+        client.apply("a" * 64, expect_spec_digest="sha256:feed")
+    args = run_cli.call_args[0][0]
+    assert args == ["apply", "a" * 64, "--expect-spec-digest", "sha256:feed"], args
+
+    with patch.object(client, "run_cli", return_value=_RUN_APPLY_JSON) as run_cli:
+        client.apply("a" * 64)
+    args = run_cli.call_args[0][0]
+    assert args == ["apply", "a" * 64], args
+
+
+_REVIEW_STATUS_JSON = json.dumps(
+    {
+        "version": "1.70.1",
+        "command": "review_status",
+        "plan_id": "a" * 64,
+        "kind": "ai_authored",
+        "reviewed": True,
+        "reviewed_at": "2026-08-18T09:00:00Z",
+        "approver": {
+            "email": "dev@example.com",
+            "host": "localhost",
+            "source": "local",
+        },
+        "breaking_change_count": 0,
+        "product_id": "product:revenue_daily",
+        "spec_digest": "sha256:0123abcd",
+    }
+)
+
+
+def test_review_status_argv_and_typed_parse():
+    """``review_status`` shells ``review <plan-id> --status`` and parses the
+    typed marker oracle, including the product pair the applier echoes back
+    via ``expect_spec_digest``."""
+    from rocky_sdk.types import ReviewStatusOutput
+
+    client = _client()
+    with patch.object(client, "run_cli", return_value=_REVIEW_STATUS_JSON) as run_cli:
+        status = client.review_status("a" * 64)
+    args = run_cli.call_args[0][0]
+    assert args == ["review", "a" * 64, "--status"], args
+    assert isinstance(status, ReviewStatusOutput)
+    assert status.reviewed is True
+    assert status.product_id == "product:revenue_daily"
+    assert status.spec_digest == "sha256:0123abcd"
+
+
+def test_review_status_pending_accepts_absent_optionals():
+    """The pending shape skip-serializes every marker-derived field."""
+    from rocky_sdk.types import ReviewStatusOutput
+
+    pending = json.dumps(
+        {
+            "version": "1.70.1",
+            "command": "review_status",
+            "plan_id": "b" * 64,
+            "kind": "backfill",
+            "reviewed": False,
+        }
+    )
+    client = _client()
+    with patch.object(client, "run_cli", return_value=pending):
+        status = client.review_status("b" * 64)
+    assert isinstance(status, ReviewStatusOutput)
+    assert status.reviewed is False
+    assert status.approver is None
+    assert status.spec_digest is None
+
+
 def test_apply_unknown_shape_raises_named_parse_error():
     """An unrecognized apply shape raises a clear parse error naming the
     received command instead of silently mis-parsing."""
@@ -861,3 +935,214 @@ def test_ai_sync_parses_populated_proposals_without_phantom_field():
     assert len(result.proposals) == 1
     assert result.proposals[0].model == "revenue"
     assert result.proposals[0].proposed_source == "SELECT *, tax FROM raw"
+
+
+def test_build_plan_args_rejects_defer():
+    # ``--defer`` / ``--defer-to`` are declared on the ``Run`` clap variant only,
+    # so the ``plan`` verb rejects them at argument parsing. The shared argv
+    # builder appended them for both verbs on the premise that the engine had
+    # backfilled every ``run`` flag onto ``plan`` -- false for these two (#1404).
+    #
+    # The reachable caller is dagster's ``RockyResource.run_pipes``, which puts
+    # ``defer`` into its build kwargs and calls this builder; the public
+    # ``RockyClient.plan()`` never exposed the argument. Refuse here, where the
+    # argv is assembled, so every route through it is covered.
+    client = _client()
+    for kwargs in ({"defer": True}, {"defer_to": "prod"}, {"defer": True, "defer_to": "prod"}):
+        with pytest.raises(ValueError, match="defer/defer_to are not supported by rocky plan"):
+            client._build_plan_args("x=y", governance_override=None, **kwargs)
+
+
+def test_build_plan_args_without_defer_is_unaffected():
+    # The guard must not disturb the ordinary plan path.
+    argv = _client()._build_plan_args("x=y", governance_override=None, pipeline="bronze")
+    assert argv[0] == "plan"
+    assert "--defer" not in argv and "--defer-to" not in argv
+    assert argv[argv.index("--pipeline") + 1] == "bronze"
+
+
+def test_run_still_accepts_defer():
+    # The flags are legitimate on ``run`` -- the fix must scope to the plan verb
+    # only, or it would break the deferred-resolution workflow it is protecting.
+    client = _client()
+    argv = client._build_run_args(
+        "x=y",
+        governance_override=None,
+        defer=True,
+        defer_to="prod",
+    )
+    assert argv[0] == "run"
+    assert "--defer" in argv
+    assert argv[argv.index("--defer-to") + 1] == "prod"
+
+
+# --------------------------------------------------------------------------- #
+# #1348 — discovery and execution must resolve the same models root
+# --------------------------------------------------------------------------- #
+
+
+def _dag_payload(nodes: list[dict]) -> str:
+    return json.dumps(
+        {
+            "version": "1.70.1",
+            "command": "dag",
+            "nodes": nodes,
+            "edges": [],
+            "execution_layers": [],
+            "summary": {
+                "total_nodes": len(nodes),
+                "total_edges": 0,
+                "execution_layers": 1,
+                "counts_by_kind": {},
+            },
+        }
+    )
+
+
+def _run_payload() -> str:
+    return json.dumps(
+        {
+            "version": "1.70.1",
+            "command": "run",
+            "filter": "",
+            "duration_ms": 0,
+            "tables_copied": 0,
+            "materializations": [],
+            "check_results": [],
+            "permissions": {
+                "grants_added": 0,
+                "grants_revoked": 0,
+                "catalogs_created": 0,
+                "schemas_created": 0,
+            },
+            "drift": {"tables_checked": 0, "tables_drifted": 0, "actions_taken": []},
+        }
+    )
+
+
+def test_dag_default_is_unchanged_so_no_existing_caller_moves():
+    """Omitting ``models_dir`` must keep the previous argv byte-for-byte.
+
+    Changing the default would make discovery follow the config while
+    ``run_model()`` (without ``pipeline``) still forced ``self.models_dir`` — a
+    model discovered from one root and materialized from another, which is the
+    split #1348 warns about. Per-pipeline resolution is opt-in instead.
+    """
+    client = _client(models_dir="custom-models")
+    with patch.object(client, "run_cli", return_value=_dag_payload([])) as run_cli:
+        client.dag()
+    args = run_cli.call_args[0][0]
+    assert args == ["dag", "--models", "custom-models"], args
+
+
+def test_dag_opts_in_to_per_pipeline_resolution_with_an_explicit_none():
+    """``--models`` is a whole-project override, not a hint.
+
+    The engine assigns that one directory to *every* transformation pipeline, so
+    a project with two of them is refused outright. `None` omits it so each
+    pipeline resolves its own configured root (#1348).
+    """
+    client = _client(models_dir="custom-models")
+    client._engine_version = (1, 70, 1)
+    with patch.object(client, "run_cli", return_value=_dag_payload([])) as run_cli:
+        client.dag(models_dir=None)
+    args = run_cli.call_args[0][0]
+    assert args == ["dag"], args
+    assert "--models" not in args
+
+
+def test_dag_still_allows_an_explicit_whole_project_override():
+    """A caller who genuinely wants the override can still ask for it."""
+    client = _client(models_dir="custom-models")
+    with patch.object(client, "run_cli", return_value=_dag_payload([])) as run_cli:
+        client.dag(models_dir="one-root")
+    args = run_cli.call_args[0][0]
+    assert args == ["dag", "--models", "one-root"], args
+
+
+def test_run_model_scopes_to_the_pipeline_and_drops_the_override():
+    client = _client(models_dir="custom-models")
+    client._engine_version = (1, 70, 1)
+    with patch.object(client, "run_cli", return_value=_run_payload()) as run_cli:
+        client.run_model("stg_orders", pipeline="alpha")
+    args = run_cli.call_args[0][0]
+    assert args == ["run", "--model", "stg_orders", "--pipeline", "alpha"], args
+    # Passing both would override the pipeline's own root with a project-wide
+    # one — the discovery/execution split #1348 warns about.
+    assert "--models" not in args
+
+
+def test_run_model_without_a_pipeline_keeps_the_previous_argv():
+    """Single-pipeline callers must be unaffected."""
+    client = _client(models_dir="custom-models")
+    with patch.object(client, "run_cli", return_value=_run_payload()) as run_cli:
+        client.run_model("stg_orders")
+    args = run_cli.call_args[0][0]
+    assert args == ["run", "--model", "stg_orders", "--models", "custom-models"], args
+
+
+def test_discovery_and_execution_resolve_the_same_root_for_a_discovered_node():
+    """#1348 acceptance: asserted, not read.
+
+    Drives execution from the node ``dag()`` actually returned, so a change that
+    stops threading the node's pipeline fails here — which two independent argv
+    assertions would not catch.
+    """
+    client = _client(models_dir="custom-models")
+    nodes = [
+        {"id": "transformation:one", "kind": "transformation", "label": "one", "pipeline": "alpha"},
+        {"id": "transformation:two", "kind": "transformation", "label": "two", "pipeline": "beta"},
+    ]
+    client._engine_version = (1, 70, 1)
+    with patch.object(client, "run_cli", return_value=_dag_payload(nodes)) as run_cli:
+        dag = client.dag(models_dir=None)
+    discovery_args = run_cli.call_args[0][0]
+    assert "--models" not in discovery_args, discovery_args
+
+    for node in dag.nodes:
+        with patch.object(client, "run_cli", return_value=_run_payload()) as run_cli:
+            client.run_model(node.label, pipeline=node.pipeline)
+        exec_args = run_cli.call_args[0][0]
+        # Execution names the node's own pipeline, so the engine resolves that
+        # pipeline's configured root — the same one discovery used.
+        assert "--pipeline" in exec_args, exec_args
+        assert exec_args[exec_args.index("--pipeline") + 1] == node.pipeline
+        # Neither side forces a whole-project root, so they cannot disagree.
+        assert "--models" not in exec_args, exec_args
+
+
+def test_per_pipeline_mode_refuses_an_engine_that_predates_it():
+    """An accepted-but-older binary does something different, silently.
+
+    Per-pipeline DAG resolution shipped in engine 1.68.0 and pipeline-scoped
+    model execution in 1.69.0, but ``MIN_ROCKY_VERSION`` is 1.34.0 — so both
+    opt-ins have to state their own floor. Without this, a 1.68 binary would
+    discover a pipeline's configured root and then execute from ``models/``
+    relative to the process CWD, which can build a same-named decoy.
+    """
+    client = _client(models_dir="custom-models")
+
+    client._engine_version = (1, 67, 0)
+    with pytest.raises(RockyVersionError):
+        client.dag(models_dir=None)
+
+    client._engine_version = (1, 68, 0)
+    with pytest.raises(RockyVersionError):
+        client.run_model("stg_orders", pipeline="alpha")
+
+    # 1.68 is enough for discovery on its own.
+    with patch.object(client, "run_cli", return_value=_dag_payload([])):
+        client.dag(models_dir=None)
+
+
+def test_unknown_engine_version_warns_rather_than_blocking():
+    """Matches the surrounding fail-open policy, but must not be silent."""
+    client = _client(models_dir="custom-models")
+    client._engine_version = None
+    client._version_checked = True
+    with (
+        patch.object(client, "run_cli", return_value=_dag_payload([])),
+        patch.object(client._logger, "warning") as warn,
+    ):
+        client.dag(models_dir=None)
+    assert warn.called, "a skipped version gate must be logged"

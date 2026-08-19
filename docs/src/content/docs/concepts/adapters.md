@@ -1,30 +1,47 @@
 ---
 title: Adapter SDK
-description: Building custom warehouse and source adapters
+description: Build a warehouse or source adapter in Rust, or in any language over stdio.
 sidebar:
   order: 13
 ---
 
-Rocky's adapter system separates the transformation engine from warehouse-specific logic. Each adapter implements a set of traits from the `rocky-adapter-sdk` crate, declaring its capabilities through an `AdapterManifest`.
+An adapter is the plug between Rocky's engine and one outside system. A warehouse
+adapter runs SQL. A source adapter lists what tables exist. See the
+[glossary](/reference/glossary/) for the short definition.
 
-## Architecture
+The in-tree adapters implement traits from `rocky-core`. The `rocky-adapter-sdk`
+crate mirrors those traits for adapters built outside this repository. Each
+adapter also ships an `AdapterManifest` that declares which optional features it
+supports.
+
+## How the engine reaches a warehouse
+
+The engine calls trait methods. It never names a warehouse.
 
 ```
-rocky-core (engine)
-    │
-    ├── WarehouseAdapter trait ──► rocky-databricks
-    ├── SqlDialect trait         ► rocky-snowflake
-    ├── DiscoveryAdapter trait    ► rocky-duckdb
-    └── GovernanceAdapter trait   ► your-custom-adapter
+                    rocky-core (engine)
+                             │
+         calls trait methods, never a product name
+                             ▼
+     WarehouseAdapter   SqlDialect   DiscoveryAdapter
+                     GovernanceAdapter
+                             │
+            each adapter implements these traits
+                             │
+  ┌──────────┬───────────────┼───────────────┬───────────────┐
+  ▼          ▼               ▼               ▼               ▼
+rocky-     rocky-          rocky-          rocky-          your-custom-
+databricks snowflake       bigquery        duckdb          adapter
 ```
 
-The core engine calls trait methods without knowing which adapter is behind them. This means Rocky can support any SQL warehouse (Databricks, Snowflake, BigQuery, Redshift, DuckDB) through the same interface.
+This is why a new warehouse needs a new crate and no change to the engine. Rocky
+runs against any SQL warehouse through the same interface.
 
 ## Adapter traits
 
 ### WarehouseAdapter
 
-The primary trait for executing SQL and managing tables:
+The main trait. It executes SQL and manages tables.
 
 ```rust
 #[async_trait]
@@ -41,7 +58,7 @@ pub trait WarehouseAdapter: Send + Sync {
 
 ### SqlDialect
 
-Generates warehouse-specific SQL syntax:
+Writes the SQL syntax one warehouse accepts.
 
 ```rust
 pub trait SqlDialect: Send + Sync {
@@ -58,6 +75,8 @@ pub trait SqlDialect: Send + Sync {
 
 ### Optional traits
 
+Implement these only when the system behind your adapter supports them.
+
 | Trait | Capability | Methods |
 |-------|-----------|---------|
 | `DiscoveryAdapter` | Discover connectors/tables | `discover() -> DiscoveryResult` |
@@ -65,11 +84,26 @@ pub trait SqlDialect: Send + Sync {
 | `BatchCheckAdapter` | Batched quality checks | `batch_row_counts()`, `batch_freshness()` |
 | `TypeMapper` | Type normalization | `normalize_type()`, `types_compatible()` |
 
-`DiscoveryAdapter::discover` returns `DiscoveryResult { connectors, failed }` so adapters that fan out per-source metadata fetches (per-connector REST calls, per-namespace `list_tables`) can surface partial failures instead of silently dropping them, protecting downstream diff-based reconcilers from misreading a transient fetch failure as "removed upstream". Adapters that complete in a single shot return `DiscoveryResult::ok(connectors)`. Each `FailedSource` carries an `error_class` (`transient` / `timeout` / `rate_limit` / `auth` / `unknown`) so consumers can branch on operating-mode without parsing free-form messages.
+### Why discovery reports partial failures
+
+`DiscoveryAdapter::discover` returns `DiscoveryResult { connectors, failed }`.
+
+Some adapters fetch metadata one source at a time: a REST call per connector, a
+`list_tables` per namespace. Any one of those calls can fail on its own. The
+`failed` list carries those failures instead of dropping them.
+
+That matters downstream. A reconciler that diffs discovery output against the
+warehouse would otherwise read a dropped source as "removed upstream" and act on
+it. Each `FailedSource` carries an `error_class` — `transient`, `timeout`,
+`rate_limit`, `auth`, or `unknown` — so a consumer branches on the class instead
+of parsing message text.
+
+An adapter that finishes in one shot returns `DiscoveryResult::ok(connectors)`.
 
 ## AdapterManifest
 
-Each adapter declares what it supports:
+Each adapter declares what it supports. Rocky reads the manifest to decide which
+conformance tests apply.
 
 ```rust
 AdapterManifest {
@@ -107,11 +141,12 @@ This creates `crates/rocky-bigquery/` with:
 - `src/{dialect,adapter,types}.rs` trait implementation stubs
 - `tests/integration.rs` — an `#[ignore]`d live-connection test stub
 
-Implement the required traits, then run the conformance suite. Note that
-`test-adapter --adapter <name>` only resolves the builtins (`databricks`,
-`snowflake`, `duckdb`) or a `rocky-<name>` process-adapter binary on your
-`PATH`; use a builtin to see the suite, or expose your adapter as a process
-adapter (or `--command`) to test it:
+Implement the required traits, then run the conformance suite.
+
+`test-adapter --adapter <name>` resolves only two things. It resolves the
+builtins (`databricks`, `snowflake`, `duckdb`), or a `rocky-<name>` process-adapter
+binary on your `PATH`. To see the suite run, pass a builtin. To test your own
+adapter, expose it as a process adapter or point at it with `--command`:
 
 ```bash
 rocky test-adapter --adapter duckdb
@@ -119,25 +154,33 @@ rocky test-adapter --adapter duckdb
 
 ## Process adapter protocol
 
-Adapters can be built in **any language** using the process adapter protocol: JSON-RPC 2.0 over stdio.
-
-Rocky spawns the adapter as a child process and communicates via stdin/stdout:
-
-```
-Rocky ──stdin──► Adapter Process
-Rocky ◄─stdout── Adapter Process
-```
+Write an adapter in **any language** using the process adapter protocol: JSON-RPC
+2.0 over stdio. Rocky spawns the adapter as a child process and talks to it over
+that process's stdin and stdout.
 
 ### Discovering installed adapters
 
-Rocky follows the `cargo`-subcommand convention: any executable on your `PATH` named `rocky-<name>` registers as the process adapter `<name>` (the bundled `rocky-lsp` is filtered out). Use [`rocky adapter list`](/reference/commands/development/#rocky-adapter) to enumerate the adapters Rocky can see, and `rocky adapter info <name>` to inspect one adapter's manifest.
+Rocky follows the `cargo`-subcommand convention. Any executable on your `PATH`
+named `rocky-<name>` registers as the process adapter `<name>`. The bundled
+`rocky-lsp` is filtered out. Use [`rocky adapter list`](/reference/commands/development/#rocky-adapter)
+to see the adapters Rocky can find, and `rocky adapter info <name>` to read one
+adapter's manifest.
 
 ### Protocol flow
 
-1. Rocky sends `initialize` with config → adapter responds with `AdapterManifest`
-2. Rocky sends method calls (`execute_statement`, `describe_table`, etc.)
-3. Adapter responds with results or errors
-4. Rocky sends `shutdown` when done
+```
+  rocky                               rocky-<name>
+    │                                          │
+    │──── initialize { config } ─ stdin ──────►│
+    │◄─── AdapterManifest ─────── stdout ──────│
+    │                                          │
+    │──── execute_query, describe_table, … ───►│
+    │◄─── result or error ─────────────────────│
+    │            (repeats per call)            │
+    │                                          │
+    │──── shutdown ───────────────────────────►│
+    ▼                                          ▼
+```
 
 ### Example request
 
@@ -153,9 +196,9 @@ Rocky follows the `cargo`-subcommand convention: any executable on your `PATH` n
 
 ## Conformance tests
 
-The SDK includes 26 test specifications: 18 always run, and 8 are
-capability-gated (skipped when the adapter's manifest declares the
-required capability as `false`).
+The SDK ships 26 test specifications. 18 always run. The other 8 are
+capability-gated: Rocky skips one when the adapter's manifest declares the
+required capability as `false`.
 
 | Category | Tests |
 |----------|-------|
@@ -176,4 +219,5 @@ rocky test-adapter --adapter duckdb
 rocky test-adapter --command ./my-adapter-binary
 ```
 
-Conformance results report pass/fail/skip per test with the adapter's declared capabilities used to determine which optional tests apply.
+The report gives pass, fail, or skip per test. The adapter's declared
+capabilities decide which optional tests apply.
