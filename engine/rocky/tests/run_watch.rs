@@ -517,9 +517,15 @@ fn run_watch_exits_on_sigterm() {
     let stderr = child.stderr.take().expect("stderr piped");
     let stderr_rx = spawn_line_reader(stderr);
 
-    // Wait until the first run has completed and the watcher is idle — that
-    // is the state in which the missing arm bites, because by then tokio has
-    // taken over signal disposition.
+    // Wait for the FIRST RUN TO FINISH, not merely for the watcher to start.
+    //
+    // This distinction is the whole test. Before the first run, SIGTERM still
+    // has its default disposition and kills the process no matter what the
+    // watch loop does — so signalling early passes with or without the fix
+    // and proves nothing. The inner run installs a SIGTERM handler of its
+    // own; when the run ends that handler is dropped, but tokio does NOT
+    // restore the default disposition. Only from that moment does a missing
+    // arm in the watch loop mean SIGTERM is swallowed.
     let mut seen = String::new();
     let mut ready = false;
     let bootstrap_deadline = Instant::now() + BOOTSTRAP_BUDGET;
@@ -528,7 +534,7 @@ fn run_watch_exits_on_sigterm() {
             Ok(line) => {
                 seen.push_str(&line);
                 seen.push('\n');
-                if line.contains("[watch] watching") {
+                if line.contains("[watch] run completed") || line.contains("[watch] run failed") {
                     ready = true;
                     break;
                 }
@@ -543,7 +549,7 @@ fn run_watch_exits_on_sigterm() {
     }
     assert!(
         ready,
-        "watcher never reported it was watching; stderr so far:\n{seen}"
+        "watcher never completed a first run; stderr so far:\n{seen}"
     );
 
     sigterm(pid);
