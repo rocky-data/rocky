@@ -3154,8 +3154,12 @@ pub struct PolicyTest {
 pub struct FulfillConfig {
     /// Directory of brief overrides (`elicitation.md`, `drafting.md`,
     /// `repair.md`). A file present there replaces the compiled default
-    /// of the same name; absent files fall back. Relative paths resolve
-    /// against the project root.
+    /// of the same name; absent files fall back. Must be a plain
+    /// RELATIVE path inside the project — the loop resolves it through
+    /// the staged commit's containment primitive, so an absolute path,
+    /// a `..` traversal, or a symlinked-ancestor escape is refused, and
+    /// every loaded brief (override or default) is validated against
+    /// the excluded worker-tool names before any dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub briefs_dir: Option<PathBuf>,
     /// The agent driver. `rocky fulfill` refuses to dispatch worker

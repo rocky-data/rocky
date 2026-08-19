@@ -850,7 +850,8 @@ impl Runner {
             kind: TaskBriefKind::Elicitation,
             text: briefs::render(
                 TaskBriefKind::Elicitation,
-                self.briefs_dir().as_deref(),
+                &self.root,
+                self.cfg.fulfill.briefs_dir.as_deref(),
                 &BriefContext {
                     product: self.product.clone(),
                     intent: "(no approved spec yet — inspect the sources and draft one)"
@@ -957,7 +958,8 @@ impl Runner {
             kind,
             text: briefs::render(
                 kind,
-                self.briefs_dir().as_deref(),
+                &self.root,
+                self.cfg.fulfill.briefs_dir.as_deref(),
                 &BriefContext {
                     product: self.product.clone(),
                     intent: spec.parsed.product().intent.clone(),
@@ -1025,16 +1027,6 @@ impl Runner {
             return Err(err);
         }
         outcome.map_err(|err| format!("{err}"))
-    }
-
-    fn briefs_dir(&self) -> Option<PathBuf> {
-        self.cfg.fulfill.briefs_dir.as_ref().map(|dir| {
-            if dir.is_absolute() {
-                dir.clone()
-            } else {
-                self.root.join(dir)
-            }
-        })
     }
 
     /// The approved snapshot, parsed — the spec-owned truth every
