@@ -51,6 +51,40 @@ export type BudgetBreachAction = "warn" | "error";
  */
 export type TestSeverity = "error" | "warning";
 /**
+ * `[fulfill.driver]` — one frozen tagged shape.
+ *
+ * ```toml [fulfill.driver] type = "subprocess"                       # | "replay" command = ["claude", "-p", "{brief}"]     # subprocess only env_allow = ["ANTHROPIC_API_KEY"] timeout_seconds = 900 kill_grace_seconds = 30 # type = "replay": # session = "replay/session.json" ```
+ *
+ * Bring-your-own-model: the command template is the whole integration — no LLM SDK enters the workspace.
+ */
+export type FulfillDriverConfig =
+  | {
+      /**
+       * The agent command template. Exactly one argument must carry the `{brief}` placeholder, replaced with the rendered brief.
+       */
+      command: string[];
+      /**
+       * Environment variables the worker may inherit. Everything else is cleared. Empty = the worker gets an empty environment.
+       */
+      env_allow?: string[];
+      /**
+       * Grace between the group SIGTERM and the group SIGKILL.
+       */
+      kill_grace_seconds?: number;
+      /**
+       * Wall-clock budget for one task; on elapse the group receives SIGTERM, then SIGKILL after the kill grace.
+       */
+      timeout_seconds?: number;
+      type: "subprocess";
+    }
+  | {
+      /**
+       * The recorded session file, relative to the project root.
+       */
+      session: string;
+      type: "replay";
+    };
+/**
  * Supports both single-webhook and multi-webhook syntax per event.
  *
  * Single: `[hook.webhooks.on_pipeline_start]` Multiple: `[[hook.webhooks.on_pipeline_start]]`
@@ -433,6 +467,10 @@ export interface RockyConfig {
    * Inheritance is field-by-field: a per-model `[freshness]` table always wins for the fields it sets; absent fields fall through to the project-level default. Models with no per-model `[freshness]` at all inherit the project default when it carries an `expected_lag_seconds` value (the required field).
    */
   freshness?: ProjectFreshnessConfig;
+  /**
+   * `[fulfill]` — the fulfillment loop's driver + brief overrides. Read only by `rocky fulfill`; see [`FulfillConfig`].
+   */
+  fulfill?: FulfillConfig;
   /**
    * `[gc]` — storage-reclamation settings for `rocky gc` / `rocky apply <gc-plan>`. Default: physical byte-deletion stays disarmed; an applied eviction is recorded as tombstone + retired ledger row only. See [`GcConfig`].
    */
@@ -968,6 +1006,21 @@ export interface ProjectFreshnessConfig {
    * Default timestamp column used to evaluate freshness at runtime. Inherited by per-model freshness blocks that don't specify their own `time_column`.
    */
   time_column?: string | null;
+}
+/**
+ * The `[fulfill]` block: the fulfillment loop's driver and briefs.
+ *
+ * Consumed by `rocky fulfill` (the `rocky-fulfill` crate). The engine's deterministic verbs never read it.
+ */
+export interface FulfillConfig {
+  /**
+   * Directory of brief overrides (`elicitation.md`, `drafting.md`, `repair.md`). A file present there replaces the compiled default of the same name; absent files fall back. Relative paths resolve against the project root.
+   */
+  briefs_dir?: string | null;
+  /**
+   * The agent driver. `rocky fulfill` refuses to dispatch worker tasks until one is configured.
+   */
+  driver?: FulfillDriverConfig | null;
 }
 /**
  * `[gc]` — storage-reclamation settings for `rocky gc` and its review-gated `rocky apply <gc-plan>`.

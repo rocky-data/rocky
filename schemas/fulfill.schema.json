@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output of `rocky fulfill <product>` — the reconciler's stop report: how far the loop advanced, why it stopped, and the exact next command when one exists.",
+  "properties": {
+    "command": {
+      "description": "Always `\"fulfill\"`.",
+      "type": "string"
+    },
+    "message": {
+      "description": "Why the loop stopped, in plain language.",
+      "type": "string"
+    },
+    "next_command": {
+      "description": "The exact command that unblocks it, when one exists.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "plan_id": {
+      "description": "The pinned plan, while one is in flight.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "product": {
+      "description": "The product name the loop was asked to drive.",
+      "type": "string"
+    },
+    "product_id": {
+      "description": "`product:<name>`.",
+      "type": "string"
+    },
+    "spec_digest": {
+      "description": "The approved spec digest the state was reached under, if any.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "state": {
+      "description": "The state the record was left in (its wire tag, e.g. `\"needs_input\"`, `\"proposed\"`, `\"observing\"`, `\"blocked\"`).",
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "message",
+    "product",
+    "product_id",
+    "state",
+    "version"
+  ],
+  "title": "FulfillOutput",
+  "type": "object"
+}

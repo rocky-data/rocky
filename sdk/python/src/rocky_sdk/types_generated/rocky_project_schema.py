@@ -655,6 +655,56 @@ class FivetranStampedeConfig(BaseModel):
     """
 
 
+class Type(StrEnum):
+    subprocess = "subprocess"
+
+
+class FulfillDriverConfig1(BaseModel):
+    """
+    Spawn the configured agent command in its own process group; the whole group is killed at task end (and on timeout).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    command: list[str]
+    """
+    The agent command template. Exactly one argument must carry the `{brief}` placeholder, replaced with the rendered brief.
+    """
+    env_allow: list[str] | None = []
+    """
+    Environment variables the worker may inherit. Everything else is cleared. Empty = the worker gets an empty environment.
+    """
+    kill_grace_seconds: conint(ge=0) | None = 30
+    """
+    Grace between the group SIGTERM and the group SIGKILL.
+    """
+    timeout_seconds: conint(ge=0) | None = 900
+    """
+    Wall-clock budget for one task; on elapse the group receives SIGTERM, then SIGKILL after the kill grace.
+    """
+    type: Type
+
+
+class Type23(StrEnum):
+    replay = "replay"
+
+
+class FulfillDriverConfig2(BaseModel):
+    """
+    Execute a recorded session against the worker-profile MCP server — deterministic and credential-free (the CI lane).
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    session: str
+    """
+    The recorded session file, relative to the project root.
+    """
+    type: Type23
+
+
 class GcConfig(BaseModel):
     """
     `[gc]` — storage-reclamation settings for `rocky gc` and its review-gated `rocky apply <gc-plan>`.
@@ -885,23 +935,23 @@ class OnCollision3(StrEnum):
     error = "error"
 
 
-class Type(StrEnum):
+class Type24(StrEnum):
     replication = "replication"
 
 
-class Type23(StrEnum):
+class Type25(StrEnum):
     transformation = "transformation"
 
 
-class Type24(StrEnum):
+class Type26(StrEnum):
     quality = "quality"
 
 
-class Type25(StrEnum):
+class Type27(StrEnum):
     snapshot = "snapshot"
 
 
-class Type26(StrEnum):
+class Type28(StrEnum):
     load = "load"
 
 
@@ -1174,55 +1224,55 @@ class PortabilityConfig(BaseModel):
     """
 
 
-class Type27(StrEnum):
+class Type29(StrEnum):
     not_null = "not_null"
 
 
-class Type28(StrEnum):
+class Type30(StrEnum):
     unique = "unique"
 
 
-class Type29(StrEnum):
+class Type31(StrEnum):
     accepted_values = "accepted_values"
 
 
-class Type30(StrEnum):
+class Type32(StrEnum):
     relationships = "relationships"
 
 
-class Type31(StrEnum):
+class Type33(StrEnum):
     expression = "expression"
 
 
-class Type32(StrEnum):
+class Type34(StrEnum):
     row_count_range = "row_count_range"
 
 
-class Type33(StrEnum):
+class Type35(StrEnum):
     in_range = "in_range"
 
 
-class Type34(StrEnum):
+class Type36(StrEnum):
     regex_match = "regex_match"
 
 
-class Type35(StrEnum):
+class Type37(StrEnum):
     aggregate = "aggregate"
 
 
-class Type36(StrEnum):
+class Type38(StrEnum):
     composite = "composite"
 
 
-class Type37(StrEnum):
+class Type39(StrEnum):
     unique_expr = "unique_expr"
 
 
-class Type38(StrEnum):
+class Type40(StrEnum):
     not_in_future = "not_in_future"
 
 
-class Type39(StrEnum):
+class Type41(StrEnum):
     older_than_n_days = "older_than_n_days"
 
 
@@ -2144,6 +2194,26 @@ class FreshnessConfig(BaseModel):
     threshold_seconds: conint(ge=0)
 
 
+class FulfillConfig(BaseModel):
+    """
+    The `[fulfill]` block: the fulfillment loop's driver and briefs.
+
+    Consumed by `rocky fulfill` (the `rocky-fulfill` crate). The engine's deterministic verbs never read it.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+    )
+    briefs_dir: str | None = None
+    """
+    Directory of brief overrides (`elicitation.md`, `drafting.md`, `repair.md`). A file present there replaces the compiled default of the same name; absent files fall back. Relative paths resolve against the project root.
+    """
+    driver: FulfillDriverConfig1 | FulfillDriverConfig2 | None = None
+    """
+    The agent driver. `rocky fulfill` refuses to dispatch worker tasks until one is configured.
+    """
+
+
 class HooksConfig(BaseModel):
     """
     The `[hook]` section from rocky.toml.
@@ -2339,7 +2409,7 @@ class QualityAssertion1(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type27
+    type: Type29
 
 
 class QualityAssertion2(BaseModel):
@@ -2371,7 +2441,7 @@ class QualityAssertion2(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type28
+    type: Type30
 
 
 class QualityAssertion3(BaseModel):
@@ -2403,7 +2473,7 @@ class QualityAssertion3(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type29
+    type: Type31
     values: list[str]
     """
     The allowed values. Compared as string literals.
@@ -2447,7 +2517,7 @@ class QualityAssertion4(BaseModel):
     """
     Fully-qualified target table (`catalog.schema.table`).
     """
-    type: Type30
+    type: Type32
 
 
 class QualityAssertion5(BaseModel):
@@ -2483,7 +2553,7 @@ class QualityAssertion5(BaseModel):
     """
     A SQL boolean expression. Rows where `NOT (expression)` are failures.
     """
-    type: Type31
+    type: Type33
 
 
 class QualityAssertion6(BaseModel):
@@ -2523,7 +2593,7 @@ class QualityAssertion6(BaseModel):
     """
     Minimum row count (inclusive). `None` means no lower bound.
     """
-    type: Type32
+    type: Type34
 
 
 class QualityAssertion7(BaseModel):
@@ -2565,7 +2635,7 @@ class QualityAssertion7(BaseModel):
     """
     Minimum value (inclusive). `None` means no lower bound.
     """
-    type: Type33
+    type: Type35
 
 
 class QualityAssertion8(BaseModel):
@@ -2605,7 +2675,7 @@ class QualityAssertion8(BaseModel):
     """
     The regex pattern. Dialect-specific syntax — stick to the portable subset (character classes, anchors, quantifiers).
     """
-    type: Type34
+    type: Type36
 
 
 class QualityAssertion9(BaseModel):
@@ -2647,7 +2717,7 @@ class QualityAssertion9(BaseModel):
     """
     Aggregate operator.
     """
-    type: Type35
+    type: Type37
     value: str
     """
     Threshold to compare against. Parsed as `f64`.
@@ -2693,7 +2763,7 @@ class QualityAssertion10(BaseModel):
     """
     The kind of composite assertion. Currently `unique` only — kept as an enum to leave room for `not_null_any` / `not_null_all` in a later phase without another TestType.
     """
-    type: Type36
+    type: Type38
 
 
 class QualityAssertion11(BaseModel):
@@ -2733,7 +2803,7 @@ class QualityAssertion11(BaseModel):
     """
     SQL scalar expression whose value must be unique across rows.
     """
-    type: Type37
+    type: Type39
 
 
 class QualityAssertion12(BaseModel):
@@ -2765,7 +2835,7 @@ class QualityAssertion12(BaseModel):
     """
     Table name this assertion applies to. Must match a table discovered from one of the pipeline's `[[tables]]` entries (by unqualified table name).
     """
-    type: Type38
+    type: Type40
 
 
 class QualityAssertion13(BaseModel):
@@ -2801,7 +2871,7 @@ class QualityAssertion13(BaseModel):
     """
     N — days in the past. Must be > 0.
     """
-    type: Type39
+    type: Type41
 
 
 class QuarantineConfig(BaseModel):
@@ -3540,7 +3610,7 @@ class PipelineConfig1(ReplicationPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type | None = None
+    type: Type24 | None = None
 
 
 class PipelineConfig3(QualityPipelineConfig):
@@ -3548,7 +3618,7 @@ class PipelineConfig3(QualityPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type24
+    type: Type26
 
 
 class PipelineConfig5(LoadPipelineConfig):
@@ -3556,7 +3626,7 @@ class PipelineConfig5(LoadPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type26
+    type: Type28
 
 
 class SnapshotPipelineConfig(BaseModel):
@@ -3698,7 +3768,7 @@ class PipelineConfig2(TransformationPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type23
+    type: Type25
 
 
 class PipelineConfig4(SnapshotPipelineConfig):
@@ -3706,7 +3776,7 @@ class PipelineConfig4(SnapshotPipelineConfig):
     Pipeline configuration. The `type` field selects one of five variants — `replication` (default when omitted), `transformation`, `quality`, `snapshot`, or `load`. Each variant has its own field set; see the per-variant subschemas in `definitions`.
     """
 
-    type: Type25
+    type: Type27
 
 
 class RockyConfig(BaseModel):
@@ -3789,6 +3859,10 @@ class RockyConfig(BaseModel):
     ```toml [freshness] expected_lag_seconds = 3600 time_column = "updated_at" severity = "warning" ```
 
     Inheritance is field-by-field: a per-model `[freshness]` table always wins for the fields it sets; absent fields fall through to the project-level default. Models with no per-model `[freshness]` at all inherit the project default when it carries an `expected_lag_seconds` value (the required field).
+    """
+    fulfill: FulfillConfig | None = Field({}, validate_default=True)
+    """
+    `[fulfill]` — the fulfillment loop's driver + brief overrides. Read only by `rocky fulfill`; see [`FulfillConfig`].
     """
     gc: GcConfig | None = Field({"physical_delete": False}, validate_default=True)
     """
