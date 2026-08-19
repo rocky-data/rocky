@@ -3021,7 +3021,9 @@ impl RockyMcpServer {
             }
             Err(ProposeError::MarkerList(inner)) => {
                 return Err(ToolError::internal(
-                    format!("failed to list durable freeze markers before the policy gate: {inner}"),
+                    format!(
+                        "failed to list durable freeze markers before the policy gate: {inner}"
+                    ),
                     "The durable `[state]` tier must be reachable so an active freeze marker \
                      is enforced before proposing a plan (fail-closed).",
                 ));

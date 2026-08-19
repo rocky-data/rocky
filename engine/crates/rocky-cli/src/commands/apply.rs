@@ -192,18 +192,16 @@ pub(crate) async fn run_apply_core_in(
             )
             .await
         }
-        PlanKind::Promote => {
-            run_apply_promote_plan(
-                root,
-                config_path,
-                plan_id,
-                state_path,
-                runtime_principal,
-                output_json,
-            )
-            .await
-            .map(|()| ApplyOutcome::Applied { run_id: None })
-        }
+        PlanKind::Promote => run_apply_promote_plan(
+            root,
+            config_path,
+            plan_id,
+            state_path,
+            runtime_principal,
+            output_json,
+        )
+        .await
+        .map(|()| ApplyOutcome::Applied { run_id: None }),
         PlanKind::AiAuthored => {
             run_apply_ai_authored_plan(
                 root,
@@ -226,30 +224,26 @@ pub(crate) async fn run_apply_core_in(
             )
             .await
         }
-        PlanKind::Gc => {
-            super::gc::run_gc_apply_in(
-                root,
-                config_path,
-                plan_id,
-                state_path,
-                runtime_principal,
-                output_json,
-            )
-            .await
-            .map(|()| ApplyOutcome::Applied { run_id: None })
-        }
-        PlanKind::Restore => {
-            super::restore::run_restore_apply_in(
-                root,
-                config_path,
-                plan_id,
-                state_path,
-                runtime_principal,
-                output_json,
-            )
-            .await
-            .map(|()| ApplyOutcome::Applied { run_id: None })
-        }
+        PlanKind::Gc => super::gc::run_gc_apply_in(
+            root,
+            config_path,
+            plan_id,
+            state_path,
+            runtime_principal,
+            output_json,
+        )
+        .await
+        .map(|()| ApplyOutcome::Applied { run_id: None }),
+        PlanKind::Restore => super::restore::run_restore_apply_in(
+            root,
+            config_path,
+            plan_id,
+            state_path,
+            runtime_principal,
+            output_json,
+        )
+        .await
+        .map(|()| ApplyOutcome::Applied { run_id: None }),
     }
 }
 

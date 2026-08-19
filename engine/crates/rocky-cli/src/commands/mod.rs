@@ -2,7 +2,6 @@ mod adapter;
 mod ai;
 mod ai_contract;
 pub mod apply;
-pub mod fulfill_api;
 mod archive;
 mod audit;
 mod backfill;
@@ -33,6 +32,7 @@ mod export_openapi;
 mod export_schemas;
 mod fmt;
 mod freeze_fence;
+pub mod fulfill_api;
 mod gc;
 pub mod groups;
 mod history;
@@ -132,6 +132,7 @@ pub use estimate::run_estimate;
 pub use export_openapi::export_openapi;
 pub use export_schemas::{export_schemas, schemas_hash};
 pub use fmt::run_fmt;
+pub use fulfill_api::propose_governed_run_plan;
 pub use gc::{run_gc_derivable, run_gc_plan};
 pub use history::{
     history_runs_output, history_runs_output_filtered, model_history_output, recipe_history_output,
@@ -157,15 +158,14 @@ pub use plan::{
     plan_promote, populate_governance_actions,
 };
 pub use playground::{run_playground, run_playground_with_template};
-pub use fulfill_api::propose_governed_run_plan;
 pub use policy::{run_policy_check, run_policy_freeze, run_policy_test};
-pub use product::{
-    run_product_approve, run_product_compile, run_product_status, run_product_verify,
-};
 pub use preview::{
     PreviewDiffAlgorithmSelector, run_preview_cost, run_preview_create, run_preview_diff,
 };
 pub use preview_rows::run_preview_rows;
+pub use product::{
+    run_product_approve, run_product_compile, run_product_status, run_product_verify,
+};
 pub use profile::run_profile;
 pub use profile_storage::run_profile_storage;
 pub use publish_ir::run_publish_ir;

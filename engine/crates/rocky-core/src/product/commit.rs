@@ -196,11 +196,7 @@ fn is_canonical_relative_posix(rel: &str) -> bool {
 /// validating one spelling and then mutating through an unresolved alias
 /// would reopen the window where a parent directory is swapped for a
 /// symlink between the check and the use.
-fn contained_final_path(
-    resolved_root: &Path,
-    journal: &Path,
-    rel: &str,
-) -> SpecResult<PathBuf> {
+fn contained_final_path(resolved_root: &Path, journal: &Path, rel: &str) -> SpecResult<PathBuf> {
     if Path::new(rel).is_absolute() || rel.starts_with('/') {
         return Err(journal_reject(
             journal,
@@ -388,8 +384,7 @@ fn commit_generation_with_ops(
         serde_json::to_vec_pretty(&record).expect("the staging journal serializes to JSON");
     std::fs::write(&journal_tmp, journal_bytes)
         .map_err(|err| io_reject("writing", &journal_tmp, &err))?;
-    (ops.rename)(&journal_tmp, &journal)
-        .map_err(|err| io_reject("renaming", &journal, &err))?;
+    (ops.rename)(&journal_tmp, &journal).map_err(|err| io_reject("renaming", &journal, &err))?;
 
     // 3. Rename staged → final: artifacts first, the manifest LAST.
     for entry in &entries {
@@ -554,7 +549,8 @@ pub fn recover_generation(project_root: &Path, parsed: &ParsedSpec) -> SpecResul
     let resolved_root = project_root
         .canonicalize()
         .map_err(|err| io_reject("resolving project root", project_root, &err))?;
-    let mut resolved_finals: Vec<(StagingEntry, PathBuf)> = Vec::with_capacity(record.entries.len());
+    let mut resolved_finals: Vec<(StagingEntry, PathBuf)> =
+        Vec::with_capacity(record.entries.len());
     for entry in &record.entries {
         let resolved = contained_final_path(&resolved_root, &journal, &entry.final_path)?;
         resolved_finals.push((entry.clone(), resolved));
@@ -674,16 +670,13 @@ pub fn recover_generation(project_root: &Path, parsed: &ParsedSpec) -> SpecResul
 /// # Errors
 ///
 /// Returns `manifest-unreadable` when a file exists but does not parse.
-pub fn committed_manifest(
-    project_root: &Path,
-    product_name: &str,
-) -> SpecResult<Option<Manifest>> {
+pub fn committed_manifest(project_root: &Path, product_name: &str) -> SpecResult<Option<Manifest>> {
     let manifest_path = project_root.join(manifest_rel(product_name));
     if !manifest_path.is_file() {
         return Ok(None);
     }
-    let raw = std::fs::read(&manifest_path)
-        .map_err(|err| io_reject("reading", &manifest_path, &err))?;
+    let raw =
+        std::fs::read(&manifest_path).map_err(|err| io_reject("reading", &manifest_path, &err))?;
     Manifest::from_json_bytes(&raw).map(Some)
 }
 
@@ -916,7 +909,9 @@ mod tests {
         let mut rename = |src: &Path, dst: &Path| {
             calls += 1;
             if calls == fail_on_call {
-                return Err(std::io::Error::other("injected crash between staged renames"));
+                return Err(std::io::Error::other(
+                    "injected crash between staged renames",
+                ));
             }
             std::fs::rename(src, dst)
         };
@@ -1096,9 +1091,7 @@ mod tests {
         let project = project_with_phase_a_and_draft(dir.path(), &parsed);
         let without_orphans = |tree: BTreeMap<String, Vec<u8>>| -> BTreeMap<String, Vec<u8>> {
             tree.into_iter()
-                .filter(|(name, _)| {
-                    !name.ends_with(STAGED_SUFFIX) && !name.ends_with(PREV_SUFFIX)
-                })
+                .filter(|(name, _)| !name.ends_with(STAGED_SUFFIX) && !name.ends_with(PREV_SUFFIX))
                 .collect()
         };
         let before = without_orphans(snapshot(&project));
@@ -1249,7 +1242,10 @@ mod tests {
         );
         let error = recover_generation(&project, &parsed_d3()).expect_err("refused");
         assert_eq!(error.code, "staging-journal-unsafe-path");
-        assert_eq!(std::fs::read(&victim).expect("intact"), b"absolute-path victim");
+        assert_eq!(
+            std::fs::read(&victim).expect("intact"),
+            b"absolute-path victim"
+        );
     }
 
     #[cfg(unix)]
@@ -1452,7 +1448,10 @@ mod tests {
         // the alias pair is refused exactly like a literal duplicate.
         let dir = tempfile::tempdir().expect("tempdir");
         let project = seeded_project(dir.path());
-        write_file(&project.join("models/revenue_daily.toml"), b"drafted sidecar");
+        write_file(
+            &project.join("models/revenue_daily.toml"),
+            b"drafted sidecar",
+        );
         write_journal(
             &project,
             "revenue_daily",
@@ -1551,13 +1550,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("project");
         std::fs::create_dir_all(root.join("models_real")).expect("mkdir");
-        std::os::unix::fs::symlink(root.join("models_real"), root.join("models"))
-            .expect("symlink");
+        std::os::unix::fs::symlink(root.join("models_real"), root.join("models")).expect("symlink");
         write_file(&root.join("models_real/x.toml"), b"content");
         let resolved_root = root.canonicalize().expect("resolves");
-        let validated =
-            contained_final_path(&resolved_root, &root.join("whatever-journal"), "models/x.toml")
-                .expect("contained");
+        let validated = contained_final_path(
+            &resolved_root,
+            &root.join("whatever-journal"),
+            "models/x.toml",
+        )
+        .expect("contained");
         assert_eq!(validated, validated.canonicalize().expect("resolves"));
         assert!(validated.iter().any(|part| part == "models_real"));
         assert!(!validated.iter().any(|part| part == "models"));
@@ -1650,7 +1651,9 @@ mod tests {
         let mut rename = |src: &Path, dst: &Path| {
             calls += 1;
             if calls == 3 {
-                return Err(std::io::Error::other("injected crash between staged renames"));
+                return Err(std::io::Error::other(
+                    "injected crash between staged renames",
+                ));
             }
             std::fs::rename(src, dst)
         };
@@ -1826,4 +1829,3 @@ mod tests {
         9
     }
 }
-

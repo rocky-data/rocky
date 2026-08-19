@@ -44,7 +44,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rocky_core::config::{MaskEntry, PolicyCapability, PolicyEffect, PolicyPrincipal, RockyConfig};
-use rocky_core::fulfill::{FulfillJournalRow, FulfillState, FulfillStateRecord, ProductApprovalRecord};
+use rocky_core::fulfill::{
+    FulfillJournalRow, FulfillState, FulfillStateRecord, ProductApprovalRecord,
+};
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::product::commit::{
     RecoveryAction, committed_manifest, recover_generation, run_phase_a, run_phase_b,
@@ -298,8 +300,18 @@ pub(crate) fn verify_policy_posture(config_path: &Path, parsed: &ParsedSpec) -> 
     }
 
     let attrs = synthetic_post_image(parsed);
-    let propose = policy::evaluate(&policy, PolicyPrincipal::Agent, PolicyCapability::Propose, &attrs);
-    let apply = policy::evaluate(&policy, PolicyPrincipal::Agent, PolicyCapability::Apply, &attrs);
+    let propose = policy::evaluate(
+        &policy,
+        PolicyPrincipal::Agent,
+        PolicyCapability::Propose,
+        &attrs,
+    );
+    let apply = policy::evaluate(
+        &policy,
+        PolicyPrincipal::Agent,
+        PolicyCapability::Apply,
+        &attrs,
+    );
 
     if policy.default_agent_effect != PolicyEffect::RequireReview {
         return PostureResult {
@@ -749,7 +761,10 @@ pub(crate) fn product_verify_outcome(
     Ok((parsed, posture))
 }
 
-pub(crate) fn verify_output_for(parsed: &ParsedSpec, posture: &PostureResult) -> ProductVerifyOutput {
+pub(crate) fn verify_output_for(
+    parsed: &ParsedSpec,
+    posture: &PostureResult,
+) -> ProductVerifyOutput {
     ProductVerifyOutput {
         version: VERSION.to_string(),
         command: "product_verify".to_string(),
@@ -937,10 +952,7 @@ fn approver_string() -> String {
 /// new-digest-old-bytes. When the file already exists its bytes must
 /// still digest to the name it carries; anything else is tamper and the
 /// approval refuses.
-pub(crate) fn write_approval_snapshot(
-    root: &Path,
-    parsed: &ParsedSpec,
-) -> Result<String> {
+pub(crate) fn write_approval_snapshot(root: &Path, parsed: &ParsedSpec) -> Result<String> {
     let rel = approval_snapshot_rel(&parsed.product().name, &parsed.digest);
     let path = root.join(&rel);
     if path.is_file() {
@@ -1035,7 +1047,9 @@ pub(crate) fn product_approve_in(
 
     let observed_approval = store.product_approval_get(product_name)?;
     let observed_state = store.fulfill_state_get(product_name)?;
-    let previous_state = observed_state.as_ref().map(|record| record.state.tag().to_string());
+    let previous_state = observed_state
+        .as_ref()
+        .map(|record| record.state.tag().to_string());
 
     if let Some(existing) = &observed_approval
         && existing.spec_digest == parsed.digest
@@ -1193,8 +1207,8 @@ pub(crate) fn product_status_in(
         }
     };
 
-    if let Some(manifest) = committed_manifest(root, product_name)
-        .map_err(|reject| anyhow::anyhow!("{reject}"))?
+    if let Some(manifest) =
+        committed_manifest(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?
     {
         output.committed_phase = Some(
             match manifest.phase {
@@ -1398,11 +1412,18 @@ effect = "require_review"
         let dir = tempfile::tempdir().expect("tempdir");
         let result = posture(dir.path(), "");
         assert_eq!(result.status, VerifyStatus::NeedsInput);
-        assert_eq!(result.paste_block.as_deref(), Some(&*paste_block("revenue_daily")));
+        assert_eq!(
+            result.paste_block.as_deref(),
+            Some(&*paste_block("revenue_daily"))
+        );
         // The trap named: enforcement allows on an absent block even
         // though `policy check` predicts review — existence is checked
         // directly.
-        assert!(result.reason.contains("ENFORCEMENT allows"), "{}", result.reason);
+        assert!(
+            result.reason.contains("ENFORCEMENT allows"),
+            "{}",
+            result.reason
+        );
     }
 
     #[test]
@@ -1497,8 +1518,15 @@ effect = "require_review"
 "#;
         let result = posture(dir.path(), block);
         assert_eq!(result.status, VerifyStatus::NeedsInput);
-        assert!(result.reason.contains("default_agent_effect"), "{}", result.reason);
-        assert_eq!(result.paste_block.as_deref(), Some(&*paste_block("revenue_daily")));
+        assert!(
+            result.reason.contains("default_agent_effect"),
+            "{}",
+            result.reason
+        );
+        assert_eq!(
+            result.paste_block.as_deref(),
+            Some(&*paste_block("revenue_daily"))
+        );
     }
 
     #[test]
@@ -1527,7 +1555,10 @@ effect = "require_review"
         assert_eq!(result.status, VerifyStatus::NeedsInput);
         assert_eq!(result.propose_effect, Some(PolicyEffect::Allow));
         assert!(result.reason.contains("broader"), "{}", result.reason);
-        assert_eq!(result.paste_block.as_deref(), Some(&*paste_block("revenue_daily")));
+        assert_eq!(
+            result.paste_block.as_deref(),
+            Some(&*paste_block("revenue_daily"))
+        );
     }
 
     #[test]
@@ -1573,10 +1604,17 @@ effect = "require_review"
         let result = posture(dir.path(), &format!("\n{block}"));
         assert_eq!(result.status, VerifyStatus::NeedsInput);
         assert_eq!(result.propose_effect, Some(PolicyEffect::Allow));
-        assert!(result.reason.contains("autonomy_budget"), "{}", result.reason);
+        assert!(
+            result.reason.contains("autonomy_budget"),
+            "{}",
+            result.reason
+        );
         assert!(result.reason.contains("failures = 2"), "{}", result.reason);
         assert!(result.reason.contains("7d"), "{}", result.reason);
-        assert_eq!(result.paste_block.as_deref(), Some(&*paste_block("revenue_daily")));
+        assert_eq!(
+            result.paste_block.as_deref(),
+            Some(&*paste_block("revenue_daily"))
+        );
     }
 
     #[test]
@@ -1623,7 +1661,11 @@ effect = "require_review"
         let dir = tempfile::tempdir().expect("tempdir");
         let result = posture(dir.path(), "\n[policy]\nversion = \"1\"\n");
         assert_eq!(result.status, VerifyStatus::NeedsInput);
-        assert!(result.reason.contains("does not parse"), "{}", result.reason);
+        assert!(
+            result.reason.contains("does not parse"),
+            "{}",
+            result.reason
+        );
     }
 
     #[test]
@@ -1631,7 +1673,11 @@ effect = "require_review"
         let dir = tempfile::tempdir().expect("tempdir");
         let result = posture(dir.path(), "\n[policy]\nversion = -1\n");
         assert_eq!(result.status, VerifyStatus::NeedsInput);
-        assert!(result.reason.contains("does not parse"), "{}", result.reason);
+        assert!(
+            result.reason.contains("does not parse"),
+            "{}",
+            result.reason
+        );
     }
 
     #[test]
@@ -1643,7 +1689,11 @@ effect = "require_review"
              capability = \"propose\"\nscope = { any = 1 }\neffect = \"allow\"\n",
         );
         assert_eq!(result.status, VerifyStatus::NeedsInput);
-        assert!(result.reason.contains("does not parse"), "{}", result.reason);
+        assert!(
+            result.reason.contains("does not parse"),
+            "{}",
+            result.reason
+        );
     }
 
     #[test]
@@ -1656,7 +1706,11 @@ effect = "require_review"
              autonomy_budget = { failures = \"2\", window = \"7d\" }\n",
         );
         assert_eq!(result.status, VerifyStatus::NeedsInput);
-        assert!(result.reason.contains("does not parse"), "{}", result.reason);
+        assert!(
+            result.reason.contains("does not parse"),
+            "{}",
+            result.reason
+        );
     }
 
     // ----- autonomy-budget validation is the engine's validate_policy -----
@@ -1692,7 +1746,11 @@ effect = "require_review"
         // so assert the budget itself raised no problem).
         let dir = tempfile::tempdir().expect("tempdir");
         let result = posture(dir.path(), &budget_rule("2", "\"7d\""));
-        assert!(!result.reason.contains("autonomy_budget"), "{}", result.reason);
+        assert!(
+            !result.reason.contains("autonomy_budget"),
+            "{}",
+            result.reason
+        );
     }
 
     #[test]
@@ -1708,7 +1766,10 @@ effect = "require_review"
     fn synthetic_post_image_shape() {
         let attrs = synthetic_post_image(&parsed_d3());
         assert_eq!(attrs.name, "revenue_daily");
-        assert_eq!(attrs.tags.get("product").map(String::as_str), Some("revenue_daily"));
+        assert_eq!(
+            attrs.tags.get("product").map(String::as_str),
+            Some("revenue_daily")
+        );
         assert!(attrs.classifications.contains("pii"));
         assert!(attrs.contracted, "Phase A writes the sibling contract");
         // Reachability is UNPROVED, never 0-by-assumption: an existing
@@ -1770,8 +1831,11 @@ effect = "require_review"
     #[test]
     fn allow_unmasked_resolves() {
         let dir = tempfile::tempdir().expect("tempdir");
-        classification_check(dir.path(), "\n[classifications]\nallow_unmasked = [\"pii\"]\n")
-            .expect("resolves");
+        classification_check(
+            dir.path(),
+            "\n[classifications]\nallow_unmasked = [\"pii\"]\n",
+        )
+        .expect("resolves");
     }
 
     // ----- collision checks against fulfillment state dirs -----
@@ -1802,11 +1866,19 @@ effect = "require_review"
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("project");
         std::fs::create_dir_all(&root).expect("mkdir");
-        committed_manifest_for(&root, "revenue_daily", "revenue_daily", "products/other_file.toml");
+        committed_manifest_for(
+            &root,
+            "revenue_daily",
+            "revenue_daily",
+            "products/other_file.toml",
+        );
         let error = check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
             .expect_err("collision");
         assert_eq!(error.code, "duplicate-product-name");
-        assert!(error.message.contains("products/other_file.toml"), "{error}");
+        assert!(
+            error.message.contains("products/other_file.toml"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1829,7 +1901,12 @@ effect = "require_review"
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("project");
         std::fs::create_dir_all(&root).expect("mkdir");
-        committed_manifest_for(&root, "other_product", "revenue_daily", "products/other.toml");
+        committed_manifest_for(
+            &root,
+            "other_product",
+            "revenue_daily",
+            "products/other.toml",
+        );
         let error = check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
             .expect_err("collision");
         assert_eq!(error.code, "duplicate-output-model");
@@ -1841,7 +1918,12 @@ effect = "require_review"
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("project");
         std::fs::create_dir_all(&root).expect("mkdir");
-        committed_manifest_for(&root, "other_product", "another_model", "products/other.toml");
+        committed_manifest_for(
+            &root,
+            "other_product",
+            "another_model",
+            "products/other.toml",
+        );
         check_product_collisions(&root, &parsed_d3(), "products/revenue_daily.toml")
             .expect("clean");
     }
@@ -1876,7 +1958,10 @@ effect = "require_review"
 
     /// A pass-verification config: the D5 posture plus a pii mask.
     fn passing_config() -> String {
-        format!("\n[mask]\npii = \"hash\"\n\n{}", paste_block("revenue_daily"))
+        format!(
+            "\n[mask]\npii = \"hash\"\n\n{}",
+            paste_block("revenue_daily")
+        )
     }
 
     #[test]
@@ -1893,11 +1978,14 @@ effect = "require_review"
     fn compile_refuses_until_verification_passes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (root, config) = project_with_config(dir.path(), "");
-        let error = product_compile_in(&root, &config, None, "revenue_daily")
-            .expect_err("no policy block");
+        let error =
+            product_compile_in(&root, &config, None, "revenue_daily").expect_err("no policy block");
         let message = format!("{error:#}");
         assert!(message.contains("verification did not pass"), "{message}");
-        assert!(message.contains("[policy]"), "the paste block rides along: {message}");
+        assert!(
+            message.contains("[policy]"),
+            "the paste block rides along: {message}"
+        );
         assert!(
             !root.join("models/revenue_daily.contract.toml").exists(),
             "nothing lowers before verification passes"
@@ -1971,7 +2059,13 @@ effect = "require_review"
             .expect("recorded");
         assert_eq!(state.state.tag(), "spec_approved");
         assert_eq!(state.journal_seq, 1);
-        assert_eq!(store.fulfill_journal_rows("revenue_daily").expect("reads").len(), 1);
+        assert_eq!(
+            store
+                .fulfill_journal_rows("revenue_daily")
+                .expect("reads")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2010,8 +2104,18 @@ effect = "require_review"
         let snapshot_rel = write_approval_snapshot(&root, &parsed).expect("snapshot");
         assert!(root.join(&snapshot_rel).is_file());
         let store = StateStore::open(&state_path).expect("opens");
-        assert!(store.product_approval_get("revenue_daily").expect("reads").is_none());
-        assert!(store.fulfill_state_get("revenue_daily").expect("reads").is_none());
+        assert!(
+            store
+                .product_approval_get("revenue_daily")
+                .expect("reads")
+                .is_none()
+        );
+        assert!(
+            store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .is_none()
+        );
         drop(store);
 
         // The re-run completes over the orphan (never overwriting it).
@@ -2029,14 +2133,20 @@ effect = "require_review"
         let output = product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
         write_file(&root.join(&output.snapshot_path), b"tampered bytes");
 
-        let error = product_approve_in(&root, &state_path, "revenue_daily")
-            .expect_err("tampered snapshot");
-        assert!(format!("{error:#}").contains("approval-snapshot-tampered"), "{error:#}");
+        let error =
+            product_approve_in(&root, &state_path, "revenue_daily").expect_err("tampered snapshot");
+        assert!(
+            format!("{error:#}").contains("approval-snapshot-tampered"),
+            "{error:#}"
+        );
 
         // Compile is a reader of the approval and refuses the same way.
         let error = product_compile_in(&root, &config, Some(&state_path), "revenue_daily")
             .expect_err("tampered snapshot");
-        assert!(format!("{error:#}").contains("approval-snapshot-tampered"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("approval-snapshot-tampered"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -2066,12 +2176,7 @@ effect = "require_review"
         let snapshots = std::fs::read_dir(&state_dir)
             .expect("state dir")
             .flatten()
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("approved-")
-            })
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("approved-"))
             .count();
         assert_eq!(snapshots, 2);
     }
@@ -2083,8 +2188,7 @@ effect = "require_review"
         let state_path = temp_state_path(dir.path());
 
         // Cold: spec parses, nothing else exists.
-        let cold =
-            product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
+        let cold = product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
         assert!(cold.spec_present);
         assert_eq!(cold.committed_phase, None);
         assert!(cold.approval.is_none());
@@ -2093,8 +2197,7 @@ effect = "require_review"
         // After approve + compile: everything reported and intact.
         product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
         product_compile_in(&root, &config, Some(&state_path), "revenue_daily").expect("compiles");
-        let status =
-            product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
+        let status = product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
         assert_eq!(status.committed_phase.as_deref(), Some("lowered_contract"));
         assert!(status.artifact_problems.is_empty());
         assert_eq!(status.snapshot_intact, Some(true));
@@ -2108,8 +2211,7 @@ effect = "require_review"
             .expect("contract")
             .replace("Int64", "String");
         write_file(&contract, tampered.as_bytes());
-        let status =
-            product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
+        let status = product_status_in(&root, Some(&state_path), "revenue_daily").expect("status");
         assert_eq!(status.artifact_problems.len(), 1);
         assert!(status.artifact_problems[0].contains("drift"));
     }
@@ -2215,8 +2317,14 @@ effect = "require_review"
 
         // The worker drafts: SQL + the draft_model-shaped sidecar (name +
         // intent only; target resolves from _defaults.toml).
-        write_file(&root.join("models/revenue_daily.sql"), WORKER_SQL.as_bytes());
-        write_file(&root.join("models/revenue_daily.toml"), DRAFT_SIDECAR.as_bytes());
+        write_file(
+            &root.join("models/revenue_daily.sql"),
+            WORKER_SQL.as_bytes(),
+        );
+        write_file(
+            &root.join("models/revenue_daily.toml"),
+            DRAFT_SIDECAR.as_bytes(),
+        );
         let result = compile_probe(&root).expect("compiles");
         assert!(!result.has_errors, "{:?}", result.diagnostics);
         assert!(
@@ -2256,7 +2364,10 @@ effect = "require_review"
 
         // Restore the good draft; before the merge W005 fires (temporal
         // column, no freshness declared yet).
-        write_file(&root.join("models/revenue_daily.sql"), WORKER_SQL.as_bytes());
+        write_file(
+            &root.join("models/revenue_daily.sql"),
+            WORKER_SQL.as_bytes(),
+        );
         let result = compile_probe(&root).expect("compiles");
         assert!(!result.has_errors, "{:?}", result.diagnostics);
         assert!(
@@ -2270,8 +2381,14 @@ effect = "require_review"
         run_phase_b(&root, "products/revenue_daily.toml", &parsed).expect("phase B");
         let result = compile_probe(&root).expect("compiles");
         assert!(!result.has_errors, "{:?}", result.diagnostics);
-        assert!(diagnostics(&result, "W005").is_empty(), "freshness clears W005");
-        assert!(diagnostics(&result, "W004").is_empty(), "[mask] resolves pii");
+        assert!(
+            diagnostics(&result, "W005").is_empty(),
+            "freshness clears W005"
+        );
+        assert!(
+            diagnostics(&result, "W004").is_empty(),
+            "[mask] resolves pii"
+        );
         let model = &result.project.models[0];
         assert_eq!(
             model.config.tags.get("product").map(String::as_str),

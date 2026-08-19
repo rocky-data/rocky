@@ -316,7 +316,10 @@ fn validate_products(config_path: &Path, out: &mut ValidateOutput) {
     let mut claimed_models: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     for path in &spec_files {
-        let file_label = format!("products/{}", path.file_name().unwrap_or_default().display());
+        let file_label = format!(
+            "products/{}",
+            path.file_name().unwrap_or_default().display()
+        );
         let stem = path
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
@@ -1653,16 +1656,18 @@ agent = "propose_only"
             message.contains("trust-not-propose-only"),
             "the parser's stable reject code rides in the message: {message}"
         );
-        assert_eq!(codes(&out, "V050"), 0, "a failing spec forfeits the ok line");
+        assert_eq!(
+            codes(&out, "V050"),
+            0,
+            "a failing spec forfeits the ok line"
+        );
         assert!(!out.valid);
     }
 
     #[test]
     fn a_misnamed_spec_reports_v052() {
-        let (_dir, out) = project_with_products(&[(
-            "misnamed.toml",
-            &MINIMAL_SPEC.replace("NAME", "alpha"),
-        )]);
+        let (_dir, out) =
+            project_with_products(&[("misnamed.toml", &MINIMAL_SPEC.replace("NAME", "alpha"))]);
         assert_eq!(codes(&out, "V052"), 1);
         assert!(!out.valid);
     }
