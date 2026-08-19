@@ -869,8 +869,19 @@ pub(crate) fn product_compile_in(
     }
 
     let sidecar_present = root.join(sidecar_rel(&parsed)).is_file();
-    let has_committed = committed_manifest(root, product_name)?.is_some();
-    let lowering = if has_committed && sidecar_present {
+    let committed = committed_manifest(root, product_name)?;
+    // Phase B (the metadata merge) only continues the CURRENT
+    // generation: a committed manifest from a DIFFERENT spec digest
+    // means the spec moved past this lowering (FF-DESIGN D6
+    // supersession), and `run_phase_b` would refuse to mix generations —
+    // so the next generation starts at Phase A instead, re-rendering the
+    // contract from the current spec (the resume arm of Phase A's
+    // cold-start rule permits it: the committed manifest claims the
+    // model).
+    let continues_generation = committed
+        .as_ref()
+        .is_some_and(|manifest| manifest.spec_digest == parsed.digest);
+    let lowering = if committed.is_some() && sidecar_present && continues_generation {
         run_phase_b(root, &spec_path, &parsed)
     } else {
         run_phase_a(root, &spec_path, &parsed)

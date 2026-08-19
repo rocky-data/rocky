@@ -655,6 +655,7 @@ mod tests {
             reuse: Default::default(),
             gc: Default::default(),
             policy: None,
+            fulfill: Default::default(),
             resilience: ResilienceConfig {
                 auto_apply_additive_drift: true,
                 ..Default::default()

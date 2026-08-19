@@ -21,8 +21,16 @@ use rocky_core::state::StateStore;
 use crate::machine::{OwnerLiveness, OwnershipDecision, SelfIdentity, decide_ownership};
 
 /// The store handle for one product's reconciler records.
+///
+/// Opens the state store PER OPERATION rather than holding a writer:
+/// redb allows one writer per state file, and the loop's engine calls
+/// (status, compile, the apply core) open their own handles between our
+/// transitions. A held handle would deadlock the loop against itself;
+/// correctness never depended on it — every write is CAS-on-observed-
+/// prior, so an interleaved writer makes our next CAS lose, which is
+/// the designed stand-down.
 pub struct StoreDriver {
-    store: StateStore,
+    state_path: std::path::PathBuf,
     product_name: String,
     product_id: String,
 }
@@ -50,13 +58,11 @@ pub enum Acquired {
 }
 
 impl StoreDriver {
-    /// Open the state store for `product_name`.
+    /// Bind to the state store at `state_path` for `product_name`. The
+    /// store itself is opened per operation (see the type docs).
     pub fn open(state_path: &Path, product_name: &str) -> Result<Self> {
-        let store = StateStore::open(state_path).with_context(|| {
-            format!("failed to open the state store at {}", state_path.display())
-        })?;
         Ok(Self {
-            store,
+            state_path: state_path.to_path_buf(),
             product_name: product_name.to_string(),
             product_id: format!("product:{product_name}"),
         })
@@ -67,20 +73,29 @@ impl StoreDriver {
         &self.product_id
     }
 
+    fn store(&self) -> Result<StateStore> {
+        StateStore::open(&self.state_path).with_context(|| {
+            format!(
+                "failed to open the state store at {} for the product records",
+                self.state_path.display()
+            )
+        })
+    }
+
     /// Read the current record.
     pub fn read(&self) -> Result<Option<FulfillStateRecord>> {
-        Ok(self.store.fulfill_state_get(&self.product_name)?)
+        Ok(self.store()?.fulfill_state_get(&self.product_name)?)
     }
 
     /// Read the current spec-approval record (a pointer — callers must
     /// re-verify snapshot bytes against its digest before trusting them).
     pub fn approval(&self) -> Result<Option<ProductApprovalRecord>> {
-        Ok(self.store.product_approval_get(&self.product_name)?)
+        Ok(self.store()?.product_approval_get(&self.product_name)?)
     }
 
     /// Read the journal, in append order.
     pub fn journal(&self) -> Result<Vec<FulfillJournalRow>> {
-        Ok(self.store.fulfill_journal_rows(&self.product_name)?)
+        Ok(self.store()?.fulfill_journal_rows(&self.product_name)?)
     }
 
     /// Apply one fenced transition: CAS `expected → new`, journaling
@@ -105,7 +120,7 @@ impl StoreDriver {
             idempotency_key: new.idempotency_key.clone(),
         };
         match self
-            .store
+            .store()?
             .fulfill_state_cas(&self.product_name, expected, new, &row)?
         {
             FulfillCas::Won => {

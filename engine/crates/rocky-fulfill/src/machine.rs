@@ -519,11 +519,18 @@ fn blocked(observed: &FulfillStateRecord, reason: String, now: DateTime<Utc>) ->
 }
 
 fn blocked_stop(record: FulfillStateRecord, event: String, product: &str, reason: &str) -> Decision {
+    // The stop surfaces the RECORD's blocked reason (which carries any
+    // `tampered:` classification), so the printed message and the
+    // persisted state never tell two different stories.
+    let message = match &record.state {
+        FulfillState::Blocked { reason } => format!("blocked: {reason}"),
+        _ => format!("blocked: {reason}"),
+    };
     Decision::AdvanceAndStop {
         record,
         event,
         stop: Stop {
-            message: format!("blocked: {reason}"),
+            message,
             next_command: Some(format!("rocky fulfill {product} --retry")),
         },
     }

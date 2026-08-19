@@ -60,18 +60,20 @@ pub fn run_fulfill_approve_spec(
     let output = fulfill_api::product_approve(&root, state_path, product)?;
     if output_json {
         rocky_cli::output::print_json(&output)?;
-    } else if output.already_approved {
-        println!(
-            "product {} spec {} was already approved (snapshot {})",
-            output.product_id, output.spec_digest, output.snapshot_path
-        );
     } else {
-        println!(
-            "product {} spec {} approved by {} (snapshot {})",
-            output.product_id, output.spec_digest, output.approver, output.snapshot_path
-        );
+        if output.already_approved {
+            println!(
+                "product {} spec {} was already approved (snapshot {})",
+                output.product_id, output.spec_digest, output.snapshot_path
+            );
+        } else {
+            println!(
+                "product {} spec {} approved by {} (snapshot {})",
+                output.product_id, output.spec_digest, output.approver, output.snapshot_path
+            );
+        }
+        println!("next: rocky fulfill {product}");
     }
-    println!("next: rocky fulfill {product}");
     Ok(())
 }
 
@@ -970,7 +972,12 @@ impl Runner {
             outbox_dir: dir.join("outbox"),
         };
         Ok(match self.dispatch(record, &*driver, &brief).await {
-            Ok(_) => Event::DraftingFinished { error: None },
+            Ok(_) => {
+                // Crash seam for the Phase-A tamper drill: the worker is
+                // gone (group killed), the byte-verify has not run yet.
+                fault_point("post-drafting");
+                Event::DraftingFinished { error: None }
+            }
             Err(err) => Event::DraftingFinished { error: Some(err) },
         })
     }
