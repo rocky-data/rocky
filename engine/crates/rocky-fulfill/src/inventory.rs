@@ -19,8 +19,29 @@ use std::path::{Path, PathBuf};
 /// source, as written. Additions are DELIBERATE diffs: call them out in
 /// the PR, and justify each one against the fulfill_api façade rule.
 const CONSUMED_ENGINE_PATHS: &[&str] = &[
-    // The façade — the loop's ONLY rocky-cli entries.
+    // The façade — the loop's ONLY rocky-cli entries, at SYMBOL
+    // granularity: consuming a new façade item is a golden diff.
     "rocky_cli::commands::fulfill_api",
+    "rocky_cli::commands::fulfill_api::FulfillOutput",
+    "rocky_cli::commands::fulfill_api::PolicyRefusal",
+    "rocky_cli::commands::fulfill_api::ProductBinding",
+    "rocky_cli::commands::fulfill_api::ProposeOutcome",
+    "rocky_cli::commands::fulfill_api::ProposeRequest",
+    "rocky_cli::commands::fulfill_api::ReceiptLookup",
+    "rocky_cli::commands::fulfill_api::TypedApplyOutcome",
+    "rocky_cli::commands::fulfill_api::VerifyStatus",
+    "rocky_cli::commands::fulfill_api::apply_plan",
+    "rocky_cli::commands::fulfill_api::compile_output",
+    "rocky_cli::commands::fulfill_api::compute_review_status",
+    "rocky_cli::commands::fulfill_api::lookup_apply_receipt",
+    "rocky_cli::commands::fulfill_api::observe_max_time_column",
+    "rocky_cli::commands::fulfill_api::print_json",
+    "rocky_cli::commands::fulfill_api::product_approve",
+    "rocky_cli::commands::fulfill_api::product_compile",
+    "rocky_cli::commands::fulfill_api::product_status",
+    "rocky_cli::commands::fulfill_api::product_verify",
+    "rocky_cli::commands::fulfill_api::propose_governed_run_plan",
+    "rocky_cli::commands::fulfill_api::test_output",
     // Config vocabulary (the [fulfill] block + the apply principal).
     "rocky_core::config::FulfillDriverConfig",
     "rocky_core::config::PolicyPrincipal",
@@ -84,6 +105,36 @@ fn consumed_paths() -> BTreeSet<String> {
     found
 }
 
+/// Alias shapes that would let engine paths hide from the golden:
+/// a bare `rocky_cli` / `rocky_core` token not followed by `::`
+/// (`use rocky_cli as cli;`, a re-export, a bare crate reference) or a
+/// ` as ` rename inside a rocky use-group (`{self as x}`). Any hit is a
+/// violation outright — the inventory only stays honest if the crates
+/// are always named in full.
+fn alias_violations(text: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let bytes = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for token in ["rocky_cli", "rocky_core"] {
+        let mut from = 0;
+        while let Some(offset) = text[from..].find(token) {
+            let start = from + offset;
+            let end = start + token.len();
+            let bounded = (start == 0 || !is_ident(bytes[start - 1]))
+                && (end == bytes.len() || !is_ident(bytes[end]));
+            if bounded && !text[end..].starts_with("::") {
+                violations.push(format!(
+                    "bare `{token}` (alias/rename/re-export?) at byte {start}: \
+                     `{}`",
+                    text[start..].lines().next().unwrap_or("")
+                ));
+            }
+            from = end;
+        }
+    }
+    violations
+}
+
 fn collect_from(text: &str, found: &mut BTreeSet<String>) {
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -91,9 +142,17 @@ fn collect_from(text: &str, found: &mut BTreeSet<String>) {
         .find("rocky_cli::")
         .into_iter()
         .chain(text[i..].find("rocky_core::"))
+        .chain(text[i..].find("fulfill_api::"))
         .min()
     {
         let start = i + offset;
+        // A qualified `…::fulfill_api::x` is handled when the full path
+        // is consumed below; only a MODULE-LOCAL `fulfill_api::x` use
+        // (no crate prefix) starts here.
+        if text[..start].ends_with("::") {
+            i = start + 1;
+            continue;
+        }
         // Consume the plain `a::b::c` path.
         let mut end = start;
         while end < bytes.len() {
@@ -106,43 +165,117 @@ fn collect_from(text: &str, found: &mut BTreeSet<String>) {
                 break;
             }
         }
-        let mut base = text[start..end].trim_end_matches("::").to_string();
-        // A `use base::{A, B as X, C::D}` group: expand one level. A
-        // façade-module group still collapses onto the module — the
-        // golden pins the DOOR, not each handle on it.
+        let base = normalize(text[start..end].trim_end_matches("::"));
+        // A `use base::{A, B as X, C::D}` group: expand one level, at
+        // SYMBOL granularity — façade items included, so a NEW façade
+        // consumption is a golden diff. A rename inside the group is an
+        // alias violation, reported via `alias_violations`-style text.
         if bytes.get(end) == Some(&b'{') {
             let close = text[end..].find('}').map(|c| end + c);
             if let Some(close) = close {
-                if base == "rocky_cli::commands::fulfill_api"
-                    || base.starts_with("rocky_cli::commands::fulfill_api::")
-                {
-                    found.insert("rocky_cli::commands::fulfill_api".to_string());
-                } else {
-                    for item in text[end + 1..close].split(',') {
-                        let item = item.trim();
-                        if item.is_empty() {
-                            continue;
-                        }
-                        let item = item.split_whitespace().next().unwrap_or(item);
-                        if item == "self" {
-                            found.insert(base.clone());
-                        } else {
-                            found.insert(format!("{base}::{item}"));
-                        }
+                for item in text[end + 1..close].split(',') {
+                    let item = item.trim();
+                    if item.is_empty() {
+                        continue;
+                    }
+                    assert!(
+                        !item.contains(" as "),
+                        "use-group rename `{item}` hides a path from the golden — name \
+                         engine items in full"
+                    );
+                    let item = item.split_whitespace().next().unwrap_or(item);
+                    if item == "self" {
+                        found.insert(base.clone());
+                    } else {
+                        found.insert(normalize(&format!("{base}::{item}")));
                     }
                 }
                 i = close + 1;
                 continue;
             }
         }
-        // `rocky_cli::commands::fulfill_api::foo` collapses onto the
-        // façade module: the golden pins the MODULE as the entry, and
-        // itemized façade symbols would double-count the same door.
-        if base.starts_with("rocky_cli::commands::fulfill_api::") {
-            base = "rocky_cli::commands::fulfill_api".to_string();
-        }
         found.insert(base);
         i = end;
+    }
+}
+
+/// Canonical golden spelling: module-local `fulfill_api::X` and the
+/// fully-qualified spelling pin identically, and a path deeper than one
+/// item past the façade (`fulfill_api::ProposeOutcome::Written`) pins
+/// its first item — the SYMBOL is the unit, variants ride their type.
+fn normalize(path: &str) -> String {
+    let path = if let Some(rest) = path.strip_prefix("fulfill_api::") {
+        format!("rocky_cli::commands::fulfill_api::{rest}")
+    } else if path == "fulfill_api" {
+        "rocky_cli::commands::fulfill_api".to_string()
+    } else {
+        path.to_string()
+    };
+    if let Some(rest) = path.strip_prefix("rocky_cli::commands::fulfill_api::") {
+        let first = rest.split("::").next().unwrap_or(rest);
+        return format!("rocky_cli::commands::fulfill_api::{first}");
+    }
+    path
+}
+
+/// Whether `text` calls `ident` as a function, tolerating any
+/// whitespace between the identifier and its `(` — `apply_plan (`,
+/// `apply_plan\n(`, and the plain spelling all match; identifier
+/// boundaries keep `x_apply_plan(` out.
+fn calls_identifier(text: &str, ident: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(ident) {
+        let start = from + offset;
+        let end = start + ident.len();
+        let bounded = (start == 0 || !is_ident(bytes[start - 1]))
+            && (end == bytes.len() || !is_ident(bytes[end]));
+        if bounded {
+            let mut rest = end;
+            while rest < bytes.len() && (bytes[rest] as char).is_whitespace() {
+                rest += 1;
+            }
+            if bytes.get(rest) == Some(&b'(') {
+                return true;
+            }
+        }
+        from = end;
+    }
+    false
+}
+
+/// Whether `text` names any identifier that STARTS with `prefix` at an
+/// identifier start boundary (`write_plan`, `write_plan_governed`,
+/// `write_plan_with_principal`, …) — call or path mention alike.
+fn names_identifier_prefix(text: &str, prefix: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(prefix) {
+        let start = from + offset;
+        if start == 0 || !is_ident(bytes[start - 1]) {
+            return true;
+        }
+        from = start + prefix.len();
+    }
+    false
+}
+
+/// Alias shapes hide paths from the golden — none may exist anywhere
+/// in the crate (comments included: a commented alias is a recipe).
+#[test]
+fn no_engine_crate_is_aliased_or_bare() {
+    for (path, text) in crate_sources() {
+        if path.ends_with("inventory.rs") {
+            continue;
+        }
+        let violations = alias_violations(&text);
+        assert!(
+            violations.is_empty(),
+            "{}: {violations:?}",
+            path.display()
+        );
     }
 }
 
@@ -182,8 +315,9 @@ fn grep_gates_hold() {
             "{rendered}: the loop never names (let alone writes) a review marker file"
         );
         assert!(
-            !text.contains("write_plan_governed") && !text.contains("write_plan("),
-            "{rendered}: plans are written ONLY inside the shared governed propose helper"
+            !names_identifier_prefix(&text, "write_plan"),
+            "{rendered}: plans are written ONLY inside the shared governed propose helper \
+             (no write_plan* identifier may even be named here)"
         );
     }
 }
@@ -197,7 +331,7 @@ fn apply_is_invoked_from_exactly_one_module() {
         if path.ends_with("inventory.rs") {
             continue;
         }
-        if text.contains("apply_plan(") {
+        if calls_identifier(&text, "apply_plan") {
             callers.push(
                 path.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
