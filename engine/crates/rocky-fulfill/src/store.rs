@@ -450,3 +450,165 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+    use rocky_core::fulfill::FulfillState;
+
+    fn driver(dir: &Path) -> StoreDriver {
+        StoreDriver::open(&dir.join("state.redb"), "revenue_daily").expect("bind")
+    }
+
+    #[test]
+    fn acquire_claims_then_release_clears_the_stamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = driver(dir.path());
+        let me = self_identity().expect("identity");
+        let now = chrono::Utc::now();
+
+        // Fresh product: claim inserts init with our stamp.
+        let Acquired::Owned(record) = store.acquire(me, now).expect("acquire") else {
+            panic!("expected Owned");
+        };
+        assert_eq!(record.state, FulfillState::Init);
+        assert_eq!(record.owner_pid, Some(me.pid));
+        assert_eq!(record.journal_seq, 1, "the claim journaled");
+
+        // Release clears the stamp; the next acquire claims immediately
+        // (no grace) — the crash-free path never waits.
+        let released = store.release(&record, now).expect("release");
+        assert!(released.owner_pid.is_none());
+        let Acquired::Owned(again) = store.acquire(me, now).expect("re-acquire") else {
+            panic!("expected Owned");
+        };
+        assert_eq!(again.owner_pid, Some(me.pid));
+
+        // Same-process re-entry while stamped: AlreadyOwned, no write.
+        let before = store.journal().expect("journal").len();
+        let Acquired::Owned(_) = store.acquire(me, now).expect("acquire") else {
+            panic!("expected Owned");
+        };
+        assert_eq!(
+            store.journal().expect("journal").len(),
+            before,
+            "AlreadyOwned writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_lost_transition_stops_cleanly_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = driver(dir.path());
+        let me = self_identity().expect("identity");
+        let now = chrono::Utc::now();
+        let Acquired::Owned(record) = store.acquire(me, now).expect("acquire") else {
+            panic!("expected Owned");
+        };
+
+        // Another process moves the record between our read and write.
+        let mut moved = record.clone();
+        moved.state = FulfillState::SpecApproved;
+        let Applied::Won(_) = store
+            .transition(Some(&record), &moved, "foreign move", now)
+            .expect("foreign wins")
+        else {
+            panic!("foreign CAS should win");
+        };
+
+        // Our CAS against the stale prior loses; the winner is named;
+        // nothing of ours is journaled.
+        let rows_before = store.journal().expect("journal").len();
+        let mut ours = record.clone();
+        ours.state = FulfillState::Elicited;
+        let Applied::Lost { winner } = store
+            .transition(Some(&record), &ours, "our move", now)
+            .expect("cas answers")
+        else {
+            panic!("expected Lost");
+        };
+        let message = lost_message(&winner);
+        assert!(message.contains("spec_approved"), "{message}");
+        assert_eq!(store.journal().expect("journal").len(), rows_before);
+    }
+
+    #[test]
+    fn a_dead_owner_is_taken_over_immediately_through_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = driver(dir.path());
+        let now = chrono::Utc::now();
+
+        // Seed a record owned by a process that is now dead: spawn one,
+        // record its REAL identity, let it exit.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let dead_pid = child.id();
+        // The start time must be read BEFORE exit to be authentic; a
+        // dead-probe answers None, so fall back to a sentinel that can
+        // never match a live reuse.
+        let dead_start = process_liveness(dead_pid).ok().flatten().unwrap_or(1);
+        child.wait().expect("reap");
+
+        let mut record = rocky_core::fulfill::FulfillStateRecord::new(
+            FulfillState::Proposed,
+            "product:revenue_daily".to_string(),
+            None,
+            None,
+        );
+        record.owner_pid = Some(dead_pid);
+        record.owner_start_time = Some(dead_start);
+        let Applied::Won(_) = store
+            .transition(None, &record, "seeded dead owner", now)
+            .expect("seed")
+        else {
+            panic!("seed should win");
+        };
+
+        let me = self_identity().expect("identity");
+        let Acquired::Owned(taken) = store.acquire(me, now).expect("acquire") else {
+            panic!("a definitively dead owner is taken over immediately");
+        };
+        assert_eq!(taken.owner_pid, Some(me.pid));
+        assert_eq!(taken.state, FulfillState::Proposed, "state untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_owner_stands_the_acquire_down_without_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = driver(dir.path());
+        let now = chrono::Utc::now();
+
+        let mut sleeper = std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .expect("sleeper");
+        let pid = sleeper.id();
+        let start = process_liveness(pid).expect("probe").expect("alive");
+
+        let mut record = rocky_core::fulfill::FulfillStateRecord::new(
+            FulfillState::Drafting,
+            "product:revenue_daily".to_string(),
+            None,
+            None,
+        );
+        record.owner_pid = Some(pid);
+        record.owner_start_time = Some(start);
+        store
+            .transition(None, &record, "seeded live owner", now)
+            .expect("seed");
+
+        let me = self_identity().expect("identity");
+        let rows_before = store.journal().expect("journal").len();
+        let Acquired::Stopped(message) = store.acquire(me, now).expect("acquire") else {
+            panic!("a live owner must stand the acquire down");
+        };
+        assert!(message.contains(&pid.to_string()), "{message}");
+        assert_eq!(store.journal().expect("journal").len(), rows_before);
+
+        sleeper.kill().expect("kill");
+        sleeper.wait().expect("reap");
+    }
+}
