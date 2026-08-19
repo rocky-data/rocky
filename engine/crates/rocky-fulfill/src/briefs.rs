@@ -136,15 +136,13 @@ pub fn load_template(
     let template = match briefs_dir {
         Some(dir) => {
             let rel = format!("{}/{}.md", dir.display(), kind.as_str());
-            let candidate =
-                rocky_core::product::commit::contained_write_target(project_root, &rel).map_err(
-                    |err| {
-                        anyhow::anyhow!(
-                            "[fulfill] briefs_dir is not a contained project path: {err} — \
+            let candidate = rocky_core::product::commit::contained_write_target(project_root, &rel)
+                .map_err(|err| {
+                    anyhow::anyhow!(
+                        "[fulfill] briefs_dir is not a contained project path: {err} — \
                              briefs_dir must be a plain relative directory inside the project"
-                        )
-                    },
-                )?;
+                    )
+                })?;
             if candidate.exists() {
                 std::fs::read_to_string(&candidate).with_context(|| {
                     format!("failed to read brief override {}", candidate.display())

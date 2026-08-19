@@ -17,7 +17,7 @@ rocky fulfill <product>
    └─ digest-gated apply ─▶ observe (tests + freshness)
 ```
 
-Every stop prints the state, why the loop stopped, and the next command. Exit codes: `0` clean stop (including a waiting ask and `observing`) · `1` parked at `applying_unknown` for a human · `2` blocked.
+Every stop prints the state, why the loop stopped, and the next command. Exit codes: `0` clean stop (including a waiting ask and `observing`) · `2` blocked · `3` parked at `applying_unknown` for a human. `1` stays the generic command-error code, so a script can tell a parked receipt from a crashed command.
 
 ---
 

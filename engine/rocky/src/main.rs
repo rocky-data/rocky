@@ -565,8 +565,9 @@ enum Command {
     /// propose → human review → digest-gated apply → observe — and
     /// every stop prints the state, why it stopped, and the exact next
     /// command. Exit codes: 0 = clean stop (including a `needs_input`
-    /// ask and `observing`), 1 = parked at `applying_unknown` for a
-    /// human, 2 = `blocked`.
+    /// ask and `observing`), 2 = `blocked`, 3 = parked at
+    /// `applying_unknown` for a human (distinct from the generic error
+    /// exit 1, so scripts can tell the two apart).
     ///
     /// `rocky fulfill approve-spec <product>` is the same authority
     /// transition as `rocky product approve` — one implementation, two

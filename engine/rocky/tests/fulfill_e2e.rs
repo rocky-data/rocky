@@ -504,7 +504,13 @@ fn phase_a_tamper_blocks_at_the_byte_verify() {
         Some("drafting"),
         "tamper was caught in the drafting window (the merged precondition)"
     );
-    for never in ["merged", "verifying", "proposed", "plan_approved", "applying"] {
+    for never in [
+        "merged",
+        "verifying",
+        "proposed",
+        "plan_approved",
+        "applying",
+    ] {
         assert!(
             !rows.iter().any(|r| r.to_state == never),
             "'{never}' must never be reached after a Phase-A tamper: {rows:?}"
@@ -643,7 +649,7 @@ fn applying_unknown_receipt_arms_park_on_in_flight_and_resolve_on_success() {
     drop(store);
 
     let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
-    assert_eq!(code, 1, "parked at applying_unknown exits 1");
+    assert_eq!(code, 3, "parked at applying_unknown exits 3");
     let json = json.expect("json");
     assert_eq!(json["state"], "applying_unknown", "{json}");
     assert!(

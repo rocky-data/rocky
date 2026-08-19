@@ -79,8 +79,11 @@ pub fn run_fulfill_approve_spec(
 
 /// `rocky fulfill <product>` — drive the reconciler one invocation
 /// forward. Exit codes: 0 = advanced to a clean stop (including
-/// `needs_input` asks and `observing`), 1 = parked at
-/// `applying_unknown` for a human, 2 = `blocked`.
+/// `needs_input` asks and `observing`), 2 = `blocked`, 3 = parked at
+/// `applying_unknown` for a human. 3 is deliberate: 1 is the CLI's
+/// generic-error code, and a caller scripting the loop must be able to
+/// tell "a human must resolve the receipt" from "the command fell
+/// over".
 pub async fn run_fulfill(
     config_path: &Path,
     state_path: &Path,
@@ -152,7 +155,7 @@ pub async fn run_fulfill(
     }
     match &released.state {
         FulfillState::Blocked { .. } => std::process::exit(2),
-        FulfillState::ApplyingUnknown => std::process::exit(1),
+        FulfillState::ApplyingUnknown => std::process::exit(3),
         _ => Ok(()),
     }
 }

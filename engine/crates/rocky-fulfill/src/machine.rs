@@ -113,6 +113,42 @@ pub enum OwnershipDecision {
 ///
 /// `liveness` is the probe result for the RECORDED owner and must be
 /// `None` exactly when the record carries no owner stamp.
+///
+/// # Takeover coexistence — the fenced-or-idempotent invariant
+///
+/// A grace takeover (an ALIVE but unprobeable owner outlives the grace)
+/// creates a window where the old loop may still complete an in-flight
+/// side effect before its next CAS loses. Every side-effect class it
+/// can produce in that window is covered, and none of the coverage
+/// depends on the liveness probe being right:
+///
+/// - **State/journal writes** — every write is CAS-on-observed-prior;
+///   the takeover moved the record, so the old owner's next write LOSES
+///   and it stands down. Fenced.
+/// - **A propose completing late** — the plan file persists, but the
+///   old owner cannot journal `proposed` (its CAS loses), the loop
+///   never applies a plan it did not pin, and an orphaned plan reaches
+///   the warehouse only through the engine's own marker + digest gates.
+///   Worst case: one extra never-approved plan in the review queue.
+/// - **An apply completing late** — the warehouse write rides the
+///   idempotency key pinned on the SHARED record lineage. The new owner
+///   resumes `applying` as `applying_unknown` and asks the
+///   authoritative receipt: a live claim PARKS it; a completed one
+///   resolves to `applied` without re-running. Keyed + receipt-resolved
+///   (both arms integration-proven).
+/// - **A candidate write completing late** — tmp+rename, last writer
+///   wins, and the candidate is untrusted-by-definition until
+///   `approve-spec` digests the bytes it is approving and prints that
+///   digest; the approval CAS names one winner. Detected at the next
+///   authority transition.
+/// - **The old worker group** — the taken-over record carries
+///   `driver_pgid` + leader start time; the new owner sweeps a
+///   still-live group before dispatching its own worker.
+/// - **Transcripts / outbox files** — advisory: no gate ever trusts
+///   them, and elicitation bytes are digest-checked on hand-off.
+///
+/// Anything outside these classes is a NEW cross-domain boundary and
+/// must state its own protocol before it lands (the E12 rule).
 pub fn decide_ownership(
     observed: Option<&FulfillStateRecord>,
     liveness: Option<&OwnerLiveness>,
@@ -599,12 +635,7 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
             }
             Event::CandidateSurface {
                 candidate_digest: None,
-            } => dispatch_elicitation(
-                observed,
-                &product,
-                "elicitation attempts exhausted",
-                now,
-            ),
+            } => dispatch_elicitation(observed, &product, "elicitation attempts exhausted", now),
             Event::ElicitationFinished {
                 written_digest: Some(digest),
                 questions,
@@ -1921,7 +1952,9 @@ mod tests {
                 now(),
             );
             match d {
-                Decision::AdvanceAndAct { record: next, task, .. } => {
+                Decision::AdvanceAndAct {
+                    record: next, task, ..
+                } => {
                     assert_eq!(task, TaskKind::Elicit);
                     dispatches += 1;
                     record = next;

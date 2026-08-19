@@ -983,7 +983,10 @@ mod supervision_tests {
         let (pgid, _) = stamp.expect("the callback fired");
         match outcome {
             Err(DriverError::Spawn(message)) => {
-                assert!(message.contains("the CAS under the stamp was lost"), "{message}");
+                assert!(
+                    message.contains("the CAS under the stamp was lost"),
+                    "{message}"
+                );
             }
             other => panic!("expected the stamp failure surfaced, got {other:?}"),
         }

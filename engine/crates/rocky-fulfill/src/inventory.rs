@@ -271,11 +271,7 @@ fn no_engine_crate_is_aliased_or_bare() {
             continue;
         }
         let violations = alias_violations(&text);
-        assert!(
-            violations.is_empty(),
-            "{}: {violations:?}",
-            path.display()
-        );
+        assert!(violations.is_empty(), "{}: {violations:?}", path.display());
     }
 }
 
