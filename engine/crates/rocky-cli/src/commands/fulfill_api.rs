@@ -20,12 +20,22 @@ use crate::output::RunPlan;
 use crate::plan_store::PlanKind;
 
 pub use crate::commands::apply::ApplyOutcome as TypedApplyOutcome;
+// The runner's OWN verification oracles at `verifying` — already-pub
+// engine surfaces, re-exported so the loop's whole engine surface stays
+// this one module.
+pub use crate::commands::compile::compile_output;
 pub use crate::commands::product::{
     ProductApproveOutput, ProductCompileOutput, ProductStatusOutput, ProductVerifyOutput,
     VerifyStatus,
 };
-pub use crate::commands::review::run_review_status;
+// The typed review-marker oracle the loop polls (`run_review_status` is
+// its printing CLI shell).
+pub use crate::commands::review::{compute_review_status, run_review_status};
 pub use crate::commands::run::RunTermination;
+#[cfg(feature = "duckdb")]
+pub use crate::commands::test::test_output;
+// The loop's stop report (registered in export-schemas as `fulfill`).
+pub use crate::output::FulfillOutput;
 
 // ---------------------------------------------------------------------------
 // The governed propose helper (one gate sequence, two consumers)

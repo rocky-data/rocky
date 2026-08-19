@@ -4234,6 +4234,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocky-fulfill"
+version = "1.71.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "libc",
+ "rocky-cli",
+ "rocky-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rocky-iceberg"
 version = "1.71.0"
 dependencies = [

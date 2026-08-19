@@ -1,0 +1,41 @@
+[package]
+name = "rocky-fulfill"
+version = "1.71.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Fulfillment reconciler: drives a product spec from elicitation to an applied plan under human approval gates, via a subprocess agent driver."
+
+[lints]
+workspace = true
+
+[features]
+default = ["duckdb"]
+# Forwards rocky-cli's DuckDB-backed local surfaces (`rocky test`, the
+# observation query path). Without it the step function refuses the
+# verifying gate with a typed error instead of silently skipping it.
+duckdb = ["rocky-cli/duckdb"]
+
+[dependencies]
+# The loop consumes rocky-cli EXCLUSIVELY through its `commands::fulfill_api`
+# façade — the route-inventory golden in `src/inventory.rs` pins every
+# consumed path. Default features off so the binary crate stays the single
+# place deciding the feature set (mirrors its own rocky-cli dependency).
+rocky-cli = { path = "../rocky-cli", default-features = false }
+rocky-core = { path = "../rocky-core" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

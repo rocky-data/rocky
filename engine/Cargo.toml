@@ -16,6 +16,7 @@ members = [
     "crates/rocky-bigquery",
     "crates/rocky-databricks",
     "crates/rocky-fivetran",
+    "crates/rocky-fulfill",
     "crates/rocky-airbyte",
     "crates/rocky-iceberg",
     "crates/rocky-catalog-core",

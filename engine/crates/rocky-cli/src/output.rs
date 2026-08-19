@@ -7053,6 +7053,34 @@ pub struct ReviewStatusOutput {
     pub spec_digest: Option<String>,
 }
 
+/// JSON output of `rocky fulfill <product>` — the reconciler's stop
+/// report: how far the loop advanced, why it stopped, and the exact
+/// next command when one exists.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct FulfillOutput {
+    pub version: String,
+    /// Always `"fulfill"`.
+    pub command: String,
+    /// The product name the loop was asked to drive.
+    pub product: String,
+    /// `product:<name>`.
+    pub product_id: String,
+    /// The state the record was left in (its wire tag, e.g.
+    /// `"needs_input"`, `"proposed"`, `"observing"`, `"blocked"`).
+    pub state: String,
+    /// Why the loop stopped, in plain language.
+    pub message: String,
+    /// The exact command that unblocks it, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_command: Option<String>,
+    /// The approved spec digest the state was reached under, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_digest: Option<String>,
+    /// The pinned plan, while one is in flight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+}
+
 /// JSON output for `rocky review <plan-id>`.
 ///
 /// `rocky review` is the human sign-off gate for an AI-authored plan. It
