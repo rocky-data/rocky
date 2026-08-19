@@ -12,16 +12,26 @@ Source list: `uv run pytest --collect-only -q` in that worktree.
 | Module | Python nodes | MAPPED | DEFERRED-PART2 | DISSOLVED |
 |---|---|---|---|---|
 | `spec/parse.py` | 53 | 53 | 0 | 0 |
-| `spec/lower.py` | 50 | 22 | 28 | 0 |
+| `spec/lower.py` | 50 | 50 | 0 | 0 |
 | `spec/manifest.py` | 12 | 12 | 0 | 0 |
-| `spec/verify.py` | pending (part 2) | — | — | — |
-| **Total so far** | **115** | **87** | **28** | **0** |
+| `spec/verify.py` | 49 | 34 | 0 | 15 |
+| `tests/test_evaluator.py` | 23 | 1 | 0 | 22 |
+| `tests/test_seam.py` | 7 | 0 | 0 | 7 |
+| `tests/test_integration_binary.py` | 5 | 2 | 0 | 3 |
+| **Total** | **199** | **152** | **0** | **47** |
 
-`DEFERRED-PART2` here is exactly one thing: the filesystem half of
+Every DISSOLVED row carries its justification inline; the dominant
+pattern is one thing said three ways: the Python mirror (evaluator,
+window grammar, engine confirmation, seam pairing) is deleted, and the
+engine surface it mirrored is the single implementation with its own
+suite. Two dissolutions were only honest after ADDING the missing engine
+pin (the tie-break test and the policy-check existence test) — noted on
+their rows.
+
+Nothing remains deferred: part 2 ported the filesystem half of
 `spec/lower.py` — staged writes, the staging journal, crash recovery, and the
-two orchestrators (`run_phase_a` / `run_phase_b`) that drive them. The port so
-far is the pure half. No lowering node is deferred for any other reason, and
-none is dissolved.
+two orchestrators (`run_phase_a` / `run_phase_b`) — into
+`rocky-core/src/product/commit.rs`. No lowering node is dissolved.
 
 ## `spec/parse.py` -> `rocky-core/src/product/spec.rs`
 
@@ -126,34 +136,34 @@ authority, not the name similarity.
 | `test_merge_fills_intent_only_when_absent` | MAPPED | `product::lowering::tests::the_merge_fills_intent_only_when_it_is_absent` |
 | `test_merge_rejects_unparseable_sidecar_naming_the_path` | MAPPED | `product::lowering::tests::the_merge_rejects_an_unparseable_sidecar_naming_the_path` |
 | `test_worker_test_identical_to_generated_is_absorbed_once` | MAPPED | `product::lowering::tests::a_worker_test_identical_to_a_generated_one_is_absorbed_once` |
-| `test_phase_a_refuses_cold_start_over_existing_model_files` | DEFERRED-PART2 | `run_phase_a` collision check — filesystem |
-| `test_phase_a_resumes_over_its_own_committed_lowering` | DEFERRED-PART2 | `run_phase_a` resume — reads the committed manifest |
-| `test_phase_b_requires_phase_a` | DEFERRED-PART2 | `run_phase_b` precondition — filesystem |
-| `test_phase_b_requires_the_drafted_sidecar` | DEFERRED-PART2 | `run_phase_b` precondition — filesystem |
-| `test_phase_b_refuses_after_a_spec_edit_supersedes_phase_a` | DEFERRED-PART2 | the orchestrated form; the pure boundary is MAPPED above |
-| `test_phase_b_refuses_a_foreign_generation_identity` | DEFERRED-PART2 | the orchestrated form; the pure boundary is MAPPED above |
-| `test_phase_b_detects_phase_a_tampering` | DEFERRED-PART2 | byte-verification against disk inside `run_phase_b` |
-| `test_full_two_phase_flow_commits_everything` | DEFERRED-PART2 | commit protocol |
-| `test_crash_between_staged_renames_rolls_back\[2\]` | DEFERRED-PART2 | recovery drill |
-| `test_crash_between_staged_renames_rolls_back\[3\]` | DEFERRED-PART2 | recovery drill |
-| `test_crash_before_journal_leaves_priors_untouched` | DEFERRED-PART2 | recovery drill |
-| `test_recovery_is_idempotent` | DEFERRED-PART2 | recovery drill |
-| `test_crash_after_commit_marker_rolls_forward` | DEFERRED-PART2 | recovery drill |
-| `test_forged_journal_with_traversal_path_is_refused_and_target_untouched` | DEFERRED-PART2 | journal containment |
-| `test_symlink_at_an_allowed_final_path_is_refused_and_target_untouched` | DEFERRED-PART2 | journal containment |
-| `test_symlinked_staging_residue_is_refused_before_any_mutation` | DEFERRED-PART2 | journal containment |
-| `test_forged_journal_with_absolute_path_is_refused` | DEFERRED-PART2 | journal containment |
-| `test_forged_journal_with_symlink_escape_is_refused` | DEFERRED-PART2 | journal containment |
-| `test_forged_journal_entry_outside_the_generation_namespace_is_refused` | DEFERRED-PART2 | journal authority |
-| `test_journal_entry_naming_the_journal_itself_is_refused` | DEFERRED-PART2 | journal authority |
-| `test_journal_entry_naming_a_foreign_manifest_path_is_refused` | DEFERRED-PART2 | journal authority |
-| `test_case_aliased_duplicate_finals_are_refused` | DEFERRED-PART2 | journal authority |
-| `test_forged_staged_manifest_grants_no_recovery_authority` | DEFERRED-PART2 | journal authority |
-| `test_contained_final_path_returns_the_resolved_absolute` | DEFERRED-PART2 | path-containment helper |
-| `test_malformed_journal_is_refused_without_mutation` | DEFERRED-PART2 | journal parsing |
-| `test_journal_naming_a_foreign_manifest_is_refused` | DEFERRED-PART2 | journal parsing |
-| `test_sigkilled_child_between_staged_renames_rolls_back` | DEFERRED-PART2 | process-death drill |
-| `test_recovery_runs_automatically_on_the_next_phase` | DEFERRED-PART2 | recovery wiring |
+| `test_phase_a_refuses_cold_start_over_existing_model_files` | MAPPED | `product::commit::tests::phase_a_refuses_cold_start_over_existing_model_files` |
+| `test_phase_a_resumes_over_its_own_committed_lowering` | MAPPED | `product::commit::tests::phase_a_resumes_over_its_own_committed_lowering` |
+| `test_phase_b_requires_phase_a` | MAPPED | `product::commit::tests::phase_b_requires_phase_a` |
+| `test_phase_b_requires_the_drafted_sidecar` | MAPPED | `product::commit::tests::phase_b_requires_the_drafted_sidecar` |
+| `test_phase_b_refuses_after_a_spec_edit_supersedes_phase_a` | MAPPED | `product::commit::tests::phase_b_refuses_after_a_spec_edit_supersedes_phase_a` |
+| `test_phase_b_refuses_a_foreign_generation_identity` | MAPPED | `product::commit::tests::phase_b_refuses_a_foreign_generation_identity` |
+| `test_phase_b_detects_phase_a_tampering` | MAPPED | `product::commit::tests::phase_b_detects_phase_a_tampering` |
+| `test_full_two_phase_flow_commits_everything` | MAPPED | `product::commit::tests::full_two_phase_flow_commits_everything` |
+| `test_crash_between_staged_renames_rolls_back\[2\]` | MAPPED | `product::commit::tests::crash_between_staged_renames_rolls_back (both bomb positions in one loop)` |
+| `test_crash_between_staged_renames_rolls_back\[3\]` | MAPPED | `product::commit::tests::crash_between_staged_renames_rolls_back (both bomb positions in one loop)` |
+| `test_crash_before_journal_leaves_priors_untouched` | MAPPED | `product::commit::tests::crash_before_journal_leaves_priors_untouched` |
+| `test_recovery_is_idempotent` | MAPPED | `product::commit::tests::recovery_is_idempotent` |
+| `test_crash_after_commit_marker_rolls_forward` | MAPPED | `product::commit::tests::crash_after_commit_marker_rolls_forward` |
+| `test_forged_journal_with_traversal_path_is_refused_and_target_untouched` | MAPPED | `product::commit::tests::forged_journal_with_traversal_path_is_refused_and_target_untouched` |
+| `test_symlink_at_an_allowed_final_path_is_refused_and_target_untouched` | MAPPED | `product::commit::tests::symlink_at_an_allowed_final_path_is_refused_and_target_untouched` |
+| `test_symlinked_staging_residue_is_refused_before_any_mutation` | MAPPED | `product::commit::tests::symlinked_staging_residue_is_refused_before_any_mutation` |
+| `test_forged_journal_with_absolute_path_is_refused` | MAPPED | `product::commit::tests::forged_journal_with_absolute_path_is_refused` |
+| `test_forged_journal_with_symlink_escape_is_refused` | MAPPED | `product::commit::tests::forged_journal_with_symlink_escape_is_refused` |
+| `test_forged_journal_entry_outside_the_generation_namespace_is_refused` | MAPPED | `product::commit::tests::forged_journal_entry_outside_the_generation_namespace_is_refused` |
+| `test_journal_entry_naming_the_journal_itself_is_refused` | MAPPED | `product::commit::tests::journal_entry_naming_the_journal_itself_is_refused` |
+| `test_journal_entry_naming_a_foreign_manifest_path_is_refused` | MAPPED | `product::commit::tests::journal_entry_naming_a_foreign_manifest_path_is_refused` |
+| `test_case_aliased_duplicate_finals_are_refused` | MAPPED | `product::commit::tests::case_aliased_duplicate_finals_are_refused` |
+| `test_forged_staged_manifest_grants_no_recovery_authority` | MAPPED | `product::commit::tests::forged_staged_manifest_grants_no_recovery_authority` |
+| `test_contained_final_path_returns_the_resolved_absolute` | MAPPED | `product::commit::tests::contained_final_path_returns_the_resolved_absolute` |
+| `test_malformed_journal_is_refused_without_mutation` | MAPPED | `product::commit::tests::malformed_journal_is_refused_without_mutation` |
+| `test_journal_naming_a_foreign_manifest_is_refused` | MAPPED | `product::commit::tests::journal_naming_a_foreign_manifest_is_refused` |
+| `test_sigkilled_child_between_staged_renames_rolls_back` | MAPPED | `product::commit::tests::sigkilled_child_between_staged_renames_rolls_back` |
+| `test_recovery_runs_automatically_on_the_next_phase` | MAPPED | `product::commit::tests::recovery_runs_automatically_on_the_next_phase` |
 
 ## `spec/manifest.py` -> `rocky-core/src/product/manifest.rs`
 
@@ -188,11 +198,140 @@ Beyond the parser's own added tests, listed further up.
 | `product::lowering::tests::a_preserved_scalar_survives_and_stays_above_the_tables` | A preserved scalar other than name/intent, which no Python test carried. |
 | `product::lowering::tests::a_nullable_column_gets_no_not_null_test` | Every column in the fixture is non-nullable, so the guard was invisible to the goldens. |
 | `product::lowering::tests::a_freshness_budget_too_wide_for_toml_is_refused` | The added refusal below. |
+| `product::commit::tests::fresh_commit_refuses_a_symlinked_staged_target_and_leaves_it_untouched` (+ `_prev_`, `_journal_temp_`, `a_symlinked_final_is_refused_on_the_fresh_path`) | Hardening beyond the answer key — see divergence 6: the prototype left the fresh commit path unguarded against symlinked write targets. |
+| `product::commit::tests::crash_during_a_cold_phase_a_removes_the_renamed_new_files`, `half_canonical_path_aliases_are_refused_as_unsafe` | Two guards the answer key's tests never reached (mutation-check findings). |
+| `product::commit::tests::crash_during_a_cold_phase_a_removes_the_renamed_new_files` | A mutation pass showed rollback's brand-new-file removal branch was live but unreached: every Phase-B drill replaces files that exist. A cold Phase-A crash is the shape that needs it. |
+| `product::commit::tests::half_canonical_path_aliases_are_refused_as_unsafe` | A mutation pass showed the canonical-spelling gate was unpinned: `a//b`-style aliases normalize inside `Path::components` and would fall through to a different refusal. |
 | `product::manifest::tests::the_instance_walk_covers_every_row_the_schema_declares` | The mechanization the answer key lacks — see divergence 6. |
 | `product::manifest::tests::json_escapes_everything_outside_printable_ascii` | The hand-written JSON writer's escaping, including surrogate pairs. |
 | `product::manifest::tests::leaf_derivation_recurses_through_a_nested_unit_model` | Unreachable in today's schema, and a hole waiting for the first model that nests another. |
 | `product::manifest::tests::a_ref_to_a_property_less_definition_is_a_leaf_not_a_model` | `FreshnessSpec.severity` is exactly this shape; misreading it would drop the leaf silently. |
 | `product::toml_compat::tests::*` (23 tests) | The compatibility renderer is new Rust code with no Python counterpart to port — the answer key rendered through a library. Its tests pin the layout rules, both string escapers, the document-order recovery, and the column budget, cross-checked case by case against that library's real output. |
+
+
+## `spec/verify.py` -> `rocky-cli/src/commands/product.rs`
+
+The evaluator MIRROR dies in this port: the posture verifier calls the
+engine's own `rocky_core::policy::evaluate`, so every test that pinned the
+mirror's equivalence to the engine dissolves into the engine's own suite,
+and every strict-parsing test dissolves into the engine's serde (the
+refusal becomes a `needs_input` carrying the parse error, pinned per shape
+below). The posture, classification, and collision behaviors port 1:1.
+
+| Python node id | Status | Rust test / reason |
+|---|---|---|
+| `test_paste_block_matches_ff_design_d5_exactly` | MAPPED | `commands::product::tests::paste_block_matches_ff_design_d5_exactly` |
+| `test_absent_policy_block_needs_input_with_paste_block` | MAPPED | `commands::product::tests::absent_policy_block_needs_input_with_paste_block` |
+| `test_bare_default_require_review_block_is_not_a_pass` | MAPPED | `commands::product::tests::bare_default_require_review_block_is_not_a_pass` |
+| `test_full_corrected_block_passes` | MAPPED | `commands::product::tests::full_corrected_block_passes` |
+| `test_explicit_agent_allow_apply_reaching_scope_fails_naming_the_rule` | MAPPED | `commands::product::tests::explicit_agent_allow_apply_reaching_scope_fails_naming_the_rule` |
+| `test_corrected_block_defends_against_a_broader_apply_allow` | MAPPED | `commands::product::tests::corrected_block_defends_against_a_broader_apply_allow` |
+| `test_permissive_default_with_scoped_review_rule_is_rejected` | MAPPED | `commands::product::tests::permissive_default_with_scoped_review_rule_is_rejected` |
+| `test_any_true_propose_allow_is_rejected` | MAPPED | `commands::product::tests::any_true_propose_allow_is_rejected` |
+| `test_broader_glob_propose_allow_is_rejected` | MAPPED | `commands::product::tests::broader_glob_propose_allow_is_rejected` |
+| `test_extra_predicate_on_the_authoring_rule_is_rejected` | MAPPED | `commands::product::tests::extra_predicate_on_the_authoring_rule_is_rejected` |
+| `test_budgeted_exact_propose_allow_is_rejected_naming_the_budget` | MAPPED | `commands::product::tests::budgeted_exact_propose_allow_is_rejected_naming_the_budget` |
+| `test_ceiling_on_the_authoring_rule_fails_closed_via_unproved_reachability` | MAPPED | `commands::product::tests::ceiling_on_the_authoring_rule_fails_closed_via_unproved_reachability` |
+| `test_wrong_policy_version_needs_input` | MAPPED | `commands::product::tests::wrong_policy_version_needs_input` |
+| `test_unknown_policy_key_needs_input` | MAPPED | `commands::product::tests::unknown_policy_key_needs_input` |
+| `test_string_policy_version_is_rejected` | MAPPED | `commands::product::tests::string_policy_version_is_rejected` |
+| `test_negative_policy_version_is_rejected` | MAPPED | `commands::product::tests::negative_policy_version_is_rejected` |
+| `test_integer_where_bool_expected_in_scope_is_rejected` | MAPPED | `commands::product::tests::integer_where_bool_expected_in_scope_is_rejected` |
+| `test_string_budget_failures_is_rejected` | MAPPED | `commands::product::tests::string_budget_failures_is_rejected` |
+| `test_budget_zero_failures_rejected` | MAPPED | `commands::product::tests::budget_zero_failures_rejected` |
+| `test_budget_invalid_window_rejected` | MAPPED | `commands::product::tests::budget_invalid_window_rejected` |
+| `test_valid_budget_is_not_flagged` | MAPPED | `commands::product::tests::valid_budget_is_not_flagged` |
+| `test_missing_config_needs_input` | MAPPED | `commands::product::tests::missing_config_needs_input` |
+| `test_synthetic_post_image_shape` | MAPPED | `commands::product::tests::synthetic_post_image_shape` |
+| `test_posture_evaluates_the_post_image_not_the_pre_image` | MAPPED | `commands::product::tests::posture_evaluates_the_post_image_not_the_pre_image` |
+| `test_unresolved_classification_tag_rejects` | MAPPED | `commands::product::tests::unresolved_classification_tag_rejects` |
+| `test_top_level_mask_strategy_resolves` | MAPPED | `commands::product::tests::top_level_mask_strategy_resolves` |
+| `test_env_override_mask_resolves_without_env_gating` | MAPPED | `commands::product::tests::env_override_mask_resolves_without_env_gating` |
+| `test_allow_unmasked_resolves` | MAPPED | `commands::product::tests::allow_unmasked_resolves` |
+| `test_duplicate_product_name_vs_existing_state_dir_rejects` | MAPPED | `commands::product::tests::duplicate_product_name_vs_existing_state_dir_rejects` |
+| `test_same_spec_path_is_not_a_name_collision` | MAPPED | `commands::product::tests::same_spec_path_is_not_a_name_collision` |
+| `test_duplicate_output_model_across_products_rejects` | MAPPED | `commands::product::tests::duplicate_output_model_across_products_rejects` |
+| `test_distinct_output_models_do_not_collide` | MAPPED | `commands::product::tests::distinct_output_models_do_not_collide` |
+| `test_no_state_dirs_is_clean` | MAPPED | `commands::product::tests::no_state_dirs_is_clean` |
+| `test_collision_check_reads_the_layout_lower_writes` | MAPPED | `commands::product::tests::collision_check_reads_the_layout_lower_writes` |
+| `test_window_grammar_accepts[7d-604800]` | DISSOLVED | the grammar mirror is deleted; the engine's own `parse_window_duration_units_and_rejections` (`rocky-core/src/config.rs`) pins the accept cases the mirror copied |
+| `test_window_grammar_accepts[24h-86400]` | DISSOLVED | the grammar mirror is deleted; the engine's own `parse_window_duration_units_and_rejections` (`rocky-core/src/config.rs`) pins the accept cases the mirror copied |
+| `test_window_grammar_accepts[30D-2592000]` | DISSOLVED | the grammar mirror is deleted; the engine's own `parse_window_duration_units_and_rejections` (`rocky-core/src/config.rs`) pins the accept cases the mirror copied |
+| `test_window_grammar_accepts[1h-3600]` | DISSOLVED | the grammar mirror is deleted; the engine's own `parse_window_duration_units_and_rejections` (`rocky-core/src/config.rs`) pins the accept cases the mirror copied |
+| `test_window_grammar_accepts[ 7d -604800]` | DISSOLVED | the grammar mirror is deleted; the engine's own `parse_window_duration_units_and_rejections` (`rocky-core/src/config.rs`) pins the accept cases the mirror copied |
+| `test_window_grammar_rejects[0d]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[-1d]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[7]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[7w]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[d]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[1.5h]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[7 d]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[\u0667d]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_confirmation_with_nonexistent_binary_blocks_instead_of_crashing` | DISSOLVED | check 3 (engine confirmation by subprocess) collapses: the verifier IS the engine, so there is no second binary whose absence could block |
+
+## `tests/test_evaluator.py` (the evaluator mirror's own suite)
+
+These tests pinned the Python MIRROR's equivalence to the engine
+evaluator — and were copied from the engine's own suite in the first
+place. With the mirror deleted there is one evaluator and one suite; each
+node names its engine pin.
+
+| Python node id | Status | Rust test / reason |
+|---|---|---|
+| `test_read_short_circuits_to_allow_even_with_deny_rule` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::read_short_circuits_to_allow_even_with_deny_rule` — the test the mirror copied — is the single pin |
+| `test_deny_overrides_a_more_specific_allow` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::deny_overrides_a_more_specific_allow` — the test the mirror copied — is the single pin |
+| `test_agent_apply_on_contracted_denied` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::agent_apply_on_contracted_denied` — the test the mirror copied — is the single pin |
+| `test_most_specific_beats_any` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::most_specific_beats_any` — the test the mirror copied — is the single pin |
+| `test_incomparable_rules_pick_most_restrictive` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::incomparable_rules_pick_most_restrictive` — the test the mirror copied — is the single pin |
+| `test_refinement_rule_outranks_bare_verb` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::refinement_rule_outranks_bare_verb` — the test the mirror copied — is the single pin |
+| `test_bare_apply_rule_matches_refinement_input` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::bare_apply_rule_matches_refinement_input` — the test the mirror copied — is the single pin |
+| `test_refinement_rule_does_not_match_other_refinement` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::refinement_rule_does_not_match_other_refinement` — the test the mirror copied — is the single pin |
+| `test_human_never_gated_by_default` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::human_never_gated_by_default` — the test the mirror copied — is the single pin |
+| `test_agent_default_posture_uses_default_agent_effect` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::agent_default_posture_uses_default_agent_effect` — the test the mirror copied — is the single pin |
+| `test_principal_mismatch_does_not_match` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::principal_mismatch_does_not_match` — the test the mirror copied — is the single pin |
+| `test_exclude_classifications_matches_clean_model` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::exclude_classifications_matches_clean_model` — the test the mirror copied — is the single pin |
+| `test_exclude_classifications_unsatisfied_on_pii_model` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::exclude_classifications_unsatisfied_on_pii_model` — the test the mirror copied — is the single pin |
+| `test_max_downstreams_within_ceiling_allows` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::max_downstreams_within_ceiling_allows` — the test the mirror copied — is the single pin |
+| `test_max_downstreams_exceeded_degrades_to_require_review` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::max_downstreams_exceeded_degrades_to_require_review` — the test the mirror copied — is the single pin |
+| `test_max_downstreams_unverifiable_degrades_to_require_review` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::max_downstreams_unverifiable_degrades_to_require_review` — the test the mirror copied — is the single pin |
+| `test_max_downstreams_does_not_soften_a_deny` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::max_downstreams_does_not_soften_a_deny` — the test the mirror copied — is the single pin |
+| `test_ceilinged_allow_does_not_leak_via_equal_specificity_sibling` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::ceilinged_allow_does_not_leak_via_equal_specificity_sibling` — the test the mirror copied — is the single pin |
+| `test_sticky_cap_more_specific_sibling_allow_cannot_bypass_breached_ceiling` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::sticky_cap_more_specific_sibling_allow_cannot_bypass_breached_ceiling` — the test the mirror copied — is the single pin |
+| `test_sticky_cap_non_breached_ceiling_still_allows` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::sticky_cap_non_breached_ceiling_still_allows` — the test the mirror copied — is the single pin |
+| `test_models_glob_selector_matches` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::models_glob_selector_matches` — the test the mirror copied — is the single pin |
+| `test_glob_match_mirrors_engine_shapes` | DISSOLVED | there is no second glob to mirror: the engine's `glob_match` is the only implementation, exercised by `models_glob_selector_matches` and the scope tests |
+| `test_equally_specific_incomparable_tie_breaks_by_earliest_rule` | MAPPED | `rocky_core::policy::tests::equally_specific_incomparable_tie_breaks_by_earliest_rule` — ADDED in part 2: the engine implemented the tie-break but had no test for it, so this was the one mirror case with no engine pin to dissolve into |
+
+## `tests/test_seam.py` (the extraction seam)
+
+The seam — a frozen capability manifest pairing the Python framework to
+engine versions — is a deleted concept: the framework became engine
+capabilities in one binary, so there is nothing left to pair.
+
+| Python node id | Status | Reason |
+|---|---|---|
+| `test_spec_version_is_frozen` | DISSOLVED | the seam module's `SPEC_VERSION = "0"` semantics carried into the parser itself — pinned by `product::spec::tests::{reject_spec_version_other_than_zero, spec_version_zero_accepted}` |
+| `test_min_rocky_version_is_frozen` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+| `test_manifest_is_frozen_exactly` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+| `test_manifest_entries_are_well_formed` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+| `test_manifest_names_are_unique` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+| `test_manifest_requires_the_drafting_loop_tools` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+| `test_manifest_never_requires_approval_or_spec_owned_surfaces` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+
+## `tests/test_integration_binary.py` (subprocess probes)
+
+The module drove a released `rocky` binary from Python. In the engine the
+"real engine" is in-process, so each probe either ports as a direct test
+or dissolves into the engine surface it was probing.
+
+| Python node id | Status | Rust test / reason |
+|---|---|---|
+| `test_lowered_artifacts_pass_the_real_engine` | MAPPED | `commands::product::tests::the_lowered_artifacts_pass_the_real_engine` — the subprocess dissolves into the in-process compiler (the same engine); the full probe battery (E010 on a dropped contract column, E011 on a broken declared type, W005 cleared by the merged freshness, W004 silent under [mask], the product tag on the compiled model) ports intact, with hand-typed source schemas standing in for the seeded DuckDB |
+| `test_engine_confirmation_agrees_with_synthetic_evaluation` | DISSOLVED | there is one evaluator; nothing exists to agree or disagree with |
+| `test_policy_check_output_shape_is_the_recorded_one` | DISSOLVED | the recorded shape IS the engine's `PolicyCheckOutput`, pinned by the exported schema + the codegen-drift gate |
+| `test_policy_check_requires_the_model_to_exist` | MAPPED | `commands::policy::tests::check_requires_the_model_to_exist` — ADDED in part 2: the behavior existed unpinned |
+| `test_wp1_propose_review_status_digest_refusal` | DISSOLVED | WP-1 shipped this in the engine with its own pin: `commands::apply::tests::expect_spec_digest_gate_is_fail_closed_both_ways` plus the propose/review roundtrip suite in rocky-mcp |
 
 ## Known divergences from the answer key
 
@@ -222,7 +361,29 @@ Beyond the parser's own added tests, listed further up.
    is not a drift from the answer key — it is two producers with two spellings,
    and both are pinned by tests.
 
-5. **The renderer is new code with no Python counterpart, and that is the
+6. **Fresh-path symlink refusal — hardening BEYOND the answer key.** The
+   frozen prototype's `commit_generation` calls `recover_generation` first,
+   whose symlinked-residue refusal sits past its no-journal early return —
+   so on the FRESH commit path (no prior crash) the prototype's own
+   `staged.write_bytes` / `shutil.copy2` would follow an attacker-planted
+   symlink at `<final>.ff-staged` / `.ff-prev` out of the project. The port
+   faithfully reproduced that hole; an adversarial review caught it. The
+   port now DIVERGES from the executable spec by refusing a symlink at every
+   write target (finals, their staged/prev siblings, the journal tmp) before
+   the first mutation, and the approve verb's snapshot temp stages with
+   O_EXCL for the same reason. Five exploit-exhibiting tests
+   (`fresh_commit_refuses_a_symlinked_*`, `a_symlinked_final_is_refused_*`,
+   `approve_refuses_a_symlinked_snapshot_temp_*`) assert the out-of-project
+   target is untouched; mutation-checked.
+
+5. **Duplicate-final folding uses `str::to_lowercase`, not Unicode
+   casefolding.** Python's `str.casefold` also folds shapes like `ß` → `ss`;
+   Rust's standard library has no casefold. Artifact paths in this protocol
+   are ASCII (`models/<identifier>.toml` and the state dir), where the two
+   are identical, and the check exists for case-insensitive filesystems,
+   whose own folding is closer to `to_lowercase` than to full casefolding.
+
+6. **The renderer is new code with no Python counterpart, and that is the
    largest residual risk in this port.** The answer key delegated its output to
    a library; the port reimplements that library's layout rules (four-space
    indent, the 100-character inline budget counted in characters rather than

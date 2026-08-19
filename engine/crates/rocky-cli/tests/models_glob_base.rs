@@ -137,6 +137,7 @@ async fn run_pipeline(config_path: &Path, state_path: &Path) -> anyhow::Result<(
         None, // #1460
     )
     .await
+    .map(|_| ())
 }
 
 /// Invoke the model-scoped path used by `rocky run --pipeline silver --model
@@ -172,6 +173,7 @@ async fn run_pipeline_model(config_path: &Path, state_path: &Path) -> anyhow::Re
         None, // #1460
     )
     .await
+    .map(|_| ())
 }
 
 /// `models = "models/*.sql"` is a supported glob shape. Before #1268 the base

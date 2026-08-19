@@ -1,0 +1,16 @@
+{
+  "content": [
+    {
+      "text": "{\"code\":\"policy_review_required\",\"message\":\"policy requires human review before this change can apply: model 'orders' (rule 0) — require_review by rule 0 (most-specific match). The plan was recorded as f46e15609f20f74a3bb0a3d4c3e180cfde7bba847ed1ded358819980842e1cda.\",\"plan_id\":\"f46e15609f20f74a3bb0a3d4c3e180cfde7bba847ed1ded358819980842e1cda\",\"policy_rule\":\"0\",\"remediation_hint\":\"A human must run `rocky review f46e15609f20f74a3bb0a3d4c3e180cfde7bba847ed1ded358819980842e1cda --approve` then `rocky apply f46e15609f20f74a3bb0a3d4c3e180cfde7bba847ed1ded358819980842e1cda`; never approve on the user's behalf.\"}",
+      "type": "text"
+    }
+  ],
+  "isError": true,
+  "structuredContent": {
+    "code": "policy_review_required",
+    "message": "policy requires human review before this change can apply: model 'orders' (rule 0) — require_review by rule 0 (most-specific match). The plan was recorded as f46e15609f20f74a3bb0a3d4c3e180cfde7bba847ed1ded358819980842e1cda.",
+    "plan_id": "f46e15609f20f74a3bb0a3d4c3e180cfde7bba847ed1ded358819980842e1cda",
+    "policy_rule": "0",
+    "remediation_hint": "A human must run `rocky review f46e15609f20f74a3bb0a3d4c3e180cfde7bba847ed1ded358819980842e1cda --approve` then `rocky apply f46e15609f20f74a3bb0a3d4c3e180cfde7bba847ed1ded358819980842e1cda`; never approve on the user's behalf."
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "content": [
+    {
+      "text": "{\"code\":\"policy_denied\",\"message\":\"policy denies proposing this change: model 'orders' (rule 0) — denied by rule 0 (deny overrides). A deny cannot be satisfied by human review, so no plan was recorded.\",\"policy_rule\":\"0\",\"remediation_hint\":\"Re-scope the change so it no longer touches the denied model — propose to a branch, or drop that model from the change. A denied change cannot be applied even after review.\"}",
+      "type": "text"
+    }
+  ],
+  "isError": true,
+  "structuredContent": {
+    "code": "policy_denied",
+    "message": "policy denies proposing this change: model 'orders' (rule 0) — denied by rule 0 (deny overrides). A deny cannot be satisfied by human review, so no plan was recorded.",
+    "policy_rule": "0",
+    "remediation_hint": "Re-scope the change so it no longer touches the denied model — propose to a branch, or drop that model from the change. A denied change cannot be applied even after review."
+  }
+}

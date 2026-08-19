@@ -794,7 +794,7 @@ pub fn check_total(
 /// answer about a file that is none of the manifest's business. The reason to
 /// refuse here anyway is that this result is what a caller trusts when it
 /// decides a generation is intact, and the same keys drive writes later.
-fn contained_artifact_path(project_root: &Path, rel_path: &str) -> Option<PathBuf> {
+pub(super) fn contained_artifact_path(project_root: &Path, rel_path: &str) -> Option<PathBuf> {
     let candidate = Path::new(rel_path);
     if rel_path.is_empty() {
         return None;

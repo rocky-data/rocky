@@ -289,3 +289,64 @@ def test_parse_run_or_apply_envelope_success_false():
     assert exc.value.kind == "envelope"
     assert exc.value.plan_id == "def"
     assert exc.value.inner_result_preview is not None
+
+
+def test_parse_rocky_output_routes_product_commands():
+    """The four product verbs dispatch to their generated models."""
+    import json as _json
+
+    from rocky_sdk.types import (
+        ProductApproveOutput,
+        ProductStatusOutput,
+        ProductVerifyOutput,
+        parse_rocky_output,
+    )
+
+    verify = parse_rocky_output(
+        _json.dumps(
+            {
+                "version": "1.71.0",
+                "command": "product_verify",
+                "product_id": "product:p",
+                "spec_digest": "sha256:" + "a" * 64,
+                "output_model": "p",
+                "status": "pass",
+                "reason": "ok",
+            }
+        )
+    )
+    assert isinstance(verify, ProductVerifyOutput)
+
+    approve = parse_rocky_output(
+        _json.dumps(
+            {
+                "version": "1.71.0",
+                "command": "product_approve",
+                "product_id": "product:p",
+                "spec_digest": "sha256:" + "a" * 64,
+                "output_model": "p",
+                "approver": "dev@example.com",
+                "approved_at": "2026-08-19T00:00:00Z",
+                "snapshot_path": ".rocky/fulfillment/p/approved-aa.toml",
+                "state": "spec_approved",
+                "already_approved": True,
+            }
+        )
+    )
+    assert isinstance(approve, ProductApproveOutput)
+    assert approve.already_approved is True
+
+    status = parse_rocky_output(
+        _json.dumps(
+            {
+                "version": "1.71.0",
+                "command": "product_status",
+                "product": "p",
+                "spec_present": False,
+                "staging_journal_present": False,
+                "journal_rows": 0,
+            }
+        )
+    )
+    assert isinstance(status, ProductStatusOutput)
+    assert status.spec_present is False

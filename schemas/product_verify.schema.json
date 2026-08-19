@@ -1,0 +1,130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "PolicyEffect": {
+      "description": "The verdict a policy rule (or the default posture) yields.\n\nOrdered by restrictiveness for incomparable-rule tie-breaking: `Deny` is a hard override (handled separately), and among non-deny verdicts `RequireReview` is more restrictive than `Allow`.",
+      "oneOf": [
+        {
+          "description": "Permit the action outright.",
+          "enum": [
+            "allow"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Permit only after human review. The safe default posture.",
+          "enum": [
+            "require_review"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Refuse the action. A hard override — no `allow` overturns it.",
+          "enum": [
+            "deny"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "VerifyStatus": {
+      "description": "Verification verdict, ordered by severity.",
+      "oneOf": [
+        {
+          "description": "The frozen posture holds and every check passed.",
+          "enum": [
+            "pass"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A human must edit configuration (the paste block says how).",
+          "enum": [
+            "needs_input"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A check failed outright (e.g. agent apply resolves `allow`).",
+          "enum": [
+            "fail"
+          ],
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "description": "JSON output of `rocky product verify`.",
+  "properties": {
+    "apply_effect": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/PolicyEffect"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The resolved agent-apply effect, when evaluation ran."
+    },
+    "command": {
+      "type": "string"
+    },
+    "output_model": {
+      "description": "The resolved output model name.",
+      "type": "string"
+    },
+    "paste_block": {
+      "description": "The corrected `[policy]` block to paste, on a posture `needs_input`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "product_id": {
+      "description": "`product:<name>`.",
+      "type": "string"
+    },
+    "propose_effect": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/PolicyEffect"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The resolved agent-propose effect, when evaluation ran."
+    },
+    "reason": {
+      "description": "Why, in plain language.",
+      "type": "string"
+    },
+    "spec_digest": {
+      "description": "`sha256:<hex>` over the spec's raw bytes.",
+      "type": "string"
+    },
+    "status": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/VerifyStatus"
+        }
+      ],
+      "description": "`pass`, `needs_input`, or `fail` — also the exit code (0 / 1 / 2)."
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "output_model",
+    "product_id",
+    "reason",
+    "spec_digest",
+    "status",
+    "version"
+  ],
+  "title": "ProductVerifyOutput",
+  "type": "object"
+}

@@ -1,0 +1,15 @@
+{
+  "content": [
+    {
+      "text": "{\"models\":[\"orders\"],\"plan_id\":\"f46e15609f20f74a3bb0a3d4c3e180cfde7bba847ed1ded358819980842e1cda\"}",
+      "type": "text"
+    }
+  ],
+  "isError": false,
+  "structuredContent": {
+    "models": [
+      "orders"
+    ],
+    "plan_id": "f46e15609f20f74a3bb0a3d4c3e180cfde7bba847ed1ded358819980842e1cda"
+  }
+}

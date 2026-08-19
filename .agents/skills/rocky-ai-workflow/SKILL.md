@@ -43,6 +43,14 @@ The path:
 
 Your job ends at *propose* and at *surfacing the review report clearly*. The approval is a human decision; do not approve on the user's behalf unless they explicitly tell you to.
 
+## Working under a product spec
+
+Some projects declare products in `products/<name>.toml` and drive fulfillment through `rocky product <verb>`. When you author for one:
+
+- **The spec's artifacts are not yours to edit.** `models/<model>.contract.toml` and the spec-owned sidecar blocks (`[[sources]]`, `[tags].product`, `[classification]`, `[freshness]`, the generated `[[tests]]`) are lowered from the spec and byte-verified against a manifest. Hand-editing them is detected as tampering. Your surface is the SQL, plus tests you append through the draft tools.
+- `rocky product verify <name>` tells you (and the runner) whether the frozen `propose_only` posture is in place before any drafting starts; `rocky product status <name>` reports the lowering, approval, and state without writing.
+- A product-bound propose carries `product_id` + `spec_digest` of the **approved** revision, and the apply requires `--expect-spec-digest`. If the spec moves after your draft, the generation is superseded — expect a refusal, not a merge of generations.
+
 ## Reading the machine-readable surface
 
 - Every command takes `--output json`, backed by a typed schema. That JSON — not the human text — is your contract. Parse it.

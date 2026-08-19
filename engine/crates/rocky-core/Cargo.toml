@@ -59,6 +59,11 @@ test-support = ["dep:tempfile"]
 
 [dev-dependencies]
 tempfile = "3"
+# redb's eviction counter is `#[cfg(feature = "cache_metrics")]`, so without
+# this it reports 0 unconditionally. Enabled for test builds only, so
+# `a_cache_budget_actually_constrains_redb` can prove the request-local cache
+# cap actually binds rather than merely being passed.
+redb = { workspace = true, features = ["cache_metrics"] }
 # Self-referential dev-dependency: turns `test-support` on for this crate's
 # own test targets, so `cargo test -p rocky-core` compiles the feature-gated
 # integration tests without extra flags.

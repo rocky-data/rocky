@@ -74,6 +74,10 @@ from rocky_sdk.types import (
     ModelLineageResult,
     OptimizeResult,
     PlanResult,
+    ProductApproveOutput,
+    ProductCompileOutput,
+    ProductStatusOutput,
+    ProductVerifyOutput,
     PromotePlan,
     RestoreApplyOutput,
     RetentionStatusOutput,
@@ -1069,6 +1073,69 @@ class RockyClient:
             self.run_cli(["review", plan_id, "--status"]),
             ReviewStatusOutput,
             command="review_status",
+        )
+
+    def product_verify(self, product: str) -> ProductVerifyOutput:
+        """Run ``rocky product verify <product>`` and return the typed report.
+
+        The frozen ``propose_only`` posture (default require_review, an
+        exactly-scoped budget-free agent propose-allow, apply
+        require_review/deny), classification-tag resolution, and identity
+        collisions — evaluated by the engine's own policy evaluator against
+        the post-image the lowering would create. ``status`` is ``pass`` /
+        ``needs_input`` / ``fail``; on ``needs_input`` the ``paste_block``
+        field carries the corrected ``[policy]`` block.
+
+        The CLI exits 1/2 on the non-pass statuses but still prints the full
+        JSON report — ``allow_partial=True`` returns that JSON (the doctor
+        pattern), so callers triage ``status`` from the result, not from the
+        exit code.
+        """
+        return _parse_rocky_json(
+            self.run_cli(["product", "verify", product], allow_partial=True),
+            ProductVerifyOutput,
+            command="product_verify",
+        )
+
+    def product_compile(self, product: str) -> ProductCompileOutput:
+        """Run ``rocky product compile <product>`` — verify, then lower.
+
+        Phase A renders the spec-owned contract; Phase B (once the drafted
+        sidecar exists) merges the spec-owned metadata. Every generation
+        commits through the staged journaled protocol with the manifest
+        rename as the marker.
+        """
+        return _parse_rocky_json(
+            self.run_cli(["product", "compile", product]),
+            ProductCompileOutput,
+            command="product_compile",
+        )
+
+    def product_approve(self, product: str) -> ProductApproveOutput:
+        """Run ``rocky product approve <product>`` — the authority transition.
+
+        Writes the immutable digest-addressed snapshot first, then one
+        state-store transaction (approval record + fulfillment state +
+        journal row). Re-approving the already-approved digest is a no-op
+        with ``already_approved = True``.
+        """
+        return _parse_rocky_json(
+            self.run_cli(["product", "approve", product]),
+            ProductApproveOutput,
+            command="product_approve",
+        )
+
+    def product_status(self, product: str) -> ProductStatusOutput:
+        """Run ``rocky product status <product>`` — the read-only report.
+
+        Spec identity, committed lowering phase, artifact byte-verification,
+        pending staging journal, approval + snapshot integrity, and the
+        persisted fulfillment state. Never mutates.
+        """
+        return _parse_rocky_json(
+            self.run_cli(["product", "status", product]),
+            ProductStatusOutput,
+            command="product_status",
         )
 
     def run(

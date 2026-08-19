@@ -260,6 +260,16 @@ rocky mcp                            # Model Context Protocol server over stdio 
 rocky init-adapter <name>            # Scaffold a new warehouse adapter crate
 ```
 
+### Products (spec-driven fulfillment, gate side)
+```bash
+rocky product verify <name>      # Frozen propose_only posture + tag resolution + collisions (exit 0/1/2)
+rocky product compile <name>     # Verify, then lower: Phase A contract / Phase B sidecar merge (staged commit)
+rocky product approve <name>     # Human authority transition: immutable snapshot + one state-store txn
+rocky product status <name>      # Read-only: spec, lowering, artifact verification, approval, loop state
+```
+
+Product specs live at `products/<name>.toml`; `rocky validate` checks them offline (V050–V053). Reference: `../docs/src/content/docs/reference/commands/products.md`.
+
 ### Administration
 ```bash
 rocky history                        # Run history with trend analysis

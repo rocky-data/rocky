@@ -46,6 +46,21 @@
 //!
 //! The `format_version` field is **not** included in the `plan_id`
 //! digest. The digest is computed over `{kind, payload}` only.
+//!
+//! ## Writer privatization (the route-inventory invariant, structural)
+//!
+//! Every function that can persist or pre-name a plan is `pub(crate)`:
+//! [`write_plan`], [`write_plan_governed`], [`write_plan_with_principal`],
+//! [`write_plan_v2`], and [`governed_plan_id`] — the full inventory of
+//! `pub` items in this module that write or mint a plan identity, taken
+//! when the MCP propose tool moved onto the shared
+//! `commands::propose_governed_run_plan` helper. From outside the crate
+//! the ONLY route to an `AiAuthored` plan is that helper, which runs the
+//! policy gate before anything persists; a compile-fail suite
+//! (`rocky-cli-compiletest`) pins that these symbols are not nameable
+//! externally. [`read_plan`] stays public: reading a plan grants no
+//! authority — apply re-verifies its integrity and gates on the runtime
+//! principal.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -498,7 +513,7 @@ fn plans_dir(root: &Path) -> Result<std::path::PathBuf> {
 /// still accepted here so that round-trip / kind-mismatch tests can
 /// fabricate a v1 plan on disk and assert the apply path errors
 /// cleanly.
-pub fn write_plan<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
+pub(crate) fn write_plan<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
     let principal = default_principal_for_kind(&kind);
     write_plan_inner(root, kind, payload, 1, principal, None)
 }
@@ -511,7 +526,7 @@ pub fn write_plan<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Res
 /// `policy_capabilities` **before** the `plan_id` is computed, so the reviewed
 /// capability decision is part of `blake3({kind, payload})`. The `principal`
 /// rides outside the hash. Used by `rocky plan` and the MCP `propose` tool.
-pub fn write_plan_governed<T: Serialize>(
+pub(crate) fn write_plan_governed<T: Serialize>(
     root: &Path,
     kind: PlanKind,
     payload: &T,
@@ -532,7 +547,7 @@ pub fn write_plan_governed<T: Serialize>(
 /// The `principal` is stamped for display/advisory purposes (it rides outside
 /// the `plan_id` digest); enforcement uses the apply-time runtime principal,
 /// not this field.
-pub fn write_plan_with_principal<T: Serialize>(
+pub(crate) fn write_plan_with_principal<T: Serialize>(
     root: &Path,
     kind: PlanKind,
     payload: &T,
@@ -550,7 +565,7 @@ pub fn write_plan_with_principal<T: Serialize>(
 /// deciding whether to write: the MCP `propose` policy gate references the id
 /// in its audit record (and a review message) even for a plan it ultimately
 /// refuses to persist.
-pub fn governed_plan_id<T: Serialize>(
+pub(crate) fn governed_plan_id<T: Serialize>(
     kind: &PlanKind,
     payload: &T,
     capabilities: &EmbeddedCapabilities,
@@ -591,7 +606,11 @@ fn payload_with_capabilities<T: Serialize>(
 /// [`PersistedPlan::format_version`] to validate the loaded plan is
 /// indeed v2 — v1-shaped compact/archive payloads on disk (written by
 /// Rocky < engine-v1.35.0) are rejected with a migration error.
-pub fn write_plan_v2<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
+pub(crate) fn write_plan_v2<T: Serialize>(
+    root: &Path,
+    kind: PlanKind,
+    payload: &T,
+) -> Result<String> {
     debug_assert!(
         matches!(kind, PlanKind::Compact | PlanKind::Archive),
         "v2 plan-store format is defined only for compact and archive; got {kind}"

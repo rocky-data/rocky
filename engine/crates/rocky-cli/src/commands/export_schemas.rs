@@ -139,6 +139,11 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         entry::<ReviewQueueOutput>("review_queue"),
         entry::<ReviewStatusOutput>("review_status"),
         entry::<PolicyCheckOutput>("policy_check"),
+        // Product-spec verbs (the fulfillment lane's gate side).
+        entry::<crate::commands::product::ProductVerifyOutput>("product_verify"),
+        entry::<crate::commands::product::ProductCompileOutput>("product_compile"),
+        entry::<crate::commands::product::ProductApproveOutput>("product_approve"),
+        entry::<crate::commands::product::ProductStatusOutput>("product_status"),
         entry::<PolicyTestOutput>("policy_test"),
         entry::<PolicyFreezeOutput>("policy_freeze"),
         entry::<AuditOutput>("audit"),
@@ -155,6 +160,10 @@ pub(crate) fn schemas() -> Vec<(&'static str, serde_json::Value)> {
         // into the editor directory after this command runs.
         entry::<AdapterConfig>("adapter_config"),
         entry::<RockyConfig>("rocky_project"),
+        // The product-spec document schema (`products/<name>.toml`) — the
+        // whole file shape (`spec_version` + `[product]`), following the
+        // `rocky_project` precedent of exporting the document root.
+        entry::<rocky_core::product::spec::SpecFile>("rocky_product"),
         // FR-C canonical state envelope. Not a CLI command output —
         // it's the on-disk shape produced by
         // `rocky discover --emit-fivetran-state-to <PATH>` and the

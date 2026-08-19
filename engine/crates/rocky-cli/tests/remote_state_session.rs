@@ -172,6 +172,7 @@ async fn drive_run(
         None,  // #1460
     )
     .await
+    .map(|_| ())
 }
 
 /// Drive the same replication path GOVERNED: a directly-constructed,
@@ -223,6 +224,7 @@ async fn drive_run_governed(config_path: &Path, state_path: &Path) -> anyhow::Re
         None,  // #1460
     )
     .await
+    .map(|_| ())
 }
 
 /// Behavior delta (ii): the terminal state writes precede the terminal upload,

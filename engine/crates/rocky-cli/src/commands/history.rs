@@ -133,6 +133,18 @@ fn parse_since(since: Option<&str>) -> Result<Option<DateTime<Utc>>> {
         .transpose()
 }
 
+/// redb cache budget for this file's request-local opens: every consumer of
+/// [`history_runs_output`] (the `GET /api/v1/runs` handler, `rocky history`,
+/// the MCP `history` tool) opens the store, reads one page, and drops it, so
+/// the default ~1 GiB cache capacity only turns a full-table `list_runs`
+/// scan into retained RSS on glibc — +8.6 MB per request at 1,435 rows,
+/// ratcheting with history size while `/runs` is polled (#1399). 1 MiB is
+/// the measured budget at which the retained step collapses ~8× with request
+/// latency unchanged. Scoped to the run-history path because it is the one
+/// this was measured on; the sibling opens in this file share the shape and
+/// can adopt the policy once measured.
+const HISTORY_REQUEST_CACHE_BYTES: usize = 1 << 20;
+
 /// Build the project-level run-history output from the state store (the
 /// model-unscoped `rocky history`). Pure compute — no printing — so other
 /// surfaces (the MCP `history` tool) can reuse it.
@@ -156,7 +168,7 @@ pub fn history_runs_output_filtered(
     audit: bool,
     trigger: Option<&str>,
 ) -> Result<HistoryOutput> {
-    let store = StateStore::open_read_only(state_path)?;
+    let store = StateStore::open_read_only_with_cache(state_path, HISTORY_REQUEST_CACHE_BYTES)?;
     let since_ts = parse_since(since)?;
 
     let runs = match trigger {

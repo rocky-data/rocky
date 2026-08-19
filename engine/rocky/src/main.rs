@@ -544,6 +544,19 @@ enum Command {
         subcommand: PolicySubcommand,
     },
 
+    /// Spec-driven data products — verify posture, lower, approve.
+    ///
+    /// A product spec (`products/<name>.toml`) declares WHAT a data
+    /// product must be — grain, columns, checks, freshness,
+    /// classifications — and lowers onto primitives the engine already
+    /// enforces (contracts, declarative tests, sidecar metadata, policy
+    /// posture). The spec introduces no new runtime semantics: a field
+    /// that cannot lower is refused at parse time rather than shimmed.
+    Product {
+        #[command(subcommand)]
+        subcommand: ProductSubcommand,
+    },
+
     /// Show the agent-policy decision ledger, or a subject's custody chain.
     ///
     /// Bare `rocky audit` lists every policy decision recorded at a mutating
@@ -2440,6 +2453,66 @@ enum PreviewAction {
     },
 }
 
+/// Subcommands under `rocky product`.
+#[derive(Subcommand)]
+enum ProductSubcommand {
+    /// Verify the frozen `propose_only` trust posture for a product.
+    ///
+    /// Fail-closed checks against the engine's own policy evaluator: a
+    /// `[policy]` block must exist with `default_agent_effect =
+    /// "require_review"`, agent propose must resolve `allow` through an
+    /// explicit budget-free rule scoped to exactly this product's output
+    /// model, and agent apply must resolve `require_review` or `deny`.
+    /// Then every classification tag must resolve to a `[mask]` strategy
+    /// or an `allow_unmasked` allowance (an error here, where compile
+    /// only warns W004), and product identities must not collide.
+    ///
+    /// Exits 0 on pass, 1 on needs-input (a paste-ready `[policy]` block
+    /// is printed), 2 on fail.
+    Verify {
+        /// Product name (`products/<name>.toml`).
+        product: String,
+    },
+
+    /// Verify, then lower the product spec onto engine primitives.
+    ///
+    /// Phase A (before drafting) renders the spec-owned
+    /// `models/<model>.contract.toml`; Phase B (after the drafted sidecar
+    /// exists) merges spec-owned metadata into `models/<model>.toml`,
+    /// preserving the worker's `name`, `intent`, and appended tests.
+    /// Every generation commits via staged same-directory writes with
+    /// the lowering manifest renamed last as the commit marker; a
+    /// crashed commit is recovered before the next one stages.
+    Compile {
+        /// Product name (`products/<name>.toml`).
+        product: String,
+    },
+
+    /// Report a product's spec, lowering, approval, and loop state.
+    ///
+    /// Read-only: byte-verifies committed artifacts against the lowering
+    /// manifest, re-verifies the approval snapshot against its recorded
+    /// digest, and reports (never resolves) a pending staging journal.
+    Status {
+        /// Product name (`products/<name>.toml`).
+        product: String,
+    },
+
+    /// Approve the current spec revision — a human authority transition.
+    ///
+    /// Writes the immutable digest-addressed snapshot
+    /// (`.rocky/fulfillment/<name>/approved-<hex>.toml`) first, then one
+    /// state-store transaction that records the approval, moves the
+    /// fulfillment state to `spec_approved`, and appends the journal row
+    /// — all-or-nothing. Re-approving the already-approved digest is a
+    /// no-op; racing another approver loses cleanly, naming the winning
+    /// digest.
+    Approve {
+        /// Product name (`products/<name>.toml`).
+        product: String,
+    },
+}
+
 /// Subcommands under `rocky policy`.
 #[derive(Subcommand)]
 enum PolicySubcommand {
@@ -3106,6 +3179,20 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             )
             .await
         }
+        Command::Product { subcommand } => match subcommand {
+            ProductSubcommand::Verify { product } => {
+                rocky_cli::commands::run_product_verify(&cli.config, &product, json)
+            }
+            ProductSubcommand::Compile { product } => {
+                rocky_cli::commands::run_product_compile(&cli.config, &product, &state_path, json)
+            }
+            ProductSubcommand::Status { product } => {
+                rocky_cli::commands::run_product_status(&cli.config, &product, &state_path, json)
+            }
+            ProductSubcommand::Approve { product } => {
+                rocky_cli::commands::run_product_approve(&cli.config, &product, &state_path, json)
+            }
+        },
         Command::Policy { subcommand } => match subcommand {
             PolicySubcommand::Check {
                 principal,
