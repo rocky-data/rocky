@@ -64,6 +64,10 @@ from .types import (
     ModelLineageResult,
     OptimizeResult,
     PlanResult,
+    ProductApproveOutput,
+    ProductCompileOutput,
+    ProductStatusOutput,
+    ProductVerifyOutput,
     PromotePlan,
     RetentionStatusOutput,
     ReviewStatusOutput,
@@ -856,6 +860,37 @@ class RockyResource(dg.ConfigurableResource):
         """
         with _translating():
             return self._get_client().review_status(plan_id)
+
+    def product_verify(self, product: str) -> ProductVerifyOutput:
+        """Run ``rocky product verify <product>`` — the typed posture report.
+
+        ``status`` is ``pass`` / ``needs_input`` / ``fail``; on
+        ``needs_input`` the ``paste_block`` carries the corrected
+        ``[policy]`` block. The payload is returned on every status (the
+        CLI's non-zero exits ride inside it, the doctor pattern).
+        """
+        with _translating():
+            return self._get_client().product_verify(product)
+
+    def product_compile(self, product: str) -> ProductCompileOutput:
+        """Run ``rocky product compile <product>`` — verify, then lower the
+        spec through the staged commit protocol (Phase A contract, Phase B
+        sidecar merge)."""
+        with _translating():
+            return self._get_client().product_compile(product)
+
+    def product_approve(self, product: str) -> ProductApproveOutput:
+        """Run ``rocky product approve <product>`` — the human authority
+        transition: immutable snapshot first, then one state-store
+        transaction. Re-approving the approved digest is a no-op."""
+        with _translating():
+            return self._get_client().product_approve(product)
+
+    def product_status(self, product: str) -> ProductStatusOutput:
+        """Run ``rocky product status <product>`` — the read-only report
+        (never mutates, never recovers)."""
+        with _translating():
+            return self._get_client().product_status(product)
 
     def run(
         self,

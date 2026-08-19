@@ -836,6 +836,80 @@ REVIEW_STATUS_PENDING: dict[str, Any] = {
 }
 
 # ---------------------------------------------------------------------------
+# product verbs — the spec-driven gate side (`rocky product <verb>`).
+# ---------------------------------------------------------------------------
+
+PRODUCT_VERIFY: dict[str, Any] = {
+    "version": "1.71.0",
+    "command": "product_verify",
+    "product_id": "product:revenue_daily",
+    "spec_digest": "sha256:" + "a" * 64,
+    "output_model": "revenue_daily",
+    "status": "needs_input",
+    "reason": "rocky.toml has no [policy] block. Paste the block below into rocky.toml.",
+    "paste_block": '[policy]\nversion = 1\ndefault_agent_effect = "require_review"\n',
+}
+
+PRODUCT_COMPILE: dict[str, Any] = {
+    "version": "1.71.0",
+    "command": "product_compile",
+    "product_id": "product:revenue_daily",
+    "spec_digest": "sha256:" + "a" * 64,
+    "spec_path": "products/revenue_daily.toml",
+    "output_model": "revenue_daily",
+    "phase": "merged",
+    "artifacts": [
+        {"path": "models/revenue_daily.toml", "sha256": "sha256:" + "b" * 64},
+    ],
+    "manifest_path": ".rocky/fulfillment/revenue_daily/lowering-manifest.json",
+    "approval": {
+        "spec_digest": "sha256:" + "a" * 64,
+        "approver": "dev@example.com",
+        "approved_at": "2026-08-19T00:00:00Z",
+        "snapshot_path": ".rocky/fulfillment/revenue_daily/approved-" + "a" * 64 + ".toml",
+    },
+    "spec_matches_approval": True,
+}
+
+PRODUCT_APPROVE: dict[str, Any] = {
+    "version": "1.71.0",
+    "command": "product_approve",
+    "product_id": "product:revenue_daily",
+    "spec_digest": "sha256:" + "a" * 64,
+    "output_model": "revenue_daily",
+    "approver": "dev@example.com",
+    "approved_at": "2026-08-19T00:00:00Z",
+    "snapshot_path": ".rocky/fulfillment/revenue_daily/approved-" + "a" * 64 + ".toml",
+    "previous_state": "needs_input",
+    "state": "spec_approved",
+    "already_approved": False,
+}
+
+PRODUCT_STATUS: dict[str, Any] = {
+    "version": "1.71.0",
+    "command": "product_status",
+    "product": "revenue_daily",
+    "spec_present": True,
+    "product_id": "product:revenue_daily",
+    "spec_digest": "sha256:" + "a" * 64,
+    "output_model": "revenue_daily",
+    "committed_phase": "merged",
+    "committed_spec_digest": "sha256:" + "a" * 64,
+    "artifact_problems": [],
+    "staging_journal_present": False,
+    "approval": {
+        "spec_digest": "sha256:" + "a" * 64,
+        "approver": "dev@example.com",
+        "approved_at": "2026-08-19T00:00:00Z",
+        "snapshot_path": ".rocky/fulfillment/revenue_daily/approved-" + "a" * 64 + ".toml",
+    },
+    "snapshot_intact": True,
+    "spec_matches_approval": True,
+    "fulfill_state": "spec_approved",
+    "journal_rows": 1,
+}
+
+# ---------------------------------------------------------------------------
 # catalog — project-wide column-lineage snapshot covering one source and
 # two derived models. Mirrors what `rocky catalog` would emit against the
 # playground POC.
