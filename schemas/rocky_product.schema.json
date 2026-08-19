@@ -1,0 +1,237 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "ColumnSpec": {
+      "additionalProperties": false,
+      "description": "One declared output column.",
+      "properties": {
+        "name": {
+          "description": "Column name; must be a bare identifier.",
+          "type": "string"
+        },
+        "nullable": {
+          "description": "Whether the column may hold nulls.",
+          "type": "boolean"
+        },
+        "type": {
+          "description": "Rocky type name, optionally parameterized.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "nullable",
+        "type"
+      ],
+      "type": "object"
+    },
+    "FreshnessSeverity": {
+      "description": "Severity of the observation-phase staleness report.",
+      "oneOf": [
+        {
+          "description": "Staleness is reported as a failure.",
+          "enum": [
+            "error"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Staleness is reported as a warning.",
+          "enum": [
+            "warning"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "FreshnessSpec": {
+      "additionalProperties": false,
+      "description": "Declared freshness: the lag budget plus the column that witnesses it.\n\n`time_column` is required. Without it the observation-phase staleness check (`MAX(time_column)` against the budget) has nothing to read, and freshness would be a claim with no witness.",
+      "properties": {
+        "max_lag": {
+          "description": "Lag budget in the duration grammar (`\"24h\"`).",
+          "type": "string"
+        },
+        "severity": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FreshnessSeverity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional severity for the staleness report."
+        },
+        "time_column": {
+          "description": "The timestamp column the staleness check reads.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "max_lag",
+        "time_column"
+      ],
+      "type": "object"
+    },
+    "OutputSpec": {
+      "additionalProperties": false,
+      "description": "The one output model and the guarantees around it.",
+      "properties": {
+        "checks": {
+          "description": "Opaque SQL boolean expressions, checked by the engine.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "classifications": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Column classification tags.\n\nHeld in an insertion-ordered map because the sidecar merge must be able to preserve an order it is given. The parser fills it in sorted key order: `toml::Value` hands back a sorted map, so document order is not recoverable here without span-based parsing. Sorted is deterministic, which is what byte-stable output needs; recovering true document order belongs with the merge that actually rewrites a human's file.",
+          "type": "object"
+        },
+        "columns": {
+          "description": "Every declared column.",
+          "items": {
+            "$ref": "#/definitions/ColumnSpec"
+          },
+          "type": "array"
+        },
+        "freshness": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/FreshnessSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional freshness declaration."
+        },
+        "grain": {
+          "description": "The columns that identify one row.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "Model name; defaults to the product name when omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "columns",
+        "grain"
+      ],
+      "type": "object"
+    },
+    "ProductSpec": {
+      "additionalProperties": false,
+      "description": "The `[product]` table.",
+      "properties": {
+        "intent": {
+          "description": "Plain-language statement of what the product is for.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Product name; names the state directory and the default model.",
+          "type": "string"
+        },
+        "output": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OutputSpec"
+            }
+          ],
+          "description": "What the product must produce."
+        },
+        "source": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SourceSpec"
+            }
+          ],
+          "description": "Where the data comes from."
+        },
+        "trust": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TrustSpec"
+            }
+          ],
+          "description": "How much the agent is trusted."
+        }
+      },
+      "required": [
+        "intent",
+        "name",
+        "output",
+        "source",
+        "trust"
+      ],
+      "type": "object"
+    },
+    "SourceSpec": {
+      "additionalProperties": false,
+      "description": "Grounding sources: exact `catalog.schema.table` triples only.\n\nv0 has no globs and no `include` selectors, because no engine counterpart exists. An `include` key is refused as an unknown key; a glob smuggled inside `tables` is refused here.",
+      "properties": {
+        "tables": {
+          "description": "One or more exact table references.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "tables"
+      ],
+      "type": "object"
+    },
+    "TrustSpec": {
+      "additionalProperties": false,
+      "description": "The trust dial. `propose_only` is the only v0 value.",
+      "properties": {
+        "agent": {
+          "description": "How much the agent may do unattended.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "The whole document: an optional version pin plus `[product]`.",
+  "properties": {
+    "product": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/ProductSpec"
+        }
+      ],
+      "description": "The product declaration."
+    },
+    "spec_version": {
+      "description": "Optional schema-version pin.",
+      "format": "int64",
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "product"
+  ],
+  "title": "SpecFile",
+  "type": "object"
+}

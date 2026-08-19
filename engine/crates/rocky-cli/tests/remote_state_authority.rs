@@ -138,6 +138,7 @@ async fn drive_run(
         None, // #1460
     )
     .await
+    .map(|_| ())
 }
 
 /// (a) An UNGOVERNED run whose remote-state download fails continues in

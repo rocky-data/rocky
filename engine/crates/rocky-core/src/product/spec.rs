@@ -48,10 +48,11 @@ pub struct SpecRejected {
 }
 
 impl SpecRejected {
-    /// Visible to the rest of `product` so the lowering raises its own
-    /// refusals through the same constructor, rather than assembling the
-    /// struct by hand and drifting on the `Display` shape.
-    pub(super) fn new(code: &'static str, message: impl Into<String>) -> Self {
+    /// Public so every layer that raises a spec-shaped refusal — the
+    /// lowering, the commit protocol, and the CLI product verbs — goes
+    /// through the same constructor, rather than assembling the struct
+    /// by hand and drifting on the `Display` shape.
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),

@@ -2,6 +2,7 @@
 members = [
     "crates/rocky-core",
     "crates/rocky-core-compiletest",
+    "crates/rocky-cli-compiletest",
     "crates/rocky-ir",
     "crates/rocky-sql",
     "crates/rocky-compiler",

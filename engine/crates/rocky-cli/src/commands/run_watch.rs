@@ -368,7 +368,7 @@ async fn iter_once(
     let elapsed_ms = started.elapsed().as_millis();
     let mut interrupted = false;
     match result {
-        Ok(()) => {
+        Ok(_) => {
             eprintln!("[watch] run completed in {elapsed_ms}ms");
         }
         Err(e) if e.is::<Interrupted>() => {

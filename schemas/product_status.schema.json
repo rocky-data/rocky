@@ -1,0 +1,154 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProductApprovalOutput": {
+      "description": "The approval record, as echoed by compile/status output.",
+      "properties": {
+        "approved_at": {
+          "description": "RFC3339 approval instant.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "approver": {
+          "description": "Best-effort approver identity.",
+          "type": "string"
+        },
+        "snapshot_path": {
+          "description": "Project-root-relative path of the immutable snapshot file.",
+          "type": "string"
+        },
+        "spec_digest": {
+          "description": "The approved `sha256:<hex>` spec digest.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "approver",
+        "snapshot_path",
+        "spec_digest"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output of `rocky product status`.",
+  "properties": {
+    "approval": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProductApprovalOutput"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The approval record, when one exists."
+    },
+    "artifact_problems": {
+      "default": [],
+      "description": "Byte-verification problems against the committed manifest (empty = every committed artifact matches its recorded hash).",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "committed_phase": {
+      "description": "The committed lowering phase, when a manifest exists.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "committed_spec_digest": {
+      "description": "The committed manifest's spec digest, when one exists.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fulfill_state": {
+      "description": "The persisted fulfillment state tag, when one exists.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "journal_rows": {
+      "description": "Number of fulfillment journal rows recorded for this product.",
+      "format": "uint64",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "output_model": {
+      "description": "The resolved output model, when the spec parses.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "product": {
+      "description": "The product name the status was asked for.",
+      "type": "string"
+    },
+    "product_id": {
+      "description": "`product:<name>`, when the spec parses.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "snapshot_intact": {
+      "description": "Whether the approval snapshot's bytes still digest to the recorded value. `null` without an approval; `false` is tamper.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "spec_digest": {
+      "description": "The working spec's digest, when it parses.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "spec_error": {
+      "description": "Why the spec failed to parse, when it did not.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "spec_matches_approval": {
+      "description": "Whether the working spec equals the approved revision. `null` when either side is missing.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "spec_present": {
+      "description": "Whether `products/<name>.toml` exists and parses.",
+      "type": "boolean"
+    },
+    "staging_journal_present": {
+      "description": "Whether an uncommitted staging journal is pending. Status never mutates; the next compile resolves it.",
+      "type": "boolean"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "command",
+    "journal_rows",
+    "product",
+    "spec_present",
+    "staging_journal_present",
+    "version"
+  ],
+  "title": "ProductStatusOutput",
+  "type": "object"
+}

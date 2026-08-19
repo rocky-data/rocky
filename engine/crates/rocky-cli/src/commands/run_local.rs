@@ -1484,6 +1484,7 @@ auto_create_schemas = true
             None, // #1460
         )
         .await
+        .map(|_| ())
     }
 
     /// #1292, red-team finding: a named pipeline whose configured models root

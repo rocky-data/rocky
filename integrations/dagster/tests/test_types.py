@@ -763,3 +763,46 @@ def test_parse_doctor(doctor_json: str):
     assert result.checks[0].status == HealthStatus.healthy
     assert result.checks[4].status == HealthStatus.warning
     assert len(result.suggestions) == 1
+
+
+def test_parse_product_verify(product_verify_json: str):
+    from dagster_rocky.types import ProductVerifyOutput
+
+    result = ProductVerifyOutput.model_validate_json(product_verify_json)
+    assert result.command == "product_verify"
+    assert result.status == "needs_input"
+    assert result.paste_block is not None
+    assert isinstance(parse_rocky_output(product_verify_json), ProductVerifyOutput)
+
+
+def test_parse_product_compile(product_compile_json: str):
+    from dagster_rocky.types import ProductCompileOutput
+
+    result = ProductCompileOutput.model_validate_json(product_compile_json)
+    assert result.command == "product_compile"
+    assert result.phase == "merged"
+    assert result.artifacts[0].path == "models/revenue_daily.toml"
+    assert result.spec_matches_approval is True
+    assert isinstance(parse_rocky_output(product_compile_json), ProductCompileOutput)
+
+
+def test_parse_product_approve(product_approve_json: str):
+    from dagster_rocky.types import ProductApproveOutput
+
+    result = ProductApproveOutput.model_validate_json(product_approve_json)
+    assert result.command == "product_approve"
+    assert result.state == "spec_approved"
+    assert result.already_approved is False
+    assert result.previous_state == "needs_input"
+    assert isinstance(parse_rocky_output(product_approve_json), ProductApproveOutput)
+
+
+def test_parse_product_status(product_status_json: str):
+    from dagster_rocky.types import ProductStatusOutput
+
+    result = ProductStatusOutput.model_validate_json(product_status_json)
+    assert result.command == "product_status"
+    assert result.snapshot_intact is True
+    assert result.fulfill_state == "spec_approved"
+    assert result.journal_rows == 1
+    assert isinstance(parse_rocky_output(product_status_json), ProductStatusOutput)

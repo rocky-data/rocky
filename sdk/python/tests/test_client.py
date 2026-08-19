@@ -809,6 +809,116 @@ _REVIEW_STATUS_JSON = json.dumps(
 )
 
 
+_PRODUCT_VERIFY_JSON = json.dumps(
+    {
+        "version": "1.71.0",
+        "command": "product_verify",
+        "product_id": "product:revenue_daily",
+        "spec_digest": "sha256:" + "a" * 64,
+        "output_model": "revenue_daily",
+        "status": "needs_input",
+        "reason": "rocky.toml has no [policy] block.",
+        "paste_block": "[policy]\nversion = 1\n",
+    }
+)
+
+_PRODUCT_APPROVE_JSON = json.dumps(
+    {
+        "version": "1.71.0",
+        "command": "product_approve",
+        "product_id": "product:revenue_daily",
+        "spec_digest": "sha256:" + "a" * 64,
+        "output_model": "revenue_daily",
+        "approver": "dev@example.com",
+        "approved_at": "2026-08-19T00:00:00Z",
+        "snapshot_path": ".rocky/fulfillment/revenue_daily/approved-" + "a" * 64 + ".toml",
+        "state": "spec_approved",
+        "already_approved": False,
+    }
+)
+
+
+def test_product_verify_argv_allows_nonzero_and_parses():
+    """``product_verify`` shells ``product verify <name>`` with
+    ``allow_partial=True`` — the CLI exits 1/2 on needs_input/fail while
+    still printing the full JSON report, and callers triage ``status``
+    from the payload (the doctor pattern)."""
+    from rocky_sdk.types import ProductVerifyOutput
+
+    client = _client()
+    with patch.object(client, "run_cli", return_value=_PRODUCT_VERIFY_JSON) as run_cli:
+        report = client.product_verify("revenue_daily")
+    args, kwargs = run_cli.call_args
+    assert args[0] == ["product", "verify", "revenue_daily"]
+    assert kwargs.get("allow_partial") is True
+    assert isinstance(report, ProductVerifyOutput)
+    assert report.status == "needs_input"
+    assert report.paste_block is not None
+
+
+def test_product_compile_approve_status_argv_and_typed_parse():
+    from rocky_sdk.types import (
+        ProductApproveOutput,
+        ProductCompileOutput,
+        ProductStatusOutput,
+    )
+
+    compile_json = json.dumps(
+        {
+            "version": "1.71.0",
+            "command": "product_compile",
+            "product_id": "product:revenue_daily",
+            "spec_digest": "sha256:" + "a" * 64,
+            "spec_path": "products/revenue_daily.toml",
+            "output_model": "revenue_daily",
+            "phase": "lowered_contract",
+            "artifacts": [
+                {
+                    "path": "models/revenue_daily.contract.toml",
+                    "sha256": "sha256:" + "b" * 64,
+                }
+            ],
+            "manifest_path": ".rocky/fulfillment/revenue_daily/lowering-manifest.json",
+        }
+    )
+    status_json = json.dumps(
+        {
+            "version": "1.71.0",
+            "command": "product_status",
+            "product": "revenue_daily",
+            "spec_present": True,
+            "product_id": "product:revenue_daily",
+            "spec_digest": "sha256:" + "a" * 64,
+            "output_model": "revenue_daily",
+            "committed_phase": "merged",
+            "artifact_problems": [],
+            "staging_journal_present": False,
+            "journal_rows": 1,
+        }
+    )
+    client = _client()
+    with patch.object(client, "run_cli", return_value=compile_json) as run_cli:
+        compiled = client.product_compile("revenue_daily")
+    assert run_cli.call_args[0][0] == ["product", "compile", "revenue_daily"]
+    assert isinstance(compiled, ProductCompileOutput)
+    assert compiled.phase == "lowered_contract"
+    assert compiled.artifacts[0].path == "models/revenue_daily.contract.toml"
+
+    with patch.object(client, "run_cli", return_value=_PRODUCT_APPROVE_JSON) as run_cli:
+        approved = client.product_approve("revenue_daily")
+    assert run_cli.call_args[0][0] == ["product", "approve", "revenue_daily"]
+    assert isinstance(approved, ProductApproveOutput)
+    assert approved.already_approved is False
+    assert approved.state == "spec_approved"
+
+    with patch.object(client, "run_cli", return_value=status_json) as run_cli:
+        status = client.product_status("revenue_daily")
+    assert run_cli.call_args[0][0] == ["product", "status", "revenue_daily"]
+    assert isinstance(status, ProductStatusOutput)
+    assert status.committed_phase == "merged"
+    assert status.journal_rows == 1
+
+
 def test_review_status_argv_and_typed_parse():
     """``review_status`` shells ``review <plan-id> --status`` and parses the
     typed marker oracle, including the product pair the applier echoes back

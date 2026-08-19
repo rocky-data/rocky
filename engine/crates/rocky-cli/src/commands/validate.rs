@@ -277,7 +277,111 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
     // --- Lint rules ---
     lint_config(&cfg, &loaded_models, &mut out);
 
+    // --- Product specs (V050–V053) ---
+    validate_products(config_path, &mut out);
+
     Ok(out)
+}
+
+/// Validate every `products/<name>.toml` spec, offline (no APIs, no
+/// state store — the deeper posture/approval checks belong to
+/// `rocky product verify`).
+///
+/// Codes (the products band):
+/// - **V050** (ok) — every spec in `products/` parsed.
+/// - **V051** (error) — a spec fails the strict parser; the message
+///   carries the parser's stable reject code.
+/// - **V052** (error) — a spec's `product.name` disagrees with its file
+///   name; every identity surface (state dir, approvals, generated
+///   headers) keys on the file name.
+/// - **V053** (error) — two specs claim the same output model; one model
+///   has one owning product.
+///
+/// A project without a `products/` directory emits nothing — the block
+/// is silent rather than noisy for the majority that don't use specs.
+fn validate_products(config_path: &Path, out: &mut ValidateOutput) {
+    let root = config_path.parent().unwrap_or(Path::new("."));
+    let products_dir = root.join("products");
+    let Ok(entries) = std::fs::read_dir(&products_dir) else {
+        return;
+    };
+    let mut spec_files: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    spec_files.sort();
+
+    let mut parsed_ok = 0usize;
+    let mut claimed_models: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for path in &spec_files {
+        let file_label = format!(
+            "products/{}",
+            path.file_name().unwrap_or_default().display()
+        );
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let parsed = match rocky_core::product::spec::parse_spec_file(path) {
+            Ok(parsed) => parsed,
+            Err(reject) => {
+                out.push(ValidateMessage {
+                    severity: "error".into(),
+                    code: "V051".into(),
+                    message: format!("product spec does not parse: {reject}"),
+                    file: Some(file_label),
+                    field: None,
+                });
+                continue;
+            }
+        };
+        if parsed.product().name != stem {
+            out.push(ValidateMessage {
+                severity: "error".into(),
+                code: "V052".into(),
+                message: format!(
+                    "product.name = '{}' disagrees with the file name — the spec must live \
+                     at products/{}.toml (state dir, approvals, and generated headers key \
+                     on the name)",
+                    parsed.product().name,
+                    parsed.product().name
+                ),
+                file: Some(file_label),
+                field: Some("product.name".into()),
+            });
+            continue;
+        }
+        let model = parsed.output_model().to_string();
+        if let Some(owner) = claimed_models.get(&model) {
+            out.push(ValidateMessage {
+                severity: "error".into(),
+                code: "V053".into(),
+                message: format!(
+                    "output model '{model}' is already claimed by product '{owner}' — one \
+                     model has one owning product"
+                ),
+                file: Some(file_label),
+                field: Some("product.output.model".into()),
+            });
+            continue;
+        }
+        claimed_models.insert(model, parsed.product().name.clone());
+        parsed_ok += 1;
+    }
+    if parsed_ok > 0 && parsed_ok == spec_files.len() {
+        out.push(ValidateMessage {
+            severity: "ok".into(),
+            code: "V050".into(),
+            message: format!(
+                "{parsed_ok} product spec{} parsed",
+                if parsed_ok == 1 { "" } else { "s" }
+            ),
+            file: None,
+            field: Some("products".into()),
+        });
+    }
 }
 
 /// Every distinct models directory this config's transformation pipelines
@@ -1469,6 +1573,118 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(toml_str.as_bytes()).unwrap();
         validate_inner(f.path()).unwrap()
+    }
+
+    // ----- the products band (V050–V053) -----
+
+    const MINIMAL_CONFIG: &str = r#"
+[adapter.db]
+type = "duckdb"
+[pipeline.raw]
+type = "transformation"
+[pipeline.raw.target]
+adapter = "db"
+"#;
+
+    const MINIMAL_SPEC: &str = r#"
+[product]
+name = "NAME"
+intent = "x"
+
+[product.source]
+tables = ["c.s.t"]
+
+[product.output]
+grain = ["id"]
+columns = [{ name = "id", type = "Int64", nullable = false }]
+
+[product.trust]
+agent = "propose_only"
+"#;
+
+    fn project_with_products(specs: &[(&str, &str)]) -> (tempfile::TempDir, ValidateOutput) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(&config, MINIMAL_CONFIG).unwrap();
+        std::fs::create_dir_all(dir.path().join("products")).unwrap();
+        for (file, contents) in specs {
+            std::fs::write(dir.path().join("products").join(file), contents).unwrap();
+        }
+        let out = validate_inner(&config).unwrap();
+        (dir, out)
+    }
+
+    fn codes(out: &ValidateOutput, code: &str) -> usize {
+        out.messages.iter().filter(|m| m.code == code).count()
+    }
+
+    #[test]
+    fn products_absent_emits_nothing_from_the_band() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("rocky.toml");
+        std::fs::write(&config, MINIMAL_CONFIG).unwrap();
+        let out = validate_inner(&config).unwrap();
+        for code in ["V050", "V051", "V052", "V053"] {
+            assert_eq!(codes(&out, code), 0, "{code}");
+        }
+    }
+
+    #[test]
+    fn parsed_products_report_v050_ok() {
+        let (_dir, out) = project_with_products(&[
+            ("alpha.toml", &MINIMAL_SPEC.replace("NAME", "alpha")),
+            ("beta.toml", &MINIMAL_SPEC.replace("NAME", "beta")),
+        ]);
+        assert_eq!(codes(&out, "V050"), 1);
+        assert!(out.valid, "a clean products dir does not fail validate");
+    }
+
+    #[test]
+    fn an_unparseable_spec_reports_v051_with_the_reject_code() {
+        let (_dir, out) = project_with_products(&[(
+            "alpha.toml",
+            &MINIMAL_SPEC.replace("agent = \"propose_only\"", "agent = \"auto_apply\""),
+        )]);
+        assert_eq!(codes(&out, "V051"), 1);
+        let message = &out
+            .messages
+            .iter()
+            .find(|m| m.code == "V051")
+            .expect("V051")
+            .message;
+        assert!(
+            message.contains("trust-not-propose-only"),
+            "the parser's stable reject code rides in the message: {message}"
+        );
+        assert_eq!(
+            codes(&out, "V050"),
+            0,
+            "a failing spec forfeits the ok line"
+        );
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn a_misnamed_spec_reports_v052() {
+        let (_dir, out) =
+            project_with_products(&[("misnamed.toml", &MINIMAL_SPEC.replace("NAME", "alpha"))]);
+        assert_eq!(codes(&out, "V052"), 1);
+        assert!(!out.valid);
+    }
+
+    #[test]
+    fn a_duplicate_output_model_reports_v053() {
+        let (_dir, out) = project_with_products(&[
+            ("alpha.toml", &MINIMAL_SPEC.replace("NAME", "alpha")),
+            (
+                "beta.toml",
+                &MINIMAL_SPEC
+                    .replace("NAME", "beta")
+                    .replace("grain = [", "model = \"alpha\"\ngrain = ["),
+            ),
+        ]);
+        assert_eq!(codes(&out, "V053"), 1);
+        assert!(!out.valid);
     }
 
     /// Write a config, then return both what `rocky validate` reports and

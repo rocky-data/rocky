@@ -219,6 +219,7 @@ async fn drive_run(
         None,  // #1460
     )
     .await
+    .map(|_| ())
 }
 
 /// Drive the real `commands::run` GOVERNED, against a config that has NO
@@ -276,6 +277,7 @@ async fn drive_run_governed(
         None,  // #1460
     )
     .await
+    .map(|_| ())
 }
 
 /// A temp DuckDB project with a load pipeline (`ingest`, `data/*.csv` →
@@ -946,15 +948,38 @@ fn backfill_fixture_with(model_sql: &str, with_policy: bool) -> (ModelProject, S
         std::fs::write(&project.config_path, cfg).expect("append policy block");
     }
 
-    let plan_id = rocky_cli::plan_store::write_plan(
-        &root,
-        rocky_cli::plan_store::PlanKind::Backfill,
-        &serde_json::json!({
-            "models": ["m1"],
-            "models_dir": "models",
-        }),
+    // The raw plan writers are `pub(crate)` (the route-inventory
+    // invariant: no public API can mint a plan without crossing the
+    // governed propose helper), so this fixture fabricates the plan FILE
+    // per the documented on-disk contract instead — `.rocky/plans/
+    // <plan_id>.json`, where `plan_id` is blake3 over the canonical
+    // `{"kind", "payload"}` envelope. `read_plan`'s integrity re-hash
+    // verifies the fabrication is faithful.
+    let payload = serde_json::json!({
+        "models": ["m1"],
+        "models_dir": "models",
+    });
+    let envelope = serde_json::json!({ "kind": "backfill", "payload": payload });
+    let plan_id = blake3::hash(&serde_json::to_vec(&envelope).expect("envelope"))
+        .to_hex()
+        .to_string();
+    let plans_dir = root.join(".rocky").join("plans");
+    std::fs::create_dir_all(&plans_dir).expect("plans dir");
+    let record = serde_json::json!({
+        "plan_id": plan_id,
+        "kind": "backfill",
+        "created_at": "2026-08-18T00:00:00Z",
+        "format_version": 1,
+        "principal": "agent",
+        "payload": payload,
+    });
+    std::fs::write(
+        plans_dir.join(format!("{plan_id}.json")),
+        serde_json::to_vec_pretty(&record).expect("record"),
     )
     .expect("persist backfill plan");
+    // The fabricated bytes must still pass the loader's integrity check.
+    rocky_cli::plan_store::read_plan(&root, &plan_id).expect("fabricated plan reads back");
     let marker = root.join(".rocky").join("plans");
     std::fs::create_dir_all(&marker).expect("plans dir");
     // A WELL-FORMED marker naming the plan: the apply gate parses and

@@ -753,8 +753,13 @@ struct IdempotencyCtx {
 /// Outcome of the initial claim attempt at the top of `rocky run`.
 enum IdempotencyOutcome {
     /// Key dedups — the caller already emitted a `skipped_*` `RunOutput`
-    /// and exited. `run()` should return immediately.
-    Skipped,
+    /// and exited. `run()` should return immediately, carrying the typed
+    /// skip so an in-process caller (the governed apply core) can journal
+    /// it honestly instead of reading `Ok` as "applied".
+    Skipped {
+        status: rocky_core::state::RunStatus,
+        prior_run_id: String,
+    },
     /// Key claimed (or adopted from stale) — run proceeds; ctx is threaded
     /// to the finalize path.
     Proceed(IdempotencyCtx),
@@ -850,7 +855,10 @@ async fn try_claim_idempotency(
                 rocky_core::state::RunStatus::SkippedIdempotent,
                 output_json,
             )?;
-            Ok(IdempotencyOutcome::Skipped)
+            Ok(IdempotencyOutcome::Skipped {
+                status: rocky_core::state::RunStatus::SkippedIdempotent,
+                prior_run_id,
+            })
         }
         IdempotencyCheck::SkipInFlight {
             run_id: prior_run_id,
@@ -861,7 +869,10 @@ async fn try_claim_idempotency(
                 rocky_core::state::RunStatus::SkippedInFlight,
                 output_json,
             )?;
-            Ok(IdempotencyOutcome::Skipped)
+            Ok(IdempotencyOutcome::Skipped {
+                status: rocky_core::state::RunStatus::SkippedInFlight,
+                prior_run_id,
+            })
         }
     }
 }
@@ -1329,6 +1340,34 @@ pub(crate) fn resolve_replication_authority(
     }
 }
 
+/// How a `run()` invocation terminated, beyond its `Result`.
+///
+/// `run()` historically returned `Result<()>`, which cannot distinguish
+/// "the pipeline ran" from "the idempotency key already dedups" — and a
+/// governed apply that resumes a crashed attempt MUST journal a
+/// `skipped_in_flight` deflection honestly rather than recording
+/// `applied`. Every path that ran (success, partial failure with the
+/// output already emitted, dry-run, no-op) terminates `Completed`; only
+/// the idempotency short-circuits — which never start the pipeline —
+/// carry their skip. CLI callers discard this value, so exit-code and
+/// output behavior are byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunTermination {
+    /// The run path executed (or legitimately no-oped) past the
+    /// idempotency gate.
+    Completed,
+    /// The key holds a terminal `Succeeded` receipt — nothing ran.
+    SkippedIdempotent {
+        /// The run that already satisfied this key.
+        prior_run_id: String,
+    },
+    /// The key holds a live in-flight claim — nothing ran.
+    SkippedInFlight {
+        /// The run currently (or apparently) holding the claim.
+        prior_run_id: String,
+    },
+}
+
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run", fields(run_id))]
@@ -1420,7 +1459,7 @@ pub async fn run(
     // SAME `decide_drift_scope` rule at the point the work is actually built,
     // which keeps the filter-scope tolerance identical.
     reviewed_source_state: Option<(&str, &[crate::output::ReplicationConnectorSnapshot])>,
-) -> Result<()> {
+) -> Result<RunTermination> {
     // With `-o json` stdout is reserved for the JSON payload — route any
     // human-readable summary/progress line (e.g. a `depends_on` upstream
     // pipeline's "Copied …") to stderr so it can't precede the JSON document.
@@ -1475,7 +1514,17 @@ pub async fn run(
             match try_claim_idempotency(&loaded.config.state, state_path, key, &run_id, output_json)
                 .await?
             {
-                IdempotencyOutcome::Skipped => return Ok(()),
+                IdempotencyOutcome::Skipped {
+                    status,
+                    prior_run_id,
+                } => {
+                    return Ok(match status {
+                        rocky_core::state::RunStatus::SkippedInFlight => {
+                            RunTermination::SkippedInFlight { prior_run_id }
+                        }
+                        _ => RunTermination::SkippedIdempotent { prior_run_id },
+                    });
+                }
                 IdempotencyOutcome::Proceed(ctx) => Some(ctx),
             }
         }
@@ -5665,7 +5714,9 @@ pub async fn run(
         }
     }
 
-    run_result
+    // Every exit of the body block ran (or no-oped) past the idempotency
+    // gate; the skip terminations returned from `run()` directly, above.
+    run_result.map(|()| RunTermination::Completed)
 }
 
 /// End-of-run retention sweep, gated by `last_retention_sweep_at`.
@@ -15461,6 +15512,7 @@ timestamp_column = "ts"
                 None, // #1460
             )
             .await
+            .map(|_| ())
         }
 
         let tmp = tempfile::TempDir::new().expect("temp dir");

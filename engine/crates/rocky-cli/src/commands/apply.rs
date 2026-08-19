@@ -103,6 +103,34 @@ pub(crate) async fn run_apply_in(
     expect_spec_digest: Option<&str>,
     output_json: bool,
 ) -> Result<()> {
+    run_apply_core_in(
+        root,
+        config_path,
+        plan_id,
+        state_path,
+        runtime_principal,
+        expect_spec_digest,
+        output_json,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The typed apply core behind [`run_apply_in`]: the same dispatch,
+/// returning the [`ApplyOutcome`] instead of discarding it. The CLI
+/// wrapper drops the value (byte-identical behavior); the fulfillment
+/// façade consumes it, because a resumed apply deflected as
+/// `skipped_in_flight` returns `Ok` here and would otherwise be
+/// mis-journaled as `applied`.
+pub(crate) async fn run_apply_core_in(
+    root: &Path,
+    config_path: &Path,
+    plan_id: &str,
+    state_path: &Path,
+    runtime_principal: PolicyPrincipal,
+    expect_spec_digest: Option<&str>,
+    output_json: bool,
+) -> Result<ApplyOutcome> {
     let plan =
         read_plan(root, plan_id).with_context(|| format!("failed to read plan '{plan_id}'"))?;
 
@@ -126,6 +154,7 @@ pub(crate) async fn run_apply_in(
                 output_json,
             )
             .await
+            .map(|()| ApplyOutcome::Applied { run_id: None })
         }
         PlanKind::Archive => {
             // Delegate to the archive apply path (destructive: DELETE + VACUUM),
@@ -139,6 +168,7 @@ pub(crate) async fn run_apply_in(
                 output_json,
             )
             .await
+            .map(|()| ApplyOutcome::Applied { run_id: None })
         }
         PlanKind::Run => {
             run_apply_run_plan(
@@ -162,17 +192,16 @@ pub(crate) async fn run_apply_in(
             )
             .await
         }
-        PlanKind::Promote => {
-            run_apply_promote_plan(
-                root,
-                config_path,
-                plan_id,
-                state_path,
-                runtime_principal,
-                output_json,
-            )
-            .await
-        }
+        PlanKind::Promote => run_apply_promote_plan(
+            root,
+            config_path,
+            plan_id,
+            state_path,
+            runtime_principal,
+            output_json,
+        )
+        .await
+        .map(|()| ApplyOutcome::Applied { run_id: None }),
         PlanKind::AiAuthored => {
             run_apply_ai_authored_plan(
                 root,
@@ -195,28 +224,26 @@ pub(crate) async fn run_apply_in(
             )
             .await
         }
-        PlanKind::Gc => {
-            super::gc::run_gc_apply_in(
-                root,
-                config_path,
-                plan_id,
-                state_path,
-                runtime_principal,
-                output_json,
-            )
-            .await
-        }
-        PlanKind::Restore => {
-            super::restore::run_restore_apply_in(
-                root,
-                config_path,
-                plan_id,
-                state_path,
-                runtime_principal,
-                output_json,
-            )
-            .await
-        }
+        PlanKind::Gc => super::gc::run_gc_apply_in(
+            root,
+            config_path,
+            plan_id,
+            state_path,
+            runtime_principal,
+            output_json,
+        )
+        .await
+        .map(|()| ApplyOutcome::Applied { run_id: None }),
+        PlanKind::Restore => super::restore::run_restore_apply_in(
+            root,
+            config_path,
+            plan_id,
+            state_path,
+            runtime_principal,
+            output_json,
+        )
+        .await
+        .map(|()| ApplyOutcome::Applied { run_id: None }),
     }
 }
 
@@ -409,7 +436,7 @@ async fn run_apply_run_plan(
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
     output_json: bool,
-) -> Result<()> {
+) -> Result<ApplyOutcome> {
     let plan =
         read_plan(root, plan_id).with_context(|| format!("failed to read run plan '{plan_id}'"))?;
 
@@ -521,7 +548,7 @@ async fn run_apply_run_plan(
         config_path,
         !run_plan.models.is_empty(),
     );
-    execute_run_plan(
+    let termination = execute_run_plan(
         config_path,
         std::sync::Arc::clone(&loaded),
         plan_id,
@@ -541,7 +568,8 @@ async fn run_apply_run_plan(
         &loaded.config,
         governed.as_ref(),
     )
-    .await
+    .await?;
+    Ok(apply_outcome_for(termination, &apply_run_id))
 }
 
 /// Reject contradictory persisted run flags before an apply reads config or
@@ -745,7 +773,7 @@ async fn execute_run_plan(
     // Governance context (agent apply): the in-run TOCTOU models-drift reject +
     // post-discovery replication gate. `None` for a human apply.
     governed_ctx: Option<&GovernedRunContext<'_>>,
-) -> Result<()> {
+) -> Result<crate::commands::run::RunTermination> {
     // ‼️ Finding #2/#1: preflight the reviewed source-schema snapshot BEFORE any
     // warehouse mutation — this path executes models (and, for a replication
     // pipeline, does replication discovery/DDL first), so a v1/missing-snapshot
@@ -874,7 +902,10 @@ async fn execute_run_plan(
             crate::commands::run_dag_exec::replayed_node_concurrency(run_plan.parallel),
         )
         .await
-        .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"));
+        .with_context(|| format!("rocky apply run plan '{plan_id}' failed (dag path)"))
+        // The DAG replay path takes no idempotency key, so a completed
+        // replay is the only non-error termination it can produce.
+        .map(|()| crate::commands::run::RunTermination::Completed);
     }
 
     // ‼️ Finding #2 (missing-dir), REPLICATION seam: a governed non-dag apply whose
@@ -974,11 +1005,11 @@ async fn execute_run_plan(
         None, // #1460: not a replication plan
     )
     .await
-    .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))?;
+    .with_context(|| format!("rocky apply run plan '{plan_id}' failed"))
 
     // The `run` command has already emitted its own JSON (or text) output.
-    // Nothing more to emit in the inline/non-envelope path.
-    Ok(())
+    // Nothing more to emit in the inline/non-envelope path; the typed
+    // termination flows out to the governed apply core.
 }
 
 /// Path to the review marker for an AI-authored plan:
@@ -1039,6 +1070,52 @@ fn new_apply_run_id() -> String {
 /// Produced by [`evaluate_apply_policy`] at each mutating enforcement point —
 /// `rocky apply`, promote, and the MCP `propose` gate — so all three share one
 /// per-model evaluation and one aggregation rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// The plan executed. For a run-shaped plan (`Run` / `AiAuthored` /
+    /// `Replication`) this carries the apply's own forced run id; the
+    /// maintenance shapes (compact/archive/promote/gc/restore) and the
+    /// backfill executor do not thread one — `None`, honestly, rather
+    /// than a fabricated id.
+    Applied {
+        /// The run id this apply recorded under, when the path forces one.
+        run_id: Option<String>,
+    },
+    /// The plan's idempotency key already holds a terminal `Succeeded`
+    /// receipt — nothing executed.
+    SkippedIdempotent {
+        /// The run that already satisfied the key.
+        prior_run_id: String,
+    },
+    /// The plan's idempotency key holds a live in-flight claim — nothing
+    /// executed. A caller journaling this as `applied` would be lying;
+    /// this variant exists so it cannot.
+    SkippedInFlight {
+        /// The run currently holding the claim.
+        prior_run_id: String,
+    },
+}
+
+/// Map a run-path termination onto the apply outcome, binding the forced
+/// apply run id to the `Applied` arm.
+fn apply_outcome_for(
+    termination: crate::commands::run::RunTermination,
+    apply_run_id: &str,
+) -> ApplyOutcome {
+    use crate::commands::run::RunTermination;
+    match termination {
+        RunTermination::Completed => ApplyOutcome::Applied {
+            run_id: Some(apply_run_id.to_string()),
+        },
+        RunTermination::SkippedIdempotent { prior_run_id } => {
+            ApplyOutcome::SkippedIdempotent { prior_run_id }
+        }
+        RunTermination::SkippedInFlight { prior_run_id } => {
+            ApplyOutcome::SkippedInFlight { prior_run_id }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyGate {
     /// No `[policy]` block in the config — the evaluator was never
@@ -3321,7 +3398,7 @@ async fn run_apply_ai_authored_plan(
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
     output_json: bool,
-) -> Result<()> {
+) -> Result<ApplyOutcome> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read AI-authored plan '{plan_id}'"))?;
 
@@ -3460,7 +3537,7 @@ async fn run_apply_ai_authored_plan(
         config_path,
         !run_plan.models.is_empty(),
     );
-    execute_run_plan(
+    let termination = execute_run_plan(
         config_path,
         std::sync::Arc::clone(&loaded),
         plan_id,
@@ -3480,7 +3557,8 @@ async fn run_apply_ai_authored_plan(
         &loaded.config,
         governed.as_ref(),
     )
-    .await
+    .await?;
+    Ok(apply_outcome_for(termination, &apply_run_id))
 }
 
 /// Apply a `PlanKind::Backfill` plan — a scoped, review-gated recovery run.
@@ -3532,7 +3610,7 @@ async fn run_apply_backfill_plan(
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
     output_json: bool,
-) -> Result<()> {
+) -> Result<ApplyOutcome> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read backfill plan '{plan_id}'"))?;
 
@@ -3817,6 +3895,9 @@ async fn run_apply_backfill_plan(
     )
     .await
     .with_context(|| format!("rocky apply backfill plan '{plan_id}' failed"))
+    // The backfill executor threads no forced run id at this seam — the
+    // honest answer is `None`, never a fabricated id.
+    .map(|()| ApplyOutcome::Applied { run_id: None })
 }
 
 /// Apply a `PlanKind::Replication` plan by re-running discovery, asserting
@@ -3885,7 +3966,7 @@ async fn run_apply_replication_plan(
     state_path: &Path,
     runtime_principal: PolicyPrincipal,
     output_json: bool,
-) -> Result<()> {
+) -> Result<ApplyOutcome> {
     let plan = read_plan(root, plan_id)
         .with_context(|| format!("failed to read replication plan '{plan_id}'"))?;
 
@@ -4102,7 +4183,7 @@ async fn run_apply_replication_plan(
 
     let replication_shadow_config = replication_shadow_config(&replication_plan, state_path)?;
 
-    crate::commands::run::run(
+    let termination = crate::commands::run::run(
         config_path,
         // Execute-from-owned: the SAME snapshot the drift check read (#1120).
         std::sync::Arc::clone(&loaded),
@@ -4158,7 +4239,8 @@ async fn run_apply_replication_plan(
         &loaded.config,
         governed.as_ref(),
     )
-    .await
+    .await?;
+    Ok(apply_outcome_for(termination, &apply_run_id))
 }
 
 /// Outcome of the symmetric source-state drift comparison at apply time,
@@ -4599,6 +4681,7 @@ pub async fn run_apply_inline_for_run(
         None, // #1460: inline `rocky run`, not a persisted plan
     )
     .await
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -8756,7 +8839,7 @@ schema_template = "s__{source}"
         // somewhere. Accepting any error would let this pass for an unrelated
         // reason and prove nothing about legacy compatibility.
         match res {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(e) => {
                 let msg = format!("{e:#}");
                 assert!(

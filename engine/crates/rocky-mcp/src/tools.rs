@@ -2945,7 +2945,7 @@ impl RockyMcpServer {
         // Product identity is all-or-nothing: exactly one of the pair is a
         // caller bug, and an empty string is not an identity. Validated before
         // any compile work so the refusal is immediate and structured.
-        match (args.product_id.as_deref(), args.spec_digest.as_deref()) {
+        let product = match (args.product_id.as_deref(), args.spec_digest.as_deref()) {
             (Some(p), _) | (_, Some(p)) if p.trim().is_empty() => {
                 return Err(ToolError::invalid_argument(
                     "product_id / spec_digest must be non-empty when present",
@@ -2960,238 +2960,145 @@ impl RockyMcpServer {
                      revision), or omit both for a non-product plan.",
                 ));
             }
-            _ => {}
-        }
-        let result = self
-            .compile_full()
-            .map_err(|e| ToolError::compile_failed(format!("{e:#}")))?;
-        if result.project.models.is_empty() {
-            return Err(ToolError::empty_project(
-                "project has no compiled models to propose",
-            ));
-        }
-        let models: Vec<String> = result
-            .project
-            .models
-            .iter()
-            .map(|m| m.config.name.clone())
-            .collect();
-
-        // If a model filter was given, assert it exists so we don't write a
-        // plan that applies to nothing.
-        if let Some(model) = args.model.as_deref()
-            && !models.iter().any(|m| m == model)
-        {
-            return Err(ToolError::model_not_found(model));
-        }
-
-        // Runner-supplied idempotency key wins; when the product pair is
-        // present and no key was supplied, derive the documented
-        // attempt-aliasing fallback so a product propose never bypasses dedup
-        // (`None` would — the run path skips dedup entirely without a key).
-        let idempotency_key = args.idempotency_key.clone().or_else(|| {
-            args.product_id
-                .as_deref()
-                .zip(args.spec_digest.as_deref())
-                .map(|(p, s)| format!("{p}@{s}"))
-        });
-        let run_plan = build_ai_run_plan(
-            args.model.clone(),
-            &result,
-            args.product_id.clone(),
-            args.spec_digest.clone(),
-            idempotency_key,
-        );
-
-        // The `propose` tool is the sole MCP writer of plans; it always authors
-        // an AI-authored plan and therefore always acts as the `agent`
-        // principal. Embed the propose-time change-classification so the
-        // reviewed capabilities bind to the plan_id (a creds-free / non-git
-        // project fails closed — every model classified breaking).
-        let state_path = self.state_path();
-        let capabilities = rocky_cli::commands::compute_embedded_capabilities(
-            &self.config_path,
-            &self.models_dir,
-            "main",
-            Some(&state_path),
-            None, // MCP propose has no `--env`; governance identity binds defaults
-            // Finding #4: `build_ai_run_plan` persists `run_all=false, models_dir=
-            // None`, so the apply never reaches the mask-reconciling model leg
-            // (replication needs `run_all||models_dir`; transformation runs no
-            // masks). The mask is therefore never bound — `false` on both sides.
-            false,
-        );
-
-        // Consult the agent-policy plane before persisting — the same per-model
-        // evaluation `rocky apply` runs — so an over-eager agent receives a
-        // structured, parseable verdict at propose time instead of a plan a
-        // later apply silently refuses. Absent a `[policy]` block this resolves
-        // to `NotConfigured` and behaviour is byte-identical to before the plane.
-        //
-        // Gate on the models the apply will EXECUTE: the freshly-compiled
-        // project (`run_plan.models`) narrowed by the plan's `--model`
-        // selection — mirroring how `rocky apply` re-derives the execution set
-        // from a recompile. `run_plan.models` is authoritative here (just built
-        // from `result`), so filtering it matches the apply-time recompile.
-        let executable: Vec<String> = run_plan
-            .models
-            .iter()
-            .filter(|name| {
-                run_plan
-                    .model
-                    .as_deref()
-                    .is_none_or(|target| target == name.as_str())
-            })
-            .cloned()
-            .collect();
-        let touched = capabilities.touched(&executable);
-        // The deterministic id the plan will carry if written — recorded in the
-        // audit ledger (and named in a review message) even when a deny refuses
-        // to persist the plan.
-        let plan_id = rocky_cli::plan_store::governed_plan_id(
-            &rocky_cli::plan_store::PlanKind::AiAuthored,
-            &run_plan,
-            &capabilities,
-        )
-        .map_err(|e| {
-            ToolError::internal(
-                format!("failed to compute plan id: {e:#}"),
-                "Retry the propose; if it persists, verify the project compiles cleanly.",
-            )
-        })?;
-        // Finding 1: load the config ONCE and thread that snapshot into both the
-        // freeze-gate sync decision and the policy gate, so a `rocky.toml` swap
-        // between the two can't let the guard skip the sync while the gate then
-        // reads stale local decisions.
-        let cfg = rocky_core::config::load_rocky_config(&self.config_path).ok();
-        // Finding 4: pull the authoritative remote freeze/budget ledger BEFORE
-        // the policy gate reads it, so an active cross-pod freeze denies the
-        // propose instead of persisting a plan a later apply would refuse.
-        // Fail-closed, remote-only, and only when the gate will actually read the
-        // ledger (a `[policy]` block + a non-empty touched set — otherwise the
-        // gate short-circuits without a ledger read).
-        if let Some(cfg) = &cfg
-            && cfg.policy.is_some()
-            && !touched.is_empty()
-            && !matches!(cfg.state.backend, rocky_core::config::StateBackend::Local)
-        {
-            // PR-A (RD-001): bind the typed authority — a successful download
-            // of either usable variant means the local ledger now mirrors
-            // remote truth; failure still `?`-bails fail-closed (unchanged).
-            // PR-B branches on the value.
-            let _authority = rocky_core::state_sync::download_state(&cfg.state, &state_path)
-                .await
-                .map_err(|e| {
-                    ToolError::internal(
-                        format!("failed to download remote state before the policy gate: {e:#}"),
-                        "The remote [state] backend must be reachable so a cross-pod freeze is \
-                         enforced before proposing a plan.",
-                    )
-                })?;
-        }
-        // Durable freeze-marker LIST, hoisted beside the ledger download —
-        // a marker-only freeze (its ledger row erased by a concurrent state
-        // upload) must still deny the propose. Same guard shape (the helper
-        // short-circuits without `[policy]` / an empty touched set /
-        // no durable tier); fail-closed on a transport failure.
-        let marker_freezes = match &cfg {
-            Some(cfg) => rocky_cli::commands::marker_freezes_before_gate(cfg, &touched)
-                .await
-                .map_err(|e| {
-                    ToolError::internal(
-                        format!(
-                            "failed to list durable freeze markers before the policy gate: {e:#}"
-                        ),
-                        "The durable `[state]` tier must be reachable so an active freeze marker \
-                         is enforced before proposing a plan (fail-closed).",
-                    )
-                })?,
-            None => Vec::new(),
+            (Some(product_id), Some(spec_digest)) => {
+                Some(rocky_cli::commands::fulfill_api::ProductBinding {
+                    product_id: product_id.to_string(),
+                    spec_digest: spec_digest.to_string(),
+                })
+            }
+            (None, None) => None,
         };
-        let gate = rocky_cli::commands::evaluate_apply_policy_with_policy(
-            cfg.as_ref().and_then(|c| c.policy.as_ref()),
-            &plan_id,
-            rocky_core::config::PolicyPrincipal::Agent,
-            &touched,
-            &self.models_dir,
-            &state_path,
-            &marker_freezes,
-        );
 
-        let write_plan = || {
-            rocky_cli::plan_store::write_plan_governed(
-                &self.root,
-                rocky_cli::plan_store::PlanKind::AiAuthored,
-                &run_plan,
-                rocky_core::config::PolicyPrincipal::Agent,
-                capabilities,
-            )
-            .map_err(|e| {
-                ToolError::internal(
-                    format!("failed to write AI-authored plan: {e:#}"),
+        // The `propose` tool is the sole MCP writer of plans; it always
+        // authors an AI-authored plan and therefore always acts as the
+        // `agent` principal. The whole gate sequence — compile, plan build,
+        // capability classification, deterministic id, authoritative ledger
+        // sync, durable freeze markers, the policy gate, and the
+        // deny-persists-nothing rule — lives in ONE shared helper
+        // (`propose_governed_run_plan`), which the fulfillment loop also
+        // drives; this tool only maps the typed outcome back onto its wire
+        // envelopes (pinned byte-for-byte by the wire-parity goldens).
+        let state_path = self.state_path();
+        let outcome = rocky_cli::commands::propose_governed_run_plan(
+            rocky_cli::commands::fulfill_api::ProposeRequest {
+                root: &self.root,
+                config_path: &self.config_path,
+                models_dir: &self.models_dir,
+                state_path: &state_path,
+                model: args.model.clone(),
+                product,
+                idempotency_key: args.idempotency_key.clone(),
+            },
+        )
+        .await;
+
+        use rocky_cli::commands::fulfill_api::{ProposeError, ProposeOutcome};
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(ProposeError::Compile(inner)) => {
+                return Err(ToolError::compile_failed(inner));
+            }
+            Err(ProposeError::EmptyProject) => {
+                return Err(ToolError::empty_project(
+                    "project has no compiled models to propose",
+                ));
+            }
+            Err(ProposeError::ModelNotFound(model)) => {
+                return Err(ToolError::model_not_found(&model));
+            }
+            Err(ProposeError::PlanId(inner)) => {
+                return Err(ToolError::internal(
+                    format!("failed to compute plan id: {inner}"),
+                    "Retry the propose; if it persists, verify the project compiles cleanly.",
+                ));
+            }
+            Err(ProposeError::LedgerDownload(inner)) => {
+                return Err(ToolError::internal(
+                    format!("failed to download remote state before the policy gate: {inner}"),
+                    "The remote [state] backend must be reachable so a cross-pod freeze is \
+                     enforced before proposing a plan.",
+                ));
+            }
+            Err(ProposeError::MarkerList(inner)) => {
+                return Err(ToolError::internal(
+                    format!(
+                        "failed to list durable freeze markers before the policy gate: {inner}"
+                    ),
+                    "The durable `[state]` tier must be reachable so an active freeze marker \
+                     is enforced before proposing a plan (fail-closed).",
+                ));
+            }
+            Err(ProposeError::PlanWrite(inner)) => {
+                return Err(ToolError::internal(
+                    format!("failed to write AI-authored plan: {inner}"),
                     "Ensure the project directory is writable so the plan store can persist the \
                      plan.",
-                )
-            })
+                ));
+            }
         };
 
-        match gate {
-            rocky_cli::commands::PolicyGate::NotConfigured
-            | rocky_cli::commands::PolicyGate::Allow => {
-                let plan_id = write_plan()?;
-                Ok(Json(ProposeResult {
-                    plan_id,
-                    models,
-                    product_id: args.product_id,
-                    spec_digest: args.spec_digest,
-                }))
-            }
-            rocky_cli::commands::PolicyGate::RequireReview {
-                model,
-                rule_id,
-                reason,
+        match outcome {
+            ProposeOutcome::Written {
+                plan_id,
+                models,
+                product_id,
+                spec_digest,
+            } => Ok(Json(ProposeResult {
+                plan_id,
+                models,
+                product_id,
+                spec_digest,
+            })),
+            ProposeOutcome::ReviewRequired {
+                plan_id,
+                product_id,
+                spec_digest,
+                refusal,
             } => {
-                // Headed to human review — persist the plan so a reviewer can
-                // approve it, then return a structured signal the agent parses.
-                // The recorded plan's id (and its product binding, when the
-                // propose carried one) ride as TYPED envelope fields — the
-                // machine handoff a fulfillment runner branches on; the prose
-                // repeats them for humans only.
-                let plan_id = write_plan()?;
-                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+                // Headed to human review — the plan is recorded; return the
+                // structured signal the agent parses. The recorded plan's id
+                // (and its product binding, when the propose carried one)
+                // ride as TYPED envelope fields — the machine handoff a
+                // fulfillment runner branches on; the prose repeats them for
+                // humans only.
+                let named = refusal
+                    .rule_id
+                    .map(|r| format!(" (rule {r})"))
+                    .unwrap_or_default();
                 Err(ToolError::policy_review_required_for_plan(
                     format!(
                         "policy requires human review before this change can apply: \
-                         model '{model}'{named} — {reason}. The plan was recorded as {plan_id}."
+                         model '{}'{named} — {}. The plan was recorded as {plan_id}.",
+                        refusal.model, refusal.reason
                     ),
                     format!(
                         "A human must run `rocky review {plan_id} --approve` then \
                          `rocky apply {plan_id}`; never approve on the user's behalf."
                     ),
-                    rule_id.map(|r| r.to_string()),
+                    refusal.rule_id.map(|r| r.to_string()),
                     plan_id,
-                    args.product_id,
-                    args.spec_digest,
+                    product_id,
+                    spec_digest,
                 ))
             }
-            rocky_cli::commands::PolicyGate::Deny {
-                model,
-                rule_id,
-                reason,
-            } => {
-                // A deny cannot be satisfied by review — do NOT persist the
-                // plan; the decision is already recorded in the audit ledger.
-                let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
+            ProposeOutcome::Denied { refusal } => {
+                // A deny cannot be satisfied by review — no plan was
+                // recorded; the decision is already in the audit ledger.
+                let named = refusal
+                    .rule_id
+                    .map(|r| format!(" (rule {r})"))
+                    .unwrap_or_default();
                 Err(ToolError::policy_denied(
                     format!(
-                        "policy denies proposing this change: model '{model}'{named} — {reason}. \
-                         A deny cannot be satisfied by human review, so no plan was recorded."
+                        "policy denies proposing this change: model '{}'{named} — {}. \
+                         A deny cannot be satisfied by human review, so no plan was recorded.",
+                        refusal.model, refusal.reason
                     ),
                     "Re-scope the change so it no longer touches the denied model — propose to a \
                      branch, or drop that model from the change. A denied change cannot be applied \
                      even after review."
                         .to_string(),
-                    rule_id.map(|r| r.to_string()),
+                    refusal.rule_id.map(|r| r.to_string()),
                 ))
             }
         }
@@ -4594,59 +4501,6 @@ fn render_cell(v: serde_json::Value) -> String {
         out
     } else {
         s
-    }
-}
-
-/// Build an AI-authored `RunPlan` for the given model filter. Constructed
-/// inline (the `rocky plan` builder is private + entangled with discovery);
-/// every field is set explicitly so a future field addition is a compile error
-/// rather than a silent default.
-///
-/// `product_id` / `spec_digest` are the opaque product identity the propose
-/// carried (validated both-or-neither by the caller); `idempotency_key` is the
-/// already-resolved key (runner-supplied, or the derived
-/// `"<product_id>@<spec_digest>"` fallback).
-fn build_ai_run_plan(
-    model: Option<String>,
-    result: &CompilerResult,
-    product_id: Option<String>,
-    spec_digest: Option<String>,
-    idempotency_key: Option<String>,
-) -> rocky_cli::output::RunPlan {
-    let models: Vec<String> = result
-        .project
-        .models
-        .iter()
-        .map(|m| m.config.name.clone())
-        .collect();
-    let execution_layers: Vec<Vec<String>> = result.project.layers.clone();
-    rocky_cli::output::RunPlan {
-        filter: None,
-        pipeline: None,
-        model,
-        branch: None,
-        partition: None,
-        partition_from: None,
-        partition_to: None,
-        latest: false,
-        missing: false,
-        lookback: None,
-        parallel: 1,
-        run_all: false,
-        env: None,
-        models_dir: None,
-        resume: None,
-        resume_latest: false,
-        shadow: false,
-        shadow_suffix: None,
-        shadow_schema: None,
-        dag: false,
-        idempotency_key,
-        governance_override: None,
-        models,
-        execution_layers,
-        product_id,
-        spec_digest,
     }
 }
 

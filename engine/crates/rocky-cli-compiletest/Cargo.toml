@@ -1,0 +1,18 @@
+[package]
+name = "rocky-cli-compiletest"
+version = "0.0.0"
+description = "Out-of-crate proof that rocky-cli's plan writers are pub(crate) (E0603)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# This edge is load-bearing, not incidental: depending on `rocky-cli` is what
+# makes cargo build `librocky_cli-*.rlib` (with all its transitive dep rlibs)
+# into THIS crate's own `deps/` dir before the test runs. The test in
+# `tests/plan_writer_privatization.rs` discovers that rlib next to its own
+# binary and runs one out-of-crate `rustc` against it. Drop this dependency and
+# the rlib is neither built nor co-located, and the proof breaks. There are no
+# dev-dependencies: the test drives `rustc` directly through `std::process`.
+[dependencies]
+rocky-cli = { path = "../rocky-cli" }
