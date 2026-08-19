@@ -1521,3 +1521,1506 @@ fn internal_mismatch(observed: &FulfillStateRecord, event: &Event) -> Decision {
         next_command: None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 19, 12, 0, 0).unwrap()
+    }
+
+    fn rec(state: FulfillState) -> FulfillStateRecord {
+        FulfillStateRecord::new(state, "product:revenue_daily".to_string(), None, None)
+    }
+
+    fn me() -> SelfIdentity {
+        SelfIdentity {
+            pid: 4242,
+            start_time: 1_000_000,
+        }
+    }
+
+    // =====================================================================
+    // decide_ownership — claim / stand-down / takeover / grace
+    // =====================================================================
+
+    #[test]
+    fn ownership_absent_record_claims_init_with_our_stamp() {
+        let d = decide_ownership(None, None, me(), "product:revenue_daily", now());
+        let OwnershipDecision::Claim(record) = d else {
+            panic!("expected Claim, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Init);
+        assert_eq!(record.owner_pid, Some(4242));
+        assert_eq!(record.owner_start_time, Some(1_000_000));
+        assert_eq!(record.product_id, "product:revenue_daily");
+    }
+
+    #[test]
+    fn ownership_released_record_claims_immediately() {
+        let mut prior = rec(FulfillState::Proposed);
+        prior.first_swept_at = Some(stamp(now())); // stale mark must clear
+        let d = decide_ownership(Some(&prior), None, me(), "product:revenue_daily", now());
+        let OwnershipDecision::Claim(record) = d else {
+            panic!("expected Claim, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Proposed, "state untouched");
+        assert_eq!(record.owner_pid, Some(4242));
+        assert!(record.first_swept_at.is_none(), "grace mark cleared");
+    }
+
+    #[test]
+    fn ownership_self_stamp_is_already_owned() {
+        let mut prior = rec(FulfillState::Drafting);
+        prior.owner_pid = Some(4242);
+        prior.owner_start_time = Some(1_000_000);
+        let d = decide_ownership(Some(&prior), None, me(), "product:revenue_daily", now());
+        assert_eq!(d, OwnershipDecision::AlreadyOwned);
+    }
+
+    #[test]
+    fn ownership_live_owner_stands_down() {
+        let mut prior = rec(FulfillState::Drafting);
+        prior.owner_pid = Some(99);
+        prior.owner_start_time = Some(5);
+        let d = decide_ownership(
+            Some(&prior),
+            Some(OwnerLiveness::Alive),
+            me(),
+            "product:revenue_daily",
+            now(),
+        );
+        assert_eq!(d, OwnershipDecision::StandDown { owner_pid: 99 });
+    }
+
+    #[test]
+    fn ownership_dead_owner_is_taken_over_immediately() {
+        let mut prior = rec(FulfillState::Applying);
+        prior.owner_pid = Some(99);
+        prior.owner_start_time = Some(5);
+        prior.first_swept_at = Some(stamp(now()));
+        let d = decide_ownership(
+            Some(&prior),
+            Some(OwnerLiveness::Dead),
+            me(),
+            "product:revenue_daily",
+            now(),
+        );
+        let OwnershipDecision::TakeOver(record) = d else {
+            panic!("expected TakeOver, got {d:?}");
+        };
+        assert_eq!(record.owner_pid, Some(4242));
+        assert_eq!(record.owner_start_time, Some(1_000_000));
+        assert!(record.first_swept_at.is_none());
+        assert_eq!(record.state, FulfillState::Applying, "state untouched");
+    }
+
+    #[test]
+    fn ownership_unprobeable_owner_stamps_the_grace_first() {
+        let mut prior = rec(FulfillState::Drafting);
+        prior.owner_pid = Some(99);
+        let d = decide_ownership(
+            Some(&prior),
+            Some(OwnerLiveness::Indefinite("no probe".into())),
+            me(),
+            "product:revenue_daily",
+            now(),
+        );
+        let OwnershipDecision::StampGrace(record) = d else {
+            panic!("expected StampGrace, got {d:?}");
+        };
+        assert_eq!(record.first_swept_at, Some(stamp(now())));
+        assert_eq!(record.owner_pid, Some(99), "the stamp stays until takeover");
+    }
+
+    #[test]
+    fn ownership_unprobeable_owner_waits_out_the_grace() {
+        let mut prior = rec(FulfillState::Drafting);
+        prior.owner_pid = Some(99);
+        prior.first_swept_at = Some(stamp(now() - Duration::seconds(30)));
+        let d = decide_ownership(
+            Some(&prior),
+            Some(OwnerLiveness::Indefinite("no probe".into())),
+            me(),
+            "product:revenue_daily",
+            now(),
+        );
+        let OwnershipDecision::WaitGrace { remaining_seconds } = d else {
+            panic!("expected WaitGrace, got {d:?}");
+        };
+        assert_eq!(
+            remaining_seconds,
+            FULFILL_RECOVERY_GRACE.num_seconds() - 30
+        );
+    }
+
+    #[test]
+    fn ownership_unprobeable_owner_is_taken_over_after_the_grace() {
+        let mut prior = rec(FulfillState::Drafting);
+        prior.owner_pid = Some(99);
+        prior.first_swept_at = Some(stamp(now() - FULFILL_RECOVERY_GRACE));
+        let d = decide_ownership(
+            Some(&prior),
+            Some(OwnerLiveness::Indefinite("no probe".into())),
+            me(),
+            "product:revenue_daily",
+            now(),
+        );
+        let OwnershipDecision::TakeOver(record) = d else {
+            panic!("expected TakeOver, got {d:?}");
+        };
+        assert_eq!(record.owner_pid, Some(4242));
+        assert!(record.first_swept_at.is_none());
+    }
+
+    // =====================================================================
+    // init | first run | → elicitation task → needs_input(spec_approval)
+    // =====================================================================
+
+    #[test]
+    fn init_with_a_candidate_adopts_it_and_asks_for_approval() {
+        let d = decide(
+            &rec(FulfillState::Init),
+            Event::CandidateSurface {
+                candidate_digest: Some("sha256:aa".into()),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::NeedsInput {
+                reason: REASON_SPEC_APPROVAL.into(),
+                payload: "sha256:aa".into()
+            }
+        );
+        assert_eq!(
+            stop.next_command.as_deref(),
+            Some("rocky fulfill approve-spec revenue_daily")
+        );
+    }
+
+    #[test]
+    fn init_without_a_candidate_counts_the_attempt_before_dispatch() {
+        let d = decide(
+            &rec(FulfillState::Init),
+            Event::CandidateSurface {
+                candidate_digest: None,
+            },
+            now(),
+        );
+        let Decision::AdvanceAndAct { record, task, .. } = d else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Init);
+        assert_eq!(record.drafting_attempts, 1, "pre-counted");
+        assert_eq!(task, TaskKind::Elicit);
+    }
+
+    #[test]
+    fn init_elicitation_budget_exhausted_blocks() {
+        let mut prior = rec(FulfillState::Init);
+        prior.drafting_attempts = MAX_COMPILE_ITERS;
+        let d = decide(
+            &prior,
+            Event::CandidateSurface {
+                candidate_digest: None,
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(matches!(record.state, FulfillState::Blocked { .. }));
+        assert_eq!(
+            stop.next_command.as_deref(),
+            Some("rocky fulfill revenue_daily --retry")
+        );
+    }
+
+    #[test]
+    fn init_elicitation_success_stops_at_needs_input_with_the_questions() {
+        let mut prior = rec(FulfillState::Init);
+        prior.drafting_attempts = 2;
+        let d = decide(
+            &prior,
+            Event::ElicitationFinished {
+                written_digest: Some("sha256:bb".into()),
+                questions: vec!["is refunds excluded?".into()],
+                error: None,
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::NeedsInput {
+                reason: REASON_SPEC_APPROVAL.into(),
+                payload: "sha256:bb".into()
+            }
+        );
+        assert_eq!(record.drafting_attempts, 0, "cycle reset");
+        assert!(stop.message.contains("is refunds excluded?"));
+    }
+
+    #[test]
+    fn init_elicitation_failure_retries_within_budget_then_blocks() {
+        let mut prior = rec(FulfillState::Init);
+        prior.drafting_attempts = 1;
+        let d = decide(
+            &prior,
+            Event::ElicitationFinished {
+                written_digest: None,
+                questions: vec![],
+                error: Some("driver timeout".into()),
+            },
+            now(),
+        );
+        assert_eq!(d, Decision::Act(TaskKind::Elicit), "budget remains");
+
+        let mut exhausted = rec(FulfillState::Init);
+        exhausted.drafting_attempts = MAX_COMPILE_ITERS;
+        let d = decide(
+            &exhausted,
+            Event::ElicitationFinished {
+                written_digest: None,
+                questions: vec![],
+                error: Some("driver timeout".into()),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let FulfillState::Blocked { reason } = &record.state else {
+            panic!("expected Blocked");
+        };
+        assert!(reason.contains("driver timeout"));
+    }
+
+    // =====================================================================
+    // elicited (adopted/legacy records) → needs_input(spec_approval)
+    // =====================================================================
+
+    #[test]
+    fn elicited_with_a_candidate_asks_for_approval() {
+        let d = decide(
+            &rec(FulfillState::Elicited),
+            Event::CandidateSurface {
+                candidate_digest: Some("sha256:cc".into()),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::NeedsInput {
+                reason: REASON_SPEC_APPROVAL.into(),
+                payload: "sha256:cc".into()
+            }
+        );
+    }
+
+    #[test]
+    fn elicited_with_the_candidate_gone_restarts() {
+        let d = decide(
+            &rec(FulfillState::Elicited),
+            Event::CandidateSurface {
+                candidate_digest: None,
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Init);
+    }
+
+    // =====================================================================
+    // needs_input(spec_approval) | approve CAS ok → spec_approved;
+    // candidate edited → stays (new digest shown)
+    // =====================================================================
+
+    fn needs_spec_approval(payload: &str) -> FulfillStateRecord {
+        rec(FulfillState::NeedsInput {
+            reason: REASON_SPEC_APPROVAL.into(),
+            payload: payload.into(),
+        })
+    }
+
+    #[test]
+    fn spec_approval_observed_advances_to_spec_approved() {
+        let d = decide(
+            &needs_spec_approval("sha256:aa"),
+            Event::ApprovalSurface {
+                candidate_digest: Some("sha256:aa".into()),
+                approved_digest: Some("sha256:aa".into()),
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::SpecApproved);
+        assert_eq!(record.spec_digest.as_deref(), Some("sha256:aa"));
+    }
+
+    #[test]
+    fn spec_approval_candidate_edit_stays_and_shows_the_new_digest() {
+        let d = decide(
+            &needs_spec_approval("sha256:aa"),
+            Event::ApprovalSurface {
+                candidate_digest: Some("sha256:NEW".into()),
+                approved_digest: None,
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::NeedsInput {
+                reason: REASON_SPEC_APPROVAL.into(),
+                payload: "sha256:NEW".into()
+            }
+        );
+        assert!(stop.message.contains("sha256:NEW"));
+    }
+
+    #[test]
+    fn spec_approval_unchanged_candidate_halts_without_a_write() {
+        let d = decide(
+            &needs_spec_approval("sha256:aa"),
+            Event::ApprovalSurface {
+                candidate_digest: Some("sha256:aa".into()),
+                approved_digest: None,
+            },
+            now(),
+        );
+        let Decision::Halt(stop) = d else {
+            panic!("expected Halt, got {d:?}");
+        };
+        assert_eq!(
+            stop.next_command.as_deref(),
+            Some("rocky fulfill approve-spec revenue_daily")
+        );
+    }
+
+    #[test]
+    fn spec_approval_candidate_deleted_restarts() {
+        let d = decide(
+            &needs_spec_approval("sha256:aa"),
+            Event::ApprovalSurface {
+                candidate_digest: None,
+                approved_digest: None,
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Init);
+    }
+
+    // =====================================================================
+    // needs_input(policy) re-entry
+    // =====================================================================
+
+    fn needs_policy() -> FulfillStateRecord {
+        rec(FulfillState::NeedsInput {
+            reason: REASON_POLICY.into(),
+            payload: String::new(),
+        })
+    }
+
+    #[test]
+    fn policy_pass_advances_to_spec_approved() {
+        let d = decide(&needs_policy(), Event::PostureVerified(PostureStatus::Pass), now());
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::SpecApproved);
+    }
+
+    #[test]
+    fn policy_still_needed_halts_with_the_paste_block() {
+        let d = decide(
+            &needs_policy(),
+            Event::PostureVerified(PostureStatus::NeedsInput {
+                paste_block: "[policy]\nversion = 1".into(),
+                reason: "no [policy] block".into(),
+            }),
+            now(),
+        );
+        let Decision::Halt(stop) = d else {
+            panic!("expected Halt, got {d:?}");
+        };
+        assert!(stop.message.contains("[policy]\nversion = 1"));
+    }
+
+    #[test]
+    fn policy_hard_fail_blocks() {
+        let d = decide(
+            &needs_policy(),
+            Event::PostureVerified(PostureStatus::Fail {
+                reason: "identity collision".into(),
+            }),
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(matches!(record.state, FulfillState::Blocked { .. }));
+    }
+
+    // =====================================================================
+    // spec_approved | snapshot exists, journal sha matches |
+    // verify pass → Phase A → lowered_contract; verify fail → needs_input
+    // =====================================================================
+
+    #[test]
+    fn spec_approved_snapshot_tamper_blocks() {
+        let d = decide(
+            &rec(FulfillState::SpecApproved),
+            Event::SnapshotVerify {
+                snapshot_ok: false,
+                detail: "digest mismatch".into(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let FulfillState::Blocked { reason } = &record.state else {
+            panic!("expected Blocked");
+        };
+        assert!(reason.contains("tampered"));
+    }
+
+    #[test]
+    fn spec_approved_snapshot_ok_verifies_the_posture() {
+        let d = decide(
+            &rec(FulfillState::SpecApproved),
+            Event::SnapshotVerify {
+                snapshot_ok: true,
+                detail: String::new(),
+            },
+            now(),
+        );
+        assert_eq!(d, Decision::Act(TaskKind::VerifyPosture));
+    }
+
+    #[test]
+    fn spec_approved_posture_pass_lowers_phase_a() {
+        let d = decide(
+            &rec(FulfillState::SpecApproved),
+            Event::PostureVerified(PostureStatus::Pass),
+            now(),
+        );
+        assert_eq!(d, Decision::Act(TaskKind::RunPhaseA));
+    }
+
+    #[test]
+    fn spec_approved_posture_needs_input_stops_with_the_paste_block() {
+        let d = decide(
+            &rec(FulfillState::SpecApproved),
+            Event::PostureVerified(PostureStatus::NeedsInput {
+                paste_block: "[policy]".into(),
+                reason: "posture drift".into(),
+            }),
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::NeedsInput {
+                reason: REASON_POLICY.into(),
+                payload: "[policy]".into()
+            }
+        );
+        assert!(stop.message.contains("[policy]"));
+    }
+
+    #[test]
+    fn spec_approved_posture_fail_blocks() {
+        let d = decide(
+            &rec(FulfillState::SpecApproved),
+            Event::PostureVerified(PostureStatus::Fail {
+                reason: "collision".into(),
+            }),
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(matches!(record.state, FulfillState::Blocked { .. }));
+    }
+
+    #[test]
+    fn spec_approved_phase_a_commit_advances_and_resets_the_cycle() {
+        let mut prior = rec(FulfillState::SpecApproved);
+        prior.drafting_attempts = 3;
+        let d = decide(
+            &prior,
+            Event::PhaseAResult {
+                ok: true,
+                detail: "phase A committed".into(),
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::LoweredContract);
+        assert_eq!(record.drafting_attempts, 0);
+    }
+
+    #[test]
+    fn spec_approved_phase_a_reject_blocks() {
+        let d = decide(
+            &rec(FulfillState::SpecApproved),
+            Event::PhaseAResult {
+                ok: false,
+                detail: "unlowerable field".into(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let FulfillState::Blocked { reason } = &record.state else {
+            panic!("expected Blocked");
+        };
+        assert!(reason.contains("unlowerable field"));
+    }
+
+    // =====================================================================
+    // lowered_contract → drafting (attempt pre-counted)
+    // =====================================================================
+
+    #[test]
+    fn lowered_contract_dispatches_drafting_with_a_counted_attempt() {
+        let d = decide(&rec(FulfillState::LoweredContract), Event::Reentry, now());
+        let Decision::AdvanceAndAct { record, task, .. } = d else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Drafting);
+        assert_eq!(record.drafting_attempts, 1);
+        assert_eq!(task, TaskKind::Draft);
+    }
+
+    #[test]
+    fn lowered_contract_with_exhausted_attempts_blocks() {
+        let mut prior = rec(FulfillState::LoweredContract);
+        prior.drafting_attempts = MAX_COMPILE_ITERS;
+        let d = decide(&prior, Event::Reentry, now());
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(matches!(record.state, FulfillState::Blocked { .. }));
+    }
+
+    // =====================================================================
+    // drafting | driver exit 0 → merged path; failure ≤ retries → retry;
+    // else blocked. merged precondition: byte-verify → blocked(tampered)
+    // =====================================================================
+
+    #[test]
+    fn drafting_success_byte_verifies_phase_a_before_merging() {
+        let d = decide(
+            &rec(FulfillState::Drafting),
+            Event::DraftingFinished { error: None },
+            now(),
+        );
+        assert_eq!(d, Decision::Act(TaskKind::ByteVerifyPhaseA));
+    }
+
+    #[test]
+    fn drafting_failure_retries_within_budget() {
+        let mut prior = rec(FulfillState::Drafting);
+        prior.drafting_attempts = 2;
+        let d = decide(
+            &prior,
+            Event::DraftingFinished {
+                error: Some("worker exited 1".into()),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndAct { record, task, .. } = d else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(record.drafting_attempts, 3);
+        assert_eq!(task, TaskKind::Draft);
+    }
+
+    #[test]
+    fn drafting_failure_exhausted_blocks_with_the_error() {
+        let mut prior = rec(FulfillState::Drafting);
+        prior.drafting_attempts = MAX_COMPILE_ITERS;
+        let d = decide(
+            &prior,
+            Event::DraftingFinished {
+                error: Some("transcript: /t/x.log".into()),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let FulfillState::Blocked { reason } = &record.state else {
+            panic!("expected Blocked");
+        };
+        assert!(reason.contains("/t/x.log"));
+    }
+
+    #[test]
+    fn drafting_clean_byte_verify_runs_phase_b() {
+        let d = decide(
+            &rec(FulfillState::Drafting),
+            Event::ArtifactCheck { problems: vec![] },
+            now(),
+        );
+        assert_eq!(d, Decision::Act(TaskKind::RunPhaseB));
+    }
+
+    #[test]
+    fn drafting_phase_a_tamper_blocks_as_tampered() {
+        let d = decide(
+            &rec(FulfillState::Drafting),
+            Event::ArtifactCheck {
+                problems: vec!["contract hash mismatch".into()],
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let FulfillState::Blocked { reason } = &record.state else {
+            panic!("expected Blocked");
+        };
+        assert!(reason.contains("tampered"));
+        assert!(reason.contains("contract hash mismatch"));
+    }
+
+    #[test]
+    fn drafting_phase_b_commit_advances_to_merged() {
+        let d = decide(
+            &rec(FulfillState::Drafting),
+            Event::PhaseBResult {
+                ok: true,
+                detail: String::new(),
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Merged);
+    }
+
+    #[test]
+    fn drafting_phase_b_reject_blocks() {
+        let d = decide(
+            &rec(FulfillState::Drafting),
+            Event::PhaseBResult {
+                ok: false,
+                detail: "merge refused".into(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(matches!(record.state, FulfillState::Blocked { .. }));
+    }
+
+    #[test]
+    fn drafting_resume_redispatches_within_budget_and_blocks_after() {
+        let mut prior = rec(FulfillState::Drafting);
+        prior.drafting_attempts = 1;
+        let d = decide(&prior, Event::Reentry, now());
+        let Decision::AdvanceAndAct { record, task, .. } = d else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(record.drafting_attempts, 2);
+        assert_eq!(task, TaskKind::Draft);
+
+        let mut exhausted = rec(FulfillState::Drafting);
+        exhausted.drafting_attempts = MAX_COMPILE_ITERS;
+        let d = decide(&exhausted, Event::Reentry, now());
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(matches!(record.state, FulfillState::Blocked { .. }));
+    }
+
+    // =====================================================================
+    // merged → verifying
+    // =====================================================================
+
+    #[test]
+    fn merged_advances_to_verifying() {
+        let d = decide(&rec(FulfillState::Merged), Event::Reentry, now());
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Verifying);
+    }
+
+    // =====================================================================
+    // verifying | green → controlled propose → proposed;
+    // red ≤ repair rounds → drafting; else blocked
+    // =====================================================================
+
+    fn green_bundle() -> Event {
+        Event::VerifyBundle {
+            compile_green: true,
+            test_green: true,
+            posture_green: true,
+            manifest_total: true,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn verifying_gathers_the_bundle_then_proposes_on_green() {
+        let d = decide(&rec(FulfillState::Verifying), Event::Reentry, now());
+        assert_eq!(d, Decision::Act(TaskKind::VerifyBundle));
+        let d = decide(&rec(FulfillState::Verifying), green_bundle(), now());
+        assert_eq!(d, Decision::Act(TaskKind::Propose));
+    }
+
+    #[test]
+    fn verifying_red_dispatches_a_repair_round() {
+        let mut prior = rec(FulfillState::Verifying);
+        prior.repair_rounds = 1;
+        prior.drafting_attempts = 5;
+        let d = decide(
+            &prior,
+            Event::VerifyBundle {
+                compile_green: false,
+                test_green: true,
+                posture_green: true,
+                manifest_total: true,
+                detail: "E012 on revenue_eur".into(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndAct { record, task, event } = d else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Drafting);
+        assert_eq!(record.repair_rounds, 2);
+        assert_eq!(record.drafting_attempts, 1, "fresh drafting cycle");
+        assert_eq!(task, TaskKind::Repair);
+        assert!(event.contains("E012 on revenue_eur"));
+    }
+
+    #[test]
+    fn verifying_red_after_max_repair_rounds_blocks() {
+        let mut prior = rec(FulfillState::Verifying);
+        prior.repair_rounds = MAX_REPAIR_ROUNDS;
+        let d = decide(
+            &prior,
+            Event::VerifyBundle {
+                compile_green: true,
+                test_green: false,
+                posture_green: true,
+                manifest_total: true,
+                detail: "unique(client_id,date) failed".into(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let FulfillState::Blocked { reason } = &record.state else {
+            panic!("expected Blocked");
+        };
+        assert!(reason.contains("repair rounds"));
+    }
+
+    #[test]
+    fn verifying_written_and_review_required_both_pin_and_advance_to_proposed() {
+        for outcome in [
+            ProposeSummary::Written {
+                plan_id: "plan-1".into(),
+            },
+            ProposeSummary::ReviewRequired {
+                plan_id: "plan-1".into(),
+                refusal: "requires review".into(),
+            },
+        ] {
+            let mut prior = rec(FulfillState::Verifying);
+            prior.repair_rounds = 2;
+            let d = decide(
+                &prior,
+                Event::Proposed {
+                    outcome,
+                    plan_payload_digest: Some("sha256:aa".into()),
+                    approved_digest: Some("sha256:aa".into()),
+                    idempotency_key: "product:revenue_daily@sha256:aa@7".into(),
+                },
+                now(),
+            );
+            let Decision::Advance { record, .. } = d else {
+                panic!("expected Advance, got {d:?}");
+            };
+            assert_eq!(record.state, FulfillState::Proposed);
+            assert_eq!(record.plan_id.as_deref(), Some("plan-1"));
+            assert_eq!(
+                record.idempotency_key.as_deref(),
+                Some("product:revenue_daily@sha256:aa@7")
+            );
+            assert_eq!(record.repair_rounds, 0, "cycle closed");
+        }
+    }
+
+    #[test]
+    fn verifying_post_propose_digest_mismatch_supersedes() {
+        let d = decide(
+            &rec(FulfillState::Verifying),
+            Event::Proposed {
+                outcome: ProposeSummary::Written {
+                    plan_id: "plan-1".into(),
+                },
+                plan_payload_digest: Some("sha256:OLD".into()),
+                approved_digest: Some("sha256:NEW".into()),
+                idempotency_key: "k".into(),
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::Superseded {
+                old_digest: "sha256:OLD".into(),
+                new_digest: "sha256:NEW".into()
+            }
+        );
+        assert!(record.plan_id.is_none(), "pins cleared");
+    }
+
+    #[test]
+    fn verifying_denied_blocks_naming_the_policy() {
+        let d = decide(
+            &rec(FulfillState::Verifying),
+            Event::Proposed {
+                outcome: ProposeSummary::Denied {
+                    refusal: "model 'revenue_daily', rule #2, deny".into(),
+                },
+                plan_payload_digest: None,
+                approved_digest: Some("sha256:aa".into()),
+                idempotency_key: "k".into(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let FulfillState::Blocked { reason } = &record.state else {
+            panic!("expected Blocked");
+        };
+        assert!(reason.contains("rule #2"), "{reason}");
+        assert!(stop.message.contains("rule #2"));
+    }
+
+    // =====================================================================
+    // proposed | marker present+valid → plan_approved;
+    // absent → needs_input(plan_approval); re-approval → superseded
+    // =====================================================================
+
+    fn proposed() -> FulfillStateRecord {
+        let mut record = rec(FulfillState::Proposed);
+        record.plan_id = Some("plan-1".into());
+        record.idempotency_key = Some("k@1".into());
+        record
+    }
+
+    #[test]
+    fn proposed_marker_absent_asks_for_review() {
+        let d = decide(
+            &proposed(),
+            Event::MarkerPoll {
+                reviewed: false,
+                invalid: None,
+                plan_payload_digest: Some("sha256:aa".into()),
+                approved_digest: Some("sha256:aa".into()),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::NeedsInput {
+                reason: REASON_PLAN_APPROVAL.into(),
+                payload: "plan-1".into()
+            }
+        );
+        assert_eq!(record.plan_id.as_deref(), Some("plan-1"), "pin carried");
+        assert_eq!(
+            stop.next_command.as_deref(),
+            Some("rocky review plan-1 --approve")
+        );
+    }
+
+    #[test]
+    fn proposed_marker_present_advances_to_plan_approved() {
+        let d = decide(
+            &proposed(),
+            Event::MarkerPoll {
+                reviewed: true,
+                invalid: None,
+                plan_payload_digest: Some("sha256:aa".into()),
+                approved_digest: Some("sha256:aa".into()),
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::PlanApproved);
+    }
+
+    #[test]
+    fn proposed_invalid_marker_halts_loudly() {
+        let d = decide(
+            &proposed(),
+            Event::MarkerPoll {
+                reviewed: false,
+                invalid: Some("truncated marker".into()),
+                plan_payload_digest: None,
+                approved_digest: None,
+            },
+            now(),
+        );
+        let Decision::Halt(stop) = d else {
+            panic!("expected Halt, got {d:?}");
+        };
+        assert!(stop.message.contains("truncated marker"));
+    }
+
+    #[test]
+    fn proposed_reapproval_supersedes_and_clears_the_pins() {
+        let d = decide(
+            &proposed(),
+            Event::MarkerPoll {
+                reviewed: false,
+                invalid: None,
+                plan_payload_digest: Some("sha256:OLD".into()),
+                approved_digest: Some("sha256:NEW".into()),
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::Superseded {
+                old_digest: "sha256:OLD".into(),
+                new_digest: "sha256:NEW".into()
+            }
+        );
+        assert!(record.plan_id.is_none());
+        assert!(record.idempotency_key.is_none());
+    }
+
+    #[test]
+    fn needs_plan_approval_reruns_the_same_marker_rule_but_halts_in_place() {
+        let mut waiting = rec(FulfillState::NeedsInput {
+            reason: REASON_PLAN_APPROVAL.into(),
+            payload: "plan-1".into(),
+        });
+        waiting.plan_id = Some("plan-1".into());
+        // Still absent: halt, no rewrite of the identical ask.
+        let d = decide(
+            &waiting,
+            Event::MarkerPoll {
+                reviewed: false,
+                invalid: None,
+                plan_payload_digest: Some("sha256:aa".into()),
+                approved_digest: Some("sha256:aa".into()),
+            },
+            now(),
+        );
+        assert!(matches!(d, Decision::Halt(_)), "got {d:?}");
+        // Approved: the same rule advances.
+        let d = decide(
+            &waiting,
+            Event::MarkerPoll {
+                reviewed: true,
+                invalid: None,
+                plan_payload_digest: Some("sha256:aa".into()),
+                approved_digest: Some("sha256:aa".into()),
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::PlanApproved);
+        // Superseded while waiting: same rule as `proposed`.
+        let d = decide(
+            &waiting,
+            Event::MarkerPoll {
+                reviewed: false,
+                invalid: None,
+                plan_payload_digest: Some("sha256:OLD".into()),
+                approved_digest: Some("sha256:NEW".into()),
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert!(matches!(record.state, FulfillState::Superseded { .. }));
+    }
+
+    // =====================================================================
+    // plan_approved → applying (pins pinned, pre-apply task carried)
+    // =====================================================================
+
+    #[test]
+    fn plan_approved_journals_applying_and_carries_the_pre_apply_task() {
+        let mut prior = rec(FulfillState::PlanApproved);
+        prior.plan_id = Some("plan-1".into());
+        prior.idempotency_key = Some("k@1".into());
+        let d = decide(&prior, Event::Reentry, now());
+        let Decision::AdvanceAndAct { record, task, event } = d else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Applying);
+        assert_eq!(record.plan_id.as_deref(), Some("plan-1"));
+        assert_eq!(record.idempotency_key.as_deref(), Some("k@1"));
+        assert_eq!(task, TaskKind::PreApplyCheck);
+        assert!(event.contains("plan-1") && event.contains("k@1"));
+    }
+
+    // =====================================================================
+    // applying | pre-apply recompute ok → apply; mismatch → superseded;
+    // crash → next run applying_unknown; skipped_in_flight KEEPS the
+    // state; skipped_idempotent resolves via the receipt
+    // =====================================================================
+
+    fn applying() -> FulfillStateRecord {
+        let mut record = rec(FulfillState::Applying);
+        record.plan_id = Some("plan-1".into());
+        record.idempotency_key = Some("k@1".into());
+        record
+    }
+
+    #[test]
+    fn applying_pre_apply_match_applies() {
+        let d = decide(
+            &applying(),
+            Event::PreApply {
+                recomputed_digest: Some("sha256:aa".into()),
+                plan_payload_digest: Some("sha256:aa".into()),
+                snapshot_ok: true,
+            },
+            now(),
+        );
+        assert_eq!(d, Decision::Act(TaskKind::Apply));
+    }
+
+    #[test]
+    fn applying_pre_apply_snapshot_tamper_blocks() {
+        let d = decide(
+            &applying(),
+            Event::PreApply {
+                recomputed_digest: Some("sha256:zz".into()),
+                plan_payload_digest: Some("sha256:aa".into()),
+                snapshot_ok: false,
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let FulfillState::Blocked { reason } = &record.state else {
+            panic!("expected Blocked");
+        };
+        assert!(reason.contains("tampered"));
+    }
+
+    #[test]
+    fn applying_pre_apply_digest_mismatch_supersedes() {
+        let d = decide(
+            &applying(),
+            Event::PreApply {
+                recomputed_digest: Some("sha256:NEW".into()),
+                plan_payload_digest: Some("sha256:OLD".into()),
+                snapshot_ok: true,
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::Superseded {
+                old_digest: "sha256:OLD".into(),
+                new_digest: "sha256:NEW".into()
+            }
+        );
+        assert!(record.plan_id.is_none());
+    }
+
+    #[test]
+    fn applying_success_journals_applied() {
+        let d = decide(
+            &applying(),
+            Event::ApplyFinished(ApplySummary::Applied {
+                run_id: Some("run-1".into()),
+            }),
+            now(),
+        );
+        let Decision::Advance { record, event } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Applied);
+        assert!(event.contains("run-1"));
+    }
+
+    #[test]
+    fn applying_skipped_idempotent_resolves_via_the_receipt_never_assumed() {
+        let d = decide(
+            &applying(),
+            Event::ApplyFinished(ApplySummary::SkippedIdempotent {
+                prior_run_id: "run-0".into(),
+            }),
+            now(),
+        );
+        assert_eq!(d, Decision::Act(TaskKind::LookupReceipt));
+    }
+
+    #[test]
+    fn applying_skipped_in_flight_keeps_the_state() {
+        let d = decide(
+            &applying(),
+            Event::ApplyFinished(ApplySummary::SkippedInFlight {
+                prior_run_id: "run-9".into(),
+            }),
+            now(),
+        );
+        let Decision::Halt(stop) = d else {
+            panic!("expected Halt (no state change), got {d:?}");
+        };
+        assert!(stop.message.contains("run-9"));
+    }
+
+    #[test]
+    fn applying_typed_failure_blocks() {
+        let d = decide(
+            &applying(),
+            Event::ApplyFinished(ApplySummary::Failed {
+                error: "policy denied".into(),
+            }),
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(matches!(record.state, FulfillState::Blocked { .. }));
+    }
+
+    #[test]
+    fn applying_cold_resume_enters_applying_unknown() {
+        let d = decide(&applying(), Event::Reentry, now());
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::ApplyingUnknown);
+    }
+
+    #[test]
+    fn applying_receipt_success_after_skip_is_applied() {
+        let d = decide(
+            &applying(),
+            Event::ReceiptResolved(ReceiptSummary::Succeeded {
+                run_id: "run-0".into(),
+            }),
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Applied);
+    }
+
+    #[test]
+    fn applying_receipt_contradiction_parks_for_a_human() {
+        // skipped_idempotent claimed a success exists; the authoritative
+        // lookup says otherwise — park, never blind-retry.
+        for lookup in [
+            ReceiptSummary::NoRecord,
+            ReceiptSummary::Failed {
+                run_id: "run-0".into(),
+            },
+        ] {
+            let d = decide(&applying(), Event::ReceiptResolved(lookup), now());
+            let Decision::AdvanceAndStop { record, stop, .. } = d else {
+                panic!("expected AdvanceAndStop, got {d:?}");
+            };
+            assert_eq!(record.state, FulfillState::ApplyingUnknown);
+            assert!(stop.next_command.is_none(), "a human resolves");
+        }
+    }
+
+    #[test]
+    fn applying_receipt_in_flight_moves_to_applying_unknown_and_stops() {
+        let d = decide(
+            &applying(),
+            Event::ReceiptResolved(ReceiptSummary::InFlight {
+                run_id: "run-9".into(),
+            }),
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::ApplyingUnknown);
+    }
+
+    // =====================================================================
+    // applying_unknown | receipt → applied; none → retry (dedup-safe);
+    // cannot answer → stays for a human — BOTH arms
+    // =====================================================================
+
+    fn applying_unknown() -> FulfillStateRecord {
+        let mut record = rec(FulfillState::ApplyingUnknown);
+        record.plan_id = Some("plan-1".into());
+        record.idempotency_key = Some("k@1".into());
+        record
+    }
+
+    #[test]
+    fn applying_unknown_looks_up_the_receipt_on_entry() {
+        let d = decide(&applying_unknown(), Event::Reentry, now());
+        assert_eq!(d, Decision::Act(TaskKind::LookupReceipt));
+    }
+
+    #[test]
+    fn applying_unknown_receipt_found_resolves_to_applied() {
+        let d = decide(
+            &applying_unknown(),
+            Event::ReceiptResolved(ReceiptSummary::Succeeded {
+                run_id: "run-1".into(),
+            }),
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Applied);
+    }
+
+    #[test]
+    fn applying_unknown_no_receipt_retries_dedup_safe() {
+        for lookup in [
+            ReceiptSummary::NoRecord,
+            ReceiptSummary::Failed {
+                run_id: "run-0".into(),
+            },
+        ] {
+            let d = decide(&applying_unknown(), Event::ReceiptResolved(lookup), now());
+            let Decision::AdvanceAndAct { record, task, .. } = d else {
+                panic!("expected AdvanceAndAct, got {d:?}");
+            };
+            assert_eq!(record.state, FulfillState::Applying);
+            assert_eq!(task, TaskKind::PreApplyCheck, "retry re-runs the digest gate");
+            assert_eq!(record.idempotency_key.as_deref(), Some("k@1"), "same key");
+        }
+    }
+
+    #[test]
+    fn applying_unknown_in_flight_stays_put() {
+        let d = decide(
+            &applying_unknown(),
+            Event::ReceiptResolved(ReceiptSummary::InFlight {
+                run_id: "run-9".into(),
+            }),
+            now(),
+        );
+        assert!(matches!(d, Decision::Halt(_)), "got {d:?}");
+    }
+
+    #[test]
+    fn applying_unknown_cannot_answer_stays_for_a_human() {
+        let d = decide(
+            &applying_unknown(),
+            Event::ReceiptResolved(ReceiptSummary::CannotAnswer {
+                reason: "s3 backend has no non-mutating read".into(),
+            }),
+            now(),
+        );
+        let Decision::Halt(stop) = d else {
+            panic!("expected Halt, got {d:?}");
+        };
+        assert!(stop.message.contains("s3 backend"));
+        assert!(stop.next_command.is_none());
+    }
+
+    // =====================================================================
+    // applied → observation → observing; observing re-observes + journals
+    // =====================================================================
+
+    #[test]
+    fn applied_observes_then_settles_into_observing() {
+        let d = decide(&rec(FulfillState::Applied), Event::Reentry, now());
+        assert_eq!(d, Decision::Act(TaskKind::Observe));
+        let d = decide(
+            &rec(FulfillState::Applied),
+            Event::ObservationDone {
+                test_green: true,
+                staleness_ok: Some(true),
+                detail: "lag 60s, budget 86400s".into(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, event, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Observing);
+        assert!(event.contains("staleness fresh"));
+    }
+
+    #[test]
+    fn observing_journals_every_observation_including_stale_ones() {
+        let d = decide(&rec(FulfillState::Observing), Event::Reentry, now());
+        assert_eq!(d, Decision::Act(TaskKind::Observe));
+        let d = decide(
+            &rec(FulfillState::Observing),
+            Event::ObservationDone {
+                test_green: false,
+                staleness_ok: Some(false),
+                detail: "lag 200000s, budget 86400s".into(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, event, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Observing, "stays observing");
+        assert!(event.contains("tests RED"));
+        assert!(event.contains("staleness STALE"));
+    }
+
+    // =====================================================================
+    // superseded → re-enters at spec_approved with the new snapshot
+    // =====================================================================
+
+    #[test]
+    fn superseded_reenters_at_spec_approved_with_the_new_digest() {
+        let mut prior = rec(FulfillState::Superseded {
+            old_digest: "sha256:OLD".into(),
+            new_digest: "sha256:NEW".into(),
+        });
+        prior.plan_id = Some("plan-1".into());
+        prior.drafting_attempts = 7;
+        prior.repair_rounds = 2;
+        let d = decide(&prior, Event::Reentry, now());
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::SpecApproved);
+        assert_eq!(record.spec_digest.as_deref(), Some("sha256:NEW"));
+        assert!(record.plan_id.is_none());
+        assert_eq!(record.drafting_attempts, 0);
+        assert_eq!(record.repair_rounds, 0);
+    }
+
+    // =====================================================================
+    // blocked | manual --retry after the printed remedy
+    // =====================================================================
+
+    #[test]
+    fn blocked_without_retry_reprints_the_remedy() {
+        let d = decide(
+            &rec(FulfillState::Blocked {
+                reason: "phase A rejected: bad type".into(),
+            }),
+            Event::Reentry,
+            now(),
+        );
+        let Decision::Halt(stop) = d else {
+            panic!("expected Halt, got {d:?}");
+        };
+        assert!(stop.message.contains("bad type"));
+        assert_eq!(
+            stop.next_command.as_deref(),
+            Some("rocky fulfill revenue_daily --retry")
+        );
+    }
+
+    #[test]
+    fn blocked_retry_reenters_at_spec_approved_when_a_digest_exists() {
+        let mut prior = rec(FulfillState::Blocked {
+            reason: "x".into(),
+        });
+        prior.spec_digest = Some("sha256:aa".into());
+        prior.plan_id = Some("plan-1".into());
+        prior.drafting_attempts = 8;
+        let d = decide(&prior, Event::RetryRequested, now());
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::SpecApproved);
+        assert!(record.plan_id.is_none());
+        assert_eq!(record.drafting_attempts, 0);
+    }
+
+    #[test]
+    fn blocked_retry_without_a_digest_reenters_at_init() {
+        let d = decide(
+            &rec(FulfillState::Blocked {
+                reason: "x".into(),
+            }),
+            Event::RetryRequested,
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Init);
+    }
+
+    // =====================================================================
+    // an impossible (state, event) pair REJECTS — it never proceeds
+    // =====================================================================
+
+    #[test]
+    fn an_impossible_event_halts_with_a_diagnostic() {
+        let d = decide(
+            &rec(FulfillState::Observing),
+            Event::PreApply {
+                recomputed_digest: None,
+                plan_payload_digest: None,
+                snapshot_ok: true,
+            },
+            now(),
+        );
+        let Decision::Halt(stop) = d else {
+            panic!("expected Halt, got {d:?}");
+        };
+        assert!(stop.message.contains("internal error"));
+        assert!(stop.message.contains("observing"));
+    }
+}
