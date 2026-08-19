@@ -826,6 +826,25 @@ impl StateStore {
         )
     }
 
+    /// redb's count of pages evicted from its read cache since this handle
+    /// was opened.
+    ///
+    /// Exists so a test can prove the cache budget passed to
+    /// [`open_read_only_with_cache`][Self::open_read_only_with_cache] is
+    /// actually in force. A parity test (same rows in, same rows out)
+    /// cannot: it passes unchanged when the budget is dropped, because a
+    /// bigger cache reads the same data. Evictions only happen when a cache
+    /// is small enough to fill, so a non-zero count is direct evidence the
+    /// cap bound.
+    ///
+    /// redb gates this counter behind its `cache_metrics` feature, which
+    /// this crate enables for test builds only (see `[dev-dependencies]`).
+    /// Without it the counter is hard-zero and proves nothing.
+    #[cfg(test)]
+    fn cache_evictions(&self) -> u64 {
+        self.db.cache_stats().evictions()
+    }
+
     /// Reads the schema version stamped in an on-disk state file **without**
     /// opening it for use, stamping it, creating tables, or recreating it.
     ///
@@ -6212,6 +6231,58 @@ mod tests {
             ids(&default_page),
             ids(&budgeted_page),
             "a cache budget must not change what a read-only open reads"
+        );
+    }
+
+    /// The cap must actually BIND, not merely be passed.
+    ///
+    /// The parity test above is not evidence of that: it reads the same
+    /// rows whether or not a budget is set, so it passes with the
+    /// `set_cache_size` call deleted. This one fails when the cap is
+    /// dropped, because redb only evicts pages when its cache is small
+    /// enough to fill — with the default (~1 GiB) against this fixture,
+    /// evictions stay at zero.
+    #[test]
+    fn a_cache_budget_actually_constrains_redb() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.redb");
+        {
+            let store = StateStore::open(&path).unwrap();
+            let base = Utc::now();
+            // Enough rows that a 64 KiB cache cannot hold the pages a full
+            // history scan touches.
+            for i in 0..4_000u32 {
+                store
+                    .record_run(&run_at(
+                        &format!("run-{i:05}"),
+                        base + chrono::Duration::seconds(i64::from(i)),
+                    ))
+                    .unwrap();
+            }
+        }
+
+        // Scoped: redb refuses a second handle to an open file (`Busy`), so
+        // each open must be dropped before the next.
+        let budgeted_evictions = {
+            let budgeted = StateStore::open_read_only_with_cache(&path, 64 * 1024).unwrap();
+            let _ = budgeted.list_runs(4_000).unwrap();
+            budgeted.cache_evictions()
+        };
+        let default_evictions = {
+            let default = StateStore::open_read_only(&path).unwrap();
+            let _ = default.list_runs(4_000).unwrap();
+            default.cache_evictions()
+        };
+
+        assert_eq!(
+            default_evictions, 0,
+            "the default cache is large enough to hold this fixture; a \
+             non-zero count here means the fixture no longer discriminates"
+        );
+        assert!(
+            budgeted_evictions > 0,
+            "a 64 KiB budget must force evictions during a 4000-run scan — \
+             got {budgeted_evictions}, which means the cap is not in force"
         );
     }
 
