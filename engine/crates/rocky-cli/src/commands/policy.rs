@@ -870,6 +870,36 @@ scope = { tags = { layer = "bronze" } }
 effect = "allow"
 "#;
 
+    /// `rocky policy check` compiles first and requires the target model
+    /// to exist — the property that makes it the POST-draft confirmation
+    /// only, never a cold-start oracle (the product posture verifier
+    /// evaluates a synthetic post-image for exactly this reason).
+    #[test]
+    fn check_requires_the_model_to_exist() {
+        let (dir, config) = config_with(&format!("{NO_POLICY_BODY}\n{POLICY}"));
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).unwrap();
+        fs::write(models.join("orders.sql"), "SELECT 1 AS id\n").unwrap();
+        fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n[target]\ncatalog = \"w\"\nschema = \"s\"\ntable = \"orders\"\n",
+        )
+        .unwrap();
+        let err = run_policy_check(
+            &config,
+            &models,
+            rocky_core::config::PolicyPrincipal::Agent,
+            rocky_core::config::PolicyCapability::Apply,
+            "missing_model",
+            false,
+        )
+        .expect_err("a nonexistent model must refuse");
+        assert!(
+            format!("{err:#}").contains("not found"),
+            "the refusal names the missing model: {err:#}"
+        );
+    }
+
     #[test]
     fn all_scenarios_pass_returns_ok() {
         let body = format!(

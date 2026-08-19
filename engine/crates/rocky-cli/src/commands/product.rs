@@ -2115,6 +2115,176 @@ effect = "require_review"
     }
 
     #[test]
+    fn the_lowered_artifacts_pass_the_real_engine() {
+        // The answer key drove a subprocess `rocky` binary; here the
+        // in-process compiler IS that engine, so the probe battery runs
+        // directly. Emission correctness is proven by the CONSUMER acting
+        // on it: the contract surfaces as targeted E010/E011 diagnostics
+        // when violated, the merged [freshness] clears W005, [mask]
+        // resolution keeps W004 silent, and the product tag lands on the
+        // compiled model.
+        use rocky_compiler::compile::{self, CompileError, CompilerConfig};
+        use rocky_compiler::types::TypedColumn;
+        use rocky_core::product::commit::{run_phase_a, run_phase_b};
+        use rocky_ir::RockyType;
+
+        const WORKER_SQL: &str = "SELECT\n    client_id,\n    charged_on AS date,\n    \
+             CAST(SUM(amount_eur) AS DECIMAL(18,2)) AS revenue_eur\nFROM raw.stripe_charges\n\
+             WHERE NOT refunded\nGROUP BY client_id, charged_on\n";
+        const DRAFT_SIDECAR: &str = "name = \"revenue_daily\"\nintent = \"Daily gross revenue \
+             per client in EUR, refunds excluded\"\n";
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config_path) = project_with_config(dir.path(), &passing_config());
+        write_file(
+            &root.join("models/_defaults.toml"),
+            b"[target]\ncatalog = \"poc\"\nschema = \"gold\"\n",
+        );
+        let parsed = parsed_d3();
+
+        // The seeded source's typed columns — the in-process stand-in for
+        // the answer key's `--with-seed` DuckDB compile.
+        let source_columns = vec![
+            ("charge_id", RockyType::Int64),
+            ("client_id", RockyType::Int64),
+            ("charged_on", RockyType::Date),
+            (
+                "amount_eur",
+                RockyType::Decimal {
+                    precision: 18,
+                    scale: 2,
+                },
+            ),
+            ("refunded", RockyType::Boolean),
+        ];
+        let compile_probe = |root: &Path| {
+            let cfg = rocky_core::config::load_rocky_config(&config_path).expect("config");
+            let mut source_schemas = std::collections::HashMap::new();
+            source_schemas.insert(
+                "raw.stripe_charges".to_string(),
+                source_columns
+                    .iter()
+                    .map(|(name, ty)| TypedColumn {
+                        name: (*name).to_string(),
+                        data_type: ty.clone(),
+                        nullable: false,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            compile::compile(&CompilerConfig {
+                models_dir: root.join("models"),
+                contracts_dir: None,
+                source_schemas,
+                source_column_info: std::collections::HashMap::new(),
+                mask: cfg.mask.clone(),
+                allow_unmasked: cfg.classifications.allow_unmasked.clone(),
+                project_freshness_default: cfg.freshness.has_default(),
+                run_vars: rocky_core::run_vars::RunVars::new(),
+            })
+        };
+        let diagnostics = |result: &compile::CompileResult, code: &str| -> Vec<String> {
+            result
+                .diagnostics
+                .iter()
+                .filter(|d| &*d.code == code)
+                .map(|d| d.message.to_string())
+                .collect()
+        };
+
+        // Posture + tag resolution on the real config (checks 1+2 against
+        // the real evaluator).
+        let (_, posture) =
+            product_verify_outcome(&root, &config_path, "revenue_daily").expect("verifies");
+        assert_eq!(posture.status, VerifyStatus::Pass, "{}", posture.reason);
+
+        // Phase A: the contract alone. No model exists yet, so compile
+        // refuses on emptiness — the orphan contract itself must not add
+        // any failure.
+        run_phase_a(&root, "products/revenue_daily.toml", &parsed).expect("phase A");
+        let err = match compile_probe(&root) {
+            Err(err) => err,
+            Ok(_) => panic!("an empty models dir must refuse to compile"),
+        };
+        assert!(
+            matches!(
+                err,
+                CompileError::Project(rocky_compiler::project::ProjectError::NoModels { .. })
+            ),
+            "{err}"
+        );
+
+        // The worker drafts: SQL + the draft_model-shaped sidecar (name +
+        // intent only; target resolves from _defaults.toml).
+        write_file(&root.join("models/revenue_daily.sql"), WORKER_SQL.as_bytes());
+        write_file(&root.join("models/revenue_daily.toml"), DRAFT_SIDECAR.as_bytes());
+        let result = compile_probe(&root).expect("compiles");
+        assert!(!result.has_errors, "{:?}", result.diagnostics);
+        assert!(
+            result.project.models[0].contract_path.is_some(),
+            "the engine DISCOVERED the lowered contract"
+        );
+
+        // Probe 1: drop a required column → E010 naming exactly the
+        // contract column the lowering emitted.
+        write_file(
+            &root.join("models/revenue_daily.sql"),
+            b"SELECT client_id, charged_on AS date FROM raw.stripe_charges\n",
+        );
+        let result = compile_probe(&root).expect("compiles with diagnostics");
+        let e010 = diagnostics(&result, "E010");
+        assert!(
+            e010.iter().any(|m| m.contains("revenue_eur")),
+            "E010 names the dropped contract column: {e010:?}"
+        );
+
+        // Probe 2: break a declared type → E011 naming the Decimal
+        // expectation from the [[columns]] entry. The wrong column carries
+        // a KNOWN inferred type (a seeded source column) — an
+        // Unknown-typed expression matches any contract type by design.
+        write_file(
+            &root.join("models/revenue_daily.sql"),
+            b"SELECT client_id, charged_on AS date, charged_on AS revenue_eur\n\
+              FROM raw.stripe_charges\n",
+        );
+        let result = compile_probe(&root).expect("compiles with diagnostics");
+        let e011 = diagnostics(&result, "E011");
+        assert!(
+            e011.iter()
+                .any(|m| m.contains("Decimal") && m.contains("revenue_eur")),
+            "E011 names the declared Decimal: {e011:?}"
+        );
+
+        // Restore the good draft; before the merge W005 fires (temporal
+        // column, no freshness declared yet).
+        write_file(&root.join("models/revenue_daily.sql"), WORKER_SQL.as_bytes());
+        let result = compile_probe(&root).expect("compiles");
+        assert!(!result.has_errors, "{:?}", result.diagnostics);
+        assert!(
+            !diagnostics(&result, "W005").is_empty(),
+            "pre-merge draft warns W005 (no freshness yet)"
+        );
+
+        // Phase B: the metadata merge. The engine consumes every block —
+        // freshness clears W005; W004 stays silent because [mask]
+        // resolves pii; the product tag lands on the compiled model.
+        run_phase_b(&root, "products/revenue_daily.toml", &parsed).expect("phase B");
+        let result = compile_probe(&root).expect("compiles");
+        assert!(!result.has_errors, "{:?}", result.diagnostics);
+        assert!(diagnostics(&result, "W005").is_empty(), "freshness clears W005");
+        assert!(diagnostics(&result, "W004").is_empty(), "[mask] resolves pii");
+        let model = &result.project.models[0];
+        assert_eq!(
+            model.config.tags.get("product").map(String::as_str),
+            Some("revenue_daily"),
+            "the merged product tag is on the compiled model"
+        );
+        assert!(
+            model.config.freshness.is_some(),
+            "the merged freshness block is on the compiled model"
+        );
+    }
+
+    #[test]
     fn status_reports_a_pending_journal_without_resolving_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (root, config) = project_with_config(dir.path(), &passing_config());
