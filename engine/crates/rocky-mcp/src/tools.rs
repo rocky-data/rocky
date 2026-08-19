@@ -4502,59 +4502,6 @@ fn render_cell(v: serde_json::Value) -> String {
     }
 }
 
-/// Build an AI-authored `RunPlan` for the given model filter. Constructed
-/// inline (the `rocky plan` builder is private + entangled with discovery);
-/// every field is set explicitly so a future field addition is a compile error
-/// rather than a silent default.
-///
-/// `product_id` / `spec_digest` are the opaque product identity the propose
-/// carried (validated both-or-neither by the caller); `idempotency_key` is the
-/// already-resolved key (runner-supplied, or the derived
-/// `"<product_id>@<spec_digest>"` fallback).
-fn build_ai_run_plan(
-    model: Option<String>,
-    result: &CompilerResult,
-    product_id: Option<String>,
-    spec_digest: Option<String>,
-    idempotency_key: Option<String>,
-) -> rocky_cli::output::RunPlan {
-    let models: Vec<String> = result
-        .project
-        .models
-        .iter()
-        .map(|m| m.config.name.clone())
-        .collect();
-    let execution_layers: Vec<Vec<String>> = result.project.layers.clone();
-    rocky_cli::output::RunPlan {
-        filter: None,
-        pipeline: None,
-        model,
-        branch: None,
-        partition: None,
-        partition_from: None,
-        partition_to: None,
-        latest: false,
-        missing: false,
-        lookback: None,
-        parallel: 1,
-        run_all: false,
-        env: None,
-        models_dir: None,
-        resume: None,
-        resume_latest: false,
-        shadow: false,
-        shadow_suffix: None,
-        shadow_schema: None,
-        dag: false,
-        idempotency_key,
-        governance_override: None,
-        models,
-        execution_layers,
-        product_id,
-        spec_digest,
-    }
-}
-
 /// The authoring-loop reminder every successful `draft_model` response carries.
 /// A draft is written and compiled, never applied — this restates the flow so
 /// the agent never mistakes a written draft for a materialized change.
