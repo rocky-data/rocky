@@ -276,7 +276,9 @@ fn contained_target(resolved_root: &Path, rel: &str) -> Result<PathBuf, String> 
         ));
     }
     if final_path.is_dir() {
-        return Err(format!("path '{rel}' names a directory — targets are always files"));
+        return Err(format!(
+            "path '{rel}' names a directory — targets are always files"
+        ));
     }
     Ok(final_path)
 }
@@ -296,9 +298,12 @@ fn contained_final_path(resolved_root: &Path, journal: &Path, rel: &str) -> Spec
 /// its `remove_file`, and its `create_new` out of the project), and a
 /// symlink or directory at the target. Reason string on the `Err`.
 pub fn contained_write_target(project_root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let resolved_root = project_root
-        .canonicalize()
-        .map_err(|err| format!("project root {} is unreadable: {err}", project_root.display()))?;
+    let resolved_root = project_root.canonicalize().map_err(|err| {
+        format!(
+            "project root {} is unreadable: {err}",
+            project_root.display()
+        )
+    })?;
     contained_target(&resolved_root, rel)
 }
 
@@ -1536,7 +1541,11 @@ mod tests {
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).expect("mkdir");
         let victim = outside.join("revenue_daily.contract.toml.ff-staged");
-        std::fs::write(&victim, b"a real file the developer keeps outside the project").expect("write");
+        std::fs::write(
+            &victim,
+            b"a real file the developer keeps outside the project",
+        )
+        .expect("write");
 
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).expect("mkdir");
@@ -1548,7 +1557,10 @@ mod tests {
         let error =
             run_phase_a(&project, SPEC_PATH, &parsed).expect_err("symlinked parent directory");
         assert_eq!(error.code, "commit-symlinked-target");
-        assert!(error.message.contains("escapes the project root"), "{error}");
+        assert!(
+            error.message.contains("escapes the project root"),
+            "{error}"
+        );
         assert_eq!(
             std::fs::read(&victim).expect("still there"),
             b"a real file the developer keeps outside the project",
@@ -1577,9 +1589,15 @@ mod tests {
         let error =
             run_phase_a(&project, SPEC_PATH, &parsed).expect_err("dangling symlinked parent");
         assert_eq!(error.code, "commit-symlinked-target");
-        assert!(error.message.contains("dangling symlinked ancestor"), "{error}");
+        assert!(
+            error.message.contains("dangling symlinked ancestor"),
+            "{error}"
+        );
         // The guard refused before `create_dir_all` could create the target.
-        assert!(!nonexistent.exists(), "nothing was created outside the project");
+        assert!(
+            !nonexistent.exists(),
+            "nothing was created outside the project"
+        );
     }
 
     // --------------- the journal is untrusted: forgeries refused ------------
