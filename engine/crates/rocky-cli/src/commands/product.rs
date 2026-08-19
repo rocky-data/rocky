@@ -955,16 +955,15 @@ fn approver_string() -> String {
 pub(crate) fn write_approval_snapshot(root: &Path, parsed: &ParsedSpec) -> Result<String> {
     let rel = approval_snapshot_rel(&parsed.product().name, &parsed.digest);
     let path = root.join(&rel);
-    // A digest-addressed snapshot is an engine-written regular file — a
-    // symlink sitting at it is tamper. Refuse before the read below (which
-    // follows a link) and before the write path (whose `rename` would
-    // otherwise replace a link at the final).
-    if is_symlink(&path) {
-        bail!(
-            "[approval-snapshot-tampered] {rel} is a symlink — a digest-addressed snapshot \
-             is an immutable regular file; refusing to read or approve through it"
-        );
-    }
+    // Prove the snapshot target is inside the project through the SAME
+    // containment primitive the commit protocol uses. A leaf-only symlink
+    // check misses a symlinked ANCESTOR: a static `.rocky/fulfillment/<name>`
+    // (or `.rocky`) symlink out of the project would redirect the temp write,
+    // its `remove_file`, and its O_EXCL create — an out-of-project write with
+    // no race. This refuses that ancestor case AND a symlink or directory at
+    // the digest-addressed final itself (which the read below would follow).
+    rocky_core::product::commit::contained_write_target(root, &rel)
+        .map_err(|reason| anyhow::anyhow!("[approval-snapshot-tampered] {reason}"))?;
     if path.is_file() {
         let existing = std::fs::read(&path)
             .with_context(|| format!("failed to read existing snapshot {}", path.display()))?;
@@ -2236,6 +2235,61 @@ effect = "require_review"
             "the out-of-project target must be untouched"
         );
         // Nothing was recorded — the transition never reached the store.
+        let store = StateStore::open(&state_path).expect("opens");
+        assert!(
+            store
+                .product_approval_get("revenue_daily")
+                .expect("reads")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approve_refuses_a_symlinked_state_dir_and_leaves_the_out_of_tree_target_untouched() {
+        // BLOCKER #2 for approve — the ANCESTOR attack: a symlinked STATE DIR
+        // (`.rocky/fulfillment/<name> -> /outside`) redirects the snapshot
+        // temp write, its `remove_file`, and its `create_new` retry out of the
+        // project THROUGH the symlinked parent, with no race and no symlink at
+        // the leaf. Under the leaf-only/O_EXCL-final guard, the `create_new`
+        // AlreadyExists path would `remove_file` the out-of-tree victim.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        let parsed = parsed_d3();
+
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        // The victim sits exactly where the temp write would resolve through
+        // the symlinked state dir.
+        let hex = parsed
+            .digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&parsed.digest);
+        let victim = outside.join(format!("approved-{hex}.toml.tmp"));
+        std::fs::write(&victim, b"an out-of-tree file the symlinked state dir points into")
+            .expect("write");
+        // Plant the symlinked state dir (its parent `.rocky/fulfillment` is a
+        // real dir; only the product's state dir is the link).
+        let state_parent = root.join(".rocky").join("fulfillment");
+        std::fs::create_dir_all(&state_parent).expect("mkdir");
+        std::os::unix::fs::symlink(&outside, state_parent.join("revenue_daily")).expect("symlink");
+
+        let error = product_approve_in(&root, &state_path, "revenue_daily")
+            .expect_err("symlinked state dir");
+        assert!(
+            format!("{error:#}").contains("approval-snapshot-tampered"),
+            "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("escapes the project root"),
+            "the refusal names the ancestor escape: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&victim).expect("still there"),
+            b"an out-of-tree file the symlinked state dir points into",
+            "the out-of-project file behind the symlinked state dir must be untouched"
+        );
         let store = StateStore::open(&state_path).expect("opens");
         assert!(
             store

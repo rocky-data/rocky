@@ -196,66 +196,138 @@ fn is_canonical_relative_posix(rel: &str) -> bool {
 /// validating one spelling and then mutating through an unresolved alias
 /// would reopen the window where a parent directory is swapped for a
 /// symlink between the check and the use.
-fn contained_final_path(resolved_root: &Path, journal: &Path, rel: &str) -> SpecResult<PathBuf> {
+///
+/// This is the SINGLE containment primitive — recovery, the fresh commit
+/// path, and the approve snapshot seam all route through it, so a
+/// leaf-only guard can never diverge from it and let an ancestor symlink
+/// through. It refuses:
+///
+/// - an absolute or traversing (`.`/`..`/empty-segment) spelling;
+/// - a parent that resolves OUTSIDE the root — this catches a static live
+///   symlinked ancestor (`models -> /outside`, a malicious checkout or
+///   tarball, no race) because its resolved parent escapes; an in-project
+///   symlinked ancestor (`models -> models_real`, both under root) resolves
+///   in-place and is allowed;
+/// - a DANGLING symlinked ancestor (`models -> /nonexistent`), the one
+///   escape resolution's lexical fallback would otherwise miss;
+/// - a symlink or a directory at the leaf.
+///
+/// Reason strings on the `Err`; each caller assigns its own stable code
+/// ([`contained_final_path`] → `staging-journal-unsafe-path`, the commit
+/// path → `commit-symlinked-target`, approve → `approval-snapshot-tampered`).
+fn contained_target(resolved_root: &Path, rel: &str) -> Result<PathBuf, String> {
     if Path::new(rel).is_absolute() || rel.starts_with('/') {
-        return Err(journal_reject(
-            journal,
-            "staging-journal-unsafe-path",
-            &format!("names absolute path '{rel}'"),
-        ));
+        return Err(format!("names absolute path '{rel}'"));
     }
     // The canonical-spelling check plus the component-shape check the
     // manifest verifier already applies (every component a plain name).
     if !is_canonical_relative_posix(rel) || contained_artifact_path(resolved_root, rel).is_none() {
-        return Err(journal_reject(
-            journal,
-            "staging-journal-unsafe-path",
-            &format!("names non-canonical or traversing path '{rel}'"),
-        ));
+        return Err(format!("names non-canonical or traversing path '{rel}'"));
     }
     let candidate = resolved_root.join(rel);
+    // The static ancestor attack a leaf-only `is_symlink` misses, no race:
+    // an attacker pre-plants `models -> /outside` and a regular file at
+    // `/outside/<leaf>`; a leaf probe passes (the leaf is a regular file at
+    // the resolved location) and the write truncates it out of the project.
+    //
+    // A LIVE escaping ancestor is caught by the parent-resolution + root
+    // containment just below (its resolved parent escapes the root), while a
+    // LIVE in-project symlinked ancestor (`models -> models_real`, both under
+    // root) legitimately resolves and is allowed. The one case resolution
+    // misses is a DANGLING symlinked ancestor: `resolve_nonstrict` falls back
+    // to a lexical join when a component cannot canonicalize, which would
+    // false-accept `models -> /nonexistent` — and the subsequent
+    // `create_dir_all` would follow that link and create OUTSIDE the project.
+    // Refuse exactly that: an ancestor that is a symlink AND does not
+    // canonicalize.
+    let mut ancestor = candidate.parent();
+    while let Some(dir) = ancestor {
+        if dir == resolved_root || !dir.starts_with(resolved_root) {
+            break;
+        }
+        if is_symlink(dir) && dir.canonicalize().is_err() {
+            return Err(format!(
+                "path '{rel}' has a dangling symlinked ancestor directory '{}' — refusing \
+                 rather than creating outside the project through it",
+                dir.display()
+            ));
+        }
+        ancestor = dir.parent();
+    }
     let parent = candidate
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| resolved_root.to_path_buf());
     let resolved_parent = resolve_nonstrict(&parent);
     if !(resolved_parent == *resolved_root || resolved_parent.starts_with(resolved_root)) {
-        return Err(journal_reject(
-            journal,
-            "staging-journal-unsafe-path",
-            &format!(
-                "path '{rel}' escapes the project root (parent resolves to {})",
-                resolved_parent.display()
-            ),
+        return Err(format!(
+            "path '{rel}' escapes the project root (parent resolves to {})",
+            resolved_parent.display()
         ));
     }
-    let file_name = candidate.file_name().map(std::ffi::OsStr::to_os_string);
-    let Some(file_name) = file_name else {
-        return Err(journal_reject(
-            journal,
-            "staging-journal-unsafe-path",
-            &format!("names non-canonical or traversing path '{rel}'"),
-        ));
+    let Some(file_name) = candidate.file_name().map(std::ffi::OsStr::to_os_string) else {
+        return Err(format!("names non-canonical or traversing path '{rel}'"));
     };
     let final_path = resolved_parent.join(file_name);
     if is_symlink(&final_path) {
-        return Err(journal_reject(
-            journal,
-            "staging-journal-unsafe-path",
-            &format!(
-                "path '{rel}' is a symlink — staged finals are always regular files, and a \
-                 link at an artifact path would redirect recovery at its target"
-            ),
+        return Err(format!(
+            "path '{rel}' is a symlink — a generation writes only regular files, and a link \
+             at the target would redirect the write at its target"
         ));
     }
     if final_path.is_dir() {
-        return Err(journal_reject(
-            journal,
-            "staging-journal-unsafe-path",
-            &format!("path '{rel}' names a directory — staged finals are always files"),
-        ));
+        return Err(format!("path '{rel}' names a directory — targets are always files"));
     }
     Ok(final_path)
+}
+
+/// Recovery's wrapper over the shared [`contained_target`] primitive:
+/// assign the untrusted-journal refusal code.
+fn contained_final_path(resolved_root: &Path, journal: &Path, rel: &str) -> SpecResult<PathBuf> {
+    contained_target(resolved_root, rel)
+        .map_err(|reason| journal_reject(journal, "staging-journal-unsafe-path", &reason))
+}
+
+/// The public single-target containment check for callers outside this
+/// module (the approve snapshot seam in `rocky-cli`): canonicalizes the
+/// project root once, then applies the shared [`contained_target`]
+/// primitive. Refuses an absolute/traversing spelling, a symlinked
+/// ancestor (a symlinked state dir would redirect the snapshot temp write,
+/// its `remove_file`, and its `create_new` out of the project), and a
+/// symlink or directory at the target. Reason string on the `Err`.
+pub fn contained_write_target(project_root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let resolved_root = project_root
+        .canonicalize()
+        .map_err(|err| format!("project root {} is unreadable: {err}", project_root.display()))?;
+    contained_target(&resolved_root, rel)
+}
+
+/// Write `bytes` to a brand-new regular file, refusing to follow a symlink
+/// at the leaf.
+///
+/// `create_new` (O_CREAT|O_EXCL) neither follows a link at the final
+/// component nor clobbers an existing file, so a link swapped in after a
+/// pre-check — during the race window the conceded v0 posture accepts — is
+/// refused rather than followed. The only legitimate `AlreadyExists` is our
+/// own stale scratch from a prior crash (the restage-over-orphans case):
+/// it is removed via `remove_file`, which never follows a link either, and
+/// the O_EXCL create retried once.
+fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let open = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    };
+    match open() {
+        Ok(mut file) => file.write_all(bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            open()?.write_all(bytes)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Refuse a symlink sitting at any path the fresh commit is about to
@@ -274,42 +346,53 @@ fn contained_final_path(resolved_root: &Path, journal: &Path, rel: &str) -> Spec
 /// and the commit would write engine bytes through it — an out-of-project
 /// write. This closes that class on the fresh path.
 ///
-/// Every checked path is refused when it is a symlink itself, dangling or
-/// not: [`is_symlink`] reads the link via `symlink_metadata` and never
-/// follows it. The final is checked too — `has_prev`'s `exists()` and the
-/// backup `copy`'s SOURCE both traverse a live symlink at the final.
+/// Routes through the SHARED [`contained_target`] primitive so it refuses
+/// a symlinked ANCESTOR directory (the static `models -> /outside` attack,
+/// no race) as well as a symlink at the leaf — a leaf-only `is_symlink`
+/// misses the ancestor case, the stronger blocker. The project root is
+/// canonicalized once; each final is run through the primitive (ancestor
+/// containment + final-symlink + final-dir refusal), and the `.ff-staged`
+/// / `.ff-prev` residue — which shares the final's now-contained parent —
+/// is additionally refused when its leaf is a symlink.
 ///
-/// Stated residual, identical to the recovery path's: a check-then-write is
-/// TOCTOU against a directory swapped for a symlink between validation and
-/// the syscall, only fully closed by dirfd/`O_NOFOLLOW` APIs, which v0 does
-/// not use — the same-machine posture accepts it.
+/// Stated residual, the conceded v0 boundary: a check-then-write is TOCTOU
+/// against a directory or leaf swapped for a symlink between validation and
+/// the syscall. The staged and journal-temp writes take the cheap half
+/// (O_EXCL via [`write_new_no_follow`], race-free for the leaf); the
+/// `.ff-prev` backup `copy` still follows a symlinked SOURCE swapped in
+/// post-check — fully closed only by an `O_NOFOLLOW` read, tracked as a
+/// known residual (see [`commit_generation`]).
 fn refuse_symlinked_write_targets<'a>(
     project_root: &Path,
     relpaths: impl IntoIterator<Item = &'a str>,
 ) -> SpecResult<()> {
+    let resolved_root = project_root.canonicalize().map_err(|err| {
+        SpecRejected::new(
+            "commit-io",
+            format!(
+                "resolving project root {} failed: {err}",
+                project_root.display()
+            ),
+        )
+    })?;
     for relpath in relpaths {
+        // Ancestor + leaf containment for the final (the shared primitive).
+        contained_target(&resolved_root, relpath).map_err(|reason| {
+            SpecRejected::new(
+                "commit-symlinked-target",
+                format!("refusing to commit: {reason}"),
+            )
+        })?;
+        // The residue shares the final's (now-contained) parent — refuse a
+        // symlink at each residue leaf too.
         let final_path = project_root.join(relpath);
-        for probe in [
-            final_path.clone(),
-            staged_sibling(&final_path),
-            prev_sibling(&final_path),
-        ] {
+        for probe in [staged_sibling(&final_path), prev_sibling(&final_path)] {
             if is_symlink(&probe) {
-                let suffix = probe
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .map(|ext| match ext {
-                        e if STAGED_SUFFIX.ends_with(e) => " (a staged residue)",
-                        e if PREV_SUFFIX.ends_with(e) => " (a backup residue)",
-                        _ => "",
-                    })
-                    .unwrap_or("");
                 return Err(SpecRejected::new(
                     "commit-symlinked-target",
                     format!(
-                        "refusing to commit: a write target for '{relpath}'{suffix} is a \
-                         symlink — a generation writes only regular files, and a link at a \
-                         staging path would redirect the write out of the project"
+                        "refusing to commit: a staging residue for '{relpath}' is a symlink — \
+                         a link at a staging path would redirect the write out of the project"
                     ),
                 ));
             }
@@ -369,10 +452,24 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 /// A prior generation may have crashed mid-commit; it is recovered first
 /// so this run stages on a consistent tree.
 ///
+/// # Symlink containment
+///
+/// Every write target is proven inside the project root through the shared
+/// [`contained_target`] primitive BEFORE the first mutation, refusing a
+/// symlinked ancestor directory (the static `models -> /outside` escape, no
+/// race) as well as a symlink at the leaf. The staged and journal-temp
+/// writes use O_EXCL. One race residual remains, the conceded v0 boundary:
+/// the `.ff-prev` backup `copy` follows a symlinked SOURCE (the final)
+/// swapped in during the window between the pre-check and the copy — fully
+/// closed only by an `O_NOFOLLOW` read. TODO(FF-WP-E1B): open the backup
+/// source with `O_NOFOLLOW` to close the copy-source race (tracking issue
+/// to be filed by the coordinator — this agent cannot run `gh`).
+///
 /// # Errors
 ///
 /// Propagates any recovery refusal (the journal is validated before
-/// anything mutates) and any I/O failure as `commit-io`.
+/// anything mutates), a `commit-symlinked-target` refusal for a symlinked
+/// ancestor or leaf, and any I/O failure as `commit-io`.
 pub fn commit_generation(
     project_root: &Path,
     parsed: &ParsedSpec,
@@ -430,10 +527,16 @@ fn commit_generation_with_ops(
                 .map_err(|err| io_reject("creating directory", parent, &err))?;
         }
         let staged = staged_sibling(&final_path);
-        std::fs::write(&staged, bytes).map_err(|err| io_reject("staging", &staged, &err))?;
+        // O_EXCL (via `write_new_no_follow`): a link swapped in at the
+        // staged leaf after the pre-check is refused, never followed.
+        write_new_no_follow(&staged, bytes).map_err(|err| io_reject("staging", &staged, &err))?;
         let has_prev = final_path.exists();
         if has_prev {
             let prev = prev_sibling(&final_path);
+            // Known residual: `copy` follows a symlinked SOURCE (the final)
+            // swapped in after the pre-check — the conceded v0 race, fully
+            // closed only by an `O_NOFOLLOW` read (see `commit_generation`).
+            // The static ancestor/leaf case is already refused above.
             std::fs::copy(&final_path, &prev)
                 .map_err(|err| io_reject("backing up", &prev, &err))?;
         }
@@ -457,7 +560,7 @@ fn commit_generation_with_ops(
     let journal_tmp = sibling_with_suffix(&journal, STAGED_SUFFIX);
     let journal_bytes =
         serde_json::to_vec_pretty(&record).expect("the staging journal serializes to JSON");
-    std::fs::write(&journal_tmp, journal_bytes)
+    write_new_no_follow(&journal_tmp, &journal_bytes)
         .map_err(|err| io_reject("writing", &journal_tmp, &err))?;
     (ops.rename)(&journal_tmp, &journal).map_err(|err| io_reject("renaming", &journal, &err))?;
 
@@ -1267,12 +1370,48 @@ mod tests {
         std::os::unix::fs::symlink(target, link).expect("symlink");
     }
 
+    /// Every `.ff-staged` / `.ff-prev` REGULAR-FILE residue under the
+    /// project (the mutations the staging loop and backup copy produce).
+    /// Symlinks (a planted exploit) are excluded via `symlink_metadata`, so
+    /// a clean PRE-mutation refusal returns `[]` — this is what proves the
+    /// guard ran before the first `write`/`copy`, not merely somewhere.
+    #[cfg(unix)]
+    fn staging_residue(project: &Path) -> Vec<String> {
+        fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_dir() {
+                    walk(&path, root, out);
+                } else if meta.file_type().is_file() {
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("under root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if rel.ends_with(STAGED_SUFFIX) || rel.ends_with(PREV_SUFFIX) {
+                        out.push(rel);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(project, project, &mut out);
+        out.sort();
+        out
+    }
+
     #[cfg(unix)]
     #[test]
     fn fresh_commit_refuses_a_symlinked_staged_target_and_leaves_it_untouched() {
-        // THE exploit: a first `rocky product compile` (no journal) with a
-        // symlink pre-planted at `<contract>.ff-staged` pointing at a file
-        // OUTSIDE the project. Without the guard, `std::fs::write` follows it
+        // THE leaf exploit: a first `rocky product compile` (no journal) with
+        // a symlink pre-planted at `<contract>.ff-staged` pointing at a file
+        // OUTSIDE the project. Without the guard, the staged write follows it
         // and writes the contract bytes through to the target.
         let dir = tempfile::tempdir().expect("tempdir");
         let secret = dir.path().join("outside-secret");
@@ -1291,8 +1430,9 @@ mod tests {
             b"a developer's private bytes outside the project",
             "the out-of-project target must be untouched"
         );
-        // Nothing committed: no manifest, and the contract final was never
-        // written.
+        // PRE-mutation: nothing was staged, backed up, or committed — the
+        // guard ran before the first write, not after artifact staging.
+        assert_eq!(staging_residue(&project), Vec::<String>::new());
         assert!(!manifest_path(&project).exists());
         assert!(!project.join("models/revenue_daily.contract.toml").exists());
     }
@@ -1323,14 +1463,17 @@ mod tests {
             b"private bytes the backup copy must not overwrite",
             "the out-of-project backup target must be untouched"
         );
+        // PRE-mutation: the refused re-commit added no staging residue, and
+        // the committed generation is still the first commit's Phase A.
+        assert_eq!(staging_residue(&project), Vec::<String>::new());
+        assert_eq!(committed(&project).phase, ManifestPhase::LoweredContract);
     }
 
     #[cfg(unix)]
     #[test]
     fn fresh_commit_refuses_a_symlinked_journal_temp_and_leaves_it_untouched() {
-        // The journal's own `.ff-staged` tmp is written with `std::fs::write`
-        // too, in the state dir — an attacker-writable location under the
-        // same threat model.
+        // The journal's own `.ff-staged` tmp is written too, in the state dir
+        // — an attacker-writable location under the same threat model.
         let dir = tempfile::tempdir().expect("tempdir");
         let secret = dir.path().join("outside-secret");
         std::fs::write(&secret, b"journal-temp target bytes").expect("write");
@@ -1348,14 +1491,22 @@ mod tests {
             std::fs::read(&secret).expect("still there"),
             b"journal-temp target bytes"
         );
+        // PRE-mutation: the guard covers the journal temp up front, so no
+        // artifact was staged before the refusal either.
+        assert_eq!(staging_residue(&project), Vec::<String>::new());
+        assert!(!manifest_path(&project).exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_symlinked_final_is_refused_on_the_fresh_path() {
-        // A symlink AT the final (not just its residue) is refused too: the
-        // backup `copy`'s SOURCE and `has_prev`'s `exists()` both traverse a
-        // live link at the final.
+    fn a_symlinked_final_is_refused_before_any_staging_residue() {
+        // A symlink AT the final is refused too. The assertion is NOT the
+        // (vacuous) external bytes — an unguarded final is only a `copy`
+        // SOURCE, then replaced by `rename`, so its target is never written.
+        // What the vulnerability WOULD produce is staging residue: the staged
+        // write creates `<contract>.ff-staged`, and the backup copies the
+        // secret's bytes into `<contract>.ff-prev`. Asserting NO residue is
+        // therefore the non-vacuous proof of pre-mutation refusal.
         let dir = tempfile::tempdir().expect("tempdir");
         let secret = dir.path().join("outside-secret");
         std::fs::write(&secret, b"final-target bytes").expect("write");
@@ -1365,9 +1516,46 @@ mod tests {
         let error = run_phase_a(&project, SPEC_PATH, &parsed).expect_err("symlinked final");
         assert_eq!(error.code, "commit-symlinked-target");
         assert_eq!(
-            std::fs::read(&secret).expect("still there"),
-            b"final-target bytes"
+            staging_residue(&project),
+            Vec::<String>::new(),
+            "a symlinked final must be refused before any staged/prev residue is created"
         );
+        assert!(!manifest_path(&project).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_commit_refuses_a_symlinked_parent_dir_and_leaves_the_out_of_tree_target_untouched() {
+        // BLOCKER #2 — the ANCESTOR attack a leaf-only check misses, no race:
+        // the attacker pre-plants `models -> /outside` (a malicious checkout
+        // or tarball) with a regular file at `/outside/<leaf>.ff-staged`.
+        // Every LEAF probe passes (the leaf is a regular file at the resolved
+        // location); the unguarded staged write then truncates it out of the
+        // project THROUGH the symlinked parent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        let victim = outside.join("revenue_daily.contract.toml.ff-staged");
+        std::fs::write(&victim, b"a real file the developer keeps outside the project").expect("write");
+
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        // `models` itself is a symlink out of the project — a REGULAR file at
+        // each leaf, so a leaf `is_symlink` check would pass.
+        std::os::unix::fs::symlink(&outside, project.join("models")).expect("symlink");
+        let parsed = parsed_d3();
+
+        let error =
+            run_phase_a(&project, SPEC_PATH, &parsed).expect_err("symlinked parent directory");
+        assert_eq!(error.code, "commit-symlinked-target");
+        assert!(error.message.contains("escapes the project root"), "{error}");
+        assert_eq!(
+            std::fs::read(&victim).expect("still there"),
+            b"a real file the developer keeps outside the project",
+            "the out-of-project file behind the symlinked parent must be untouched"
+        );
+        // Nothing committed inside or outside.
+        assert!(!project.join(".rocky").exists() || !manifest_path(&project).exists());
     }
 
     // --------------- the journal is untrusted: forgeries refused ------------
