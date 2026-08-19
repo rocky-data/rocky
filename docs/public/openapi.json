@@ -4787,6 +4787,30 @@
         ],
         "type": "object"
       },
+      "ColumnSpec": {
+        "additionalProperties": false,
+        "description": "One declared output column.",
+        "properties": {
+          "name": {
+            "description": "Column name; must be a bare identifier.",
+            "type": "string"
+          },
+          "nullable": {
+            "description": "Whether the column may hold nulls.",
+            "type": "boolean"
+          },
+          "type": {
+            "description": "Rocky type name, optionally parameterized.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "nullable",
+          "type"
+        ],
+        "type": "object"
+      },
       "ColumnTrendPoint": {
         "properties": {
           "null_rate": {
@@ -7618,6 +7642,55 @@
         },
         "required": [
           "threshold_seconds"
+        ],
+        "type": "object"
+      },
+      "FreshnessSeverity": {
+        "description": "Severity of the observation-phase staleness report.",
+        "oneOf": [
+          {
+            "description": "Staleness is reported as a failure.",
+            "enum": [
+              "error"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "Staleness is reported as a warning.",
+            "enum": [
+              "warning"
+            ],
+            "type": "string"
+          }
+        ]
+      },
+      "FreshnessSpec": {
+        "additionalProperties": false,
+        "description": "Declared freshness: the lag budget plus the column that witnesses it.\n\n`time_column` is required. Without it the observation-phase staleness check (`MAX(time_column)` against the budget) has nothing to read, and freshness would be a claim with no witness.",
+        "properties": {
+          "max_lag": {
+            "description": "Lag budget in the duration grammar (`\"24h\"`).",
+            "type": "string"
+          },
+          "severity": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FreshnessSeverity"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional severity for the staleness report."
+          },
+          "time_column": {
+            "description": "The timestamp column the staleness check reads.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "max_lag",
+          "time_column"
         ],
         "type": "object"
       },
@@ -11001,6 +11074,63 @@
         ],
         "type": "object"
       },
+      "OutputSpec": {
+        "additionalProperties": false,
+        "description": "The one output model and the guarantees around it.",
+        "properties": {
+          "checks": {
+            "description": "Opaque SQL boolean expressions, checked by the engine.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "classifications": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Column classification tags.\n\nHeld in an insertion-ordered map because the sidecar merge must be able to preserve an order it is given. The parser fills it in sorted key order: `toml::Value` hands back a sorted map, so document order is not recoverable here without span-based parsing. Sorted is deterministic, which is what byte-stable output needs; recovering true document order belongs with the merge that actually rewrites a human's file.",
+            "type": "object"
+          },
+          "columns": {
+            "description": "Every declared column.",
+            "items": {
+              "$ref": "#/components/schemas/ColumnSpec"
+            },
+            "type": "array"
+          },
+          "freshness": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FreshnessSpec"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional freshness declaration."
+          },
+          "grain": {
+            "description": "The columns that identify one row.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "model": {
+            "description": "Model name; defaults to the product name when omitted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "columns",
+          "grain"
+        ],
+        "type": "object"
+      },
       "OverrideWarningOutput": {
         "description": "Soft warning surfaced on [`RunOutput::override_warnings`] when an override rule matched no tables this run.\n\nDistinct kinds let orchestrators (Dagster) branch on cause without parsing free-form messages.",
         "properties": {
@@ -13186,6 +13316,429 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "ProductApprovalOutput": {
+        "description": "The approval record, as echoed by compile/status output.",
+        "properties": {
+          "approved_at": {
+            "description": "RFC3339 approval instant.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approver": {
+            "description": "Best-effort approver identity.",
+            "type": "string"
+          },
+          "snapshot_path": {
+            "description": "Project-root-relative path of the immutable snapshot file.",
+            "type": "string"
+          },
+          "spec_digest": {
+            "description": "The approved `sha256:<hex>` spec digest.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "approver",
+          "snapshot_path",
+          "spec_digest"
+        ],
+        "type": "object"
+      },
+      "ProductApproveOutput": {
+        "description": "JSON output of `rocky product approve`.",
+        "properties": {
+          "already_approved": {
+            "description": "True when this exact digest was already approved and nothing was re-written.",
+            "type": "boolean"
+          },
+          "approved_at": {
+            "description": "RFC3339 approval instant.",
+            "type": "string"
+          },
+          "approver": {
+            "description": "Best-effort approver identity recorded on the approval.",
+            "type": "string"
+          },
+          "command": {
+            "type": "string"
+          },
+          "output_model": {
+            "description": "The resolved output model name.",
+            "type": "string"
+          },
+          "previous_state": {
+            "description": "The fulfillment state tag before this approval, if any.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_id": {
+            "description": "`product:<name>`.",
+            "type": "string"
+          },
+          "snapshot_path": {
+            "description": "Project-root-relative path of the immutable snapshot file.",
+            "type": "string"
+          },
+          "spec_digest": {
+            "description": "The approved `sha256:<hex>` spec digest.",
+            "type": "string"
+          },
+          "state": {
+            "description": "The fulfillment state after this approval (`spec_approved`).",
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "already_approved",
+          "approved_at",
+          "approver",
+          "command",
+          "output_model",
+          "product_id",
+          "snapshot_path",
+          "spec_digest",
+          "state",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ProductArtifactOutput": {
+        "description": "One emitted artifact, as reported by `rocky product compile`.",
+        "properties": {
+          "path": {
+            "description": "Project-root-relative POSIX path.",
+            "type": "string"
+          },
+          "sha256": {
+            "description": "`sha256:<hex>` over the committed bytes.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "sha256"
+        ],
+        "type": "object"
+      },
+      "ProductCompileOutput": {
+        "description": "JSON output of `rocky product compile`.",
+        "properties": {
+          "approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProductApprovalOutput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The current approval record, when one exists. Compile is a READER of the approval: when present, the snapshot bytes were re-verified against the record digest before this output was produced."
+          },
+          "artifacts": {
+            "description": "The artifacts this phase committed (manifest excluded).",
+            "items": {
+              "$ref": "#/components/schemas/ProductArtifactOutput"
+            },
+            "type": "array"
+          },
+          "command": {
+            "type": "string"
+          },
+          "manifest_path": {
+            "description": "Project-root-relative path of the committed lowering manifest.",
+            "type": "string"
+          },
+          "output_model": {
+            "description": "The resolved output model name.",
+            "type": "string"
+          },
+          "phase": {
+            "description": "Which lowering phase this run committed: `lowered_contract` (Phase A) or `merged` (Phase B).",
+            "type": "string"
+          },
+          "product_id": {
+            "description": "`product:<name>`.",
+            "type": "string"
+          },
+          "spec_digest": {
+            "description": "`sha256:<hex>` over the compiled spec's raw bytes.",
+            "type": "string"
+          },
+          "spec_matches_approval": {
+            "description": "Whether the compiled spec's digest equals the approved digest. `null` when no approval exists. `false` is not an error at compile time — it means the working spec has moved past the approval (the loop's supersession trigger).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "spec_path": {
+            "description": "Project-root-relative spec path.",
+            "type": "string"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifacts",
+          "command",
+          "manifest_path",
+          "output_model",
+          "phase",
+          "product_id",
+          "spec_digest",
+          "spec_path",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ProductSpec": {
+        "additionalProperties": false,
+        "description": "The `[product]` table.",
+        "properties": {
+          "intent": {
+            "description": "Plain-language statement of what the product is for.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Product name; names the state directory and the default model.",
+            "type": "string"
+          },
+          "output": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/OutputSpec"
+              }
+            ],
+            "description": "What the product must produce."
+          },
+          "source": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SourceSpec"
+              }
+            ],
+            "description": "Where the data comes from."
+          },
+          "trust": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/TrustSpec"
+              }
+            ],
+            "description": "How much the agent is trusted."
+          }
+        },
+        "required": [
+          "intent",
+          "name",
+          "output",
+          "source",
+          "trust"
+        ],
+        "type": "object"
+      },
+      "ProductStatusOutput": {
+        "description": "JSON output of `rocky product status`.",
+        "properties": {
+          "approval": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProductApprovalOutput"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The approval record, when one exists."
+          },
+          "artifact_problems": {
+            "default": [],
+            "description": "Byte-verification problems against the committed manifest (empty = every committed artifact matches its recorded hash).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "command": {
+            "type": "string"
+          },
+          "committed_phase": {
+            "description": "The committed lowering phase, when a manifest exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "committed_spec_digest": {
+            "description": "The committed manifest's spec digest, when one exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fulfill_state": {
+            "description": "The persisted fulfillment state tag, when one exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "journal_rows": {
+            "description": "Number of fulfillment journal rows recorded for this product.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "output_model": {
+            "description": "The resolved output model, when the spec parses.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product": {
+            "description": "The product name the status was asked for.",
+            "type": "string"
+          },
+          "product_id": {
+            "description": "`product:<name>`, when the spec parses.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "snapshot_intact": {
+            "description": "Whether the approval snapshot's bytes still digest to the recorded value. `null` without an approval; `false` is tamper.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "spec_digest": {
+            "description": "The working spec's digest, when it parses.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spec_error": {
+            "description": "Why the spec failed to parse, when it did not.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spec_matches_approval": {
+            "description": "Whether the working spec equals the approved revision. `null` when either side is missing.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "spec_present": {
+            "description": "Whether `products/<name>.toml` exists and parses.",
+            "type": "boolean"
+          },
+          "staging_journal_present": {
+            "description": "Whether an uncommitted staging journal is pending. Status never mutates; the next compile resolves it.",
+            "type": "boolean"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "journal_rows",
+          "product",
+          "spec_present",
+          "staging_journal_present",
+          "version"
+        ],
+        "type": "object"
+      },
+      "ProductVerifyOutput": {
+        "description": "JSON output of `rocky product verify`.",
+        "properties": {
+          "apply_effect": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyEffect"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The resolved agent-apply effect, when evaluation ran."
+          },
+          "command": {
+            "type": "string"
+          },
+          "output_model": {
+            "description": "The resolved output model name.",
+            "type": "string"
+          },
+          "paste_block": {
+            "description": "The corrected `[policy]` block to paste, on a posture `needs_input`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product_id": {
+            "description": "`product:<name>`.",
+            "type": "string"
+          },
+          "propose_effect": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PolicyEffect"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The resolved agent-propose effect, when evaluation ran."
+          },
+          "reason": {
+            "description": "Why, in plain language.",
+            "type": "string"
+          },
+          "spec_digest": {
+            "description": "`sha256:<hex>` over the spec's raw bytes.",
+            "type": "string"
+          },
+          "status": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/VerifyStatus"
+              }
+            ],
+            "description": "`pass`, `needs_input`, or `fail` — also the exit code (0 / 1 / 2)."
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "command",
+          "output_model",
+          "product_id",
+          "reason",
+          "spec_digest",
+          "status",
+          "version"
+        ],
         "type": "object"
       },
       "ProfileColumnStats": {
@@ -17678,6 +18231,49 @@
         ],
         "type": "object"
       },
+      "SourceSpec": {
+        "additionalProperties": false,
+        "description": "Grounding sources: exact `catalog.schema.table` triples only.\n\nv0 has no globs and no `include` selectors, because no engine counterpart exists. An `include` key is refused as an unknown key; a glob smuggled inside `tables` is refused here.",
+        "properties": {
+          "tables": {
+            "description": "One or more exact table references.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tables"
+        ],
+        "type": "object"
+      },
+      "SpecFile": {
+        "additionalProperties": false,
+        "description": "The whole document: an optional version pin plus `[product]`.",
+        "properties": {
+          "product": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ProductSpec"
+              }
+            ],
+            "description": "The product declaration."
+          },
+          "spec_version": {
+            "description": "Optional schema-version pin.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "product"
+        ],
+        "type": "object"
+      },
       "StateBackend": {
         "description": "State storage backend variants.",
         "oneOf": [
@@ -19208,6 +19804,20 @@
         },
         "type": "object"
       },
+      "TrustSpec": {
+        "additionalProperties": false,
+        "description": "The trust dial. `propose_only` is the only v0 value.",
+        "properties": {
+          "agent": {
+            "description": "How much the agent may do unattended.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent"
+        ],
+        "type": "object"
+      },
       "UnitTestResult": {
         "description": "Result of running a single unit test.",
         "properties": {
@@ -19499,6 +20109,32 @@
           "strategy"
         ],
         "type": "object"
+      },
+      "VerifyStatus": {
+        "description": "Verification verdict, ordered by severity.",
+        "oneOf": [
+          {
+            "description": "The frozen posture holds and every check passed.",
+            "enum": [
+              "pass"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A human must edit configuration (the paste block says how).",
+            "enum": [
+              "needs_input"
+            ],
+            "type": "string"
+          },
+          {
+            "description": "A check failed outright (e.g. agent apply resolves `allow`).",
+            "enum": [
+              "fail"
+            ],
+            "type": "string"
+          }
+        ]
       },
       "WatermarkEntry": {
         "properties": {
