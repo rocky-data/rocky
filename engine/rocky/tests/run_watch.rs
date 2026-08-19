@@ -501,6 +501,14 @@ fn run_watch_exits_on_sigterm() {
     }
     fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write rocky.toml");
 
+    // Clock starts BEFORE the spawn: everything up to the first completion
+    // line is part of one run's cost, and on a loaded machine the gap is most
+    // of it (#1315). The shutdown deadline is then expressed in run-times, not
+    // seconds — a flat wall-clock deadline asserts a property of the machine,
+    // which is exactly how the first version of this test failed on CI while
+    // passing locally.
+    let calibration_start = Instant::now();
+
     let mut child = Command::new(env!("CARGO_BIN_EXE_rocky"))
         .arg("-c")
         .arg(dir.join("rocky.toml"))
@@ -551,12 +559,14 @@ fn run_watch_exits_on_sigterm() {
         ready,
         "watcher never completed a first run; stderr so far:\n{seen}"
     );
+    let one_run = calibration_start.elapsed();
 
     sigterm(pid);
 
     // Poll for exit rather than blocking: a hung watcher must fail the test,
     // not hang the suite.
-    let deadline = Instant::now() + MIN_BUDGET;
+    let budget = scaled_budget(one_run, SHUTDOWN_BUDGET_RUNS);
+    let deadline = Instant::now() + budget;
     let mut exited = None;
     while Instant::now() < deadline {
         match child.try_wait().expect("try_wait") {
@@ -577,8 +587,9 @@ fn run_watch_exits_on_sigterm() {
     let _ = child.wait();
     assert!(
         exited.is_some(),
-        "rocky run --watch ignored SIGTERM for {:?} — before #1405 the watch \
-         select had no SIGTERM arm, so only SIGKILL could stop it",
-        MIN_BUDGET
+        "rocky run --watch ignored SIGTERM for {budget:?} (one run measured \
+         {one_run:?}) — before #1405 the watch select had no SIGTERM arm, so \
+         only SIGKILL could stop it. If one_run is far above a few seconds \
+         this machine is loaded rather than rocky being stuck."
     );
 }
