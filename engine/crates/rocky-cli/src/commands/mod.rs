@@ -2,6 +2,7 @@ mod adapter;
 mod ai;
 mod ai_contract;
 pub mod apply;
+pub mod fulfill_api;
 mod archive;
 mod audit;
 mod backfill;
@@ -156,6 +157,7 @@ pub use plan::{
     plan_promote, populate_governance_actions,
 };
 pub use playground::{run_playground, run_playground_with_template};
+pub use fulfill_api::propose_governed_run_plan;
 pub use policy::{run_policy_check, run_policy_freeze, run_policy_test};
 pub use product::{
     run_product_approve, run_product_compile, run_product_status, run_product_verify,
