@@ -352,12 +352,9 @@ pub async fn propose_governed_run_plan(
     // The deterministic id the plan will carry if written — recorded in
     // the audit ledger (and named in a review message) even when a deny
     // refuses to persist the plan.
-    let plan_id = crate::plan_store::governed_plan_id(
-        &PlanKind::AiAuthored,
-        &run_plan,
-        &capabilities,
-    )
-    .map_err(|e| ProposeError::PlanId(format!("{e:#}")))?;
+    let plan_id =
+        crate::plan_store::governed_plan_id(&PlanKind::AiAuthored, &run_plan, &capabilities)
+            .map_err(|e| ProposeError::PlanId(format!("{e:#}")))?;
 
     // Load the config ONCE and thread that snapshot into both the
     // freeze-gate sync decision and the policy gate, so a `rocky.toml`
@@ -812,11 +809,7 @@ mod tests {
         std::fs::write(path, bytes).expect("write");
     }
 
-    fn seed_entry(
-        state_path: &Path,
-        key: &str,
-        state: rocky_core::idempotency::IdempotencyState,
-    ) {
+    fn seed_entry(state_path: &Path, key: &str, state: rocky_core::idempotency::IdempotencyState) {
         let store = rocky_core::state::StateStore::open(state_path).expect("opens");
         let now = chrono::Utc::now();
         store
@@ -932,7 +925,10 @@ mod tests {
             lookup_apply_receipt(&config, &state_path, "any-key").expect("answers honestly");
         match lookup {
             ReceiptLookup::CannotAnswer { backend, .. } => {
-                assert!(backend.contains("s3") || backend.contains("object"), "{backend}");
+                assert!(
+                    backend.contains("s3") || backend.contains("object"),
+                    "{backend}"
+                );
             }
             other => panic!("an object-store backend must refuse to guess, got {other:?}"),
         }
@@ -971,9 +967,10 @@ mod tests {
             ] {
                 warehouse.execute_query(statement).await.expect(statement);
             }
-            let observed = observe_max_time_column(&config, &root.join("models"), "orders", "loaded_at")
-                .await
-                .expect("observes");
+            let observed =
+                observe_max_time_column(&config, &root.join("models"), "orders", "loaded_at")
+                    .await
+                    .expect("observes");
             assert_eq!(observed.model, "orders");
             assert_eq!(observed.time_column, "loaded_at");
             let max = observed.max_value.expect("rows exist");
@@ -993,7 +990,10 @@ mod tests {
             )
             .await
             .expect_err("invalid identifier");
-            assert!(format!("{err:#}").contains("invalid time column"), "{err:#}");
+            assert!(
+                format!("{err:#}").contains("invalid time column"),
+                "{err:#}"
+            );
         });
     }
 }

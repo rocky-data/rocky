@@ -606,7 +606,11 @@ fn payload_with_capabilities<T: Serialize>(
 /// [`PersistedPlan::format_version`] to validate the loaded plan is
 /// indeed v2 — v1-shaped compact/archive payloads on disk (written by
 /// Rocky < engine-v1.35.0) are rejected with a migration error.
-pub(crate) fn write_plan_v2<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
+pub(crate) fn write_plan_v2<T: Serialize>(
+    root: &Path,
+    kind: PlanKind,
+    payload: &T,
+) -> Result<String> {
     debug_assert!(
         matches!(kind, PlanKind::Compact | PlanKind::Archive),
         "v2 plan-store format is defined only for compact and archive; got {kind}"

@@ -108,8 +108,7 @@ fn assert_matches_fixture(name: &str, captured: &serde_json::Value) {
         )
     });
     assert_eq!(
-        rendered,
-        expected,
+        rendered, expected,
         "the propose wire envelope drifted from the pre-refactor golden {name}"
     );
 }

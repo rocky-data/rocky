@@ -6288,14 +6288,18 @@ mod tests {
             store.product_approval_get("nonexistent").unwrap().is_none(),
             "a fresh store has an empty product_approvals table"
         );
-        assert!(store.fulfill_journal_rows("nonexistent").unwrap().is_empty());
+        assert!(
+            store
+                .fulfill_journal_rows("nonexistent")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn product_approval_cas_writes_record_state_and_journal_atomically() {
         use crate::fulfill::{
-            FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord,
-            ProductApprovalRecord,
+            FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord, ProductApprovalRecord,
         };
         let (store, _dir) = temp_store();
         let approval = ProductApprovalRecord {
@@ -6325,7 +6329,10 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, FulfillCas::Won);
 
-        let stored_approval = store.product_approval_get("revenue_daily").unwrap().unwrap();
+        let stored_approval = store
+            .product_approval_get("revenue_daily")
+            .unwrap()
+            .unwrap();
         assert_eq!(stored_approval, approval);
         let stored_state = store.fulfill_state_get("revenue_daily").unwrap().unwrap();
         assert_eq!(stored_state.state, FulfillState::SpecApproved);
@@ -6361,14 +6368,16 @@ mod tests {
                 .journal_seq,
             2
         );
-        assert_eq!(store.fulfill_journal_rows("revenue_daily").unwrap().len(), 2);
+        assert_eq!(
+            store.fulfill_journal_rows("revenue_daily").unwrap().len(),
+            2
+        );
     }
 
     #[test]
     fn product_approval_cas_lost_writes_nothing() {
         use crate::fulfill::{
-            FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord,
-            ProductApprovalRecord,
+            FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord, ProductApprovalRecord,
         };
         let (store, _dir) = temp_store();
         let approval = ProductApprovalRecord {
@@ -6414,9 +6423,19 @@ mod tests {
                 current_state: None,
             }
         );
-        assert!(store.product_approval_get("revenue_daily").unwrap().is_none());
+        assert!(
+            store
+                .product_approval_get("revenue_daily")
+                .unwrap()
+                .is_none()
+        );
         assert!(store.fulfill_state_get("revenue_daily").unwrap().is_none());
-        assert!(store.fulfill_journal_rows("revenue_daily").unwrap().is_empty());
+        assert!(
+            store
+                .fulfill_journal_rows("revenue_daily")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
