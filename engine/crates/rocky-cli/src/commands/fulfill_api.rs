@@ -34,8 +34,10 @@ pub use crate::commands::review::{compute_review_status, run_review_status};
 pub use crate::commands::run::RunTermination;
 #[cfg(feature = "duckdb")]
 pub use crate::commands::test::test_output;
-// The loop's stop report (registered in export-schemas as `fulfill`).
-pub use crate::output::FulfillOutput;
+// The loop's stop report (registered in export-schemas as `fulfill`),
+// and the one JSON printer, so the loop's whole rocky-cli surface stays
+// this module.
+pub use crate::output::{FulfillOutput, print_json};
 
 // ---------------------------------------------------------------------------
 // The governed propose helper (one gate sequence, two consumers)

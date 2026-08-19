@@ -21,7 +21,6 @@ use std::path::{Path, PathBuf};
 const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // The façade — the loop's ONLY rocky-cli entries.
     "rocky_cli::commands::fulfill_api",
-    "rocky_cli::output::print_json",
     // Config vocabulary (the [fulfill] block + the apply principal).
     "rocky_core::config::FulfillDriverConfig",
     "rocky_core::config::PolicyPrincipal",

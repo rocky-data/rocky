@@ -59,7 +59,7 @@ pub fn run_fulfill_approve_spec(
     let root = std::env::current_dir().context("failed to get current working directory")?;
     let output = fulfill_api::product_approve(&root, state_path, product)?;
     if output_json {
-        rocky_cli::output::print_json(&output)?;
+        fulfill_api::print_json(&output)?;
     } else {
         if output.already_approved {
             println!(
@@ -142,7 +142,7 @@ pub async fn run_fulfill(
         plan_id: released.plan_id.clone(),
     };
     if output_json {
-        rocky_cli::output::print_json(&output)?;
+        fulfill_api::print_json(&output)?;
     } else {
         println!("product {product}: {}", released.state.tag());
         println!("{}", stop.message);
