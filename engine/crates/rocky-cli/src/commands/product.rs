@@ -749,7 +749,7 @@ pub(crate) fn product_verify_outcome(
     Ok((parsed, posture))
 }
 
-fn verify_output(parsed: &ParsedSpec, posture: &PostureResult) -> ProductVerifyOutput {
+pub(crate) fn verify_output_for(parsed: &ParsedSpec, posture: &PostureResult) -> ProductVerifyOutput {
     ProductVerifyOutput {
         version: VERSION.to_string(),
         command: "product_verify".to_string(),
@@ -790,7 +790,7 @@ fn print_verify(output: &ProductVerifyOutput, output_json: bool) -> Result<()> {
 pub fn run_product_verify(config_path: &Path, product_name: &str, output_json: bool) -> Result<()> {
     let root = std::env::current_dir().context("failed to get current working directory")?;
     let (parsed, posture) = product_verify_outcome(&root, config_path, product_name)?;
-    let output = verify_output(&parsed, &posture);
+    let output = verify_output_for(&parsed, &posture);
     print_verify(&output, output_json)?;
     match posture.status {
         VerifyStatus::Pass => Ok(()),
