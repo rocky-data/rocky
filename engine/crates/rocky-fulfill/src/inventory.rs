@@ -72,7 +72,14 @@ fn consumed_paths() -> BTreeSet<String> {
         if path.ends_with("inventory.rs") {
             continue;
         }
-        collect_from(&text, &mut found);
+        // Comment lines cite paths (machine.rs cites schedule::claim by
+        // instruction) without consuming them: the golden pins CODE.
+        let code_only: String = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        collect_from(&code_only, &mut found);
     }
     found
 }

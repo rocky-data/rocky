@@ -130,19 +130,22 @@ mod tests {
         }
     }
 
-    /// `propose` is both an excluded tool and an English verb. The one
-    /// sanctioned use is the frozen negative sentence; every other
-    /// occurrence is a defect (it would read as guidance toward a tool
-    /// the worker cannot have).
+    /// `propose` is both an excluded tool and an English verb. Exactly
+    /// two contexts are sanctioned: the frozen negative sentence, and
+    /// the spec literal `propose_only` (the trust-dial VALUE the
+    /// elicitation worker writes into the candidate — data, not tool
+    /// guidance). Every other occurrence is a defect: it would read as
+    /// guidance toward a tool the worker cannot have.
     #[test]
-    fn propose_appears_only_inside_the_frozen_negative_sentence() {
+    fn propose_appears_only_in_sanctioned_contexts() {
         for kind in all_kinds() {
-            let brief = default_brief(kind);
-            let occurrences = brief.matches("propose").count();
-            let sanctioned = brief.matches(NO_PROPOSE_SENTENCE).count();
-            assert_eq!(
-                occurrences, sanctioned,
-                "{} brief: every 'propose' must sit inside '{NO_PROPOSE_SENTENCE}'",
+            let brief = default_brief(kind)
+                .replace(NO_PROPOSE_SENTENCE, "")
+                .replace("propose_only", "");
+            assert!(
+                !brief.contains("propose"),
+                "{} brief: 'propose' may appear only inside '{NO_PROPOSE_SENTENCE}' or the \
+                 spec literal 'propose_only'",
                 kind.as_str()
             );
         }
