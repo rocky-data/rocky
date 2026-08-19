@@ -496,6 +496,45 @@ mod store_tests {
         );
     }
 
+    /// The step loop CHAINS the record each `Won` returns into the next
+    /// CAS's expected-prior — so the returned record's `journal_seq`
+    /// mirror must match the transaction's arithmetic exactly. A drifted
+    /// mirror would make the very next chained CAS lose against our own
+    /// write (a phantom "another process moved").
+    #[test]
+    fn chained_transitions_ride_the_returned_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = driver(dir.path());
+        let me = self_identity().expect("identity");
+        let now = chrono::Utc::now();
+        let Acquired::Owned(mut record) = store.acquire(me, now).expect("acquire") else {
+            panic!("expected Owned");
+        };
+        for (step, state) in [
+            FulfillState::Elicited,
+            FulfillState::SpecApproved,
+            FulfillState::LoweredContract,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut next = record.clone();
+            next.state = state;
+            match store
+                .transition(Some(&record), &next, "chained", now)
+                .expect("cas answers")
+            {
+                Applied::Won(stored) => record = stored,
+                Applied::Lost { winner } => panic!(
+                    "chained CAS {step} lost against our own write: {}",
+                    lost_message(&winner)
+                ),
+            }
+        }
+        assert_eq!(record.journal_seq, 4, "acquire + three chained rows");
+        assert_eq!(store.journal().expect("journal").len(), 4);
+    }
+
     #[test]
     fn a_lost_transition_stops_cleanly_and_writes_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
