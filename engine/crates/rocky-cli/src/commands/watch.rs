@@ -71,6 +71,16 @@ pub async fn run_watch(
         "watching for file changes (Ctrl-C to stop)"
     );
 
+    // ONE long-lived signal registration, built before the first iteration
+    // and never dropped — see the comment in `run_watch.rs` for why building
+    // it inside the loop lets tokio discard a signal (#1405). SIGTERM gains
+    // an arm here too, so `timeout` and container eviction work.
+    let ctrl_c_signal = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c_signal);
+    #[cfg(unix)]
+    let mut sigterm_stream =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+
     // Debounce + recompile loop.
     loop {
         tokio::select! {
@@ -96,7 +106,23 @@ pub async fn run_watch(
                 print_compile_result(models_dir, contracts_dir, state_namespace, output_json);
                 println!("[watch] waiting for changes...");
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut ctrl_c_signal => {
+                println!("\n[watch] stopped");
+                return Ok(());
+            }
+            Some(()) = async {
+                #[cfg(unix)]
+                {
+                    match sigterm_stream.as_mut() {
+                        Some(stream) => stream.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending().await
+                }
+            } => {
                 println!("\n[watch] stopped");
                 return Ok(());
             }

@@ -481,3 +481,95 @@ fn touch(p: &Path) {
     let bytes = fs::read(p).expect("read for touch");
     fs::write(p, bytes).expect("write for touch");
 }
+
+/// SIGTERM must stop the watcher.
+///
+/// Before #1405 the steady-state `select!` had no SIGTERM arm at all, so once
+/// the first run had replaced the default disposition the watcher could not be
+/// killed by `timeout`, a CI job cancellation, or a container eviction — only
+/// by SIGKILL. That is deterministic, unlike the SIGINT race in the test
+/// above, which is why this is the test that pins the fix.
+#[test]
+fn run_watch_exits_on_sigterm() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    let db_path = dir.join("fixture.duckdb");
+    {
+        let conn = duckdb::Connection::open(&db_path).expect("open duckdb");
+        conn.execute_batch(SEED_SQL).expect("seed sql");
+    }
+    fs::write(dir.join("rocky.toml"), ROCKY_TOML).expect("write rocky.toml");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("-c")
+        .arg(dir.join("rocky.toml"))
+        .arg("run")
+        .arg("--watch")
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rocky");
+
+    let pid = child.id();
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_rx = spawn_line_reader(stderr);
+
+    // Wait until the first run has completed and the watcher is idle — that
+    // is the state in which the missing arm bites, because by then tokio has
+    // taken over signal disposition.
+    let mut seen = String::new();
+    let mut ready = false;
+    let bootstrap_deadline = Instant::now() + BOOTSTRAP_BUDGET;
+    while Instant::now() < bootstrap_deadline {
+        match stderr_rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(line) => {
+                seen.push_str(&line);
+                seen.push('\n');
+                if line.contains("[watch] watching") {
+                    ready = true;
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    if !ready {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(
+        ready,
+        "watcher never reported it was watching; stderr so far:\n{seen}"
+    );
+
+    sigterm(pid);
+
+    // Poll for exit rather than blocking: a hung watcher must fail the test,
+    // not hang the suite.
+    let deadline = Instant::now() + MIN_BUDGET;
+    let mut exited = None;
+    while Instant::now() < deadline {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => {
+                exited = Some(status);
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+
+    if exited.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(
+        exited.is_some(),
+        "rocky run --watch ignored SIGTERM for {:?} — before #1405 the watch \
+         select had no SIGTERM arm, so only SIGKILL could stop it",
+        MIN_BUDGET
+    );
+}

@@ -194,10 +194,47 @@ pub async fn run_watch(
         return Ok(());
     }
 
+    // ONE long-lived signal registration, built before the first iteration
+    // and never dropped.
+    //
+    // Building `ctrl_c()` inside the loop meant the future was dropped every
+    // time the file-change arm won, and tokio discards a signal that arrives
+    // while zero listeners are registered. That left a window — the debounce
+    // sleep, then the config load, until the inner run registers its own
+    // handler — in which a SIGINT was both swallowed AND non-fatal, because
+    // tokio had already replaced the default disposition (#1405). Hoisting
+    // the future keeps the registration alive across that window; `pin!`
+    // alone would not, since nothing registers until the first poll.
+    //
+    // SIGTERM had no arm at all, so after the first run the watcher could not
+    // be killed by `timeout`, CI cancellation or a container eviction. Same
+    // shape as the run loop's own handling (`run.rs`).
+    let ctrl_c_signal = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c_signal);
+    #[cfg(unix)]
+    let mut sigterm_stream =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+
     // Steady-state loop: wait for an event, debounce, drain, re-run.
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = &mut ctrl_c_signal => {
+                eprintln!("\n[watch] stopped");
+                return Ok(());
+            }
+            Some(()) = async {
+                #[cfg(unix)]
+                {
+                    match sigterm_stream.as_mut() {
+                        Some(stream) => stream.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending().await
+                }
+            } => {
                 eprintln!("\n[watch] stopped");
                 return Ok(());
             }

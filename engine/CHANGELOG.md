@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`rocky run --watch` and `rocky watch` now honour SIGINT reliably, and honour SIGTERM at all.** Both loops built a fresh `tokio::signal::ctrl_c()` future on every iteration. When the file-change arm won, that future was dropped — and tokio discards a signal that arrives while no listener is registered. Between the debounce window and the inner run registering its own handler, a Ctrl-C was therefore both ignored *and* non-fatal, because tokio had already replaced the default disposition; the watcher kept running and a second Ctrl-C was needed. The registration is now built once, before the first iteration, and never dropped. Separately, neither loop had a SIGTERM arm at all, so after the first run the watcher could not be stopped by `timeout`, a CI job cancellation, or a container eviction — only by SIGKILL. Both now stop cleanly on either signal. (#1405)
+
+
 ### Changed
 
 - **`rocky dag` refuses to report an empty graph as success when a declared transformation pipeline's models root does not exist.** Such a pipeline produced a zero-node DAG at exit 0, which the Dagster component then cached as a clean empty asset graph with `dag_status: "success"` — indistinguishable from a project that has no models (#1397). The refusal fires only when the final graph is empty AND a declared root is missing, and it names the pipeline and the path. Every deliberate tolerance survives: an existing-but-empty models directory stays a supported no-op (a fresh scaffold still dags to an empty graph), a seed-only transformation pipeline still dags on its seed nodes, replication-only projects are untouched (with and without the `--models` override the SDK sends by default), and an empty sibling root next to a populated one still contributes nothing without refusing the project. With the refusal in place, the Dagster component's existing failure machinery records `dag_status: "failed"` — or fails the deploy under `strict_build` — instead of shipping zero assets. `rocky serve`'s `GET /api/v1/dag` shares the same core and now answers an error for the same case.
