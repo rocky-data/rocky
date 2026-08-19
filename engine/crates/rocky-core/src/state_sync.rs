@@ -3359,14 +3359,33 @@ pub async fn probe_state_backend(config: &StateConfig) -> Result<(), StateSyncEr
     }
 }
 
-/// Build a per-call probe key under the configured prefix. Uses PID +
-/// nanosecond epoch so concurrent doctor invocations don't collide.
+/// Build a per-call probe key under the configured prefix. PID separates
+/// concurrent doctor invocations; a process-local sequence separates calls
+/// inside one process, so uniqueness never depends on clock resolution.
 fn probe_key() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    format!("doctor-probe-{}-{}.marker", std::process::id(), nanos)
+    probe_key_at(nanos)
+}
+
+/// Format a probe key for an already-read `nanos`. Split out so a test can
+/// exhibit two calls landing in the same clock tick.
+fn probe_key_at(nanos: u128) -> String {
+    // A process-unique sequence disambiguates two probes that observe the same
+    // `nanos` on a coarse clock — the probe writes the key, reads it back and
+    // compares the bytes, so a collision would let one probe read another's
+    // write. The name carries no contract; it is deleted, best-effort, after a
+    // successful round-trip.
+    static PROBE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = PROBE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "doctor-probe-{}-{}-{}.marker",
+        std::process::id(),
+        nanos,
+        sequence
+    )
 }
 
 async fn probe_object_store(
@@ -3976,6 +3995,19 @@ mod tests {
         assert_ne!(a, b, "probe_key should produce unique values per call");
         assert!(a.starts_with("doctor-probe-"));
         assert!(a.ends_with(".marker"));
+    }
+
+    #[test]
+    fn test_probe_key_is_unique_within_one_clock_tick() {
+        // Two calls that read the same `nanos` — what a coarse realtime clock
+        // hands back for back-to-back calls. PID + nanos alone would collide.
+        let nanos = 1_700_000_000_000_000_000u128;
+        let a = probe_key_at(nanos);
+        let b = probe_key_at(nanos);
+        assert_ne!(
+            a, b,
+            "probe_key must not depend on clock resolution for uniqueness"
+        );
     }
 
     #[test]
