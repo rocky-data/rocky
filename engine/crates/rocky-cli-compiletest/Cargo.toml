@@ -1,0 +1,19 @@
+[package]
+name = "rocky-cli-compiletest"
+version = "0.0.0"
+description = "Compile-fail (trybuild) guards for rocky-cli's plan-writer privatization"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# `rocky-cli` is the crate whose (non-)public API the compile-fail cases
+# exercise. Hosted in its own crate for the same reason as
+# `rocky-core-compiletest`: trybuild copies the host's dependencies into the
+# private project it builds under `target/tests/trybuild/`, and rocky-cli's
+# dev-dependency set (DuckDB included) must stay out of that build.
+[dependencies]
+rocky-cli = { path = "../rocky-cli" }
+
+[dev-dependencies]
+trybuild = { workspace = true }
