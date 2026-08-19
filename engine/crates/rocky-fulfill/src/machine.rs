@@ -599,31 +599,12 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
             }
             Event::CandidateSurface {
                 candidate_digest: None,
-            } => {
-                if observed.drafting_attempts >= MAX_COMPILE_ITERS {
-                    let record = blocked(
-                        observed,
-                        format!("elicitation failed {MAX_COMPILE_ITERS} times (max_compile_iters)"),
-                        now,
-                    );
-                    blocked_stop(
-                        record,
-                        "elicitation budget exhausted".to_string(),
-                        &product,
-                        "elicitation attempts exhausted",
-                    )
-                } else {
-                    // Count the attempt BEFORE dispatch (a crash mid-task
-                    // still consumed budget — the claim.rs discipline).
-                    let mut next = to_state(observed, FulfillState::Init, now);
-                    next.drafting_attempts = observed.drafting_attempts + 1;
-                    Decision::AdvanceAndAct {
-                        record: next,
-                        event: format!("elicitation attempt {}", observed.drafting_attempts + 1),
-                        task: TaskKind::Elicit,
-                    }
-                }
-            }
+            } => dispatch_elicitation(
+                observed,
+                &product,
+                "elicitation attempts exhausted",
+                now,
+            ),
             Event::ElicitationFinished {
                 written_digest: Some(digest),
                 questions,
@@ -664,18 +645,14 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 error,
                 ..
             } => {
+                // A failed attempt re-dispatches through the SAME
+                // persisted-budget gate as the first one: the retry's
+                // increment is CAS'd onto the record, never a local
+                // counter, so a crash-loop (or a lying driver) can burn
+                // at most `MAX_COMPILE_ITERS` dispatches total.
                 let error =
                     error.unwrap_or_else(|| "elicitation produced no candidate".to_string());
-                if observed.drafting_attempts >= MAX_COMPILE_ITERS {
-                    let record = blocked(
-                        observed,
-                        format!("elicitation failed: {error} (attempts exhausted)"),
-                        now,
-                    );
-                    blocked_stop(record, "elicitation failed".to_string(), &product, &error)
-                } else {
-                    Decision::Act(TaskKind::Elicit)
-                }
+                dispatch_elicitation(observed, &product, &error, now)
             }
             other => internal_mismatch(observed, &other),
         },
@@ -1549,6 +1526,42 @@ fn retry_or_park(observed: &FulfillStateRecord, detail: &str, now: DateTime<Utc>
     }
 }
 
+/// The elicitation dispatch: count the attempt BEFORE dispatch onto the
+/// PERSISTED record (the claim.rs cycle discipline — a crash mid-task
+/// still consumed budget), or block once `MAX_COMPILE_ITERS` dispatches
+/// are spent. `failure_detail` names the latest failure in the blocked
+/// reason.
+fn dispatch_elicitation(
+    observed: &FulfillStateRecord,
+    product: &str,
+    failure_detail: &str,
+    now: DateTime<Utc>,
+) -> Decision {
+    if observed.drafting_attempts >= MAX_COMPILE_ITERS {
+        let record = blocked(
+            observed,
+            format!(
+                "elicitation failed {MAX_COMPILE_ITERS} times (max_compile_iters): \
+                 {failure_detail}"
+            ),
+            now,
+        );
+        return blocked_stop(
+            record,
+            "elicitation budget exhausted".to_string(),
+            product,
+            failure_detail,
+        );
+    }
+    let mut next = to_state(observed, FulfillState::Init, now);
+    next.drafting_attempts = observed.drafting_attempts + 1;
+    Decision::AdvanceAndAct {
+        record: next,
+        event: format!("elicitation attempt {}", observed.drafting_attempts + 1),
+        task: TaskKind::Elicit,
+    }
+}
+
 /// The drafting dispatch: count the attempt BEFORE dispatch, then act.
 fn dispatch_drafting(
     observed: &FulfillStateRecord,
@@ -1850,6 +1863,9 @@ mod tests {
 
     #[test]
     fn init_elicitation_failure_retries_within_budget_then_blocks() {
+        // A failed attempt's retry must consume PERSISTED budget: the
+        // decision carries a record with the incremented counter (the
+        // caller CASes it before dispatching), never a bare Act.
         let mut prior = rec(FulfillState::Init);
         prior.drafting_attempts = 1;
         let d = decide(
@@ -1861,7 +1877,11 @@ mod tests {
             },
             now(),
         );
-        assert_eq!(d, Decision::Act(TaskKind::Elicit), "budget remains");
+        let Decision::AdvanceAndAct { record, task, .. } = d else {
+            panic!("expected AdvanceAndAct (persisted increment), got {d:?}");
+        };
+        assert_eq!(record.drafting_attempts, 2, "budget consumed on the record");
+        assert_eq!(task, TaskKind::Elicit);
 
         let mut exhausted = rec(FulfillState::Init);
         exhausted.drafting_attempts = MAX_COMPILE_ITERS;
@@ -1881,6 +1901,67 @@ mod tests {
             panic!("expected Blocked");
         };
         assert!(reason.contains("driver timeout"));
+    }
+
+    /// S2 regression: walking the DECIDED records through repeated
+    /// failures blocks at exactly `MAX_COMPILE_ITERS` dispatches — the
+    /// budget lives on the record the caller persists, so no failure
+    /// path can loop for free.
+    #[test]
+    fn elicitation_failure_loop_blocks_at_exactly_the_budget() {
+        let mut record = rec(FulfillState::Init);
+        let mut dispatches = 0u32;
+        loop {
+            // Cold gather: no candidate on disk.
+            let d = decide(
+                &record,
+                Event::CandidateSurface {
+                    candidate_digest: None,
+                },
+                now(),
+            );
+            match d {
+                Decision::AdvanceAndAct { record: next, task, .. } => {
+                    assert_eq!(task, TaskKind::Elicit);
+                    dispatches += 1;
+                    record = next;
+                }
+                Decision::AdvanceAndStop { record: next, .. } => {
+                    assert!(
+                        matches!(next.state, FulfillState::Blocked { .. }),
+                        "the only stop on this path is blocked"
+                    );
+                    break;
+                }
+                other => panic!("unexpected decision {other:?}"),
+            }
+            // The dispatched attempt fails; the retry decision must also
+            // ride the persisted counter.
+            let d = decide(
+                &record,
+                Event::ElicitationFinished {
+                    written_digest: None,
+                    questions: vec![],
+                    error: Some("driver exploded".into()),
+                },
+                now(),
+            );
+            match d {
+                Decision::AdvanceAndAct { record: next, .. } => {
+                    dispatches += 1;
+                    record = next;
+                }
+                Decision::AdvanceAndStop { record: next, .. } => {
+                    assert!(matches!(next.state, FulfillState::Blocked { .. }));
+                    break;
+                }
+                other => panic!("unexpected decision {other:?}"),
+            }
+        }
+        assert_eq!(
+            dispatches, MAX_COMPILE_ITERS,
+            "exactly max_compile_iters driver dispatches, then blocked"
+        );
     }
 
     // =====================================================================

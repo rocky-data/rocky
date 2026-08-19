@@ -286,7 +286,13 @@ impl AgentDriver for SubprocessDriver {
             .ok()
             .flatten()
             .unwrap_or(0);
-        on_group((pgid, leader_start)).map_err(|e| DriverError::Spawn(format!("{e:#}")))?;
+        // S1: a failed stamp must never leak the group it just spawned —
+        // the child is already running, so the error path kills and
+        // reaps it (no-survivors asserted) BEFORE surfacing the failure.
+        if let Err(stamp_err) = on_group((pgid, leader_start)) {
+            kill_group(pgid, self.kill_grace, vec![&mut leader]).await?;
+            return Err(DriverError::Spawn(format!("{stamp_err:#}")));
+        }
 
         // Race the leader's natural exit against the task budget (the
         // schedule::spawn select shape).
@@ -678,7 +684,12 @@ impl AgentDriver for ReplayDriver {
             .ok()
             .flatten()
             .unwrap_or(0);
-        on_group((pgid, leader_start)).map_err(|e| DriverError::Spawn(format!("{e:#}")))?;
+        // S1: same rule as the subprocess driver — a failed stamp kills
+        // and reaps the just-spawned server before surfacing the error.
+        if let Err(stamp_err) = on_group((pgid, leader_start)) {
+            kill_group(pgid, Duration::from_secs(5), vec![&mut server]).await?;
+            return Err(DriverError::Spawn(format!("{stamp_err:#}")));
+        }
 
         let result = replay_calls(&mut server, task, &mut transcript).await;
 
@@ -948,6 +959,37 @@ mod supervision_tests {
         assert!(
             !group_exists(pgid),
             "leader AND sibling must be gone after the group kill"
+        );
+    }
+
+    /// S1: a failed ownership-stamp callback must not leak the group it
+    /// just spawned — the error path kills, reaps, and asserts no
+    /// survivors BEFORE returning the failure.
+    #[tokio::test]
+    async fn a_failed_stamp_kills_the_just_spawned_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = subprocess(
+            &["/bin/sh", "-c", "sleep 300 & sleep 300; echo {brief}"],
+            Duration::from_secs(30),
+            Duration::from_millis(300),
+        );
+        let brief = brief(TaskBriefKind::Drafting, dir.path());
+        let mut stamp: Option<GroupStamp> = None;
+        let mut on_group = |group: GroupStamp| {
+            stamp = Some(group);
+            anyhow::bail!("the CAS under the stamp was lost")
+        };
+        let outcome = driver.run_task(&brief, &mut on_group).await;
+        let (pgid, _) = stamp.expect("the callback fired");
+        match outcome {
+            Err(DriverError::Spawn(message)) => {
+                assert!(message.contains("the CAS under the stamp was lost"), "{message}");
+            }
+            other => panic!("expected the stamp failure surfaced, got {other:?}"),
+        }
+        assert!(
+            !group_exists(pgid),
+            "the spawned group must be dead after a stamp failure"
         );
     }
 
