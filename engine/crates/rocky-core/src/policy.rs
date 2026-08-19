@@ -1078,6 +1078,42 @@ mod tests {
     }
 
     #[test]
+    fn equally_specific_incomparable_tie_breaks_by_earliest_rule() {
+        // Two equally-specific, equally-restrictive matches: earliest wins.
+        // (Rule 4 of the frozen semantics; the most-restrictive sibling
+        // test above only pins the unequal-restrictiveness half.)
+        let attrs = ModelAttributes {
+            name: "m".to_string(),
+            layer: Some("silver".to_string()),
+            classifications: BTreeSet::from(["pii".to_string()]),
+            ..Default::default()
+        };
+        let p = policy(vec![
+            rule(
+                PolicyPrincipal::Agent,
+                PolicyCapability::Apply,
+                PolicyScope {
+                    layer: Some("silver".to_string()),
+                    ..Default::default()
+                },
+                PolicyEffect::RequireReview,
+            ),
+            rule(
+                PolicyPrincipal::Agent,
+                PolicyCapability::Apply,
+                PolicyScope {
+                    classifications: vec!["pii".to_string()],
+                    ..Default::default()
+                },
+                PolicyEffect::RequireReview,
+            ),
+        ]);
+        let d = evaluate(&p, PolicyPrincipal::Agent, PolicyCapability::Apply, &attrs);
+        assert_eq!(d.effect, PolicyEffect::RequireReview);
+        assert_eq!(d.matched_rule, Some(0), "ties break by declaration order");
+    }
+
+    #[test]
     fn refinement_rule_outranks_bare_verb() {
         // rule 0: apply on layer=bronze → require_review ({Layer});
         // rule 1: schema_change.additive on layer=bronze → allow
