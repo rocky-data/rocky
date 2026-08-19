@@ -3158,8 +3158,10 @@ pub struct FulfillConfig {
     /// RELATIVE path inside the project — the loop resolves it through
     /// the staged commit's containment primitive, so an absolute path,
     /// a `..` traversal, or a symlinked-ancestor escape is refused, and
-    /// every loaded brief (override or default) is validated against
-    /// the excluded worker-tool names before any dispatch.
+    /// every loaded brief is validated before any dispatch: an override
+    /// may not name ANY tool outside the worker profile (nor the word
+    /// `apply`), with no quoting exception — the compiled defaults
+    /// carry the sanctioned prohibition wording.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub briefs_dir: Option<PathBuf>,
     /// The agent driver. `rocky fulfill` refuses to dispatch worker

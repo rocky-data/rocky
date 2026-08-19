@@ -4244,6 +4244,7 @@ dependencies = [
  "libc",
  "rocky-cli",
  "rocky-core",
+ "rocky-mcp",
  "serde",
  "serde_json",
  "tempfile",

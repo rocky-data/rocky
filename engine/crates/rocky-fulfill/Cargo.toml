@@ -38,4 +38,9 @@ tracing = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+# Parity only: the excluded-tool brief golden is pinned against the
+# REAL registry (default-profile tool names minus worker-profile tool
+# names). A dev-dependency keeps the runtime crate topology intact —
+# the loop itself never links rocky-mcp.
+rocky-mcp = { path = "../rocky-mcp" }
 tempfile = "3"

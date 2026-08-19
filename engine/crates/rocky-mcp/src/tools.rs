@@ -558,6 +558,23 @@ impl RockyMcpServer {
         Self::new_with_profile(config_path, McpProfile::Default)
     }
 
+    /// The tool names this server actually serves, sorted — the
+    /// authoritative registry view for cross-crate parity tests
+    /// (rocky-fulfill pins its excluded-tool brief golden against
+    /// default-profile-minus-worker-profile). Reads the same router the
+    /// constructor filtered, so it can never disagree with what
+    /// `tools/list` serves.
+    pub fn tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Build a server serving `profile`'s tool surface.
     ///
     /// The worker profile filters the full router down to
