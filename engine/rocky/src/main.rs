@@ -557,6 +557,31 @@ enum Command {
         subcommand: ProductSubcommand,
     },
 
+    /// Drive a product's fulfillment loop as far as it can go, then
+    /// stop with a precise ask (EXPERIMENTAL).
+    ///
+    /// One invocation advances the reconciler — elicit → approve-spec →
+    /// lower → draft (worker-profile agent driver) → verify → governed
+    /// propose → human review → digest-gated apply → observe — and
+    /// every stop prints the state, why it stopped, and the exact next
+    /// command. Exit codes: 0 = clean stop (including a `needs_input`
+    /// ask and `observing`), 1 = parked at `applying_unknown` for a
+    /// human, 2 = `blocked`.
+    ///
+    /// `rocky fulfill approve-spec <product>` is the same authority
+    /// transition as `rocky product approve` — one implementation, two
+    /// spellings.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Fulfill {
+        #[command(subcommand)]
+        subcommand: Option<FulfillSubcommand>,
+        /// Product name (`products/<name>.toml`).
+        product: Option<String>,
+        /// Re-enter a blocked product after fixing the printed remedy.
+        #[arg(long)]
+        retry: bool,
+    },
+
     /// Show the agent-policy decision ledger, or a subject's custody chain.
     ///
     /// Bare `rocky audit` lists every policy decision recorded at a mutating
@@ -2453,6 +2478,23 @@ enum PreviewAction {
     },
 }
 
+/// Subcommands under `rocky fulfill`.
+#[derive(Subcommand)]
+enum FulfillSubcommand {
+    /// Approve the product's current spec revision.
+    ///
+    /// The SAME authority transition as `rocky product approve` (one
+    /// implementation, two spellings): the immutable digest-addressed
+    /// snapshot file is written first, then ONE state-store transaction
+    /// compare-and-swaps the approval record, the fulfillment state, and
+    /// the journal row. A second approver racing this one fails its CAS
+    /// cleanly and is shown the winning digest.
+    ApproveSpec {
+        /// Product name (`products/<name>.toml`).
+        product: String,
+    },
+}
+
 /// Subcommands under `rocky product`.
 #[derive(Subcommand)]
 enum ProductSubcommand {
@@ -3179,6 +3221,25 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             )
             .await
         }
+        Command::Fulfill {
+            subcommand,
+            product,
+            retry,
+        } => match subcommand {
+            Some(FulfillSubcommand::ApproveSpec { product }) => {
+                rocky_fulfill::run_fulfill_approve_spec(&cli.config, &state_path, &product, json)
+            }
+            None => match product {
+                Some(product) => {
+                    rocky_fulfill::run_fulfill(&cli.config, &state_path, &product, retry, json)
+                        .await
+                }
+                None => anyhow::bail!(
+                    "usage: rocky fulfill <product> [--retry] | rocky fulfill approve-spec \
+                     <product>"
+                ),
+            },
+        },
         Command::Product { subcommand } => match subcommand {
             ProductSubcommand::Verify { product } => {
                 rocky_cli::commands::run_product_verify(&cli.config, &product, json)
