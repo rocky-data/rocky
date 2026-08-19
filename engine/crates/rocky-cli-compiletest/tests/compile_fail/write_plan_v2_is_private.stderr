@@ -7,8 +7,12 @@ error[E0603]: function `write_plan_v2` is private
 note: the function `write_plan_v2` is defined here
  --> $WORKSPACE/crates/rocky-cli/src/plan_store.rs
   |
-  | pub(crate) fn write_plan_v2<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  | / pub(crate) fn write_plan_v2<T: Serialize>(
+  | |     root: &Path,
+  | |     kind: PlanKind,
+  | |     payload: &T,
+  | | ) -> Result<String> {
+  | |___________________^
 
 error[E0283]: type annotations needed
  --> tests/compile_fail/write_plan_v2_is_private.rs:6:13
@@ -30,7 +34,7 @@ error[E0283]: type annotations needed
 note: required by a bound in `plan_store::write_plan_v2`
  --> $WORKSPACE/crates/rocky-cli/src/plan_store.rs
   |
-  | pub(crate) fn write_plan_v2<T: Serialize>(root: &Path, kind: PlanKind, payload: &T) -> Result<String> {
+  | pub(crate) fn write_plan_v2<T: Serialize>(
   |                                ^^^^^^^^^ required by this bound in `write_plan_v2`
 help: consider specifying the generic argument
   |
