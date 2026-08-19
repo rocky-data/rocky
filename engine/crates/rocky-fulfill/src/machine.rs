@@ -143,7 +143,10 @@ pub enum OwnershipDecision {
 ///   authority transition.
 /// - **The old worker group** — the taken-over record carries
 ///   `driver_pgid` + leader start time; the new owner sweeps a
-///   still-live group before dispatching its own worker.
+///   still-live group before dispatching its own worker. The approve
+///   verb refuses a new-digest approval while any state is mid-step or
+///   a worker group is stamped, so no record replacement can drop the
+///   stamp (or the pinned key) out from under this argument.
 /// - **Transcripts / outbox files** — advisory: no gate ever trusts
 ///   them, and elicitation bytes are digest-checked on hand-off.
 ///
