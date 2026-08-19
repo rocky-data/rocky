@@ -4051,6 +4051,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rocky-cli-compiletest"
+version = "0.0.0"
+dependencies = [
+ "rocky-cli",
+ "trybuild",
+]
+
+[[package]]
 name = "rocky-compiler"
 version = "1.71.0"
 dependencies = [
