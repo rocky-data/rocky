@@ -476,9 +476,16 @@ fn phase_a_tamper_blocks_at_the_byte_verify() {
     assert_eq!(code, 2, "blocked exits 2");
     let json = json.expect("json");
     assert_eq!(json["state"], "blocked");
+    let message = json["message"].as_str().unwrap();
+    assert!(message.contains("tampered"), "{json}");
+    // The LOOP's own byte-verify fired — not the substrate's Phase-B
+    // backstop (`[phase-a-tampered]`, prefixed "phase B rejected"). Both
+    // refuse a tampered generation (defense in depth, proven by the
+    // mutation pass), but the merged-precondition check must be the one
+    // that answers first.
     assert!(
-        json["message"].as_str().unwrap().contains("tampered"),
-        "{json}"
+        message.contains("content drift") && !message.contains("phase B rejected"),
+        "the pre-Phase-B byte-verify must fire first: {json}"
     );
 
     // F4: the block fired at the PRE-PROPOSE byte-verify — while the
