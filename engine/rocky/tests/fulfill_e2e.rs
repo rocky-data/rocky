@@ -650,6 +650,98 @@ fn applying_unknown_receipt_arms_park_on_in_flight_and_resolve_on_success() {
     assert_eq!(table_exists, 0, "nothing executed: the receipt resolved it");
 }
 
+/// F3: the REAL `skipped_in_flight` arm — the loop reaches an ACTUAL
+/// apply whose idempotency key is held by a live (unexpired) claim, so
+/// the engine's typed outcome is `SkippedInFlight`, and the loop keeps
+/// the state (never journals applied). The prior drills only ever hit
+/// the receipt-lookup path BEFORE an apply; this one executes the
+/// deflection arm itself.
+#[test]
+fn a_live_in_flight_claim_deflects_the_real_apply_and_keeps_the_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+    let plan_id = drive_to_plan_review(dir);
+    let (code, _j, _o, e) = rocky(dir, &["review", &plan_id, "--approve"]);
+    assert_eq!(code, 0, "{e}");
+
+    // Hold the pinned key with a LIVE claim (future expiry): the engine
+    // classifies an unexpired InFlight as SkipInFlight, never adopts it.
+    let key = {
+        let store = state_store(dir);
+        let key = store
+            .fulfill_state_get(PRODUCT)
+            .expect("read")
+            .expect("record")
+            .idempotency_key
+            .expect("key pinned at propose time");
+        let now = chrono::Utc::now();
+        store
+            .idempotency_put(&rocky_core::idempotency::IdempotencyEntry {
+                key: key.clone(),
+                run_id: "run-held".to_string(),
+                state: rocky_core::idempotency::IdempotencyState::InFlight,
+                stamped_at: now,
+                expires_at: now + chrono::Duration::hours(1),
+                dedup_on: rocky_core::config::DedupPolicy::Success,
+            })
+            .expect("seed live claim");
+        key
+    };
+
+    // The loop reaches the REAL apply; the engine deflects it as
+    // skipped_in_flight; the machine KEEPS the state (a clean stop).
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "a deflected apply is a clean stop");
+    let json = json.expect("json");
+    assert_eq!(json["state"], "applying", "the state is KEPT: {json}");
+    assert!(
+        json["message"].as_str().unwrap().contains("run-held"),
+        "the holding run is named: {json}"
+    );
+    {
+        let store = state_store(dir);
+        let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+        assert_eq!(
+            rows.iter().filter(|r| r.to_state == "applied").count(),
+            0,
+            "a deflected apply must never journal applied"
+        );
+        // The claim is untouched: still InFlight under the same run.
+        let entry = store.idempotency_get(&key).expect("read").expect("entry");
+        assert_eq!(
+            entry.state,
+            rocky_core::idempotency::IdempotencyState::InFlight
+        );
+        assert_eq!(entry.run_id, "run-held");
+        // The target was never materialized.
+        drop(store);
+        let conn = duckdb::Connection::open(dir.join("wh.duckdb")).expect("duckdb");
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'out' AND table_name = 'revenue_daily'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query");
+        assert_eq!(table_exists, 0, "nothing executed under a held claim");
+    }
+
+    // A rerun (cold resume at applying) goes through applying_unknown
+    // and PARKS on the live claim — still no applied row.
+    let (_code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("json");
+    assert_eq!(json["state"], "applying_unknown", "{json}");
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    assert_eq!(
+        rows.iter().filter(|r| r.to_state == "applied").count(),
+        0,
+        "parked resume adds no applied row either"
+    );
+}
+
 #[test]
 fn a_live_foreign_owner_stands_the_loop_down_and_a_dead_one_is_taken_over() {
     let tmp = tempfile::tempdir().expect("tempdir");
