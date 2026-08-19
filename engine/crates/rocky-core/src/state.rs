@@ -3782,8 +3782,8 @@ impl StateStore {
         } else {
             drop(txn);
             Ok(FulfillCas::Lost {
-                current_approval,
-                current_state,
+                current_approval: current_approval.map(Box::new),
+                current_state: current_state.map(Box::new),
             })
         }
     }

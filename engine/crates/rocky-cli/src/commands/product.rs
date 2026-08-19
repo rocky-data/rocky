@@ -1231,15 +1231,14 @@ pub(crate) fn product_status_in(
     };
     if let Some(store) = store {
         if let Some(record) = store.product_approval_get(product_name)? {
-            let intact = root
-                .join(&record.snapshot_path)
-                .is_file()
-                .then(|| {
-                    std::fs::read(root.join(&record.snapshot_path))
-                        .map(|bytes| content_digest(&bytes) == record.spec_digest)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
+            let snapshot_file = root.join(&record.snapshot_path);
+            let intact = if snapshot_file.is_file() {
+                std::fs::read(&snapshot_file)
+                    .map(|bytes| content_digest(&bytes) == record.spec_digest)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
             output.snapshot_intact = Some(intact);
             output.spec_matches_approval = parsed
                 .as_ref()
@@ -2246,7 +2245,7 @@ effect = "require_review"
 
         // The seeded source's typed columns — the in-process stand-in for
         // the answer key's `--with-seed` DuckDB compile.
-        let source_columns = vec![
+        let source_columns = [
             ("charge_id", RockyType::Int64),
             ("client_id", RockyType::Int64),
             ("charged_on", RockyType::Date),

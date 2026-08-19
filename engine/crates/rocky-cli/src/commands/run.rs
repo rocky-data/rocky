@@ -1340,8 +1340,6 @@ pub(crate) fn resolve_replication_authority(
     }
 }
 
-/// Execute `rocky run` — full pipeline.
-#[allow(clippy::too_many_arguments)]
 /// How a `run()` invocation terminated, beyond its `Result`.
 ///
 /// `run()` historically returned `Result<()>`, which cannot distinguish
@@ -1370,6 +1368,8 @@ pub enum RunTermination {
     },
 }
 
+/// Execute `rocky run` — full pipeline.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run", fields(run_id))]
 pub async fn run(
     // Kept for directory resolution and sub-paths (models dir defaults,

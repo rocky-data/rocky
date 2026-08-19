@@ -209,12 +209,13 @@ pub fn fulfill_journal_key(product_name: &str, seq: u64) -> String {
 pub enum FulfillCas {
     /// The expected priors matched; every write committed atomically.
     Won,
-    /// A prior did not match; nothing was written.
+    /// A prior did not match; nothing was written. Boxed: the records
+    /// dwarf the `Won` variant, and a CAS loss is the rare arm.
     Lost {
         /// The approval record currently stored, if any.
-        current_approval: Option<ProductApprovalRecord>,
+        current_approval: Option<Box<ProductApprovalRecord>>,
         /// The fulfillment record currently stored, if any.
-        current_state: Option<FulfillStateRecord>,
+        current_state: Option<Box<FulfillStateRecord>>,
     },
 }
 
