@@ -258,6 +258,66 @@ fn contained_final_path(resolved_root: &Path, journal: &Path, rel: &str) -> Spec
     Ok(final_path)
 }
 
+/// Refuse a symlink sitting at any path the fresh commit is about to
+/// WRITE THROUGH, before the first mutation.
+///
+/// The staging loop stages with `std::fs::write` (into `<final>.ff-staged`)
+/// and backs finals up with `std::fs::copy` (into `<final>.ff-prev`), and
+/// the journal is written with `std::fs::write` (into `<journal>.ff-staged`)
+/// — all three FOLLOW a symlink at the destination. A crash recovery path
+/// already refuses symlinked residue, but that check lives past
+/// [`recover_generation`]'s no-journal early return, so on the FRESH
+/// commit path (the common case: no prior crash) nothing guarded these
+/// writes. An attacker who can place a file in the models directory or the
+/// state dir (a malicious spec repo, a lower-privilege process) could park
+/// a symlink at `<contract>.ff-staged` pointing at `~/.ssh/authorized_keys`
+/// and the commit would write engine bytes through it — an out-of-project
+/// write. This closes that class on the fresh path.
+///
+/// Every checked path is refused when it is a symlink itself, dangling or
+/// not: [`is_symlink`] reads the link via `symlink_metadata` and never
+/// follows it. The final is checked too — `has_prev`'s `exists()` and the
+/// backup `copy`'s SOURCE both traverse a live symlink at the final.
+///
+/// Stated residual, identical to the recovery path's: a check-then-write is
+/// TOCTOU against a directory swapped for a symlink between validation and
+/// the syscall, only fully closed by dirfd/`O_NOFOLLOW` APIs, which v0 does
+/// not use — the same-machine posture accepts it.
+fn refuse_symlinked_write_targets<'a>(
+    project_root: &Path,
+    relpaths: impl IntoIterator<Item = &'a str>,
+) -> SpecResult<()> {
+    for relpath in relpaths {
+        let final_path = project_root.join(relpath);
+        for probe in [
+            final_path.clone(),
+            staged_sibling(&final_path),
+            prev_sibling(&final_path),
+        ] {
+            if is_symlink(&probe) {
+                let suffix = probe
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| match ext {
+                        e if STAGED_SUFFIX.ends_with(e) => " (a staged residue)",
+                        e if PREV_SUFFIX.ends_with(e) => " (a backup residue)",
+                        _ => "",
+                    })
+                    .unwrap_or("");
+                return Err(SpecRejected::new(
+                    "commit-symlinked-target",
+                    format!(
+                        "refusing to commit: a write target for '{relpath}'{suffix} is a \
+                         symlink — a generation writes only regular files, and a link at a \
+                         staging path would redirect the write out of the project"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The staged sibling of a final path (same directory, fixed suffix).
 fn staged_sibling(final_path: &Path) -> PathBuf {
     sibling_with_suffix(final_path, STAGED_SUFFIX)
@@ -345,6 +405,21 @@ fn commit_generation_with_ops(
         .map(|artifact| (artifact.relpath.clone(), artifact.content.clone()))
         .collect();
     contents.push((manifest_relpath.clone(), lowering.manifest.to_json_bytes()));
+
+    // Refuse a symlink at any write target BEFORE the first mutation: the
+    // fresh commit path stages/backs-up/journals with write+copy, all of
+    // which follow a link at the destination. `recover_generation` above
+    // guards the recovery path's residue, but returns early with no
+    // journal, so this is the fresh path's only guard. The journal and its
+    // `.ff-staged` tmp are covered alongside every artifact's siblings.
+    let journal_relpath = format!("{}/{STAGING_JOURNAL}", state_dir_rel(product_name));
+    refuse_symlinked_write_targets(
+        project_root,
+        contents
+            .iter()
+            .map(|(relpath, _)| relpath.as_str())
+            .chain(std::iter::once(journal_relpath.as_str())),
+    )?;
 
     // 1. Stage every file (same dir, fixed suffix) and back up finals.
     let mut entries: Vec<StagingEntry> = Vec::with_capacity(contents.len());
@@ -1173,6 +1248,122 @@ mod tests {
         run_phase_b(&project, SPEC_PATH, &parsed).expect("recovers then commits");
         assert_eq!(committed(&project).phase, ManifestPhase::Merged);
         assert!(!journal_path(&project, "revenue_daily").exists());
+    }
+
+    // ----- fresh-path symlink refusals (no journal → recovery is a no-op) ---
+    //
+    // The residue-symlink guard inside `recover_generation` runs only when a
+    // journal already exists. On the FRESH commit path — the common case, no
+    // prior crash — the staging writes (`write` into `.ff-staged`, `copy`
+    // into `.ff-prev`, `write` into `<journal>.ff-staged`) would otherwise
+    // follow an attacker-planted symlink out of the project. These pin the
+    // pre-mutation refusal that closes that class.
+
+    #[cfg(unix)]
+    fn plant_symlink(link: &Path, target: &Path) {
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_commit_refuses_a_symlinked_staged_target_and_leaves_it_untouched() {
+        // THE exploit: a first `rocky product compile` (no journal) with a
+        // symlink pre-planted at `<contract>.ff-staged` pointing at a file
+        // OUTSIDE the project. Without the guard, `std::fs::write` follows it
+        // and writes the contract bytes through to the target.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"a developer's private bytes outside the project").expect("write");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        plant_symlink(
+            &project.join("models/revenue_daily.contract.toml.ff-staged"),
+            &secret,
+        );
+
+        let error = run_phase_a(&project, SPEC_PATH, &parsed).expect_err("symlinked staged target");
+        assert_eq!(error.code, "commit-symlinked-target");
+        assert_eq!(
+            std::fs::read(&secret).expect("still there"),
+            b"a developer's private bytes outside the project",
+            "the out-of-project target must be untouched"
+        );
+        // Nothing committed: no manifest, and the contract final was never
+        // written.
+        assert!(!manifest_path(&project).exists());
+        assert!(!project.join("models/revenue_daily.contract.toml").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_commit_refuses_a_symlinked_prev_target_and_leaves_it_untouched() {
+        // The backup `copy` vector: on a re-commit the existing final is
+        // copied to `<final>.ff-prev` — a symlink there is written through.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"private bytes the backup copy must not overwrite").expect("write");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        // First commit: the contract final now exists, so the next commit
+        // will back it up.
+        run_phase_a(&project, SPEC_PATH, &parsed).expect("phase A");
+        plant_symlink(
+            &project.join("models/revenue_daily.contract.toml.ff-prev"),
+            &secret,
+        );
+        // Resume (re-commit): would copy the existing contract to .ff-prev.
+        let error = run_phase_a(&project, SPEC_PATH, &parsed).expect_err("symlinked prev target");
+        assert_eq!(error.code, "commit-symlinked-target");
+        assert_eq!(
+            std::fs::read(&secret).expect("still there"),
+            b"private bytes the backup copy must not overwrite",
+            "the out-of-project backup target must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_commit_refuses_a_symlinked_journal_temp_and_leaves_it_untouched() {
+        // The journal's own `.ff-staged` tmp is written with `std::fs::write`
+        // too, in the state dir — an attacker-writable location under the
+        // same threat model.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"journal-temp target bytes").expect("write");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        plant_symlink(
+            &project
+                .join(state_dir_rel("revenue_daily"))
+                .join(format!("{STAGING_JOURNAL}{STAGED_SUFFIX}")),
+            &secret,
+        );
+        let error = run_phase_a(&project, SPEC_PATH, &parsed).expect_err("symlinked journal temp");
+        assert_eq!(error.code, "commit-symlinked-target");
+        assert_eq!(
+            std::fs::read(&secret).expect("still there"),
+            b"journal-temp target bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_final_is_refused_on_the_fresh_path() {
+        // A symlink AT the final (not just its residue) is refused too: the
+        // backup `copy`'s SOURCE and `has_prev`'s `exists()` both traverse a
+        // live link at the final.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"final-target bytes").expect("write");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        plant_symlink(&project.join("models/revenue_daily.contract.toml"), &secret);
+        let error = run_phase_a(&project, SPEC_PATH, &parsed).expect_err("symlinked final");
+        assert_eq!(error.code, "commit-symlinked-target");
+        assert_eq!(std::fs::read(&secret).expect("still there"), b"final-target bytes");
     }
 
     // --------------- the journal is untrusted: forgeries refused ------------
