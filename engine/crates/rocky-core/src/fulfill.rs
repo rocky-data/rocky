@@ -133,6 +133,72 @@ pub struct FulfillStateRecord {
     /// RFC3339 instant of the last transition.
     #[serde(default)]
     pub updated_at: Option<String>,
+    /// The plan the in-flight work pinned at propose time, if any.
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    /// The idempotency key pinned for the apply
+    /// (`<product_id>@<spec_digest>@<journal_seq>`), if any. The
+    /// `applying_unknown` resume resolves receipts by exactly this key.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Driver dispatches consumed in the current task cycle
+    /// (elicitation or drafting), counted BEFORE dispatch so an attempt
+    /// that crashes mid-task is still counted (the
+    /// `schedule::claim::ClaimRecord::cycle_attempts` discipline).
+    #[serde(default)]
+    pub drafting_attempts: u32,
+    /// Verify-red → repair-drafting cycles consumed.
+    #[serde(default)]
+    pub repair_rounds: u32,
+    /// The loop process currently driving this product. `None` = the
+    /// record is released (every clean stop clears it); a stamp that
+    /// outlives its process is what the takeover probe detects.
+    #[serde(default)]
+    pub owner_pid: Option<u32>,
+    /// The owner process's start time, paired with [`Self::owner_pid`]
+    /// to make the liveness probe PID-reuse-proof.
+    #[serde(default)]
+    pub owner_start_time: Option<u64>,
+    /// The live driver task's process-group leader, stamped while a
+    /// worker is in flight so a takeover can sweep the group.
+    #[serde(default)]
+    pub driver_pgid: Option<u32>,
+    /// The group leader's start time (PID-reuse-proof pair).
+    #[serde(default)]
+    pub driver_leader_start_time: Option<u64>,
+    /// When an owner that could not be probed was first observed by
+    /// another process, so the recovery grace can elapse before a
+    /// takeover (the `first_swept_at` pattern). RFC3339.
+    #[serde(default)]
+    pub first_swept_at: Option<String>,
+}
+
+impl FulfillStateRecord {
+    /// A fresh record with no pins, no counters, and no owner stamp.
+    /// `journal_seq` starts at 0 — the CAS transaction allocates it.
+    pub fn new(
+        state: FulfillState,
+        product_id: String,
+        spec_digest: Option<String>,
+        updated_at: Option<String>,
+    ) -> Self {
+        Self {
+            state,
+            product_id,
+            spec_digest,
+            journal_seq: 0,
+            updated_at,
+            plan_id: None,
+            idempotency_key: None,
+            drafting_attempts: 0,
+            repair_rounds: 0,
+            owner_pid: None,
+            owner_start_time: None,
+            driver_pgid: None,
+            driver_leader_start_time: None,
+            first_swept_at: None,
+        }
+    }
 }
 
 /// One append-only journal row (key `product:<name>#<seq:08>`).
@@ -156,6 +222,12 @@ pub struct FulfillJournalRow {
     /// The spec digest involved, when the event concerns one.
     #[serde(default)]
     pub spec_digest: Option<String>,
+    /// The plan involved, when the event concerns one (propose, apply).
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    /// The idempotency key pinned by this event, when it pinned one.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// The spec-approval record (table `product_approvals`, key

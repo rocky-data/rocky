@@ -3841,6 +3841,81 @@ impl StateStore {
         }
     }
 
+    /// One fulfillment state transition: compare-and-swap the current
+    /// record and append the journal row, in ONE write transaction — the
+    /// [`Self::product_approval_cas`] shape without the approval half.
+    /// Every reconciler transition goes through here.
+    ///
+    /// The CAS asserts the stored record still equals `expected_state`
+    /// (`None` = expect absent). The journal sequence is allocated
+    /// inside the transaction from the current record's `journal_seq` —
+    /// the caller's `new_state.journal_seq` and `journal_row.seq` are
+    /// overwritten — so a torn record/journal pair cannot exist. On a
+    /// mismatch nothing is written: another process moved the record and
+    /// the caller must stop (the [`crate::fulfill::FulfillCas::Lost`]
+    /// payload carries what won, for the stand-down message).
+    pub fn fulfill_state_cas(
+        &self,
+        product_name: &str,
+        expected_state: Option<&crate::fulfill::FulfillStateRecord>,
+        new_state: &crate::fulfill::FulfillStateRecord,
+        journal_row: &crate::fulfill::FulfillJournalRow,
+    ) -> Result<crate::fulfill::FulfillCas, StateError> {
+        use crate::fulfill::{FulfillCas, FulfillStateRecord, ProductApprovalRecord};
+
+        let key = crate::fulfill::fulfill_state_key(product_name);
+        let txn = self.db.begin_write()?;
+        let current_approval: Option<ProductApprovalRecord>;
+        let current_state: Option<FulfillStateRecord>;
+        let won;
+        {
+            let approvals = txn.open_table(PRODUCT_APPROVALS)?;
+            current_approval = match approvals.get(key.as_str())? {
+                Some(value) => Some(serde_json::from_slice(value.value())?),
+                None => None,
+            };
+            let mut states = txn.open_table(FULFILL_STATE)?;
+            current_state = match states.get(key.as_str())? {
+                Some(value) => Some(serde_json::from_slice(value.value())?),
+                None => None,
+            };
+            let states_match = match (expected_state, &current_state) {
+                (None, None) => true,
+                (Some(e), Some(c)) => e == c,
+                _ => false,
+            };
+            if states_match {
+                let seq = current_state
+                    .as_ref()
+                    .map(|record| record.journal_seq + 1)
+                    .unwrap_or(1);
+                let mut stamped_state = new_state.clone();
+                stamped_state.journal_seq = seq;
+                let state_bytes = serde_json::to_vec(&stamped_state)?;
+                states.insert(key.as_str(), state_bytes.as_slice())?;
+
+                let mut stamped_row = journal_row.clone();
+                stamped_row.seq = seq;
+                let journal_key = crate::fulfill::fulfill_journal_key(product_name, seq);
+                let row_bytes = serde_json::to_vec(&stamped_row)?;
+                states.insert(journal_key.as_str(), row_bytes.as_slice())?;
+                won = true;
+            } else {
+                won = false;
+            }
+        }
+        if won {
+            self.commit_write(txn)?;
+            Ok(FulfillCas::Won)
+        } else {
+            drop(txn);
+            Ok(FulfillCas::Lost {
+                current_approval: current_approval.map(Box::new),
+                current_state: current_state.map(Box::new),
+            })
+        }
+    }
+
     /// Find the newest terminal run record carrying `submission_id`, used by the
     /// stuck-claim resolver to derive an outcome. Skip statuses (which did no
     /// work) are ignored.
@@ -6362,13 +6437,12 @@ mod tests {
             approved_at: Some("2026-08-19T00:00:00Z".to_string()),
             snapshot_path: ".rocky/fulfillment/revenue_daily/approved-sha256:aa.toml".to_string(),
         };
-        let state = FulfillStateRecord {
-            state: FulfillState::SpecApproved,
-            product_id: "product:revenue_daily".to_string(),
-            spec_digest: Some("sha256:aa".to_string()),
-            journal_seq: 0, // overwritten inside the transaction
-            updated_at: Some("2026-08-19T00:00:00Z".to_string()),
-        };
+        let state = FulfillStateRecord::new(
+            FulfillState::SpecApproved,
+            "product:revenue_daily".to_string(),
+            Some("sha256:aa".to_string()),
+            Some("2026-08-19T00:00:00Z".to_string()),
+        );
         let row = FulfillJournalRow {
             seq: 0, // overwritten inside the transaction
             at: Some("2026-08-19T00:00:00Z".to_string()),
@@ -6376,6 +6450,8 @@ mod tests {
             from_state: None,
             to_state: "spec_approved".to_string(),
             spec_digest: Some("sha256:aa".to_string()),
+            plan_id: None,
+            idempotency_key: None,
         };
         let outcome = store
             .product_approval_cas("revenue_daily", None, &approval, None, &state, &row)
@@ -6440,13 +6516,12 @@ mod tests {
             approved_at: None,
             snapshot_path: "x".to_string(),
         };
-        let state = FulfillStateRecord {
-            state: FulfillState::SpecApproved,
-            product_id: "product:revenue_daily".to_string(),
-            spec_digest: Some("sha256:aa".to_string()),
-            journal_seq: 0,
-            updated_at: None,
-        };
+        let state = FulfillStateRecord::new(
+            FulfillState::SpecApproved,
+            "product:revenue_daily".to_string(),
+            Some("sha256:aa".to_string()),
+            None,
+        );
         let row = FulfillJournalRow {
             seq: 0,
             at: None,
@@ -6454,6 +6529,8 @@ mod tests {
             from_state: None,
             to_state: "spec_approved".to_string(),
             spec_digest: None,
+            plan_id: None,
+            idempotency_key: None,
         };
         // Expecting a prior approval that does not exist: the CAS loses and
         // NOTHING is written — not the approval, not the state, not a
@@ -6505,13 +6582,12 @@ mod tests {
                 approved_at: None,
                 snapshot_path: "x".to_string(),
             };
-            let state = FulfillStateRecord {
-                state: FulfillState::SpecApproved,
-                product_id: format!("product:{name}"),
-                spec_digest: None,
-                journal_seq: 0,
-                updated_at: None,
-            };
+            let state = FulfillStateRecord::new(
+                FulfillState::SpecApproved,
+                format!("product:{name}"),
+                None,
+                None,
+            );
             let row = FulfillJournalRow {
                 seq: 0,
                 at: None,
@@ -6519,6 +6595,8 @@ mod tests {
                 from_state: None,
                 to_state: "spec_approved".to_string(),
                 spec_digest: None,
+                plan_id: None,
+                idempotency_key: None,
             };
             store
                 .product_approval_cas(name, None, &approval, None, &state, &row)
@@ -6529,6 +6607,126 @@ mod tests {
         let rows = store.fulfill_journal_rows("revenue").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event, "approved revenue");
+    }
+
+    #[test]
+    fn fulfill_state_cas_inserts_transitions_and_journals_atomically() {
+        use crate::fulfill::{FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord};
+        let (store, _dir) = temp_store();
+        let row = |event: &str, to: &str| FulfillJournalRow {
+            seq: 0, // overwritten inside the transaction
+            at: None,
+            event: event.to_string(),
+            from_state: None,
+            to_state: to.to_string(),
+            spec_digest: None,
+            plan_id: None,
+            idempotency_key: None,
+        };
+
+        // Insert (expect absent).
+        let init = FulfillStateRecord::new(
+            FulfillState::Init,
+            "product:revenue_daily".to_string(),
+            None,
+            None,
+        );
+        let outcome = store
+            .fulfill_state_cas("revenue_daily", None, &init, &row("loop started", "init"))
+            .unwrap();
+        assert_eq!(outcome, FulfillCas::Won);
+        let stored = store.fulfill_state_get("revenue_daily").unwrap().unwrap();
+        assert_eq!(stored.state, FulfillState::Init);
+        assert_eq!(stored.journal_seq, 1, "seq allocated in the txn");
+
+        // Transition on the observed prior.
+        let mut next = stored.clone();
+        next.state = FulfillState::NeedsInput {
+            reason: "spec_approval".to_string(),
+            payload: "sha256:aa".to_string(),
+        };
+        let outcome = store
+            .fulfill_state_cas(
+                "revenue_daily",
+                Some(&stored),
+                &next,
+                &row("candidate adopted", "needs_input"),
+            )
+            .unwrap();
+        assert_eq!(outcome, FulfillCas::Won);
+        let stored = store.fulfill_state_get("revenue_daily").unwrap().unwrap();
+        assert_eq!(stored.journal_seq, 2);
+        let rows = store.fulfill_journal_rows("revenue_daily").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].seq, 1);
+        assert_eq!(rows[1].seq, 2);
+        assert_eq!(rows[1].event, "candidate adopted");
+    }
+
+    #[test]
+    fn fulfill_state_cas_lost_writes_nothing() {
+        use crate::fulfill::{FulfillCas, FulfillJournalRow, FulfillState, FulfillStateRecord};
+        let (store, _dir) = temp_store();
+        let record = FulfillStateRecord::new(
+            FulfillState::Init,
+            "product:revenue_daily".to_string(),
+            None,
+            None,
+        );
+        let row = FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: "x".to_string(),
+            from_state: None,
+            to_state: "init".to_string(),
+            spec_digest: None,
+            plan_id: None,
+            idempotency_key: None,
+        };
+        // Expecting a prior that does not exist: the CAS loses, and neither
+        // the record nor a journal row is written.
+        let outcome = store
+            .fulfill_state_cas("revenue_daily", Some(&record), &record, &row)
+            .unwrap();
+        let FulfillCas::Lost {
+            current_state,
+            current_approval,
+        } = outcome
+        else {
+            panic!("expected Lost");
+        };
+        assert!(current_state.is_none());
+        assert!(current_approval.is_none());
+        assert!(store.fulfill_state_get("revenue_daily").unwrap().is_none());
+        assert!(
+            store
+                .fulfill_journal_rows("revenue_daily")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Seed, then expect a DIFFERENT prior: lost, and the stored record
+        // is returned so the caller can print who won.
+        store
+            .fulfill_state_cas("revenue_daily", None, &record, &row)
+            .unwrap();
+        let mut wrong = record.clone();
+        wrong.journal_seq = 99;
+        let outcome = store
+            .fulfill_state_cas("revenue_daily", Some(&wrong), &record, &row)
+            .unwrap();
+        let FulfillCas::Lost { current_state, .. } = outcome else {
+            panic!("expected Lost");
+        };
+        assert_eq!(current_state.unwrap().journal_seq, 1);
+        assert_eq!(
+            store
+                .fulfill_journal_rows("revenue_daily")
+                .unwrap()
+                .len(),
+            1,
+            "the losing CAS appended nothing"
+        );
     }
 
     #[test]

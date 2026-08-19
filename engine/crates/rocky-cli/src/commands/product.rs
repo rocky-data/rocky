@@ -1163,13 +1163,12 @@ pub(crate) fn product_approve_in(
         approved_at: Some(now.clone()),
         snapshot_path: snapshot_path.clone(),
     };
-    let new_state = FulfillStateRecord {
-        state: FulfillState::SpecApproved,
-        product_id: parsed.product_id(),
-        spec_digest: Some(parsed.digest.clone()),
-        journal_seq: 0, // allocated inside the transaction
-        updated_at: Some(now.clone()),
-    };
+    let new_state = FulfillStateRecord::new(
+        FulfillState::SpecApproved,
+        parsed.product_id(),
+        Some(parsed.digest.clone()),
+        Some(now.clone()),
+    );
     let journal_row = FulfillJournalRow {
         seq: 0, // allocated inside the transaction
         at: Some(now.clone()),
@@ -1177,6 +1176,8 @@ pub(crate) fn product_approve_in(
         from_state: previous_state.clone(),
         to_state: "spec_approved".to_string(),
         spec_digest: Some(parsed.digest.clone()),
+        plan_id: None,
+        idempotency_key: None,
     };
     match store.product_approval_cas(
         product_name,
