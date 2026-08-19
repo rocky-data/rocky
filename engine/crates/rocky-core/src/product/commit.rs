@@ -31,11 +31,16 @@
 //! mutation. No on-disk manifest grants recovery authority: staged and
 //! previous manifests are exactly as forgeable as the journal itself.
 //!
-//! Stated residual, accepted under the v0 same-machine threat posture:
-//! path-based syscalls re-traverse the path at syscall time, so a
-//! directory swapped for a symlink in the instant between validation and
-//! one specific rename/unlink is only fully closed by dirfd/`O_NOFOLLOW`
-//! APIs, which v0 does not use.
+//! Stated residuals, accepted under the v0 same-machine threat posture.
+//! Path-based syscalls re-traverse the path at syscall time, so a
+//! DIRECTORY swapped for a symlink in the instant between validation and
+//! a rename/unlink is only fully closed by dirfd-relative APIs, which v0
+//! does not use. Every LEAF the protocol writes or reads is guarded at
+//! the syscall itself — O_EXCL on each write, `O_NOFOLLOW` on the backup
+//! read — but `O_NOFOLLOW` is unix only: on Windows that read still
+//! follows a symlink or junction planted at the leaf, and containment
+//! there rests on the pre-check alone. Windows reparse-point behaviour is
+//! untested; every symlink exploit test in this module is `#[cfg(unix)]`.
 
 use std::path::{Path, PathBuf};
 
@@ -319,6 +324,12 @@ pub fn contained_write_target(project_root: &Path, rel: &str) -> Result<PathBuf,
 /// the O_EXCL create retried once.
 fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
+    create_new_no_follow(path)?.write_all(bytes)
+}
+
+/// The open half of [`write_new_no_follow`], handing back the handle so a
+/// caller can also set the mode on the descriptor rather than by path.
+fn create_new_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     let open = || {
         std::fs::OpenOptions::new()
             .write(true)
@@ -326,22 +337,73 @@ fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             .open(path)
     };
     match open() {
-        Ok(mut file) => file.write_all(bytes),
+        Ok(file) => Ok(file),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             std::fs::remove_file(path)?;
-            open()?.write_all(bytes)
+            open()
         }
         Err(err) => Err(err),
     }
 }
 
+/// Read `path` whole, refusing to follow a symlink at the leaf, and hand
+/// back its mode alongside the bytes.
+///
+/// On unix the open carries `O_NOFOLLOW`, so a link swapped in at the leaf
+/// AFTER a path-based pre-check — the TOCTOU window no re-check can close,
+/// because a path syscall re-traverses the path — fails instead of being
+/// read through to its target. Windows `OpenOptions` has no `O_NOFOLLOW`
+/// equivalent, so there the read still follows a symlink or junction: that
+/// platform keeps the weaker pre-check-only guarantee, stated rather than
+/// papered over.
+///
+/// The mode comes off the DESCRIPTOR, not a second path lookup, so it
+/// describes the same file the bytes came from.
+fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions)> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let permissions = file.metadata()?.permissions();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok((bytes, permissions))
+}
+
+/// Copy `src` to `dst` without following a symlink at EITHER end.
+///
+/// `std::fs::copy` follows both: a link at the source is read through to
+/// its target, and a link at the destination is written through to its.
+/// Both are TOCTOU against the containment pre-check, so each end takes a
+/// syscall-level guard instead — `O_NOFOLLOW` on the read (unix only, see
+/// [`read_no_follow`]) and O_EXCL on the create. The source's mode is
+/// carried across, as `std::fs::copy` did, and is set on the destination
+/// DESCRIPTOR so a link swapped in at `dst` afterwards cannot catch a
+/// path-based `set_permissions`.
+///
+/// The files copied here are a lowered contract, sidecar, SQL model, and
+/// manifest — kilobytes — so reading one whole is cheaper than streaming.
+fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let (bytes, permissions) = read_no_follow(src)?;
+    let mut backup = create_new_no_follow(dst)?;
+    backup.write_all(&bytes)?;
+    backup.set_permissions(permissions)
+}
+
 /// Refuse a symlink sitting at any path the fresh commit is about to
 /// WRITE THROUGH, before the first mutation.
 ///
-/// The staging loop stages with `std::fs::write` (into `<final>.ff-staged`)
-/// and backs finals up with `std::fs::copy` (into `<final>.ff-prev`), and
-/// the journal is written with `std::fs::write` (into `<journal>.ff-staged`)
-/// — all three FOLLOW a symlink at the destination. A crash recovery path
+/// The staging loop stages into `<final>.ff-staged`, backs finals up into
+/// `<final>.ff-prev`, and journals into `<journal>.ff-staged`. Written the
+/// plain way (`std::fs::write`, `std::fs::copy`) all three FOLLOW a symlink
+/// at the destination — which is why they go through the no-follow helpers
+/// above, and why this pre-check exists at all. A crash recovery path
 /// already refuses symlinked residue, but that check lives past
 /// [`recover_generation`]'s no-journal early return, so on the FRESH
 /// commit path (the common case: no prior crash) nothing guarded these
@@ -361,12 +423,13 @@ fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// is additionally refused when its leaf is a symlink.
 ///
 /// Stated residual, the conceded v0 boundary: a check-then-write is TOCTOU
-/// against a directory or leaf swapped for a symlink between validation and
-/// the syscall. The staged and journal-temp writes take the cheap half
-/// (O_EXCL via [`write_new_no_follow`], race-free for the leaf); the
-/// `.ff-prev` backup `copy` still follows a symlinked SOURCE swapped in
-/// post-check — fully closed only by an `O_NOFOLLOW` read, tracked as a
-/// known residual (see [`commit_generation`]).
+/// against a DIRECTORY swapped for a symlink between validation and the
+/// syscall, which only dirfd-relative APIs close. Every LEAF this pre-check
+/// covers is guarded a second time at the syscall itself: the staged,
+/// journal-temp and `.ff-prev` writes use O_EXCL ([`write_new_no_follow`]),
+/// and the `.ff-prev` backup reads its source with `O_NOFOLLOW`
+/// ([`copy_no_follow`]) — the read guard on unix only (see
+/// [`commit_generation`]).
 fn refuse_symlinked_write_targets<'a>(
     project_root: &Path,
     relpaths: impl IntoIterator<Item = &'a str>,
@@ -462,13 +525,20 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 /// Every write target is proven inside the project root through the shared
 /// [`contained_target`] primitive BEFORE the first mutation, refusing a
 /// symlinked ancestor directory (the static `models -> /outside` escape, no
-/// race) as well as a symlink at the leaf. The staged and journal-temp
-/// writes use O_EXCL. One race residual remains, the conceded v0 boundary:
-/// the `.ff-prev` backup `copy` follows a symlinked SOURCE (the final)
-/// swapped in during the window between the pre-check and the copy — fully
-/// closed only by an `O_NOFOLLOW` read. TODO(FF-WP-E1B): open the backup
-/// source with `O_NOFOLLOW` to close the copy-source race (tracking issue
-/// to be filed by the coordinator — this agent cannot run `gh`).
+/// race) as well as a symlink at the leaf. Each leaf is then guarded a
+/// second time at the syscall, so a link swapped in AFTER the pre-check is
+/// refused rather than followed: the staged, journal-temp and `.ff-prev`
+/// writes use O_EXCL, and the `.ff-prev` backup reads its source with
+/// `O_NOFOLLOW` ([`copy_no_follow`]). The backup copy has TWO symlink-follow
+/// ends — the SOURCE read and the DESTINATION write — and both are covered.
+///
+/// Two residuals remain, the conceded v0 boundary. A DIRECTORY swapped for
+/// a symlink between validation and a rename/unlink is closed only by
+/// dirfd-relative APIs, which v0 does not use. And `O_NOFOLLOW` is unix
+/// only: on Windows the backup read still follows a symlink or junction
+/// planted at the final, so containment there rests on the pre-check alone
+/// — and that platform is untested, because every symlink exploit test in
+/// this module is `#[cfg(unix)]`.
 ///
 /// # Errors
 ///
@@ -538,12 +608,12 @@ fn commit_generation_with_ops(
         let has_prev = final_path.exists();
         if has_prev {
             let prev = prev_sibling(&final_path);
-            // Known residual: `copy` follows a symlinked SOURCE (the final)
-            // swapped in after the pre-check — the conceded v0 race, fully
-            // closed only by an `O_NOFOLLOW` read (see `commit_generation`).
-            // The static ancestor/leaf case is already refused above.
-            std::fs::copy(&final_path, &prev)
-                .map_err(|err| io_reject("backing up", &prev, &err))?;
+            // Neither end of this copy follows a link swapped in after the
+            // pre-check: `O_NOFOLLOW` on the source read (unix) and O_EXCL
+            // on the backup create. The failure is named against the SOURCE
+            // — the racy end — not the destination it writes.
+            copy_no_follow(&final_path, &prev)
+                .map_err(|err| io_reject("backing up", &final_path, &err))?;
         }
         entries.push(StagingEntry {
             final_path: relpath.clone(),
@@ -1472,6 +1542,112 @@ mod tests {
         // the committed generation is still the first commit's Phase A.
         assert_eq!(staging_residue(&project), Vec::<String>::new());
         assert_eq!(committed(&project).phase, ManifestPhase::LoweredContract);
+    }
+
+    // ----- the backup copy's own syscall-level guards ----------------------
+    //
+    // The pre-check above refuses a symlink PLANTED before the commit. It
+    // cannot refuse one swapped in AFTER it validates and before the copy
+    // runs — a path-based check re-traverses the path, so the window is real
+    // for any local process that can write the models directory. These pin
+    // the syscall-level guard at each end of the copy, which is what closes
+    // it: `O_NOFOLLOW` on the source read, O_EXCL on the destination create.
+    // They exercise the helper directly because no end-to-end path can reach
+    // the copy with a symlinked source — the pre-check refuses that first.
+
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_refuses_a_source_swapped_for_a_symlink_after_the_check() {
+        // A local racer swaps the final for a link at an out-of-project file
+        // between the pre-check and the backup. `std::fs::copy` reads THROUGH
+        // that link and stamps the secret into `<final>.ff-prev`, from which
+        // a rollback renames it over the final — the secret becomes the
+        // committed artifact. The `O_NOFOLLOW` open refuses instead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"a developer's private bytes outside the project").expect("write");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        plant_symlink(&final_path, &secret);
+        let prev = prev_sibling(&final_path);
+
+        let error = copy_no_follow(&final_path, &prev).expect_err("a symlinked source is refused");
+
+        // The security property, asserted platform-independently: no backup
+        // exists at all, so nothing read through the link reached the
+        // project. (The errno differs across unixes — Linux reports ELOOP,
+        // some BSDs EMLINK — so the bytes are the assertion, not the code.)
+        assert!(
+            !prev.exists(),
+            "no backup may be produced from a symlinked source (error was {error})"
+        );
+        assert_eq!(
+            std::fs::read(&secret).expect("still there"),
+            b"a developer's private bytes outside the project",
+            "the out-of-project source must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_refuses_a_destination_swapped_for_a_symlink_after_the_check() {
+        // The other end of the same copy: a link parked at `<final>.ff-prev`
+        // after the pre-check. O_EXCL neither follows it nor clobbers
+        // through it — the link is unlinked and a real file created in its
+        // place, so the out-of-project target keeps its bytes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"private bytes the backup copy must not overwrite")
+            .expect("write");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        std::fs::write(&final_path, b"the previous generation's contract").expect("write");
+        let prev = prev_sibling(&final_path);
+        plant_symlink(&prev, &secret);
+
+        copy_no_follow(&final_path, &prev).expect("the backup is taken beside the link");
+
+        assert_eq!(
+            std::fs::read(&secret).expect("still there"),
+            b"private bytes the backup copy must not overwrite",
+            "the out-of-project destination target must be untouched"
+        );
+        assert!(
+            !is_symlink(&prev),
+            "the link must not survive as the backup"
+        );
+        assert_eq!(
+            std::fs::read(&prev).expect("backup"),
+            b"the previous generation's contract"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_carries_the_source_mode_across() {
+        // `std::fs::copy` preserved the source's mode, and a rollback renames
+        // the backup back over the final — so dropping the mode here would
+        // silently widen a locked-down artifact on every recovery.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        std::fs::write(&final_path, b"owner-only contract bytes").expect("write");
+        std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+        let prev = prev_sibling(&final_path);
+
+        copy_no_follow(&final_path, &prev).expect("copy");
+
+        assert_eq!(
+            std::fs::read(&prev).expect("backup"),
+            b"owner-only contract bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(&prev).expect("meta").permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[cfg(unix)]

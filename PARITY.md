@@ -374,7 +374,11 @@ or dissolves into the engine surface it was probing.
    O_EXCL for the same reason. Five exploit-exhibiting tests
    (`fresh_commit_refuses_a_symlinked_*`, `a_symlinked_final_is_refused_*`,
    `approve_refuses_a_symlinked_snapshot_temp_*`) assert the out-of-project
-   target is untouched; mutation-checked.
+   target is untouched; mutation-checked. The pre-check is path-based, so it
+   is TOCTOU against a link swapped in after it validates; each leaf is
+   therefore guarded a second time at the syscall — O_EXCL on every write,
+   and `O_NOFOLLOW` on the `.ff-prev` backup's source read (unix only, so
+   Windows keeps the pre-check-only guarantee and stays untested).
 
 5. **Duplicate-final folding uses `str::to_lowercase`, not Unicode
    casefolding.** Python's `str.casefold` also folds shapes like `ß` → `ss`;
