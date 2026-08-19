@@ -813,7 +813,8 @@ impl StateStore {
     /// so a polled `GET /api/v1/runs` ratchets serve's RSS with history size:
     /// one request retained +8.6 MB at 1,435 rows and +211 MB at 50,000 rows
     /// under the default budget, vs +1.0 MB and +4.0 MB under a 1 MiB budget,
-    /// with no latency cost (p99 187ms vs 205ms at 50,000 rows) — #1399.
+    /// and no latency cost: at 50,000 rows the budgeted arm measured p99
+    /// 187ms against 205ms unbudgeted, so the cap is not a trade — #1399.
     /// Callers holding a store open to serve repeated reads should
     /// keep using [`open_read_only`][Self::open_read_only] — a real cache
     /// helps there.
