@@ -814,7 +814,9 @@ impl Runner {
                 (Ok(Some(start)), Some(expected)) if start == expected
             );
             if leader_alive_and_ours {
-                driver::kill_group(pgid, std::time::Duration::from_secs(5)).await?;
+                // The stale group is not our child (its parent crashed),
+                // so there is nothing to reap here.
+                driver::kill_group(pgid, std::time::Duration::from_secs(5), vec![]).await?;
             }
         }
         *record = self

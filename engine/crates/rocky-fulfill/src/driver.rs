@@ -297,7 +297,7 @@ impl AgentDriver for SubprocessDriver {
 
         // Group kill on EVERY path: after a normal leader exit AS WELL as
         // on timeout — leader exit does not imply grandchildren exit.
-        kill_group(pgid, self.kill_grace).await?;
+        kill_group(pgid, self.kill_grace, vec![&mut leader]).await?;
 
         let transcript_rendered = transcript_path.display().to_string();
         let status = match waited {
@@ -427,45 +427,84 @@ fn signal_group(pgid: u32, signal: libc::c_int) -> Result<(), DriverError> {
     }
 }
 
-/// `killpg(SIGTERM)` → grace → `killpg(SIGKILL)` → no-survivors, on the
-/// whole group. Safe to call when the group is already gone (the fast
-/// path costs one probe). Also safe against the kill-race where members
-/// exit exactly as the signals land: ESRCH is success everywhere.
+/// `killpg(SIGTERM)` → reap the direct child → grace → `killpg(SIGKILL)`
+/// → no-survivors, on the whole group.
+///
+/// `own` must name EVERY group member that is this process's direct
+/// child and is still held by the caller (the leader, and any sibling
+/// the driver spawned into the group): each must be reaped (waited)
+/// between the signals, because an unreaped zombie of ours keeps the
+/// pgid alive and — on macOS — makes `killpg` return EPERM for the
+/// whole group. Members that are NOT our children (orphaned
+/// grandchildren) are reaped by init/launchd once killed; the
+/// escalation below retries `SIGKILL` through that reap window instead
+/// of treating a transient EPERM as either success or failure.
+///
+/// Safe when the group is already gone (ESRCH is success everywhere)
+/// and against the kill-race where members exit exactly as the signals
+/// land.
 #[cfg(unix)]
-pub async fn kill_group(pgid: u32, grace: Duration) -> Result<(), DriverError> {
-    if !group_exists(pgid) {
-        return Ok(());
+pub async fn kill_group(
+    pgid: u32,
+    grace: Duration,
+    mut own: Vec<&mut tokio::process::Child>,
+) -> Result<(), DriverError> {
+    if group_exists(pgid) {
+        signal_group(pgid, libc::SIGTERM)?;
     }
-    signal_group(pgid, libc::SIGTERM)?;
-    // Poll the group down within the grace, then escalate.
-    let deadline = tokio::time::Instant::now() + grace;
-    while group_exists(pgid) && tokio::time::Instant::now() < deadline {
+    // Reap our direct children within the grace: they usually exit on
+    // SIGTERM, and an unreaped zombie would wedge the group probe.
+    // `Child::wait` is cancel-safe, so a timeout here loses nothing.
+    let reap_deadline = tokio::time::Instant::now() + grace;
+    for child in own.iter_mut() {
+        let left = reap_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let _ = tokio::time::timeout(left, child.wait()).await;
+    }
+    while group_exists(pgid) && tokio::time::Instant::now() < reap_deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    if group_exists(pgid) {
-        signal_group(pgid, libc::SIGKILL)?;
-    }
-    assert_no_survivors(pgid).await
-}
-
-/// Poll until the group is gone; a group that survives SIGKILL past the
-/// bounded window is a supervision failure surfaced as an error.
-#[cfg(unix)]
-pub async fn assert_no_survivors(pgid: u32) -> Result<(), DriverError> {
-    // SIGKILL is not deliverable-refusable; the window only covers the
-    // kernel reaping zombies whose parent (us) hasn't waited yet plus
-    // scheduler latency. 5s is generous.
+    // Escalate + assert, retrying SIGKILL through zombie-reap windows: a
+    // live member dies on a successful killpg; a zombie-only group
+    // clears as its reapers run. Only a group still standing at the end
+    // of the window is a supervision failure.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
+    let mut last_detail = String::new();
+    loop {
         if !group_exists(pgid) {
+            // One final reap so a child that only died on SIGKILL never
+            // outlives this call as a zombie.
+            for child in own.iter_mut() {
+                let _ = child.wait().await;
+            }
             return Ok(());
+        }
+        // SAFETY: `killpg` with a valid pgid and SIGKILL is a
+        // well-defined libc call with no memory-safety implications;
+        // ESRCH ("already gone") and EPERM ("only zombies remain",
+        // observed on macOS) are handled by the surrounding poll.
+        let rc = unsafe { libc::killpg(pgid as libc::pid_t, libc::SIGKILL) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                continue; // gone between the probe and the signal
+            }
+            last_detail = format!("killpg(SIGKILL) said: {err}");
+        }
+        for child in own.iter_mut() {
+            let _ = tokio::time::timeout(Duration::from_millis(50), child.wait()).await;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DriverError::Survivors {
+                pgid,
+                detail: if last_detail.is_empty() {
+                    "the group still exists 5s after SIGKILL".to_string()
+                } else {
+                    format!("the group still exists 5s after SIGKILL ({last_detail})")
+                },
+            });
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    Err(DriverError::Survivors {
-        pgid,
-        detail: "the group still exists 5s after SIGKILL".to_string(),
-    })
 }
 
 /// Spawn an additional child INTO an existing group (the sibling-MCP
@@ -639,8 +678,9 @@ impl AgentDriver for ReplayDriver {
         let result = replay_calls(&mut server, task, &mut transcript).await;
 
         // Group kill + no-survivors on every path (success and failure).
-        drop(server); // close our pipe handles first so the child sees EOF
-        kill_group(pgid, Duration::from_secs(5)).await?;
+        // The server's stdin handle dropped inside `replay_calls`, so it
+        // already saw EOF; the kill sweeps it and anything it spawned.
+        kill_group(pgid, Duration::from_secs(5), vec![&mut server]).await?;
 
         result?;
         match brief.kind {
@@ -808,4 +848,366 @@ fn log_exchange(
         .map(|v| v.to_string())
         .unwrap_or_else(|| "<no response>".to_string());
     let _ = writeln!(transcript, "== {label}\n{rendered}");
+}
+
+// ---------------------------------------------------------------------------
+// The supervision battery (Unix)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, unix))]
+mod supervision_tests {
+    use super::*;
+
+    fn brief(kind: TaskBriefKind, dir: &Path) -> TaskBrief {
+        TaskBrief {
+            kind,
+            text: "battery".to_string(),
+            product: "battery".to_string(),
+            project_root: dir.to_path_buf(),
+            transcript_dir: dir.join("transcripts"),
+            outbox_dir: dir.join("outbox"),
+        }
+    }
+
+    fn subprocess(command: &[&str], timeout: Duration, grace: Duration) -> SubprocessDriver {
+        SubprocessDriver::new(
+            command.iter().map(|s| s.to_string()).collect(),
+            Vec::new(),
+            timeout,
+            grace,
+        )
+        .expect("valid template")
+    }
+
+    /// Drive one task, capturing the group stamp.
+    async fn run(
+        driver: &SubprocessDriver,
+        brief: &TaskBrief,
+    ) -> (Result<DriverOutcome, DriverError>, Option<GroupStamp>) {
+        let mut stamp: Option<GroupStamp> = None;
+        let mut on_group = |group: GroupStamp| {
+            stamp = Some(group);
+            Ok(())
+        };
+        let outcome = driver.run_task(brief, &mut on_group).await;
+        (outcome, stamp)
+    }
+
+    /// Battery case: an orphaned grandchild — backgrounded by the
+    /// leader, which then exits 0 — dies with the group. The leader's
+    /// NORMAL exit must still trigger the group kill.
+    #[tokio::test]
+    async fn orphan_grandchild_dies_with_the_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = subprocess(
+            &[
+                "/bin/sh",
+                "-c",
+                "(sleep 300 &); echo {brief}; exit 0",
+            ],
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+        );
+        let brief = brief(TaskBriefKind::Drafting, dir.path());
+        let (outcome, stamp) = run(&driver, &brief).await;
+        let (pgid, _) = stamp.expect("the group was stamped");
+        assert!(
+            matches!(outcome, Ok(DriverOutcome::Drafting { .. })),
+            "{outcome:?}"
+        );
+        // No-survivors after the window: the orphan is gone.
+        assert!(
+            !group_exists(pgid),
+            "the backgrounded grandchild must not survive the leader's normal exit"
+        );
+    }
+
+    /// Battery case: a sibling spawned INTO the leader's group (the
+    /// sibling-MCP shape) dies with the group kill even when the leader
+    /// is long gone.
+    #[tokio::test]
+    async fn sibling_in_group_dies_with_the_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A leader that lives long enough to attach a sibling to.
+        let mut leader = tokio::process::Command::new("/bin/sleep");
+        leader
+            .arg("300")
+            .stdin(std::process::Stdio::null())
+            .process_group(0);
+        let mut leader = leader.spawn().expect("leader");
+        let pgid = leader.id().expect("pid");
+
+        let mut sibling = spawn_sibling_in_group(pgid, "/bin/sleep", &["300"], dir.path())
+            .expect("sibling joins the group");
+        assert!(group_exists(pgid));
+
+        kill_group(pgid, Duration::from_secs(2), vec![&mut leader, &mut sibling])
+            .await
+            .expect("group kill");
+        assert!(
+            !group_exists(pgid),
+            "leader AND sibling must be gone after the group kill"
+        );
+    }
+
+    /// Battery case: the kill-race — children exiting exactly as the
+    /// timeout fires. Every iteration must end coherently (a normal
+    /// outcome or a typed timeout, never a panic or an errno surprise)
+    /// with no survivors.
+    #[tokio::test]
+    async fn kill_race_during_child_exit_is_coherent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..10 {
+            let driver = subprocess(
+                &["/bin/sh", "-c", "sleep 0.1; echo {brief}"],
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+            );
+            let brief = brief(TaskBriefKind::Drafting, dir.path());
+            let (outcome, stamp) = run(&driver, &brief).await;
+            let (pgid, _) = stamp.expect("stamped");
+            match &outcome {
+                Ok(DriverOutcome::Drafting { .. }) | Err(DriverError::Timeout { .. }) => {}
+                other => panic!("iteration {i}: incoherent outcome {other:?}"),
+            }
+            assert!(!group_exists(pgid), "iteration {i}: survivors");
+        }
+    }
+
+    /// Battery case: the timeout path kills the WHOLE group (leader +
+    /// grandchild), reports the typed timeout, and leaves no survivors.
+    #[tokio::test]
+    async fn timeout_kills_the_whole_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = subprocess(
+            &["/bin/sh", "-c", "sleep 300 & sleep 300; echo {brief}"],
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+        );
+        let brief = brief(TaskBriefKind::Drafting, dir.path());
+        let (outcome, stamp) = run(&driver, &brief).await;
+        let (pgid, _) = stamp.expect("stamped");
+        assert!(
+            matches!(outcome, Err(DriverError::Timeout { .. })),
+            "{outcome:?}"
+        );
+        assert!(!group_exists(pgid), "survivors after the timeout kill");
+    }
+
+    /// Battery case: killing an already-dead group is success (the
+    /// ESRCH arm), and probing it says gone — the PID-reuse guard's
+    /// group-level counterpart.
+    #[tokio::test]
+    async fn killing_a_dead_group_is_a_clean_noop() {
+        let mut child = tokio::process::Command::new("/bin/sh");
+        child
+            .args(["-c", "exit 0"])
+            .stdin(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = child.spawn().expect("spawn");
+        let pgid = child.id().expect("pid");
+        child.wait().await.expect("wait");
+        // The group may briefly exist while the zombie is reaped; the
+        // kill path handles both sides of that race.
+        kill_group(pgid, Duration::from_millis(100), vec![])
+            .await
+            .expect("ESRCH is success");
+        assert!(!group_exists(pgid));
+    }
+
+    /// The worker sees ONLY `env_allow`: an allowed variable passes
+    /// through, an un-allowed one is absent.
+    #[tokio::test]
+    async fn env_is_only_the_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let probe = dir.path().join("env-probe");
+        // SAFETY: test-process env mutation is serialized by the test
+        // harness convention (no other test reads these names).
+        unsafe {
+            std::env::set_var("ROCKY_FULFILL_BATTERY_ALLOWED", "yes");
+            std::env::set_var("ROCKY_FULFILL_BATTERY_BLOCKED", "leak");
+        }
+        let script = format!(
+            "printf '%s,%s' \"$ROCKY_FULFILL_BATTERY_ALLOWED\" \
+             \"$ROCKY_FULFILL_BATTERY_BLOCKED\" > {}; echo {{brief}}",
+            probe.display()
+        );
+        let driver = SubprocessDriver::new(
+            vec!["/bin/sh".into(), "-c".into(), script],
+            vec!["ROCKY_FULFILL_BATTERY_ALLOWED".into()],
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+        )
+        .expect("valid");
+        let brief = brief(TaskBriefKind::Drafting, dir.path());
+        let (outcome, _) = run(&driver, &brief).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let seen = std::fs::read_to_string(&probe).expect("probe file");
+        assert_eq!(seen, "yes,", "allowed passes; everything else is cleared");
+    }
+
+    /// The transcript captures the worker's stdout and stderr.
+    #[tokio::test]
+    async fn transcript_captures_stdout_and_stderr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = subprocess(
+            &[
+                "/bin/sh",
+                "-c",
+                "echo {brief}; echo out-line; echo err-line >&2",
+            ],
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+        );
+        let brief = brief(TaskBriefKind::Drafting, dir.path());
+        let (outcome, _) = run(&driver, &brief).await;
+        let Ok(DriverOutcome::Drafting { transcript_path }) = outcome else {
+            panic!("{outcome:?}");
+        };
+        let transcript = std::fs::read_to_string(&transcript_path).expect("transcript");
+        assert!(transcript.contains("out-line"));
+        assert!(transcript.contains("err-line"));
+    }
+
+    /// The elicitation outbox contract: candidate + questions read back,
+    /// digest computed over the exact bytes; a missing candidate is the
+    /// typed outbox error.
+    #[tokio::test]
+    async fn elicitation_outbox_round_trips_and_missing_candidate_is_typed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let brief = brief(TaskBriefKind::Elicitation, dir.path());
+        let outbox = brief.outbox_dir.display().to_string();
+        let script = format!(
+            "printf '[product]\\nname = \"battery\"\\n' > {outbox}/candidate_spec.toml; \
+             printf '[\"q1\",\"q2\"]' > {outbox}/questions.json; echo {{brief}}"
+        );
+        let driver = SubprocessDriver::new(
+            vec!["/bin/sh".into(), "-c".into(), script],
+            Vec::new(),
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+        )
+        .expect("valid");
+        let (outcome, _) = run(&driver, &brief).await;
+        let Ok(DriverOutcome::Elicitation {
+            candidate_spec_bytes,
+            questions,
+            expected_digest,
+            ..
+        }) = outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(
+            String::from_utf8_lossy(&candidate_spec_bytes),
+            "[product]\nname = \"battery\"\n"
+        );
+        assert_eq!(questions, vec!["q1".to_string(), "q2".to_string()]);
+        assert_eq!(
+            expected_digest,
+            rocky_core::product::spec::spec_digest(&candidate_spec_bytes)
+        );
+
+        // No candidate written → the typed outbox error, not a success.
+        let empty = subprocess(
+            &["/bin/sh", "-c", "echo {brief}"],
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+        );
+        let (outcome, _) = run(&empty, &brief).await;
+        assert!(
+            matches!(outcome, Err(DriverError::OutboxMissing(_))),
+            "{outcome:?}"
+        );
+    }
+
+    /// A non-zero worker exit is the typed task failure carrying the
+    /// transcript path, and the group still dies.
+    #[tokio::test]
+    async fn nonzero_exit_is_a_typed_failure_with_no_survivors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = subprocess(
+            &["/bin/sh", "-c", "sleep 300 & echo {brief}; exit 3"],
+            Duration::from_secs(30),
+            Duration::from_millis(300),
+        );
+        let brief = brief(TaskBriefKind::Drafting, dir.path());
+        let (outcome, stamp) = run(&driver, &brief).await;
+        let (pgid, _) = stamp.expect("stamped");
+        match outcome {
+            Err(DriverError::TaskFailed { exit_code, .. }) => assert_eq!(exit_code, 3),
+            other => panic!("{other:?}"),
+        }
+        assert!(!group_exists(pgid), "survivors after a failure exit");
+    }
+
+    /// Template validation: no `{brief}` slot, two slots, and an empty
+    /// command are all typed config refusals.
+    #[test]
+    fn template_validation_refuses_bad_shapes() {
+        for command in [
+            vec![],
+            vec!["/bin/echo".to_string()],
+            vec!["/bin/echo".to_string(), "{brief}".to_string(), "{brief}".to_string()],
+        ] {
+            let result = SubprocessDriver::new(
+                command,
+                Vec::new(),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            );
+            assert!(matches!(result, Err(DriverError::Config(_))));
+        }
+    }
+
+    /// The group stamp reaches the runner BEFORE the task ends, with the
+    /// leader's real start time (PID-reuse-proof pair).
+    #[tokio::test]
+    async fn the_group_stamp_carries_the_leaders_start_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = subprocess(
+            &["/bin/sh", "-c", "echo {brief}"],
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+        );
+        let brief = brief(TaskBriefKind::Drafting, dir.path());
+        let (outcome, stamp) = run(&driver, &brief).await;
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let (pgid, start) = stamp.expect("stamped");
+        assert!(pgid > 0);
+        // The leader is gone now, so its recorded start time cannot be
+        // re-read — but the stamp must have carried a NONZERO probe
+        // value (0 = the probe failed at spawn, which would neuter the
+        // takeover sweep's reuse guard).
+        assert!(start > 0, "the stamp must carry a real start time");
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod windows_tests {
+    use super::*;
+
+    /// v0 refuses to run unsupervised on Windows — typed, not a panic.
+    #[tokio::test]
+    async fn run_task_refuses_on_windows() {
+        let driver = SubprocessDriver::new(
+            vec!["agent.exe".into(), "{brief}".into()],
+            Vec::new(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("template validates on every platform");
+        let dir = std::env::temp_dir().join("rocky-fulfill-win-test");
+        let brief = TaskBrief {
+            kind: TaskBriefKind::Drafting,
+            text: "x".into(),
+            product: "p".into(),
+            project_root: dir.clone(),
+            transcript_dir: dir.join("t"),
+            outbox_dir: dir.join("o"),
+        };
+        let mut on_group = |_group: GroupStamp| Ok(());
+        let outcome = driver.run_task(&brief, &mut on_group).await;
+        assert!(matches!(outcome, Err(DriverError::UnsupportedPlatform)));
+    }
 }
