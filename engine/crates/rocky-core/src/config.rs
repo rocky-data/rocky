@@ -2658,6 +2658,11 @@ pub struct RockyConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyConfig>,
 
+    /// `[fulfill]` — the fulfillment loop's driver + brief overrides.
+    /// Read only by `rocky fulfill`; see [`FulfillConfig`].
+    #[serde(default)]
+    pub fulfill: FulfillConfig,
+
     /// `[resilience]` — the run loop's classified-retry policy. Governs
     /// whether a model whose materialization fails *transiently* is re-run,
     /// with a conservative bounded budget and capped backoff. On by default
@@ -3138,6 +3143,79 @@ pub struct PolicyTest {
     /// as at a real seam where the graph did not compile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reachable_downstreams: Option<u64>,
+}
+
+/// The `[fulfill]` block: the fulfillment loop's driver and briefs.
+///
+/// Consumed by `rocky fulfill` (the `rocky-fulfill` crate). The engine's
+/// deterministic verbs never read it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FulfillConfig {
+    /// Directory of brief overrides (`elicitation.md`, `drafting.md`,
+    /// `repair.md`). A file present there replaces the compiled default
+    /// of the same name; absent files fall back. Relative paths resolve
+    /// against the project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub briefs_dir: Option<PathBuf>,
+    /// The agent driver. `rocky fulfill` refuses to dispatch worker
+    /// tasks until one is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<FulfillDriverConfig>,
+}
+
+/// `[fulfill.driver]` — one frozen tagged shape.
+///
+/// ```toml
+/// [fulfill.driver]
+/// type = "subprocess"                       # | "replay"
+/// command = ["claude", "-p", "{brief}"]     # subprocess only
+/// env_allow = ["ANTHROPIC_API_KEY"]
+/// timeout_seconds = 900
+/// kill_grace_seconds = 30
+/// # type = "replay":
+/// # session = "replay/session.json"
+/// ```
+///
+/// Bring-your-own-model: the command template is the whole integration —
+/// no LLM SDK enters the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FulfillDriverConfig {
+    /// Spawn the configured agent command in its own process group; the
+    /// whole group is killed at task end (and on timeout).
+    Subprocess {
+        /// The agent command template. Exactly one argument must carry
+        /// the `{brief}` placeholder, replaced with the rendered brief.
+        command: Vec<String>,
+        /// Environment variables the worker may inherit. Everything else
+        /// is cleared. Empty = the worker gets an empty environment.
+        #[serde(default)]
+        env_allow: Vec<String>,
+        /// Wall-clock budget for one task; on elapse the group receives
+        /// SIGTERM, then SIGKILL after the kill grace.
+        #[serde(default = "default_fulfill_timeout_seconds")]
+        timeout_seconds: u64,
+        /// Grace between the group SIGTERM and the group SIGKILL.
+        #[serde(default = "default_fulfill_kill_grace_seconds")]
+        kill_grace_seconds: u64,
+    },
+    /// Execute a recorded session against the worker-profile MCP server —
+    /// deterministic and credential-free (the CI lane).
+    Replay {
+        /// The recorded session file, relative to the project root.
+        session: PathBuf,
+    },
+}
+
+/// Default `[fulfill.driver] timeout_seconds`.
+fn default_fulfill_timeout_seconds() -> u64 {
+    900
+}
+
+/// Default `[fulfill.driver] kill_grace_seconds`.
+fn default_fulfill_kill_grace_seconds() -> u64 {
+    30
 }
 
 /// The `[policy]` block: agent-authority policy for this project.
@@ -11450,5 +11528,117 @@ schema_template = "raw__{source}"
         assert!(cfg(vec![], None).resolved_key_exprs().is_err());
         // invalid column name is rejected (injection guard on `keys`).
         assert!(cfg(vec!["a; DROP"], None).resolved_key_exprs().is_err());
+    }
+
+    #[test]
+    fn fulfill_block_parses_both_driver_variants_with_defaults() {
+        let raw = r#"
+[adapter]
+type = "duckdb"
+path = "wh.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target]
+adapter = "default"
+
+[fulfill]
+briefs_dir = "briefs"
+
+[fulfill.driver]
+type = "subprocess"
+command = ["claude", "-p", "{brief}"]
+env_allow = ["ANTHROPIC_API_KEY"]
+"#;
+        let cfg = parse_rocky_config_str(raw).expect("parses");
+        assert_eq!(
+            cfg.fulfill.briefs_dir.as_deref(),
+            Some(std::path::Path::new("briefs"))
+        );
+        match cfg.fulfill.driver.expect("driver") {
+            FulfillDriverConfig::Subprocess {
+                command,
+                env_allow,
+                timeout_seconds,
+                kill_grace_seconds,
+            } => {
+                assert_eq!(command, vec!["claude", "-p", "{brief}"]);
+                assert_eq!(env_allow, vec!["ANTHROPIC_API_KEY"]);
+                assert_eq!(timeout_seconds, 900, "frozen default");
+                assert_eq!(kill_grace_seconds, 30, "frozen default");
+            }
+            other => panic!("expected subprocess, got {other:?}"),
+        }
+
+        let raw_replay = r#"
+[adapter]
+type = "duckdb"
+path = "wh.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target]
+adapter = "default"
+
+[fulfill.driver]
+type = "replay"
+session = "replay/session.json"
+"#;
+        let cfg = parse_rocky_config_str(raw_replay).expect("parses");
+        match cfg.fulfill.driver.expect("driver") {
+            FulfillDriverConfig::Replay { session } => {
+                assert_eq!(session, std::path::PathBuf::from("replay/session.json"));
+            }
+            other => panic!("expected replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fulfill_block_is_strict_and_optional() {
+        // Absent block → default (no driver, no briefs_dir).
+        let raw = r#"
+[adapter]
+type = "duckdb"
+path = "wh.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target]
+adapter = "default"
+"#;
+        let cfg = parse_rocky_config_str(raw).expect("parses");
+        assert!(cfg.fulfill.driver.is_none());
+        assert!(cfg.fulfill.briefs_dir.is_none());
+
+        // Unknown keys are rejected, never shimmed — in the block and in
+        // the driver variant.
+        for (bad, needle) in [
+            ("[fulfill]\nunknown_key = 1\n", "unknown_key"),
+            (
+                "[fulfill.driver]\ntype = \"replay\"\nsession = \"s.json\"\nextra = 1\n",
+                "extra",
+            ),
+            (
+                "[fulfill.driver]\ntype = \"telepathy\"\n",
+                "telepathy",
+            ),
+        ] {
+            let raw = format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n\n\
+                 [pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target]\nadapter = \"default\"\n\n{bad}"
+            );
+            let err = parse_rocky_config_str(&raw).expect_err("must reject");
+            assert!(
+                format!("{err}").contains(needle),
+                "error for {bad:?} should mention {needle}: {err}"
+            );
+        }
     }
 }

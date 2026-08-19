@@ -1506,6 +1506,7 @@ mod tests {
             reuse: Default::default(),
             gc: Default::default(),
             policy: None,
+            fulfill: Default::default(),
             resilience: Default::default(),
             schedule: Default::default(),
         }
