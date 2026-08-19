@@ -1,5 +1,4 @@
-//! Compile-fail (`trybuild`) guards for `rocky-cli`'s plan-writer
-//! privatization.
+//! Out-of-crate proof of `rocky-cli`'s plan-writer privatization.
 //!
 //! This crate has no runtime code. It hosts the proof that the
 //! route-inventory invariant is STRUCTURAL: every raw plan writer
@@ -8,5 +7,9 @@
 //! `pub(crate)` inside `rocky-cli`, so no external consumer — the
 //! fulfillment driver included — can persist or pre-name a plan without
 //! crossing `commands::propose_governed_run_plan`, which runs the policy
-//! gate before anything reaches disk. See
+//! gate before anything reaches disk.
+//!
+//! The proof is a single test that runs `rustc` once against the already-built
+//! `rocky-cli` rlib and asserts on the stable privacy error code (`E0603`),
+//! not on version-specific diagnostic text. See
 //! `tests/plan_writer_privatization.rs`.
