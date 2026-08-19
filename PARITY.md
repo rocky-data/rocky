@@ -14,8 +14,19 @@ Source list: `uv run pytest --collect-only -q` in that worktree.
 | `spec/parse.py` | 53 | 53 | 0 | 0 |
 | `spec/lower.py` | 50 | 50 | 0 | 0 |
 | `spec/manifest.py` | 12 | 12 | 0 | 0 |
-| `spec/verify.py` | pending (part 2) | — | — | — |
-| **Total so far** | **115** | **115** | **0** | **0** |
+| `spec/verify.py` | 49 | 34 | 0 | 15 |
+| `tests/test_evaluator.py` | 23 | 1 | 0 | 22 |
+| `tests/test_seam.py` | 7 | 0 | 0 | 7 |
+| `tests/test_integration_binary.py` | 5 | 2 | 0 | 3 |
+| **Total** | **199** | **152** | **0** | **47** |
+
+Every DISSOLVED row carries its justification inline; the dominant
+pattern is one thing said three ways: the Python mirror (evaluator,
+window grammar, engine confirmation, seam pairing) is deleted, and the
+engine surface it mirrored is the single implementation with its own
+suite. Two dissolutions were only honest after ADDING the missing engine
+pin (the tie-break test and the policy-check existence test) — noted on
+their rows.
 
 Nothing remains deferred: part 2 ported the filesystem half of
 `spec/lower.py` — staged writes, the staging journal, crash recovery, and the
@@ -194,6 +205,131 @@ Beyond the parser's own added tests, listed further up.
 | `product::manifest::tests::leaf_derivation_recurses_through_a_nested_unit_model` | Unreachable in today's schema, and a hole waiting for the first model that nests another. |
 | `product::manifest::tests::a_ref_to_a_property_less_definition_is_a_leaf_not_a_model` | `FreshnessSpec.severity` is exactly this shape; misreading it would drop the leaf silently. |
 | `product::toml_compat::tests::*` (23 tests) | The compatibility renderer is new Rust code with no Python counterpart to port — the answer key rendered through a library. Its tests pin the layout rules, both string escapers, the document-order recovery, and the column budget, cross-checked case by case against that library's real output. |
+
+
+## `spec/verify.py` -> `rocky-cli/src/commands/product.rs`
+
+The evaluator MIRROR dies in this port: the posture verifier calls the
+engine's own `rocky_core::policy::evaluate`, so every test that pinned the
+mirror's equivalence to the engine dissolves into the engine's own suite,
+and every strict-parsing test dissolves into the engine's serde (the
+refusal becomes a `needs_input` carrying the parse error, pinned per shape
+below). The posture, classification, and collision behaviors port 1:1.
+
+| Python node id | Status | Rust test / reason |
+|---|---|---|
+| `test_paste_block_matches_ff_design_d5_exactly` | MAPPED | `commands::product::tests::paste_block_matches_ff_design_d5_exactly` |
+| `test_absent_policy_block_needs_input_with_paste_block` | MAPPED | `commands::product::tests::absent_policy_block_needs_input_with_paste_block` |
+| `test_bare_default_require_review_block_is_not_a_pass` | MAPPED | `commands::product::tests::bare_default_require_review_block_is_not_a_pass` |
+| `test_full_corrected_block_passes` | MAPPED | `commands::product::tests::full_corrected_block_passes` |
+| `test_explicit_agent_allow_apply_reaching_scope_fails_naming_the_rule` | MAPPED | `commands::product::tests::explicit_agent_allow_apply_reaching_scope_fails_naming_the_rule` |
+| `test_corrected_block_defends_against_a_broader_apply_allow` | MAPPED | `commands::product::tests::corrected_block_defends_against_a_broader_apply_allow` |
+| `test_permissive_default_with_scoped_review_rule_is_rejected` | MAPPED | `commands::product::tests::permissive_default_with_scoped_review_rule_is_rejected` |
+| `test_any_true_propose_allow_is_rejected` | MAPPED | `commands::product::tests::any_true_propose_allow_is_rejected` |
+| `test_broader_glob_propose_allow_is_rejected` | MAPPED | `commands::product::tests::broader_glob_propose_allow_is_rejected` |
+| `test_extra_predicate_on_the_authoring_rule_is_rejected` | MAPPED | `commands::product::tests::extra_predicate_on_the_authoring_rule_is_rejected` |
+| `test_budgeted_exact_propose_allow_is_rejected_naming_the_budget` | MAPPED | `commands::product::tests::budgeted_exact_propose_allow_is_rejected_naming_the_budget` |
+| `test_ceiling_on_the_authoring_rule_fails_closed_via_unproved_reachability` | MAPPED | `commands::product::tests::ceiling_on_the_authoring_rule_fails_closed_via_unproved_reachability` |
+| `test_wrong_policy_version_needs_input` | MAPPED | `commands::product::tests::wrong_policy_version_needs_input` |
+| `test_unknown_policy_key_needs_input` | MAPPED | `commands::product::tests::unknown_policy_key_needs_input` |
+| `test_string_policy_version_is_rejected` | MAPPED | `commands::product::tests::string_policy_version_is_rejected` |
+| `test_negative_policy_version_is_rejected` | MAPPED | `commands::product::tests::negative_policy_version_is_rejected` |
+| `test_integer_where_bool_expected_in_scope_is_rejected` | MAPPED | `commands::product::tests::integer_where_bool_expected_in_scope_is_rejected` |
+| `test_string_budget_failures_is_rejected` | MAPPED | `commands::product::tests::string_budget_failures_is_rejected` |
+| `test_budget_zero_failures_rejected` | MAPPED | `commands::product::tests::budget_zero_failures_rejected` |
+| `test_budget_invalid_window_rejected` | MAPPED | `commands::product::tests::budget_invalid_window_rejected` |
+| `test_valid_budget_is_not_flagged` | MAPPED | `commands::product::tests::valid_budget_is_not_flagged` |
+| `test_missing_config_needs_input` | MAPPED | `commands::product::tests::missing_config_needs_input` |
+| `test_synthetic_post_image_shape` | MAPPED | `commands::product::tests::synthetic_post_image_shape` |
+| `test_posture_evaluates_the_post_image_not_the_pre_image` | MAPPED | `commands::product::tests::posture_evaluates_the_post_image_not_the_pre_image` |
+| `test_unresolved_classification_tag_rejects` | MAPPED | `commands::product::tests::unresolved_classification_tag_rejects` |
+| `test_top_level_mask_strategy_resolves` | MAPPED | `commands::product::tests::top_level_mask_strategy_resolves` |
+| `test_env_override_mask_resolves_without_env_gating` | MAPPED | `commands::product::tests::env_override_mask_resolves_without_env_gating` |
+| `test_allow_unmasked_resolves` | MAPPED | `commands::product::tests::allow_unmasked_resolves` |
+| `test_duplicate_product_name_vs_existing_state_dir_rejects` | MAPPED | `commands::product::tests::duplicate_product_name_vs_existing_state_dir_rejects` |
+| `test_same_spec_path_is_not_a_name_collision` | MAPPED | `commands::product::tests::same_spec_path_is_not_a_name_collision` |
+| `test_duplicate_output_model_across_products_rejects` | MAPPED | `commands::product::tests::duplicate_output_model_across_products_rejects` |
+| `test_distinct_output_models_do_not_collide` | MAPPED | `commands::product::tests::distinct_output_models_do_not_collide` |
+| `test_no_state_dirs_is_clean` | MAPPED | `commands::product::tests::no_state_dirs_is_clean` |
+| `test_collision_check_reads_the_layout_lower_writes` | MAPPED | `commands::product::tests::collision_check_reads_the_layout_lower_writes` |
+| `test_window_grammar_accepts[7d-604800]` | DISSOLVED | the grammar mirror is deleted; the engine's own `parse_window_duration_units_and_rejections` (`rocky-core/src/config.rs`) pins the accept cases the mirror copied |
+| `test_window_grammar_accepts[24h-86400]` | DISSOLVED | the grammar mirror is deleted; the engine's own `parse_window_duration_units_and_rejections` (`rocky-core/src/config.rs`) pins the accept cases the mirror copied |
+| `test_window_grammar_accepts[30D-2592000]` | DISSOLVED | the grammar mirror is deleted; the engine's own `parse_window_duration_units_and_rejections` (`rocky-core/src/config.rs`) pins the accept cases the mirror copied |
+| `test_window_grammar_accepts[1h-3600]` | DISSOLVED | the grammar mirror is deleted; the engine's own `parse_window_duration_units_and_rejections` (`rocky-core/src/config.rs`) pins the accept cases the mirror copied |
+| `test_window_grammar_accepts[ 7d -604800]` | DISSOLVED | the grammar mirror is deleted; the engine's own `parse_window_duration_units_and_rejections` (`rocky-core/src/config.rs`) pins the accept cases the mirror copied |
+| `test_window_grammar_rejects[0d]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[-1d]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[7]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[7w]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[d]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[1.5h]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[7 d]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_window_grammar_rejects[\u0667d]` | DISSOLVED | same — the engine's `parse_window_duration_units_and_rejections` pins the reject cases |
+| `test_confirmation_with_nonexistent_binary_blocks_instead_of_crashing` | DISSOLVED | check 3 (engine confirmation by subprocess) collapses: the verifier IS the engine, so there is no second binary whose absence could block |
+
+## `tests/test_evaluator.py` (the evaluator mirror's own suite)
+
+These tests pinned the Python MIRROR's equivalence to the engine
+evaluator — and were copied from the engine's own suite in the first
+place. With the mirror deleted there is one evaluator and one suite; each
+node names its engine pin.
+
+| Python node id | Status | Rust test / reason |
+|---|---|---|
+| `test_read_short_circuits_to_allow_even_with_deny_rule` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::read_short_circuits_to_allow_even_with_deny_rule` — the test the mirror copied — is the single pin |
+| `test_deny_overrides_a_more_specific_allow` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::deny_overrides_a_more_specific_allow` — the test the mirror copied — is the single pin |
+| `test_agent_apply_on_contracted_denied` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::agent_apply_on_contracted_denied` — the test the mirror copied — is the single pin |
+| `test_most_specific_beats_any` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::most_specific_beats_any` — the test the mirror copied — is the single pin |
+| `test_incomparable_rules_pick_most_restrictive` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::incomparable_rules_pick_most_restrictive` — the test the mirror copied — is the single pin |
+| `test_refinement_rule_outranks_bare_verb` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::refinement_rule_outranks_bare_verb` — the test the mirror copied — is the single pin |
+| `test_bare_apply_rule_matches_refinement_input` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::bare_apply_rule_matches_refinement_input` — the test the mirror copied — is the single pin |
+| `test_refinement_rule_does_not_match_other_refinement` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::refinement_rule_does_not_match_other_refinement` — the test the mirror copied — is the single pin |
+| `test_human_never_gated_by_default` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::human_never_gated_by_default` — the test the mirror copied — is the single pin |
+| `test_agent_default_posture_uses_default_agent_effect` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::agent_default_posture_uses_default_agent_effect` — the test the mirror copied — is the single pin |
+| `test_principal_mismatch_does_not_match` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::principal_mismatch_does_not_match` — the test the mirror copied — is the single pin |
+| `test_exclude_classifications_matches_clean_model` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::exclude_classifications_matches_clean_model` — the test the mirror copied — is the single pin |
+| `test_exclude_classifications_unsatisfied_on_pii_model` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::exclude_classifications_unsatisfied_on_pii_model` — the test the mirror copied — is the single pin |
+| `test_max_downstreams_within_ceiling_allows` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::max_downstreams_within_ceiling_allows` — the test the mirror copied — is the single pin |
+| `test_max_downstreams_exceeded_degrades_to_require_review` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::max_downstreams_exceeded_degrades_to_require_review` — the test the mirror copied — is the single pin |
+| `test_max_downstreams_unverifiable_degrades_to_require_review` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::max_downstreams_unverifiable_degrades_to_require_review` — the test the mirror copied — is the single pin |
+| `test_max_downstreams_does_not_soften_a_deny` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::max_downstreams_does_not_soften_a_deny` — the test the mirror copied — is the single pin |
+| `test_ceilinged_allow_does_not_leak_via_equal_specificity_sibling` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::ceilinged_allow_does_not_leak_via_equal_specificity_sibling` — the test the mirror copied — is the single pin |
+| `test_sticky_cap_more_specific_sibling_allow_cannot_bypass_breached_ceiling` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::sticky_cap_more_specific_sibling_allow_cannot_bypass_breached_ceiling` — the test the mirror copied — is the single pin |
+| `test_sticky_cap_non_breached_ceiling_still_allows` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::sticky_cap_non_breached_ceiling_still_allows` — the test the mirror copied — is the single pin |
+| `test_models_glob_selector_matches` | DISSOLVED | the mirror is deleted; the engine's own `rocky_core::policy::tests::models_glob_selector_matches` — the test the mirror copied — is the single pin |
+| `test_glob_match_mirrors_engine_shapes` | DISSOLVED | there is no second glob to mirror: the engine's `glob_match` is the only implementation, exercised by `models_glob_selector_matches` and the scope tests |
+| `test_equally_specific_incomparable_tie_breaks_by_earliest_rule` | MAPPED | `rocky_core::policy::tests::equally_specific_incomparable_tie_breaks_by_earliest_rule` — ADDED in part 2: the engine implemented the tie-break but had no test for it, so this was the one mirror case with no engine pin to dissolve into |
+
+## `tests/test_seam.py` (the extraction seam)
+
+The seam — a frozen capability manifest pairing the Python framework to
+engine versions — is a deleted concept: the framework became engine
+capabilities in one binary, so there is nothing left to pair.
+
+| Python node id | Status | Reason |
+|---|---|---|
+| `test_spec_version_is_frozen` | DISSOLVED | the seam module's `SPEC_VERSION = "0"` semantics carried into the parser itself — pinned by `product::spec::tests::{reject_spec_version_other_than_zero, spec_version_zero_accepted}` |
+| `test_min_rocky_version_is_frozen` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+| `test_manifest_is_frozen_exactly` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+| `test_manifest_entries_are_well_formed` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+| `test_manifest_names_are_unique` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+| `test_manifest_requires_the_drafting_loop_tools` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+| `test_manifest_never_requires_approval_or_spec_owned_surfaces` | DISSOLVED | the extraction seam (capability manifest + version pairing) is a deleted concept: the boundary is now the crate boundary + the fulfill_api façade, and the worker-profile tool surface is pinned by the engine's own `worker_profile` roundtrip goldens |
+
+## `tests/test_integration_binary.py` (subprocess probes)
+
+The module drove a released `rocky` binary from Python. In the engine the
+"real engine" is in-process, so each probe either ports as a direct test
+or dissolves into the engine surface it was probing.
+
+| Python node id | Status | Rust test / reason |
+|---|---|---|
+| `test_lowered_artifacts_pass_the_real_engine` | MAPPED | `commands::product::tests::the_lowered_artifacts_pass_the_real_engine` — the subprocess dissolves into the in-process compiler (the same engine); the full probe battery (E010 on a dropped contract column, E011 on a broken declared type, W005 cleared by the merged freshness, W004 silent under [mask], the product tag on the compiled model) ports intact, with hand-typed source schemas standing in for the seeded DuckDB |
+| `test_engine_confirmation_agrees_with_synthetic_evaluation` | DISSOLVED | there is one evaluator; nothing exists to agree or disagree with |
+| `test_policy_check_output_shape_is_the_recorded_one` | DISSOLVED | the recorded shape IS the engine's `PolicyCheckOutput`, pinned by the exported schema + the codegen-drift gate |
+| `test_policy_check_requires_the_model_to_exist` | MAPPED | `commands::policy::tests::check_requires_the_model_to_exist` — ADDED in part 2: the behavior existed unpinned |
+| `test_wp1_propose_review_status_digest_refusal` | DISSOLVED | WP-1 shipped this in the engine with its own pin: `commands::apply::tests::expect_spec_digest_gate_is_fail_closed_both_ways` plus the propose/review roundtrip suite in rocky-mcp |
 
 ## Known divergences from the answer key
 
