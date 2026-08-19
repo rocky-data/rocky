@@ -115,7 +115,7 @@ pub enum OwnershipDecision {
 /// `None` exactly when the record carries no owner stamp.
 pub fn decide_ownership(
     observed: Option<&FulfillStateRecord>,
-    liveness: Option<OwnerLiveness>,
+    liveness: Option<&OwnerLiveness>,
     me: SelfIdentity,
     product_id: &str,
     now: DateTime<Utc>,
@@ -1314,14 +1314,19 @@ fn decide_marker(
         });
     }
     // Snapshot re-approved while the plan waited → superseded (D6).
-    if let (Some(plan), Some(approved)) = (&plan_payload_digest, &approved_digest)
-        && plan != approved
-    {
+    let superseded = matches!(
+        (&plan_payload_digest, &approved_digest),
+        (Some(plan), Some(approved)) if plan != approved
+    );
+    if superseded {
+        let old = plan_payload_digest.unwrap_or_default();
+        let new = approved_digest.unwrap_or_default();
+        let event = format!("superseded while awaiting review ({old} -> {new})");
         let mut next = to_state(
             observed,
             FulfillState::Superseded {
-                old_digest: plan.clone(),
-                new_digest: approved.clone(),
+                old_digest: old,
+                new_digest: new,
             },
             now,
         );
@@ -1329,7 +1334,7 @@ fn decide_marker(
         next.idempotency_key = None;
         return Decision::Advance {
             record: next,
-            event: format!("superseded while awaiting review ({plan} -> {approved})"),
+            event,
         };
     }
     if reviewed {
@@ -1386,14 +1391,19 @@ fn decide_proposed(
         ProposeSummary::Written { plan_id } | ProposeSummary::ReviewRequired { plan_id, .. } => {
             // Post-propose stale-spec refusal (D1 point 1): the persisted
             // plan's payload digest vs the CURRENT approval.
-            if let (Some(plan), Some(approved)) = (&plan_payload_digest, &approved_digest)
-                && plan != approved
-            {
+            let superseded = matches!(
+                (&plan_payload_digest, &approved_digest),
+                (Some(plan), Some(approved)) if plan != approved
+            );
+            if superseded {
+                let old = plan_payload_digest.unwrap_or_default();
+                let new = approved_digest.unwrap_or_default();
+                let event = format!("superseded at post-propose ({old} -> {new})");
                 let mut next = to_state(
                     observed,
                     FulfillState::Superseded {
-                        old_digest: plan.clone(),
-                        new_digest: approved.clone(),
+                        old_digest: old,
+                        new_digest: new,
                     },
                     now,
                 );
@@ -1401,7 +1411,7 @@ fn decide_proposed(
                 next.idempotency_key = None;
                 return Decision::Advance {
                     record: next,
-                    event: format!("superseded at post-propose ({plan} -> {approved})"),
+                    event,
                 };
             }
             let mut next = to_state(observed, FulfillState::Proposed, now);
@@ -1443,7 +1453,7 @@ fn decide_receipt(
     lookup: ReceiptSummary,
     now: DateTime<Utc>,
 ) -> Decision {
-    match &lookup {
+    match lookup {
         ReceiptSummary::Succeeded { run_id } => {
             let next = to_state(observed, FulfillState::Applied, now);
             Decision::Advance {
@@ -1451,44 +1461,9 @@ fn decide_receipt(
                 event: format!("receipt found: applied (run {run_id})"),
             }
         }
-        // From `applying_unknown`, no receipt (or a terminal failure)
-        // makes the retry dedup-safe: re-run the pre-apply gate then the
-        // apply, in-process. From `applying` the same answer is a
-        // CONTRADICTION — the engine just said `skipped_idempotent`
-        // (a Succeeded receipt exists) and the lookup disagrees — so the
-        // state parks at applying_unknown for a human instead of
-        // retrying into an inconsistent store.
-        ReceiptSummary::NoRecord | ReceiptSummary::Failed { .. } => {
-            let detail = match &lookup {
-                ReceiptSummary::NoRecord => "no receipt".to_string(),
-                ReceiptSummary::Failed { run_id } => format!("prior apply failed (run {run_id})"),
-                _ => unreachable!("outer match arm"),
-            };
-            match &observed.state {
-                FulfillState::ApplyingUnknown => {
-                    let next = to_state(observed, FulfillState::Applying, now);
-                    Decision::AdvanceAndAct {
-                        record: next,
-                        event: format!("{detail}; retrying apply under the pinned key"),
-                        task: TaskKind::PreApplyCheck,
-                    }
-                }
-                _ => {
-                    let next = to_state(observed, FulfillState::ApplyingUnknown, now);
-                    Decision::AdvanceAndStop {
-                        record: next,
-                        event: format!("receipt contradicts skipped_idempotent ({detail})"),
-                        stop: Stop {
-                            message: format!(
-                                "the apply was deflected as already-satisfied, but the \
-                                 authoritative receipt lookup says {detail} — resolve by \
-                                 hand before re-running"
-                            ),
-                            next_command: None,
-                        },
-                    }
-                }
-            }
+        ReceiptSummary::NoRecord => retry_or_park(observed, "no receipt", now),
+        ReceiptSummary::Failed { run_id } => {
+            retry_or_park(observed, &format!("prior apply failed (run {run_id})"), now)
         }
         ReceiptSummary::InFlight { run_id } => match &observed.state {
             FulfillState::ApplyingUnknown => Decision::Halt(Stop {
@@ -1536,6 +1511,41 @@ fn decide_receipt(
                 }
             }
         },
+    }
+}
+
+/// The `NoRecord`/`Failed` receipt arms. From `applying_unknown` the
+/// retry is dedup-safe: re-run the pre-apply gate then the apply,
+/// in-process. From `applying` the same answer is a CONTRADICTION —
+/// the engine just said `skipped_idempotent` (a Succeeded receipt
+/// exists) and the lookup disagrees — so the state parks at
+/// `applying_unknown` for a human instead of retrying into an
+/// inconsistent store.
+fn retry_or_park(observed: &FulfillStateRecord, detail: &str, now: DateTime<Utc>) -> Decision {
+    match &observed.state {
+        FulfillState::ApplyingUnknown => {
+            let next = to_state(observed, FulfillState::Applying, now);
+            Decision::AdvanceAndAct {
+                record: next,
+                event: format!("{detail}; retrying apply under the pinned key"),
+                task: TaskKind::PreApplyCheck,
+            }
+        }
+        _ => {
+            let next = to_state(observed, FulfillState::ApplyingUnknown, now);
+            Decision::AdvanceAndStop {
+                record: next,
+                event: format!("receipt contradicts skipped_idempotent ({detail})"),
+                stop: Stop {
+                    message: format!(
+                        "the apply was deflected as already-satisfied, but the \
+                         authoritative receipt lookup says {detail} — resolve by \
+                         hand before re-running"
+                    ),
+                    next_command: None,
+                },
+            }
+        }
     }
 }
 
@@ -1659,7 +1669,7 @@ mod tests {
         prior.owner_start_time = Some(5);
         let d = decide_ownership(
             Some(&prior),
-            Some(OwnerLiveness::Alive),
+            Some(&OwnerLiveness::Alive),
             me(),
             "product:revenue_daily",
             now(),
@@ -1675,7 +1685,7 @@ mod tests {
         prior.first_swept_at = Some(stamp(now()));
         let d = decide_ownership(
             Some(&prior),
-            Some(OwnerLiveness::Dead),
+            Some(&OwnerLiveness::Dead),
             me(),
             "product:revenue_daily",
             now(),
@@ -1695,7 +1705,7 @@ mod tests {
         prior.owner_pid = Some(99);
         let d = decide_ownership(
             Some(&prior),
-            Some(OwnerLiveness::Indefinite("no probe".into())),
+            Some(&OwnerLiveness::Indefinite("no probe".to_string())),
             me(),
             "product:revenue_daily",
             now(),
@@ -1714,7 +1724,7 @@ mod tests {
         prior.first_swept_at = Some(stamp(now() - Duration::seconds(30)));
         let d = decide_ownership(
             Some(&prior),
-            Some(OwnerLiveness::Indefinite("no probe".into())),
+            Some(&OwnerLiveness::Indefinite("no probe".to_string())),
             me(),
             "product:revenue_daily",
             now(),
@@ -1732,7 +1742,7 @@ mod tests {
         prior.first_swept_at = Some(stamp(now() - FULFILL_RECOVERY_GRACE));
         let d = decide_ownership(
             Some(&prior),
-            Some(OwnerLiveness::Indefinite("no probe".into())),
+            Some(&OwnerLiveness::Indefinite("no probe".to_string())),
             me(),
             "product:revenue_daily",
             now(),

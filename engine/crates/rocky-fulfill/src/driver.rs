@@ -846,7 +846,7 @@ fn log_exchange(transcript: &mut std::fs::File, label: &str, response: &Option<s
     use std::io::Write as _;
     let rendered = response
         .as_ref()
-        .map(|v| v.to_string())
+        .map(ToString::to_string)
         .unwrap_or_else(|| "<no response>".to_string());
     let _ = writeln!(transcript, "== {label}\n{rendered}");
 }
@@ -872,7 +872,7 @@ mod supervision_tests {
 
     fn subprocess(command: &[&str], timeout: Duration, grace: Duration) -> SubprocessDriver {
         SubprocessDriver::new(
-            command.iter().map(|s| s.to_string()).collect(),
+            command.iter().map(ToString::to_string).collect(),
             Vec::new(),
             timeout,
             grace,

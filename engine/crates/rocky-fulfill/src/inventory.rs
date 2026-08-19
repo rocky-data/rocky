@@ -151,7 +151,7 @@ fn the_route_inventory_golden_matches_the_source() {
     let consumed = consumed_paths();
     let pinned: BTreeSet<String> = CONSUMED_ENGINE_PATHS
         .iter()
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
         .collect();
     let unpinned: Vec<&String> = consumed.difference(&pinned).collect();
     let stale: Vec<&String> = pinned.difference(&consumed).collect();

@@ -50,8 +50,9 @@ pub enum Applied {
 /// The outcome of the ownership acquisition.
 #[derive(Debug)]
 pub enum Acquired {
-    /// This process owns the record; drive it.
-    Owned(FulfillStateRecord),
+    /// This process owns the record; drive it. Boxed: the record dwarfs
+    /// the stop message, and ownership is decided once per invocation.
+    Owned(Box<FulfillStateRecord>),
     /// This process must not drive the record; the message says why and
     /// what to do (printed verbatim, exit clean).
     Stopped(String),
@@ -153,15 +154,21 @@ impl StoreDriver {
             },
             None => None,
         };
-        let decision = decide_ownership(observed.as_ref(), liveness, me, &self.product_id, now);
+        let decision = decide_ownership(
+            observed.as_ref(),
+            liveness.as_ref(),
+            me,
+            &self.product_id,
+            now,
+        );
         match decision {
             OwnershipDecision::AlreadyOwned => {
                 let record = observed.expect("AlreadyOwned implies a record");
-                Ok(Acquired::Owned(record))
+                Ok(Acquired::Owned(Box::new(record)))
             }
             OwnershipDecision::Claim(claimed) | OwnershipDecision::TakeOver(claimed) => {
                 match self.transition(observed.as_ref(), &claimed, "ownership acquired", now)? {
-                    Applied::Won(stored) => Ok(Acquired::Owned(stored)),
+                    Applied::Won(stored) => Ok(Acquired::Owned(Box::new(stored))),
                     Applied::Lost { winner } => Ok(Acquired::Stopped(lost_message(&winner))),
                 }
             }
@@ -508,9 +515,10 @@ mod store_tests {
         let store = driver(dir.path());
         let me = self_identity().expect("identity");
         let now = chrono::Utc::now();
-        let Acquired::Owned(mut record) = store.acquire(me, now).expect("acquire") else {
+        let Acquired::Owned(record) = store.acquire(me, now).expect("acquire") else {
             panic!("expected Owned");
         };
+        let mut record = *record;
         for (step, state) in [
             FulfillState::Elicited,
             FulfillState::SpecApproved,

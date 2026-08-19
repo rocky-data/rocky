@@ -111,7 +111,7 @@ pub async fn run_fulfill(
         }
     };
 
-    let outcome = runner.step_loop(record, retry).await;
+    let outcome = runner.step_loop(*record, retry).await;
     let (final_record, stop) = match outcome {
         Ok(pair) => pair,
         Err(err) => {
@@ -186,14 +186,14 @@ impl Runner {
                     record: next,
                     event,
                 } => {
-                    record = self.cas(&record, next, &event)?;
+                    record = self.cas(&record, &next, &event)?;
                 }
                 Decision::AdvanceAndAct {
                     record: next,
                     event,
                     task,
                 } => {
-                    record = self.cas(&record, next, &event)?;
+                    record = self.cas(&record, &next, &event)?;
                     pending = Some(self.perform(&mut record, task).await?);
                 }
                 Decision::AdvanceAndStop {
@@ -201,7 +201,7 @@ impl Runner {
                     event,
                     stop,
                 } => {
-                    record = self.cas(&record, next, &event)?;
+                    record = self.cas(&record, &next, &event)?;
                     return Ok((record, stop));
                 }
                 Decision::Act(task) => {
@@ -220,12 +220,12 @@ impl Runner {
     fn cas(
         &self,
         expected: &FulfillStateRecord,
-        next: FulfillStateRecord,
+        next: &FulfillStateRecord,
         event: &str,
     ) -> Result<FulfillStateRecord> {
         match self
             .store
-            .transition(Some(expected), &next, event, Utc::now())?
+            .transition(Some(expected), next, event, Utc::now())?
         {
             Applied::Won(stored) => Ok(stored),
             Applied::Lost { winner } => Err(LostRace(crate::store::lost_message(&winner)).into()),
