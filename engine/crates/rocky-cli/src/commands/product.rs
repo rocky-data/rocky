@@ -1161,6 +1161,50 @@ pub(crate) fn product_approve_in(
         });
     }
 
+    // A NEW-digest approval replaces the whole fulfillment record — so
+    // it must never land on top of in-flight work: the replacement
+    // would drop the record's `driver_pgid` (orphaning a live worker
+    // group no takeover could sweep) and the pinned idempotency key (an
+    // in-flight apply would lose its only authoritative resolution
+    // handle). Refuse while the loop is mid-step or a worker group is
+    // recorded; approve from the stop states. Refusal — not a pin
+    // hand-off — is deliberate: carrying the OLD generation's plan/key
+    // pins onto the NEW digest is exactly the inheritance the
+    // supersession exists to prevent.
+    if let Some(record) = &observed_state {
+        let active_state = matches!(
+            record.state,
+            FulfillState::Elicited
+                | FulfillState::LoweredContract
+                | FulfillState::Drafting
+                | FulfillState::Merged
+                | FulfillState::Verifying
+                | FulfillState::Proposed
+                | FulfillState::PlanApproved
+                | FulfillState::Applying
+                | FulfillState::ApplyingUnknown
+                | FulfillState::Applied
+                | FulfillState::Superseded { .. }
+        );
+        if active_state || record.driver_pgid.is_some() {
+            let why = if record.driver_pgid.is_some() {
+                format!(
+                    "a worker process group (pgid {}) is recorded as live",
+                    record.driver_pgid.unwrap_or_default()
+                )
+            } else {
+                format!("the loop state is '{}'", record.state.tag())
+            };
+            bail!(
+                "[approval-refused-in-flight] refusing to approve a new spec revision for \
+                 product '{product_name}' while fulfillment work is in flight ({why}). \
+                 Stop the running `rocky fulfill` loop (or let it reach its next stop — \
+                 needs_input, blocked, or observing), then re-run the approval; nothing \
+                 was written."
+            );
+        }
+    }
+
     // 1. The immutable snapshot file, before any record.
     let snapshot_path = write_approval_snapshot(root, &parsed)?;
 
@@ -2177,6 +2221,168 @@ effect = "require_review"
             1,
             "a no-op re-approve appends no journal row"
         );
+    }
+
+    /// D2: a NEW-digest approval must refuse while fulfillment work is
+    /// in flight — replacing the record would orphan a live worker
+    /// group (`driver_pgid` dropped) and strand an in-flight apply (the
+    /// pinned idempotency key dropped). Approval proceeds only from the
+    /// stop states.
+    #[test]
+    fn approving_a_new_digest_over_in_flight_work_refuses() {
+        use rocky_core::fulfill::{FulfillJournalRow, FulfillState};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        let first = product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+        let row = |event: &str, to: &str| FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: event.to_string(),
+            from_state: None,
+            to_state: to.to_string(),
+            spec_digest: None,
+            plan_id: None,
+            idempotency_key: None,
+        };
+
+        // Drive the record into `drafting` with a live worker group
+        // stamped, the way a running loop would hold it.
+        {
+            let store = StateStore::open(&state_path).expect("opens");
+            let observed = store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            let mut drafting = observed.clone();
+            drafting.state = FulfillState::Drafting;
+            drafting.drafting_attempts = 1;
+            drafting.driver_pgid = Some(4242);
+            drafting.driver_leader_start_time = Some(1);
+            let outcome = store
+                .fulfill_state_cas(
+                    "revenue_daily",
+                    Some(&observed),
+                    &drafting,
+                    &row("drafting attempt 1", "drafting"),
+                )
+                .expect("cas");
+            assert_eq!(outcome, rocky_core::fulfill::FulfillCas::Won);
+        }
+
+        // A spec edit makes a NEW digest; approving it now must refuse.
+        let spec_path = root.join("products/revenue_daily.toml");
+        let mut edited = std::fs::read_to_string(&spec_path).expect("read");
+        edited.push_str("\n# reviewer note\n");
+        std::fs::write(&spec_path, &edited).expect("edit");
+        let err = product_approve_in(&root, &state_path, "revenue_daily")
+            .expect_err("in-flight approval must refuse");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("[approval-refused-in-flight]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("pgid 4242"), "{rendered}");
+
+        // Nothing was written: the approval still names the FIRST digest
+        // and the drafting record (with its worker stamp) is untouched.
+        {
+            let store = StateStore::open(&state_path).expect("opens");
+            let approval = store
+                .product_approval_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            assert_eq!(approval.spec_digest, first.spec_digest);
+            let state = store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            assert_eq!(state.state.tag(), "drafting");
+            assert_eq!(state.driver_pgid, Some(4242));
+        }
+
+        // `applying` (no worker group, key pinned) refuses too, naming
+        // the state.
+        {
+            let store = StateStore::open(&state_path).expect("opens");
+            let observed = store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            let mut applying = observed.clone();
+            applying.state = FulfillState::Applying;
+            applying.driver_pgid = None;
+            applying.driver_leader_start_time = None;
+            applying.idempotency_key = Some("product:revenue_daily@sha:a@7".to_string());
+            store
+                .fulfill_state_cas(
+                    "revenue_daily",
+                    Some(&observed),
+                    &applying,
+                    &row("applying", "applying"),
+                )
+                .expect("cas");
+        }
+        let err = product_approve_in(&root, &state_path, "revenue_daily")
+            .expect_err("approval over applying must refuse");
+        assert!(
+            format!("{err:#}").contains("'applying'"),
+            "names the state: {err:#}"
+        );
+
+        // From a STOP state the same edited spec approves fine, and the
+        // supersession fence replaces the record.
+        {
+            let store = StateStore::open(&state_path).expect("opens");
+            let observed = store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            let mut waiting = observed.clone();
+            waiting.state = FulfillState::NeedsInput {
+                reason: "plan_approval".to_string(),
+                payload: "plan-1".to_string(),
+            };
+            store
+                .fulfill_state_cas(
+                    "revenue_daily",
+                    Some(&observed),
+                    &waiting,
+                    &row("awaiting plan review", "needs_input"),
+                )
+                .expect("cas");
+        }
+        let output =
+            product_approve_in(&root, &state_path, "revenue_daily").expect("a stop state approves");
+        assert!(!output.already_approved);
+        assert_ne!(output.spec_digest, first.spec_digest);
+        assert_eq!(output.previous_state.as_deref(), Some("needs_input"));
+
+        // The SAME-digest idempotent re-approve stays allowed even over
+        // in-flight work — it writes nothing.
+        {
+            let store = StateStore::open(&state_path).expect("opens");
+            let observed = store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            let mut drafting = observed.clone();
+            drafting.state = FulfillState::Drafting;
+            drafting.drafting_attempts = 1;
+            store
+                .fulfill_state_cas(
+                    "revenue_daily",
+                    Some(&observed),
+                    &drafting,
+                    &row("drafting attempt 1", "drafting"),
+                )
+                .expect("cas");
+        }
+        let unchanged = product_approve_in(&root, &state_path, "revenue_daily")
+            .expect("same-digest re-approve writes nothing");
+        assert!(unchanged.already_approved);
     }
 
     #[test]
