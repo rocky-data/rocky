@@ -198,6 +198,8 @@ Beyond the parser's own added tests, listed further up.
 | `product::lowering::tests::a_preserved_scalar_survives_and_stays_above_the_tables` | A preserved scalar other than name/intent, which no Python test carried. |
 | `product::lowering::tests::a_nullable_column_gets_no_not_null_test` | Every column in the fixture is non-nullable, so the guard was invisible to the goldens. |
 | `product::lowering::tests::a_freshness_budget_too_wide_for_toml_is_refused` | The added refusal below. |
+| `product::commit::tests::fresh_commit_refuses_a_symlinked_staged_target_and_leaves_it_untouched` (+ `_prev_`, `_journal_temp_`, `a_symlinked_final_is_refused_on_the_fresh_path`) | Hardening beyond the answer key — see divergence 6: the prototype left the fresh commit path unguarded against symlinked write targets. |
+| `product::commit::tests::crash_during_a_cold_phase_a_removes_the_renamed_new_files`, `half_canonical_path_aliases_are_refused_as_unsafe` | Two guards the answer key's tests never reached (mutation-check findings). |
 | `product::commit::tests::crash_during_a_cold_phase_a_removes_the_renamed_new_files` | A mutation pass showed rollback's brand-new-file removal branch was live but unreached: every Phase-B drill replaces files that exist. A cold Phase-A crash is the shape that needs it. |
 | `product::commit::tests::half_canonical_path_aliases_are_refused_as_unsafe` | A mutation pass showed the canonical-spelling gate was unpinned: `a//b`-style aliases normalize inside `Path::components` and would fall through to a different refusal. |
 | `product::manifest::tests::the_instance_walk_covers_every_row_the_schema_declares` | The mechanization the answer key lacks — see divergence 6. |
@@ -358,6 +360,21 @@ or dissolves into the engine surface it was probing.
    library spelling (`render_string`). They differ on control characters. This
    is not a drift from the answer key — it is two producers with two spellings,
    and both are pinned by tests.
+
+6. **Fresh-path symlink refusal — hardening BEYOND the answer key.** The
+   frozen prototype's `commit_generation` calls `recover_generation` first,
+   whose symlinked-residue refusal sits past its no-journal early return —
+   so on the FRESH commit path (no prior crash) the prototype's own
+   `staged.write_bytes` / `shutil.copy2` would follow an attacker-planted
+   symlink at `<final>.ff-staged` / `.ff-prev` out of the project. The port
+   faithfully reproduced that hole; an adversarial review caught it. The
+   port now DIVERGES from the executable spec by refusing a symlink at every
+   write target (finals, their staged/prev siblings, the journal tmp) before
+   the first mutation, and the approve verb's snapshot temp stages with
+   O_EXCL for the same reason. Five exploit-exhibiting tests
+   (`fresh_commit_refuses_a_symlinked_*`, `a_symlinked_final_is_refused_*`,
+   `approve_refuses_a_symlinked_snapshot_temp_*`) assert the out-of-project
+   target is untouched; mutation-checked.
 
 5. **Duplicate-final folding uses `str::to_lowercase`, not Unicode
    casefolding.** Python's `str.casefold` also folds shapes like `ß` → `ss`;
