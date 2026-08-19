@@ -833,12 +833,17 @@ mod tests {
 
     fn config_with_state(dir: &Path, state_block: &str) -> std::path::PathBuf {
         let config = dir.join("rocky.toml");
+        // The adapter path must be ABSOLUTE: a relative path resolves
+        // against the test process's cwd, so the DuckDB file would outlive
+        // the tempdir and collide across runs.
+        let db = dir.join("wh.duckdb");
         write_file(
             &config,
             format!(
-                "[adapter]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n\n[pipeline.p]\n\
+                "[adapter]\ntype = \"duckdb\"\npath = \"{}\"\n\n[pipeline.p]\n\
                  type = \"transformation\"\nmodels = \"models/**\"\n\n\
-                 [pipeline.p.target.governance]\nauto_create_schemas = true\n\n{state_block}"
+                 [pipeline.p.target.governance]\nauto_create_schemas = true\n\n{state_block}",
+                db.display()
             )
             .as_bytes(),
         );
