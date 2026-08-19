@@ -32,6 +32,7 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_core::fulfill::FulfillJournalRow",
     "rocky_core::fulfill::FulfillState",
     "rocky_core::fulfill::FulfillStateRecord",
+    "rocky_core::fulfill::FulfillStateRecord::new",
     "rocky_core::fulfill::ProductApprovalRecord",
     "rocky_core::state::StateStore",
     // Spec identity + the confined write target (the runner's candidate
