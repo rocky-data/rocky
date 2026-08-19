@@ -301,9 +301,14 @@ fn happy_path_cold_init_to_observing() {
     drop(store);
 
     // A transcript was captured for the drafting task.
-    let transcripts = dir.join(".rocky/fulfillment").join(PRODUCT).join("transcripts");
+    let transcripts = dir
+        .join(".rocky/fulfillment")
+        .join(PRODUCT)
+        .join("transcripts");
     assert!(
-        std::fs::read_dir(&transcripts).map(|d| d.count() > 0).unwrap_or(false),
+        std::fs::read_dir(&transcripts)
+            .map(|d| d.count() > 0)
+            .unwrap_or(false),
         "transcripts exist at {}",
         transcripts.display()
     );
@@ -347,7 +352,10 @@ fn candidate_edit_surfaces_then_reapproval_supersedes_the_plan() {
     let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
     assert_eq!(code, 0);
     let json = json.expect("json");
-    assert_eq!(json["state"], "needs_input", "still waiting on the SAME plan");
+    assert_eq!(
+        json["state"], "needs_input",
+        "still waiting on the SAME plan"
+    );
     assert_eq!(json["plan_id"].as_str(), Some(old_plan.as_str()));
 
     // Re-approve mid-flight: the authority transition fences the wait —
@@ -378,9 +386,7 @@ fn candidate_edit_surfaces_then_reapproval_supersedes_the_plan() {
     };
     let fence = rows
         .iter()
-        .filter(|r| {
-            r.event == "spec approved" && r.from_state.as_deref() == Some("needs_input")
-        })
+        .filter(|r| r.event == "spec approved" && r.from_state.as_deref() == Some("needs_input"))
         .count();
     assert!(fence >= 1, "the re-approval fenced the waiting loop");
 
@@ -517,7 +523,10 @@ fn fault_at_digest_recompute_to_apply_resumes_through_applying_unknown() {
     );
     assert_ne!(code, 0, "the fault aborts the process");
     let store = state_store(dir);
-    let record = store.fulfill_state_get(PRODUCT).expect("read").expect("record");
+    let record = store
+        .fulfill_state_get(PRODUCT)
+        .expect("read")
+        .expect("record");
     assert_eq!(record.state.tag(), "applying", "crashed mid-applying");
     let key = record.idempotency_key.clone().expect("key pinned");
     assert!(

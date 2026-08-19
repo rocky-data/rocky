@@ -11624,10 +11624,7 @@ adapter = "default"
                 "[fulfill.driver]\ntype = \"replay\"\nsession = \"s.json\"\nextra = 1\n",
                 "extra",
             ),
-            (
-                "[fulfill.driver]\ntype = \"telepathy\"\n",
-                "telepathy",
-            ),
+            ("[fulfill.driver]\ntype = \"telepathy\"\n", "telepathy"),
         ] {
             let raw = format!(
                 "[adapter]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n\n\

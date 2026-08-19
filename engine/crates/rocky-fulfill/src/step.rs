@@ -182,7 +182,10 @@ impl Runner {
                 None => self.gather(&record, &mut retry_pending)?,
             };
             match machine::decide(&record, event, Utc::now()) {
-                Decision::Advance { record: next, event } => {
+                Decision::Advance {
+                    record: next,
+                    event,
+                } => {
                     record = self.cas(&record, next, &event)?;
                 }
                 Decision::AdvanceAndAct {
@@ -337,25 +340,30 @@ impl Runner {
     /// The typed marker oracle + the supersession comparison.
     fn poll_marker(&self, record: &FulfillStateRecord) -> Result<Event> {
         let Some(plan_id) = record.plan_id.as_deref() else {
-            bail!("internal error: state '{}' has no pinned plan", record.state.tag());
+            bail!(
+                "internal error: state '{}' has no pinned plan",
+                record.state.tag()
+            );
         };
         let approved_digest = self.approved_digest()?;
-        Ok(match fulfill_api::compute_review_status(&self.root, plan_id) {
-            Ok(status) => Event::MarkerPoll {
-                reviewed: status.reviewed,
-                invalid: None,
-                plan_payload_digest: status.spec_digest,
-                approved_digest,
+        Ok(
+            match fulfill_api::compute_review_status(&self.root, plan_id) {
+                Ok(status) => Event::MarkerPoll {
+                    reviewed: status.reviewed,
+                    invalid: None,
+                    plan_payload_digest: status.spec_digest,
+                    approved_digest,
+                },
+                // A malformed marker (or an unreadable/tampered plan) is an
+                // ERROR surfaced to the human, never a silent "not yet".
+                Err(err) => Event::MarkerPoll {
+                    reviewed: false,
+                    invalid: Some(format!("{err:#}")),
+                    plan_payload_digest: None,
+                    approved_digest,
+                },
             },
-            // A malformed marker (or an unreadable/tampered plan) is an
-            // ERROR surfaced to the human, never a silent "not yet".
-            Err(err) => Event::MarkerPoll {
-                reviewed: false,
-                invalid: Some(format!("{err:#}")),
-                plan_payload_digest: None,
-                approved_digest,
-            },
-        })
+        )
     }
 
     // -----------------------------------------------------------------
@@ -821,9 +829,7 @@ impl Runner {
                 driver::kill_group(pgid, std::time::Duration::from_secs(5), vec![]).await?;
             }
         }
-        *record = self
-            .store
-            .stamp_driver_group(record, None, Utc::now())?;
+        *record = self.store.stamp_driver_group(record, None, Utc::now())?;
         Ok(())
     }
 
@@ -939,12 +945,7 @@ impl Runner {
             }
         };
         let spec = self.approved_spec()?;
-        let sources: Vec<String> = spec
-            .parsed
-            .product()
-            .source
-            .tables
-            .clone();
+        let sources: Vec<String> = spec.parsed.product().source.tables.clone();
         let dir = self.fulfillment_dir();
         let verify_detail = match &record.state {
             FulfillState::Drafting if kind == TaskBriefKind::Repair => {
@@ -1055,8 +1056,9 @@ impl Runner {
                 approval.spec_digest
             );
         }
-        let parsed = rocky_core::product::spec::parse_spec_bytes(&bytes, &approval.snapshot_path)
-            .map_err(|reject| anyhow::anyhow!("approved snapshot does not parse: {reject}"))?;
+        let parsed =
+            rocky_core::product::spec::parse_spec_bytes(&bytes, &approval.snapshot_path)
+                .map_err(|reject| anyhow::anyhow!("approved snapshot does not parse: {reject}"))?;
         Ok(ApprovedSpec {
             digest: approval.spec_digest,
             parsed,

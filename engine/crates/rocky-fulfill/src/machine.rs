@@ -503,7 +503,11 @@ fn parse_stamp(raw: Option<&str>) -> Option<DateTime<Utc>> {
 
 /// Clone `observed` into a new record in `state`, stamped `now`.
 /// Pins and counters carry over unless the caller mutates them.
-fn to_state(observed: &FulfillStateRecord, state: FulfillState, now: DateTime<Utc>) -> FulfillStateRecord {
+fn to_state(
+    observed: &FulfillStateRecord,
+    state: FulfillState,
+    now: DateTime<Utc>,
+) -> FulfillStateRecord {
     let mut next = observed.clone();
     next.state = state;
     next.updated_at = Some(stamp(now));
@@ -511,14 +515,23 @@ fn to_state(observed: &FulfillStateRecord, state: FulfillState, now: DateTime<Ut
 }
 
 /// The blocked record for `reason`, pins cleared.
-fn blocked(observed: &FulfillStateRecord, reason: String, now: DateTime<Utc>) -> FulfillStateRecord {
+fn blocked(
+    observed: &FulfillStateRecord,
+    reason: String,
+    now: DateTime<Utc>,
+) -> FulfillStateRecord {
     let mut next = to_state(observed, FulfillState::Blocked { reason }, now);
     next.plan_id = None;
     next.idempotency_key = None;
     next
 }
 
-fn blocked_stop(record: FulfillStateRecord, event: String, product: &str, reason: &str) -> Decision {
+fn blocked_stop(
+    record: FulfillStateRecord,
+    event: String,
+    product: &str,
+    reason: &str,
+) -> Decision {
     // The stop surfaces the RECORD's blocked reason (which carries any
     // `tampered:` classification), so the printed message and the
     // persisted state never tell two different stories.
@@ -590,13 +603,15 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 if observed.drafting_attempts >= MAX_COMPILE_ITERS {
                     let record = blocked(
                         observed,
-                        format!(
-                            "elicitation failed {MAX_COMPILE_ITERS} times (max_compile_iters)"
-                        ),
+                        format!("elicitation failed {MAX_COMPILE_ITERS} times (max_compile_iters)"),
                         now,
                     );
-                    blocked_stop(record, "elicitation budget exhausted".to_string(), &product,
-                        "elicitation attempts exhausted")
+                    blocked_stop(
+                        record,
+                        "elicitation budget exhausted".to_string(),
+                        &product,
+                        "elicitation attempts exhausted",
+                    )
                 } else {
                     // Count the attempt BEFORE dispatch (a crash mid-task
                     // still consumed budget — the claim.rs discipline).
@@ -604,10 +619,7 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                     next.drafting_attempts = observed.drafting_attempts + 1;
                     Decision::AdvanceAndAct {
                         record: next,
-                        event: format!(
-                            "elicitation attempt {}",
-                            observed.drafting_attempts + 1
-                        ),
+                        event: format!("elicitation attempt {}", observed.drafting_attempts + 1),
                         task: TaskKind::Elicit,
                     }
                 }
@@ -652,7 +664,8 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 error,
                 ..
             } => {
-                let error = error.unwrap_or_else(|| "elicitation produced no candidate".to_string());
+                let error =
+                    error.unwrap_or_else(|| "elicitation produced no candidate".to_string());
                 if observed.drafting_attempts >= MAX_COMPILE_ITERS {
                     let record = blocked(
                         observed,
@@ -715,10 +728,13 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
             // approve-spec CAS ok → spec_approved (the approve verb moves
             // the state itself; observing it here covers records that
             // carry a matching approval but were left in needs_input).
-            (REASON_SPEC_APPROVAL, Event::ApprovalSurface {
-                candidate_digest,
-                approved_digest,
-            }) => match (candidate_digest, approved_digest) {
+            (
+                REASON_SPEC_APPROVAL,
+                Event::ApprovalSurface {
+                    candidate_digest,
+                    approved_digest,
+                },
+            ) => match (candidate_digest, approved_digest) {
                 (Some(cand), Some(approved)) if cand == approved => {
                     let mut next = to_state(observed, FulfillState::SpecApproved, now);
                     next.spec_digest = Some(approved.clone());
@@ -772,27 +788,39 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                     event: "posture verified".to_string(),
                 }
             }
-            (REASON_POLICY, Event::PostureVerified(PostureStatus::NeedsInput { paste_block, reason })) => {
-                Decision::Halt(Stop {
-                    message: format!(
-                        "policy posture still needs a human edit: {reason}\n\
+            (
+                REASON_POLICY,
+                Event::PostureVerified(PostureStatus::NeedsInput {
+                    paste_block,
+                    reason,
+                }),
+            ) => Decision::Halt(Stop {
+                message: format!(
+                    "policy posture still needs a human edit: {reason}\n\
                          paste this into rocky.toml, then re-run:\n\n{paste_block}"
-                    ),
-                    next_command: Some(format!("rocky fulfill {product}")),
-                })
-            }
+                ),
+                next_command: Some(format!("rocky fulfill {product}")),
+            }),
             (REASON_POLICY, Event::PostureVerified(PostureStatus::Fail { reason })) => {
                 let record = blocked(observed, reason.clone(), now);
-                blocked_stop(record, "posture verification failed".to_string(), &product, &reason)
+                blocked_stop(
+                    record,
+                    "posture verification failed".to_string(),
+                    &product,
+                    &reason,
+                )
             }
             // plan_approval: rerun re-checks the marker; a re-approved
             // snapshot meanwhile supersedes.
-            (REASON_PLAN_APPROVAL, Event::MarkerPoll {
-                reviewed,
-                invalid,
-                plan_payload_digest,
-                approved_digest,
-            }) => decide_marker(
+            (
+                REASON_PLAN_APPROVAL,
+                Event::MarkerPoll {
+                    reviewed,
+                    invalid,
+                    plan_payload_digest,
+                    approved_digest,
+                },
+            ) => decide_marker(
                 observed,
                 &product,
                 reviewed,
@@ -810,15 +838,26 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
         //   verify fail → needs_input(policy)
         // ------------------------------------------------------------------
         FulfillState::SpecApproved => match event {
-            Event::SnapshotVerify { snapshot_ok: false, detail } => {
+            Event::SnapshotVerify {
+                snapshot_ok: false,
+                detail,
+            } => {
                 let record = blocked(observed, format!("tampered: {detail}"), now);
-                blocked_stop(record, "snapshot tamper detected".to_string(), &product, &detail)
+                blocked_stop(
+                    record,
+                    "snapshot tamper detected".to_string(),
+                    &product,
+                    &detail,
+                )
             }
-            Event::SnapshotVerify { snapshot_ok: true, .. } => {
-                Decision::Act(TaskKind::VerifyPosture)
-            }
+            Event::SnapshotVerify {
+                snapshot_ok: true, ..
+            } => Decision::Act(TaskKind::VerifyPosture),
             Event::PostureVerified(PostureStatus::Pass) => Decision::Act(TaskKind::RunPhaseA),
-            Event::PostureVerified(PostureStatus::NeedsInput { paste_block, reason }) => {
+            Event::PostureVerified(PostureStatus::NeedsInput {
+                paste_block,
+                reason,
+            }) => {
                 let next = to_state(
                     observed,
                     FulfillState::NeedsInput {
@@ -881,7 +920,12 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                         format!("drafting failed: {error} (attempts exhausted)"),
                         now,
                     );
-                    blocked_stop(record, "drafting budget exhausted".to_string(), &product, &error)
+                    blocked_stop(
+                        record,
+                        "drafting budget exhausted".to_string(),
+                        &product,
+                        &error,
+                    )
                 } else {
                     dispatch_drafting(observed, &product, TaskKind::Draft, now)
                 }
@@ -895,7 +939,12 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
             Event::ArtifactCheck { problems } => {
                 let detail = problems.join("; ");
                 let record = blocked(observed, format!("tampered: {detail}"), now);
-                blocked_stop(record, "phase A tamper detected".to_string(), &product, &detail)
+                blocked_stop(
+                    record,
+                    "phase A tamper detected".to_string(),
+                    &product,
+                    &detail,
+                )
             }
             Event::PhaseBResult { ok: true, .. } => {
                 let next = to_state(observed, FulfillState::Merged, now);
@@ -966,20 +1015,24 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 if observed.repair_rounds >= MAX_REPAIR_ROUNDS {
                     let record = blocked(
                         observed,
-                        format!("verification red after {MAX_REPAIR_ROUNDS} repair rounds: {detail}"),
+                        format!(
+                            "verification red after {MAX_REPAIR_ROUNDS} repair rounds: {detail}"
+                        ),
                         now,
                     );
-                    blocked_stop(record, "repair budget exhausted".to_string(), &product, &detail)
+                    blocked_stop(
+                        record,
+                        "repair budget exhausted".to_string(),
+                        &product,
+                        &detail,
+                    )
                 } else {
                     let mut next = to_state(observed, FulfillState::Drafting, now);
                     next.repair_rounds = observed.repair_rounds + 1;
                     next.drafting_attempts = 1;
                     Decision::AdvanceAndAct {
                         record: next,
-                        event: format!(
-                            "repair round {} ({detail})",
-                            observed.repair_rounds + 1
-                        ),
+                        event: format!("repair round {} ({detail})", observed.repair_rounds + 1),
                         task: TaskKind::Repair,
                     }
                 }
@@ -1052,7 +1105,9 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
         //   write ok | apply ok → applied; crash → next run applying_unknown
         // ------------------------------------------------------------------
         FulfillState::Applying => match event {
-            Event::PreApply { snapshot_ok: false, .. } => {
+            Event::PreApply {
+                snapshot_ok: false, ..
+            } => {
                 let record = blocked(
                     observed,
                     "tampered: snapshot bytes no longer match the approval record".to_string(),
@@ -1146,7 +1201,11 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
         // ------------------------------------------------------------------
         FulfillState::Applied => match event {
             Event::Reentry => Decision::Act(TaskKind::Observe),
-            Event::ObservationDone { test_green, staleness_ok, detail } => {
+            Event::ObservationDone {
+                test_green,
+                staleness_ok,
+                detail,
+            } => {
                 let next = to_state(observed, FulfillState::Observing, now);
                 Decision::AdvanceAndStop {
                     record: next,
@@ -1165,7 +1224,11 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
         // ------------------------------------------------------------------
         FulfillState::Observing => match event {
             Event::Reentry => Decision::Act(TaskKind::Observe),
-            Event::ObservationDone { test_green, staleness_ok, detail } => {
+            Event::ObservationDone {
+                test_green,
+                staleness_ok,
+                detail,
+            } => {
                 let next = to_state(observed, FulfillState::Observing, now);
                 Decision::AdvanceAndStop {
                     record: next,
@@ -1299,8 +1362,8 @@ fn decide_marker(
                 event: "awaiting plan review".to_string(),
                 stop: Stop {
                     message: format!(
-                "plan {plan_id} awaits human review; after approving, re-run: rocky fulfill {product}"
-            ),
+                        "plan {plan_id} awaits human review; after approving, re-run: rocky fulfill {product}"
+                    ),
                     next_command: Some(format!("rocky review {plan_id} --approve")),
                 },
             }
@@ -1352,7 +1415,11 @@ fn decide_proposed(
         }
         // Denied → blocked, NAMING the policy (nothing persisted).
         ProposeSummary::Denied { refusal } => {
-            let record = blocked(observed, format!("policy denied the propose: {refusal}"), now);
+            let record = blocked(
+                observed,
+                format!("policy denied the propose: {refusal}"),
+                now,
+            );
             blocked_stop(
                 record,
                 "propose denied by policy".to_string(),
@@ -1410,9 +1477,7 @@ fn decide_receipt(
                     let next = to_state(observed, FulfillState::ApplyingUnknown, now);
                     Decision::AdvanceAndStop {
                         record: next,
-                        event: format!(
-                            "receipt contradicts skipped_idempotent ({detail})"
-                        ),
+                        event: format!("receipt contradicts skipped_idempotent ({detail})"),
                         stop: Stop {
                             message: format!(
                                 "the apply was deflected as already-satisfied, but the \
@@ -1657,10 +1722,7 @@ mod tests {
         let OwnershipDecision::WaitGrace { remaining_seconds } = d else {
             panic!("expected WaitGrace, got {d:?}");
         };
-        assert_eq!(
-            remaining_seconds,
-            FULFILL_RECOVERY_GRACE.num_seconds() - 30
-        );
+        assert_eq!(remaining_seconds, FULFILL_RECOVERY_GRACE.num_seconds() - 30);
     }
 
     #[test]
@@ -1951,7 +2013,11 @@ mod tests {
 
     #[test]
     fn policy_pass_advances_to_spec_approved() {
-        let d = decide(&needs_policy(), Event::PostureVerified(PostureStatus::Pass), now());
+        let d = decide(
+            &needs_policy(),
+            Event::PostureVerified(PostureStatus::Pass),
+            now(),
+        );
         let Decision::Advance { record, .. } = d else {
             panic!("expected Advance, got {d:?}");
         };
@@ -2324,7 +2390,12 @@ mod tests {
             },
             now(),
         );
-        let Decision::AdvanceAndAct { record, task, event } = d else {
+        let Decision::AdvanceAndAct {
+            record,
+            task,
+            event,
+        } = d
+        else {
             panic!("expected AdvanceAndAct, got {d:?}");
         };
         assert_eq!(record.state, FulfillState::Drafting);
@@ -2609,7 +2680,12 @@ mod tests {
         prior.plan_id = Some("plan-1".into());
         prior.idempotency_key = Some("k@1".into());
         let d = decide(&prior, Event::Reentry, now());
-        let Decision::AdvanceAndAct { record, task, event } = d else {
+        let Decision::AdvanceAndAct {
+            record,
+            task,
+            event,
+        } = d
+        else {
             panic!("expected AdvanceAndAct, got {d:?}");
         };
         assert_eq!(record.state, FulfillState::Applying);
@@ -2852,7 +2928,11 @@ mod tests {
                 panic!("expected AdvanceAndAct, got {d:?}");
             };
             assert_eq!(record.state, FulfillState::Applying);
-            assert_eq!(task, TaskKind::PreApplyCheck, "retry re-runs the digest gate");
+            assert_eq!(
+                task,
+                TaskKind::PreApplyCheck,
+                "retry re-runs the digest gate"
+            );
             assert_eq!(record.idempotency_key.as_deref(), Some("k@1"), "same key");
         }
     }
@@ -2979,9 +3059,7 @@ mod tests {
 
     #[test]
     fn blocked_retry_reenters_at_spec_approved_when_a_digest_exists() {
-        let mut prior = rec(FulfillState::Blocked {
-            reason: "x".into(),
-        });
+        let mut prior = rec(FulfillState::Blocked { reason: "x".into() });
         prior.spec_digest = Some("sha256:aa".into());
         prior.plan_id = Some("plan-1".into());
         prior.drafting_attempts = 8;
@@ -2997,9 +3075,7 @@ mod tests {
     #[test]
     fn blocked_retry_without_a_digest_reenters_at_init() {
         let d = decide(
-            &rec(FulfillState::Blocked {
-                reason: "x".into(),
-            }),
+            &rec(FulfillState::Blocked { reason: "x".into() }),
             Event::RetryRequested,
             now(),
         );

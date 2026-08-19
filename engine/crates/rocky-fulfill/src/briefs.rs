@@ -69,7 +69,11 @@ pub fn load_template(kind: TaskBriefKind, briefs_dir: Option<&Path>) -> Result<S
 /// the context. Unknown placeholders are left as-is (an override may
 /// carry prose braces); the known set is `{product}`, `{intent}`,
 /// `{sources}`, `{model}`, `{outbox_dir}`, `{verify_detail}`.
-pub fn render(kind: TaskBriefKind, briefs_dir: Option<&Path>, ctx: &BriefContext) -> Result<String> {
+pub fn render(
+    kind: TaskBriefKind,
+    briefs_dir: Option<&Path>,
+    ctx: &BriefContext,
+) -> Result<String> {
     let template = load_template(kind, briefs_dir)?;
     let sources = if ctx.sources.is_empty() {
         "(none listed)".to_string()

@@ -352,7 +352,10 @@ fn prepare_dirs(brief: &TaskBrief) -> Result<PathBuf, DriverError> {
 /// Read the typed outcome for the task kind (elicitation: the outbox
 /// hand-off; drafting/repair: the transcript alone — the runner's own
 /// compile/test decide everything else).
-fn collect_outcome(brief: &TaskBrief, transcript_path: PathBuf) -> Result<DriverOutcome, DriverError> {
+fn collect_outcome(
+    brief: &TaskBrief,
+    transcript_path: PathBuf,
+) -> Result<DriverOutcome, DriverError> {
     match brief.kind {
         TaskBriefKind::Elicitation => {
             let candidate = brief.outbox_dir.join(OUTBOX_CANDIDATE);
@@ -422,7 +425,10 @@ fn signal_group(pgid: u32, signal: libc::c_int) -> Result<(), DriverError> {
     } else {
         Err(DriverError::Survivors {
             pgid,
-            detail: format!("killpg({signal}) failed: {}", std::io::Error::last_os_error()),
+            detail: format!(
+                "killpg({signal}) failed: {}",
+                std::io::Error::last_os_error()
+            ),
         })
     }
 }
@@ -620,9 +626,8 @@ impl AgentDriver for ReplayDriver {
         on_group: &mut (dyn FnMut(GroupStamp) -> anyhow::Result<()> + Send),
     ) -> Result<DriverOutcome, DriverError> {
         let transcript_path = prepare_dirs(brief)?;
-        let raw = std::fs::read(&self.session_path).map_err(|e| {
-            DriverError::Session(format!("{}: {e}", self.session_path.display()))
-        })?;
+        let raw = std::fs::read(&self.session_path)
+            .map_err(|e| DriverError::Session(format!("{}: {e}", self.session_path.display())))?;
         let session: ReplaySession = serde_json::from_slice(&raw)
             .map_err(|e| DriverError::Session(format!("{}: {e}", self.session_path.display())))?;
         let task = session.tasks.get(brief.kind.as_str()).ok_or_else(|| {
@@ -837,11 +842,7 @@ async fn replay_calls(
 }
 
 #[cfg(unix)]
-fn log_exchange(
-    transcript: &mut std::fs::File,
-    label: &str,
-    response: &Option<serde_json::Value>,
-) {
+fn log_exchange(transcript: &mut std::fs::File, label: &str, response: &Option<serde_json::Value>) {
     use std::io::Write as _;
     let rendered = response
         .as_ref()
@@ -900,11 +901,7 @@ mod supervision_tests {
     async fn orphan_grandchild_dies_with_the_group() {
         let dir = tempfile::tempdir().expect("tempdir");
         let driver = subprocess(
-            &[
-                "/bin/sh",
-                "-c",
-                "(sleep 300 &); echo {brief}; exit 0",
-            ],
+            &["/bin/sh", "-c", "(sleep 300 &); echo {brief}; exit 0"],
             Duration::from_secs(30),
             Duration::from_secs(2),
         );
@@ -941,9 +938,13 @@ mod supervision_tests {
             .expect("sibling joins the group");
         assert!(group_exists(pgid));
 
-        kill_group(pgid, Duration::from_secs(2), vec![&mut leader, &mut sibling])
-            .await
-            .expect("group kill");
+        kill_group(
+            pgid,
+            Duration::from_secs(2),
+            vec![&mut leader, &mut sibling],
+        )
+        .await
+        .expect("group kill");
         assert!(
             !group_exists(pgid),
             "leader AND sibling must be gone after the group kill"
@@ -1148,7 +1149,11 @@ mod supervision_tests {
         for command in [
             vec![],
             vec!["/bin/echo".to_string()],
-            vec!["/bin/echo".to_string(), "{brief}".to_string(), "{brief}".to_string()],
+            vec![
+                "/bin/echo".to_string(),
+                "{brief}".to_string(),
+                "{brief}".to_string(),
+            ],
         ] {
             let result = SubprocessDriver::new(
                 command,

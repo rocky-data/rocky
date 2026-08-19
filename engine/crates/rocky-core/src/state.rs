@@ -6720,10 +6720,7 @@ mod tests {
         };
         assert_eq!(current_state.unwrap().journal_seq, 1);
         assert_eq!(
-            store
-                .fulfill_journal_rows("revenue_daily")
-                .unwrap()
-                .len(),
+            store.fulfill_journal_rows("revenue_daily").unwrap().len(),
             1,
             "the losing CAS appended nothing"
         );

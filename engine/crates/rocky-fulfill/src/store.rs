@@ -143,7 +143,9 @@ impl StoreDriver {
         let observed = self.read()?;
         let liveness = match &observed {
             Some(record) => match (record.owner_pid, record.owner_start_time) {
-                (Some(pid), expected_start) if pid != me.pid || expected_start != Some(me.start_time) => {
+                (Some(pid), expected_start)
+                    if pid != me.pid || expected_start != Some(me.start_time) =>
+                {
                     Some(probe_owner(pid, expected_start))
                 }
                 (Some(_), _) => None, // ourselves; decide_ownership answers AlreadyOwned
@@ -175,12 +177,7 @@ impl StoreDriver {
                     self.product_name,
                     crate::machine::FULFILL_RECOVERY_GRACE.num_seconds()
                 );
-                match self.transition(
-                    observed.as_ref(),
-                    &stamped,
-                    "recovery grace stamped",
-                    now,
-                )? {
+                match self.transition(observed.as_ref(), &stamped, "recovery grace stamped", now)? {
                     Applied::Won(_) => Ok(Acquired::Stopped(message)),
                     Applied::Lost { winner } => Ok(Acquired::Stopped(lost_message(&winner))),
                 }
@@ -197,7 +194,11 @@ impl StoreDriver {
     /// next invocation claims immediately (no grace). Journal-free by
     /// design? No — every write journals; the release row keeps the
     /// audit trail complete.
-    pub fn release(&self, observed: &FulfillStateRecord, now: DateTime<Utc>) -> Result<FulfillStateRecord> {
+    pub fn release(
+        &self,
+        observed: &FulfillStateRecord,
+        now: DateTime<Utc>,
+    ) -> Result<FulfillStateRecord> {
         let mut released = observed.clone();
         released.owner_pid = None;
         released.owner_start_time = None;
