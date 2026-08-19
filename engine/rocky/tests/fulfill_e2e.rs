@@ -258,31 +258,39 @@ fn happy_path_cold_init_to_observing() {
     let plan_id = drive_to_plan_review(dir);
     approve_and_apply(dir, &plan_id);
 
-    // The journal tells the whole story, in order. (Scoped: an open
-    // state store would lock out the next binary invocation.)
+    // The journal tells the whole story, IN ORDER: dedup consecutive
+    // repeats of the to_state projection (ownership stamps and releases
+    // keep the state they annotate) and demand the exact sequence — an
+    // out-of-order or skipped gate cannot pass. (Scoped: an open state
+    // store would lock out the next binary invocation.)
     {
         let store = state_store(dir);
         let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
-        let states: Vec<&str> = rows.iter().map(|r| r.to_state.as_str()).collect();
-        for expected in [
-            "init",
-            "needs_input",
-            "spec_approved",
-            "lowered_contract",
-            "drafting",
-            "merged",
-            "verifying",
-            "proposed",
-            "plan_approved",
-            "applying",
-            "applied",
-            "observing",
-        ] {
-            assert!(
-                states.contains(&expected),
-                "journal is missing '{expected}': {states:?}"
-            );
+        let mut sequence: Vec<&str> = Vec::new();
+        for row in &rows {
+            if sequence.last() != Some(&row.to_state.as_str()) {
+                sequence.push(row.to_state.as_str());
+            }
         }
+        assert_eq!(
+            sequence,
+            vec![
+                "init",
+                "needs_input",
+                "spec_approved",
+                "lowered_contract",
+                "drafting",
+                "merged",
+                "verifying",
+                "proposed",
+                "needs_input",
+                "plan_approved",
+                "applying",
+                "applied",
+                "observing",
+            ],
+            "the D6 order, exactly"
+        );
         let applied_rows = rows.iter().filter(|r| r.to_state == "applied").count();
         assert_eq!(applied_rows, 1, "exactly one applied journal row");
     }
@@ -471,6 +479,33 @@ fn phase_a_tamper_blocks_at_the_byte_verify() {
     assert!(
         json["message"].as_str().unwrap().contains("tampered"),
         "{json}"
+    );
+
+    // F4: the block fired at the PRE-PROPOSE byte-verify — while the
+    // record still sat in `drafting`, before Phase B could commit and
+    // before anything could reach the review queue. The journal has no
+    // merged/verifying/proposed row at all, and NO plan was ever
+    // written (the plan store directory does not exist).
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    let blocked_row = rows
+        .iter()
+        .find(|r| r.to_state == "blocked")
+        .expect("the blocked transition is journaled");
+    assert_eq!(
+        blocked_row.from_state.as_deref(),
+        Some("drafting"),
+        "tamper was caught in the drafting window (the merged precondition)"
+    );
+    for never in ["merged", "verifying", "proposed", "plan_approved", "applying"] {
+        assert!(
+            !rows.iter().any(|r| r.to_state == never),
+            "'{never}' must never be reached after a Phase-A tamper: {rows:?}"
+        );
+    }
+    assert!(
+        !dir.join(".rocky").join("plans").exists(),
+        "no plan may reach the store before the byte-verify clears"
     );
 }
 
