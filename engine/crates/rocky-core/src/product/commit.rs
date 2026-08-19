@@ -1558,6 +1558,30 @@ mod tests {
         assert!(!project.join(".rocky").exists() || !manifest_path(&project).exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fresh_commit_refuses_a_dangling_symlinked_parent_dir() {
+        // The one ancestor escape parent-resolution's lexical fallback would
+        // otherwise miss: `models -> /nonexistent` (dangling). `resolve_nonstrict`
+        // cannot canonicalize it, falls back to a lexical `<root>/models`, and
+        // the containment check would then PASS — but the subsequent
+        // `create_dir_all` would follow the dangling link and create OUTSIDE
+        // the project. The explicit dangling-ancestor guard refuses it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nonexistent = dir.path().join("nonexistent-outside");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("mkdir");
+        std::os::unix::fs::symlink(&nonexistent, project.join("models")).expect("symlink");
+        let parsed = parsed_d3();
+
+        let error =
+            run_phase_a(&project, SPEC_PATH, &parsed).expect_err("dangling symlinked parent");
+        assert_eq!(error.code, "commit-symlinked-target");
+        assert!(error.message.contains("dangling symlinked ancestor"), "{error}");
+        // The guard refused before `create_dir_all` could create the target.
+        assert!(!nonexistent.exists(), "nothing was created outside the project");
+    }
+
     // --------------- the journal is untrusted: forgeries refused ------------
 
     fn write_journal(project: &Path, product_name: &str, payload: &serde_json::Value) -> PathBuf {
