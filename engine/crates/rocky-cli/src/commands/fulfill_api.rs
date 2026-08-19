@@ -536,14 +536,21 @@ pub enum ReceiptLookup {
 ///
 /// Invariant guarded: `applying_unknown` is resolved only by a terminal
 /// `Succeeded` receipt, never by a blind re-apply and never by guessing.
-/// Only the local redb store (the `local` backend, and the tiered/valkey
-/// mirror cases whose authority IS the local mirror) has a non-mutating
-/// authoritative read today; for a pure Valkey or object-store backend
-/// the existing API can only claim-or-report (a mutating check), so this
-/// lookup returns [`ReceiptLookup::CannotAnswer`] and the state stays
-/// `applying_unknown` for a human. That honesty is the design's hedge —
-/// a lookup that "probably" answered would quietly convert a crash into
-/// a double apply.
+/// The answer surface is backend-honest:
+///
+/// - **local** — the redb store IS the authority: all four answers.
+/// - **tiered** (Valkey mirrored to redb) — a finalized receipt is
+///   written through to the mirror, so a mirrored `Succeeded` proves a
+///   success happened. Nothing else does: the mirror's ABSENCE proves
+///   nothing, a mirrored `InFlight` may be a stale copy of a remote
+///   claim, and a mirrored `Failed` may have been superseded remotely.
+///   Everything but `Succeeded` is [`ReceiptLookup::CannotAnswer`].
+/// - **pure Valkey / object-store** — the current API can only
+///   claim-or-report (a mutating check), so the lookup always says
+///   [`ReceiptLookup::CannotAnswer`] and the state stays
+///   `applying_unknown` for a human. That honesty is the design's hedge
+///   — a lookup that "probably" answered would quietly convert a crash
+///   into a double apply.
 pub fn lookup_apply_receipt(
     config_path: &Path,
     state_path: &Path,
@@ -554,56 +561,62 @@ pub fn lookup_apply_receipt(
     let cfg = rocky_core::config::load_rocky_config(config_path)
         .with_context(|| format!("failed to load config from {}", config_path.display()))?;
     let backend = IdempotencyBackend::from_state_config(&cfg.state);
-    let authoritative_locally = match &backend {
-        IdempotencyBackend::Local => true,
-        IdempotencyBackend::Valkey { mirror_to_redb, .. } => {
-            // The mirror is a copy; the AUTHORITATIVE claim lives in
-            // Valkey, which has no non-mutating read in the current API.
-            // A mirror row can prove a success happened (receipts are
-            // written through), but its absence proves nothing — so only
-            // a mirrored SUCCESS is authoritative.
-            *mirror_to_redb
-        }
-        IdempotencyBackend::ObjectStore { .. } => false,
+    let cannot_answer = |reason: &str| ReceiptLookup::CannotAnswer {
+        backend: backend.backend_label().to_string(),
+        reason: reason.to_string(),
     };
-    if !authoritative_locally {
-        return Ok(ReceiptLookup::CannotAnswer {
-            backend: backend.backend_label().to_string(),
-            reason: "the configured idempotency backend has no non-mutating authoritative \
-                     read; refusing to guess — resolve the receipt by hand or retry once the \
-                     claim expires"
-                .to_string(),
-        });
-    }
+    let mirrored = match &backend {
+        IdempotencyBackend::Local => false,
+        IdempotencyBackend::Valkey {
+            mirror_to_redb: true,
+            ..
+        } => true,
+        IdempotencyBackend::Valkey { .. } | IdempotencyBackend::ObjectStore { .. } => {
+            return Ok(cannot_answer(
+                "the configured idempotency backend has no non-mutating authoritative read; \
+                 refusing to guess — resolve the receipt by hand or retry once the claim \
+                 expires",
+            ));
+        }
+    };
 
     let store = rocky_core::state::StateStore::open_read_only(state_path)
         .with_context(|| format!("failed to open state store at {}", state_path.display()))?;
-    let Some(entry) = store.idempotency_get(idempotency_key)? else {
-        return Ok(ReceiptLookup::NoRecord);
-    };
-    let lookup = match entry.state {
-        IdempotencyState::Succeeded => ReceiptLookup::Succeeded {
+    let entry = store.idempotency_get(idempotency_key)?;
+    let lookup = match (mirrored, entry) {
+        // The local store is the authority: all four answers.
+        (false, None) => ReceiptLookup::NoRecord,
+        (false, Some(entry)) => match entry.state {
+            IdempotencyState::Succeeded => ReceiptLookup::Succeeded {
+                run_id: entry.run_id,
+            },
+            IdempotencyState::Failed => ReceiptLookup::Failed {
+                run_id: entry.run_id,
+            },
+            IdempotencyState::InFlight => ReceiptLookup::InFlight {
+                run_id: entry.run_id,
+            },
+        },
+        // A mirrored Succeeded is written through — it proves a success.
+        (
+            true,
+            Some(
+                entry @ rocky_core::idempotency::IdempotencyEntry {
+                    state: IdempotencyState::Succeeded,
+                    ..
+                },
+            ),
+        ) => ReceiptLookup::Succeeded {
             run_id: entry.run_id,
         },
-        IdempotencyState::Failed => ReceiptLookup::Failed {
-            run_id: entry.run_id,
-        },
-        IdempotencyState::InFlight => {
-            if matches!(&backend, IdempotencyBackend::Valkey { .. }) {
-                // A mirrored InFlight is a stale copy of a remote claim —
-                // only the remote can say whether it is live.
-                ReceiptLookup::CannotAnswer {
-                    backend: backend.backend_label().to_string(),
-                    reason: "the local mirror shows an in-flight claim, but the \
-                             authoritative claim lives remotely and has no non-mutating read"
-                        .to_string(),
-                }
-            } else {
-                ReceiptLookup::InFlight {
-                    run_id: entry.run_id,
-                }
-            }
-        }
+        // Everything else on the mirror proves nothing about the remote
+        // authority: absence, a possibly-stale InFlight, a possibly-
+        // superseded Failed.
+        (true, _) => cannot_answer(
+            "the local mirror carries no terminal Succeeded receipt, and only a mirrored \
+             success is authoritative — the live claim (or its absence) can only be read \
+             remotely, and no non-mutating remote read exists",
+        ),
     };
     Ok(lookup)
 }
@@ -787,3 +800,195 @@ pub fn product_approve(
 /// Re-exported so the loop's capability classification and gate share
 /// the exact types the plan store persists.
 pub use crate::plan_store::EmbeddedCapabilities as ProposeCapabilities;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_file(path: &Path, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    fn seed_entry(
+        state_path: &Path,
+        key: &str,
+        state: rocky_core::idempotency::IdempotencyState,
+    ) {
+        let store = rocky_core::state::StateStore::open(state_path).expect("opens");
+        let now = chrono::Utc::now();
+        store
+            .idempotency_put(&rocky_core::idempotency::IdempotencyEntry {
+                key: key.to_string(),
+                run_id: format!("run-{key}"),
+                state,
+                stamped_at: now,
+                expires_at: now + chrono::Duration::days(7),
+                dedup_on: rocky_core::config::DedupPolicy::Success,
+            })
+            .expect("seeds");
+    }
+
+    fn config_with_state(dir: &Path, state_block: &str) -> std::path::PathBuf {
+        let config = dir.join("rocky.toml");
+        write_file(
+            &config,
+            format!(
+                "[adapter]\ntype = \"duckdb\"\npath = \"wh.duckdb\"\n\n[pipeline.p]\n\
+                 type = \"transformation\"\nmodels = \"models/**\"\n\n\
+                 [pipeline.p.target.governance]\nauto_create_schemas = true\n\n{state_block}"
+            )
+            .as_bytes(),
+        );
+        config
+    }
+
+    // ----- the authoritative receipt lookup -----
+
+    #[test]
+    fn receipt_lookup_answers_all_four_on_the_local_backend() {
+        use rocky_core::idempotency::IdempotencyState;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = config_with_state(dir.path(), "");
+        let state_path = dir.path().join("state.redb");
+        seed_entry(&state_path, "k-succeeded", IdempotencyState::Succeeded);
+        seed_entry(&state_path, "k-failed", IdempotencyState::Failed);
+        seed_entry(&state_path, "k-inflight", IdempotencyState::InFlight);
+
+        assert_eq!(
+            lookup_apply_receipt(&config, &state_path, "k-succeeded").expect("reads"),
+            ReceiptLookup::Succeeded {
+                run_id: "run-k-succeeded".to_string()
+            }
+        );
+        assert_eq!(
+            lookup_apply_receipt(&config, &state_path, "k-failed").expect("reads"),
+            ReceiptLookup::Failed {
+                run_id: "run-k-failed".to_string()
+            }
+        );
+        assert_eq!(
+            lookup_apply_receipt(&config, &state_path, "k-inflight").expect("reads"),
+            ReceiptLookup::InFlight {
+                run_id: "run-k-inflight".to_string()
+            }
+        );
+        assert_eq!(
+            lookup_apply_receipt(&config, &state_path, "k-absent").expect("reads"),
+            ReceiptLookup::NoRecord
+        );
+    }
+
+    #[test]
+    fn receipt_lookup_on_tiered_trusts_only_a_mirrored_success() {
+        use rocky_core::idempotency::IdempotencyState;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = config_with_state(
+            dir.path(),
+            "[state]\nbackend = \"tiered\"\nvalkey_url = \"redis://localhost:6379\"\n",
+        );
+        let state_path = dir.path().join("state.redb");
+        seed_entry(&state_path, "k-succeeded", IdempotencyState::Succeeded);
+        seed_entry(&state_path, "k-inflight", IdempotencyState::InFlight);
+        seed_entry(&state_path, "k-failed", IdempotencyState::Failed);
+
+        // A mirrored Succeeded is written through — authoritative.
+        assert_eq!(
+            lookup_apply_receipt(&config, &state_path, "k-succeeded").expect("reads"),
+            ReceiptLookup::Succeeded {
+                run_id: "run-k-succeeded".to_string()
+            }
+        );
+        // Everything else on the mirror proves nothing: the live claim can
+        // only be read remotely. Absence included — a runner that treated
+        // mirror-absence as NoRecord would blind-retry into a live claim.
+        for key in ["k-inflight", "k-failed", "k-absent"] {
+            assert!(
+                matches!(
+                    lookup_apply_receipt(&config, &state_path, key).expect("reads"),
+                    ReceiptLookup::CannotAnswer { .. }
+                ),
+                "{key} must refuse to guess on a mirror"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_lookup_refuses_to_guess_on_an_object_store_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = config_with_state(
+            dir.path(),
+            "[state]\nbackend = \"s3\"\ns3_bucket = \"rocky-state\"\n",
+        );
+        let state_path = dir.path().join("state.redb");
+        let lookup =
+            lookup_apply_receipt(&config, &state_path, "any-key").expect("answers honestly");
+        match lookup {
+            ReceiptLookup::CannotAnswer { backend, .. } => {
+                assert!(backend.contains("s3") || backend.contains("object"), "{backend}");
+            }
+            other => panic!("an object-store backend must refuse to guess, got {other:?}"),
+        }
+    }
+
+    // ----- the observation façade -----
+
+    #[test]
+    fn observe_max_time_column_reads_the_dialect_correct_max() {
+        // A real DuckDB warehouse: create the model's target with rows,
+        // then observe MAX(time_column) through the engine's adapter and
+        // dialect path — the same route the replication watermark uses.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let config = config_with_state(root, "");
+        write_file(
+            &root.join("models/orders.sql"),
+            b"SELECT 1 AS id, TIMESTAMP '2026-01-01 00:00:00' AS loaded_at\n",
+        );
+        write_file(
+            &root.join("models/orders.toml"),
+            b"name = \"orders\"\n\n[target]\ncatalog = \"wh\"\nschema = \"out\"\ntable = \"orders\"\n",
+        );
+
+        // Seed the physical target the observation reads.
+        let cfg = rocky_core::config::load_rocky_config(&config).expect("config");
+        let registry = crate::registry::AdapterRegistry::from_config(&cfg).expect("registry");
+        let warehouse = registry.warehouse_adapter("default").expect("adapter");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            for statement in [
+                "CREATE SCHEMA IF NOT EXISTS out",
+                "CREATE TABLE out.orders (id BIGINT, loaded_at TIMESTAMP)",
+                "INSERT INTO out.orders VALUES (1, TIMESTAMP '2026-08-01 10:00:00'), \
+                 (2, TIMESTAMP '2026-08-19 12:34:56')",
+            ] {
+                warehouse.execute_query(statement).await.expect(statement);
+            }
+            let observed = observe_max_time_column(&config, &root.join("models"), "orders", "loaded_at")
+                .await
+                .expect("observes");
+            assert_eq!(observed.model, "orders");
+            assert_eq!(observed.time_column, "loaded_at");
+            let max = observed.max_value.expect("rows exist");
+            assert_eq!(
+                max,
+                chrono::NaiveDateTime::parse_from_str("2026-08-19 12:34:56", "%Y-%m-%d %H:%M:%S")
+                    .expect("parses")
+                    .and_utc()
+            );
+
+            // An injection-shaped column name is refused before any SQL.
+            let err = observe_max_time_column(
+                &config,
+                &root.join("models"),
+                "orders",
+                "loaded_at; DROP TABLE out.orders",
+            )
+            .await
+            .expect_err("invalid identifier");
+            assert!(format!("{err:#}").contains("invalid time column"), "{err:#}");
+        });
+    }
+}
