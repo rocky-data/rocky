@@ -1001,7 +1001,7 @@ class PolicyCapability87(StrEnum):
     value_change = "value_change"
 
 
-class PolicyEffect21(StrEnum):
+class PolicyEffect24(StrEnum):
     """
     Permit the action outright.
     """
@@ -1009,7 +1009,7 @@ class PolicyEffect21(StrEnum):
     allow = "allow"
 
 
-class PolicyEffect22(StrEnum):
+class PolicyEffect25(StrEnum):
     """
     Permit only after human review. The safe default posture.
     """
@@ -1017,7 +1017,7 @@ class PolicyEffect22(StrEnum):
     require_review = "require_review"
 
 
-class PolicyEffect23(StrEnum):
+class PolicyEffect26(StrEnum):
     """
     Refuse the action. A hard override — no `allow` overturns it.
     """
@@ -1124,7 +1124,7 @@ class PolicyTest(BaseModel):
     """
     Synthetic direct downstream count. Informational — the `max_downstreams` ceiling reads `reachable_downstreams`.
     """
-    expect: PolicyEffect21 | PolicyEffect22 | PolicyEffect23
+    expect: PolicyEffect24 | PolicyEffect25 | PolicyEffect26
     """
     The effect the evaluator must resolve for this scenario. A mismatch fails the scenario (and the `rocky policy test` run).
     """
@@ -2257,7 +2257,7 @@ class PolicyRule(BaseModel):
     """
     Optional v1 conditional refinements not yet promoted to typed fields. **Parsed and ignored** — captured as opaque JSON so a config authored against a later version still loads.
     """
-    effect: PolicyEffect21 | PolicyEffect22 | PolicyEffect23
+    effect: PolicyEffect24 | PolicyEffect25 | PolicyEffect26
     """
     The verdict when this rule matches.
     """
@@ -3112,7 +3112,7 @@ class PolicyConfig(BaseModel):
     model_config = ConfigDict(
         extra="forbid",
     )
-    default_agent_effect: PolicyEffect21 | PolicyEffect22 | PolicyEffect23 | None = (
+    default_agent_effect: PolicyEffect24 | PolicyEffect25 | PolicyEffect26 | None = (
         "require_review"
     )
     """

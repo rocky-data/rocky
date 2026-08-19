@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "JSON output of `rocky product approve`.",
+  "properties": {
+    "already_approved": {
+      "description": "True when this exact digest was already approved and nothing was re-written.",
+      "type": "boolean"
+    },
+    "approved_at": {
+      "description": "RFC3339 approval instant.",
+      "type": "string"
+    },
+    "approver": {
+      "description": "Best-effort approver identity recorded on the approval.",
+      "type": "string"
+    },
+    "command": {
+      "type": "string"
+    },
+    "output_model": {
+      "description": "The resolved output model name.",
+      "type": "string"
+    },
+    "previous_state": {
+      "description": "The fulfillment state tag before this approval, if any.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "product_id": {
+      "description": "`product:<name>`.",
+      "type": "string"
+    },
+    "snapshot_path": {
+      "description": "Project-root-relative path of the immutable snapshot file.",
+      "type": "string"
+    },
+    "spec_digest": {
+      "description": "The approved `sha256:<hex>` spec digest.",
+      "type": "string"
+    },
+    "state": {
+      "description": "The fulfillment state after this approval (`spec_approved`).",
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "already_approved",
+    "approved_at",
+    "approver",
+    "command",
+    "output_model",
+    "product_id",
+    "snapshot_path",
+    "spec_digest",
+    "state",
+    "version"
+  ],
+  "title": "ProductApproveOutput",
+  "type": "object"
+}

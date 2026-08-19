@@ -1315,6 +1315,12 @@ from .types_generated import (  # noqa: E402, F401
     PreviewSampledRowDiff,
     PreviewSamplingWindow,
     PreviewStructuralDiff,
+    ProductApprovalOutput,
+    ProductApproveOutput,
+    ProductArtifactOutput,
+    ProductCompileOutput,
+    ProductStatusOutput,
+    ProductVerifyOutput,
     PromotePlan,
     PromoteTarget,
     PromoteTargetPlan,
@@ -1466,6 +1472,10 @@ RockyOutput = (
     | PromotePlan
     | CompactApplyOutput
     | ArchiveApplyOutput
+    | ProductApproveOutput
+    | ProductCompileOutput
+    | ProductStatusOutput
+    | ProductVerifyOutput
     | ReviewStatusOutput
 )
 
@@ -1506,6 +1516,10 @@ _SIMPLE_DISPATCH: dict[str, type[BaseModel]] = {
     "compact apply": CompactApplyOutput,
     "archive apply": ArchiveApplyOutput,
     "review_status": ReviewStatusOutput,
+    "product_verify": ProductVerifyOutput,
+    "product_compile": ProductCompileOutput,
+    "product_approve": ProductApproveOutput,
+    "product_status": ProductStatusOutput,
 }
 
 

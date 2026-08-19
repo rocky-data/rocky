@@ -110,6 +110,10 @@ _COMMAND_SCHEMA: dict[str, str] = {
     "compact apply": "compact_apply.schema.json",
     "archive apply": "archive_apply.schema.json",
     "review_status": "review_status.schema.json",
+    "product_verify": "product_verify.schema.json",
+    "product_compile": "product_compile.schema.json",
+    "product_approve": "product_approve.schema.json",
+    "product_status": "product_status.schema.json",
 }
 
 # Client-only parse targets not routed by ``parse_rocky_output`` (their payloads

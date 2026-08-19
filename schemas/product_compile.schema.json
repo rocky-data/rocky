@@ -1,0 +1,124 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "ProductApprovalOutput": {
+      "description": "The approval record, as echoed by compile/status output.",
+      "properties": {
+        "approved_at": {
+          "description": "RFC3339 approval instant.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "approver": {
+          "description": "Best-effort approver identity.",
+          "type": "string"
+        },
+        "snapshot_path": {
+          "description": "Project-root-relative path of the immutable snapshot file.",
+          "type": "string"
+        },
+        "spec_digest": {
+          "description": "The approved `sha256:<hex>` spec digest.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "approver",
+        "snapshot_path",
+        "spec_digest"
+      ],
+      "type": "object"
+    },
+    "ProductArtifactOutput": {
+      "description": "One emitted artifact, as reported by `rocky product compile`.",
+      "properties": {
+        "path": {
+          "description": "Project-root-relative POSIX path.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "`sha256:<hex>` over the committed bytes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "JSON output of `rocky product compile`.",
+  "properties": {
+    "approval": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/ProductApprovalOutput"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The current approval record, when one exists. Compile is a READER of the approval: when present, the snapshot bytes were re-verified against the record digest before this output was produced."
+    },
+    "artifacts": {
+      "description": "The artifacts this phase committed (manifest excluded).",
+      "items": {
+        "$ref": "#/definitions/ProductArtifactOutput"
+      },
+      "type": "array"
+    },
+    "command": {
+      "type": "string"
+    },
+    "manifest_path": {
+      "description": "Project-root-relative path of the committed lowering manifest.",
+      "type": "string"
+    },
+    "output_model": {
+      "description": "The resolved output model name.",
+      "type": "string"
+    },
+    "phase": {
+      "description": "Which lowering phase this run committed: `lowered_contract` (Phase A) or `merged` (Phase B).",
+      "type": "string"
+    },
+    "product_id": {
+      "description": "`product:<name>`.",
+      "type": "string"
+    },
+    "spec_digest": {
+      "description": "`sha256:<hex>` over the compiled spec's raw bytes.",
+      "type": "string"
+    },
+    "spec_matches_approval": {
+      "description": "Whether the compiled spec's digest equals the approved digest. `null` when no approval exists. `false` is not an error at compile time — it means the working spec has moved past the approval (the loop's supersession trigger).",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "spec_path": {
+      "description": "Project-root-relative spec path.",
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "artifacts",
+    "command",
+    "manifest_path",
+    "output_model",
+    "phase",
+    "product_id",
+    "spec_digest",
+    "spec_path",
+    "version"
+  ],
+  "title": "ProductCompileOutput",
+  "type": "object"
+}
