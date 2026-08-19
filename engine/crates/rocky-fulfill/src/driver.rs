@@ -15,8 +15,17 @@
 //!   `killpg(SIGKILL)`, and it runs after a NORMAL leader exit as well
 //!   as on timeout — a leader's exit says nothing about its
 //!   grandchildren.
-//! - After every window the driver asserts no survivors: the group must
-//!   not exist (`killpg(pgid, 0)` = ESRCH) before `run_task` returns.
+//! - After every window the driver asserts the GROUP is gone (`killpg
+//!   (pgid, 0)` = ESRCH) before `run_task` returns, and best-effort
+//!   sweeps the leader's direct children captured at kill time (covers
+//!   a `setpgid`-only straggler). SCOPE, stated honestly: this contains
+//!   COOPERATIVE and ACCIDENTAL descendants — helpers, the sibling MCP
+//!   server, backgrounded grandchildren. A descendant that DELIBERATELY
+//!   `setsid()`s into its own session escapes `killpg` by design of
+//!   Unix process groups; no portable userspace kill closes that. That
+//!   is the D7-conceded hostile-local-worker residual, pinned by an
+//!   exhibit test below and addressed only by the Phase-2 OS-sandbox /
+//!   PID-namespace containment.
 //! - The worker's environment is ONLY `env_allow`: everything else is
 //!   cleared before spawn.
 //! - Windows is not supervised in v0: the driver refuses with a typed
@@ -100,8 +109,8 @@ pub enum DriverOutcome {
         transcript_path: PathBuf,
     },
     /// A drafting / repair task ended with the worker's exit 0 and the
-    /// group killed with no survivors. The runner trusts NOTHING from
-    /// it — its own compile/test decide.
+    /// group killed (cooperative-descendant scope; see the module doc).
+    /// The runner trusts NOTHING from it — its own compile/test decide.
     Drafting {
         /// The captured transcript.
         transcript_path: PathBuf,
@@ -142,8 +151,10 @@ pub enum DriverError {
     /// The recorded session is unusable or its expectations failed.
     #[error("replay session error: {0}")]
     Session(String),
-    /// Survivors remained after the kill window — a supervision failure,
-    /// never ignored.
+    /// The process GROUP outlived the kill window — a supervision
+    /// failure, never ignored. (A `setsid` escapee is a different,
+    /// documented residual: it has LEFT the group and this error cannot
+    /// see it.)
     #[error("process group {pgid} still has survivors after SIGKILL: {detail}")]
     Survivors {
         /// The group that would not die.
@@ -461,6 +472,22 @@ pub async fn kill_group(
     grace: Duration,
     mut own: Vec<&mut tokio::process::Child>,
 ) -> Result<(), DriverError> {
+    // Best-effort straggler snapshot: the leader's LIVE direct children
+    // (pid + start time) captured before the first signal. A child that
+    // left the group (`setpgid`, or a direct `setsid`) escapes `killpg`
+    // but is still swept at the end, start-time-guarded so a recycled
+    // pid is never killed. A DOUBLE-FORKED escapee (daemonize: the
+    // middle process exits, the grandchild reparents to init) is not a
+    // direct child and stays out of reach — the documented residual.
+    let stragglers: Vec<(u32, u64)> = direct_children(pgid)
+        .into_iter()
+        .filter_map(|pid| {
+            crate::store::process_liveness(pid)
+                .ok()
+                .flatten()
+                .map(|start| (pid, start))
+        })
+        .collect();
     if group_exists(pgid) {
         signal_group(pgid, libc::SIGTERM)?;
     }
@@ -488,6 +515,7 @@ pub async fn kill_group(
             for child in own.iter_mut() {
                 let _ = child.wait().await;
             }
+            sweep_stragglers(&stragglers);
             return Ok(());
         }
         // SAFETY: `killpg` with a valid pgid and SIGKILL is a
@@ -517,6 +545,71 @@ pub async fn kill_group(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// Kill any snapshot straggler that is STILL the same process (start
+/// time matches) — it left the process group, so `killpg` missed it.
+/// Best-effort: every error is ignored (the straggler may have exited,
+/// or the pid may have been recycled — the start-time guard refuses
+/// those).
+#[cfg(unix)]
+fn sweep_stragglers(stragglers: &[(u32, u64)]) {
+    for (pid, start) in stragglers {
+        if crate::store::process_liveness(*pid) == Ok(Some(*start)) {
+            // SAFETY: `kill` with a verified-identity pid and SIGKILL is
+            // a well-defined libc call; ESRCH (already gone) is ignored.
+            unsafe {
+                libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Best-effort list of `pid`'s LIVE direct children. Empty on any
+/// failure — the sweep this feeds is an extra net, never a guarantee.
+#[cfg(target_os = "macos")]
+fn direct_children(pid: u32) -> Vec<u32> {
+    let mut buffer = vec![0i32; 512];
+    // SAFETY: `proc_listchildpids` writes at most `buffersize` bytes
+    // into `buffer`; the buffer is exactly the size passed and no
+    // pointer outlives the call.
+    let rc = unsafe {
+        libc::proc_listchildpids(
+            pid as libc::pid_t,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * std::mem::size_of::<i32>()) as libc::c_int,
+        )
+    };
+    if rc <= 0 {
+        return Vec::new();
+    }
+    // The return value is the number of entries filled (capped by the
+    // buffer); guard against byte-count semantics by clamping.
+    let count = (rc as usize).min(buffer.len());
+    buffer[..count]
+        .iter()
+        .filter(|child| **child > 0)
+        .map(|child| *child as u32)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn direct_children(pid: u32) -> Vec<u32> {
+    // /proc/<pid>/task/<tid>/children lists direct children on modern
+    // kernels; fall back to empty on any read failure.
+    let path = format!("/proc/{pid}/task/{pid}/children");
+    std::fs::read_to_string(path)
+        .map(|list| {
+            list.split_ascii_whitespace()
+                .filter_map(|token| token.parse::<u32>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn direct_children(_pid: u32) -> Vec<u32> {
+    Vec::new()
 }
 
 /// Spawn an additional child INTO an existing group (the sibling-MCP
@@ -1259,5 +1352,151 @@ mod windows_tests {
         let mut on_group = |_group: GroupStamp| Ok(());
         let outcome = driver.run_task(&brief, &mut on_group).await;
         assert!(matches!(outcome, Err(DriverError::UnsupportedPlatform)));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod escape_scope_tests {
+    use super::*;
+
+    fn brief(dir: &Path) -> TaskBrief {
+        TaskBrief {
+            kind: TaskBriefKind::Drafting,
+            text: "battery".to_string(),
+            product: "battery".to_string(),
+            project_root: dir.to_path_buf(),
+            transcript_dir: dir.join("transcripts"),
+            outbox_dir: dir.join("outbox"),
+        }
+    }
+
+    async fn wait_for_pid_file(path: &Path) -> u32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Ok(pid) = raw.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "escapee pid file never appeared at {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A DIRECT child that `setsid()`s out of the group escapes
+    /// `killpg` — but it was snapshotted as a direct child at kill
+    /// time, so the start-time-guarded straggler sweep still gets it.
+    #[tokio::test]
+    async fn a_direct_setsid_straggler_is_swept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let escapee_file = dir.path().join("escapee.pid");
+        let script = format!(
+            "import os, time\n\
+             note = \"{{brief}}\"\n\
+             pid = os.fork()\n\
+             if pid == 0:\n\
+             \x20   os.setsid()\n\
+             \x20   open(\"{}\", \"w\").write(str(os.getpid()))\n\
+             \x20   time.sleep(300)\n\
+             else:\n\
+             \x20   time.sleep(300)\n",
+            escapee_file.display()
+        );
+        let driver = SubprocessDriver::new(
+            vec!["python3".into(), "-c".into(), script],
+            vec!["PATH".into()],
+            Duration::from_millis(1500),
+            Duration::from_millis(300),
+        )
+        .expect("valid");
+        let brief = brief(dir.path());
+        let mut on_group = |_group: GroupStamp| Ok(());
+        let outcome = driver.run_task(&brief, &mut on_group).await;
+        assert!(
+            matches!(outcome, Err(DriverError::Timeout { .. })),
+            "{outcome:?}"
+        );
+        let escapee = wait_for_pid_file(&escapee_file).await;
+        // The sweep ran inside run_task; the escapee must be gone (allow
+        // a short reap window).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match crate::store::process_liveness(escapee) {
+                Ok(None) => break,
+                Ok(Some(_)) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(Some(_)) => {
+                    // Cleanup before failing so the box is not littered.
+                    // SAFETY: best-effort SIGKILL on the test's own child.
+                    unsafe {
+                        libc::kill(escapee as libc::pid_t, libc::SIGKILL);
+                    }
+                    panic!("a direct setsid straggler survived the sweep");
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// The PINNED RESIDUAL: a double-forked escapee (daemonize — the
+    /// middle process `setsid()`s, forks, and exits; the grandchild
+    /// reparents to init) SURVIVES the group kill AND the direct-child
+    /// sweep. This is inherent to Unix process groups: no portable
+    /// userspace kill reaches it. It is the D7-conceded hostile-worker
+    /// boundary; the Phase-2 OS-sandbox / PID-namespace containment is
+    /// the real fix. This test EXHIBITS the escape so the limitation
+    /// can never silently regress into a false "nothing survives"
+    /// guarantee.
+    #[tokio::test]
+    async fn a_double_forked_setsid_escapee_survives_the_group_kill() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let escapee_file = dir.path().join("escapee.pid");
+        let script = format!(
+            "import os, time\n\
+             note = \"{{brief}}\"\n\
+             if os.fork() == 0:\n\
+             \x20   os.setsid()\n\
+             \x20   if os.fork() == 0:\n\
+             \x20       open(\"{}\", \"w\").write(str(os.getpid()))\n\
+             \x20       time.sleep(300)\n\
+             \x20   os._exit(0)\n\
+             time.sleep(0.5)\n",
+            escapee_file.display()
+        );
+        let driver = SubprocessDriver::new(
+            vec!["python3".into(), "-c".into(), script],
+            vec!["PATH".into()],
+            Duration::from_secs(30),
+            Duration::from_millis(300),
+        )
+        .expect("valid");
+        let brief = brief(dir.path());
+        let mut on_group = |_group: GroupStamp| Ok(());
+        let outcome = driver.run_task(&brief, &mut on_group).await;
+        assert!(
+            matches!(outcome, Ok(DriverOutcome::Drafting { .. })),
+            "{outcome:?}"
+        );
+        let escapee = wait_for_pid_file(&escapee_file).await;
+        let alive = crate::store::process_liveness(escapee)
+            .expect("probe")
+            .is_some();
+        // Clean the escapee up regardless — the assertion is about what
+        // the DRIVER could reach, not about littering the machine.
+        // SAFETY: best-effort SIGKILL on the test's own grandchild.
+        unsafe {
+            libc::kill(escapee as libc::pid_t, libc::SIGKILL);
+        }
+        assert!(
+            alive,
+            "the double-forked escapee was expected to SURVIVE (the documented \
+             residual); if the driver can now reach it, the containment story \
+             improved — update the docs and this pin deliberately"
+        );
     }
 }

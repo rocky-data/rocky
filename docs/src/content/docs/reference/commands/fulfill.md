@@ -31,7 +31,7 @@ rocky fulfill revenue_daily
 
 The loop trusts nothing it did not verify itself:
 
-- The drafting agent runs in its own process group on a worker-profile MCP server. It can read, compile, test, and draft models. It cannot touch contracts, metadata, proposals, reviews, or schedules. The whole group is killed when the task ends — nothing the agent started survives into the review window.
+- The drafting agent runs in its own process group on a worker-profile MCP server. It can read, compile, test, and draft models. It cannot touch contracts, metadata, proposals, reviews, or schedules. The whole group is killed when the task ends, so helpers and accidental stragglers do not outlive the task. A process that deliberately breaks out of its session (`setsid`) is beyond any process-group kill — that is part of the hostile-local-agent residual below, not a covered case.
 - After drafting, every spec-owned artifact is byte-verified against the committed lowering manifest. Drift means `blocked` — the loop names the tampered file.
 - The plan reaches the review queue only through the engine's one governed propose path, as the `agent` principal, under your `[policy]`.
 - The apply recomputes the spec digest from the approved snapshot and passes `--expect-spec-digest`. The engine refuses a mismatch even if the loop did not.
