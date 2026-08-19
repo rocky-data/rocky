@@ -226,7 +226,9 @@ fn type_name_matches(rocky_type: &RockyType, type_name: &str) -> bool {
         RockyType::Int64 => type_name == "Int64",
         RockyType::Float32 => type_name == "Float32",
         RockyType::Float64 => type_name == "Float64",
-        RockyType::Decimal { .. } => type_name == "Decimal" || type_name.starts_with("Decimal("),
+        RockyType::Decimal { precision, scale } => {
+            decimal_type_matches(*precision, *scale, type_name)
+        }
         RockyType::String => type_name == "String",
         RockyType::Binary => type_name == "Binary",
         RockyType::Date => type_name == "Date",
@@ -238,6 +240,53 @@ fn type_name_matches(rocky_type: &RockyType, type_name: &str) -> bool {
         RockyType::Variant => type_name == "Variant",
         RockyType::Unknown => true, // Unknown matches anything
     }
+}
+
+/// Check if a contract's `Decimal` spelling matches an inferred decimal type.
+///
+/// A bare `Decimal` matches any precision and scale, so contracts written
+/// before the digits were checked keep passing. `Decimal(p,s)` must match the
+/// inferred precision and scale exactly. `Decimal(p)` means scale 0 — the same
+/// reading the type checker gives SQL's `DECIMAL(p)`. A parameter block that
+/// does not parse as digits never matches, so an unreadable contract does not
+/// pass on the prefix alone.
+///
+/// The match is exact, not "the inferred type fits inside the declared one".
+/// A contract states the model's declared output type, and this matcher
+/// already rejects an inferred `Int32` against a contract saying `Int64` even
+/// though that widening is safe. `drift.rs::is_safe_type_widening` answers a
+/// different question — whether a live warehouse column can be altered in
+/// place. It is a `SqlDialect` method, and each dialect scopes its own
+/// allowlist (the default, Databricks and Trino all differ), so a compile-time
+/// diagnostic cannot inherit it without becoming dialect-dependent. Every one
+/// of those decimal rules requires the scale to be equal, so the case this
+/// function was written for — a `Decimal(18,2)` contract over an inferred
+/// `Decimal(10,0)` — is a mismatch under them too.
+fn decimal_type_matches(precision: u8, scale: u8, type_name: &str) -> bool {
+    if type_name == "Decimal" {
+        return true;
+    }
+
+    let Some(args) = type_name
+        .strip_prefix("Decimal(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+
+    let (declared_precision, declared_scale) = match args.split_once(',') {
+        Some((declared_precision, declared_scale)) => {
+            (declared_precision.trim(), declared_scale.trim())
+        }
+        None => (args.trim(), "0"),
+    };
+
+    declared_precision
+        .parse::<u8>()
+        .is_ok_and(|declared| declared == precision)
+        && declared_scale
+            .parse::<u8>()
+            .is_ok_and(|declared| declared == scale)
 }
 
 #[cfg(test)]
@@ -389,6 +438,80 @@ mod tests {
         let diags = validate_contract("test_model", &schema, &contract);
         // Unknown type should not produce an error (we can't check)
         assert!(diags.iter().all(|d| &*d.code != "E011"));
+    }
+
+    /// Validate one decimal column against one contract type string.
+    fn decimal_diagnostics(precision: u8, scale: u8, contract_type: &str) -> Vec<Diagnostic> {
+        let schema = vec![typed_col(
+            "amount",
+            RockyType::Decimal { precision, scale },
+            false,
+        )];
+
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "amount".to_string(),
+                type_name: Some(contract_type.to_string()),
+                nullable: None,
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+
+        validate_contract("test_model", &schema, &contract)
+    }
+
+    #[test]
+    fn test_decimal_scale_mismatch_is_e011() {
+        // The reported case: the contract pins Decimal(18,2), the model
+        // produces Decimal(10,0). Neither digit matches.
+        let diags = decimal_diagnostics(10, 0, "Decimal(18,2)");
+        assert!(
+            diags.iter().any(|d| &*d.code == "E011"),
+            "Decimal(10,0) must not satisfy a Decimal(18,2) contract: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_decimal_precision_widening_is_e011() {
+        // Same scale, narrower precision. A "fits inside" rule would pass this;
+        // a contract states the declared type, so it is a mismatch.
+        let diags = decimal_diagnostics(10, 2, "Decimal(18,2)");
+        assert!(
+            diags.iter().any(|d| &*d.code == "E011"),
+            "Decimal(10,2) must not satisfy a Decimal(18,2) contract: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_decimal_exact_match_passes() {
+        let diags = decimal_diagnostics(18, 2, "Decimal(18,2)");
+        assert!(
+            diags.iter().all(|d| &*d.code != "E011"),
+            "Decimal(18,2) must satisfy a Decimal(18,2) contract: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_bare_decimal_contract_matches_any_precision() {
+        let diags = decimal_diagnostics(10, 0, "Decimal");
+        assert!(
+            diags.iter().all(|d| &*d.code != "E011"),
+            "a bare `Decimal` contract must keep matching any precision: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_decimal_type_spellings() {
+        // `Decimal(p)` means scale 0, as the type checker reads `DECIMAL(p)`.
+        assert!(decimal_type_matches(18, 0, "Decimal(18)"));
+        assert!(!decimal_type_matches(18, 2, "Decimal(18)"));
+        // Whitespace around the digits is accepted.
+        assert!(decimal_type_matches(18, 2, "Decimal( 18 , 2 )"));
+        // A parameter block that is not digits never matches.
+        assert!(!decimal_type_matches(18, 2, "Decimal(18,2"));
+        assert!(!decimal_type_matches(18, 2, "Decimal()"));
+        assert!(!decimal_type_matches(18, 2, "Decimal(p,s)"));
     }
 
     #[test]
