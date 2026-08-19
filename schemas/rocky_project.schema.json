@@ -1299,7 +1299,7 @@
       "description": "The `[fulfill]` block: the fulfillment loop's driver and briefs.\n\nConsumed by `rocky fulfill` (the `rocky-fulfill` crate). The engine's deterministic verbs never read it.",
       "properties": {
         "briefs_dir": {
-          "description": "Directory of brief overrides (`elicitation.md`, `drafting.md`, `repair.md`). A file present there replaces the compiled default of the same name; absent files fall back. Relative paths resolve against the project root.",
+          "description": "Directory of brief overrides (`elicitation.md`, `drafting.md`, `repair.md`). A file present there replaces the compiled default of the same name; absent files fall back. Must be a plain RELATIVE path inside the project — the loop resolves it through the staged commit's containment primitive, so an absolute path, a `..` traversal, or a symlinked-ancestor escape is refused, and every loaded brief is validated before any dispatch: an override may not name ANY tool outside the worker profile (nor the word `apply`), with no quoting exception — the compiled defaults carry the sanctioned prohibition wording.",
           "type": [
             "string",
             "null"
