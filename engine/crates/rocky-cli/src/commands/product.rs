@@ -2267,8 +2267,11 @@ effect = "require_review"
             .strip_prefix("sha256:")
             .unwrap_or(&parsed.digest);
         let victim = outside.join(format!("approved-{hex}.toml.tmp"));
-        std::fs::write(&victim, b"an out-of-tree file the symlinked state dir points into")
-            .expect("write");
+        std::fs::write(
+            &victim,
+            b"an out-of-tree file the symlinked state dir points into",
+        )
+        .expect("write");
         // Plant the symlinked state dir (its parent `.rocky/fulfillment` is a
         // real dir; only the product's state dir is the link).
         let state_parent = root.join(".rocky").join("fulfillment");
