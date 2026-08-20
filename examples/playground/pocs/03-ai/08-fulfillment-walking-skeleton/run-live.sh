@@ -201,9 +201,14 @@ empty directory. No recorded SQL. This is the capability proof.
 - \`materialized_snapshot.csv\` — the warehouse table the worker's model produced.
 
 ## Ledger
-PASS — one bounded live run reached \`observing\`; the worker's own spec + SQL
-cleared the product-bound plan, human review, digest-gated apply, and the
-generated tests. Freshness was observed (lag ${LAG}s vs ${BUD}s), not enforced.
+PASS — one bounded run reached \`observing\`. The worker AUTHORED the SQL itself
+(\`worker_authored.sql\`, sha256 ${SQL_HASH}); its candidate spec is the
+\`briefs/elicitation.md\` schema template with an \`intent\` filled in — grounding,
+NOT a from-scratch design. The worker's SQL cleared compile, test, the
+product-bound plan, human review, and the digest-gated apply. Freshness was
+observed (lag ${LAG}s vs ${BUD}s), not enforced. SQL authorship is genuine;
+from-scratch spec design against the closed schema is the open capability — on the
+*compiled* brief a cold worker designs a plausible but off-schema spec.
 EOF
 
 echo

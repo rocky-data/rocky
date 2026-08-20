@@ -41,9 +41,11 @@ itself.
   the custody chain, the state machine, the privilege boundary. It does **not**
   prove that an AI agent can author a correct model — the worker's output is
   recorded, not generated.
-- `./run-live.sh` is the **capability** proof: a real `claude -p` worker drafts
-  the model end to end. That is the gate that answers "can an agent actually do
-  this", and it is the required Phase-1 completion gate.
+- `./run-live.sh` is the **capability** proof: a real `claude -p` worker authors
+  the model SQL end to end and the loop applies it. It is the required Phase-1
+  completion gate. Its precise scope — what is genuine authorship and what is
+  brief-provided grounding — is in "What the live lane proves" below; do not read
+  it as an agent designing the whole product spec unaided.
 - **Freshness is observed, not enforced.** Assert 10 shows the loop *reporting*
   staleness (lag vs budget) after the data is aged. Staleness is a finding in the
   loop's journal; it never blocks an apply. This POC makes no claim that Rocky
@@ -85,17 +87,35 @@ mutation-pass.sh           # disables one gate per assert and shows each assert 
 expected/live/             # the banked live-run evidence bundle (committed)
 ```
 
-### A finding from the live lane
+### What the live lane proves — and what it does not
 
-A cold worker gets no intent and no source list, and the *compiled* elicitation
-brief says "Rocky types" without enumerating them — so a live worker first
-emitted warehouse type names (`DATE`, `BIGINT`) and extra keys, which the closed
-spec schema rejects at Phase A. `briefs/elicitation.md` is a project-level
-`[fulfill] briefs_dir` override that states the exact schema (Rocky type
-vocabulary, three-part source triple, the freshness rule). With it, a real
-`claude -p` worker produces a schema-valid spec and the loop converges. The
-override is legitimate grounding, not a pre-arranged answer — the worker still
-samples the data and designs the columns, grain, checks, and SQL itself.
+Be precise about this. The live run proves:
+
+- **The whole driver stack works with a real agent.** Subprocess supervision
+  (one process group, killed at task end), `env_clear` + `env_allow`, the
+  worker-profile MCP over stdio, the outbox hand-off, the digest verification of
+  that hand-off, and every downstream gate — all of it runs against a live
+  `claude -p` worker, not a recording.
+- **The worker authors the SQL itself.** The banked `worker_authored.sql` is the
+  worker's own design (`current_timestamp AS loaded_at`, `coalesce(is_refund,
+  false) = false`, explicit NULL guards) — it differs from the recorded
+  `draft_model` SQL, so it is genuine authorship, and it cleared compile, test,
+  the product-bound plan, human review, and the digest-gated apply.
+
+It does **not** prove that an agent can design a product spec from data alone.
+`briefs/elicitation.md` hands the worker an *example spec* — the exact columns,
+grain, checks and freshness for this data — so the banked candidate spec is that
+template with an `intent` sentence filled in, not a design. That grounding is
+why the loop converges, and it is honest only if labelled as grounding.
+
+The genuinely interesting spec-design evidence is the FIRST live attempt, with
+the *compiled* brief (no schema enumeration): the worker designed a real spec of
+its own (`revenue_date`, `net_revenue_eur`, per-column classifications, ten
+grounded questions) — which Phase A then **rejected** on warehouse type names
+(`DATE`, `BIGINT`) and extra keys. So: a cold worker will design a plausible
+spec, but not yet a schema-valid one; a project-level `briefs_dir` with the exact
+closed schema is the bridge. SQL authorship is solved; from-scratch spec design
+against the closed schema is not.
 
 ## Run
 

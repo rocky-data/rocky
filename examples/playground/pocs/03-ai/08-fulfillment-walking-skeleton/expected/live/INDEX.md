@@ -23,6 +23,18 @@ empty directory. No recorded SQL. This is the capability proof.
 - `materialized_snapshot.csv` — the warehouse table the worker's model produced.
 
 ## Ledger
-PASS — one bounded live run reached `observing`; the worker's own spec + SQL
-cleared the product-bound plan, human review, digest-gated apply, and the
-generated tests. Freshness was observed (lag 1s vs 86400s), not enforced.
+PASS (one-shot `run-live.sh`). The worker AUTHORED the SQL itself
+(`worker_authored.sql`: `current_timestamp AS loaded_at`, `coalesce(is_refund,
+false) = false`, NULL guards — different from the recorded `draft_model` SQL, so
+genuine authorship). Its candidate spec is the `briefs/elicitation.md` schema
+template with an `intent` sentence filled in, NOT a from-scratch design. That
+output cleared compile, test, the product-bound plan, human review, and the
+digest-gated apply to `observing`. Freshness was observed (lag 1s vs 86400s),
+not enforced.
+
+Attempt history (honest): (1) with the *compiled* brief a cold worker designed a
+genuine but off-schema spec (`revenue_date`, `net_revenue_eur`, per-column
+classifications) that Phase A rejected on warehouse type names; (2) a phased run
+with the `briefs_dir` override converged; (3) this one-shot `run-live.sh`
+converged and is the banked bundle. SQL authorship is solved; from-scratch spec
+design against the closed schema is the open capability.

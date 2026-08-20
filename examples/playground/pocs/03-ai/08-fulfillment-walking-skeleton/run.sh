@@ -294,7 +294,7 @@ echo "    OK  loop applied -> observing; out.${PRODUCT} has $ROWS row(s)"
 echo; echo "[9] output validation: composite-unique grain test generated + runs green"
 # MUTATION 9: delete the composite-unique test from the merged sidecar -> the
 # grain-uniqueness assertion must catch that it is gone.
-mut 9 && sed -i '' '/type = "composite"/d' "models/${PRODUCT}.toml"
+mut 9 && perl -i -ne 'print unless /type = "composite"/' "models/${PRODUCT}.toml"
 grep -q 'type = "composite"' "models/${PRODUCT}.toml" && grep -q 'kind = "unique"' "models/${PRODUCT}.toml" \
   || fail "9 (no composite-unique grain test in the merged sidecar)"
 code=$(rj expected/09_test.json test --models models/)
