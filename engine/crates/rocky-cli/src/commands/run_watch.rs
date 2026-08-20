@@ -169,6 +169,47 @@ pub async fn run_watch(
         .collect();
     eprintln!("[watch] watching {} (Ctrl-C to stop)", watched.join(", "));
 
+    // ONE long-lived registration per signal, built BEFORE the first run and
+    // never dropped.
+    //
+    // Two windows exist where a signal has zero listeners, and tokio
+    // DISCARDS a signal that arrives while zero listeners are registered
+    // (the process-level disposition stays tokio's once any listener ever
+    // existed, so the default terminate behavior does not come back):
+    //
+    //   1. Inside the loop, when the file-change arm wins and a per-
+    //      iteration future would be dropped — closed by #1490 (hoist the
+    //      futures out of the loop).
+    //   2. Between the inner run's own listener dropping (when the first
+    //      run ends) and the loop's registrations being created. A SIGTERM
+    //      landing there was swallowed forever: the watcher then ignored
+    //      every later SIGTERM because the discarded one never latched.
+    //      This is not theoretical — `run_watch_exits_on_sigterm` signals
+    //      the instant the first run completes, and lost exactly this race
+    //      on CI once the schedule shifted (#1405's residual).
+    //
+    // Window 2 is why the registrations sit ABOVE the first `iter_once`:
+    // `tokio::signal::unix::signal()` registers eagerly at creation and a
+    // `Signal` stream LATCHES a pending signal even while nothing polls it,
+    // so a signal arriving during (or right after) the first run fires the
+    // select arm at loop entry. `ctrl_c()` registers only on first poll
+    // (`pin!` alone registers nothing), which is why the unix SIGINT arm
+    // uses an eager `SignalKind::interrupt()` stream too; the `ctrl_c()`
+    // future stays as the portable arm for non-unix.
+    //
+    // SIGTERM previously had no arm at all, so after the first run the
+    // watcher could not be killed by `timeout`, CI cancellation or a
+    // container eviction. Same shape as the run loop's own handling
+    // (`run.rs`).
+    let ctrl_c_signal = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c_signal);
+    #[cfg(unix)]
+    let mut sigint_stream =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+    #[cfg(unix)]
+    let mut sigterm_stream =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+
     // First run is immediate so the user gets feedback without having to
     // touch a file. A Ctrl-C during it stops the watcher: the signal was the
     // user's, and the inner run consumed it (#1405).
@@ -194,31 +235,26 @@ pub async fn run_watch(
         return Ok(());
     }
 
-    // ONE long-lived signal registration, built before the first iteration
-    // and never dropped.
-    //
-    // Building `ctrl_c()` inside the loop meant the future was dropped every
-    // time the file-change arm won, and tokio discards a signal that arrives
-    // while zero listeners are registered. That left a window — the debounce
-    // sleep, then the config load, until the inner run registers its own
-    // handler — in which a SIGINT was both swallowed AND non-fatal, because
-    // tokio had already replaced the default disposition (#1405). Hoisting
-    // the future keeps the registration alive across that window; `pin!`
-    // alone would not, since nothing registers until the first poll.
-    //
-    // SIGTERM had no arm at all, so after the first run the watcher could not
-    // be killed by `timeout`, CI cancellation or a container eviction. Same
-    // shape as the run loop's own handling (`run.rs`).
-    let ctrl_c_signal = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c_signal);
-    #[cfg(unix)]
-    let mut sigterm_stream =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
-
     // Steady-state loop: wait for an event, debounce, drain, re-run.
     loop {
         tokio::select! {
             _ = &mut ctrl_c_signal => {
+                eprintln!("\n[watch] stopped");
+                return Ok(());
+            }
+            Some(()) = async {
+                #[cfg(unix)]
+                {
+                    match sigint_stream.as_mut() {
+                        Some(stream) => stream.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending().await
+                }
+            } => {
                 eprintln!("\n[watch] stopped");
                 return Ok(());
             }
