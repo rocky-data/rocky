@@ -157,18 +157,21 @@ ROWS="$(duckdb -csv -noheader wh.duckdb "SELECT COUNT(*) FROM out.${PRODUCT}" 2>
 [ "${ROWS:-0}" -ge 1 ] || die "no rows materialised from the worker's model"
 # 9: the generated composite-unique grain test RUNS green (declarative, against
 # the warehouse). Plain `rocky test` runs only the model; --declarative runs the
-# sidecar [[tests]]. A CLEAN run needs ALL of: 0 errored (no malformed
-# declaration), 0 failed (no data violation), the composite grain test PASSING,
-# and a zero exit code. This is the banked runner_reverify_test.json.
+# sidecar [[tests]]. A CLEAN run needs ALL of: 0 errored, 0 failed, 0 WARNED
+# (Rocky counts warning-severity failures under `warned` and STILL exits 0), the
+# composite grain test PASSING, passed==total, and a zero exit code. This is the
+# banked runner_reverify_test.json.
 code=$(rj live_test.json test --models models/ --declarative)
-LERR="$(jq -r '.declarative.errored // 1' live_test.json)"; LFAIL="$(jq -r '.declarative.failed // 1' live_test.json)"
+LTOTAL="$(jq -r '.declarative.total // "err"' live_test.json)"; LPASS="$(jq -r '.declarative.passed // "err"' live_test.json)"
+LERR="$(jq -r '.declarative.errored // 1' live_test.json)"; LFAIL="$(jq -r '.declarative.failed // 1' live_test.json)"; LWARN="$(jq -r '.declarative.warned // 1' live_test.json)"
 [ "$LERR" = "0" ] || die "the worker's declarative tests ERRORED=$LERR (malformed declarations): $(jq -c '.declarative.results[]?|select(.status=="error")|{test_type,detail}' live_test.json)"
-[ "$LFAIL" = "0" ] || die "the worker's model failed a declarative test: $(jq -c '.declarative.results[]?|select(.status=="fail")' live_test.json)"
+[ "$LFAIL" = "0" ] || die "the worker's model failed a declarative test: $(jq -c '.declarative.results[]?|select(.status=="fail" and .severity!="warning")' live_test.json)"
+[ "$LWARN" = "0" ] || die "the worker's declarative tests WARNED=$LWARN (a warning-severity failure exits 0 but is NOT clean): $(jq -c '.declarative.results[]?|select(.severity=="warning" and .status!="pass")|{test_type,detail}' live_test.json)"
+[ "$LPASS" = "$LTOTAL" ] || die "the worker's declarative run is not all-pass: passed=$LPASS != total=$LTOTAL"
 jq -e '.declarative.results[] | select(.test_type == "composite" and .status == "pass")' live_test.json >/dev/null \
   || die "the composite-unique grain test did not run and pass under --declarative"
-[ "$code" = "0" ] || die "rocky test --declarative exit $code despite errored=0 failed=0"
-LTOTAL="$(jq -r '.declarative.total' live_test.json)"
-echo "    OK  plan product-bound; out.${PRODUCT} has $ROWS row(s); $LTOTAL declarative tests all pass (0 failed, 0 errored)"
+[ "$code" = "0" ] || die "rocky test --declarative exit $code despite errored=0 failed=0 warned=0"
+echo "    OK  plan product-bound; out.${PRODUCT} has $ROWS row(s); $LTOTAL declarative tests all pass ($LPASS/$LTOTAL; 0 failed, 0 errored, 0 warned)"
 
 # --- Bank the evidence bundle (committed under expected/live/). ---
 echo; echo "Banking the evidence bundle -> $BUNDLE"

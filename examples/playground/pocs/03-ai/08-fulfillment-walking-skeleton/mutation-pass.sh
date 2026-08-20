@@ -33,6 +33,7 @@ declare -a WHAT=(
   "8:pass the CORRECT digest where a wrong one is expected"
   "9:inject a duplicate (client_id, day) row so the declarative composite test FAILS (failed!=0)"
   "9e:append a malformed declaration (unique, no column) so the declarative run ERRORS (errored!=0)"
+  "9w:append a failing warning-severity test -> WARNED!=0 while exit stays 0 (the silent-pass hole)"
   "10:skip backdating so the data never goes stale"
 )
 
@@ -71,6 +72,6 @@ echo
 echo "Ledger (assert | broken gate | observed | verdict):"
 printf '%s' "$LEDGER"
 echo
-echo "Mutation pass: $pass / $total gate mutations caught (10 asserts; assert 9 has two — errored + failed)."
+echo "Mutation pass: $pass / $total gate mutations caught (10 asserts; assert 9 has three — failed + errored + warned)."
 [ "$pass" = "$total" ] || { echo "MUTATION PASS INCOMPLETE — $((total - pass)) mutation(s) not caught."; exit 1; }
 echo "Every broken gate is caught. The replay lane is a real gate exerciser."
