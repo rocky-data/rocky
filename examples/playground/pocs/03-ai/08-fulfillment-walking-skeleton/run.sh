@@ -20,6 +20,12 @@ MANIFEST=".rocky/fulfillment/${PRODUCT}/lowering-manifest.json"
 
 fail() { echo "FAIL: $1"; exit 1; }
 
+# Mutation-pass hook. `MUTATE=<n>` breaks assert <n>'s gate so mutation-pass.sh
+# can prove the assert is non-vacuous (it must then print FAIL: <n>). Unset in
+# normal runs. Mutations run in a throwaway copy of the POC, never the tree.
+MUT="${MUTATE:-0}"
+mut() { [ "$MUT" = "$1" ]; }
+
 # --- Fail-fast: the binary must carry the fulfillment verbs (E1/E2). ---
 command -v rocky >/dev/null 2>&1 || fail "0 (rocky not on PATH — see README: build the engine and add engine/target/release to PATH)"
 rocky product --help >/dev/null 2>&1 || fail "0 (this rocky has no 'product' command — build from a worktree that carries FF-WP-E1/E2; see README)"
@@ -50,6 +56,9 @@ echo "=================================================================="
 # writes them. Engine gate: Init --Elicit--> confined candidate write -->
 # needs_input(spec_approval), with the hand-off digest re-verified.
 echo; echo "[1] cold start: elicitation writes the candidate, loop stops for approval"
+# MUTATION 1: lie about the candidate digest -> the runner refuses the hand-off,
+# the candidate is never written, the loop blocks instead of stopping for approval.
+mut 1 && { jq '.tasks.elicitation.outcome.expected_digest="sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"' replay/session.json > .mut && mv .mut replay/session.json; }
 [ -e "products/${PRODUCT}.toml" ] && fail "1 (products/${PRODUCT}.toml existed before the first fulfill — not a cold start)"
 code=$(rj expected/01_cold.json fulfill "$PRODUCT")
 [ "$code" = "0" ] || fail "1 (cold fulfill exit $code, want 0; $(cat expected/01_cold.err))"
@@ -64,6 +73,9 @@ echo "    OK  state=needs_input, products/${PRODUCT}.toml written by the runner"
 # engine's spec-schema gates (parse-time in rocky-core; classification is
 # verify-time in rocky-cli), not shell theater.
 echo; echo "[3] negative lowering: each broken spec is refused with its stable code"
+# MUTATION 3: replace the auto_apply variant with the VALID spec -> it lowers
+# cleanly, no reject code, so the last check_reject must fail.
+mut 3 && cp replay/candidate_spec.toml broken-specs/auto-apply.toml
 S3="$(mktemp -d)"
 mkdir -p "$S3/models" "$S3/products"
 cp rocky.toml "$S3/rocky.toml"; cp models/_defaults.toml "$S3/models/_defaults.toml"
@@ -104,6 +116,9 @@ type = "replay"
 session = "replay/session.json"
 EOF
 grep -c '^\[fulfill\]' "$S4/rocky.toml" | grep -qx 1 || fail "4 (scratch config has a duplicate [fulfill] block)"
+# MUTATION 4: DON'T strip [policy] -> posture verify passes, no paste_block,
+# so the needs_input assertion must fail.
+mut 4 && cp rocky.toml "$S4/rocky.toml"
 cp models/_defaults.toml "$S4/models/_defaults.toml"
 cp replay/session.json "$S4/replay/session.json"
 cp data/seed.sql "$S4/data/seed.sql"
@@ -138,6 +153,9 @@ rm -rf "$S4"
 # verify -> propose, stopping for plan review. The committed lowering manifest
 # must be TOTAL: phase "merged", every spec field mapped, zero rejects.
 echo; echo "[2] approve spec + drive the loop; manifest is total (merged, 0 rejects)"
+# MUTATION 2: the drafted SQL omits the revenue_eur contract column -> the loop's
+# own verify goes red and it blocks; it never reaches the merged manifest.
+mut 2 && { jq '(.tasks.drafting.calls[] | select(.tool=="draft_model") | .arguments.sql) = "SELECT client_id, CAST(charged_at AS DATE) AS day, MAX(charged_at) AS loaded_at FROM wh.raw.stripe_charges GROUP BY client_id, CAST(charged_at AS DATE)"' replay/session.json > .mut && mv .mut replay/session.json; }
 code=$(rj expected/02_approve.json fulfill approve-spec "$PRODUCT")
 [ "$code" = "0" ] || fail "2 (approve-spec exit $code; $(cat expected/02_approve.err))"
 [ "$(jq -r .state expected/02_approve.json)" = "spec_approved" ] || fail "2 (state after approve $(jq -r .state expected/02_approve.json), want spec_approved)"
@@ -163,6 +181,9 @@ PLAN1="$(jq -r .plan_id expected/02_drive.json)"
 [ -n "$PLAN1" ] && [ "$PLAN1" != "null" ] || fail "5 (no plan_id pinned after propose)"
 PLAN_JSON=".rocky/plans/${PLAN1}.json"
 [ -f "$PLAN_JSON" ] || fail "5 (plan JSON $PLAN_JSON missing)"
+# MUTATION 5: strip the product binding from the persisted plan -> assert 5's
+# product_id check must catch it (it reads the real plan payload, not memory).
+mut 5 && { jq '.payload.product_id="product:not_revenue_daily"' "$PLAN_JSON" > .mut && mv .mut "$PLAN_JSON"; }
 [ "$(jq -r '.payload.product_id' "$PLAN_JSON")" = "product:${PRODUCT}" ] || fail "5 (plan payload.product_id wrong)"
 [ "$(jq -r '.payload.spec_digest' "$PLAN_JSON")" = "$APPROVED_DIGEST" ] || fail "5 (plan payload.spec_digest != approved digest)"
 echo "    OK  plan ${PLAN1:0:12}… bound to product:${PRODUCT} @ ${APPROVED_DIGEST:0:19}…"
@@ -177,8 +198,12 @@ echo "    OK  plan ${PLAN1:0:12}… bound to product:${PRODUCT} @ ${APPROVED_DIG
 #      supersede: the loop re-enters spec_approved (the CAS fence) and a NEW plan
 #      replaces the old one, which is orphaned (never applied).
 echo; echo "[6] D2: candidate edit does not supersede; re-approval does (new plan)"
-printf '# reviewer note: confirmed refunds are excluded\n%s' "$(cat products/${PRODUCT}.toml)" > products/${PRODUCT}.toml.new
-mv products/${PRODUCT}.toml.new products/${PRODUCT}.toml
+# MUTATION 6: skip the edit -> re-approval sees the SAME digest, nothing is
+# superseded, and the "fresh plan id" assertion must fail.
+if ! mut 6; then
+  printf '# reviewer note: confirmed refunds are excluded\n%s' "$(cat products/${PRODUCT}.toml)" > products/${PRODUCT}.toml.new
+  mv products/${PRODUCT}.toml.new products/${PRODUCT}.toml
+fi
 EDITED_DIGEST="sha256:$(shasum -a 256 products/${PRODUCT}.toml | awk '{print $1}')"
 code=$(rj expected/06_edit.json fulfill "$PRODUCT")
 [ "$code" = "0" ] || fail "6 (fulfill after edit exit $code; $(cat expected/06_edit.err))"
@@ -222,7 +247,11 @@ GOOD8="$(jq -r .spec_digest "$S8/drive.json")"
 ( cd "$S8" && rocky apply "$P8" >bare.out 2>bare.err ); bare=$?
 [ "$bare" != "0" ] || fail "8 (bare apply of a product-bound plan must refuse)"
 grep -qiE 'expect-spec-digest|product-bound' "$S8/bare.err" || fail "8 (bare-apply refusal did not name --expect-spec-digest)"
-( cd "$S8" && rocky apply "$P8" --expect-spec-digest sha256:deadbeef >wrong.out 2>wrong.err ); wrong=$?
+# MUTATION 8: feed the CORRECT digest where the assert expects a wrong one ->
+# the apply succeeds, so the "must refuse" assertion must fail.
+WRONG8="sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+mut 8 && WRONG8="$GOOD8"
+( cd "$S8" && rocky apply "$P8" --expect-spec-digest "$WRONG8" >wrong.out 2>wrong.err ); wrong=$?
 [ "$wrong" != "0" ] || fail "8 (WRONG --expect-spec-digest must refuse)"
 grep -qiE 'digest' "$S8/wrong.err" || fail "8 (wrong-digest refusal did not mention the digest)"
 ( cd "$S8" && rocky apply "$P8" --expect-spec-digest "$GOOD8" >right.out 2>right.err ); right=$?
@@ -237,8 +266,14 @@ rm -rf "$S8"
 echo; echo "[7] approval gate: bare apply refuses; review --approve -> loop applies"
 ( rocky apply "$PLAN2" >expected/07_bare.out 2>expected/07_bare.err ); bare=$?
 [ "$bare" != "0" ] || fail "7 (bare apply of the un-reviewed plan must refuse)"
-code=$(rj expected/07_review.json review "$PLAN2" --approve)
-[ "$code" = "0" ] || fail "7 (review --approve exit $code; $(cat expected/07_review.err))"
+# MUTATION 7: skip the human review -> no sign-off marker, so the loop cannot
+# leave needs_input(plan_approval) and never reaches observing.
+if mut 7; then
+  echo "    (mutation 7: skipping rocky review --approve)"
+else
+  code=$(rj expected/07_review.json review "$PLAN2" --approve)
+  [ "$code" = "0" ] || fail "7 (review --approve exit $code; $(cat expected/07_review.err))"
+fi
 code=$(rj expected/07_apply.json fulfill "$PRODUCT")
 [ "$code" = "0" ] || fail "7 (apply+observe exit $code; $(cat expected/07_apply.err))"
 STATE7="$(jq -r .state expected/07_apply.json)"
@@ -254,6 +289,9 @@ echo "    OK  loop applied -> observing; out.${PRODUCT} has $ROWS row(s)"
 # the merged sidecar) and that the model's tests RAN green — not just an overall
 # tally. The grain [client_id] is non-vacuous: two distinct clients materialised.
 echo; echo "[9] output validation: composite-unique grain test generated + runs green"
+# MUTATION 9: delete the composite-unique test from the merged sidecar -> the
+# grain-uniqueness assertion must catch that it is gone.
+mut 9 && sed -i '' '/type = "composite"/d' "models/${PRODUCT}.toml"
 grep -q 'type = "composite"' "models/${PRODUCT}.toml" && grep -q 'kind = "unique"' "models/${PRODUCT}.toml" \
   || fail "9 (no composite-unique grain test in the merged sidecar)"
 code=$(rj expected/09_test.json test --models models/)
@@ -276,7 +314,9 @@ FRESH_BUD=$(jq -r '.message | capture("budget (?<b>[0-9]+)s").b' expected/07_app
 [ -n "$FRESH_LAG" ] && [ -n "$FRESH_BUD" ] || fail "10 (fresh observe did not report lag/budget)"
 [ "$FRESH_LAG" -le "$FRESH_BUD" ] || fail "10 (fresh data should be within budget: lag $FRESH_LAG > budget $FRESH_BUD)"
 # Age the materialised output beyond the budget, then re-observe (Observing -> Observe).
-duckdb wh.duckdb "UPDATE out.${PRODUCT} SET loaded_at = TIMESTAMP '2020-01-01 00:00:00'" >/dev/null 2>&1 || fail "10 (could not backdate the output)"
+# MUTATION 10: skip the backdating -> the data stays fresh, so the "stale" branch
+# never exceeds the budget and the assertion must fail.
+mut 10 || duckdb wh.duckdb "UPDATE out.${PRODUCT} SET loaded_at = TIMESTAMP '2020-01-01 00:00:00'" >/dev/null 2>&1 || fail "10 (could not backdate the output)"
 code=$(rj expected/10_stale.json fulfill "$PRODUCT")
 [ "$code" = "0" ] || fail "10 (re-observe exit $code, staleness must NOT block; $(cat expected/10_stale.err))"
 [ "$(jq -r .state expected/10_stale.json)" = "observing" ] || fail "10 (staleness must stay observing, got $(jq -r .state expected/10_stale.json))"
