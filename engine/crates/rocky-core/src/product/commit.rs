@@ -468,7 +468,7 @@ fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions
 fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
     let (bytes, permissions) = read_no_follow(src)?;
     let backup = create_new_no_follow(dst, Some(0o600))?;
-    match write_backup(backup, &bytes, permissions) {
+    match write_backup(backup, &bytes, &permissions) {
         Ok(()) => Ok(()),
         Err(error) => {
             // Best-effort: if this unlink fails the caller still sees the
@@ -485,7 +485,7 @@ fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
 fn write_backup(
     mut backup: std::fs::File,
     bytes: &[u8],
-    permissions: std::fs::Permissions,
+    permissions: &std::fs::Permissions,
 ) -> std::io::Result<()> {
     use std::io::Write as _;
     backup.write_all(bytes)?;
@@ -494,6 +494,8 @@ fn write_backup(
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::Permissions::from_mode(permissions.mode() & 0o777)
     };
+    #[cfg(not(unix))]
+    let permissions = permissions.clone();
     backup.set_permissions(permissions)
 }
 
