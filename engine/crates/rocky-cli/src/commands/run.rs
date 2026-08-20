@@ -10573,14 +10573,23 @@ async fn run_one_partition(
         };
     }
 
-    // Success: mark Computed.
+    // Success: atomically mark every logical partition covered by the batch
+    // Computed so --missing does not re-run keys already committed above.
     record.status = PartitionStatus::Computed;
     record.duration_ms = partition_start.elapsed().as_millis() as u64;
-    if let Err(e) = state_ref.record_partition(&record) {
+    let records: Vec<_> = std::iter::once(&key)
+        .chain(&partition_plan.batch_with)
+        .map(|partition_key| PartitionRecord {
+            partition_key: partition_key.clone(),
+            ..record.clone()
+        })
+        .collect();
+    if let Err(e) = state_ref.record_partitions(&records) {
         return PartitionExecutionResult {
             partition_key: key.clone(),
-            outcome: Err(anyhow::Error::from(e)
-                .context(format!("failed to record Computed for {model_name}|{key}"))),
+            outcome: Err(anyhow::Error::from(e).context(format!(
+                "failed to record Computed batch for {model_name}|{key}"
+            ))),
         };
     }
 
@@ -14792,6 +14801,120 @@ table = "fct_daily"
             .await
             .unwrap();
         assert_eq!(rows.rows, vec![vec![serde_json::json!("99")]]);
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn batched_time_interval_records_every_partition_as_computed() {
+        use rocky_core::incremental::PartitionStatus;
+        use rocky_core::models::load_model_pair;
+        use rocky_core::state::StateStore;
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+        use rocky_duckdb::dialect::DuckDbSqlDialect;
+
+        let today = Utc::now().date_naive();
+        let first = today.pred_opt().unwrap().pred_opt().unwrap().to_string();
+        let middle = today.pred_opt().unwrap().to_string();
+        let last = today.to_string();
+
+        let warehouse = DuckDbWarehouseAdapter::in_memory().unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement(&format!(
+                "CREATE TABLE raw.orders AS SELECT * FROM (VALUES \
+                 (TIMESTAMP '{first} 12:00:00'), \
+                 (TIMESTAMP '{middle} 12:00:00'), \
+                 (TIMESTAMP '{last} 12:00:00')) AS t(order_at)"
+            ))
+            .await
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.sql"),
+            "SELECT CAST(order_at AS DATE) AS order_date FROM raw.orders \
+             WHERE order_at >= @start_date AND order_at < @end_date",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fct_daily_orders.toml"),
+            format!(
+                "name = \"fct_daily_orders\"\n\n\
+                 [strategy]\ntype = \"time_interval\"\ntime_column = \"order_date\"\n\
+                 granularity = \"day\"\nbatch_size = 3\nfirst_partition = \"{first}\"\n\n\
+                 [target]\ncatalog = \"\"\nschema = \"main\"\ntable = \"fct_daily_orders\"\n"
+            ),
+        )
+        .unwrap();
+        let model = load_model_pair(
+            &dir.path().join("fct_daily_orders.sql"),
+            &dir.path().join("fct_daily_orders.toml"),
+            None,
+        )
+        .unwrap();
+        let state = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let typed_models = indexmap::IndexMap::new();
+        let model_timings = std::collections::HashMap::new();
+        let surrogate_keys = std::collections::HashMap::new();
+        let exec_ctx = super::ExecutionContext {
+            typed_models: &typed_models,
+            model_timings: &model_timings,
+            surrogate_keys: &surrogate_keys,
+        };
+
+        let range = PartitionRunOptions {
+            from: Some(first.clone()),
+            to: Some(last.clone()),
+            parallel: 1,
+            ..Default::default()
+        };
+        let mut output = RunOutput::new(String::new(), 0, 1);
+        super::execute_time_interval_model(
+            &model,
+            &warehouse,
+            &DuckDbSqlDialect,
+            Some(&state),
+            &range,
+            "batch-run",
+            &mut output,
+            &exec_ctx,
+        )
+        .await
+        .unwrap();
+
+        let mut records = state.list_partitions("fct_daily_orders").unwrap();
+        records.sort_by(|a, b| a.partition_key.cmp(&b.partition_key));
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.partition_key.as_str())
+                .collect::<Vec<_>>(),
+            [first.as_str(), middle.as_str(), last.as_str()]
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.status == PartitionStatus::Computed)
+        );
+
+        let missing = rocky_core::plan_partition::plan_partitions(
+            &model,
+            &PartitionSelection::Missing,
+            None,
+            &state,
+        )
+        .unwrap();
+        let replanned: Vec<_> = missing
+            .iter()
+            .flat_map(|plan| std::iter::once(&plan.partition_key).chain(&plan.batch_with))
+            .collect();
+        assert!(!replanned.contains(&&first));
+        assert!(!replanned.contains(&&middle));
+        assert!(!replanned.contains(&&last));
     }
 
     /// Inverse-design property: a *transient* target-probe failure must not be
