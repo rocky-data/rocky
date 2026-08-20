@@ -52,6 +52,7 @@ cp "$HERE/data/warehouse_seed.sql" "$WORK/data/warehouse_seed.sql"
 # Rocky spec schema. Without it, a cold worker emits warehouse types / extra keys
 # and Phase A rejects the spec. drafting/repair fall back to the compiled defaults.
 cp "$HERE/briefs/elicitation.md" "$WORK/briefs/elicitation.md"
+cp "$HERE/briefs/drafting.md" "$WORK/briefs/drafting.md"
 duckdb "$WORK/wh.duckdb" < "$WORK/data/warehouse_seed.sql" >/dev/null 2>&1 || die "warehouse seed failed"
 
 # The subprocess driver: `claude -p {brief}` against the worker-profile MCP.
@@ -98,7 +99,7 @@ command = [
   "claude", "-p", "{brief}",
   "--mcp-config", "mcp-worker.json",
   "--strict-mcp-config",
-  "--allowedTools", "mcp__rocky__list,mcp__rocky__inspect_schema,mcp__rocky__sample_rows,mcp__rocky__profile_column,mcp__rocky__compile,mcp__rocky__test,mcp__rocky__draft_model,mcp__rocky__draft_check,Write,Read,Edit,Glob,Grep,LS,TodoWrite",
+  "--allowedTools", "mcp__rocky__list,mcp__rocky__inspect_schema,mcp__rocky__sample_rows,mcp__rocky__profile_column,mcp__rocky__compile,mcp__rocky__test,mcp__rocky__draft_model,Write,Read,Edit,Glob,Grep,LS,TodoWrite",
   "--dangerously-skip-permissions",
 ]
 env_allow = ["ANTHROPIC_API_KEY", "PATH", "HOME"]
@@ -156,12 +157,18 @@ ROWS="$(duckdb -csv -noheader wh.duckdb "SELECT COUNT(*) FROM out.${PRODUCT}" 2>
 [ "${ROWS:-0}" -ge 1 ] || die "no rows materialised from the worker's model"
 # 9: the generated composite-unique grain test RUNS green (declarative, against
 # the warehouse). Plain `rocky test` runs only the model; --declarative runs the
-# sidecar [[tests]]. This is the banked runner_reverify_test.json.
+# sidecar [[tests]]. A CLEAN run needs ALL of: 0 errored (no malformed
+# declaration), 0 failed (no data violation), the composite grain test PASSING,
+# and a zero exit code. This is the banked runner_reverify_test.json.
 code=$(rj live_test.json test --models models/ --declarative)
-[ "$(jq -r '.declarative.failed // 1' live_test.json)" = "0" ] || die "the worker's model failed a declarative test: $(jq -c '.declarative.results[]?|select(.status!="pass")' live_test.json)"
+LERR="$(jq -r '.declarative.errored // 1' live_test.json)"; LFAIL="$(jq -r '.declarative.failed // 1' live_test.json)"
+[ "$LERR" = "0" ] || die "the worker's declarative tests ERRORED=$LERR (malformed declarations): $(jq -c '.declarative.results[]?|select(.status=="error")|{test_type,detail}' live_test.json)"
+[ "$LFAIL" = "0" ] || die "the worker's model failed a declarative test: $(jq -c '.declarative.results[]?|select(.status=="fail")' live_test.json)"
 jq -e '.declarative.results[] | select(.test_type == "composite" and .status == "pass")' live_test.json >/dev/null \
   || die "the composite-unique grain test did not run and pass under --declarative"
-echo "    OK  plan product-bound; out.${PRODUCT} has $ROWS row(s); declarative grain test green"
+[ "$code" = "0" ] || die "rocky test --declarative exit $code despite errored=0 failed=0"
+LTOTAL="$(jq -r '.declarative.total' live_test.json)"
+echo "    OK  plan product-bound; out.${PRODUCT} has $ROWS row(s); $LTOTAL declarative tests all pass (0 failed, 0 errored)"
 
 # --- Bank the evidence bundle (committed under expected/live/). ---
 echo; echo "Banking the evidence bundle -> $BUNDLE"
@@ -169,6 +176,8 @@ rm -rf "$BUNDLE"; mkdir -p "$BUNDLE"
 cp -R .rocky/fulfillment/"$PRODUCT"/transcripts "$BUNDLE/transcripts" 2>/dev/null || true
 cp "products/${PRODUCT}.toml"      "$BUNDLE/worker_candidate_spec.toml"
 cp "models/${PRODUCT}.sql"         "$BUNDLE/worker_authored.sql"
+# The merged sidecar makes the declarative [[tests]] visible in the evidence.
+cp "models/${PRODUCT}.toml"        "$BUNDLE/model_sidecar.toml"
 SQL_HASH="$(shasum -a 256 "models/${PRODUCT}.sql" | awk '{print $1}')"
 cp live_draft.json "$BUNDLE/runner_propose.json"
 cp live_apply.json "$BUNDLE/runner_observe.json"
@@ -192,15 +201,17 @@ empty directory. No recorded SQL. This is the capability proof.
 | plan id | \`$PLAN\` |
 | authored SQL sha256 | \`$SQL_HASH\` |
 | materialised rows | $ROWS |
+| declarative tests | ${LTOTAL} total, all pass (0 failed, 0 errored) |
 | freshness at apply | lag ${LAG}s vs budget ${BUD}s |
 | final state | observing |
 
 ## Files
 - \`worker_candidate_spec.toml\` — the spec the worker wrote (the runner then digested + approved it).
 - \`worker_authored.sql\` — the model SQL the worker authored (sha256 above).
+- \`model_sidecar.toml\` — the merged sidecar, so the declarative \`[[tests]]\` are visible.
 - \`transcripts/\` — the driver transcripts (worker stdout/stderr per task).
 - \`runner_propose.json\` / \`runner_observe.json\` — the loop's own stops.
-- \`runner_reverify_test.json\` — the runner re-running the generated tests on the worker's output.
+- \`runner_reverify_test.json\` — \`rocky test --declarative\`: ${LTOTAL} tests, all pass, 0 failed, 0 errored.
 - \`runner_product_status.json\` — the loop's journaled state.
 - \`materialized_snapshot.csv\` — the warehouse table the worker's model produced.
 
@@ -210,9 +221,9 @@ PASS — one bounded run reached \`observing\`. The worker AUTHORED the SQL itse
 \`briefs/elicitation.md\` schema template with an \`intent\` filled in — grounding,
 NOT a from-scratch design (convergence needs this override; on the *compiled*
 brief a cold worker designs a plausible but off-schema spec). The worker's SQL
-cleared compile, the declarative grain + expression tests (\`rocky test
---declarative\`), the product-bound plan, human review, and the digest-gated
-apply. Freshness was
+cleared compile, the declarative tests (\`rocky test --declarative\`: ${LTOTAL}
+tests, all pass, 0 failed, 0 errored), the product-bound plan, human review, and
+the digest-gated apply. Freshness was
 observed (lag ${LAG}s vs ${BUD}s), not enforced. SQL authorship is genuine;
 from-scratch spec design against the closed schema is the open capability — on the
 *compiled* brief a cold worker designs a plausible but off-schema spec.
