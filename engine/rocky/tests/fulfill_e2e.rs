@@ -123,7 +123,7 @@ fn draft_model_call(sql: &str) -> serde_json::Value {
 fn session_json(extra_drafting_calls: &[serde_json::Value]) -> String {
     let mut drafting_calls = extra_drafting_calls.to_vec();
     drafting_calls.push(draft_model_call(DRAFT_SQL));
-    session_json_with_tasks(&drafting_calls, &drafting_calls.clone())
+    session_json_with_tasks(&drafting_calls, &drafting_calls)
 }
 
 /// A session whose drafting round authors `drafting_sql` and whose
