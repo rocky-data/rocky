@@ -1,0 +1,11 @@
+[product]
+name = "revenue_daily"
+intent = "Daily gross revenue per client in EUR"
+[product.source]
+tables = ["wh.raw.stripe_charges"]
+[product.output]
+model = "revenue_daily"
+grain = ["client_id"]
+columns = [ { name = "client_id", type = "BIGINT", nullable = true } ]
+[product.trust]
+agent = "propose_only"

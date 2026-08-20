@@ -1,0 +1,56 @@
+{
+  "_comment": "Recorded worker session, replayed verbatim against `rocky mcp --profile worker`. Elicitation hands off the candidate spec (digest re-checked by the runner). Drafting first PROVES the privilege boundary (propose/review/etc are tool-not-found on the worker profile), then authors the model via draft_model. repair.calls is empty on purpose: a genuine red verify must surface as `verification red after N repair rounds`, not be masked by a repair round re-issuing draft_model (which would clobber the merged sidecar and mis-report as tamper).",
+  "tasks": {
+    "elicitation": {
+      "calls": [],
+      "outcome": {
+        "candidate_spec": "[product]\nname = \"revenue_daily\"\nintent = \"Daily gross revenue per client in EUR, refunds excluded\"\n\n[product.source]\ntables = [\"wh.raw.stripe_charges\"]\n\n[product.output]\nmodel = \"revenue_daily\"\ngrain = [\"client_id\", \"day\"]\ncolumns = [\n  { name = \"client_id\", type = \"Int64\", nullable = true },\n  { name = \"day\", type = \"Date\", nullable = true },\n  { name = \"loaded_at\", type = \"Timestamp\", nullable = true },\n  { name = \"revenue_eur\", type = \"Float64\", nullable = true },\n]\nchecks = [\"revenue_eur >= 0\"]\nfreshness = { max_lag = \"24h\", time_column = \"loaded_at\" }\n\n[product.trust]\nagent = \"propose_only\"\n",
+        "questions": [
+          "Should refunds subtract from revenue_eur, or be excluded entirely?"
+        ],
+        "expected_digest": "sha256:5b1bf5c7759fef2d34841d8acbcc92b50f51488958927a2f6df0682c55ef83f4"
+      }
+    },
+    "drafting": {
+      "calls": [
+        {
+          "tool": "propose",
+          "arguments": {},
+          "expect": "tool_not_found"
+        },
+        {
+          "tool": "review_queue",
+          "arguments": {},
+          "expect": "tool_not_found"
+        },
+        {
+          "tool": "draft_contract",
+          "arguments": {},
+          "expect": "tool_not_found"
+        },
+        {
+          "tool": "draft_metadata",
+          "arguments": {},
+          "expect": "tool_not_found"
+        },
+        {
+          "tool": "pause_schedule",
+          "arguments": {},
+          "expect": "tool_not_found"
+        },
+        {
+          "tool": "draft_model",
+          "arguments": {
+            "name": "revenue_daily",
+            "sql": "SELECT client_id, CAST(charged_at AS DATE) AS day, MAX(charged_at) AS loaded_at, SUM(CASE WHEN is_refund THEN 0 ELSE amount_eur END)::DOUBLE AS revenue_eur FROM wh.raw.stripe_charges GROUP BY client_id, CAST(charged_at AS DATE)",
+            "intent": "Daily gross revenue per client in EUR, refunds excluded"
+          },
+          "expect": "ok"
+        }
+      ]
+    },
+    "repair": {
+      "calls": []
+    }
+  }
+}

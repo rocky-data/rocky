@@ -1,0 +1,43 @@
+# Fulfillment walking skeleton — single binary, replay driver (credential-free).
+[adapter]
+type = "duckdb"
+path = "wh.duckdb"
+
+[pipeline.p]
+type = "transformation"
+models = "models/**"
+
+[pipeline.p.target]
+adapter = "default"
+
+[pipeline.p.target.governance]
+auto_create_schemas = true
+
+# The agent-policy posture the loop verifies before it will lower or propose.
+# Stripping this block is assert 4 (the loop stops with a paste-ready block).
+[policy]
+version = 1
+default_agent_effect = "require_review"
+
+# Authoring lane: the agent may draft and propose WITHIN the product's scope…
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { models = ["revenue_daily"] }
+effect = "allow"
+
+# …but applying stays a human decision (explicit, though the default already covers it).
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { models = ["revenue_daily"] }
+effect = "require_review"
+
+# The credential-free CI lane: a recorded worker session, replayed verbatim
+# against `rocky mcp --profile worker`. run-live.sh swaps this for a real
+# subprocess worker. This is the FF-DESIGN D7 machinery-vs-capability split.
+[fulfill]
+
+[fulfill.driver]
+type = "replay"
+session = "replay/session.json"

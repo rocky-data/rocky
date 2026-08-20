@@ -1,0 +1,21 @@
+[product]
+name = "revenue_daily"
+intent = "Daily gross revenue per client in EUR, refunds excluded"
+
+[product.source]
+tables = ["wh.raw.stripe_charges"]
+
+[product.output]
+model = "revenue_daily"
+grain = ["client_id", "day"]
+columns = [
+  { name = "client_id", type = "Int64", nullable = true },
+  { name = "day", type = "Date", nullable = true },
+  { name = "loaded_at", type = "Timestamp", nullable = true },
+  { name = "revenue_eur", type = "Float64", nullable = true },
+]
+checks = ["revenue_eur >= 0"]
+freshness = { max_lag = "24h", time_column = "loaded_at" }
+
+[product.trust]
+agent = "propose_only"
