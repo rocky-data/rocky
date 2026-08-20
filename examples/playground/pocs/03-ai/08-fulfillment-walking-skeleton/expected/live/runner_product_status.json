@@ -1,0 +1,23 @@
+{
+  "version": "1.71.0",
+  "command": "product_status",
+  "product": "revenue_daily",
+  "spec_present": true,
+  "product_id": "product:revenue_daily",
+  "spec_digest": "sha256:7f453024430612d34750fbff24cb17732f5a4894cb9cc805485ba7d5c8718d97",
+  "output_model": "revenue_daily",
+  "committed_phase": "merged",
+  "committed_spec_digest": "sha256:7f453024430612d34750fbff24cb17732f5a4894cb9cc805485ba7d5c8718d97",
+  "artifact_problems": [],
+  "staging_journal_present": false,
+  "approval": {
+    "spec_digest": "sha256:7f453024430612d34750fbff24cb17732f5a4894cb9cc805485ba7d5c8718d97",
+    "approver": "<redacted: git-derived committer>",
+    "approved_at": "2026-08-20T10:39:11Z",
+    "snapshot_path": ".rocky/fulfillment/revenue_daily/approved-7f453024430612d34750fbff24cb17732f5a4894cb9cc805485ba7d5c8718d97.toml"
+  },
+  "snapshot_intact": true,
+  "spec_matches_approval": true,
+  "fulfill_state": "observing",
+  "journal_rows": 23
+}

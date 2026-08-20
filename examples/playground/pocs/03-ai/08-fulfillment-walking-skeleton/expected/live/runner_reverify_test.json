@@ -1,0 +1,14 @@
+{
+  "version": "1.71.0",
+  "command": "test",
+  "total": 1,
+  "passed": 1,
+  "failed": 0,
+  "failures": [],
+  "model_results": [
+    {
+      "model": "revenue_daily",
+      "status": "pass"
+    }
+  ]
+}

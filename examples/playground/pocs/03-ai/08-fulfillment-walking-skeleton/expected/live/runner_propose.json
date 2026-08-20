@@ -1,0 +1,11 @@
+{
+  "version": "1.71.0",
+  "command": "fulfill",
+  "product": "revenue_daily",
+  "product_id": "product:revenue_daily",
+  "state": "needs_input",
+  "message": "plan 431d306a006731dfca8908b1c5d5143ccee0424481bbdce4129a65c3b872f4fc awaits human review; after approving, re-run: rocky fulfill revenue_daily",
+  "next_command": "rocky review 431d306a006731dfca8908b1c5d5143ccee0424481bbdce4129a65c3b872f4fc --approve",
+  "spec_digest": "sha256:7f453024430612d34750fbff24cb17732f5a4894cb9cc805485ba7d5c8718d97",
+  "plan_id": "431d306a006731dfca8908b1c5d5143ccee0424481bbdce4129a65c3b872f4fc"
+}

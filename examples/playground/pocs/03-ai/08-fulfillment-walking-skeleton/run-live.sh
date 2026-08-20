@@ -169,7 +169,8 @@ SQL_HASH="$(shasum -a 256 "models/${PRODUCT}.sql" | awk '{print $1}')"
 cp live_draft.json "$BUNDLE/runner_propose.json"
 cp live_apply.json "$BUNDLE/runner_observe.json"
 cp live_test.json  "$BUNDLE/runner_reverify_test.json"
-rocky --output json product status "$PRODUCT" > "$BUNDLE/runner_product_status.json" 2>/dev/null
+# redact the git-derived approver so the committed bundle carries no personal identifier
+rocky --output json product status "$PRODUCT" 2>/dev/null | jq '(.approval.approver) |= "<redacted: git-derived committer>"' > "$BUNDLE/runner_product_status.json"
 duckdb -csv wh.duckdb "SELECT * FROM out.${PRODUCT} ORDER BY 1,2" > "$BUNDLE/materialized_snapshot.csv" 2>/dev/null
 LAG="$(jq -r '.message | capture("lag (?<l>[0-9]+)s").l' live_apply.json 2>/dev/null)"
 BUD="$(jq -r '.message | capture("budget (?<b>[0-9]+)s").b' live_apply.json 2>/dev/null)"
