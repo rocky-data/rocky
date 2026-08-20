@@ -4,8 +4,8 @@
   "product": "revenue_daily",
   "product_id": "product:revenue_daily",
   "state": "needs_input",
-  "message": "plan 431d306a006731dfca8908b1c5d5143ccee0424481bbdce4129a65c3b872f4fc awaits human review; after approving, re-run: rocky fulfill revenue_daily",
-  "next_command": "rocky review 431d306a006731dfca8908b1c5d5143ccee0424481bbdce4129a65c3b872f4fc --approve",
-  "spec_digest": "sha256:7f453024430612d34750fbff24cb17732f5a4894cb9cc805485ba7d5c8718d97",
-  "plan_id": "431d306a006731dfca8908b1c5d5143ccee0424481bbdce4129a65c3b872f4fc"
+  "message": "plan 6c9bee313b7452cfaf96e9dad1d3a7580a86c8710abc82a477f2609463f4bbaf awaits human review; after approving, re-run: rocky fulfill revenue_daily",
+  "next_command": "rocky review 6c9bee313b7452cfaf96e9dad1d3a7580a86c8710abc82a477f2609463f4bbaf --approve",
+  "spec_digest": "sha256:36281940a92251215d546bd5168fe62744d0b867a927a3024390ffa8a8203ad5",
+  "plan_id": "6c9bee313b7452cfaf96e9dad1d3a7580a86c8710abc82a477f2609463f4bbaf"
 }

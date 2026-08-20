@@ -1,12 +1,10 @@
-select
+SELECT
     client_id,
-    cast(charged_at as date) as day,
-    sum(amount_eur) as revenue_eur,
-    current_timestamp as loaded_at
-from wh.raw.stripe_charges
-where coalesce(is_refund, false) = false
-  and client_id is not null
-  and charged_at is not null
-group by
-    client_id,
-    cast(charged_at as date)
+    CAST(charged_at AS DATE) AS day,
+    SUM(amount_eur) AS revenue_eur,
+    CURRENT_TIMESTAMP AS loaded_at
+FROM wh.raw.stripe_charges
+WHERE NOT COALESCE(is_refund, FALSE)
+  AND client_id IS NOT NULL
+  AND charged_at IS NOT NULL
+GROUP BY client_id, CAST(charged_at AS DATE)

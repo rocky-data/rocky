@@ -4,17 +4,17 @@
   "product": "revenue_daily",
   "spec_present": true,
   "product_id": "product:revenue_daily",
-  "spec_digest": "sha256:7f453024430612d34750fbff24cb17732f5a4894cb9cc805485ba7d5c8718d97",
+  "spec_digest": "sha256:36281940a92251215d546bd5168fe62744d0b867a927a3024390ffa8a8203ad5",
   "output_model": "revenue_daily",
   "committed_phase": "merged",
-  "committed_spec_digest": "sha256:7f453024430612d34750fbff24cb17732f5a4894cb9cc805485ba7d5c8718d97",
+  "committed_spec_digest": "sha256:36281940a92251215d546bd5168fe62744d0b867a927a3024390ffa8a8203ad5",
   "artifact_problems": [],
   "staging_journal_present": false,
   "approval": {
-    "spec_digest": "sha256:7f453024430612d34750fbff24cb17732f5a4894cb9cc805485ba7d5c8718d97",
+    "spec_digest": "sha256:36281940a92251215d546bd5168fe62744d0b867a927a3024390ffa8a8203ad5",
     "approver": "<redacted: git-derived committer>",
-    "approved_at": "2026-08-20T10:39:11Z",
-    "snapshot_path": ".rocky/fulfillment/revenue_daily/approved-7f453024430612d34750fbff24cb17732f5a4894cb9cc805485ba7d5c8718d97.toml"
+    "approved_at": "2026-08-20T11:40:02Z",
+    "snapshot_path": ".rocky/fulfillment/revenue_daily/approved-36281940a92251215d546bd5168fe62744d0b867a927a3024390ffa8a8203ad5.toml"
   },
   "snapshot_intact": true,
   "spec_matches_approval": true,

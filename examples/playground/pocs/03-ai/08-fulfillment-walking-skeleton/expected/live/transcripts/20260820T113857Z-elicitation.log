@@ -1,0 +1,12 @@
+Hand-off complete. Both files are written to the outbox for the trusted runner to verify; I've made no writes toward production.
+
+**What I grounded the spec in.** The only source under catalog `wh` is `wh.raw.stripe_charges` with four columns, all nullable in the warehouse schema: `client_id BIGINT`, `charged_at TIMESTAMP`, `amount_eur DOUBLE`, `is_refund BOOLEAN`. Sampling (5 rows, zero nulls in any column) confirmed the types and surfaced the one load-bearing fact: refunds are stored as **positive amounts with `is_refund = true`** — e.g. client 2 has a 10.0 EUR row flagged as a refund alongside a 75.0 EUR charge the same day.
+
+**The candidate spec** (`.rocky/fulfillment/revenue_daily/outbox/candidate_spec.toml`) follows the closed schema exactly: source `["wh.raw.stripe_charges"]`, grain `["client_id", "day"]`, and four output columns mapped `BIGINT → Int64`, truncated `TIMESTAMP → Date` for `day`, `TIMESTAMP → Timestamp` for `loaded_at`, `DOUBLE → Float64` for `revenue_eur`. Invariants encoded: the check `revenue_eur >= 0` (safe because refunds are excluded rather than subtracted, so no negative aggregates should occur), freshness `max_lag = "24h"` observed via `MAX(loaded_at)`, and `agent = "propose_only"`.
+
+**Flagged for the human** (`questions.json`, 7 questions). The sharpest three:
+1. Because refund rows are positive-and-flagged, "refunds excluded" is ambiguous between *filter out* (gross) and *subtract* (net) — the numbers differ.
+2. `client_id` and `is_refund` are nullable in the schema even though the sample had no nulls; a NULL grain key or NULL refund flag needs a policy before this hardens.
+3. `charged_at` is timezone-naive, so the day boundary (UTC vs. business timezone) is an unstated choice, and `loaded_at` derived from charge time (not ingestion time) may make the 24h freshness SLA measure the wrong thing.
+
+Stopping here — the runner records, reviews, and applies.

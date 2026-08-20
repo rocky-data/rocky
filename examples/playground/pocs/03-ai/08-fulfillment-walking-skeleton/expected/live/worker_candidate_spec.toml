@@ -1,6 +1,6 @@
 [product]
 name = "revenue_daily"
-intent = "Daily gross revenue per client in EUR, excluding refund charges, one row per (client_id, day)."
+intent = "Daily gross revenue per client in EUR, refunds excluded, one row per (client, day)."
 
 [product.source]
 tables = ["wh.raw.stripe_charges"]
