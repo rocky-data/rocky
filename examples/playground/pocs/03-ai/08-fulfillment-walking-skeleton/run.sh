@@ -34,10 +34,13 @@ command -v jq >/dev/null 2>&1 || fail "0 (jq is required for the assertions)"
 command -v duckdb >/dev/null 2>&1 || fail "0 (duckdb CLI is required to seed and inspect the warehouse)"
 
 # --- Truly cold start: wipe generated state (keep only committed inputs). ---
-rm -rf products .rocky expected wh.duckdb
+rm -rf products .rocky wh.duckdb
 rm -f  models/.rocky-state.redb models/.rocky-state.redb.lock .rocky-state.redb .rocky-state.redb.lock
 rm -f  "models/${PRODUCT}.sql" "models/${PRODUCT}.toml" "models/${PRODUCT}.contract.toml"
+# Wipe the ephemeral goldens but PRESERVE the committed live evidence bundle
+# (expected/live/), which run-live.sh banks and which must survive a replay run.
 mkdir -p expected
+find expected -mindepth 1 -maxdepth 1 ! -name live -exec rm -rf {} + 2>/dev/null || true
 
 # Seed the persistent warehouse so the apply materialises real revenue.
 duckdb wh.duckdb < data/warehouse_seed.sql >/dev/null 2>&1 || fail "0 (warehouse seed failed)"
