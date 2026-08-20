@@ -1,0 +1,12 @@
+Hand-off complete. Both deliverables are written to `.rocky/fulfillment/revenue_daily/outbox/`; the trusted runner performs any write to `products/` after review.
+
+**What I drafted** (`candidate_spec.toml`): a `revenue_daily` product sourced from `wh.raw.stripe_charges`, grain `(client_id, day)`, with four output columns typed in ROCKY names mapped from the sampled warehouse schema — `client_id` BIGINT→`Int64`, `day` as truncated `charged_at` TIMESTAMP→`Date`, `loaded_at` (MAX charge time per group)→`Timestamp`, `amount_eur` DOUBLE summed→`Float64`. Trust is `propose_only`.
+
+**Invariants encoded:**
+- Check `revenue_eur >= 0` — safe because refunds are stored as *positive* amounts flagged by `is_refund` (confirmed by profiling: 4 false / 1 true, all amounts 10.0–100.0 positive), so exclusion is a filter and remaining sums can't go negative.
+- Freshness `max_lag = "24h"` observed via `time_column = "loaded_at"`; sampled `charged_at` has zero nulls and a sane range (2026-08-19 → 2026-08-20), so it's usable as the monotonic source.
+- All columns kept `nullable = true`, matching the source schema's declared nullability (the 5-row sample happens to have no nulls, but the schema permits them).
+
+**Flagged for the human** (`questions.json`, 6 questions): whether refund exclusion means filter-out vs. subtract (the positive-amount storage makes these differ), which timezone defines the `day` boundary (`charged_at` is tz-naive), how to handle NULL `client_id`/`charged_at` rows (which decides if the grain columns can tighten to non-nullable), whether `Float64` revenue should be a `Decimal` instead, whether refund-only days emit a zero row, and whether staleness against charge time (rather than ingestion time) is really the intended semantics.
+
+Stopping here per the worker profile — nothing has been proposed or applied.

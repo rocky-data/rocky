@@ -1,0 +1,18 @@
+Both gates are green — `compile` reports zero errors and zero warnings, and `test` passes 1/1. Drafting is complete; handing off to the trusted runner.
+
+**Drafted files**
+- `models/revenue_daily.sql` — authored via `draft_model`
+- `models/revenue_daily.toml` — sidecar written by the tool; only `name` and `intent` set by me, all spec-owned metadata preserved
+
+**What the SQL encodes**
+- One row per (client, day): `GROUP BY client_id, CAST(charged_at AS DATE)`, matching the spec's composite-unique grain test.
+- Refunds excluded via `COALESCE(is_refund, FALSE) = FALSE` — rows with a NULL `is_refund` flag are treated as charges, not refunds, so only explicit refunds are dropped.
+- All source columns are nullable, so rows with NULL `client_id`, `charged_at`, or `amount_eur` are filtered out before aggregation to satisfy the spec-generated not_null tests. A (client, day) whose only charges have NULL amounts produces no row rather than a NULL or zero revenue row.
+- The contract requires a `loaded_at` column that doesn't exist in the source, so it's emitted as `CURRENT_TIMESTAMP` (load-time stamp). Compile's E010 confirmed the requirement and accepted this.
+- The source is referenced fully qualified as `wh.raw.stripe_charges` — the local DuckDB test harness could not resolve the bare `raw.stripe_charges` form.
+
+**Flagged for the reviewer**
+- `revenue_eur` is `SUM` of a DOUBLE; if the contract intends exact currency arithmetic, a DECIMAL cast upstream may be worth considering.
+- The refund-NULL policy (NULL `is_refund` counted as revenue) is an interpretation of "excluding refunds" — worth a human confirmation.
+
+Per the worker profile, I stop here: no `[[tests]]` blocks were authored, no contract or metadata touched, and recording/review/apply belong to the runner.

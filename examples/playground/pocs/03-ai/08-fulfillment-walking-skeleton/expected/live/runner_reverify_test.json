@@ -7,11 +7,11 @@
   "failures": [],
   "model_results": [],
   "declarative": {
-    "total": 4,
+    "total": 2,
     "passed": 2,
     "failed": 0,
     "warned": 0,
-    "errored": 2,
+    "errored": 0,
     "results": [
       {
         "model": "revenue_daily",
@@ -28,24 +28,6 @@
         "status": "pass",
         "severity": "error",
         "sql": "SELECT COUNT(*) FROM wh.out.revenue_daily WHERE NOT (revenue_eur >= 0)"
-      },
-      {
-        "model": "revenue_daily",
-        "table": "wh.out.revenue_daily",
-        "test_type": "unique",
-        "status": "error",
-        "severity": "error",
-        "detail": "SQL generation error: test 'unique' requires a column but none was provided",
-        "sql": ""
-      },
-      {
-        "model": "revenue_daily",
-        "table": "wh.out.revenue_daily",
-        "test_type": "not_null",
-        "status": "error",
-        "severity": "error",
-        "detail": "SQL generation error: test 'not_null' requires a column but none was provided",
-        "sql": ""
       }
     ]
   }

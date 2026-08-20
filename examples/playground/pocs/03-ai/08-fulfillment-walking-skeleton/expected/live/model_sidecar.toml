@@ -1,0 +1,26 @@
+# GENERATED from products/revenue_daily.toml (spec sha256:978af3b411e92dd0ec76b587d5c855f685420554c912ecd2482fa2d6f1e7de2d) — edit the spec, not this file.
+name = "revenue_daily"
+intent = "Daily gross revenue per client in EUR, excluding refunds, one row per (client, day)."
+sources = [
+    { catalog = "wh", schema = "raw", table = "stripe_charges" },
+]
+
+[tags]
+product = "revenue_daily"
+
+[freshness]
+expected_lag_seconds = 86400
+time_column = "loaded_at"
+
+[[tests]]
+type = "composite"
+kind = "unique"
+columns = [
+    "client_id",
+    "day",
+]
+
+[[tests]]
+type = "expression"
+expression = "revenue_eur >= 0"
+severity = "error"

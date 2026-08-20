@@ -112,8 +112,9 @@ Be precise about this. The live run proves:
   worker's own design (`current_timestamp AS loaded_at`, `coalesce(is_refund,
   false) = false`, explicit NULL guards) — it differs from the recorded
   `draft_model` SQL, so it is genuine authorship, and it cleared compile, the
-  declarative grain + expression tests (`rocky test --declarative`), the
-  product-bound plan, human review, and the digest-gated apply.
+  declarative tests (`rocky test --declarative` — the banked run: 2 tests, all
+  pass, 0 failed, 0 errored), the product-bound plan, human review, and the
+  digest-gated apply.
 
 It does **not** prove that an agent can design a product spec from data alone.
 `briefs/elicitation.md` hands the worker an *example spec* — the exact columns,
