@@ -58,6 +58,12 @@ agent = "propose_only"
 const DRAFT_SQL: &str =
     "SELECT 1::BIGINT AS client_id, now() AS loaded_at, 1.5::DOUBLE AS revenue_eur";
 
+/// A draft that violates the Phase-A contract (required column
+/// `revenue_eur` missing → E010), so the runner's own verify bundle
+/// comes back red on the compile leg and the machine enters a repair
+/// round (#1493).
+const BAD_DRAFT_SQL: &str = "SELECT 1::BIGINT AS client_id, now() AS loaded_at";
+
 fn rocky_toml() -> String {
     r#"[adapter]
 type = "duckdb"
@@ -98,21 +104,43 @@ session = "replay/session.json"
     .to_string()
 }
 
+/// One recorded `draft_model` call authoring `sql`.
+fn draft_model_call(sql: &str) -> serde_json::Value {
+    serde_json::json!({
+        "tool": "draft_model",
+        "arguments": {
+            "name": PRODUCT,
+            "sql": sql,
+            "intent": "Daily gross revenue per client in EUR"
+        },
+        "expect": "ok"
+    })
+}
+
 /// Build the recorded session: the elicitation hand-off (with the REAL
 /// digest over the candidate bytes) and the drafting `draft_model`
 /// call. `extra_drafting_calls` prepends privilege-gate probes.
 fn session_json(extra_drafting_calls: &[serde_json::Value]) -> String {
-    let digest = rocky_core::product::spec::spec_digest(CANDIDATE_SPEC.as_bytes());
     let mut drafting_calls = extra_drafting_calls.to_vec();
-    drafting_calls.push(serde_json::json!({
-        "tool": "draft_model",
-        "arguments": {
-            "name": PRODUCT,
-            "sql": DRAFT_SQL,
-            "intent": "Daily gross revenue per client in EUR"
-        },
-        "expect": "ok"
-    }));
+    drafting_calls.push(draft_model_call(DRAFT_SQL));
+    session_json_with_tasks(&drafting_calls, &drafting_calls.clone())
+}
+
+/// A session whose drafting round authors `drafting_sql` and whose
+/// repair round authors `repair_sql` — the repair drills record a red
+/// first draft and a fixing (or still-red) repair.
+fn session_json_with_repair(drafting_sql: &str, repair_sql: &str) -> String {
+    session_json_with_tasks(
+        &[draft_model_call(drafting_sql)],
+        &[draft_model_call(repair_sql)],
+    )
+}
+
+fn session_json_with_tasks(
+    drafting_calls: &[serde_json::Value],
+    repair_calls: &[serde_json::Value],
+) -> String {
+    let digest = rocky_core::product::spec::spec_digest(CANDIDATE_SPEC.as_bytes());
     serde_json::json!({
         "mcp_command": [env!("CARGO_BIN_EXE_rocky"), "mcp", "--profile", "worker"],
         "tasks": {
@@ -125,14 +153,10 @@ fn session_json(extra_drafting_calls: &[serde_json::Value]) -> String {
                 }
             },
             "drafting": { "calls": drafting_calls },
-            "repair": { "calls": drafting_calls_clone(&drafting_calls) }
+            "repair": { "calls": repair_calls }
         }
     })
     .to_string()
-}
-
-fn drafting_calls_clone(calls: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    calls.to_vec()
 }
 
 /// A COLD scratch project: config + models/_defaults.toml + the session.
@@ -583,6 +607,92 @@ fn phase_a_tamper_blocks_at_the_byte_verify() {
     assert!(
         !dir.join(".rocky").join("plans").exists(),
         "no plan may reach the store before the byte-verify clears"
+    );
+}
+
+/// The journal's state walk, consecutive repeats collapsed (ownership
+/// stamps and releases keep the state they annotate).
+fn deduped_states(rows: &[rocky_core::fulfill::FulfillJournalRow]) -> Vec<&str> {
+    let mut sequence: Vec<&str> = Vec::new();
+    for row in rows {
+        if sequence.last() != Some(&row.to_state.as_str()) {
+            sequence.push(row.to_state.as_str());
+        }
+    }
+    sequence
+}
+
+/// #1493: a red verify enters a repair round, and the repair driver's
+/// `draft_model` legitimately rewrites the merged sidecar (parse,
+/// re-serialize, overwrite). The loop dispatched that write itself, so
+/// it must treat it as authorized — reopen the drafting window through
+/// the staged commit — and converge, never mis-classify its own repair
+/// as tamper.
+#[test]
+#[ignore = "#1493: the repair round's sidecar rewrite is mis-blocked as tamper; fix lands next"]
+fn a_red_verify_repairs_and_converges() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_repair(BAD_DRAFT_SQL, DRAFT_SQL));
+
+    // Elicit, then approve the spec.
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", "approve-spec", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+
+    // ONE invocation: draft (red) → merge → verify red → repair round →
+    // re-merge → verify green → propose → the plan-review ask.
+    let (code, json, _o, e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "the repair round must recover, not block: {e}");
+    let json = json.expect("json");
+    assert_eq!(json["state"], "needs_input", "{json}");
+    let plan_id = json["plan_id"].as_str().expect("plan pinned").to_string();
+
+    // The journal shows BOTH drafting windows and exactly one repair.
+    {
+        let store = state_store(dir);
+        let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+        assert_eq!(
+            deduped_states(&rows),
+            vec![
+                "init",
+                "needs_input",
+                "spec_approved",
+                "lowered_contract",
+                "drafting",
+                "merged",
+                "verifying",
+                "drafting", // the repair round reopens the window
+                "merged",
+                "verifying",
+                "proposed",
+                "needs_input",
+            ],
+            "one repair round, then convergence"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.event.starts_with("repair round"))
+                .count(),
+            1,
+            "exactly one repair dispatch: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.to_state == "blocked"),
+            "the loop's own repair write must never be classified as tamper: {rows:?}"
+        );
+    }
+
+    // The REPAIRED draft is what reaches the warehouse — not the red one.
+    approve_and_apply(dir, &plan_id);
+    let conn = duckdb::Connection::open(dir.join("wh.duckdb")).expect("duckdb");
+    let revenue: f64 = conn
+        .query_row("SELECT revenue_eur FROM out.revenue_daily", [], |r| r.get(0))
+        .expect("applied row");
+    assert!(
+        revenue > 0.0,
+        "the repaired SQL applied, not the red draft (revenue_eur = {revenue})"
     );
 }
 
