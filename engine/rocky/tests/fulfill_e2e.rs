@@ -739,6 +739,12 @@ fn out_of_band_tamper_during_the_repair_window_still_blocks() {
             && message.contains("content drift"),
         "the CONTRACT drift is what blocks: {json}"
     );
+    // The LOOP's byte-verify fired, not the substrate's Phase-B
+    // backstop — same layer pin as the round-1 tamper drill.
+    assert!(
+        !message.contains("phase B rejected"),
+        "the pre-Phase-B byte-verify must answer first: {json}"
+    );
 
     let store = state_store(dir);
     let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
@@ -871,6 +877,13 @@ fn a_repair_that_stays_red_exhausts_the_budget_and_blocks() {
             "repair round {round} dispatched exactly once: {rows:?}"
         );
     }
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.event.starts_with("repair round"))
+            .count(),
+        3,
+        "the budget is EXACTLY 3 rounds — never a fourth dispatch: {rows:?}"
+    );
     assert!(
         !rows.iter().any(|r| r.to_state == "proposed"),
         "a red bundle never proposes: {rows:?}"
