@@ -687,7 +687,9 @@ fn a_red_verify_repairs_and_converges() {
     approve_and_apply(dir, &plan_id);
     let conn = duckdb::Connection::open(dir.join("wh.duckdb")).expect("duckdb");
     let revenue: f64 = conn
-        .query_row("SELECT revenue_eur FROM out.revenue_daily", [], |r| r.get(0))
+        .query_row("SELECT revenue_eur FROM out.revenue_daily", [], |r| {
+            r.get(0)
+        })
         .expect("applied row");
     assert!(
         revenue > 0.0,
@@ -808,7 +810,9 @@ fn tamper_before_the_reopen_blocks_at_the_reopen() {
         .join(".rocky/fulfillment")
         .join(PRODUCT)
         .join("transcripts");
-    let transcripts_before = std::fs::read_dir(&transcripts).expect("transcripts").count();
+    let transcripts_before = std::fs::read_dir(&transcripts)
+        .expect("transcripts")
+        .count();
 
     // Resume: the reopen verifies the merged manifest in full and
     // refuses — blocked as tamper, with NO further driver dispatch.
@@ -824,7 +828,9 @@ fn tamper_before_the_reopen_blocks_at_the_reopen() {
         "the sidecar drift is what blocks: {json}"
     );
     assert_eq!(
-        std::fs::read_dir(&transcripts).expect("transcripts").count(),
+        std::fs::read_dir(&transcripts)
+            .expect("transcripts")
+            .count(),
         transcripts_before,
         "the reopen blocked BEFORE dispatching another worker"
     );

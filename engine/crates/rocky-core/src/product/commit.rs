@@ -1677,16 +1677,15 @@ mod tests {
             );
         let edited = parse_spec_bytes(edited_text.as_bytes(), SPEC_PATH).expect("valid");
         assert_ne!(edited.digest, parsed.digest);
-        let error =
-            reopen_for_drafting(&project, SPEC_PATH, &edited).expect_err("superseded");
+        let error = reopen_for_drafting(&project, SPEC_PATH, &edited).expect_err("superseded");
         assert_eq!(error.code, "spec-superseded");
         assert!(error.message.contains(&parsed.digest), "{error}");
         assert!(error.message.contains(&edited.digest), "{error}");
 
         // A manifest recorded under another spec path is a foreign
         // generation identity.
-        let error = reopen_for_drafting(&project, "products/elsewhere.toml", &parsed)
-            .expect_err("foreign");
+        let error =
+            reopen_for_drafting(&project, "products/elsewhere.toml", &parsed).expect_err("foreign");
         assert_eq!(error.code, "reopen-foreign-generation");
         assert!(error.message.contains("spec_path"), "{error}");
 
