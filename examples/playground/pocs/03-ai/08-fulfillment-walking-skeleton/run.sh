@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fulfillment walking skeleton — the whole loop, end to end, one binary.
+# Fulfillment walking skeleton — the loop's happy path end to end, one binary.
+# (Repair recovery is a known engine gap, #1493 — see README; not exercised here.)
 #
 # `set -uo pipefail` (NOT -e): this POC asserts FAILURE paths, so expected
 # non-zero exits are captured explicitly (`; echo EXIT=$?`) and checked. Every

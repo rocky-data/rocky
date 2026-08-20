@@ -8,7 +8,8 @@
 ## What it shows
 
 One product goes from nothing to a live table, driven by one binary. You write no
-SQL and pre-create no spec. `rocky fulfill revenue_daily` runs the whole loop:
+SQL and pre-create no spec. `rocky fulfill revenue_daily` drives the loop's happy
+path end to end:
 
 ```
 elicit spec ─▶ human approves spec ─▶ lower to contract ─▶ agent drafts SQL
@@ -19,7 +20,9 @@ Every step that could let an agent change the warehouse without a human is a rea
 engine gate, and this POC drives each one and checks it holds. The default
 `./run.sh` uses a **recorded** worker session (no network, no key), so it runs in
 CI. `./run-live.sh` swaps in a **real** worker (`claude -p`) that writes the SQL
-itself.
+itself. Scope: this POC covers the happy path and every gate above — it does NOT
+exercise repair recovery (a red verify → retry), which is a known engine gap
+(#1493, see below).
 
 ## Why it's distinctive
 
@@ -46,6 +49,13 @@ itself.
   completion gate. Its precise scope — what is genuine authorship and what is
   brief-provided grounding — is in "What the live lane proves" below; do not read
   it as an agent designing the whole product spec unaided.
+- **Repair recovery is NOT exercised — a known engine gap (#1493).** When the
+  runner's verify goes red it dispatches a *repair* round, whose `draft_model`
+  legitimately rewrites the merged sidecar; the artifact byte-check then compares
+  that rewrite against Phase B's pre-repair hash and mis-classifies it as
+  `tampered`. So both lanes use an empty `repair.calls` / rely on the first draft
+  being green, and the POC's claim is bounded to the happy path plus every gate.
+  Repair recovery lands when #1493 is fixed in the engine (not fixed here).
 - **Freshness is observed, not enforced.** Assert 10 shows the loop *reporting*
   staleness (lag vs budget) after the data is aged. Staleness is a finding in the
   loop's journal; it never blocks an apply. This POC makes no claim that Rocky
@@ -66,8 +76,10 @@ rocky product --help   # must succeed — run.sh fail-fasts if it does not
 ```
 
 `run.sh` runs whatever `rocky` is on `PATH` and stops with a clear message if the
-binary is too old. This POC will be picked up by the credential-free smoke lane
-(`run-all-duckdb.sh`) once an engine release ships these verbs.
+binary is too old. Activation is ON MERGE, not release-gated: `run-all-duckdb.sh`
+globs every `pocs/*/*/run.sh` immediately, and the weekly CI job builds `rocky`
+from source before running the catalog — so a merged commit that carries these
+verbs is smoke-tested on the next weekly run regardless of any release.
 
 ## Layout
 
@@ -99,8 +111,9 @@ Be precise about this. The live run proves:
 - **The worker authors the SQL itself.** The banked `worker_authored.sql` is the
   worker's own design (`current_timestamp AS loaded_at`, `coalesce(is_refund,
   false) = false`, explicit NULL guards) — it differs from the recorded
-  `draft_model` SQL, so it is genuine authorship, and it cleared compile, test,
-  the product-bound plan, human review, and the digest-gated apply.
+  `draft_model` SQL, so it is genuine authorship, and it cleared compile, the
+  declarative grain + expression tests (`rocky test --declarative`), the
+  product-bound plan, human review, and the digest-gated apply.
 
 It does **not** prove that an agent can design a product spec from data alone.
 `briefs/elicitation.md` hands the worker an *example spec* — the exact columns,
@@ -150,5 +163,5 @@ with 6 refusal paths exercised (negatives, policy, supersession, backstop, stale
 | 6 | Edit doesn't supersede; re-approval does | D2 fence: `approve-spec` re-enters `spec_approved`, orphaning the old plan |
 | 7 | Bare apply refuses; review → loop applies | require-review policy gate + `rocky review --approve` marker |
 | 8 | Wrong `--expect-spec-digest` refused | the engine's digest backstop (bypasses the loop; `rocky apply` direct) |
-| 9 | Composite-unique grain test ran green | the generated `[[tests]] type=composite kind=unique` on `[client_id, day]` |
+| 9 | Composite-unique grain test RAN green (declarative) | `rocky test --declarative` executes the generated `[[tests]] type=composite kind=unique` on `[client_id, day]` against the warehouse (plain `rocky test` runs only the model) |
 | 10 | Staleness observed after backdating | the runner's observation phase (MAX(time_column) vs budget), reported not enforced |

@@ -154,10 +154,14 @@ echo; echo "[live 4/4] the worker's OWN output passes the same gates (asserts 5,
 # 7: the warehouse table exists with rows
 ROWS="$(duckdb -csv -noheader wh.duckdb "SELECT COUNT(*) FROM out.${PRODUCT}" 2>/dev/null)"
 [ "${ROWS:-0}" -ge 1 ] || die "no rows materialised from the worker's model"
-# 9: the model's tests run green
-code=$(rj live_test.json test --models models/)
-[ "$(jq -r '.failed' live_test.json)" = "0" ] || die "the worker's model failed its own tests"
-echo "    OK  plan product-bound; out.${PRODUCT} has $ROWS row(s); tests green"
+# 9: the generated composite-unique grain test RUNS green (declarative, against
+# the warehouse). Plain `rocky test` runs only the model; --declarative runs the
+# sidecar [[tests]]. This is the banked runner_reverify_test.json.
+code=$(rj live_test.json test --models models/ --declarative)
+[ "$(jq -r '.declarative.failed // 1' live_test.json)" = "0" ] || die "the worker's model failed a declarative test: $(jq -c '.declarative.results[]?|select(.status!="pass")' live_test.json)"
+jq -e '.declarative.results[] | select(.test_type == "composite" and .status == "pass")' live_test.json >/dev/null \
+  || die "the composite-unique grain test did not run and pass under --declarative"
+echo "    OK  plan product-bound; out.${PRODUCT} has $ROWS row(s); declarative grain test green"
 
 # --- Bank the evidence bundle (committed under expected/live/). ---
 echo; echo "Banking the evidence bundle -> $BUNDLE"
