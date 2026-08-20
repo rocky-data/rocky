@@ -50,7 +50,7 @@ cd pocs/02-performance/01-incremental-watermark
 
 **Prerequisites:** the Rocky CLI on your `PATH`. Many POCs also use the [DuckDB CLI](https://duckdb.org) to load seed data (`brew install duckdb`).
 
-**88 of 100 POCs run with no external credentials.** See each POC's README for prerequisites.
+**89 of 101 POCs run with no external credentials.** See each POC's README for prerequisites.
 
 ## The catalog
 
@@ -117,7 +117,7 @@ How Rocky avoids rebuilding what has not changed. These POCs cover the increment
 | [13-estimate-explain-cost](pocs/02-performance/13-estimate-explain-cost) | `rocky estimate` runs each model's SELECT through DuckDB `EXPLAIN` — row estimates, join strategy, filter pushdown — as a pure dry-run, no tables materialized |
 | [14-skip-unchanged](pocs/02-performance/14-skip-unchanged) | `rocky run --skip-unchanged` — opt-in model-skip gate: unchanged logic + unchanged upstream data ⇒ SKIP (`tables_skipped: 1`); mutate the upstream ⇒ BUILD. Best-effort, default-off, fail-safe |
 
-### 03 — AI (7 POCs · `ANTHROPIC_API_KEY` for 01–05, DuckDB for 06–07)
+### 03 — AI (8 POCs · `ANTHROPIC_API_KEY` for 01–05, DuckDB for 06–08; 08's `run-live.sh` also uses `ANTHROPIC_API_KEY`)
 
 How Rocky keeps a language model honest. A generated model goes through the compiler first, and Rocky writes it only when it type-checks.
 
@@ -130,6 +130,7 @@ How Rocky keeps a language model honest. A generated model goes through the comp
 | [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
 | [06-mcp-grounding](pocs/03-ai/06-mcp-grounding) | `rocky mcp` server — a schema-only model compiles but reconciles wrong; sampling the data via the MCP tools fixes it (creds-free `run.sh`) |
 | [07-policy](pocs/03-ai/07-policy) | `rocky policy test` — scenario assertions pin an agent `[policy]` so a careless edit that opens a hole becomes a red CI check (creds-free `run.sh`) |
+| [08-fulfillment-walking-skeleton](pocs/03-ai/08-fulfillment-walking-skeleton) | `rocky fulfill` — the whole spec → lower → human gate → digest-gated apply loop on one binary; creds-free replay `run.sh` (10 asserts + mutation pass), plus `run-live.sh` where a real `claude -p` worker drafts it end to end |
 
 ### 04 — Governance (11 POCs · Databricks / DuckDB)
 

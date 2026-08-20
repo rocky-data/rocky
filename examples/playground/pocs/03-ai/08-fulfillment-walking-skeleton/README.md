@@ -78,11 +78,24 @@ data/warehouse_seed.sql    # the same rows, seeded into the persistent wh.duckdb
 replay/candidate_spec.toml # the spec the recorded worker "proposed" (source of the session digest)
 replay/session.json        # the recorded worker session, replayed against `rocky mcp --profile worker`
 broken-specs/*.toml        # 6 one-fault specs for assert 3 (the negative lowering cases)
+briefs/elicitation.md      # live lane only: grounds the worker in the exact closed spec schema
 run.sh                     # the replay lane — 10 asserts, credential-free, exits 0 in < 10s
 run-live.sh                # the live lane — a real `claude -p` worker (needs ANTHROPIC_API_KEY)
 mutation-pass.sh           # disables one gate per assert and shows each assert FAIL (the ledger)
 expected/live/             # the banked live-run evidence bundle (committed)
 ```
+
+### A finding from the live lane
+
+A cold worker gets no intent and no source list, and the *compiled* elicitation
+brief says "Rocky types" without enumerating them — so a live worker first
+emitted warehouse type names (`DATE`, `BIGINT`) and extra keys, which the closed
+spec schema rejects at Phase A. `briefs/elicitation.md` is a project-level
+`[fulfill] briefs_dir` override that states the exact schema (Rocky type
+vocabulary, three-part source triple, the freshness rule). With it, a real
+`claude -p` worker produces a schema-valid spec and the loop converges. The
+override is legitimate grounding, not a pre-arranged answer — the worker still
+samples the data and designs the columns, grain, checks, and SQL itself.
 
 ## Run
 
