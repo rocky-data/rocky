@@ -324,17 +324,31 @@ pub fn contained_write_target(project_root: &Path, rel: &str) -> Result<PathBuf,
 /// the O_EXCL create retried once.
 fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    create_new_no_follow(path)?.write_all(bytes)
+    // `None` keeps the process default (0666 & umask) these staged
+    // artifacts have always been created with — they are renamed into place
+    // as the user's own project files.
+    create_new_no_follow(path, None)?.write_all(bytes)
 }
 
 /// The open half of [`write_new_no_follow`], handing back the handle so a
 /// caller can also set the mode on the descriptor rather than by path.
-fn create_new_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+fn create_new_no_follow(path: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
     let open = || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // A caller that will set the final mode itself creates restrictively
+        // first, so the file is never briefly WIDER than its source: a
+        // `0600` original copied under the default `0666 & umask` would be
+        // world-readable for the length of the write, and stay that way if
+        // the later chmod fails.
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        options.open(path)
     };
     match open() {
         Ok(file) => Ok(file),
@@ -359,6 +373,14 @@ fn create_new_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 ///
 /// The mode comes off the DESCRIPTOR, not a second path lookup, so it
 /// describes the same file the bytes came from.
+/// The largest artifact this module will back up.
+///
+/// The files copied here are a lowered contract, sidecar, SQL model, and
+/// manifest — kilobytes. `std::fs::copy` streamed, so it could not be made
+/// to exhaust memory; reading whole can be, which is why the size is
+/// bounded rather than trusted.
+const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
+
 fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions)> {
     use std::io::Read as _;
     let mut options = std::fs::OpenOptions::new();
@@ -366,13 +388,55 @@ fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
+        // O_NONBLOCK as well as O_NOFOLLOW: opening a FIFO for reading
+        // blocks until a writer appears, so a raced FIFO would hang the
+        // commit here forever. With O_NONBLOCK the open returns and the
+        // regular-file check below refuses it.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = options.open(path)?;
-    let permissions = file.metadata()?.permissions();
+    let file = options.open(path)?;
+
+    // Check the DESCRIPTOR, not the path — the thing already opened cannot
+    // be swapped underneath this check. `std::fs::copy` refused a
+    // non-regular source; reading by hand has to refuse it explicitly, or a
+    // raced FIFO or device becomes an unbounded read.
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to back up {} — not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.len() > MAX_BACKUP_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to back up {} — {} bytes exceeds the {MAX_BACKUP_BYTES}-byte limit",
+                path.display(),
+                metadata.len()
+            ),
+        ));
+    }
+
+    // Bounded read even so: `len()` is a snapshot, and a writer can extend
+    // the file between the check and the read. One byte over the limit is
+    // enough to detect the overrun.
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    Ok((bytes, permissions))
+    let mut limited = file.take(MAX_BACKUP_BYTES + 1);
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_BACKUP_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to back up {} — it grew past the {MAX_BACKUP_BYTES}-byte limit while being read",
+                path.display()
+            ),
+        ));
+    }
+    Ok((bytes, metadata.permissions()))
 }
 
 /// Copy `src` to `dst` without following a symlink at EITHER end.
@@ -388,11 +452,48 @@ fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions
 ///
 /// The files copied here are a lowered contract, sidecar, SQL model, and
 /// manifest — kilobytes — so reading one whole is cheaper than streaming.
+/// [`read_no_follow`] bounds that read rather than trusting the size.
+///
+/// The mode carried across is masked to `0o777`. `std::fs::copy` propagates
+/// the source mode verbatim, which is safe when the destination is the
+/// caller's own file — but here the source is attacker-influenceable and the
+/// destination is created as Rocky. Racing in a `04755` source would
+/// otherwise produce a ROCKY-OWNED SETUID backup, which a rollback then
+/// renames over the final. Set-user-ID and set-group-ID are dropped;
+/// nothing this module backs up is executable, let alone privileged.
+///
+/// Every failure after the destination exists removes it. A half-written or
+/// wrongly-permissioned `.ff-prev` left on disk is not inert: recovery
+/// restores a backup it finds there.
 fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
-    use std::io::Write as _;
     let (bytes, permissions) = read_no_follow(src)?;
-    let mut backup = create_new_no_follow(dst)?;
-    backup.write_all(&bytes)?;
+    let backup = create_new_no_follow(dst, Some(0o600))?;
+    match write_backup(backup, &bytes, permissions) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Best-effort: if this unlink fails the caller still sees the
+            // original error, which is the one that explains the refusal.
+            let _ = std::fs::remove_file(dst);
+            Err(error)
+        }
+    }
+}
+
+/// Write the backup body and apply its mode, both on the DESCRIPTOR so a
+/// link swapped in at the destination afterwards cannot catch a path-based
+/// operation. Split out so [`copy_no_follow`] has one cleanup path.
+fn write_backup(
+    mut backup: std::fs::File,
+    bytes: &[u8],
+    permissions: std::fs::Permissions,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    backup.write_all(bytes)?;
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::Permissions::from_mode(permissions.mode() & 0o777)
+    };
     backup.set_permissions(permissions)
 }
 
@@ -1676,6 +1777,78 @@ mod tests {
             std::fs::metadata(&prev).expect("meta").permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// Set-user-ID must never survive the copy.
+    ///
+    /// `std::fs::copy` propagates the source mode verbatim. That is safe
+    /// when the destination is the caller's own file, but here the source is
+    /// attacker-influenceable and the destination is created as Rocky: a
+    /// raced `04755` source would produce a ROCKY-OWNED SETUID backup, which
+    /// a rollback then renames over the final.
+    ///
+    /// The mode assertion in the test above masks `& 0o777`, so it cannot
+    /// see these bits at all — this one asserts the UNMASKED mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_drops_setuid_and_setgid_from_the_source_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        std::fs::write(&final_path, b"contract bytes").expect("write");
+        // setuid + setgid + sticky, all three, plus 0755.
+        std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o7755))
+            .expect("chmod");
+        let prev = prev_sibling(&final_path);
+
+        copy_no_follow(&final_path, &prev).expect("copy");
+
+        let mode = std::fs::metadata(&prev).expect("meta").permissions().mode();
+        assert_eq!(
+            mode & 0o7000,
+            0,
+            "setuid/setgid/sticky must not be carried onto a Rocky-created \
+             backup (mode was {mode:o})"
+        );
+        assert_eq!(mode & 0o777, 0o755, "the ordinary permission bits carry");
+    }
+
+    /// A non-regular source is refused, and refused WITHOUT blocking.
+    ///
+    /// `std::fs::copy` rejected non-regular sources; reading by hand has to
+    /// refuse them explicitly. A FIFO raced into place would otherwise block
+    /// the open until a writer appeared — the commit hangs forever, with no
+    /// timeout anywhere above it.
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_refuses_a_fifo_source_instead_of_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        std::fs::remove_file(&final_path).ok();
+        let c_path = std::ffi::CString::new(final_path.as_os_str().as_encoded_bytes())
+            .expect("path has no interior nul");
+        // SAFETY: `mkfifo` with a valid NUL-terminated path and a mode is
+        // sound; the worst case is a failure return, asserted below.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let prev = prev_sibling(&final_path);
+
+        // The assertion is that this RETURNS. Before O_NONBLOCK it would
+        // block here until a writer opened the FIFO, which never happens.
+        let error = copy_no_follow(&final_path, &prev).expect_err("a FIFO source is refused");
+
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "expected the regular-file refusal, got: {error}"
+        );
+        assert!(!prev.exists(), "a refused copy must leave no backup behind");
     }
 
     #[cfg(unix)]
