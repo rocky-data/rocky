@@ -1552,6 +1552,148 @@ mod tests {
         assert_eq!(leftovers(&project), Vec::<String>::new());
     }
 
+    // ------------------- the drafting-window reopen (#1493) -----------------
+
+    #[test]
+    fn reopen_demotes_a_verified_merged_generation_to_phase_a() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        full_flow(&project, &parsed);
+        let before = snapshot(&project);
+
+        let outcome = reopen_for_drafting(&project, SPEC_PATH, &parsed).expect("reopens");
+        assert_eq!(outcome, ReopenOutcome::Reopened);
+
+        // The manifest is Phase A again: contract-only artifact set, so
+        // the sidecar is back in the drafting namespace.
+        let manifest = committed(&project);
+        assert_eq!(manifest.phase, ManifestPhase::LoweredContract);
+        assert_eq!(
+            manifest.artifacts.keys().collect::<Vec<_>>(),
+            vec!["models/revenue_daily.contract.toml"]
+        );
+
+        // ONLY the manifest changed: every model file kept its exact
+        // bytes, nothing appeared, nothing vanished.
+        let after = snapshot(&project);
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>(),
+            "no files created or removed"
+        );
+        let changed: Vec<&String> = before
+            .iter()
+            .filter(|(name, bytes)| after.get(*name) != Some(bytes))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            changed,
+            vec![".rocky/fulfillment/revenue_daily/lowering-manifest.json"],
+            "the reopen writes the manifest and nothing else"
+        );
+
+        // Round-trip: the next Phase B re-merges and re-records the
+        // sidecar hash transactionally.
+        run_phase_b(&project, SPEC_PATH, &parsed).expect("phase B re-commits");
+        assert_eq!(committed(&project).phase, ManifestPhase::Merged);
+        assert_eq!(leftovers(&project), Vec::<String>::new());
+    }
+
+    #[test]
+    fn reopen_refuses_a_drifted_artifact_without_mutating() {
+        // Drift in EITHER committed artifact between the merge and the
+        // reopen had no authorized writer: tamper, refused, untouched.
+        for tampered_rel in [
+            "models/revenue_daily.toml",
+            "models/revenue_daily.contract.toml",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let project = seeded_project(dir.path());
+            let parsed = parsed_d3();
+            full_flow(&project, &parsed);
+            let path = project.join(tampered_rel);
+            let mut text = std::fs::read_to_string(&path).expect("read");
+            text.push_str("\n# out-of-band edit\n");
+            write_file(&path, text.as_bytes());
+            let before = snapshot(&project);
+
+            let outcome = reopen_for_drafting(&project, SPEC_PATH, &parsed).expect("runs");
+            let ReopenOutcome::Tampered(problems) = outcome else {
+                panic!("expected Tampered for {tampered_rel}, got {outcome:?}");
+            };
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains(tampered_rel) && p.contains("content drift")),
+                "{tampered_rel}: {problems:?}"
+            );
+            assert_eq!(snapshot(&project), before, "a refusal mutates nothing");
+            assert_eq!(
+                committed(&project).phase,
+                ManifestPhase::Merged,
+                "the merged manifest is never demoted over drifted bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn reopen_is_not_needed_before_the_merge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+
+        // No committed manifest at all: nothing to demote.
+        assert_eq!(
+            reopen_for_drafting(&project, SPEC_PATH, &parsed).expect("runs"),
+            ReopenOutcome::NotNeeded
+        );
+
+        // A committed Phase-A manifest: the window is already open.
+        run_phase_a(&project, SPEC_PATH, &parsed).expect("phase A");
+        let before = snapshot(&project);
+        assert_eq!(
+            reopen_for_drafting(&project, SPEC_PATH, &parsed).expect("runs"),
+            ReopenOutcome::NotNeeded
+        );
+        assert_eq!(snapshot(&project), before, "not-needed writes nothing");
+    }
+
+    #[test]
+    fn reopen_refuses_a_superseded_or_foreign_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        full_flow(&project, &parsed);
+        let before = snapshot(&project);
+
+        // The spec moved after the merge: refuse, never demote spec A's
+        // generation under spec B.
+        let edited_text = String::from_utf8(SPEC_FIXTURE.to_vec())
+            .expect("utf-8")
+            .replace(
+                r#"checks = ["revenue_eur >= 0"]"#,
+                r#"checks = ["revenue_eur > 0"]"#,
+            );
+        let edited = parse_spec_bytes(edited_text.as_bytes(), SPEC_PATH).expect("valid");
+        assert_ne!(edited.digest, parsed.digest);
+        let error =
+            reopen_for_drafting(&project, SPEC_PATH, &edited).expect_err("superseded");
+        assert_eq!(error.code, "spec-superseded");
+        assert!(error.message.contains(&parsed.digest), "{error}");
+        assert!(error.message.contains(&edited.digest), "{error}");
+
+        // A manifest recorded under another spec path is a foreign
+        // generation identity.
+        let error = reopen_for_drafting(&project, "products/elsewhere.toml", &parsed)
+            .expect_err("foreign");
+        assert_eq!(error.code, "reopen-foreign-generation");
+        assert!(error.message.contains("spec_path"), "{error}");
+
+        assert_eq!(snapshot(&project), before, "refusals mutate nothing");
+        assert_eq!(committed(&project).phase, ManifestPhase::Merged);
+    }
+
     // ------------------------- crash and recovery ---------------------------
 
     #[test]

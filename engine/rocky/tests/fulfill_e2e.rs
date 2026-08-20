@@ -695,6 +695,188 @@ fn a_red_verify_repairs_and_converges() {
     );
 }
 
+/// The #1493 invariant: authorizing the loop's OWN repair write must not
+/// bless anyone else's. An out-of-band edit to a file the repair round
+/// does NOT write (the spec-owned contract), made while the repair
+/// window is open, is still caught and blocked as tamper.
+#[test]
+fn out_of_band_tamper_during_the_repair_window_still_blocks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_repair(BAD_DRAFT_SQL, DRAFT_SQL));
+
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", "approve-spec", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+
+    // Crash right after the REPAIR driver finished — the window is
+    // reopened and the sidecar legitimately rewritten, but the
+    // byte-verify has not run yet.
+    let (code, _j, _o, _e) = rocky_env(
+        dir,
+        &["fulfill", PRODUCT],
+        &[("ROCKY_FULFILL_FAULT", "post-repair-drafting")],
+    );
+    assert_ne!(code, 0, "the fault aborts the process");
+
+    // Tamper the spec-owned contract while the loop is down: the repair
+    // window authorizes the WORKER's sidecar/SQL writes, never this.
+    let contract = dir.join(format!("models/{PRODUCT}.contract.toml"));
+    let mut bytes = std::fs::read_to_string(&contract).expect("read contract");
+    bytes.push_str("\n# tampered during the repair window\n");
+    std::fs::write(&contract, bytes).expect("tamper");
+
+    // Resume: the byte-verify catches the contract drift → blocked.
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 2, "blocked exits 2");
+    let json = json.expect("json");
+    assert_eq!(json["state"], "blocked", "{json}");
+    let message = json["message"].as_str().unwrap();
+    assert!(
+        message.contains("tampered")
+            && message.contains(&format!("models/{PRODUCT}.contract.toml"))
+            && message.contains("content drift"),
+        "the CONTRACT drift is what blocks: {json}"
+    );
+
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.event.starts_with("repair round"))
+            .count(),
+        1,
+        "the tamper happened inside a live repair round: {rows:?}"
+    );
+    let blocked_row = rows
+        .iter()
+        .find(|r| r.to_state == "blocked")
+        .expect("the blocked transition is journaled");
+    assert_eq!(
+        blocked_row.from_state.as_deref(),
+        Some("drafting"),
+        "caught in the drafting window, before Phase B"
+    );
+    for never in ["proposed", "plan_approved", "applying", "applied"] {
+        assert!(
+            !rows.iter().any(|r| r.to_state == never),
+            "'{never}' must never be reached after a repair-window tamper: {rows:?}"
+        );
+    }
+}
+
+/// The reopen itself fails closed: a crash lands between the repair CAS
+/// and the reopen (state = drafting, manifest still MERGED, no write
+/// authorized yet), the sidecar is edited while the loop is down, and
+/// the resume's reopen refuses to demote drifted bytes — blocked as
+/// tamper BEFORE any driver dispatch.
+#[test]
+fn tamper_before_the_reopen_blocks_at_the_reopen() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_repair(BAD_DRAFT_SQL, DRAFT_SQL));
+
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", "approve-spec", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+
+    // Crash after the repair transition is journaled, BEFORE the reopen.
+    let (code, _j, _o, _e) = rocky_env(
+        dir,
+        &["fulfill", PRODUCT],
+        &[("ROCKY_FULFILL_FAULT", "pre-repair-reopen")],
+    );
+    assert_ne!(code, 0, "the fault aborts the process");
+
+    // The merged sidecar is still hash-pinned (no window is open).
+    // Edit it out-of-band.
+    let sidecar = dir.join(format!("models/{PRODUCT}.toml"));
+    let mut bytes = std::fs::read_to_string(&sidecar).expect("read sidecar");
+    bytes.push_str("\n# tampered before the reopen\n");
+    std::fs::write(&sidecar, bytes).expect("tamper");
+
+    // Count the transcripts before the resume: elicitation + drafting.
+    let transcripts = dir
+        .join(".rocky/fulfillment")
+        .join(PRODUCT)
+        .join("transcripts");
+    let transcripts_before = std::fs::read_dir(&transcripts).expect("transcripts").count();
+
+    // Resume: the reopen verifies the merged manifest in full and
+    // refuses — blocked as tamper, with NO further driver dispatch.
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 2, "blocked exits 2");
+    let json = json.expect("json");
+    assert_eq!(json["state"], "blocked", "{json}");
+    let message = json["message"].as_str().unwrap();
+    assert!(
+        message.contains("tampered")
+            && message.contains(&format!("models/{PRODUCT}.toml"))
+            && message.contains("content drift"),
+        "the sidecar drift is what blocks: {json}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&transcripts).expect("transcripts").count(),
+        transcripts_before,
+        "the reopen blocked BEFORE dispatching another worker"
+    );
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    let blocked_row = rows
+        .iter()
+        .find(|r| r.to_state == "blocked")
+        .expect("the blocked transition is journaled");
+    assert_eq!(blocked_row.from_state.as_deref(), Some("drafting"));
+}
+
+/// A repair that never turns the verify green exhausts
+/// MAX_REPAIR_ROUNDS and blocks on the BUDGET — a plain red, never a
+/// tamper claim, with each round's reopen + re-merge journaled.
+#[test]
+fn a_repair_that_stays_red_exhausts_the_budget_and_blocks() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    // The repair rounds re-author the SAME red draft.
+    write_project(dir, &session_json_with_repair(BAD_DRAFT_SQL, BAD_DRAFT_SQL));
+
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", "approve-spec", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 2, "blocked exits 2");
+    let json = json.expect("json");
+    assert_eq!(json["state"], "blocked", "{json}");
+    let message = json["message"].as_str().unwrap();
+    assert!(
+        message.contains("verification red after 3 repair rounds"),
+        "the budget is what blocks: {json}"
+    );
+    assert!(
+        !message.contains("tampered"),
+        "a red repair is never classified as tamper: {json}"
+    );
+
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    for round in 1..=3 {
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.event.starts_with(&format!("repair round {round} ")))
+                .count(),
+            1,
+            "repair round {round} dispatched exactly once: {rows:?}"
+        );
+    }
+    assert!(
+        !rows.iter().any(|r| r.to_state == "proposed"),
+        "a red bundle never proposes: {rows:?}"
+    );
+}
+
 #[test]
 fn snapshot_tamper_blocks_at_the_pre_apply_recompute() {
     let tmp = tempfile::tempdir().expect("tempdir");
