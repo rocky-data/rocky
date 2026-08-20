@@ -31,7 +31,8 @@ declare -a WHAT=(
   "6:skip the candidate edit so re-approval supersedes nothing"
   "7:skip rocky review --approve (no sign-off marker)"
   "8:pass the CORRECT digest where a wrong one is expected"
-  "9:inject a duplicate (client_id, day) row so the declarative composite test fails"
+  "9:inject a duplicate (client_id, day) row so the declarative composite test FAILS (failed!=0)"
+  "9e:append a malformed declaration (unique, no column) so the declarative run ERRORS (errored!=0)"
   "10:skip backdating so the data never goes stale"
 )
 
@@ -42,6 +43,8 @@ pass=0; total=0
 LEDGER=""
 for entry in "${WHAT[@]}"; do
   n="${entry%%:*}"; desc="${entry#*:}"
+  # The assert a mutation targets is the digits of its MUTATE value (so 9e -> 9).
+  expect="$(printf '%s' "$n" | tr -dc '0-9')"
   total=$((total + 1))
   # Fresh sandbox per mutation (each run mutates its own copy).
   RUN="$(mktemp -d)"
@@ -49,17 +52,17 @@ for entry in "${WHAT[@]}"; do
   ( cd "$RUN" && MUTATE="$n" bash run.sh ) > "$RUN/out.log" 2>&1
   rc=$?
   got="$(grep -oE "FAIL: [0-9]+" "$RUN/out.log" | head -1)"
-  if [ "$rc" != "0" ] && [ "$got" = "FAIL: $n" ]; then
-    echo "  [assert $n] PASS — mutation caught (exit $rc, '$got')"
+  if [ "$rc" != "0" ] && [ "$got" = "FAIL: $expect" ]; then
+    echo "  [assert $expect via MUTATE=$n] PASS — mutation caught (exit $rc, '$got')"
     echo "             gate broken: $desc"
-    LEDGER="${LEDGER}| ${n} | ${desc} | ${got} (exit ${rc}) | caught |"$'\n'
+    LEDGER="${LEDGER}| ${expect} (MUTATE=${n}) | ${desc} | ${got} (exit ${rc}) | caught |"$'\n'
     pass=$((pass + 1))
   else
-    echo "  [assert $n] LEAK — expected 'FAIL: $n', got '${got:-<none>}' (exit $rc)"
+    echo "  [assert $expect via MUTATE=$n] LEAK — expected 'FAIL: $expect', got '${got:-<none>}' (exit $rc)"
     echo "             gate broken: $desc"
     echo "             --- last 6 lines ---"
     tail -6 "$RUN/out.log" | sed 's/^/             /'
-    LEDGER="${LEDGER}| ${n} | ${desc} | ${got:-none} (exit ${rc}) | LEAK |"$'\n'
+    LEDGER="${LEDGER}| ${expect} (MUTATE=${n}) | ${desc} | ${got:-none} (exit ${rc}) | LEAK |"$'\n'
   fi
   rm -rf "$RUN"
 done
@@ -68,6 +71,6 @@ echo
 echo "Ledger (assert | broken gate | observed | verdict):"
 printf '%s' "$LEDGER"
 echo
-echo "Mutation pass: $pass / $total asserts are non-vacuous."
-[ "$pass" = "$total" ] || { echo "MUTATION PASS INCOMPLETE — $((total - pass)) assert(s) did not catch their mutation."; exit 1; }
-echo "All asserts catch a broken gate. The replay lane is a real gate exerciser."
+echo "Mutation pass: $pass / $total gate mutations caught (10 asserts; assert 9 has two — errored + failed)."
+[ "$pass" = "$total" ] || { echo "MUTATION PASS INCOMPLETE — $((total - pass)) mutation(s) not caught."; exit 1; }
+echo "Every broken gate is caught. The replay lane is a real gate exerciser."

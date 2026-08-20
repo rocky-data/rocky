@@ -297,25 +297,34 @@ echo "    OK  loop applied -> observing; out.${PRODUCT} has $ROWS row(s)"
 # materialised data. Assert the composite-unique grain test was GENERATED (in
 # the merged sidecar) and that the model's tests RAN green — not just an overall
 # tally. The grain [client_id] is non-vacuous: two distinct clients materialised.
-echo; echo "[9] output validation: composite-unique grain test RUNS (declarative) + passes"
+echo; echo "[9] output validation: composite-unique grain test RUNS (declarative) + CLEAN"
 # MUTATION 9: inject a DUPLICATE (client_id, day) row into the materialised output
-# -> the declarative composite-unique test must FAIL. This mutates what the ENGINE
-# reads (the warehouse table), not a shell-visible sidecar line, so the failure is
-# the declarative gate itself, not a grep.
+# -> the declarative composite-unique test must FAIL (failed != 0). Mutates what
+# the ENGINE reads (the warehouse table), not a shell-visible sidecar line.
 mut 9 && duckdb wh.duckdb "INSERT INTO out.${PRODUCT} SELECT * FROM out.${PRODUCT} ORDER BY client_id, day LIMIT 1" >/dev/null 2>&1
+# MUTATION 9e: append a MALFORMED declaration (a `unique` test with no column) to
+# the sidecar -> it compiles but ERRORS at test time (errored != 0). Proves the
+# tightened errored==0 check is non-vacuous.
+mut 9e && printf '\n[[tests]]\ntype = "unique"\n' >> "models/${PRODUCT}.toml"
 # (a) the composite-unique test was GENERATED into the merged sidecar from the grain,
 grep -q 'type = "composite"' "models/${PRODUCT}.toml" && grep -q 'kind = "unique"' "models/${PRODUCT}.toml" \
   || fail "9 (no composite-unique grain test in the merged sidecar)"
-# (b) and it actually RUNS and PASSES. Plain `rocky test` executes only the model;
-# the sidecar [[tests]] run solely under --declarative (against the warehouse).
+# (b) and the declarative run is CLEAN. Plain `rocky test` executes only the model;
+# the sidecar [[tests]] run solely under --declarative (against the warehouse). A
+# clean run needs ALL of: 0 errored (no malformed declaration), 0 failed (no data
+# violation), the composite grain test PASSING, and a zero exit code.
 code=$(rj expected/09_test.json test --models models/ --declarative)
-DFAILED="$(jq -r '.declarative.failed // "err"' expected/09_test.json 2>/dev/null)"
-[ "$DFAILED" = "0" ] || fail "9 (declarative tests failed=$DFAILED: $(jq -c '.declarative.results[]? | select(.status != "pass")' expected/09_test.json 2>/dev/null))"
+DERR="$(jq -r '.declarative.errored // "err"' expected/09_test.json 2>/dev/null)"
+DFAIL="$(jq -r '.declarative.failed // "err"' expected/09_test.json 2>/dev/null)"
+[ "$DERR" = "0" ] || fail "9 (declarative tests ERRORED=$DERR — a malformed declaration: $(jq -c '.declarative.results[]? | select(.status=="error") | {test_type, detail}' expected/09_test.json 2>/dev/null))"
+[ "$DFAIL" = "0" ] || fail "9 (declarative tests failed=$DFAIL: $(jq -c '.declarative.results[]? | select(.status=="fail")' expected/09_test.json 2>/dev/null))"
 jq -e '.declarative.results[] | select(.test_type == "composite" and .status == "pass")' expected/09_test.json >/dev/null \
   || fail "9 (the composite-unique grain test did not run and pass under --declarative)"
+[ "$code" = "0" ] || fail "9 (rocky test --declarative exit $code despite errored=0 failed=0 — investigate)"
+DTOTAL="$(jq -r '.declarative.total' expected/09_test.json)"
 PAIRS="$(duckdb -csv -noheader wh.duckdb "SELECT COUNT(*) FROM (SELECT DISTINCT client_id, day FROM out.${PRODUCT})" 2>/dev/null)"
 [ "${PAIRS:-0}" -ge 3 ] || fail "9 (grain uniqueness is vacuous: <3 distinct (client_id, day) pairs)"
-echo "    OK  composite-unique grain test [client_id, day] RAN declaratively and passed over $PAIRS distinct pairs"
+echo "    OK  $DTOTAL declarative tests, all pass (0 failed, 0 errored); composite grain over $PAIRS distinct pairs"
 
 # ------------------------------------------------------------------ Assert 10
 # STALENESS (honest freshness NEGATIVE case; observed, not enforced). Fresh
