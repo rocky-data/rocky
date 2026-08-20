@@ -1588,6 +1588,34 @@ mod tests {
         );
     }
 
+    /// The wiring, not the helper.
+    ///
+    /// The two tests around this one call `copy_no_follow` directly, because
+    /// the vector is a TOCTOU race: the pre-check refuses a symlinked final,
+    /// so only a swap landing between that check and the copy reaches it, and
+    /// staging that deterministically needs a fault-injection hook this
+    /// module does not have. That leaves the call site itself unpinned —
+    /// reverting it to `std::fs::copy` keeps every one of those tests green,
+    /// which is exactly the regression this guard catches.
+    ///
+    /// The needle is assembled from fragments so this assertion cannot match
+    /// its own source text.
+    #[test]
+    fn the_backup_call_site_uses_the_no_follow_copy() {
+        let source = include_str!("commit.rs");
+        let banned = format!("std::fs::{}(&final_path", "copy");
+        assert!(
+            !source.contains(&banned),
+            "the .ff-prev backup must go through copy_no_follow: a plain \
+             copy follows a symlinked source swapped in after the pre-check"
+        );
+        let required = format!("copy_no_{}(&final_path, &prev)", "follow");
+        assert!(
+            source.contains(&required),
+            "expected the backup call site to call copy_no_follow"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_backup_copy_refuses_a_destination_swapped_for_a_symlink_after_the_check() {
