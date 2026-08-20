@@ -211,28 +211,72 @@ pub async fn run_watch(
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
 
     // First run is immediate so the user gets feedback without having to
-    // touch a file. A Ctrl-C during it stops the watcher: the signal was the
-    // user's, and the inner run consumed it (#1405).
-    if iter_once(
-        config_path,
-        filter,
-        pipeline_name_arg,
-        state_path,
-        governance_override,
-        output_json,
-        models_dir,
-        run_all,
-        shadow_config,
-        partition_opts,
-        cache_ttl_override,
-        env,
-        skip_opts,
-    )
-    .await
-    .interrupted
+    // touch a file.
+    //
+    // The run is RACED against the signal arms rather than plainly awaited.
+    // With the streams registered above, a signal arriving mid-run is only
+    // latched — nothing polls the streams while `iter_once` is in flight —
+    // and the replication path's own graceful arms (`run.rs`) exist only
+    // after its setup, while the transformation path has none at all. An
+    // un-raced await would therefore defer shutdown to the end of the
+    // iteration and make a stalled run unkillable by SIGTERM, where the
+    // pre-registration code died instantly on the default disposition.
+    // Racing restores prompt shutdown: the outer arm fires, the iteration
+    // future is dropped, and the process exits. Dropping mid-run is
+    // crash-parity — the state store's commit protocol and `InProgress`
+    // breadcrumbs are designed for exactly that — and is strictly cleaner
+    // than the old mid-run default-disposition kill.
     {
-        eprintln!("\n[watch] stopped");
-        return Ok(());
+        let first_run = iter_once(
+            config_path,
+            filter,
+            pipeline_name_arg,
+            state_path,
+            governance_override,
+            output_json,
+            models_dir,
+            run_all,
+            shadow_config,
+            partition_opts,
+            cache_ttl_override,
+            env,
+            skip_opts,
+        );
+        tokio::pin!(first_run);
+        let interrupted = tokio::select! {
+            outcome = &mut first_run => outcome.interrupted,
+            _ = &mut ctrl_c_signal => true,
+            Some(()) = async {
+                #[cfg(unix)]
+                {
+                    match sigint_stream.as_mut() {
+                        Some(stream) => stream.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending().await
+                }
+            } => true,
+            Some(()) = async {
+                #[cfg(unix)]
+                {
+                    match sigterm_stream.as_mut() {
+                        Some(stream) => stream.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending().await
+                }
+            } => true,
+        };
+        if interrupted {
+            eprintln!("\n[watch] stopped");
+            return Ok(());
+        }
     }
 
     // Steady-state loop: wait for an event, debounce, drain, re-run.
@@ -297,7 +341,13 @@ pub async fn run_watch(
                     .unwrap_or_default();
                 eprintln!("[watch] detected change: {display}");
 
-                if iter_once(
+                // Same race as the first run, for the same reason: a signal
+                // during the debounce sleep or the re-run is only latched by
+                // the streams above, and an un-raced await would defer
+                // shutdown to the end of the iteration (or forever, for a
+                // stalled one). A signal latched during the debounce fires
+                // here immediately, before the re-run starts.
+                let rerun = iter_once(
                     config_path,
                     filter,
                     pipeline_name_arg,
@@ -311,10 +361,39 @@ pub async fn run_watch(
                     cache_ttl_override,
                     env,
                     skip_opts,
-                )
-                .await
-                .interrupted
-                {
+                );
+                tokio::pin!(rerun);
+                let interrupted = tokio::select! {
+                    outcome = &mut rerun => outcome.interrupted,
+                    _ = &mut ctrl_c_signal => true,
+                    Some(()) = async {
+                        #[cfg(unix)]
+                        {
+                            match sigint_stream.as_mut() {
+                                Some(stream) => stream.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            std::future::pending().await
+                        }
+                    } => true,
+                    Some(()) = async {
+                        #[cfg(unix)]
+                        {
+                            match sigterm_stream.as_mut() {
+                                Some(stream) => stream.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            std::future::pending().await
+                        }
+                    } => true,
+                };
+                if interrupted {
                     eprintln!("\n[watch] stopped");
                     return Ok(());
                 }
