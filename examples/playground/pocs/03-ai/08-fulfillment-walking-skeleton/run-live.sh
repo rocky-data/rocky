@@ -44,10 +44,14 @@ echo "=================================================================="
 # --- A fresh, cold working directory: no recorded SQL, no pre-made spec. ---
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/models" "$WORK/data"
+mkdir -p "$WORK/models" "$WORK/data" "$WORK/briefs"
 cp "$HERE/models/_defaults.toml" "$WORK/models/_defaults.toml"
 cp "$HERE/data/seed.sql" "$WORK/data/seed.sql"
 cp "$HERE/data/warehouse_seed.sql" "$WORK/data/warehouse_seed.sql"
+# The project-level brief override that grounds the worker in the exact (closed)
+# Rocky spec schema. Without it, a cold worker emits warehouse types / extra keys
+# and Phase A rejects the spec. drafting/repair fall back to the compiled defaults.
+cp "$HERE/briefs/elicitation.md" "$WORK/briefs/elicitation.md"
 duckdb "$WORK/wh.duckdb" < "$WORK/data/warehouse_seed.sql" >/dev/null 2>&1 || die "warehouse seed failed"
 
 # The subprocess driver: `claude -p {brief}` against the worker-profile MCP.
@@ -86,6 +90,7 @@ scope = { models = ["revenue_daily"] }
 effect = "require_review"
 
 [fulfill]
+briefs_dir = "briefs"
 
 [fulfill.driver]
 type = "subprocess"
