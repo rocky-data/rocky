@@ -93,6 +93,7 @@ replay/candidate_spec.toml # the spec the recorded worker "proposed" (source of 
 replay/session.json        # the recorded worker session, replayed against `rocky mcp --profile worker`
 broken-specs/*.toml        # 6 one-fault specs for assert 3 (the negative lowering cases)
 briefs/elicitation.md      # live lane only: grounds the worker in the exact closed spec schema
+briefs/drafting.md         # live lane only: steers the worker to author SQL only (cooperative, not enforced)
 run.sh                     # the replay lane — 10 asserts, credential-free, exits 0 in < 10s
 run-live.sh                # the live lane — a real `claude -p` worker (needs ANTHROPIC_API_KEY)
 mutation-pass.sh           # disables one gate per assert and shows each assert FAIL (the ledger)
@@ -130,6 +131,19 @@ grounded questions) — which Phase A then **rejected** on warehouse type names
 spec, but not yet a schema-valid one; a project-level `briefs_dir` with the exact
 closed schema is the bridge. SQL authorship is solved; from-scratch spec design
 against the closed schema is not.
+
+There is a second override, `briefs/drafting.md`, that steers the worker to
+author only the model SQL — the spec's declared grain and checks already lower
+into the sidecar tests (a composite-unique test from the grain, an expression
+test per check), so hand-authored `[[tests]]` are redundant and easy to malform.
+Be precise about what this is: **cooperative prompt steering, not enforcement.**
+The worker still holds raw `Write`/`Edit`, and the lowering PRESERVES a
+worker-authored sidecar test — nothing in the engine discards it. The POC also
+drops `draft_check` from the live worker's tool allowlist, which removes the
+easiest path to that mistake but does not architecturally prevent a determined
+worker from editing the sidecar. The digest-gated apply and human review are the
+real gates; the drafting brief is only a nudge toward a clean, redundant-free
+sidecar.
 
 ## Run
 
