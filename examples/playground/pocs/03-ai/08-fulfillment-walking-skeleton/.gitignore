@@ -17,3 +17,6 @@ models/revenue_daily.contract.toml
 # re-included (git cannot re-include inside a fully-excluded directory).
 /expected/*
 !/expected/live/
+# The banked worker transcripts are *.log — re-include them past the repo-root
+# `*.log` ignore (their parent dir is not excluded, so this negation is honoured).
+!/expected/live/transcripts/*.log

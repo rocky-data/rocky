@@ -1,0 +1,21 @@
+Done — compile and tests are both green. Ending at the typed hand-off as required.
+
+## Hand-off report
+
+**Drafted files**
+- `models/revenue_daily.sql` — the model body
+- `models/revenue_daily.toml` — sidecar with intent plus my appended checks (spec-owned keys untouched; `draft_check` is append-only)
+
+**Final state:** compile clean (0 errors, 0 warnings), tests 1/1 passed on both the scoped and whole-project runs.
+
+**The SQL** aggregates `wh.raw.stripe_charges` to one row per (client_id, day): `cast(charged_at as date)` as the day, `sum(amount_eur)` as `revenue_eur`, filtering out refund rows, plus `current_timestamp as loaded_at` to satisfy the contract's required `loaded_at` column.
+
+**Invariants encoded as checks** (`[[tests]]` blocks in the sidecar): `client_id`, `day`, and `revenue_eur` are not null; (`client_id`, `day`) is unique — the declared grain; and `revenue_eur >= 0`, which holds because refunds are excluded.
+
+**Decisions the reviewer should be aware of**
+1. **`loaded_at` semantics:** the contract requires `loaded_at` but the source has no load timestamp, so I stamp it with `current_timestamp` at build time. If the contract intends a source-side ingestion time instead, that needs a different upstream column.
+2. **NULL handling:** every source column is nullable. Rows with NULL `client_id` or NULL `charged_at` are excluded (they can't be attributed to a grain cell), and NULL `is_refund` is treated as *not a refund* via `coalesce(is_refund, false)` — unlabeled charges count as revenue. That's the revenue-preserving reading of the intent, but it's a judgment call worth a human eye.
+3. **Source qualification:** the local DuckDB harness only resolves the catalog-qualified name `wh.raw.stripe_charges`; the bare `raw.stripe_charges` compiled but failed at test time, so the model uses the qualified form.
+4. An earlier W005 (no freshness block for `day`) cleared on the final compile — presumably satisfied by spec-owned metadata; I couldn't and didn't author metadata.
+
+Recording, review, and apply are the runner's — nothing was proposed or applied from this session.

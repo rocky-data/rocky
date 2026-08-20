@@ -1,0 +1,12 @@
+Hand-off complete. Both files are written to `.rocky/fulfillment/revenue_daily/outbox/` for the trusted runner to verify — I have not written anything under `products/` and everything here is advisory pending human sign-off.
+
+**What I drafted** (`candidate_spec.toml`): a spec for `revenue_daily` sourced solely from `wh.raw.stripe_charges`, grain `(client_id, day)`, with four columns typed from the actual warehouse schema — `client_id` BIGINT→`Int64`, `day` as `Date` truncated from `charged_at` TIMESTAMP, `loaded_at` as `Timestamp` (max charge time per group, serving as the freshness `time_column` with a 24h budget), and `revenue_eur` DOUBLE→`Float64`. All four are `nullable = true`, matching the source's declared nullability. One check is encoded: `revenue_eur >= 0`, which holds if refund rows are filtered before aggregation since every sampled amount is positive. Trust is `propose_only`.
+
+**What the data grounded**: the sample (5 rows, clients 1–2, 2026-08-19 through 2026-08-20) shows refunds as separate rows flagged `is_refund = true` with a *positive* `amount_eur` — not negative adjustments. No column had a single null in profiling, but the schema declares all of them nullable.
+
+**Flags for the human reviewer** (`questions.json`, 7 questions — the sharpest three):
+1. **Refund semantics**: with positive refund amounts, "excluded" (filter the rows) and "netted" (subtract them) give different numbers. The spec filters; that needs confirmation.
+2. **Freshness is event-time, not load-time**: the source has no ingestion timestamp, so `loaded_at` = max `charged_at`. A quiet 24h with no charges will look identical to a stale pipeline.
+3. **Nullable grain**: `client_id`/`charged_at` are nullable at the source and the closed spec schema can't express a drop/quarantine policy for null grain values — that decision lives outside the spec.
+
+Remaining questions cover NULL `is_refund` handling, the timezone defining the day boundary, `Float64` vs `Decimal` for money, and whether refund-only days should emit a zero row. Stopping here per the worker profile.
