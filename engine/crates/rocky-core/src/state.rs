@@ -1452,12 +1452,25 @@ impl StateStore {
         &self,
         record: &crate::incremental::PartitionRecord,
     ) -> Result<(), StateError> {
-        let key = partition_record_key(&record.model_name, &record.partition_key);
-        let bytes = serde_json::to_vec(record)?;
+        self.record_partitions(std::slice::from_ref(record))
+    }
+
+    /// Records multiple partition lifecycle states in one transaction.
+    pub fn record_partitions(
+        &self,
+        records: &[crate::incremental::PartitionRecord],
+    ) -> Result<(), StateError> {
+        let mut entries = Vec::with_capacity(records.len());
+        for record in records {
+            let key = partition_record_key(&record.model_name, &record.partition_key);
+            entries.push((key, serde_json::to_vec(record)?));
+        }
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(PARTITIONS)?;
-            table.insert(key.as_str(), bytes.as_slice())?;
+            for (key, bytes) in &entries {
+                table.insert(key.as_str(), bytes.as_slice())?;
+            }
         }
         self.commit_write(txn)?;
         Ok(())
@@ -8301,6 +8314,19 @@ mod tests {
         let retrieved = store.get_partition("m", "2026-04-07").unwrap().unwrap();
         assert_eq!(retrieved.status, PartitionStatus::Computed);
         assert_eq!(retrieved.row_count, 999);
+    }
+
+    #[test]
+    fn test_record_partitions_commits_batch_atomically() {
+        let (store, _dir) = temp_store();
+        let records = ["2026-04-07", "2026-04-08", "2026-04-09"]
+            .map(|key| make_partition("m", key, PartitionStatus::Computed));
+        let epoch = store.write_epoch();
+
+        store.record_partitions(&records).unwrap();
+
+        assert_eq!(store.write_epoch(), epoch + 1);
+        assert_eq!(store.list_partitions("m").unwrap().len(), 3);
     }
 
     #[test]
