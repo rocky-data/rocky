@@ -510,27 +510,29 @@ table = "{name}"
         let name = format!("fct_{model_idx:04}");
         let dep1 = &intermediate_names[i % intermediate_names.len()];
         let has_second_dep = i % 3 == 0;
-        let deps_toml;
-        let sql;
-        if has_second_dep {
+        let (deps_toml, sql) = if has_second_dep {
             let dep2 = &intermediate_names[(i + 13) % intermediate_names.len()];
-            deps_toml = format!(r#"depends_on = ["{dep1}", "{dep2}"]"#);
-            sql = format!(
-                "SELECT\n    a.col_0,\n    a.total,\n    a.row_count,\n    \
-                 b.col_2_upper AS secondary_dim,\n    \
-                 CASE WHEN a.total > 1000 THEN 'high' ELSE 'low' END AS tier,\n    \
-                 ROW_NUMBER() OVER (ORDER BY a.total DESC) AS rank\n\
-                 FROM {dep1} a\nJOIN {dep2} b ON a.col_0 = b.col_0"
-            );
+            (
+                format!(r#"depends_on = ["{dep1}", "{dep2}"]"#),
+                format!(
+                    "SELECT\n    a.col_0,\n    a.total,\n    a.row_count,\n    \
+                     b.col_2_upper AS secondary_dim,\n    \
+                     CASE WHEN a.total > 1000 THEN 'high' ELSE 'low' END AS tier,\n    \
+                     ROW_NUMBER() OVER (ORDER BY a.total DESC) AS rank\n\
+                     FROM {dep1} a\nJOIN {dep2} b ON a.col_0 = b.col_0"
+                ),
+            )
         } else {
-            deps_toml = format!(r#"depends_on = ["{dep1}"]"#);
-            sql = format!(
-                "SELECT\n    col_0,\n    total,\n    row_count,\n    \
-                 CASE WHEN total > 1000 THEN 'high' ELSE 'low' END AS tier,\n    \
-                 ROW_NUMBER() OVER (ORDER BY total DESC) AS rank\n\
-                 FROM {dep1}"
-            );
-        }
+            (
+                format!(r#"depends_on = ["{dep1}"]"#),
+                format!(
+                    "SELECT\n    col_0,\n    total,\n    row_count,\n    \
+                     CASE WHEN total > 1000 THEN 'high' ELSE 'low' END AS tier,\n    \
+                     ROW_NUMBER() OVER (ORDER BY total DESC) AS rank\n\
+                     FROM {dep1}"
+                ),
+            )
+        };
         let toml = format!(
             r#"name = "{name}"
 {deps_toml}
