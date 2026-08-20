@@ -468,14 +468,54 @@ fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions
 fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
     let (bytes, permissions) = read_no_follow(src)?;
     let backup = create_new_no_follow(dst, Some(0o600))?;
+    // Identity of the file THIS call created, taken from the descriptor
+    // before anything can replace the name.
+    #[cfg(unix)]
+    let created = {
+        use std::os::unix::fs::MetadataExt as _;
+        backup.metadata().ok().map(|m| (m.dev(), m.ino()))
+    };
     match write_backup(backup, &bytes, &permissions) {
         Ok(()) => Ok(()),
         Err(error) => {
-            // Best-effort: if this unlink fails the caller still sees the
-            // original error, which is the one that explains the refusal.
+            #[cfg(unix)]
+            remove_if_same_file(dst, created);
+            #[cfg(not(unix))]
             let _ = std::fs::remove_file(dst);
             Err(error)
         }
+    }
+}
+
+/// Unlink `path` only if it is still the file identified by `created`.
+///
+/// `O_EXCL` guarantees exclusivity at open time and nothing after it. A
+/// racer that unlinks the backup and moves its own file — or one of the
+/// user's — into that name would otherwise have this cleanup delete THAT
+/// file, which the copy never created. Comparing the `(dev, ino)` taken
+/// from the descriptor makes the cleanup a no-op in that case.
+///
+/// `symlink_metadata`, not `metadata`: a symlink swapped in must compare as
+/// itself and fail the check, not resolve to whatever it points at.
+///
+/// A window remains between this check and the unlink — closing it needs
+/// dirfd-relative removal, tracked with the other pathname-based races in
+/// #1500. Leaving the orphan is the safer failure here: recovery restoring
+/// a stale backup is a bug (#1482 follow-up), deleting a bystander's file
+/// is data loss.
+#[cfg(unix)]
+fn remove_if_same_file(path: &Path, created: Option<(u64, u64)>) {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(created) = created else {
+        return;
+    };
+    let Ok(current) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if (current.dev(), current.ino()) == created {
+        // Best-effort: if this fails the caller still sees the original
+        // error, which is the one that explains the refusal.
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -1814,6 +1854,44 @@ mod tests {
              backup (mode was {mode:o})"
         );
         assert_eq!(mode & 0o777, 0o755, "the ordinary permission bits carry");
+    }
+
+    /// The failure cleanup must not delete a bystander's file.
+    ///
+    /// `O_EXCL` guarantees exclusivity at open time and nothing after it. A
+    /// racer that unlinks the backup and moves another file into that name
+    /// would have a path-based `remove_file` delete THAT file — one this
+    /// copy never created. Here the swapped-in file stands for a user's
+    /// data, and it must survive.
+    #[cfg(unix)]
+    #[test]
+    fn the_failure_cleanup_spares_a_file_it_did_not_create() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bystander = dir.path().join("someone-elses-file");
+        std::fs::write(&bystander, b"not ours to delete").expect("write");
+        let created = std::fs::metadata(&bystander).expect("meta");
+
+        // Stand in for the racer: the name now resolves to a file this
+        // copy did not create, carrying a different inode.
+        let target = dir.path().join("contract.toml.ff-prev");
+        std::fs::rename(&bystander, &target).expect("rename");
+
+        // A cleanup keyed on an inode that is NOT the current one.
+        let never_created = Some((created.dev(), created.ino() ^ 0xFFFF));
+        remove_if_same_file(&target, never_created);
+
+        assert!(target.exists(), "cleanup deleted a file it did not create");
+        assert_eq!(
+            std::fs::read(&target).expect("still there"),
+            b"not ours to delete"
+        );
+
+        // And the matching case still cleans up, or the guard would just
+        // disable cleanup entirely and pass this test vacuously.
+        let current = std::fs::metadata(&target).expect("meta");
+        remove_if_same_file(&target, Some((current.dev(), current.ino())));
+        assert!(!target.exists(), "cleanup must remove the file it created");
     }
 
     /// A non-regular source is refused, and refused WITHOUT blocking.
