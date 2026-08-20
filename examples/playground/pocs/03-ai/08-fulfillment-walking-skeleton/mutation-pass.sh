@@ -24,14 +24,14 @@ rm -rf "$WORK/poc/products" "$WORK/poc/.rocky" "$WORK/poc/expected" "$WORK/poc/w
 
 declare -a WHAT=(
   "1:lie about the candidate hand-off digest (runner refuses the write)"
-  "2:drafted SQL omits the revenue_eur contract column (verify goes red)"
-  "3:swap a broken spec for the valid one (no reject fires)"
-  "4:keep [policy] instead of stripping it (posture passes)"
+  "2:inject a rejected field into the committed manifest (breaks zero-rejects totality)"
+  "3:swap a broken spec for the valid one (a valid spec exits 0 -> no refusal)"
+  "4:keep [policy] instead of stripping it (posture passes, no paste-block)"
   "5:strip product_id from the persisted plan payload"
   "6:skip the candidate edit so re-approval supersedes nothing"
   "7:skip rocky review --approve (no sign-off marker)"
   "8:pass the CORRECT digest where a wrong one is expected"
-  "9:delete the composite-unique grain test from the sidecar"
+  "9:inject a duplicate (client_id, day) row so the declarative composite test fails"
   "10:skip backdating so the data never goes stale"
 )
 

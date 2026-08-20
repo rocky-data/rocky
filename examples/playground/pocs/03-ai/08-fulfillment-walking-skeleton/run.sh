@@ -83,14 +83,16 @@ S3="$(mktemp -d)"
 mkdir -p "$S3/models" "$S3/products"
 cp rocky.toml "$S3/rocky.toml"; cp models/_defaults.toml "$S3/models/_defaults.toml"
 check_reject() { # <file> <expected-code>
-  local spec="$1" want="$2"
+  local spec="$1" want="$2" rc
   cp "$spec" "$S3/products/${PRODUCT}.toml"
-  ( cd "$S3" && rocky --output json product compile "$PRODUCT" >c.json 2>c.err )
-  if grep -q "$want" "$S3/c.json" "$S3/c.err" 2>/dev/null; then
-    echo "    OK  $(basename "$spec")  -> [$want]"
+  ( cd "$S3" && rocky --output json product compile "$PRODUCT" >c.json 2>c.err ); rc=$?
+  # A refusal is BOTH a non-zero exit AND the stable code named — not just the code
+  # appearing somewhere. A valid spec (mutation 3) exits 0 and fails this.
+  if [ "$rc" != "0" ] && grep -q "$want" "$S3/c.json" "$S3/c.err" 2>/dev/null; then
+    echo "    OK  $(basename "$spec")  refused (exit $rc) -> [$want]"
   else
-    echo "    got: $(head -c 200 "$S3/c.json" "$S3/c.err" 2>/dev/null)"
-    fail "3 ($(basename "$spec") did not reject with [$want])"
+    echo "    got: exit=$rc  $(head -c 200 "$S3/c.json" "$S3/c.err" 2>/dev/null)"
+    fail "3 ($(basename "$spec") must refuse with a NON-ZERO exit AND code [$want]; got exit $rc)"
   fi
 }
 check_reject broken-specs/unknown-key.toml            "unknown-key"
@@ -137,16 +139,17 @@ jq -r '.paste_block' "$S4/v.json" > "$S4/paste_block.txt"
 ( cd "$S4" && rocky --output json fulfill approve-spec "$PRODUCT" >fa.json 2>fa.err )
 ( cd "$S4" && rocky --output json fulfill "$PRODUCT" >f.json 2>f.err )
 jq -r '.message' "$S4/f.json" > "$S4/loop_msg.txt"
-# Compare verbatim: every line of the paste block appears, in order, in the loop message.
-if ! grep -qF "$(cat "$S4/paste_block.txt")" "$S4/loop_msg.txt"; then
-  # Fall back to line-by-line containment (message may wrap the block in prose).
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    grep -qF -- "$line" "$S4/loop_msg.txt" || fail "4 (loop message is missing paste-block line: $line)"
-  done < "$S4/paste_block.txt"
+[ "$(jq -r .state "$S4/f.json")" = "needs_input" ] || fail "4 (loop did not stop at needs_input for policy)"
+grep -q '^policy posture needs a human edit' "$S4/loop_msg.txt" || fail "4 (loop stop is not the policy-posture ask)"
+# BYTE-FOR-BYTE: the loop embeds the paste-block verbatim after a fixed preamble.
+# Extract from the block's first line ([policy]) to EOF and diff against the
+# `rocky product verify` block. No order-independent fallback: exact match or FAIL.
+sed -n '/^\[policy\]/,$p' "$S4/loop_msg.txt" > "$S4/loop_block.txt"
+if ! diff "$S4/paste_block.txt" "$S4/loop_block.txt" >/dev/null 2>&1; then
+  echo "    --- product verify block (left) vs loop block (right) ---"; diff "$S4/paste_block.txt" "$S4/loop_block.txt" | head -20
+  fail "4 (the loop's paste-block is NOT byte-identical to rocky product verify)"
 fi
-grep -q "policy" "$S4/f.json" || fail "4 (loop did not stop for policy)"
-echo "    OK  product verify paste_block matches the loop's needs_input(policy) message"
+echo "    OK  the loop's needs_input(policy) block is byte-identical to rocky product verify ($(wc -c < "$S4/paste_block.txt" | tr -d ' ') bytes)"
 cp "$S4/paste_block.txt" expected/04_paste_block.txt
 rm -rf "$S4"
 
@@ -156,9 +159,6 @@ rm -rf "$S4"
 # verify -> propose, stopping for plan review. The committed lowering manifest
 # must be TOTAL: phase "merged", every spec field mapped, zero rejects.
 echo; echo "[2] approve spec + drive the loop; manifest is total (merged, 0 rejects)"
-# MUTATION 2: the drafted SQL omits the revenue_eur contract column -> the loop's
-# own verify goes red and it blocks; it never reaches the merged manifest.
-mut 2 && { jq '(.tasks.drafting.calls[] | select(.tool=="draft_model") | .arguments.sql) = "SELECT client_id, CAST(charged_at AS DATE) AS day, MAX(charged_at) AS loaded_at FROM wh.raw.stripe_charges GROUP BY client_id, CAST(charged_at AS DATE)"' replay/session.json > .mut && mv .mut replay/session.json; }
 code=$(rj expected/02_approve.json fulfill approve-spec "$PRODUCT")
 [ "$code" = "0" ] || fail "2 (approve-spec exit $code; $(cat expected/02_approve.err))"
 [ "$(jq -r .state expected/02_approve.json)" = "spec_approved" ] || fail "2 (state after approve $(jq -r .state expected/02_approve.json), want spec_approved)"
@@ -167,6 +167,11 @@ code=$(rj expected/02_drive.json fulfill "$PRODUCT")
 [ "$code" = "0" ] || fail "2 (drive-to-review exit $code; $(cat expected/02_drive.err))"
 [ "$(jq -r .state expected/02_drive.json)" = "needs_input" ] || fail "2 (state $(jq -r .state expected/02_drive.json), want needs_input(plan_approval))"
 [ -f "$MANIFEST" ] || fail "2 (no lowering manifest at $MANIFEST)"
+# MUTATION 2: inject a REJECTED field into the committed manifest -> the
+# zero-rejects totality assertion below must catch it. The loop still reached
+# needs_input (drive succeeded), so this mutation exercises the manifest-totality
+# gate itself, not the earlier drive-exit check.
+mut 2 && { jq '.fields["product.output.grain"].disposition = "reject" | .fields["product.output.grain"].reject_reason = "injected by mutation 2 (F4)"' "$MANIFEST" > .mut && mv .mut "$MANIFEST"; }
 [ "$(jq -r .phase "$MANIFEST")" = "merged" ] || fail "2 (manifest phase $(jq -r .phase "$MANIFEST"), want merged)"
 [ "$(jq -r .spec_digest "$MANIFEST")" = "$APPROVED_DIGEST" ] || fail "2 (manifest spec_digest != approved digest)"
 NFIELDS=$(jq -r '.fields | length' "$MANIFEST")
@@ -291,19 +296,25 @@ echo "    OK  loop applied -> observing; out.${PRODUCT} has $ROWS row(s)"
 # materialised data. Assert the composite-unique grain test was GENERATED (in
 # the merged sidecar) and that the model's tests RAN green — not just an overall
 # tally. The grain [client_id] is non-vacuous: two distinct clients materialised.
-echo; echo "[9] output validation: composite-unique grain test generated + runs green"
-# MUTATION 9: delete the composite-unique test from the merged sidecar -> the
-# grain-uniqueness assertion must catch that it is gone.
-mut 9 && perl -i -ne 'print unless /type = "composite"/' "models/${PRODUCT}.toml"
+echo; echo "[9] output validation: composite-unique grain test RUNS (declarative) + passes"
+# MUTATION 9: inject a DUPLICATE (client_id, day) row into the materialised output
+# -> the declarative composite-unique test must FAIL. This mutates what the ENGINE
+# reads (the warehouse table), not a shell-visible sidecar line, so the failure is
+# the declarative gate itself, not a grep.
+mut 9 && duckdb wh.duckdb "INSERT INTO out.${PRODUCT} SELECT * FROM out.${PRODUCT} ORDER BY client_id, day LIMIT 1" >/dev/null 2>&1
+# (a) the composite-unique test was GENERATED into the merged sidecar from the grain,
 grep -q 'type = "composite"' "models/${PRODUCT}.toml" && grep -q 'kind = "unique"' "models/${PRODUCT}.toml" \
   || fail "9 (no composite-unique grain test in the merged sidecar)"
-code=$(rj expected/09_test.json test --models models/)
-[ "$code" = "0" ] || fail "9 (rocky test exit $code; $(cat expected/09_test.err))"
-[ "$(jq -r '.failed' expected/09_test.json)" = "0" ] || fail "9 (rocky test reported failures)"
-jq -e --arg m "$PRODUCT" '.model_results[] | select(.model == $m and .status == "pass")' expected/09_test.json >/dev/null || fail "9 (the ${PRODUCT} model's tests did not run green)"
+# (b) and it actually RUNS and PASSES. Plain `rocky test` executes only the model;
+# the sidecar [[tests]] run solely under --declarative (against the warehouse).
+code=$(rj expected/09_test.json test --models models/ --declarative)
+DFAILED="$(jq -r '.declarative.failed // "err"' expected/09_test.json 2>/dev/null)"
+[ "$DFAILED" = "0" ] || fail "9 (declarative tests failed=$DFAILED: $(jq -c '.declarative.results[]? | select(.status != "pass")' expected/09_test.json 2>/dev/null))"
+jq -e '.declarative.results[] | select(.test_type == "composite" and .status == "pass")' expected/09_test.json >/dev/null \
+  || fail "9 (the composite-unique grain test did not run and pass under --declarative)"
 PAIRS="$(duckdb -csv -noheader wh.duckdb "SELECT COUNT(*) FROM (SELECT DISTINCT client_id, day FROM out.${PRODUCT})" 2>/dev/null)"
 [ "${PAIRS:-0}" -ge 3 ] || fail "9 (grain uniqueness is vacuous: <3 distinct (client_id, day) pairs)"
-echo "    OK  composite-unique grain test [client_id, day] ran green over $PAIRS distinct pairs"
+echo "    OK  composite-unique grain test [client_id, day] RAN declaratively and passed over $PAIRS distinct pairs"
 
 # ------------------------------------------------------------------ Assert 10
 # STALENESS (honest freshness NEGATIVE case; observed, not enforced). Fresh
