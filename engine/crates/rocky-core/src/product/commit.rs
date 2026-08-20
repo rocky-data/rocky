@@ -51,7 +51,8 @@ use crate::product::lowering::{
     state_dir_rel,
 };
 use crate::product::manifest::{
-    MANIFEST_FILENAME, Manifest, contained_artifact_path, content_digest, verify_artifact_hashes,
+    MANIFEST_FILENAME, Manifest, ManifestPhase, contained_artifact_path, content_digest,
+    verify_artifact_hashes,
 };
 use crate::product::spec::{ParsedSpec, SpecRejected, SpecResult};
 
@@ -72,6 +73,23 @@ pub enum RecoveryAction {
     RolledBack,
     /// A committed generation's leftovers were swept.
     RolledForward,
+}
+
+/// What [`reopen_for_drafting`] found and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReopenOutcome {
+    /// No committed manifest exists, or it is already at Phase A: the
+    /// drafting window is open (or there is nothing to demote) and
+    /// nothing was written.
+    NotNeeded,
+    /// Every artifact byte-verified against the committed merged
+    /// manifest, and the manifest was then demoted to Phase A through
+    /// the staged commit — the drafting window is open again.
+    Reopened,
+    /// Artifact bytes drifted from the committed merged manifest while
+    /// no write was authorized. Nothing was mutated; each entry is a
+    /// [`verify_artifact_hashes`] problem rendering.
+    Tampered(Vec<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,6 +1193,102 @@ fn run_phase_b_with_ops(
     let lowering = lower_phase_b(parsed, spec_path, &sidecar_text, &committed)?;
     commit_generation_with_ops(project_root, parsed, &lowering, ops)?;
     Ok(lowering)
+}
+
+/// (Re)open the drafting window over a committed MERGED generation —
+/// the loop's authorized transition before it dispatches a repair (or a
+/// resumed drafting) worker (#1493).
+///
+/// A merged manifest pins the sidecar's exact bytes, which is right for
+/// every window where no write is authorized — but a repair round the
+/// loop itself dispatched rewrites the sidecar legitimately, and
+/// verifying it against the previous round's hash would mis-classify
+/// the loop's own work as tamper. This is the E12 authority transition
+/// that resolves it, with the prepare / commit / recovery protocol
+/// stated:
+///
+/// - **prepare** — byte-verify EVERY artifact hash in the committed
+///   merged manifest first. Any drift happened while no write was
+///   authorized and is reported as [`ReopenOutcome::Tampered`], nothing
+///   mutated — the reopen never blesses dirty state into a fresh
+///   window.
+/// - **commit** — re-lower Phase A from the caller's spec (byte-stable:
+///   the contract render is deterministic and the verified on-disk
+///   contract already matches it) and commit it through
+///   [`commit_generation`], manifest-renamed-last. The sidecar leaves
+///   the manifest's artifact set, returning it to the drafting
+///   namespace exactly as in round 1; the very next Phase B re-records
+///   its hash transactionally from what it merges.
+/// - **recovery** — [`recover_generation`] (run first here and by the
+///   commit) rolls a crashed reopen back to the merged manifest, and
+///   the next drafting dispatch simply reopens again.
+///
+/// Only the staged commit protocol ever updates hashes; out-of-band
+/// edits between gates stay detected because every other verification
+/// surface is unchanged.
+///
+/// # Errors
+///
+/// Returns `spec-superseded` when the merged manifest was generated
+/// from a different spec digest (the supersession fence should have
+/// re-entered the loop before any reopen), and
+/// `reopen-foreign-generation` when its identity fields name another
+/// product, model, or spec path — a foreign generation is never
+/// demoted. Plus anything [`recover_generation`], [`lower_phase_a`], or
+/// [`commit_generation`] refuses.
+pub fn reopen_for_drafting(
+    project_root: &Path,
+    spec_path: &str,
+    parsed: &ParsedSpec,
+) -> SpecResult<ReopenOutcome> {
+    recover_generation(project_root, parsed)?;
+    let Some(committed) = committed_manifest(project_root, &parsed.product().name)? else {
+        return Ok(ReopenOutcome::NotNeeded);
+    };
+    if committed.phase == ManifestPhase::LoweredContract {
+        return Ok(ReopenOutcome::NotNeeded);
+    }
+    let output_model = parsed.output_model().to_string();
+    let product_id = parsed.product_id();
+    let mismatches: Vec<String> = [
+        ("product_id", &committed.product_id, &product_id),
+        ("output_model", &committed.output_model, &output_model),
+        ("spec_path", &committed.spec_path, &spec_path.to_string()),
+    ]
+    .into_iter()
+    .filter(|(_, recorded, current)| recorded != current)
+    .map(|(name, recorded, current)| {
+        format!("{name}: manifest {recorded:?} vs current {current:?}")
+    })
+    .collect();
+    if !mismatches.is_empty() {
+        return Err(SpecRejected::new(
+            "reopen-foreign-generation",
+            format!(
+                "the committed merged manifest belongs to a different generation identity \
+                 and is never demoted: {}",
+                mismatches.join("; ")
+            ),
+        ));
+    }
+    if committed.spec_digest != parsed.digest {
+        return Err(SpecRejected::new(
+            "spec-superseded",
+            format!(
+                "the committed merged manifest was generated from spec {}, but the current \
+                 spec digests to {} — re-approve to restart the generation instead of \
+                 reopening a superseded one",
+                committed.spec_digest, parsed.digest
+            ),
+        ));
+    }
+    let problems = verify_artifact_hashes(project_root, &committed);
+    if !problems.is_empty() {
+        return Ok(ReopenOutcome::Tampered(problems));
+    }
+    let lowering = lower_phase_a(parsed, spec_path)?;
+    commit_generation(project_root, parsed, &lowering)?;
+    Ok(ReopenOutcome::Reopened)
 }
 
 #[cfg(test)]

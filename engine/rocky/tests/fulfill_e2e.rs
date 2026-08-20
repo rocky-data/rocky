@@ -629,7 +629,6 @@ fn deduped_states(rows: &[rocky_core::fulfill::FulfillJournalRow]) -> Vec<&str> 
 /// the staged commit — and converge, never mis-classify its own repair
 /// as tamper.
 #[test]
-#[ignore = "#1493: the repair round's sidecar rewrite is mis-blocked as tamper; fix lands next"]
 fn a_red_verify_repairs_and_converges() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();

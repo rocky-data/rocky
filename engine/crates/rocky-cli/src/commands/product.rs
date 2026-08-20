@@ -49,7 +49,8 @@ use rocky_core::fulfill::{
 };
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::product::commit::{
-    RecoveryAction, committed_manifest, recover_generation, run_phase_a, run_phase_b,
+    RecoveryAction, ReopenOutcome, committed_manifest, recover_generation, reopen_for_drafting,
+    run_phase_a, run_phase_b,
 };
 use rocky_core::product::lowering::{manifest_rel, sidecar_rel, state_dir_rel};
 use rocky_core::product::manifest::{
@@ -1451,6 +1452,17 @@ pub fn run_product_status(
 pub(crate) fn product_recover_in(root: &Path, product_name: &str) -> Result<RecoveryAction> {
     let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
     recover_generation(root, &parsed).map_err(|reject| anyhow::anyhow!("{reject}"))
+}
+
+/// The loop's (re)opening of a drafting window (#1493): byte-verify the
+/// committed MERGED generation in full, then demote its manifest to
+/// Phase A through the staged commit. See
+/// [`rocky_core::product::commit::reopen_for_drafting`] for the
+/// protocol; this wrapper only resolves the spec.
+pub(crate) fn product_reopen_in(root: &Path, product_name: &str) -> Result<ReopenOutcome> {
+    let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
+    let spec_path = spec_rel(product_name);
+    reopen_for_drafting(root, &spec_path, &parsed).map_err(|reject| anyhow::anyhow!("{reject}"))
 }
 
 #[cfg(test)]

@@ -1028,7 +1028,10 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
         // ------------------------------------------------------------------
         // verifying | own compile+test green; policy check agrees;
         //   manifest total | → controlled propose → proposed;
-        //   red ≤ repair rounds → drafting; else blocked
+        //   red ≤ repair rounds → drafting (the repair dispatch reopens
+        //   the window: merged generation byte-verified in full, then
+        //   the manifest demoted to Phase A through the staged commit —
+        //   #1493); else blocked
         // ------------------------------------------------------------------
         FulfillState::Verifying => match event {
             Event::Reentry => Decision::Act(TaskKind::VerifyBundle),

@@ -37,6 +37,8 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_cli::commands::fulfill_api::ProposeOutcome",
     "rocky_cli::commands::fulfill_api::ProposeRequest",
     "rocky_cli::commands::fulfill_api::ReceiptLookup",
+    // #1493 — the drafting-window reopen (typed outcome + the call).
+    "rocky_cli::commands::fulfill_api::ReopenOutcome",
     "rocky_cli::commands::fulfill_api::TypedApplyOutcome",
     "rocky_cli::commands::fulfill_api::VerifyStatus",
     "rocky_cli::commands::fulfill_api::apply_plan",
@@ -52,6 +54,7 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_cli::commands::fulfill_api::print_json",
     "rocky_cli::commands::fulfill_api::product_approve",
     "rocky_cli::commands::fulfill_api::product_compile",
+    "rocky_cli::commands::fulfill_api::product_reopen_drafting",
     "rocky_cli::commands::fulfill_api::product_status",
     "rocky_cli::commands::fulfill_api::product_verify",
     "rocky_cli::commands::fulfill_api::propose_governed_run_plan",
