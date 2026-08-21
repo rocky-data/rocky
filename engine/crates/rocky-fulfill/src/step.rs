@@ -570,9 +570,11 @@ impl Runner {
     /// `scoped_tests_green`), so nothing is lost by declining here.
     #[cfg(not(feature = "duckdb"))]
     fn count_declared_checks(&self, _spec: &ApprovedSpec) -> Result<usize, String> {
-        Err("this build has no duckdb feature, so the declarative test loader \
+        Err(
+            "this build has no duckdb feature, so the declarative test loader \
              cannot be asked what it would run"
-            .to_string())
+                .to_string(),
+        )
     }
 
     #[cfg(feature = "duckdb")]
