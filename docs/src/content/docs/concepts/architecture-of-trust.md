@@ -105,6 +105,11 @@ recorded branch state hash matches the branch now, and it is not older than
 `max_age_seconds`. When `allowed_signers` is not empty, the approver's email
 must also be on that list.
 
+Two things bypass the gate even when it is on. `rocky branch promote
+--skip-approval` skips it, and so does the `ROCKY_BRANCH_APPROVAL_SKIP`
+environment variable. Both record the reason as an audit event rather than
+failing.
+
 That digest is not a cryptographic signature. It is unkeyed, so it detects an
 artifact edited after it was written, and it authenticates nobody. The
 approver's email is a self-asserted git identity hashed with the rest of the
