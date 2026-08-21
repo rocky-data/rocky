@@ -186,12 +186,13 @@ test pins this behaviour so it cannot quietly become a claim. Sandboxing at the
 operating-system level is the planned fix. Tracked in
 [#1491](https://github.com/rocky-data/rocky/issues/1491).
 
-**A directory swapped mid-write is still a race.** Rocky opens the files it
-commits with `O_NOFOLLOW`, and creates them with `O_EXCL`. A symbolic link
-planted at the final path is refused. Rocky does not use directory-relative
-system calls, so a directory component replaced between the check and the open
-stays a window. `O_NOFOLLOW` is a Unix flag. On Windows one backup read follows a
-link.
+**A directory swapped mid-write is still a race.** The fulfillment loop commits
+its files with `O_NOFOLLOW` and creates them with `O_EXCL`, so a symbolic link
+planted at the final path is refused. It does not use directory-relative system
+calls, so a directory component replaced between the check and the open stays a
+window. `O_NOFOLLOW` is a Unix flag. On Windows one backup read follows a link.
+The approval marker is written by a different path. That path stages the file and
+renames it, so a crash leaves no marker, but it does not open with `O_NOFOLLOW`.
 
 None of this changes what the gates do for the case they are built for: an agent
 you chose, running your prompt, making a mistake or being steered by something it
