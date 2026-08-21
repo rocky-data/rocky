@@ -341,6 +341,61 @@ pub enum FulfillCas {
 mod tests {
     use super::*;
 
+    /// `drafting_round` (#1493) must be readable in BOTH directions
+    /// across the version that added it, because the record is persisted
+    /// state a user's binary may straddle:
+    ///
+    /// - a record written BEFORE the field existed must still parse, and
+    ///   default to `Draft` — the behaviour that shipped before, so an
+    ///   upgrade never changes a running product's round;
+    /// - a record written AFTER must still parse on a binary that does
+    ///   not know the field, i.e. the struct must not deny unknown
+    ///   fields.
+    ///
+    /// The whole-record CAS compares equality, so a field that silently
+    /// changed representation between reads would make every CAS lose.
+    #[test]
+    fn the_drafting_round_reads_across_the_version_that_added_it() {
+        // A record as an OLDER binary wrote it: no `drafting_round` key.
+        let old = serde_json::json!({
+            "state": "drafting",
+            "product_id": "product:revenue_daily",
+            "journal_seq": 3,
+            "drafting_attempts": 1,
+            "repair_rounds": 2,
+        });
+        let parsed: FulfillStateRecord =
+            serde_json::from_value(old).expect("a pre-field record still parses");
+        assert_eq!(
+            parsed.drafting_round,
+            DraftingRound::Draft,
+            "an absent round defaults to the behaviour that shipped before"
+        );
+
+        // Re-serializing and re-reading is stable, so an expected/current
+        // pair read either side of a write still compares equal.
+        let round_tripped: FulfillStateRecord =
+            serde_json::from_str(&serde_json::to_string(&parsed).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(round_tripped, parsed, "the CAS compares whole records");
+
+        // A record an OLDER binary reads back: the unknown key is
+        // ignored, not a hard error.
+        let mut newer = parsed.clone();
+        newer.drafting_round = DraftingRound::Repair;
+        let text = serde_json::to_string(&newer).expect("serialize");
+        assert!(text.contains("\"drafting_round\":\"repair\""), "{text}");
+        #[derive(serde::Deserialize)]
+        struct WithoutTheField {
+            product_id: String,
+            repair_rounds: u32,
+        }
+        let older: WithoutTheField =
+            serde_json::from_str(&text).expect("a reader without the field must not fail");
+        assert_eq!(older.product_id, "product:revenue_daily");
+        assert_eq!(older.repair_rounds, 2);
+    }
+
     #[test]
     fn state_tags_round_trip_through_serde() {
         // The tag() spelling and the serde wire tag must agree — journal
