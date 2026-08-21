@@ -197,8 +197,10 @@ its files with `O_NOFOLLOW` and creates them with `O_EXCL`, so a symbolic link
 planted at the final path is refused. It does not use directory-relative system
 calls, so a directory component replaced between the check and the open stays a
 window. `O_NOFOLLOW` is a Unix flag. On Windows one backup read follows a link.
-The approval marker is written by a different path. That path stages the file and
-renames it, so a crash leaves no marker, but it does not open with `O_NOFOLLOW`.
+The approval marker is written by a different path. That path writes a temporary
+file and renames it into place, so you never read a half-written marker. The
+rename is the only guarantee it makes. It does not open with `O_NOFOLLOW`, and it
+does not remove a marker that is already there.
 
 None of this changes what the gates do for the case they are built for: an agent
 you chose, running your prompt, making a mistake or being steered by something it
