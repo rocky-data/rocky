@@ -253,9 +253,9 @@ You write one spec file. `products/<name>.toml` states what the product must be:
           ├── rocky product compile  renders the model's contract, then
           │                          merges spec-owned sidecar metadata
           │
-          └── rocky fulfill <name>   drives the steps above in order, and
-                                     stops at each gate with the exact
-                                     next command to run
+          └── rocky fulfill <name>   drives these verbs, and the drafting
+                                     agent between them. Stops at each gate
+                                     with the exact next command to run
 ```
 
 `rocky fulfill` starts a drafting agent on the worker MCP profile. That profile serves the read and inspect tools, the compile and test loop, and two draft tools. It serves nothing else, and a tool added later stays out until someone adds it deliberately. The runner then re-reads what the agent wrote from disk, re-verifies it, and hands it to the same governed `propose` as any other agent change.
