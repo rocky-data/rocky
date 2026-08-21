@@ -180,6 +180,29 @@ fn state_store(dir: &Path) -> rocky_core::state::StateStore {
     rocky_core::state::StateStore::open(&dir.join("models/.rocky-state.redb")).expect("store")
 }
 
+/// Count the declared data checks in the MERGED sidecar, independently
+/// of the engine's own counter.
+///
+/// Deliberately a different parser from the one under test — the `toml`
+/// crate, not the engine's `product::toml_compat` — so this cannot
+/// agree with a buggy counter by construction.
+///
+/// Counting `[[tests]]` headers in the TEXT would NOT work: the
+/// sidecar renderer inlines an array of tables whenever every entry
+/// fits the line budget, so short checks appear as `tests = [ { … } ]`
+/// with no header at all. Parse, never scan.
+fn declared_check_count(dir: &Path) -> usize {
+    let sidecar = dir.join(format!("models/{PRODUCT}.toml"));
+    let text = std::fs::read_to_string(&sidecar)
+        .unwrap_or_else(|err| panic!("merged sidecar {}: {err}", sidecar.display()));
+    let document: toml::Value = toml::from_str(&text)
+        .unwrap_or_else(|err| panic!("merged sidecar {}: {err}", sidecar.display()));
+    document
+        .get("tests")
+        .and_then(toml::Value::as_array)
+        .map_or(0, Vec::len)
+}
+
 /// Drive the loop up to the plan-review ask, returning the plan id.
 fn drive_to_plan_review(dir: &Path) -> String {
     // 1. Cold init: elicitation writes the candidate, stop at approval.
@@ -293,6 +316,40 @@ fn happy_path_cold_init_to_observing() {
         );
         let applied_rows = rows.iter().filter(|r| r.to_state == "applied").count();
         assert_eq!(applied_rows, 1, "exactly one applied journal row");
+
+        // #1495: the verify bundle's green verdict must say what green
+        // did NOT cover. The product's declared data checks lower into
+        // the model sidecar and run only against a materialised table,
+        // so at verify time (before apply) none of them can run. The
+        // journal names them deferred, with the real count read from
+        // the merged sidecar on disk.
+        //
+        // This is the WIRING pin: the count is read through
+        // `sidecar_rel` against the runner's project root, so a wrong
+        // root would silently degrade every run to "count unavailable"
+        // — which no unit test can catch.
+        let verdict = rows
+            .iter()
+            .find(|r| r.event.starts_with("verify green"))
+            .expect("the green verify verdict is journaled");
+        let declared = declared_check_count(dir);
+        assert!(
+            declared > 0,
+            "fixture must declare at least one data check to make this pin meaningful"
+        );
+        assert_eq!(
+            verdict.event,
+            format!(
+                "verify green: {declared} declared data checks deferred \
+                 (not evaluable before the model is materialized)"
+            ),
+            "the green verdict must state the real deferred count"
+        );
+        assert!(
+            !verdict.event.contains("count unavailable"),
+            "the sidecar must actually be found: {}",
+            verdict.event
+        );
     }
 
     // A rerun re-observes and stays observing — idempotent resume.

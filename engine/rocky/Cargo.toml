@@ -52,6 +52,10 @@ chrono = { workspace = true }
 # to the real binary for review/apply — same client feature set as
 # rocky-mcp's own round-trip tests.
 rmcp = { version = "3.0", features = ["server", "macros", "transport-io", "client"] }
+# `fulfill_e2e` counts the merged sidecar's declared checks through a
+# DIFFERENT TOML parser than the engine's own `product::toml_compat`, so the
+# deferred-count assertion cannot agree with a buggy counter by construction.
+toml = { workspace = true }
 
 [lints]
 workspace = true
