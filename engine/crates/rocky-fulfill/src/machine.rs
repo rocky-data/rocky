@@ -393,9 +393,12 @@ pub enum Event {
         /// How many of the product's declared data checks were NOT
         /// evaluated. They run against a materialised table, and verify
         /// runs before apply, so at this point none of them can run.
+        /// `None` when the count could not be read at all — distinct
+        /// from `Some(0)`, which claims there are none.
+        ///
         /// Reported, never gated: deferred is not a failure, so this
         /// field is deliberately absent from the green pattern below.
-        tests_deferred: usize,
+        tests_deferred: Option<usize>,
         /// Rendered detail. Carries the deferred-checks note on every
         /// path, plus the red legs' reasons when there are any.
         detail: String,
@@ -1648,10 +1651,9 @@ fn dispatch_drafting(
 /// The ONE wording for unevaluated declared data checks.
 ///
 /// The verify bundle runs before apply, so the target table does not
-/// exist yet and the product's declared checks (the grain-uniqueness
-/// test, one not-null test per non-nullable column, and one expression
-/// test per declared check) cannot run. Saying "deferred" keeps the
-/// claim true: they did not pass and they did not fail.
+/// exist yet and the model sidecar's declared checks cannot run.
+/// Saying "deferred" keeps the claim true: they did not pass and they
+/// did not fail.
 ///
 /// `None` when nothing is deferred, so a caller never renders an empty
 /// or zero-valued clause.
@@ -1668,6 +1670,17 @@ pub fn deferred_note(tests_deferred: usize) -> Option<String> {
         "{tests_deferred} declared data {checks} deferred \
          (not evaluable before the model is materialized)"
     ))
+}
+
+/// The wording when the declared checks could not even be counted.
+///
+/// Still deferred — nothing ran — but the count is withheld rather
+/// than guessed, because a number nobody read is not evidence.
+pub fn uncounted_deferred_note(why: &str) -> String {
+    format!(
+        "declared data checks deferred (not evaluable before the model \
+         is materialized); count unavailable: {why}"
+    )
 }
 
 /// The journal event for an all-green verify bundle.
@@ -2550,7 +2563,7 @@ mod tests {
             test_green: true,
             posture_green: true,
             manifest_total: true,
-            tests_deferred,
+            tests_deferred: Some(tests_deferred),
             detail: deferred_note(tests_deferred).unwrap_or_default(),
         }
     }
@@ -2629,6 +2642,34 @@ mod tests {
     }
 
     #[test]
+    fn a_count_that_could_not_be_read_is_never_reported_as_zero() {
+        // `Some(0)` claims "there are none"; `None` admits "nobody
+        // read it". Collapsing the second into the first would be the
+        // same lie in a new place.
+        let note = uncounted_deferred_note("models/revenue_daily.toml does not parse: bad line 3");
+        assert!(note.starts_with("declared data checks deferred"));
+        assert!(note.contains("count unavailable: models/revenue_daily.toml does not parse"));
+        assert!(!note.contains(" 0 "), "an unknown count must not render as zero: {note}");
+        let d = decide(
+            &rec(FulfillState::Verifying),
+            Event::VerifyBundle {
+                compile_green: true,
+                test_green: true,
+                posture_green: true,
+                manifest_total: true,
+                tests_deferred: None,
+                detail: note.clone(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndAct { task, event, .. } = d else {
+            panic!("an uncountable sidecar must not change the decision, got {d:?}");
+        };
+        assert_eq!(task, TaskKind::Propose, "not knowing is still not a failure");
+        assert_eq!(event, format!("verify green: {note}"));
+    }
+
+    #[test]
     fn a_model_that_fails_to_execute_is_still_red_even_with_checks_deferred() {
         // The gate this fix must NOT relax: a model that fails to run is
         // red, deferred count or not.
@@ -2641,7 +2682,7 @@ mod tests {
                 test_green: false,
                 posture_green: true,
                 manifest_total: true,
-                tests_deferred: 6,
+                tests_deferred: Some(6),
                 detail: "test failures: revenue_daily: binder error".into(),
             },
             now(),
@@ -2665,7 +2706,7 @@ mod tests {
                 test_green: true,
                 posture_green: true,
                 manifest_total: true,
-                tests_deferred: 6,
+                tests_deferred: Some(6),
                 detail: "E012 on revenue_eur".into(),
             },
             now(),
@@ -2696,7 +2737,7 @@ mod tests {
                 test_green: false,
                 posture_green: true,
                 manifest_total: true,
-                tests_deferred: 6,
+                tests_deferred: Some(6),
                 detail: "unique(client_id,date) failed".into(),
             },
             now(),
