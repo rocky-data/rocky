@@ -137,7 +137,66 @@ written.
 
 **Gate 3, a human.** `propose` writes a plan marked as AI-authored. `rocky apply`
 refuses to run one until a person approves it. The engine enforces this, not a
-convention the prompts ask the agent to follow.
+convention the prompts ask the agent to follow. The check is a floor. It runs on
+every AI-authored apply whatever your `[policy]` rules say, so an `allow` rule
+cannot waive it. A policy rule can only add restrictions on top.
+
+## What the three gates do not defend against
+
+The gates are checks in the engine, and they hold against the case they are
+built for. They still have a boundary. This section states where it sits, so you
+can decide what else you need.
+
+The gates defend against mistakes, against drift steered by content the agent
+read, and against tool misuse. They are not a sandbox. The agent, the plan
+store, and the approval markers all sit on one machine, under one user account.
+
+```
+   ┌─ your machine, your user account ─────────────────────────┐
+   │                                                           │
+   │   agent ──► gate 1 ──► gate 2 ──► gate 3 ──► apply         │
+   │             compiler   policy     marker                  │
+   │                                     ▲                     │
+   │                                     │ an unsigned file    │
+   │                                     │ that any process    │
+   │                                     │ of yours can write  │
+   └───────────────────────────────────────────────────────────┘
+     the gates sit inside this box. They do not draw the box.
+```
+
+**The approval marker is not signed.** `rocky review <plan-id> --approve` writes
+a JSON file next to the plan. Rocky checks that the file parses and that it names
+the exact plan being applied. A malformed or mispasted marker is refused with its
+own error, and never counts as an approval. The file still carries no signature.
+It proves that an approval was recorded on this machine, not who wrote the bytes.
+Signed approvals are planned work, not shipped work.
+
+**The author stamp on a plan is a label, not a boundary.** A plan records the
+principal that authored it, and `rocky audit` reports it. That field sits outside
+the plan's content digest, so Rocky treats it as display only. Gate 3 does not
+read it. The gate keys off the plan's kind, which is fixed when the plan is
+written. A plan carrying no author stamp still counts as agent-authored, which is
+the safe direction.
+
+**A process-group kill does not hold a process that leaves the group.** The
+fulfillment loop runs its drafting agent in a separate process group, and kills
+the whole group when the task ends. A descendant that calls `setsid` and then
+forks twice is re-parented by the operating system, and survives that kill. A
+test pins this behaviour so it cannot quietly become a claim. Sandboxing at the
+operating-system level is the planned fix. Tracked in
+[#1491](https://github.com/rocky-data/rocky/issues/1491).
+
+**A directory swapped mid-write is still a race.** Rocky opens the files it
+commits with `O_NOFOLLOW`, and creates them with `O_EXCL`. A symbolic link
+planted at the final path is refused. Rocky does not use directory-relative
+system calls, so a directory component replaced between the check and the open
+stays a window. `O_NOFOLLOW` is a Unix flag. On Windows one backup read follows a
+link.
+
+None of this changes what the gates do for the case they are built for: an agent
+you chose, running your prompt, making a mistake or being steered by something it
+read. It does mean two things. Point Rocky at an agent binary you trust. Treat
+the machine that runs it as trusted too.
 
 ## Why a warehouse grant is not enough
 

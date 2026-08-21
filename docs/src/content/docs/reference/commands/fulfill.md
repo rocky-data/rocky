@@ -70,3 +70,13 @@ Bring your own model: the command template is the whole integration. `type = "re
 ## What v0 does not defend
 
 The worker runs on the same machine as the runner and the review markers, and markers are unsigned. The gates defend against mistakes, prompt-injection-shaped drift, and tool misuse — not against a hostile local process acting as your user. Do not point the driver at an agent binary you do not trust. Signed approvals and OS sandboxing are named follow-up work.
+
+Two limits have their own tracking issues. A descendant that calls `setsid` and forks twice is re-parented and survives the group kill; OS-level sandboxing is the fix ([#1491](https://github.com/rocky-data/rocky/issues/1491)). Rocky opens committed files with `O_NOFOLLOW` and creates them with `O_EXCL`, but it does not use directory-relative system calls, so a directory component swapped between the check and the open stays a window. `O_NOFOLLOW` is a Unix flag; on Windows one backup read follows a link.
+
+The full boundary, and how it applies to any agent rather than just this loop, is set out in [Operating Rocky with agents](/concepts/operating-rocky-with-agents/), "What the three gates do not defend against".
+
+## Known issue: a repair round is reported as tampering
+
+A red first verification sends the loop into a repair round. That repair rewrites the merged sidecar file, which is exactly what it is meant to do. The integrity check that follows compares the file against the hash recorded **before** the repair, so the loop reports its own authorized write as tampering and moves the product to `blocked`.
+
+This fails closed. Nothing unreviewed reaches your warehouse. It does mean that a product whose first verification is red cannot finish today, which is the case repair exists for. Tracked in [#1493](https://github.com/rocky-data/rocky/issues/1493).
