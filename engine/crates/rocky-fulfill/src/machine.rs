@@ -2649,7 +2649,10 @@ mod tests {
         let note = uncounted_deferred_note("models/revenue_daily.toml does not parse: bad line 3");
         assert!(note.starts_with("declared data checks deferred"));
         assert!(note.contains("count unavailable: models/revenue_daily.toml does not parse"));
-        assert!(!note.contains(" 0 "), "an unknown count must not render as zero: {note}");
+        assert!(
+            !note.contains(" 0 "),
+            "an unknown count must not render as zero: {note}"
+        );
         let d = decide(
             &rec(FulfillState::Verifying),
             Event::VerifyBundle {
@@ -2665,7 +2668,11 @@ mod tests {
         let Decision::AdvanceAndAct { task, event, .. } = d else {
             panic!("an uncountable sidecar must not change the decision, got {d:?}");
         };
-        assert_eq!(task, TaskKind::Propose, "not knowing is still not a failure");
+        assert_eq!(
+            task,
+            TaskKind::Propose,
+            "not knowing is still not a failure"
+        );
         assert_eq!(event, format!("verify green: {note}"));
     }
 

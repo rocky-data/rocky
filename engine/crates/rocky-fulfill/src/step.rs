@@ -1195,7 +1195,10 @@ mod deferred_check_counting {
 
         let (count, note) = deferred_report(Ok(4));
         assert_eq!(count, Some(4));
-        assert!(note.expect("four deferred").starts_with("4 declared data checks deferred"));
+        assert!(
+            note.expect("four deferred")
+                .starts_with("4 declared data checks deferred")
+        );
 
         // A genuine zero is a real answer, and renders no clause.
         assert_eq!(deferred_report(Ok(0)), (Some(0), None));
