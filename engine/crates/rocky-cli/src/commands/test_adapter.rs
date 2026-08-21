@@ -68,29 +68,7 @@ pub async fn run_test_adapter(
             // checks and override `connect` as failed below.
             let mut result = conformance::run_conformance(&manifest, None);
             // Override the first test (connect) as failed.
-            if let Some(connect_test) = result.results.first_mut() {
-                // Move the counter this test ALREADY contributed to, rather
-                // than assuming it passed. It used to pass unconditionally —
-                // every unimplemented spec did — so `tests_passed -= 1` was
-                // safe by accident. Now that an unimplemented spec reports
-                // Skipped, `tests_passed` is 0 here and that subtraction
-                // underflows: a panic in debug, `u64::MAX` in release, before
-                // the failure contract below ever fires.
-                match connect_test.status {
-                    conformance::TestStatus::Passed => {
-                        result.tests_passed = result.tests_passed.saturating_sub(1);
-                    }
-                    conformance::TestStatus::Skipped => {
-                        result.tests_skipped = result.tests_skipped.saturating_sub(1);
-                    }
-                    // Already counted as a failure; do not double-count.
-                    conformance::TestStatus::Failed => {}
-                }
-                connect_test.status = conformance::TestStatus::Failed;
-                connect_test.message = Some(format!("failed to initialize: {e}"));
-                result.tests_failed += 1;
-                result.tests_run = result.tests_passed + result.tests_failed;
-            }
+            mark_connect_failed(&mut result, &format!("failed to initialize: {e}"));
 
             result
         }
@@ -215,6 +193,36 @@ fn output_result(result: &ConformanceResult, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite a conformance result's first spec (`connect`) as a failure.
+///
+/// Extracted so it can be tested against the REAL path. The bug it carried
+/// was invisible inline: it did `tests_passed -= 1`, assuming `connect` had
+/// passed. Every unimplemented spec passed unconditionally, so that held by
+/// accident — and once unimplemented specs report `Skipped`, `tests_passed`
+/// is 0 here. The subtraction then panics in debug and wraps in release,
+/// corrupting the result before the `tests_failed > 0` contract fires.
+///
+/// It moves the counter the test ACTUALLY contributed to, and saturates.
+fn mark_connect_failed(result: &mut conformance::ConformanceResult, reason: &str) {
+    let Some(connect_test) = result.results.first_mut() else {
+        return;
+    };
+    match connect_test.status {
+        conformance::TestStatus::Passed => {
+            result.tests_passed = result.tests_passed.saturating_sub(1);
+        }
+        conformance::TestStatus::Skipped => {
+            result.tests_skipped = result.tests_skipped.saturating_sub(1);
+        }
+        // Already counted as a failure; do not double-count.
+        conformance::TestStatus::Failed => {}
+    }
+    connect_test.status = conformance::TestStatus::Failed;
+    connect_test.message = Some(reason.to_string());
+    result.tests_failed += 1;
+    result.tests_run = result.tests_passed + result.tests_failed;
+}
+
 #[cfg(test)]
 mod tests {
     use rocky_adapter_sdk::conformance::{self, TestStatus};
@@ -252,21 +260,10 @@ mod tests {
         );
         let skipped_before = result.tests_skipped;
 
-        // The same override the init-failure path performs.
-        if let Some(connect_test) = result.results.first_mut() {
-            match connect_test.status {
-                TestStatus::Passed => {
-                    result.tests_passed = result.tests_passed.saturating_sub(1);
-                }
-                TestStatus::Skipped => {
-                    result.tests_skipped = result.tests_skipped.saturating_sub(1);
-                }
-                TestStatus::Failed => {}
-            }
-            connect_test.status = TestStatus::Failed;
-            result.tests_failed += 1;
-            result.tests_run = result.tests_passed + result.tests_failed;
-        }
+        // The PRODUCTION path, not a copy of it. An earlier version of this
+        // test reimplemented the override inline, and therefore passed even
+        // with the real code reverted to the underflowing form.
+        super::mark_connect_failed(&mut result, "failed to initialize: probe");
 
         assert_eq!(result.tests_failed, 1);
         assert_eq!(
