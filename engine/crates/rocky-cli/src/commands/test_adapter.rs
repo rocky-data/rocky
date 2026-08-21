@@ -69,9 +69,25 @@ pub async fn run_test_adapter(
             let mut result = conformance::run_conformance(&manifest, None);
             // Override the first test (connect) as failed.
             if let Some(connect_test) = result.results.first_mut() {
+                // Move the counter this test ALREADY contributed to, rather
+                // than assuming it passed. It used to pass unconditionally —
+                // every unimplemented spec did — so `tests_passed -= 1` was
+                // safe by accident. Now that an unimplemented spec reports
+                // Skipped, `tests_passed` is 0 here and that subtraction
+                // underflows: a panic in debug, `u64::MAX` in release, before
+                // the failure contract below ever fires.
+                match connect_test.status {
+                    conformance::TestStatus::Passed => {
+                        result.tests_passed = result.tests_passed.saturating_sub(1);
+                    }
+                    conformance::TestStatus::Skipped => {
+                        result.tests_skipped = result.tests_skipped.saturating_sub(1);
+                    }
+                    // Already counted as a failure; do not double-count.
+                    conformance::TestStatus::Failed => {}
+                }
                 connect_test.status = conformance::TestStatus::Failed;
                 connect_test.message = Some(format!("failed to initialize: {e}"));
-                result.tests_passed -= 1;
                 result.tests_failed += 1;
                 result.tests_run = result.tests_passed + result.tests_failed;
             }
@@ -197,4 +213,71 @@ fn output_result(result: &ConformanceResult, json_output: bool) -> Result<()> {
         print!("{}", result.report());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rocky_adapter_sdk::conformance::{self, TestStatus};
+    use rocky_adapter_sdk::{AdapterCapabilities, AdapterManifest};
+
+    /// The init-failure path must not underflow its counters.
+    ///
+    /// It used to do `tests_passed -= 1` on the assumption that `connect`
+    /// had passed. Every unimplemented spec passed unconditionally, so that
+    /// held by accident. Once an unimplemented spec reports Skipped,
+    /// `tests_passed` is 0 there — and the subtraction panics in debug and
+    /// wraps to `u64::MAX` in release, corrupting the result before the
+    /// failure contract fires (#475 review).
+    ///
+    /// This reproduces the exact shape: take a real conformance result whose
+    /// `connect` is NOT Passed, and apply the same override.
+    #[test]
+    fn overriding_connect_as_failed_never_underflows() {
+        let manifest = AdapterManifest {
+            name: "probe".into(),
+            version: "0".into(),
+            sdk_version: rocky_adapter_sdk::SDK_VERSION.into(),
+            dialect: "unknown".into(),
+            capabilities: AdapterCapabilities::warehouse_only(),
+            auth_methods: vec![],
+            config_schema: serde_json::Value::Null,
+        };
+        let mut result = conformance::run_conformance(&manifest, None);
+
+        assert_ne!(
+            result.results[0].status,
+            TestStatus::Passed,
+            "fixture precondition: connect must not be Passed, or this test \
+             cannot exhibit the underflow"
+        );
+        let skipped_before = result.tests_skipped;
+
+        // The same override the init-failure path performs.
+        if let Some(connect_test) = result.results.first_mut() {
+            match connect_test.status {
+                TestStatus::Passed => {
+                    result.tests_passed = result.tests_passed.saturating_sub(1);
+                }
+                TestStatus::Skipped => {
+                    result.tests_skipped = result.tests_skipped.saturating_sub(1);
+                }
+                TestStatus::Failed => {}
+            }
+            connect_test.status = TestStatus::Failed;
+            result.tests_failed += 1;
+            result.tests_run = result.tests_passed + result.tests_failed;
+        }
+
+        assert_eq!(result.tests_failed, 1);
+        assert_eq!(
+            result.tests_skipped,
+            skipped_before - 1,
+            "the skipped count must lose the test that became a failure"
+        );
+        assert!(
+            result.tests_run <= result.results.len(),
+            "tests_run underflowed: {}",
+            result.tests_run
+        );
+    }
 }
