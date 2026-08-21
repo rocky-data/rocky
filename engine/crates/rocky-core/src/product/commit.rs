@@ -31,11 +31,16 @@
 //! mutation. No on-disk manifest grants recovery authority: staged and
 //! previous manifests are exactly as forgeable as the journal itself.
 //!
-//! Stated residual, accepted under the v0 same-machine threat posture:
-//! path-based syscalls re-traverse the path at syscall time, so a
-//! directory swapped for a symlink in the instant between validation and
-//! one specific rename/unlink is only fully closed by dirfd/`O_NOFOLLOW`
-//! APIs, which v0 does not use.
+//! Stated residuals, accepted under the v0 same-machine threat posture.
+//! Path-based syscalls re-traverse the path at syscall time, so a
+//! DIRECTORY swapped for a symlink in the instant between validation and
+//! a rename/unlink is only fully closed by dirfd-relative APIs, which v0
+//! does not use. Every LEAF the protocol writes or reads is guarded at
+//! the syscall itself — O_EXCL on each write, `O_NOFOLLOW` on the backup
+//! read — but `O_NOFOLLOW` is unix only: on Windows that read still
+//! follows a symlink or junction planted at the leaf, and containment
+//! there rests on the pre-check alone. Windows reparse-point behaviour is
+//! untested; every symlink exploit test in this module is `#[cfg(unix)]`.
 
 use std::path::{Path, PathBuf};
 
@@ -319,29 +324,194 @@ pub fn contained_write_target(project_root: &Path, rel: &str) -> Result<PathBuf,
 /// the O_EXCL create retried once.
 fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
+    // `None` keeps the process default (0666 & umask) these staged
+    // artifacts have always been created with — they are renamed into place
+    // as the user's own project files.
+    create_new_no_follow(path, None)?.write_all(bytes)
+}
+
+/// The open half of [`write_new_no_follow`], handing back the handle so a
+/// caller can also set the mode on the descriptor rather than by path.
+fn create_new_no_follow(path: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
     let open = || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // A caller that will set the final mode itself creates restrictively
+        // first, so the file is never briefly WIDER than its source: a
+        // `0600` original copied under the default `0666 & umask` would be
+        // world-readable for the length of the write, and stay that way if
+        // the later chmod fails.
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        options.open(path)
     };
     match open() {
-        Ok(mut file) => file.write_all(bytes),
+        Ok(file) => Ok(file),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             std::fs::remove_file(path)?;
-            open()?.write_all(bytes)
+            open()
         }
         Err(err) => Err(err),
     }
 }
 
+/// Read `path` whole, refusing to follow a symlink at the leaf, and hand
+/// back its mode alongside the bytes.
+///
+/// On unix the open carries `O_NOFOLLOW`, so a link swapped in at the leaf
+/// AFTER a path-based pre-check — the TOCTOU window no re-check can close,
+/// because a path syscall re-traverses the path — fails instead of being
+/// read through to its target. Windows `OpenOptions` has no `O_NOFOLLOW`
+/// equivalent, so there the read still follows a symlink or junction: that
+/// platform keeps the weaker pre-check-only guarantee, stated rather than
+/// papered over.
+///
+/// The mode comes off the DESCRIPTOR, not a second path lookup, so it
+/// describes the same file the bytes came from.
+/// The largest artifact this module will back up.
+///
+/// The files copied here are a lowered contract, sidecar, SQL model, and
+/// manifest — kilobytes. `std::fs::copy` streamed, so it could not be made
+/// to exhaust memory; reading whole can be, which is why the size is
+/// bounded rather than trusted.
+const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
+
+fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions)> {
+    use std::io::Read as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        // O_NONBLOCK as well as O_NOFOLLOW: opening a FIFO for reading
+        // blocks until a writer appears, so a raced FIFO would hang the
+        // commit here forever. With O_NONBLOCK the open returns and the
+        // regular-file check below refuses it.
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+
+    // Check the DESCRIPTOR, not the path — the thing already opened cannot
+    // be swapped underneath this check. `std::fs::copy` refused a
+    // non-regular source; reading by hand has to refuse it explicitly, or a
+    // raced FIFO or device becomes an unbounded read.
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to back up {} — not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.len() > MAX_BACKUP_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to back up {} — {} bytes exceeds the {MAX_BACKUP_BYTES}-byte limit",
+                path.display(),
+                metadata.len()
+            ),
+        ));
+    }
+
+    // Bounded read even so: `len()` is a snapshot, and a writer can extend
+    // the file between the check and the read. One byte over the limit is
+    // enough to detect the overrun.
+    let mut bytes = Vec::new();
+    let mut limited = file.take(MAX_BACKUP_BYTES + 1);
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_BACKUP_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to back up {} — it grew past the {MAX_BACKUP_BYTES}-byte limit while being read",
+                path.display()
+            ),
+        ));
+    }
+    Ok((bytes, metadata.permissions()))
+}
+
+/// Copy `src` to `dst` without following a symlink at EITHER end.
+///
+/// `std::fs::copy` follows both: a link at the source is read through to
+/// its target, and a link at the destination is written through to its.
+/// Both are TOCTOU against the containment pre-check, so each end takes a
+/// syscall-level guard instead — `O_NOFOLLOW` on the read (unix only, see
+/// [`read_no_follow`]) and O_EXCL on the create. The source's mode is
+/// carried across, as `std::fs::copy` did, and is set on the destination
+/// DESCRIPTOR so a link swapped in at `dst` afterwards cannot catch a
+/// path-based `set_permissions`.
+///
+/// The files copied here are a lowered contract, sidecar, SQL model, and
+/// manifest — kilobytes — so reading one whole is cheaper than streaming.
+/// [`read_no_follow`] bounds that read rather than trusting the size.
+///
+/// The mode carried across is masked to `0o777`. `std::fs::copy` propagates
+/// the source mode verbatim, which is safe when the destination is the
+/// caller's own file — but here the source is attacker-influenceable and the
+/// destination is created as Rocky. Racing in a `04755` source would
+/// otherwise produce a ROCKY-OWNED SETUID backup, which a rollback then
+/// renames over the final. Set-user-ID and set-group-ID are dropped;
+/// nothing this module backs up is executable, let alone privileged.
+///
+/// A failed write leaves the partial `.ff-prev` in place, deliberately.
+///
+/// Deleting it would be the obvious cleanup, and it is the wrong call here:
+/// `O_EXCL` grants exclusivity at open time and nothing after it, so ANY
+/// path-based unlink can remove a file this copy never created if a racer
+/// swapped the name — including one of the user's. An `(dev, ino)` check
+/// before the unlink narrows that window but cannot close it, and doing
+/// nothing has no deletion window at all. Between a stale backup and
+/// deleting a bystander's file, the stale backup is the recoverable one.
+///
+/// The orphan is therefore handled where it is consumed, and that half has
+/// landed: [`recover_generation`] restores only what the journal's
+/// `has_prev` records, and refuses a backup it does not know about
+/// (`commit-unexpected-backup`, #1502). So a partial `.ff-prev` left here
+/// is inert rather than dangerous — this function's job is only to not
+/// make it worse.
+fn copy_no_follow(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let (bytes, permissions) = read_no_follow(src)?;
+    let backup = create_new_no_follow(dst, Some(0o600))?;
+    write_backup(backup, &bytes, &permissions)
+}
+
+/// Write the backup body and apply its mode, both on the DESCRIPTOR so a
+/// link swapped in at the destination afterwards cannot catch a path-based
+/// operation. Split out so [`copy_no_follow`] has one cleanup path.
+fn write_backup(
+    mut backup: std::fs::File,
+    bytes: &[u8],
+    permissions: &std::fs::Permissions,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    backup.write_all(bytes)?;
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::Permissions::from_mode(permissions.mode() & 0o777)
+    };
+    #[cfg(not(unix))]
+    let permissions = permissions.clone();
+    backup.set_permissions(permissions)
+}
+
 /// Refuse a symlink sitting at any path the fresh commit is about to
 /// WRITE THROUGH, before the first mutation.
 ///
-/// The staging loop stages with `std::fs::write` (into `<final>.ff-staged`)
-/// and backs finals up with `std::fs::copy` (into `<final>.ff-prev`), and
-/// the journal is written with `std::fs::write` (into `<journal>.ff-staged`)
-/// — all three FOLLOW a symlink at the destination. A crash recovery path
+/// The staging loop stages into `<final>.ff-staged`, backs finals up into
+/// `<final>.ff-prev`, and journals into `<journal>.ff-staged`. Written the
+/// plain way (`std::fs::write`, `std::fs::copy`) all three FOLLOW a symlink
+/// at the destination — which is why they go through the no-follow helpers
+/// above, and why this pre-check exists at all. A crash recovery path
 /// already refuses symlinked residue, but that check lives past
 /// [`recover_generation`]'s no-journal early return, so on the FRESH
 /// commit path (the common case: no prior crash) nothing guarded these
@@ -361,12 +531,13 @@ fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// is additionally refused when its leaf is a symlink.
 ///
 /// Stated residual, the conceded v0 boundary: a check-then-write is TOCTOU
-/// against a directory or leaf swapped for a symlink between validation and
-/// the syscall. The staged and journal-temp writes take the cheap half
-/// (O_EXCL via [`write_new_no_follow`], race-free for the leaf); the
-/// `.ff-prev` backup `copy` still follows a symlinked SOURCE swapped in
-/// post-check — fully closed only by an `O_NOFOLLOW` read, tracked as a
-/// known residual (see [`commit_generation`]).
+/// against a DIRECTORY swapped for a symlink between validation and the
+/// syscall, which only dirfd-relative APIs close. Every LEAF this pre-check
+/// covers is guarded a second time at the syscall itself: the staged,
+/// journal-temp and `.ff-prev` writes use O_EXCL ([`write_new_no_follow`]),
+/// and the `.ff-prev` backup reads its source with `O_NOFOLLOW`
+/// ([`copy_no_follow`]) — the read guard on unix only (see
+/// [`commit_generation`]).
 fn refuse_symlinked_write_targets<'a>(
     project_root: &Path,
     relpaths: impl IntoIterator<Item = &'a str>,
@@ -462,13 +633,20 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 /// Every write target is proven inside the project root through the shared
 /// [`contained_target`] primitive BEFORE the first mutation, refusing a
 /// symlinked ancestor directory (the static `models -> /outside` escape, no
-/// race) as well as a symlink at the leaf. The staged and journal-temp
-/// writes use O_EXCL. One race residual remains, the conceded v0 boundary:
-/// the `.ff-prev` backup `copy` follows a symlinked SOURCE (the final)
-/// swapped in during the window between the pre-check and the copy — fully
-/// closed only by an `O_NOFOLLOW` read. TODO(FF-WP-E1B): open the backup
-/// source with `O_NOFOLLOW` to close the copy-source race (tracking issue
-/// to be filed by the coordinator — this agent cannot run `gh`).
+/// race) as well as a symlink at the leaf. Each leaf is then guarded a
+/// second time at the syscall, so a link swapped in AFTER the pre-check is
+/// refused rather than followed: the staged, journal-temp and `.ff-prev`
+/// writes use O_EXCL, and the `.ff-prev` backup reads its source with
+/// `O_NOFOLLOW` ([`copy_no_follow`]). The backup copy has TWO symlink-follow
+/// ends — the SOURCE read and the DESTINATION write — and both are covered.
+///
+/// Two residuals remain, the conceded v0 boundary. A DIRECTORY swapped for
+/// a symlink between validation and a rename/unlink is closed only by
+/// dirfd-relative APIs, which v0 does not use. And `O_NOFOLLOW` is unix
+/// only: on Windows the backup read still follows a symlink or junction
+/// planted at the final, so containment there rests on the pre-check alone
+/// — and that platform is untested, because every symlink exploit test in
+/// this module is `#[cfg(unix)]`.
 ///
 /// # Errors
 ///
@@ -538,12 +716,12 @@ fn commit_generation_with_ops(
         let has_prev = final_path.exists();
         if has_prev {
             let prev = prev_sibling(&final_path);
-            // Known residual: `copy` follows a symlinked SOURCE (the final)
-            // swapped in after the pre-check — the conceded v0 race, fully
-            // closed only by an `O_NOFOLLOW` read (see `commit_generation`).
-            // The static ancestor/leaf case is already refused above.
-            std::fs::copy(&final_path, &prev)
-                .map_err(|err| io_reject("backing up", &prev, &err))?;
+            // Neither end of this copy follows a link swapped in after the
+            // pre-check: `O_NOFOLLOW` on the source read (unix) and O_EXCL
+            // on the backup create. The failure is named against the SOURCE
+            // — the racy end — not the destination it writes.
+            copy_no_follow(&final_path, &prev)
+                .map_err(|err| io_reject("backing up", &final_path, &err))?;
         }
         entries.push(StagingEntry {
             final_path: relpath.clone(),
@@ -818,9 +996,33 @@ pub fn recover_generation(project_root: &Path, parsed: &ParsedSpec) -> SpecResul
             }
             continue;
         }
-        if prev.exists() {
+        // The JOURNAL decides whether a backup should exist — not the
+        // filesystem. This record is documented as "filesystem-mutation
+        // authority" at recovery time, and restoring on `prev.exists()`
+        // alone contradicted that: a partial `.ff-prev` left by an earlier
+        // failed attempt would be renamed over the final, undoing a commit
+        // the journal never recorded a backup for (#1502).
+        if entry.has_prev && prev.exists() {
             std::fs::rename(&prev, final_path)
                 .map_err(|err| io_reject("restoring", final_path, &err))?;
+        } else if !entry.has_prev && prev.exists() {
+            // A backup the journal does not know about. Refusing is the
+            // conservative half of the trade this module already made: the
+            // producer deliberately leaves a failed backup in place rather
+            // than unlink under a race, so recovery must not treat one as
+            // trustworthy content. Nothing is deleted here either — the
+            // operator is told what to look at.
+            return Err(SpecRejected::new(
+                "commit-unexpected-backup",
+                format!(
+                    "{} exists but the staging journal records no backup for {}. \
+                     Recovery will not restore a backup it did not create. \
+                     Inspect that file and remove it once you have confirmed \
+                     it is not needed, then re-run.",
+                    prev.display(),
+                    final_path.display()
+                ),
+            ));
         } else if !entry.has_prev
             && final_path.is_file()
             && std::fs::read(final_path)
@@ -1290,6 +1492,112 @@ mod tests {
         assert_eq!(committed(&project).phase, ManifestPhase::Merged);
     }
 
+    /// Recovery must not restore a backup the journal never recorded.
+    ///
+    /// The producer deliberately leaves a failed `.ff-prev` in place rather
+    /// than unlink it under a race (#1482's review rejected both a plain and
+    /// an inode-checked unlink). So an orphan from an earlier failed attempt
+    /// can sit next to a final whose journal entry says `has_prev: false`.
+    /// Renaming it over the final would undo a commit using content the
+    /// journal never vouched for (#1502).
+    #[test]
+    fn recovery_refuses_a_backup_the_journal_does_not_know_about() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        let models = project.join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+
+        // A committed final, and beside it an orphan `.ff-prev` — the shape a
+        // failed backup write leaves, since the producer deliberately does
+        // not unlink under a race (#1482).
+        let final_path = models.join("revenue_daily.contract.toml");
+        write_file(&final_path, b"the committed contract");
+        let orphan = prev_sibling(&final_path);
+        write_file(&orphan, b"orphan bytes from a failed earlier attempt");
+
+        // A journal that records NO backup for that final.
+        write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[serde_json::json!({
+                "final": "models/revenue_daily.contract.toml",
+                "staged_sha": content_digest(b"the committed contract"),
+                "has_prev": false,
+            })]),
+        );
+
+        let error = recover_generation(&project, &parsed_d3())
+            .expect_err("an unrecorded backup must refuse recovery");
+        assert_eq!(error.code, "commit-unexpected-backup");
+
+        // Nothing restored, nothing deleted: the final keeps its own bytes
+        // and the orphan is left for the operator to inspect.
+        assert_eq!(
+            std::fs::read(&final_path).expect("final intact"),
+            b"the committed contract",
+            "the orphan must not have been renamed over the final"
+        );
+        assert_eq!(
+            std::fs::read(&orphan).expect("orphan intact"),
+            b"orphan bytes from a failed earlier attempt",
+            "recovery must not delete a file it did not create"
+        );
+    }
+
+    /// The refusal must be a PAUSE, not a dead end.
+    ///
+    /// `recover_generation` refuses mid-loop, so entries handled before the
+    /// orphan may already be rolled back when it returns — the tree is left
+    /// partially restored. That is only acceptable if the operator can act
+    /// on the message and finish the job, so this asserts the whole
+    /// sequence: refuse, clear the named file, re-run, complete.
+    ///
+    /// The journal is removed only AFTER the loop, which is what makes the
+    /// re-run possible.
+    #[test]
+    fn the_unexpected_backup_refusal_is_recoverable_by_re_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        let models = project.join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+
+        let final_path = models.join("revenue_daily.contract.toml");
+        write_file(&final_path, b"the committed contract");
+        let orphan = prev_sibling(&final_path);
+        write_file(&orphan, b"orphan bytes from a failed earlier attempt");
+
+        write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[serde_json::json!({
+                "final": "models/revenue_daily.contract.toml",
+                "staged_sha": content_digest(b"the committed contract"),
+                "has_prev": false,
+            })]),
+        );
+
+        let error = recover_generation(&project, &parsed_d3()).expect_err("refuses on the orphan");
+        assert_eq!(error.code, "commit-unexpected-backup");
+
+        // The journal survives the refusal — without it the operator would
+        // be stranded, because recovery would then report "nothing to do".
+        assert!(
+            journal_path(&project, "revenue_daily").is_file(),
+            "the journal must survive a refusal or the rollback cannot be finished"
+        );
+
+        // The operator does what the message says.
+        std::fs::remove_file(&orphan).expect("operator clears the named file");
+
+        // And the re-run completes.
+        let action = recover_generation(&project, &parsed_d3()).expect("re-run completes");
+        assert_eq!(action, RecoveryAction::RolledBack);
+        assert!(
+            !journal_path(&project, "revenue_daily").exists(),
+            "a completed recovery consumes its journal"
+        );
+    }
+
     #[test]
     fn recovery_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1472,6 +1780,212 @@ mod tests {
         // the committed generation is still the first commit's Phase A.
         assert_eq!(staging_residue(&project), Vec::<String>::new());
         assert_eq!(committed(&project).phase, ManifestPhase::LoweredContract);
+    }
+
+    // ----- the backup copy's own syscall-level guards ----------------------
+    //
+    // The pre-check above refuses a symlink PLANTED before the commit. It
+    // cannot refuse one swapped in AFTER it validates and before the copy
+    // runs — a path-based check re-traverses the path, so the window is real
+    // for any local process that can write the models directory. These pin
+    // the syscall-level guard at each end of the copy, which is what closes
+    // it: `O_NOFOLLOW` on the source read, O_EXCL on the destination create.
+    // They exercise the helper directly because no end-to-end path can reach
+    // the copy with a symlinked source — the pre-check refuses that first.
+
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_refuses_a_source_swapped_for_a_symlink_after_the_check() {
+        // A local racer swaps the final for a link at an out-of-project file
+        // between the pre-check and the backup. `std::fs::copy` reads THROUGH
+        // that link and stamps the secret into `<final>.ff-prev`, from which
+        // a rollback renames it over the final — the secret becomes the
+        // committed artifact. The `O_NOFOLLOW` open refuses instead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"a developer's private bytes outside the project").expect("write");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        plant_symlink(&final_path, &secret);
+        let prev = prev_sibling(&final_path);
+
+        let error = copy_no_follow(&final_path, &prev).expect_err("a symlinked source is refused");
+
+        // The security property, asserted platform-independently: no backup
+        // exists at all, so nothing read through the link reached the
+        // project. (The errno differs across unixes — Linux reports ELOOP,
+        // some BSDs EMLINK — so the bytes are the assertion, not the code.)
+        assert!(
+            !prev.exists(),
+            "no backup may be produced from a symlinked source (error was {error})"
+        );
+        assert_eq!(
+            std::fs::read(&secret).expect("still there"),
+            b"a developer's private bytes outside the project",
+            "the out-of-project source must be untouched"
+        );
+    }
+
+    /// The wiring, not the helper.
+    ///
+    /// The two tests around this one call `copy_no_follow` directly, because
+    /// the vector is a TOCTOU race: the pre-check refuses a symlinked final,
+    /// so only a swap landing between that check and the copy reaches it, and
+    /// staging that deterministically needs a fault-injection hook this
+    /// module does not have. That leaves the call site itself unpinned —
+    /// reverting it to `std::fs::copy` keeps every one of those tests green,
+    /// which is exactly the regression this guard catches.
+    ///
+    /// The needle is assembled from fragments so this assertion cannot match
+    /// its own source text.
+    #[test]
+    fn the_backup_call_site_uses_the_no_follow_copy() {
+        let source = include_str!("commit.rs");
+        let banned = format!("std::fs::{}(&final_path", "copy");
+        assert!(
+            !source.contains(&banned),
+            "the .ff-prev backup must go through copy_no_follow: a plain \
+             copy follows a symlinked source swapped in after the pre-check"
+        );
+        let required = format!("copy_no_{}(&final_path, &prev)", "follow");
+        assert!(
+            source.contains(&required),
+            "expected the backup call site to call copy_no_follow"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_refuses_a_destination_swapped_for_a_symlink_after_the_check() {
+        // The other end of the same copy: a link parked at `<final>.ff-prev`
+        // after the pre-check. O_EXCL neither follows it nor clobbers
+        // through it — the link is unlinked and a real file created in its
+        // place, so the out-of-project target keeps its bytes.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"private bytes the backup copy must not overwrite")
+            .expect("write");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        std::fs::write(&final_path, b"the previous generation's contract").expect("write");
+        let prev = prev_sibling(&final_path);
+        plant_symlink(&prev, &secret);
+
+        copy_no_follow(&final_path, &prev).expect("the backup is taken beside the link");
+
+        assert_eq!(
+            std::fs::read(&secret).expect("still there"),
+            b"private bytes the backup copy must not overwrite",
+            "the out-of-project destination target must be untouched"
+        );
+        assert!(
+            !is_symlink(&prev),
+            "the link must not survive as the backup"
+        );
+        assert_eq!(
+            std::fs::read(&prev).expect("backup"),
+            b"the previous generation's contract"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_carries_the_source_mode_across() {
+        // `std::fs::copy` preserved the source's mode, and a rollback renames
+        // the backup back over the final — so dropping the mode here would
+        // silently widen a locked-down artifact on every recovery.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        std::fs::write(&final_path, b"owner-only contract bytes").expect("write");
+        std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+        let prev = prev_sibling(&final_path);
+
+        copy_no_follow(&final_path, &prev).expect("copy");
+
+        assert_eq!(
+            std::fs::read(&prev).expect("backup"),
+            b"owner-only contract bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(&prev).expect("meta").permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// Set-user-ID must never survive the copy.
+    ///
+    /// `std::fs::copy` propagates the source mode verbatim. That is safe
+    /// when the destination is the caller's own file, but here the source is
+    /// attacker-influenceable and the destination is created as Rocky: a
+    /// raced `04755` source would produce a ROCKY-OWNED SETUID backup, which
+    /// a rollback then renames over the final.
+    ///
+    /// The mode assertion in the test above masks `& 0o777`, so it cannot
+    /// see these bits at all — this one asserts the UNMASKED mode.
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_drops_setuid_and_setgid_from_the_source_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        std::fs::write(&final_path, b"contract bytes").expect("write");
+        // setuid + setgid + sticky, all three, plus 0755.
+        std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o7755))
+            .expect("chmod");
+        let prev = prev_sibling(&final_path);
+
+        copy_no_follow(&final_path, &prev).expect("copy");
+
+        let mode = std::fs::metadata(&prev).expect("meta").permissions().mode();
+        assert_eq!(
+            mode & 0o7000,
+            0,
+            "setuid/setgid/sticky must not be carried onto a Rocky-created \
+             backup (mode was {mode:o})"
+        );
+        assert_eq!(mode & 0o777, 0o755, "the ordinary permission bits carry");
+    }
+
+    /// A non-regular source is refused, and refused WITHOUT blocking.
+    ///
+    /// `std::fs::copy` rejected non-regular sources; reading by hand has to
+    /// refuse them explicitly. A FIFO raced into place would otherwise block
+    /// the open until a writer appeared — the commit hangs forever, with no
+    /// timeout anywhere above it.
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_refuses_a_fifo_source_instead_of_blocking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        std::fs::remove_file(&final_path).ok();
+        let c_path = std::ffi::CString::new(final_path.as_os_str().as_encoded_bytes())
+            .expect("path has no interior nul");
+        // SAFETY: `mkfifo` with a valid NUL-terminated path and a mode is
+        // sound; the worst case is a failure return, asserted below.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let prev = prev_sibling(&final_path);
+
+        // The assertion is that this RETURNS. Before O_NONBLOCK it would
+        // block here until a writer opened the FIFO, which never happens.
+        let error = copy_no_follow(&final_path, &prev).expect_err("a FIFO source is refused");
+
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "expected the regular-file refusal, got: {error}"
+        );
+        assert!(!prev.exists(), "a refused copy must leave no backup behind");
     }
 
     #[cfg(unix)]
