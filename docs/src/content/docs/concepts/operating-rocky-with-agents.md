@@ -130,14 +130,19 @@ write, not on a second round-trip.
 **Gate 2, your policy rules.** A `[policy]` block in `rocky.toml` states who may
 change what. Rocky evaluates every `draft_*` and `propose` call against it before
 anything persists. A `deny` removes a new file, or restores the prior content of
-a file the agent re-drafted, so a denial leaves nothing behind. Rocky writes each
-decision, including each denial, to the audit ledger. At apply, that write is
-best-effort for an ordinary rule: a failed write warns and does not stop the
-apply. This is the same evaluator
-that gates `apply` and `promote`, so an agent learns the verdict with the write
-rather than three steps later. See
+a file the agent re-drafted, so a denial leaves nothing behind. This is the same
+evaluator that gates `apply` and `promote`, so an agent learns the verdict with
+the write rather than three steps later. See
 [Cross-team contracts](/concepts/cross-team-contracts/) for how the rules are
 written.
+
+Rocky records policy decisions in an audit ledger, and `rocky audit` lists them.
+Read that ledger as a best-effort record, not as proof. The write is best-effort
+wherever it happens, on `apply` and on the `draft_*` and `propose` tools alike: a
+failed write warns and lets the operation continue. Some refusals never reach the
+ledger at all, because a request refused before the rules are evaluated returns
+its verdict without writing a row. If you need a decision to be provably
+recorded, the ledger does not give you that today.
 
 **Gate 3, a human.** `propose` writes a plan marked as AI-authored. `rocky apply`
 refuses to run one until a person approves it. The engine enforces this, not a
