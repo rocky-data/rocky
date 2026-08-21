@@ -861,12 +861,52 @@ pub(crate) fn product_compile_in(
         Some(store) => store.product_approval_get(product_name)?,
         None => None,
     };
+    // No state store means no fulfillment record can exist, so no loop
+    // can own this product.
+    let observed_state = match &state_store {
+        Some(store) => store.fulfill_state_get(product_name)?,
+        None => None,
+    };
     let mut approval_echo = None;
     let mut spec_matches_approval = None;
     if let Some(record) = &approval {
         verify_approval_snapshot(root, record)?;
         spec_matches_approval = Some(record.spec_digest == parsed.digest);
         approval_echo = Some(approval_output(record));
+    }
+
+    // Compile picks its phase from what is on disk, so it must never run
+    // concurrently with a fulfillment loop that OWNS this product. The
+    // loop's drafting window is exactly the interval where the manifest
+    // says Phase A while last round's sidecar is still on disk: a
+    // `rocky product compile` landing there re-merges and re-pins that
+    // stale sidecar, which makes the loop's own repair look like tamper
+    // all over again (#1493). Refuse for a foreign owner — the same
+    // shape `product_approve_in` uses for in-flight work below.
+    //
+    // The loop's OWN compile passes straight through: it runs in the
+    // process whose pid is stamped on the record it CAS'd.
+    if let Some(record) = &observed_state {
+        let me = std::process::id();
+        let mine = record.owner_pid == Some(me);
+        if !mine && (record.owner_pid.is_some() || record.driver_pgid.is_some()) {
+            let who = match (record.owner_pid, record.driver_pgid) {
+                (Some(pid), _) => format!("a fulfillment loop (pid {pid}) owns it"),
+                (None, Some(pgid)) => {
+                    format!("a worker process group (pgid {pgid}) is recorded as live")
+                }
+                (None, None) => unreachable!("guarded by the condition above"),
+            };
+            bail!(
+                "[compile-refused-in-flight] refusing to compile product '{product_name}' \
+                 while fulfillment work is in flight ({who}, this process is pid {me}). \
+                 Compiling now could re-merge and re-pin artifacts the loop is mid-round \
+                 on. Stop the running `rocky fulfill` loop (or let it reach its next stop \
+                 — needs_input, blocked, or observing), then re-run; nothing was written. \
+                 If that loop is already gone, `rocky fulfill {product_name}` sweeps the \
+                 dead owner by its start time and takes the record over."
+            );
+        }
     }
 
     let sidecar_present = root.join(sidecar_rel(&parsed)).is_file();
@@ -2259,6 +2299,140 @@ effect = "require_review"
             1,
             "a no-op re-approve appends no journal row"
         );
+    }
+
+    /// #1493 F3: `compile` picks its phase from what is on disk, so a
+    /// concurrent run during the loop's drafting window would re-merge
+    /// and re-pin the PREVIOUS round's sidecar — making the loop's own
+    /// repair look like tamper again. It refuses for a foreign owner,
+    /// the same shape the D2 approve guard uses.
+    #[test]
+    fn compiling_a_product_a_live_loop_owns_refuses() {
+        use rocky_core::fulfill::{FulfillJournalRow, FulfillState};
+
+        let row = |event: &str, to: &str| FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: event.to_string(),
+            from_state: None,
+            to_state: to.to_string(),
+            spec_digest: None,
+            plan_id: None,
+            idempotency_key: None,
+        };
+
+        // Each case is a DIFFERENT in-flight stamp, and each must refuse
+        // on its own.
+        for (why, owner_pid, driver_pgid, expect) in [
+            ("a live loop owns the record", Some(31337u32), None, "pid 31337"),
+            (
+                "only a worker group is stamped",
+                None,
+                Some(4242u32),
+                "pgid 4242",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (root, config) = project_with_config(dir.path(), &passing_config());
+            let state_path = temp_state_path(dir.path());
+            product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+            {
+                let store = StateStore::open(&state_path).expect("opens");
+                let observed = store
+                    .fulfill_state_get("revenue_daily")
+                    .expect("reads")
+                    .expect("recorded");
+                let mut drafting = observed.clone();
+                drafting.state = FulfillState::Drafting;
+                drafting.owner_pid = owner_pid;
+                drafting.owner_start_time = owner_pid.map(|_| 1);
+                drafting.driver_pgid = driver_pgid;
+                store
+                    .fulfill_state_cas(
+                        "revenue_daily",
+                        Some(&observed),
+                        &drafting,
+                        &row("drafting", "drafting"),
+                    )
+                    .expect("cas");
+            }
+
+            let err = product_compile_in(&root, &config, Some(&state_path), "revenue_daily")
+                .expect_err(why);
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("[compile-refused-in-flight]"),
+                "{why}: {rendered}"
+            );
+            assert!(rendered.contains(expect), "{why}: names who owns it: {rendered}");
+            assert!(
+                rendered.contains("rocky fulfill revenue_daily"),
+                "{why}: a stale stamp is recoverable, and the refusal must say how: \
+                 {rendered}"
+            );
+
+            // Nothing was compiled: no manifest, no artifacts.
+            assert!(
+                committed_manifest(&root, "revenue_daily")
+                    .expect("reads")
+                    .is_none(),
+                "{why}: a refusal must not commit a generation"
+            );
+            assert!(
+                !root.join("models/revenue_daily.contract.toml").exists(),
+                "{why}: a refusal must write no artifacts"
+            );
+        }
+    }
+
+    /// The other half of F3: the loop's OWN compile is not refused. The
+    /// loop calls `product_compile` in the very process whose pid it
+    /// stamped on the record, so the guard must let that through — a
+    /// guard that blocked it would deadlock the loop at Phase A.
+    #[test]
+    fn the_owning_process_compiles_its_own_product() {
+        use rocky_core::fulfill::{FulfillJournalRow, FulfillState};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+        {
+            let store = StateStore::open(&state_path).expect("opens");
+            let observed = store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            let mut drafting = observed.clone();
+            drafting.state = FulfillState::Drafting;
+            // The stamp a loop running IN THIS PROCESS would leave.
+            drafting.owner_pid = Some(std::process::id());
+            drafting.owner_start_time = Some(1);
+            drafting.driver_pgid = Some(4242);
+            store
+                .fulfill_state_cas(
+                    "revenue_daily",
+                    Some(&observed),
+                    &drafting,
+                    &FulfillJournalRow {
+                        seq: 0,
+                        at: None,
+                        event: "drafting".to_string(),
+                        from_state: None,
+                        to_state: "drafting".to_string(),
+                        spec_digest: None,
+                        plan_id: None,
+                        idempotency_key: None,
+                    },
+                )
+                .expect("cas");
+        }
+
+        let output = product_compile_in(&root, &config, Some(&state_path), "revenue_daily")
+            .expect("the owner's own compile proceeds");
+        assert_eq!(output.phase, "lowered_contract");
     }
 
     /// D2: a NEW-digest approval must refuse while fulfillment work is
