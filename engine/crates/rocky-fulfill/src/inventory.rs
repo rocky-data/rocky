@@ -75,6 +75,13 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_core::fulfill::FulfillStateRecord::new",
     "rocky_core::fulfill::ProductApprovalRecord",
     "rocky_core::state::StateStore",
+    // The process start-time probe (#1493). DELIBERATE addition: it used
+    // to live in this crate, and moved DOWN to rocky-core because
+    // `rocky-cli` needs the same answer to tell whether a product
+    // record's owner stamp is its own process — and rocky-cli cannot
+    // depend on this crate, which sits above it. This crate re-exports
+    // it, so the ownership probe and every caller are unchanged.
+    "rocky_core::process::process_liveness",
     // Spec identity + the confined write target (the runner's candidate
     // write and the snapshot re-verification).
     "rocky_core::product::commit::contained_write_target",
