@@ -60,9 +60,21 @@ recorded repair round (#1493, fixed — see below).
   write is authorized exactly like the first draft's and out-of-band edits
   between gates stay detected. The replay lane's recorded first draft is red
   (E010: `revenue_eur` missing) and the recorded repair fixes it; assert 2
-  pins the round (three worker transcripts, the repaired SQL survives). The
-  **banked live evidence predates the fix** — its first draft was green, so it
-  exercised no repair round; the live lane simply gains this recovery path now.
+  pins the round by KIND — the worker transcripts must be exactly
+  `elicitation`, `drafting`, `repair`, and the repaired SQL must survive. By
+  kind, not by count: three transcripts reading `elicitation, drafting,
+  drafting` would pass a count check while meaning the repair round was
+  dispatched as a plain draft. The **banked live evidence predates the fix** —
+  its first draft was green, so it exercised no repair round; the live lane
+  simply gains this recovery path now.
+- **The repair window is a real residual.** Between the repair dispatch and the
+  merge that closes it, the sidecar is not covered by any hash, and the merge
+  preserves keys and `[[tests]]` entries the lowering does not own — so content
+  added to that file during the window is carried into the committed artifact.
+  Using it needs a process that can write the models directory while the loop
+  runs, which is the same access that can forge an approval marker. This POC
+  makes no claim to defend against that. Tracked in
+  [#1515](https://github.com/rocky-data/rocky/issues/1515).
 - **Freshness is observed, not enforced.** Assert 10 shows the loop *reporting*
   staleness (lag vs budget) after the data is aged. Staleness is a finding in the
   loop's journal; it never blocks an apply. This POC makes no claim that Rocky

@@ -1673,11 +1673,7 @@ fn dispatch_drafting(
     next.drafting_round = round;
     Decision::AdvanceAndAct {
         record: next,
-        event: format!(
-            "{} attempt {}",
-            round.tag(),
-            observed.drafting_attempts + 1
-        ),
+        event: format!("{} attempt {}", round.tag(), observed.drafting_attempts + 1),
         task,
     }
 }

@@ -2324,7 +2324,12 @@ effect = "require_review"
         // Each case is a DIFFERENT in-flight stamp, and each must refuse
         // on its own.
         for (why, owner_pid, driver_pgid, expect) in [
-            ("a live loop owns the record", Some(31337u32), None, "pid 31337"),
+            (
+                "a live loop owns the record",
+                Some(31337u32),
+                None,
+                "pid 31337",
+            ),
             (
                 "only a worker group is stamped",
                 None,
@@ -2365,7 +2370,10 @@ effect = "require_review"
                 rendered.contains("[compile-refused-in-flight]"),
                 "{why}: {rendered}"
             );
-            assert!(rendered.contains(expect), "{why}: names who owns it: {rendered}");
+            assert!(
+                rendered.contains(expect),
+                "{why}: names who owns it: {rendered}"
+            );
             assert!(
                 rendered.contains("rocky fulfill revenue_daily"),
                 "{why}: a stale stamp is recoverable, and the refusal must say how: \

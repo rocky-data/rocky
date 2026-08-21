@@ -64,8 +64,9 @@ fn the_gated_reopen_keeps_its_evidence_parameter() {
         &str,
         &rocky_core::product::spec::ParsedSpec,
         &rocky_core::fulfill::FulfillStateRecord,
-    ) -> rocky_core::product::spec::SpecResult<rocky_core::product::commit::ReopenOutcome> =
-        rocky_core::product::commit::reopen_for_drafting;
+    ) -> rocky_core::product::spec::SpecResult<
+        rocky_core::product::commit::ReopenOutcome,
+    > = rocky_core::product::commit::reopen_for_drafting;
 }
 
 /// The negative half: the raw demotion is not nameable from outside

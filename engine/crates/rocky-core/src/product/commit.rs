@@ -1652,7 +1652,8 @@ mod tests {
         full_flow(&project, &parsed);
         let before = snapshot(&project);
 
-        let outcome = demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("reopens");
+        let outcome =
+            demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("reopens");
         assert_eq!(outcome, ReopenOutcome::Reopened);
 
         // The manifest is Phase A again: contract-only artifact set, so
@@ -1708,7 +1709,8 @@ mod tests {
             write_file(&path, text.as_bytes());
             let before = snapshot(&project);
 
-            let outcome = demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("runs");
+            let outcome =
+                demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("runs");
             let ReopenOutcome::Tampered(problems) = outcome else {
                 panic!("expected Tampered for {tampered_rel}, got {outcome:?}");
             };
@@ -1767,15 +1769,16 @@ mod tests {
             );
         let edited = parse_spec_bytes(edited_text.as_bytes(), SPEC_PATH).expect("valid");
         assert_ne!(edited.digest, parsed.digest);
-        let error = demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &edited).expect_err("superseded");
+        let error = demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &edited)
+            .expect_err("superseded");
         assert_eq!(error.code, "spec-superseded");
         assert!(error.message.contains(&parsed.digest), "{error}");
         assert!(error.message.contains(&edited.digest), "{error}");
 
         // A manifest recorded under another spec path is a foreign
         // generation identity.
-        let error =
-            demote_merged_manifest_to_phase_a(&project, "products/elsewhere.toml", &parsed).expect_err("foreign");
+        let error = demote_merged_manifest_to_phase_a(&project, "products/elsewhere.toml", &parsed)
+            .expect_err("foreign");
         assert_eq!(error.code, "reopen-foreign-generation");
         assert!(error.message.contains("spec_path"), "{error}");
 
@@ -1811,45 +1814,53 @@ mod tests {
         assert_eq!(committed(&project).phase, ManifestPhase::LoweredContract);
     }
 
+    /// One refusal case: why it must refuse, how to build the record
+    /// that triggers it, and the fragment the message must name.
+    type UndecidedCase = (
+        &'static str,
+        fn(&ParsedSpec) -> FulfillStateRecord,
+        &'static str,
+    );
+
     #[test]
     fn the_reopen_refuses_every_record_that_is_not_the_loops_decision() {
         // Each case removes exactly ONE element of the decision, so a
         // passing case cannot be carried by the others.
-        let cases: Vec<(&str, Box<dyn Fn(&ParsedSpec) -> FulfillStateRecord>, &str)> = vec![
+        let cases: [UndecidedCase; 4] = [
             (
                 "no owner stamp at all — nobody won the record's CAS",
-                Box::new(|parsed: &ParsedSpec| {
+                |parsed: &ParsedSpec| {
                     let mut record = decided_record(parsed);
                     record.owner_pid = None;
                     record
-                }),
+                },
                 "owned by no one",
             ),
             (
                 "owned by a DIFFERENT process — a concurrent caller",
-                Box::new(|parsed: &ParsedSpec| {
+                |parsed: &ParsedSpec| {
                     let mut record = decided_record(parsed);
                     record.owner_pid = Some(std::process::id().wrapping_add(1));
                     record
-                }),
+                },
                 "not this process",
             ),
             (
                 "the loop is not in a drafting round",
-                Box::new(|parsed: &ParsedSpec| {
+                |parsed: &ParsedSpec| {
                     let mut record = decided_record(parsed);
                     record.state = FulfillState::Merged;
                     record
-                }),
+                },
                 "not 'drafting'",
             ),
             (
                 "a record fetched for ANOTHER product",
-                Box::new(|parsed: &ParsedSpec| {
+                |parsed: &ParsedSpec| {
                     let mut record = decided_record(parsed);
                     record.product_id = "product:elsewhere".to_string();
                     record
-                }),
+                },
                 "belongs to product:elsewhere",
             ),
         ];
@@ -1861,8 +1872,8 @@ mod tests {
             full_flow(&project, &parsed);
             let before = snapshot(&project);
 
-            let error = reopen_for_drafting(&project, SPEC_PATH, &parsed, &build(&parsed))
-                .expect_err(why);
+            let error =
+                reopen_for_drafting(&project, SPEC_PATH, &parsed, &build(&parsed)).expect_err(why);
             assert_eq!(error.code, "reopen-undecided", "{why}: {error}");
             assert!(
                 error.message.contains(expected_fragment),
@@ -1873,7 +1884,11 @@ mod tests {
                 error.message.contains("rocky fulfill revenue_daily"),
                 "{why}: the refusal must name the decided route: {error}"
             );
-            assert_eq!(snapshot(&project), before, "{why}: a refusal mutates nothing");
+            assert_eq!(
+                snapshot(&project),
+                before,
+                "{why}: a refusal mutates nothing"
+            );
             assert_eq!(
                 committed(&project).phase,
                 ManifestPhase::Merged,
