@@ -121,6 +121,13 @@ pub async fn run_fulfill(
         }
     };
 
+    // Crash seam for the self-lockout drill (#1493): ownership is
+    // stamped on disk, no state transition has happened yet. The next
+    // invocation must be able to take that stamp over and still open its
+    // own drafting window — a gate that read the dead owner's stamp as
+    // "mine" would lock the product out permanently.
+    fault_point("post-acquire");
+
     let outcome = runner.step_loop(*record, retry).await;
     let (final_record, stop) = match outcome {
         Ok(pair) => pair,

@@ -950,6 +950,72 @@ fn a_crash_between_the_repair_cas_and_its_worker_resumes_as_a_repair() {
     );
 }
 
+/// #1493: a crash between `acquire` and the first state transition must
+/// not lock the product out of its own drafting window.
+///
+/// The reopen gate requires the record's owner stamp to name THIS
+/// process — pid paired with process start time. A hard crash leaves a
+/// stamp behind that no live process matches. If the next invocation
+/// could not take that stamp over, or took it over without restamping,
+/// the loop would refuse to open a window it is entitled to and the
+/// product would be permanently stuck.
+///
+/// This is the seam the reasoning covered but no test did: the fault
+/// fires with ownership on disk and no transition yet.
+#[test]
+fn a_crash_right_after_acquire_does_not_lock_the_product_out() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_repair(BAD_DRAFT_SQL, DRAFT_SQL));
+
+    // Crash with ownership stamped and nothing else done.
+    let (code, _j, _o, _e) = rocky_env(
+        dir,
+        &["fulfill", PRODUCT],
+        &[("ROCKY_FULFILL_FAULT", "post-acquire")],
+    );
+    assert_ne!(code, 0, "the fault aborts the process");
+
+    // A dead process's stamp is on the record.
+    {
+        let store = state_store(dir);
+        let record = store
+            .fulfill_state_get(PRODUCT)
+            .expect("reads")
+            .expect("the crash left a record");
+        let stamped = record.owner_pid.expect("ownership was stamped");
+        assert!(
+            !rocky_core::process::stamp_is_this_process(record.owner_pid, record.owner_start_time),
+            "the stale stamp (pid {stamped}) must not read as this process"
+        );
+    }
+
+    // Drive to completion: the takeover restamps ownership, and every
+    // later gate that asks "is this record mine?" answers yes.
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "the stale owner stamp must be taken over: {e}");
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", "approve-spec", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+
+    // The full path including a REPAIR round, which is the one that
+    // reopens the drafting window through the owner-stamp gate.
+    let (code, json, _o, e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "the reopen must not refuse its own loop: {e}");
+    let json = json.expect("json");
+    assert_eq!(json["state"], "needs_input", "{json}");
+
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    assert!(
+        rows.iter().any(|r| r.event.starts_with("repair round")),
+        "the repair round ran, so the reopen gate was exercised: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.to_state == "blocked"),
+        "nothing blocks — a self-lockout would show up here: {rows:?}"
+    );
+}
+
 /// A repair that never turns the verify green exhausts
 /// MAX_REPAIR_ROUNDS and blocks on the BUDGET — a plain red, never a
 /// tamper claim, with each round's reopen + re-merge journaled.

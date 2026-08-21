@@ -1301,14 +1301,22 @@ pub fn reopen_for_drafting(
     }
     if !crate::process::stamp_is_this_process(decided.owner_pid, decided.owner_start_time) {
         let me = std::process::id();
-        let owner = decided
-            .owner_pid
-            .map(|pid| format!("pid {pid}"))
-            .unwrap_or_else(|| "no one".to_string());
-        return Err(undecided(format!(
-            "the record is owned by {owner}, not this process (pid {me}); a stamp whose \
-             process start time does not match is a dead owner's, not ours"
-        )));
+        // Say which of the two cases this is. "owned by pid 43917, not
+        // this process (pid 43917)" reads as a contradiction and tells
+        // an operator nothing.
+        let why = match decided.owner_pid {
+            None => "no process owns the record — nothing decided a drafting round".to_string(),
+            Some(pid) if pid == me => format!(
+                "the record's owner stamp carries this pid ({pid}) but a different process \
+                 start time, so it was left by an earlier process that has since died and \
+                 whose pid the system reused — not by this one. Re-run `rocky fulfill` to \
+                 take the stale record over"
+            ),
+            Some(pid) => format!(
+                "the record is owned by another process (pid {pid}), not this one (pid {me})"
+            ),
+        };
+        return Err(undecided(why));
     }
     demote_merged_manifest_to_phase_a(project_root, spec_path, parsed)
 }
@@ -1928,7 +1936,7 @@ mod tests {
                     record.owner_pid = None;
                     record
                 },
-                "owned by no one",
+                "nothing decided a drafting round",
             ),
             (
                 "owned by a DIFFERENT process — a concurrent caller",
@@ -1937,7 +1945,7 @@ mod tests {
                     record.owner_pid = Some(std::process::id().wrapping_add(1));
                     record
                 },
-                "not this process",
+                "owned by another process",
             ),
             (
                 "OUR pid, but a dead owner's start time — a recycled pid",
@@ -1946,7 +1954,7 @@ mod tests {
                     record.owner_start_time = Some(1);
                     record
                 },
-                "process start time does not match",
+                "pid the system reused",
             ),
             (
                 "our pid with NO recorded start time — unconfirmable, so not ours",
@@ -1955,7 +1963,7 @@ mod tests {
                     record.owner_start_time = None;
                     record
                 },
-                "process start time does not match",
+                "pid the system reused",
             ),
             (
                 "the loop is not in a drafting round",
