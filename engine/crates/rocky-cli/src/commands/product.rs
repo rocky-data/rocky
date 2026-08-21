@@ -1458,11 +1458,37 @@ pub(crate) fn product_recover_in(root: &Path, product_name: &str) -> Result<Reco
 /// committed MERGED generation in full, then demote its manifest to
 /// Phase A through the staged commit. See
 /// [`rocky_core::product::commit::reopen_for_drafting`] for the
-/// protocol; this wrapper only resolves the spec.
-pub(crate) fn product_reopen_in(root: &Path, product_name: &str) -> Result<ReopenOutcome> {
+/// protocol.
+///
+/// The decision evidence is read HERE, from the state store, never
+/// accepted from the caller: the record this passes down is the
+/// compare-and-swapped one on disk. So a caller that never won the
+/// record's CAS cannot manufacture the evidence by handing in a record
+/// it built itself — it has to actually be the loop that owns the
+/// product.
+///
+/// # Errors
+///
+/// `reopen-undecided` when no fulfillment record exists for the product
+/// at all (nothing decided anything), plus whatever the core reopen and
+/// the spec load refuse.
+pub(crate) fn product_reopen_in(
+    root: &Path,
+    state_path: &Path,
+    product_name: &str,
+) -> Result<ReopenOutcome> {
     let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
     let spec_path = spec_rel(product_name);
-    reopen_for_drafting(root, &spec_path, &parsed).map_err(|reject| anyhow::anyhow!("{reject}"))
+    let store = open_state_store(state_path)?;
+    let Some(decided) = store.fulfill_state_get(product_name)? else {
+        bail!(
+            "[reopen-undecided] refusing to reopen the drafting window for product \
+             '{product_name}': no fulfillment record exists, so no loop decided a drafting \
+             round. Run `rocky fulfill {product_name}`."
+        );
+    };
+    reopen_for_drafting(root, &spec_path, &parsed, &decided)
+        .map_err(|reject| anyhow::anyhow!("{reject}"))
 }
 
 #[cfg(test)]

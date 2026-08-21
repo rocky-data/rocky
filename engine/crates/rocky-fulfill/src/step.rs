@@ -1039,7 +1039,7 @@ impl Runner {
             // journaled, the window not yet reopened.
             fault_point("pre-repair-reopen");
         }
-        match fulfill_api::product_reopen_drafting(&self.root, &self.product)? {
+        match fulfill_api::product_reopen_drafting(&self.root, &self.state_path, &self.product)? {
             fulfill_api::ReopenOutcome::Tampered(problems) => {
                 return Ok(Event::ArtifactCheck { problems });
             }

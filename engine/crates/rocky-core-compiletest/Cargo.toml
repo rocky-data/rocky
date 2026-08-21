@@ -1,7 +1,7 @@
 [package]
 name = "rocky-core-compiletest"
 version = "0.0.0"
-description = "Compile-fail (trybuild) guards for rocky-core's #[must_use] boundaries"
+description = "Out-of-crate compile-fail guards for rocky-core: the #[must_use] authority boundary and the pub(crate) manifest demotion"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true

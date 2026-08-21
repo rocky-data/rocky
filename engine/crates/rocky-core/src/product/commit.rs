@@ -46,6 +46,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fulfill::{FulfillState, FulfillStateRecord};
 use crate::product::lowering::{
     Lowering, contract_rel, lower_phase_a, lower_phase_b, manifest_rel, sidecar_rel, sql_rel,
     state_dir_rel,
@@ -1195,9 +1196,98 @@ fn run_phase_b_with_ops(
     Ok(lowering)
 }
 
-/// (Re)open the drafting window over a committed MERGED generation —
+/// (Re)open the drafting window over a committed MERGED generation, on
+/// the evidence that the fulfillment loop DECIDED this drafting round
+/// (#1493).
+///
+/// # Why this needs evidence
+///
+/// The demotion below is an authority transition: it takes a generation
+/// whose sidecar bytes are pinned by a committed manifest and returns
+/// that sidecar to the writable drafting namespace. Reached without the
+/// loop, it would open the Phase-A window on a legitimate merged
+/// generation with no round to fill it — so the raw transition is
+/// [`demote_merged_manifest_to_phase_a`], which is `pub(crate)` and
+/// unreachable from any other crate (pinned by the out-of-crate
+/// compile-fail proof in `rocky-core-compiletest`). This is the only
+/// public way in, and it demands the loop's compare-and-swapped record:
+///
+/// - the record is THIS product's (`product_id` matches the spec), so a
+///   record fetched for another product grants nothing here;
+/// - the machine is at [`FulfillState::Drafting`] — the one state in
+///   which a drafting or repair worker is dispatched. Every other state
+///   (`Merged`, `Verifying`, `Applied`, …) has no round to open a window
+///   for;
+/// - the owner stamp names THIS process. Stamping it means winning the
+///   record's CAS, which is what "the loop decided" reduces to on disk.
+///
+/// # What the owner stamp does and does not prove
+///
+/// It proves the caller is the process that holds the record — a
+/// concurrent `rocky product …` process carries a different pid and is
+/// refused. It is not an authentication: the stamp is reuse-proofed by
+/// the ownership probe the loop runs at acquire time (which pairs the
+/// pid with the owner's start time), not by this check, and a hostile
+/// local process that can write the state store can write any record it
+/// likes — the v0 threat model concedes that adversary outright. This
+/// gate closes OUR surface area, not that one.
+///
+/// # Errors
+///
+/// Returns `reopen-undecided` when the record does not carry the loop's
+/// decision, plus everything
+/// [`demote_merged_manifest_to_phase_a`] refuses.
+pub fn reopen_for_drafting(
+    project_root: &Path,
+    spec_path: &str,
+    parsed: &ParsedSpec,
+    decided: &FulfillStateRecord,
+) -> SpecResult<ReopenOutcome> {
+    let product_id = parsed.product_id();
+    let undecided = |why: String| {
+        SpecRejected::new(
+            "reopen-undecided",
+            format!(
+                "refusing to reopen the drafting window for {product_id}: {why}. The drafting \
+                 window is opened by the fulfillment loop's own decided round — run \
+                 `rocky fulfill {}` instead of demoting a committed generation by hand",
+                parsed.product().name
+            ),
+        )
+    };
+    if decided.product_id != product_id {
+        return Err(undecided(format!(
+            "the supplied fulfillment record belongs to {} ",
+            decided.product_id
+        )));
+    }
+    if decided.state != FulfillState::Drafting {
+        return Err(undecided(format!(
+            "the loop is at '{}', not 'drafting' — no drafting round is open",
+            decided.state.tag()
+        )));
+    }
+    let me = std::process::id();
+    if decided.owner_pid != Some(me) {
+        let owner = decided
+            .owner_pid
+            .map(|pid| format!("pid {pid}"))
+            .unwrap_or_else(|| "no one".to_string());
+        return Err(undecided(format!(
+            "the record is owned by {owner}, not this process (pid {me})"
+        )));
+    }
+    demote_merged_manifest_to_phase_a(project_root, spec_path, parsed)
+}
+
+/// The raw demotion of a committed MERGED generation back to Phase A —
 /// the loop's authorized transition before it dispatches a repair (or a
 /// resumed drafting) worker (#1493).
+///
+/// `pub(crate)`: reaching this without the loop's decided round would
+/// open the Phase-A window on a legitimate merged generation. The one
+/// public route in is [`reopen_for_drafting`], which demands the
+/// compare-and-swapped record first.
 ///
 /// A merged manifest pins the sidecar's exact bytes, which is right for
 /// every window where no write is authorized — but a repair round the
@@ -1236,7 +1326,7 @@ fn run_phase_b_with_ops(
 /// product, model, or spec path — a foreign generation is never
 /// demoted. Plus anything [`recover_generation`], [`lower_phase_a`], or
 /// [`commit_generation`] refuses.
-pub fn reopen_for_drafting(
+pub(crate) fn demote_merged_manifest_to_phase_a(
     project_root: &Path,
     spec_path: &str,
     parsed: &ParsedSpec,
@@ -1562,7 +1652,7 @@ mod tests {
         full_flow(&project, &parsed);
         let before = snapshot(&project);
 
-        let outcome = reopen_for_drafting(&project, SPEC_PATH, &parsed).expect("reopens");
+        let outcome = demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("reopens");
         assert_eq!(outcome, ReopenOutcome::Reopened);
 
         // The manifest is Phase A again: contract-only artifact set, so
@@ -1618,7 +1708,7 @@ mod tests {
             write_file(&path, text.as_bytes());
             let before = snapshot(&project);
 
-            let outcome = reopen_for_drafting(&project, SPEC_PATH, &parsed).expect("runs");
+            let outcome = demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("runs");
             let ReopenOutcome::Tampered(problems) = outcome else {
                 panic!("expected Tampered for {tampered_rel}, got {outcome:?}");
             };
@@ -1645,7 +1735,7 @@ mod tests {
 
         // No committed manifest at all: nothing to demote.
         assert_eq!(
-            reopen_for_drafting(&project, SPEC_PATH, &parsed).expect("runs"),
+            demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("runs"),
             ReopenOutcome::NotNeeded
         );
 
@@ -1653,7 +1743,7 @@ mod tests {
         run_phase_a(&project, SPEC_PATH, &parsed).expect("phase A");
         let before = snapshot(&project);
         assert_eq!(
-            reopen_for_drafting(&project, SPEC_PATH, &parsed).expect("runs"),
+            demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("runs"),
             ReopenOutcome::NotNeeded
         );
         assert_eq!(snapshot(&project), before, "not-needed writes nothing");
@@ -1677,7 +1767,7 @@ mod tests {
             );
         let edited = parse_spec_bytes(edited_text.as_bytes(), SPEC_PATH).expect("valid");
         assert_ne!(edited.digest, parsed.digest);
-        let error = reopen_for_drafting(&project, SPEC_PATH, &edited).expect_err("superseded");
+        let error = demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &edited).expect_err("superseded");
         assert_eq!(error.code, "spec-superseded");
         assert!(error.message.contains(&parsed.digest), "{error}");
         assert!(error.message.contains(&edited.digest), "{error}");
@@ -1685,12 +1775,111 @@ mod tests {
         // A manifest recorded under another spec path is a foreign
         // generation identity.
         let error =
-            reopen_for_drafting(&project, "products/elsewhere.toml", &parsed).expect_err("foreign");
+            demote_merged_manifest_to_phase_a(&project, "products/elsewhere.toml", &parsed).expect_err("foreign");
         assert_eq!(error.code, "reopen-foreign-generation");
         assert!(error.message.contains("spec_path"), "{error}");
 
         assert_eq!(snapshot(&project), before, "refusals mutate nothing");
         assert_eq!(committed(&project).phase, ManifestPhase::Merged);
+    }
+
+    // ---------------- the reopen's evidence gate (F1, #1493) ----------------
+
+    /// The record a loop that DECIDED a drafting round leaves on disk:
+    /// this product, at `drafting`, owner stamp = this process.
+    fn decided_record(parsed: &ParsedSpec) -> FulfillStateRecord {
+        let mut record = FulfillStateRecord::new(
+            FulfillState::Drafting,
+            parsed.product_id(),
+            Some(parsed.digest.clone()),
+            None,
+        );
+        record.owner_pid = Some(std::process::id());
+        record
+    }
+
+    #[test]
+    fn the_reopen_demotes_only_on_the_loops_decided_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        full_flow(&project, &parsed);
+
+        let outcome = reopen_for_drafting(&project, SPEC_PATH, &parsed, &decided_record(&parsed))
+            .expect("the decided record opens the window");
+        assert_eq!(outcome, ReopenOutcome::Reopened);
+        assert_eq!(committed(&project).phase, ManifestPhase::LoweredContract);
+    }
+
+    #[test]
+    fn the_reopen_refuses_every_record_that_is_not_the_loops_decision() {
+        // Each case removes exactly ONE element of the decision, so a
+        // passing case cannot be carried by the others.
+        let cases: Vec<(&str, Box<dyn Fn(&ParsedSpec) -> FulfillStateRecord>, &str)> = vec![
+            (
+                "no owner stamp at all — nobody won the record's CAS",
+                Box::new(|parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.owner_pid = None;
+                    record
+                }),
+                "owned by no one",
+            ),
+            (
+                "owned by a DIFFERENT process — a concurrent caller",
+                Box::new(|parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.owner_pid = Some(std::process::id().wrapping_add(1));
+                    record
+                }),
+                "not this process",
+            ),
+            (
+                "the loop is not in a drafting round",
+                Box::new(|parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.state = FulfillState::Merged;
+                    record
+                }),
+                "not 'drafting'",
+            ),
+            (
+                "a record fetched for ANOTHER product",
+                Box::new(|parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.product_id = "product:elsewhere".to_string();
+                    record
+                }),
+                "belongs to product:elsewhere",
+            ),
+        ];
+
+        for (why, build, expected_fragment) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let project = seeded_project(dir.path());
+            let parsed = parsed_d3();
+            full_flow(&project, &parsed);
+            let before = snapshot(&project);
+
+            let error = reopen_for_drafting(&project, SPEC_PATH, &parsed, &build(&parsed))
+                .expect_err(why);
+            assert_eq!(error.code, "reopen-undecided", "{why}: {error}");
+            assert!(
+                error.message.contains(expected_fragment),
+                "{why}: the refusal must name the missing evidence \
+                 ({expected_fragment:?}), got: {error}"
+            );
+            assert!(
+                error.message.contains("rocky fulfill revenue_daily"),
+                "{why}: the refusal must name the decided route: {error}"
+            );
+            assert_eq!(snapshot(&project), before, "{why}: a refusal mutates nothing");
+            assert_eq!(
+                committed(&project).phase,
+                ManifestPhase::Merged,
+                "{why}: the merged manifest is never demoted without the decision"
+            );
+        }
     }
 
     // ------------------------- crash and recovery ---------------------------
