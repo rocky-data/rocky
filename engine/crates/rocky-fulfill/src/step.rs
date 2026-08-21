@@ -541,12 +541,7 @@ impl Runner {
     /// The deferred-checks report: the typed count, and the
     /// plain-language note for `detail`.
     fn deferred_declared_checks(&self, spec: &ApprovedSpec) -> (Option<usize>, Option<String>) {
-        match self.count_declared_checks(spec) {
-            Ok(count) => (Some(count), machine::deferred_note(count)),
-            // Never silently zero: "0 deferred" and "could not tell"
-            // are different claims, and only one of them is true here.
-            Err(why) => (None, Some(machine::uncounted_deferred_note(&why))),
-        }
+        deferred_report(self.count_declared_checks(spec))
     }
 
     /// Count every declared data check that `rocky test --declarative`
@@ -1125,6 +1120,18 @@ struct ApprovedSpec {
     parsed: rocky_core::product::spec::ParsedSpec,
 }
 
+/// Turn a count attempt into the typed field plus its `detail` note.
+///
+/// Pure, so the rule that a FAILED count never becomes `Some(0)` is
+/// pinned by a test rather than by reading the code. "0 deferred" and
+/// "could not tell" are different claims and only one can be true.
+fn deferred_report(counted: Result<usize, String>) -> (Option<usize>, Option<String>) {
+    match counted {
+        Ok(count) => (Some(count), machine::deferred_note(count)),
+        Err(why) => (None, Some(machine::uncounted_deferred_note(&why))),
+    }
+}
+
 /// Count every `[[tests]]` entry a model sidecar declares — the set
 /// `rocky test --declarative` would run against the materialised table.
 ///
@@ -1173,7 +1180,26 @@ fn fault_point(_name: &str) {}
 
 #[cfg(test)]
 mod deferred_check_counting {
-    use super::count_sidecar_tests;
+    use super::{count_sidecar_tests, deferred_report};
+
+    #[test]
+    fn a_failed_count_reports_unknown_rather_than_zero() {
+        // The step-side half of the same rule the machine pins: a count
+        // that could not be read must NOT collapse into `Some(0)`,
+        // which would read as "nothing is deferred".
+        let (count, note) = deferred_report(Err("models/x.toml unreadable: nope".to_string()));
+        assert_eq!(count, None, "an unread count is not a zero count");
+        let note = note.expect("an unknown count still says checks are deferred");
+        assert!(note.contains("deferred"));
+        assert!(note.contains("count unavailable: models/x.toml unreadable: nope"));
+
+        let (count, note) = deferred_report(Ok(4));
+        assert_eq!(count, Some(4));
+        assert!(note.expect("four deferred").starts_with("4 declared data checks deferred"));
+
+        // A genuine zero is a real answer, and renders no clause.
+        assert_eq!(deferred_report(Ok(0)), (Some(0), None));
+    }
 
     /// A merged sidecar exactly as Phase B leaves it for the walking
     /// skeleton's product: three spec-owned tests (the composite grain,
