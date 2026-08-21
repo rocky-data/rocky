@@ -52,9 +52,9 @@ does. The tools are named so the loop reads in sequence.
         └───────┬────────┘
                 ▼
         ┌────────────────┐   rocky review <plan_id> --approve
-        │ 6. a human     │   rocky apply  <plan_id>
-        │    approves    │   No MCP tool writes that approval.
-        └────────────────┘
+        │ 6. an approval │   rocky apply  <plan_id>
+        │    marker      │   The worker profile serves no tool
+        └────────────────┘   that writes that marker.
 ```
 
 Steps 1 and 2 are the reason the rest works. A column name does not tell you its
@@ -92,8 +92,8 @@ See [MCP Authoring](/concepts/mcp-authoring/) for every tool in both families.
 
 ## The three gates
 
-Nothing an agent produces reaches your warehouse without clearing three
-independent checks. The engine performs all three in code.
+Nothing an agent produces reaches your warehouse without clearing three checks.
+The engine performs all three in code.
 [What the three gates do not defend against](#what-the-three-gates-do-not-defend-against)
 states what each check actually verifies, and where that stops.
 
@@ -147,8 +147,14 @@ recorded, the ledger does not give you that today.
 
 **Gate 3, the approval marker.** `propose` writes a plan marked as AI-authored.
 `rocky apply` refuses to run one unless an approval marker is present that parses
-and names that exact plan. `rocky review <plan-id> --approve` is the command that
-writes that marker, and no MCP tool writes it.
+and names that exact plan. `rocky review <plan-id> --approve` writes that marker.
+
+One MCP tool can write it too. `review_queue` writes the marker when it is
+called with `approve_plan_id` and `confirm: true`. It refuses any plan that is
+not already in the pending review queue. The `confirm` flag is set by the
+caller, and Rocky does not check that a person set it. `rocky mcp --profile
+worker` does not serve `review_queue`, so a drafting worker on that profile has
+no tool that writes a marker.
 
 Be exact about what this check verifies. It reads a file, parses it, and compares
 the plan id. It does not authenticate who approved, or that a person approved at

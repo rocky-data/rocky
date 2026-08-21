@@ -376,9 +376,9 @@ The server is **stateless**: every tool call resolves the project from the confi
 
 What leaves your machine is bounded: warehouse queries go to your warehouse; the generators send your model's SQL and schema to **your own** Anthropic key, and for `ai_contract` only aggregate column counts (row / null / distinct), **never raw cell values**.
 
-### Safety model: read-only and propose-only
+### Safety model: the server does not materialize
 
-The server **never materializes anything**. An agent can write files and record a plan. It stops there.
+The server **never materializes anything**. No tool runs SQL that changes your warehouse. An agent can write project files and record a plan. One tool, `review_queue`, can also write the approval marker for a plan that is already in the pending review queue.
 
 ```
    agent, through rocky mcp                human
@@ -387,22 +387,24 @@ The server **never materializes anything**. An agent can write files and record 
    draft_contract  ──writes──► models/<model>.contract.toml
    draft_check     ──writes──► [[tests]] in the sidecar
         │
-        │ this is as far as the agent goes
         ▼
    propose         ──writes──► .rocky/plans/<plan-id>.json
-                                        │
-                                        ▼
+        │
+        │ review_queue, with confirm: true, writes the
+        │ marker for a plan already in the pending queue
+        ▼
                               rocky review <plan-id> --approve
                                         │
                                         ▼
                               rocky apply <plan-id> ──► warehouse
+                              no MCP tool runs this step
 ```
 
 Three rules keep that boundary in place:
 
 - The generators (`ai_contract`, `ai_test`, `explain_model`) return **drafts** and mutate nothing. Hand a draft to the `draft_contract` or `draft_check` write tool, or save it to disk and run `compile` and `test` yourself.
 - `governance_preview` and `drift_preview` are **read-only** previews.
-- The server never approves on your behalf. Approval is the one step it cannot take.
+- The server does not apply. `rocky apply` is the only step that reaches the warehouse, and no MCP tool runs it. `review_queue` can write a plan's approval marker, so treat approval as a step the server can take: it needs `confirm: true` from the caller, and it refuses a plan that is not already in the pending review queue. `rocky mcp --profile worker` does not serve `review_queue`.
 
 ### Tools
 
@@ -451,11 +453,11 @@ A `draft_*` call made without its content `spec` returns an actionable error poi
 
 | Tool | What it does |
 |---|---|
-| `propose` | Record an **AI-authored plan** for materializing a model. Writes a plan only — it compiles the project and records the plan offline (no LLM call, no warehouse write). A human must run `rocky review <plan_id> --approve` then `rocky apply <plan_id>`. |
+| `propose` | Record an **AI-authored plan** for materializing a model. Writes a plan only — it compiles the project and records the plan offline (no LLM call, no warehouse write). `rocky apply <plan_id>` then runs it only once `rocky review <plan_id> --approve` has written the approval marker. |
 
 ### Prompts (guided trajectories)
 
-The server also exposes MCP prompts that orchestrate the tools above into a guided workflow. Every trajectory **stops at the propose / human-gate step**; it never applies.
+The server also exposes MCP prompts that orchestrate the tools above into a guided workflow. Every trajectory **stops at the propose step**; it never applies.
 
 | Prompt | What it guides |
 |---|---|
@@ -488,4 +490,4 @@ claude mcp add rocky -- rocky mcp --config rocky.toml
 ### Related Commands
 
 - [`rocky ai`](#rocky-ai) -- one-shot model generation from the CLI (no MCP client needed)
-- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- execute an approved AI-authored plan (a human runs `rocky review <plan_id> --approve` first)
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- execute an AI-authored plan (`rocky review <plan_id> --approve` writes the marker it requires first)
