@@ -30,7 +30,6 @@ Write for a person who is busy. These rules apply to chat replies, PR descriptio
 | `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. Multi-crate Cargo workspace. |
 | `sdk/python/` | Python | `rocky-sdk` — standalone typed Python client (`RockyClient`) over the `rocky` CLI. Owns the generated Pydantic models. For notebooks, scripts, and orchestrators. |
 | `integrations/dagster/` | Python | Dagster integration — a thin `ConfigurableResource` adapter over `rocky-sdk`'s `RockyClient`; maps results to assets/checks. Depends on `rocky-sdk`. |
-| `framework/` | Python | `rocky-fulfillment` (working name) — spec-driven fulfillment runtime: lowers an approved product spec onto Rocky primitives and drives draft → verify → propose under human review gates. Depends on `rocky-sdk`. Scaffold; not yet published. |
 | `editors/vscode/` | TypeScript | VS Code extension — LSP client (stdio to `rocky lsp`), syntax highlighting, commands for AI features. |
 | `examples/playground/` | Config only | Self-contained DuckDB sample pipeline. Used as a smoke test and a benchmark fixture. No credentials needed. |
 
@@ -106,7 +105,6 @@ Tag-namespaced — each artifact ships independently:
 - `sdk-v0.1.0` → `rocky-sdk` wheel on PyPI
 - `dagster-v0.1.0` → `dagster-rocky` wheel on PyPI
 - `vscode-v0.1.0` → Rocky VSIX on VS Code Marketplace
-- `framework-v0.1.0` → fulfillment framework wheel on the GitHub Release only (no registry publish yet)
 
 Release **`rocky-sdk` before any `dagster-rocky` release that raises its `rocky-sdk>=…` floor** — the published `dagster-rocky` wheel resolves the SDK from PyPI, not the monorepo path source.
 

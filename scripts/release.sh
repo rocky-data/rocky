@@ -268,53 +268,6 @@ release_vscode() {
     [[ "$publish" == "--publish" ]] && info "Published to VS Code Marketplace." || info "Skipped Marketplace publish (pass --publish to enable)."
 }
 
-# --- Framework ---------------------------------------------------------------
-
-release_framework() {
-    local version="$1"
-    local publish="${2:-}"
-    local tag="framework-v${version}"
-
-    # Nothing publishes to a registry in Phase 1, and the distribution name is
-    # still a working name — refuse --publish outright rather than pushing a
-    # placeholder package to PyPI.
-    if [[ "$publish" == "--publish" ]]; then
-        die "framework does not publish to a registry yet — it only builds the wheel and creates the framework-v* tag + GitHub Release"
-    fi
-
-    require_cmd uv
-    require_cmd gh
-
-    confirm_tag "$tag"
-    mkdir -p "$DIST_DIR"
-
-    # 1. Build wheel + sdist
-    info "Building rocky-fulfillment wheel"
-    (cd "$WORKSPACE_ROOT/framework" && uv build)
-
-    # Copy artifacts to dist/
-    cp "$WORKSPACE_ROOT/framework/dist/"* "$DIST_DIR/"
-    info "Built: $(ls "$WORKSPACE_ROOT/framework/dist/")"
-
-    # 2. Tag and push. Each step is guarded so a tag-creation failure (e.g.
-    # unsigned config, protected ref) never proceeds to `push` on a missing
-    # or stale tag.
-    info "Creating and pushing tag $tag"
-    git -C "$WORKSPACE_ROOT" tag -a "$tag" -m "Release $tag" \
-        || die "git tag -a $tag failed — aborting before push"
-    git -C "$WORKSPACE_ROOT" push origin "$tag" \
-        || die "git push origin $tag failed"
-
-    # 3. Create GitHub Release
-    # --latest=false: the engine release owns the "Latest" badge.
-    create_release "$tag" \
-        --latest=false \
-        "$WORKSPACE_ROOT/framework/dist/"*
-
-    echo
-    info "Framework release $tag created (no registry publish yet)."
-}
-
 # --- Main --------------------------------------------------------------------
 
 usage() {
@@ -326,7 +279,6 @@ Components:
   sdk     <version> [--publish]  Build wheel, create GH release, optionally publish to PyPI
   dagster <version> [--publish]  Build wheel, create GH release, optionally publish to PyPI
   vscode  <version> [--publish]  Build VSIX, create GH release, optionally publish to Marketplace
-  framework <version>            Build wheel, create GH release (no registry publish yet)
 
 Examples:
   ./scripts/release.sh engine  0.2.0
@@ -351,6 +303,5 @@ case "$component" in
     sdk)     release_sdk     "$version" "${1:-}" ;;
     dagster) release_dagster "$version" "${1:-}" ;;
     vscode)  release_vscode  "$version" "${1:-}" ;;
-    framework) release_framework "$version" "${1:-}" ;;
-    *)       die "Unknown component: $component. Use engine, sdk, dagster, vscode, or framework." ;;
+    *)       die "Unknown component: $component. Use engine, sdk, dagster, or vscode." ;;
 esac
