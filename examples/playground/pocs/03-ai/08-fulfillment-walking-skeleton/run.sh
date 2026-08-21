@@ -192,8 +192,13 @@ UNMAPPED=$(jq -r '[.fields[] | select(.disposition == "pending")] | length' "$MA
 [ "$UNMAPPED" = "0" ] || fail "2 (manifest has $UNMAPPED still-pending field(s) in the merged phase)"
 # REPAIR EVIDENCE (#1493). Convergence alone could hide a repair that never
 # ran, so pin the round itself:
-#  (a) exactly THREE worker transcripts exist — elicitation + the red drafting
-#      round + the repair round. A green first draft (mutation 2r) leaves two.
+#  (a) the worker transcripts are exactly elicitation + drafting + repair, BY
+#      KIND. The driver names each transcript `<stamp>-<kind>.log`, so this
+#      reads which round actually reached a worker. Counting alone is weaker:
+#      three transcripts of kinds elicitation+drafting+drafting would pass a
+#      count check while meaning the repair round was dispatched as a plain
+#      draft (the F2 defect: the round the machine decided must survive into
+#      the dispatch). A green first draft (mutation 2r) leaves two.
 #  (b) the surviving model SQL carries revenue_eur — the REPAIR's draft, which
 #      the red first draft did not have. The loop classified its own repair
 #      write as authorized (window reopened through the staged commit), not as
@@ -201,8 +206,11 @@ UNMAPPED=$(jq -r '[.fields[] | select(.disposition == "pending")] | length' "$MA
 TRANSCRIPTS_DIR=".rocky/fulfillment/${PRODUCT}/transcripts"
 NTRANSCRIPTS=$(find "$TRANSCRIPTS_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
 [ "$NTRANSCRIPTS" = "3" ] || fail "2 (want 3 worker transcripts — elicitation + red draft + repair — got ${NTRANSCRIPTS:-0}: the repair round did not run)"
+KINDS=$(find "$TRANSCRIPTS_DIR" -type f -name '*.log' 2>/dev/null \
+  | sed -e 's|.*/||' -e 's|\.log$||' -e 's|.*-||' | sort | tr '\n' ' ')
+[ "$KINDS" = "drafting elicitation repair " ] || fail "2 (worker rounds by kind were [${KINDS}], want [drafting elicitation repair ] — a second 'drafting' means the repair round was dispatched as a plain draft)"
 grep -q "revenue_eur" "models/${PRODUCT}.sql" || fail "2 (the surviving model SQL lacks revenue_eur — the repair's draft did not land)"
-echo "    OK  red draft repaired (3 transcripts; repaired SQL survived); manifest merged, $NFIELDS fields, 0 rejects, digest bound"
+echo "    OK  red draft repaired (rounds by kind: ${KINDS}; repaired SQL survived); manifest merged, $NFIELDS fields, 0 rejects, digest bound"
 
 # ------------------------------------------------------------------ Assert 5
 # The proposed plan on disk carries the product binding: product_id + spec_digest.

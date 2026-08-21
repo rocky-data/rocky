@@ -203,6 +203,32 @@ turn into a false guarantee. Sandboxing at the operating-system level is the
 planned fix. Tracked in
 [#1491](https://github.com/rocky-data/rocky/issues/1491).
 
+**A repair round opens a window where the sidecar is not hash-pinned.** When the
+fulfillment loop's verification comes back red, it sends the model back to the
+agent for a repair. The agent has to rewrite the model's sidecar file, so the
+loop first returns that file to the writable set: it checks every recorded hash,
+then demotes the lowering manifest to its contract-only phase. While that window
+is open, the sidecar is not covered by any hash. The merge that closes the window
+keeps every key the lowering does not own, and every `[[tests]]` entry it did not
+generate. So content added to the sidecar during the window is carried into the
+committed file and hashed there, exactly as if the agent had written it.
+
+The window is open only between the loop's own repair dispatch and its next
+merge, and only a process that can write your models directory can use it. That
+same process can write an approval marker, which is a larger capability than
+this one. Trusted handling of the repair agent's output bytes is planned work.
+Tracked in [#1515](https://github.com/rocky-data/rocky/issues/1515).
+
+**The committed manifest is data, not a credential.** The lowering manifest
+records which files belong to a product generation, which phase it is in, and
+each file's hash. The loop reads it to decide what to verify. It is an ordinary
+file in your project, so a process that can edit it can change what gets checked
+— setting the phase back to contract-only and deleting the sidecar's entry makes
+the loop skip that file rather than report drift. The engine already treats
+manifests this way: matching identity fields in a manifest authenticate nothing.
+The verification is a check on files, not a proof about them. This needs the same
+write access as the point above, and is covered by the same planned work.
+
 **A directory swapped mid-write is still a race.** The fulfillment loop commits
 its files with `O_NOFOLLOW` and creates them with `O_EXCL`, so a symbolic link
 planted at the final path is refused. It does not use directory-relative system
