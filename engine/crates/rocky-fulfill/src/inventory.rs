@@ -67,6 +67,11 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // Spec identity + the confined write target (the runner's candidate
     // write and the snapshot re-verification).
     "rocky_core::product::commit::contained_write_target",
+    // The spec-owned `[[tests]]` lowering. Read-only, and the SAME
+    // function the sidecar merge emits from — so the verify bundle's
+    // deferred-checks count cannot drift from what was actually
+    // lowered. Counting only; the loop never writes a sidecar.
+    "rocky_core::product::lowering::generated_tests",
     "rocky_core::product::spec::ParsedSpec",
     "rocky_core::product::spec::parse_spec_bytes",
     "rocky_core::product::spec::spec_digest",

@@ -479,6 +479,24 @@ impl Runner {
 
         let test_green = self.scoped_tests_green(&model, &mut detail);
 
+        // The product's declared data checks are lowered into the model
+        // sidecar as `[[tests]]` (grain uniqueness, not-null per
+        // non-nullable column, one expression per declared check). They
+        // execute only via `rocky test --declarative`, against the
+        // MATERIALISED table — and this gate runs before apply, so the
+        // table does not exist yet. `test_green` above therefore covers
+        // model execution and unit tests ONLY. Counting them here, from
+        // the approved spec, is what keeps the bundle's claim honest:
+        // they are reported deferred, never counted as passed.
+        //
+        // Computed in the bundle rather than inside `scoped_tests_green`
+        // so the count survives the `#[cfg(not(feature = "duckdb"))]`
+        // build, which has no local test surface at all.
+        let tests_deferred = rocky_core::product::lowering::generated_tests(&spec.parsed).len();
+        if let Some(note) = machine::deferred_note(tests_deferred) {
+            detail.push(note);
+        }
+
         let posture_green = match self.verify_posture()? {
             PostureStatus::Pass => true,
             PostureStatus::NeedsInput { reason, .. } | PostureStatus::Fail { reason } => {
@@ -517,6 +535,7 @@ impl Runner {
             test_green,
             posture_green,
             manifest_total,
+            tests_deferred,
             detail: detail.join(" | "),
         })
     }
@@ -582,12 +601,22 @@ impl Runner {
                 // A pre-gate failure (compile, ledger, plan write) is a
                 // red verify bundle in spirit: surface it as a verify
                 // failure so the repair budget applies.
+                let tests_deferred =
+                    rocky_core::product::lowering::generated_tests(&spec.parsed).len();
+                let mut detail = vec![format!("propose failed before the policy gate: {err}")];
+                // Still true on this path, and for the same reason: the
+                // target was never materialised, so nothing declarative
+                // ran here either.
+                if let Some(note) = machine::deferred_note(tests_deferred) {
+                    detail.push(note);
+                }
                 return Ok(Event::VerifyBundle {
                     compile_green: false,
                     test_green: true,
                     posture_green: true,
                     manifest_total: true,
-                    detail: format!("propose failed before the policy gate: {err}"),
+                    tests_deferred,
+                    detail: detail.join(" | "),
                 });
             }
         };

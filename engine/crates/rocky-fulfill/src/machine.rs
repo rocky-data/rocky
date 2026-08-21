@@ -382,13 +382,22 @@ pub enum Event {
     VerifyBundle {
         /// `compile_output` had no errors.
         compile_green: bool,
-        /// `test_output` had no failures.
+        /// The model executed and its unit tests passed. This does NOT
+        /// cover the product's declared data checks — see
+        /// `tests_deferred`.
         test_green: bool,
         /// `product verify` still passes (policy-check agreement).
         posture_green: bool,
         /// The committed manifest is total and byte-clean.
         manifest_total: bool,
-        /// Rendered detail for the red path.
+        /// How many of the product's declared data checks were NOT
+        /// evaluated. They run against a materialised table, and verify
+        /// runs before apply, so at this point none of them can run.
+        /// Reported, never gated: deferred is not a failure, so this
+        /// field is deliberately absent from the green pattern below.
+        tests_deferred: usize,
+        /// Rendered detail. Carries the deferred-checks note on every
+        /// path, plus the red legs' reasons when there are any.
         detail: String,
     },
     /// The governed propose ran.
@@ -1015,13 +1024,24 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
         // ------------------------------------------------------------------
         FulfillState::Verifying => match event {
             Event::Reentry => Decision::Act(TaskKind::VerifyBundle),
+            // `tests_deferred` is deliberately NOT in this pattern:
+            // deferred checks are reported, never gated, so any count
+            // still proposes. The green verdict is journaled first —
+            // without this row the bundle would leave no trace at all,
+            // and "verify green" would be a claim with no record of
+            // what green did and did not cover.
             Event::VerifyBundle {
                 compile_green: true,
                 test_green: true,
                 posture_green: true,
                 manifest_total: true,
+                detail,
                 ..
-            } => Decision::Act(TaskKind::Propose),
+            } => Decision::AdvanceAndAct {
+                record: to_state(observed, FulfillState::Verifying, now),
+                event: verify_green_event(&detail),
+                task: TaskKind::Propose,
+            },
             Event::VerifyBundle { detail, .. } => {
                 if observed.repair_rounds >= MAX_REPAIR_ROUNDS {
                     let record = blocked(
@@ -1622,6 +1642,45 @@ fn dispatch_drafting(
         record: next,
         event: format!("drafting attempt {}", observed.drafting_attempts + 1),
         task,
+    }
+}
+
+/// The ONE wording for unevaluated declared data checks.
+///
+/// The verify bundle runs before apply, so the target table does not
+/// exist yet and the product's declared checks (the grain-uniqueness
+/// test, one not-null test per non-nullable column, and one expression
+/// test per declared check) cannot run. Saying "deferred" keeps the
+/// claim true: they did not pass and they did not fail.
+///
+/// `None` when nothing is deferred, so a caller never renders an empty
+/// or zero-valued clause.
+pub fn deferred_note(tests_deferred: usize) -> Option<String> {
+    if tests_deferred == 0 {
+        return None;
+    }
+    let checks = if tests_deferred == 1 {
+        "check"
+    } else {
+        "checks"
+    };
+    Some(format!(
+        "{tests_deferred} declared data {checks} deferred \
+         (not evaluable before the model is materialized)"
+    ))
+}
+
+/// The journal event for an all-green verify bundle.
+///
+/// `detail` is the bundle's own rendering; on the green path it is the
+/// deferred-checks note (every red leg is what pushes anything else).
+/// Carrying it verbatim is what stops "verify green" from being a bare
+/// claim in the journal.
+fn verify_green_event(detail: &str) -> String {
+    if detail.is_empty() {
+        "verify green".to_string()
+    } else {
+        format!("verify green: {detail}")
     }
 }
 
@@ -2483,14 +2542,21 @@ mod tests {
     // red ≤ repair rounds → drafting; else blocked
     // =====================================================================
 
-    fn green_bundle() -> Event {
+    /// An all-green bundle reporting `tests_deferred` unevaluated
+    /// declared data checks, rendered exactly as `verify_bundle` does.
+    fn green_bundle_with(tests_deferred: usize) -> Event {
         Event::VerifyBundle {
             compile_green: true,
             test_green: true,
             posture_green: true,
             manifest_total: true,
-            detail: String::new(),
+            tests_deferred,
+            detail: deferred_note(tests_deferred).unwrap_or_default(),
         }
+    }
+
+    fn green_bundle() -> Event {
+        green_bundle_with(0)
     }
 
     #[test]
@@ -2498,7 +2564,93 @@ mod tests {
         let d = decide(&rec(FulfillState::Verifying), Event::Reentry, now());
         assert_eq!(d, Decision::Act(TaskKind::VerifyBundle));
         let d = decide(&rec(FulfillState::Verifying), green_bundle(), now());
-        assert_eq!(d, Decision::Act(TaskKind::Propose));
+        let Decision::AdvanceAndAct {
+            record,
+            task,
+            event,
+        } = d
+        else {
+            panic!("expected AdvanceAndAct (the green verdict is journaled), got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Verifying);
+        assert_eq!(task, TaskKind::Propose);
+        assert_eq!(event, "verify green");
+    }
+
+    #[test]
+    fn deferred_declared_checks_are_journaled_and_never_block_the_propose() {
+        // The anti-vacuity pin for #1495. A product whose declared check
+        // WOULD fail (say `revenue_eur >= 0` against negative rows) still
+        // verifies green, because that check runs against a materialised
+        // table and this gate runs before apply. Gating is deliberately
+        // unchanged — the loop still proposes — but the journal now
+        // records what green did NOT cover, with the exact count.
+        let d = decide(&rec(FulfillState::Verifying), green_bundle_with(6), now());
+        let Decision::AdvanceAndAct {
+            record,
+            task,
+            event,
+        } = d
+        else {
+            panic!("deferred checks must not change the decision, got {d:?}");
+        };
+        assert_eq!(task, TaskKind::Propose, "deferred is not a failure");
+        assert_eq!(record.state, FulfillState::Verifying);
+        assert_eq!(
+            event,
+            "verify green: 6 declared data checks deferred \
+             (not evaluable before the model is materialized)"
+        );
+        assert!(
+            !event.contains("passed"),
+            "a deferred check must never read as passed: {event}"
+        );
+    }
+
+    #[test]
+    fn the_deferred_note_states_the_exact_count_and_vanishes_at_zero() {
+        // No false alarm: nothing deferred renders no clause at all, and
+        // the bare green event stays bare. (A real product spec always
+        // lowers at least its grain test, so zero is unreachable through
+        // `verify_bundle`; the helper still has to be honest at zero.)
+        assert_eq!(deferred_note(0), None);
+        assert_eq!(verify_green_event(""), "verify green");
+        // The count is stated exactly, and reads as English at one.
+        assert_eq!(
+            deferred_note(1).expect("one is deferred"),
+            "1 declared data check deferred \
+             (not evaluable before the model is materialized)"
+        );
+        assert_eq!(
+            deferred_note(6).expect("six are deferred"),
+            "6 declared data checks deferred \
+             (not evaluable before the model is materialized)"
+        );
+    }
+
+    #[test]
+    fn a_model_that_fails_to_execute_is_still_red_even_with_checks_deferred() {
+        // The gate this fix must NOT relax: a model that fails to run is
+        // red, deferred count or not.
+        let mut prior = rec(FulfillState::Verifying);
+        prior.repair_rounds = 1;
+        let d = decide(
+            &prior,
+            Event::VerifyBundle {
+                compile_green: true,
+                test_green: false,
+                posture_green: true,
+                manifest_total: true,
+                tests_deferred: 6,
+                detail: "test failures: revenue_daily: binder error".into(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndAct { record, task, .. } = d else {
+            panic!("a failing model must still dispatch a repair, got {d:?}");
+        };
+        assert_eq!(task, TaskKind::Repair, "an execution failure is still red");
+        assert_eq!(record.state, FulfillState::Drafting);
     }
 
     #[test]
@@ -2513,6 +2665,7 @@ mod tests {
                 test_green: true,
                 posture_green: true,
                 manifest_total: true,
+                tests_deferred: 6,
                 detail: "E012 on revenue_eur".into(),
             },
             now(),
@@ -2543,6 +2696,7 @@ mod tests {
                 test_green: false,
                 posture_green: true,
                 manifest_total: true,
+                tests_deferred: 6,
                 detail: "unique(client_id,date) failed".into(),
             },
             now(),
