@@ -142,15 +142,19 @@ full set, or read the [CLI reference](https://rocky-data.dev/reference/cli/).
 
 ## The gate on agent-authored changes
 
-An AI agent can author a plan. A bare `rocky apply` refuses to execute one. A
-human clears it with `rocky review <plan-id> --approve`, which writes the
-sign-off marker that unblocks the apply.
+An AI agent can author a plan. A bare `rocky apply` refuses to execute one. It
+runs the plan only when a marker file is present that parses and names that
+exact plan. `rocky review <plan-id> --approve` writes that marker.
 
-A `[policy]` block supersedes that default. Rocky evaluates every model the
-plan touches and takes the most restrictive answer. `allow` proceeds with no
-marker, `require_review` still demands one, and `deny` refuses outright. So
-only a `[policy]` rule you wrote lets an agent-authored plan through
-unreviewed.
+That check is a floor. It runs on every AI-authored apply whatever your
+`[policy]` block says, so an `allow` rule cannot waive it. A `[policy]` rule can
+only add restrictions on top. Rocky evaluates every model the plan touches and
+takes the most restrictive answer. The policy gate runs first, so a `deny`
+refuses before the marker is read at all.
+
+Be exact about what the marker check verifies. It reads a file, parses it, and
+compares the plan id. It does not authenticate who approved, or that a person
+approved at all. The marker is not signed.
 
 Rocky enforces the same `[policy]` block at three seams: `rocky apply`,
 `rocky branch promote`, and the MCP authoring tools. Two of its mechanisms
