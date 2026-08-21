@@ -53,7 +53,7 @@ does. The tools are named so the loop reads in sequence.
                 ▼
         ┌────────────────┐   rocky review <plan_id> --approve
         │ 6. a human     │   rocky apply  <plan_id>
-        │    approves    │   The agent never approves for you.
+        │    approves    │   No MCP tool writes that approval.
         └────────────────┘
 ```
 
@@ -93,9 +93,9 @@ See [MCP Authoring](/concepts/mcp-authoring/) for every tool in both families.
 ## The three gates
 
 Nothing an agent produces reaches your warehouse without clearing three
-independent checks. The engine enforces each one.
+independent checks. The engine performs all three in code.
 [What the three gates do not defend against](#what-the-three-gates-do-not-defend-against)
-states where that enforcement stops.
+states what each check actually verifies, and where that stops.
 
 ```
    the agent's draft
@@ -115,10 +115,11 @@ states where that enforcement stops.
           │ allowed
           ▼
    ┌──────────────┐   rocky review <plan_id> --approve
-   │ gate 3       │   The engine refuses to apply an
-   │ a human      │   AI-authored plan without it.
+   │ gate 3       │   writes an approval marker. Apply
+   │ the approval │   refuses an AI-authored plan unless
+   │ marker       │   a marker names that exact plan.
    └──────┬───────┘
-          │ approved
+          │ marker matches
           ▼
    rocky apply <plan_id>  ──►  your warehouse
 ```
@@ -144,11 +145,16 @@ ledger at all, because a request refused before the rules are evaluated returns
 its verdict without writing a row. If you need a decision to be provably
 recorded, the ledger does not give you that today.
 
-**Gate 3, a human.** `propose` writes a plan marked as AI-authored. `rocky apply`
-refuses to run one until a person approves it. The engine enforces this, not a
-convention the prompts ask the agent to follow. The check is a floor. It runs on
-every AI-authored apply whatever your `[policy]` rules say, so an `allow` rule
-cannot waive it. A policy rule can only add restrictions on top.
+**Gate 3, the approval marker.** `propose` writes a plan marked as AI-authored.
+`rocky apply` refuses to run one unless an approval marker is present that parses
+and names that exact plan. `rocky review <plan-id> --approve` is the command that
+writes that marker, and no MCP tool writes it.
+
+Be exact about what this check verifies. It reads a file, parses it, and compares
+the plan id. It does not authenticate who approved, or that a person approved at
+all. That check is a floor: it runs on every AI-authored apply whatever your
+`[policy]` rules say, so an `allow` rule cannot waive it, and a policy rule can
+only add restrictions on top. What the marker cannot tell you is covered below.
 
 ## What the three gates do not defend against
 

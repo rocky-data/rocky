@@ -1,11 +1,11 @@
 ---
 title: Fulfill Commands
-description: The fulfillment loop — drive a product spec from elicitation to an applied plan, one human-gated step at a time
+description: The fulfillment loop — drive a product spec from elicitation to an applied plan, one gated step at a time
 sidebar:
   order: 8
 ---
 
-`rocky fulfill` is the loop half of spec fulfillment (EXPERIMENTAL). The [product verbs](/reference/commands/products/) parse, verify, lower, and approve — deterministically. `rocky fulfill` drives them: it dispatches an untrusted drafting agent, re-verifies everything the agent touched, hands the result to the engine's governed propose, waits for your review, and applies with the digest gate. One invocation advances as far as it can without you, then stops and tells you the exact next command.
+`rocky fulfill` is the loop half of spec fulfillment (EXPERIMENTAL). The [product verbs](/reference/commands/products/) parse, verify, lower, and approve — deterministically. `rocky fulfill` drives them: it dispatches an untrusted drafting agent, re-verifies everything the agent touched, hands the result to the engine's governed propose, waits for the approval marker your `rocky review --approve` writes, and applies with the digest gate. One invocation advances as far as it can without you, then stops and tells you the exact next command.
 
 ```
 rocky fulfill <product>
@@ -79,4 +79,4 @@ The full boundary, and how it applies to any agent rather than just this loop, i
 
 A red first verification sends the loop into a repair round. That repair rewrites the merged sidecar file, which is exactly what it is meant to do. The integrity check that follows compares the file against the hash recorded **before** the repair, so the loop reports its own authorized write as tampering and moves the product to `blocked`.
 
-This fails closed. Nothing unreviewed reaches your warehouse. It does mean that a product whose first verification is red cannot finish today, which is the case repair exists for. Tracked in [#1493](https://github.com/rocky-data/rocky/issues/1493).
+This fails closed. The product stops at `blocked` and the apply never runs, so nothing reaches your warehouse. It does mean that a product whose first verification is red cannot finish today, which is the case repair exists for. Tracked in [#1493](https://github.com/rocky-data/rocky/issues/1493).
