@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rocky test-adapter` no longer reports a pass for conformance specs it never ran.** The conformance runner implements exactly one check (`format_table_ref`); every other spec — connect, statement execution, schema and table lifecycle, grants, batch checks, discovery — fell through a `_ => Pass` catch-all. A full-capability adapter therefore printed **26 passing conformance tests having executed one**. Those specs now report `Skipped` with the reason, and `tests_run` counts only real work. Exit status is unchanged (it keys on failures), so no pipeline breaks — but a run that used to print 26 passed now prints 1 accounted-for and 25 skipped, which is the honest number. (#475)
+
+
+### Fixed
+
 - **`rocky run --watch` and `rocky watch` now honour SIGINT reliably, and honour SIGTERM at all.** Both loops built a fresh `tokio::signal::ctrl_c()` future on every iteration. When the file-change arm won, that future was dropped — and tokio discards a signal that arrives while no listener is registered. Between the debounce window and the inner run registering its own handler, a Ctrl-C was therefore both ignored *and* non-fatal, because tokio had already replaced the default disposition; the watcher kept running and a second Ctrl-C was needed. The registration is now built once, before the first iteration, and never dropped. Separately, neither loop had a SIGTERM arm at all, so after the first run the watcher could not be stopped by `timeout`, a CI job cancellation, or a container eviction — only by SIGKILL. Both now stop cleanly on either signal. (#1405)
 
 
