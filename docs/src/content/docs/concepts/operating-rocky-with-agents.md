@@ -128,8 +128,10 @@ write, not on a second round-trip.
 **Gate 2, your policy rules.** A `[policy]` block in `rocky.toml` states who may
 change what. Rocky evaluates every `draft_*` and `propose` call against it before
 anything persists. A `deny` removes a new file, or restores the prior content of
-a file the agent re-drafted, so a denial leaves nothing behind. Every decision,
-including each denial, is written to the audit ledger. This is the same evaluator
+a file the agent re-drafted, so a denial leaves nothing behind. Rocky writes each
+decision, including each denial, to the audit ledger. At apply, that write is
+best-effort for an ordinary rule: a failed write warns and does not stop the
+apply. This is the same evaluator
 that gates `apply` and `promote`, so an agent learns the verdict with the write
 rather than three steps later. See
 [Cross-team contracts](/concepts/cross-team-contracts/) for how the rules are
@@ -173,10 +175,11 @@ Signed approvals are planned work, not shipped work.
 
 **The author stamp on a plan is a label, not a boundary.** A plan records the
 principal that authored it, and `rocky audit` reports it. That field sits outside
-the plan's content digest, so Rocky treats it as display only. Gate 3 does not
-read it. The gate keys off the plan's kind, which is fixed when the plan is
-written. A plan carrying no author stamp still counts as agent-authored, which is
-the safe direction.
+the plan's content digest, so nothing stops it being edited. Rocky therefore does
+not enforce against it. It enforces against the plan's kind together with the
+principal at apply time, and uses whichever of the two is more restrictive. An
+AI-authored plan carrying no stamp still counts as agent-authored, which is the
+safe direction.
 
 **A process-group kill does not hold a process that leaves the group.** The
 fulfillment loop runs its drafting agent in a separate process group, and kills
