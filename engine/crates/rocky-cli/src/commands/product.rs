@@ -831,8 +831,11 @@ pub fn run_product_verify(config_path: &Path, product_name: &str, output_json: b
 /// fail-open direction — a crashed loop leaves its stamp behind, and an
 /// unrelated process that later recycles that pid would be read as the
 /// owner and let through.
+/// `pub(crate)`: no public function takes one, and `commands::product`
+/// is a `pub` module — exporting it would widen the crate's surface for
+/// a type only the two in-crate entry points need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompileCaller {
+pub(crate) enum CompileCaller {
     /// The `rocky product compile` verb: a human (or a script) at a
     /// shell. Refused while any in-flight stamp is on the record.
     Cli,
