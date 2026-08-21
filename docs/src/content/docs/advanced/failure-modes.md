@@ -20,7 +20,7 @@ Read whichever signal you already have. Then follow the branch to a section.
  ─────────────────────────────────    ────────────────    ─────────────────
 
  Rocky never called the warehouse
-   ├─ code E010–E013                  2. Contracts        the contract file
+   ├─ code E010–E014                  2. Contracts        the contract file
    └─ any other error code            1. Compile-time     rocky compile
 
  The run printed JSON: which block is populated?
@@ -48,7 +48,7 @@ Entries on `contained[*]` are not a failure of their own. They name the models R
 | Category | Detection signal | Surface |
 |---|---|---|
 | [Compile-time](#1-compile-time-failures) | `severity: Error` diagnostic with code `E001`, `E020`–`E028` | `rocky compile`, `rocky ci`, LSP red squiggles |
-| [Contract violations](#2-contract-violations) | Diagnostic codes `E010`–`E013` | `rocky compile`, `rocky ci`, `rocky apply` (pre-flight) |
+| [Contract violations](#2-contract-violations) | Diagnostic codes `E010`–`E014` | `rocky compile`, `rocky ci`, `rocky apply` (pre-flight) |
 | [Schema drift](#3-schema-drift) | `drift.actions_taken[].action` on `rocky run` / `rocky apply` output | `rocky run`, `rocky apply` drift block |
 | [Quality check failures](#4-quality-check-failures) | `check_results[].checks[].passed == false` | `rocky run` / `rocky apply --output json` |
 | [Adapter / runtime failures](#5-adapter--runtime-failures) | Non-zero `rocky apply` exit + entry on `errors[*]` with typed `failure_kind` | `rocky apply`, `rocky doctor` |
@@ -76,9 +76,9 @@ Every finding is a [diagnostic](/reference/glossary/#diagnostic-code): a stable 
 | `E027` | Model's projected cost exceeds its `[budget]` ceiling |
 | `E028` | Unresolved `@var` reference |
 
-This table is not exhaustive. The compiler also emits `E010`–`E013` and `E030`–`E035`.
+This table is not exhaustive. The compiler also emits `E010`–`E014` and `E030`–`E035`.
 
-Codes `E010`–`E013` are formally compile-time failures. They get their own section because the fix is contract-shaped rather than type-shaped. See [Contract violations](#2-contract-violations).
+Codes `E010`–`E014` are formally compile-time failures. They get their own section because the fix is contract-shaped rather than type-shaped. See [Contract violations](#2-contract-violations).
 
 **Recovery playbook.**
 
@@ -99,7 +99,7 @@ Rocky contains that failure at the table boundary instead of passing over the mo
 
 **Definition.** A model's output schema does not match its data contract (`<model>.contract.toml`). The contract declares required columns, protected columns, and the expected types and nullability. Rocky checks it at compile time, before any warehouse work.
 
-**Detection signal.** Diagnostic codes `E010`–`E013`:
+**Detection signal.** Diagnostic codes `E010`–`E014`:
 
 | Code | Severity | Meaning |
 |---|---|---|
@@ -107,6 +107,7 @@ Rocky contains that failure at the table boundary instead of passing over the mo
 | `E011` | Error | Column type mismatch (contract vs model output) |
 | `E012` | Error | Nullability violation (contract says non-nullable, model says nullable) |
 | `E013` | Error | Protected column has been removed |
+| `E014` | Error | A nullable column the contract does not declare, under `[rules] no_new_nullable` |
 
 **Recovery playbook.**
 
