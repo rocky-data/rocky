@@ -547,23 +547,32 @@ impl Runner {
     /// Count every declared data check that `rocky test --declarative`
     /// would run for this product's model.
     ///
-    /// The MERGED SIDECAR is the authority, not `generated_tests(spec)`.
-    /// Phase B merges the spec-owned tests (grain uniqueness, not-null
-    /// per non-nullable column, one expression per declared check) with
-    /// the worker's own appended `[[tests]]` — the engine's
-    /// `draft_check` tool appends those, and `lower_phase_b` preserves
-    /// every one it did not generate. `run_declarative_tests` then runs
-    /// every entry it finds in the sidecar. Counting only the
-    /// spec-owned subset would undercount by exactly the worker's
-    /// checks, which is the same class of lie this whole gate is being
-    /// fixed for.
+    /// ASKS THE RUNNER'S OWN LOADER rather than re-deriving the set.
+    /// Two earlier re-derivations both undercounted: the spec's
+    /// `generated_tests` misses the worker's appended `[[tests]]` (the
+    /// merge preserves them), and the sidecar's raw `[[tests]]` array
+    /// misses every `[[use_test]]` reference (the model loader resolves
+    /// those against `test_definitions.toml` and appends them to
+    /// `ModelConfig.tests`, which is the vector the runner iterates).
     ///
-    /// The path is derived through `sidecar_rel` against `self.root` —
-    /// the SAME derivation `run_phase_b` writes through, so the count
-    /// cannot read a different file from the one that was merged.
+    /// Counting through `declarative_test_count` makes the counted set
+    /// the executed set by construction, so a future layer of expansion
+    /// cannot silently reopen the same hole.
+    #[cfg(feature = "duckdb")]
     fn count_declared_checks(&self, spec: &ApprovedSpec) -> Result<usize, String> {
-        let rel = rocky_core::product::lowering::sidecar_rel(&spec.parsed);
-        count_sidecar_tests(&self.root.join(&rel)).map_err(|why| format!("{rel} {why}"))
+        fulfill_api::declarative_test_count(&self.models_dir, spec.parsed.output_model())
+            .map_err(|err| format!("{err:#}"))
+    }
+
+    /// Without the duckdb feature there is no declarative test surface
+    /// to ask, so the count is unavailable rather than invented. This
+    /// build already fails the verify gate closed (see
+    /// `scoped_tests_green`), so nothing is lost by declining here.
+    #[cfg(not(feature = "duckdb"))]
+    fn count_declared_checks(&self, _spec: &ApprovedSpec) -> Result<usize, String> {
+        Err("this build has no duckdb feature, so the declarative test loader \
+             cannot be asked what it would run"
+            .to_string())
     }
 
     #[cfg(feature = "duckdb")]
@@ -1133,25 +1142,6 @@ fn deferred_report(counted: Result<usize, String>) -> (Option<usize>, Option<Str
     }
 }
 
-/// Count every `[[tests]]` entry a model sidecar declares — the set
-/// `rocky test --declarative` would run against the materialised table.
-///
-/// A free function so the counting rule is testable without a live
-/// runner. Counts the WHOLE array: the spec-owned tests Phase B
-/// generated AND the worker's own appended checks, which the merge
-/// preserves and the declarative runner does not distinguish.
-fn count_sidecar_tests(path: &Path) -> Result<usize, String> {
-    let text = std::fs::read_to_string(path).map_err(|err| format!("unreadable: {err}"))?;
-    let document = rocky_core::product::toml_compat::parse_ordered(&text)
-        .map_err(|reject| format!("does not parse: {reject}"))?;
-    // A sidecar with no `[[tests]]` array declares no checks. That is a
-    // real zero, not a failure to count.
-    Ok(document
-        .get("tests")
-        .and_then(|value| value.as_array())
-        .map_or(0, <[_]>::len))
-}
-
 fn render_refusal(refusal: &fulfill_api::PolicyRefusal) -> String {
     format!(
         "model '{}', rule {}, {}",
@@ -1181,18 +1171,18 @@ fn fault_point(_name: &str) {}
 
 #[cfg(test)]
 mod deferred_check_counting {
-    use super::{count_sidecar_tests, deferred_report};
+    use super::deferred_report;
 
     #[test]
     fn a_failed_count_reports_unknown_rather_than_zero() {
         // The step-side half of the same rule the machine pins: a count
         // that could not be read must NOT collapse into `Some(0)`,
         // which would read as "nothing is deferred".
-        let (count, note) = deferred_report(Err("models/x.toml unreadable: nope".to_string()));
+        let (count, note) = deferred_report(Err("model 'x' not found".to_string()));
         assert_eq!(count, None, "an unread count is not a zero count");
         let note = note.expect("an unknown count still says checks are deferred");
         assert!(note.contains("deferred"));
-        assert!(note.contains("count unavailable: models/x.toml unreadable: nope"));
+        assert!(note.contains("count unavailable: model 'x' not found"));
 
         let (count, note) = deferred_report(Ok(4));
         assert_eq!(count, Some(4));
@@ -1203,83 +1193,5 @@ mod deferred_check_counting {
 
         // A genuine zero is a real answer, and renders no clause.
         assert_eq!(deferred_report(Ok(0)), (Some(0), None));
-    }
-
-    /// A merged sidecar exactly as Phase B leaves it for the walking
-    /// skeleton's product: three spec-owned tests (the composite grain,
-    /// one not-null, one declared check) PLUS the worker's own appended
-    /// check, which `lower_phase_b` preserves verbatim.
-    const MERGED_SIDECAR: &str = concat!(
-        "name = \"revenue_daily\"\n",
-        "intent = \"Daily gross revenue per client in EUR, refunds excluded\"\n",
-        "\n",
-        "[[tests]]\n",
-        "type = \"composite\"\n",
-        "kind = \"unique\"\n",
-        "columns = [\"client_id\", \"date\"]\n",
-        "\n",
-        "[[tests]]\n",
-        "type = \"not_null\"\n",
-        "column = \"client_id\"\n",
-        "\n",
-        "[[tests]]\n",
-        "type = \"expression\"\n",
-        "expression = \"revenue_eur >= 0\"\n",
-        "severity = \"error\"\n",
-        "\n",
-        // The worker's own check, appended by the engine's `draft_check`
-        // tool. `rocky test --declarative` runs it like any other.
-        "[[tests]]\n",
-        "type = \"expression\"\n",
-        "expression = \"client_id > 0\"\n",
-    );
-
-    fn write(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("revenue_daily.toml");
-        std::fs::write(&path, text).expect("write sidecar");
-        (dir, path)
-    }
-
-    #[test]
-    fn a_worker_appended_check_is_counted_too() {
-        // The undercount guard. Counting the SPEC-OWNED subset
-        // (`generated_tests`) would report 3 here and quietly drop the
-        // worker's check — an undercount is the same class of lie as
-        // the green badge this whole change exists to fix. The sidecar
-        // is the authority because it is what the declarative runner
-        // reads.
-        let (_dir, path) = write(MERGED_SIDECAR);
-        assert_eq!(
-            count_sidecar_tests(&path).expect("count"),
-            4,
-            "the worker's appended check must be counted, not just the spec-owned three"
-        );
-    }
-
-    #[test]
-    fn a_sidecar_with_no_tests_array_counts_zero() {
-        // No false alarm: a sidecar that declares no checks defers none.
-        let (_dir, path) = write("name = \"revenue_daily\"\nintent = \"none\"\n");
-        assert_eq!(count_sidecar_tests(&path).expect("count"), 0);
-    }
-
-    #[test]
-    fn an_unreadable_or_unparseable_sidecar_refuses_to_guess() {
-        // Never silently zero — the caller turns these into "count
-        // unavailable", not "0 deferred".
-        let dir = tempfile::tempdir().expect("tempdir");
-        let missing = dir.path().join("revenue_daily.toml");
-        assert!(
-            count_sidecar_tests(&missing)
-                .expect_err("a missing sidecar is not a zero count")
-                .starts_with("unreadable:")
-        );
-        let (_dir, bad) = write("name = \"revenue_daily\"\n[[tests]\n");
-        assert!(
-            count_sidecar_tests(&bad)
-                .expect_err("a broken sidecar is not a zero count")
-                .starts_with("does not parse:")
-        );
     }
 }

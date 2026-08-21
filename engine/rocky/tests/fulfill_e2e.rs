@@ -197,10 +197,17 @@ fn declared_check_count(dir: &Path) -> usize {
         .unwrap_or_else(|err| panic!("merged sidecar {}: {err}", sidecar.display()));
     let document: toml::Value = toml::from_str(&text)
         .unwrap_or_else(|err| panic!("merged sidecar {}: {err}", sidecar.display()));
-    document
-        .get("tests")
-        .and_then(toml::Value::as_array)
-        .map_or(0, Vec::len)
+    // Both arrays: the model loader appends every resolved `[[use_test]]`
+    // to `ModelConfig.tests`, so the executed set is inline + referenced.
+    // Counting only `tests` here would rebuild the very blind spot the
+    // production counter was fixed to avoid.
+    let count = |key: &str| {
+        document
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .map_or(0, Vec::len)
+    };
+    count("tests") + count("use_test")
 }
 
 /// Drive the loop up to the plan-review ask, returning the plan id.
