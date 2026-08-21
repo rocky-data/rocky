@@ -93,7 +93,9 @@ See [MCP Authoring](/concepts/mcp-authoring/) for every tool in both families.
 ## The three gates
 
 Nothing an agent produces reaches your warehouse without clearing three
-independent checks.
+independent checks. The engine enforces each one.
+[What the three gates do not defend against](#what-the-three-gates-do-not-defend-against)
+states where that enforcement stops.
 
 ```
    the agent's draft
