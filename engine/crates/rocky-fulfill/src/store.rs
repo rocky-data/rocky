@@ -301,98 +301,10 @@ pub fn self_identity() -> Result<SelfIdentity> {
 
 /// The start time of a live process, or `None` when no such pid exists.
 ///
-/// The value's unit is platform-specific (macOS: microseconds since the
-/// epoch of the process start; Linux: clock ticks since boot) and is
-/// only ever compared for EQUALITY on the same machine — the
-/// `fulfill_state` table is local-only, so a stamp never crosses hosts.
-///
-/// # Errors
-///
-/// A probe failure (not "no such process") is an error so callers can
-/// treat it as indefinite rather than dead — a transient read failure
-/// must never trigger a takeover.
-pub fn process_liveness(pid: u32) -> Result<Option<u64>, String> {
-    imp_process_liveness(pid)
-}
-
-#[cfg(target_os = "macos")]
-fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
-    use std::mem::MaybeUninit;
-
-    let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `proc_pidinfo(PROC_PIDTBSDINFO)` writes at most
-    // `buffersize` bytes into `buffer`; the buffer is exactly
-    // `proc_bsdinfo`-sized and zero-initialized, and no pointer is
-    // retained past the call.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            size,
-        )
-    };
-    if written <= 0 {
-        let err = std::io::Error::last_os_error();
-        // ESRCH = no such process — a definitive answer.
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(None);
-        }
-        return Err(format!("proc_pidinfo({pid}) failed: {err}"));
-    }
-    if (written as usize) < std::mem::size_of::<libc::proc_bsdinfo>() {
-        return Err(format!(
-            "proc_pidinfo({pid}) wrote {written} bytes, expected {size}"
-        ));
-    }
-    // SAFETY: the kernel reported a full `proc_bsdinfo` write, so the
-    // buffer is initialized.
-    let info = unsafe { info.assume_init() };
-    if info.pbi_pid != pid {
-        return Ok(None);
-    }
-    Ok(Some(
-        info.pbi_start_tvsec.saturating_mul(1_000_000) + info.pbi_start_tvusec,
-    ))
-}
-
-#[cfg(target_os = "linux")]
-fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
-    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("reading /proc/{pid}/stat failed: {err}")),
-    };
-    // Field 22 (1-based) is starttime, in clock ticks since boot. The
-    // comm field (2) may contain spaces and parentheses, so split after
-    // the LAST ')' — the documented parse for /proc/<pid>/stat.
-    let after_comm = stat
-        .rsplit_once(')')
-        .map(|(_, rest)| rest)
-        .ok_or_else(|| format!("/proc/{pid}/stat has no comm terminator"))?;
-    let start = after_comm
-        .split_ascii_whitespace()
-        .nth(19) // after the comm split the first token is field 3 (state), so field 22 = index 19
-        .ok_or_else(|| format!("/proc/{pid}/stat has no starttime field"))?;
-    start
-        .parse::<u64>()
-        .map(Some)
-        .map_err(|e| format!("/proc/{pid}/stat starttime did not parse: {e}"))
-}
-
-#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
-    let _ = pid;
-    Err("no process start-time probe exists for this Unix platform".to_string())
-}
-
-#[cfg(not(unix))]
-fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
-    let _ = pid;
-    Err("no process start-time probe exists for this platform".to_string())
-}
+/// Re-exported from [`rocky_core::process`], which is where the probe
+/// lives so `rocky-cli` can reach it too (this crate sits above
+/// `rocky-cli`, so it could not host a primitive that layer needs).
+pub use rocky_core::process::process_liveness;
 
 #[cfg(test)]
 mod tests {
