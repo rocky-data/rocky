@@ -31,7 +31,7 @@ rocky fulfill revenue_daily
 
 The loop trusts nothing it did not verify itself:
 
-- The drafting agent runs in its own process group on a worker-profile MCP server. It can read, compile, test, and draft models. It cannot touch contracts, metadata, proposals, reviews, or schedules. The whole group is killed when the task ends, so helpers and accidental stragglers do not outlive the task. A process that deliberately breaks out of its session (`setsid`) is beyond any process-group kill — that is part of the hostile-local-agent residual below, not a covered case.
+- The drafting agent runs in its own process group on a worker-profile MCP server. It can read, compile, test, and draft models. It cannot touch contracts, metadata, proposals, reviews, or schedules. The whole group is killed when the task ends, so helpers and accidental stragglers do not outlive the task. A process that puts itself in a new session with `setsid` leaves the group and is beyond any process-group kill — that is part of the hostile-local-agent residual below, not a covered case.
 - After drafting, every spec-owned artifact is byte-verified against the committed lowering manifest. Drift means `blocked` — the loop names the tampered file.
 - The plan reaches the review queue only through the engine's one governed propose path, as the `agent` principal, under your `[policy]`.
 - The apply recomputes the spec digest from the approved snapshot and passes `--expect-spec-digest`. The engine refuses a mismatch even if the loop did not.
@@ -71,7 +71,7 @@ Bring your own model: the command template is the whole integration. `type = "re
 
 The worker runs on the same machine as the runner and the review markers, and markers are unsigned. The gates defend against mistakes, prompt-injection-shaped drift, and tool misuse — not against a hostile local process acting as your user. Do not point the driver at an agent binary you do not trust. Signed approvals and OS sandboxing are named follow-up work.
 
-Two limits have their own tracking issues. A descendant that calls `setsid` and forks twice is re-parented and survives the group kill; OS-level sandboxing is the fix ([#1491](https://github.com/rocky-data/rocky/issues/1491)). Rocky opens committed files with `O_NOFOLLOW` and creates them with `O_EXCL`, but it does not use directory-relative system calls, so a directory component swapped between the check and the open stays a window. `O_NOFOLLOW` is a Unix flag; on Windows one backup read follows a link.
+Two limits have their own tracking issues. A descendant that puts itself in a new session with `setsid` leaves the process group, is re-parented by the operating system, and survives the group kill; OS-level sandboxing is the fix ([#1491](https://github.com/rocky-data/rocky/issues/1491)). Rocky opens committed files with `O_NOFOLLOW` and creates them with `O_EXCL`, but it does not use directory-relative system calls, so a directory component swapped between the check and the open stays a window. `O_NOFOLLOW` is a Unix flag; on Windows one backup read follows a link.
 
 The full boundary, and how it applies to any agent rather than just this loop, is set out in [Operating Rocky with agents](/concepts/operating-rocky-with-agents/), "What the three gates do not defend against".
 

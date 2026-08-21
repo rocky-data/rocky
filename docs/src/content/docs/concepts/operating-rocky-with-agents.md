@@ -185,11 +185,11 @@ safe direction.
 
 **A process-group kill does not hold a process that leaves the group.** The
 fulfillment loop runs its drafting agent in a separate process group, and kills
-the whole group when the task ends. A descendant that calls `setsid` and then
-forks twice is re-parented by the operating system, and survives that kill. A
-test exhibits that escape, so the limit cannot quietly turn into a false
-guarantee. Sandboxing at the operating-system level is the planned fix. Tracked
-in
+the whole group when the task ends. A descendant that puts itself in a new
+session with `setsid` leaves that group. The operating system re-parents it, and
+it survives the kill. A test exhibits the escape, so the limit cannot quietly
+turn into a false guarantee. Sandboxing at the operating-system level is the
+planned fix. Tracked in
 [#1491](https://github.com/rocky-data/rocky/issues/1491).
 
 **A directory swapped mid-write is still a race.** The fulfillment loop commits
