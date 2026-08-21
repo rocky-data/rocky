@@ -131,10 +131,15 @@ an observation job that you own.
 
 One separate, opt-in run-time check exists, for replication pipelines only:
 `[checks] freshness = { threshold_seconds = ... }` measures the real lag with
-SQL after the pipeline runs, and the check fails when the lag exceeds the
-threshold. Other pipeline types do not execute that check today; `rocky
-validate` flags it there as inert (V034). It is a pipeline check with its
-own key, not the model's `[freshness]` declaration.
+SQL after the pipeline runs, and records the check as failed when the lag
+exceeds the threshold. Other pipeline types do not execute that check today;
+`rocky validate` flags it there as inert (V034). It is a pipeline check with
+its own key, not the model's `[freshness]` declaration.
+
+That recorded failure is advisory. The replication runner does not stop on it.
+The run's status comes from copied and failed tables, never from check results,
+so the exit code does not change. Rocky reports the outcome and leaves the
+decision to your orchestrator.
 
 Declaration: `ModelFreshnessConfig`, `engine/crates/rocky-core/src/models.rs`
 (its own doc comment states the compiler does not enforce it). Scheduler
