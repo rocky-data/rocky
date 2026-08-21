@@ -239,6 +239,31 @@ An agent earns freedom one step at a time. You grant each step. `rocky policy fr
 
 Full detail: [Operating Rocky with agents](https://rocky-data.dev/concepts/operating-rocky-with-agents/).
 
+## Declare a data product
+
+You write one spec file. `products/<name>.toml` states what the product must be: its grain, its columns, its checks, and how fresh it has to be. The spec adds no new runtime machinery. Every field lowers onto something the engine already checks, such as a contract, declarative tests, or sidecar metadata. A field that cannot lower is refused when the spec is parsed.
+
+```
+   products/<name>.toml
+          │
+          ├── rocky product verify   checks the trust posture, the masking
+          │                          tags, and identity collisions
+          ├── rocky product approve  freezes the revision as a snapshot
+          │                          addressed by its digest
+          ├── rocky product compile  lowers the spec onto a contract and
+          │                          declarative tests
+          │
+          └── rocky fulfill <name>   drives the steps above in order, and
+                                     stops at each gate with the exact
+                                     next command to run
+```
+
+`rocky fulfill` starts a drafting agent on the worker MCP profile. That profile serves the read and inspect tools, the compile and test loop, and two draft tools. It serves nothing else, and a tool added later stays out until someone adds it deliberately. The runner then re-reads what the agent wrote from disk, re-verifies it, and hands it to the same governed `propose` as any other agent change.
+
+The plan records the digest of the approved spec. A bare `rocky apply` refuses a product-bound plan. You run `rocky apply <plan-id> --expect-spec-digest <digest>`, and it refuses when the digest you pass does not match the one on the plan. `rocky fulfill` is experimental.
+
+Full detail: [Product commands](https://rocky-data.dev/reference/commands/products/) and [Fulfill commands](https://rocky-data.dev/reference/commands/fulfill/).
+
 ## Where Rocky is today
 
 The checker, named branches, replay, column lineage, rule enforcement and per-model cost are the most complete parts. Here is what is still thin.
