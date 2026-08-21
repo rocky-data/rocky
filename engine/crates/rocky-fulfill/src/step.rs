@@ -627,21 +627,22 @@ impl Runner {
                 // A pre-gate failure (compile, ledger, plan write) is a
                 // red verify bundle in spirit: surface it as a verify
                 // failure so the repair budget applies.
-                let (tests_deferred, deferred_note) = self.deferred_declared_checks(&spec);
-                let mut detail = vec![format!("propose failed before the policy gate: {err}")];
-                // Still true on this path, and for the same reason: the
-                // target was never materialised, so nothing declarative
-                // ran here either.
-                if let Some(note) = deferred_note {
-                    detail.push(note);
-                }
+                //
+                // No deferred count of its own. `TaskKind::Propose` is
+                // dispatched from exactly one place — the all-green
+                // bundle arm — so a `verify green: N declared data
+                // checks deferred` row is ALREADY in the journal for
+                // this same pass. Re-reading the sidecar here would be
+                // a second, independent reading that could state a
+                // different number and make the journal tell two
+                // stories about one pass.
                 return Ok(Event::VerifyBundle {
                     compile_green: false,
                     test_green: true,
                     posture_green: true,
                     manifest_total: true,
-                    tests_deferred,
-                    detail: detail.join(" | "),
+                    tests_deferred: None,
+                    detail: format!("propose failed before the policy gate: {err}"),
                 });
             }
         };

@@ -393,14 +393,19 @@ pub enum Event {
         /// How many of the product's declared data checks were NOT
         /// evaluated. They run against a materialised table, and verify
         /// runs before apply, so at this point none of them can run.
-        /// `None` when the count could not be read at all — distinct
-        /// from `Some(0)`, which claims there are none.
+        ///
+        /// `None` when this bundle carries no count of its own —
+        /// either the sidecar could not be read, or the bundle is the
+        /// synthesized propose-failure one, whose pass already
+        /// journaled the authoritative count. Distinct from `Some(0)`,
+        /// which positively claims there are none.
         ///
         /// Reported, never gated: deferred is not a failure, so this
         /// field is deliberately absent from the green pattern below.
         tests_deferred: Option<usize>,
-        /// Rendered detail. Carries the deferred-checks note on every
-        /// path, plus the red legs' reasons when there are any.
+        /// Rendered detail. Carries the deferred-checks note on the
+        /// paths that counted, plus the red legs' reasons when there
+        /// are any.
         detail: String,
     },
     /// The governed propose ran.
