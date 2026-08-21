@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+#
+# Rocky monorepo post-checkout hook.
+#
+# Shouts when a branch switch CARRIED uncommitted work across with it.
+#
+# `git checkout <branch>` does not stop for a dirty worktree: when the change
+# does not conflict, git brings it along silently. The work then belongs to
+# whichever branch you happen to land on, and the next `git add -A` commits it
+# there. That has repeatedly put changes on the wrong branch in this repo —
+# unrelated tooling inside a bugfix PR, a docs edit inside an engine PR, and a
+# branch accidentally stacked on another PR's commits.
+#
+# git has no pre-checkout hook, so this cannot refuse. It can make the carry
+# impossible to miss, which is the whole failure: it happens quietly.
+#
+# Skip with ROCKY_SKIP_HOOKS=1.
+set -uo pipefail
+
+# Args: $1 = previous HEAD, $2 = new HEAD, $3 = 1 for a branch checkout,
+# 0 for a file checkout. Only a branch switch can carry work.
+prev_head="${1:-}"
+new_head="${2:-}"
+branch_switch="${3:-0}"
+
+[ "$branch_switch" = "1" ] || exit 0
+[ "${ROCKY_SKIP_HOOKS:-}" = "1" ] && exit 0
+
+# A no-op checkout of the branch you are already on carries nothing.
+[ "$prev_head" = "$new_head" ] && exit 0
+
+carried="$(git status --porcelain 2>/dev/null)"
+status_rc=$?
+if [ "$status_rc" -ne 0 ]; then
+    echo "post-checkout: WARNING — could not read git status; cannot tell whether" >&2
+    echo "               uncommitted work came across with this switch." >&2
+    exit 0
+fi
+[ -z "$carried" ] && exit 0
+
+branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+
+cat >&2 <<WARNING
+
+╔════════════════════════════════════════════════════════════════════╗
+║  UNCOMMITTED WORK CAME WITH YOU                                    ║
+╚════════════════════════════════════════════════════════════════════╝
+
+You are now on '$branch', and these changes followed the switch:
+
+$carried
+
+They are NOT part of any branch yet. Committing here puts them on
+'$branch' — which is how unrelated changes end up inside a PR.
+
+If they belong on the branch you just LEFT:
+
+    git stash push -u -m "wip"     # here
+    git checkout -                 # back
+    git stash pop
+
+If they belong here, commit them here deliberately.
+
+WARNING
+
+# Never block: a post-checkout hook that exits nonzero leaves the user on the
+# new branch anyway, so failing would only add confusion to a switch that has
+# already happened.
+exit 0
