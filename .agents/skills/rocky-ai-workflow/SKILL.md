@@ -7,7 +7,7 @@ description: How an AI agent should author or modify a Rocky data model. Use whe
 
 This is the workflow for an AI agent that has been asked to build or change a Rocky model. It assumes you can run the `rocky` CLI (or call the equivalent tools) and read its `--output json`. For the config format see the `rocky-config` skill; for the full command surface see the `rocky` skill. This skill is specifically about *how to converge on a correct model* and *how to ship it safely*.
 
-The shape of the job: **you propose, Rocky's compiler verifies, an approval marker gates the apply.** Your edits are not trusted because they compiled — they're trusted because the typed substrate checked them and someone reviewed the reported delta.
+The shape of the job: **you propose, Rocky's compiler verifies, an approval marker gates the apply.** Your edits are not trusted because they compiled — they're trusted because the typed substrate checked them and the apply is gated on a marker naming that plan.
 
 ## Author SQL, not the DSL
 
@@ -38,7 +38,7 @@ The path:
 
 1. **Propose.** Generate the plan that materializes your change (it is recorded as an *AI-authored* plan with a `plan_id`). A propose can also bind the plan to a product identity — `product_id` plus `spec_digest`, both together or neither. A product-bound plan refuses a bare `rocky apply`; the applier must pass `rocky apply <plan-id> --expect-spec-digest <digest>` with the digest of the approved spec. When you do not work for a product runner, omit both fields.
 2. **Review.** Run `rocky review <plan-id>`. This compiles your working tree against the base ref and runs the semantic breaking-change classifier, then reports the delta — added/removed/retyped columns, anything downstream consumers depend on. Read it.
-3. **Approve.** `rocky review <plan-id> --approve` writes the approval marker. Approving over breaking changes is allowed, and the report lists them, so raise them explicitly rather than assuming the approver read the output.
+3. **Approve.** `rocky review <plan-id> --approve` writes the approval marker. Approving over breaking changes is allowed. The marker is written even when the classifier could not run: if either tree fails to compile, findings are absent and `breaking_change_count` falls back to 0. So a marker is not evidence a delta was computed — raise the findings explicitly.
 4. **Apply.** Only after the approval marker exists does `rocky apply <plan-id>` execute.
 
 Your job ends at *propose* and at *surfacing the review report clearly*. The approval is a human decision; do not approve on the user's behalf unless they explicitly tell you to.

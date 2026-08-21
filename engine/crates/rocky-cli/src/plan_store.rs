@@ -97,9 +97,10 @@ use serde::{Deserialize, Serialize};
 /// paths never call (#1310). Such checks belong at the seam every entrypoint
 /// crosses.
 ///
-/// Audited across all nine kinds. Some entries below record a gap rather than
-/// a guarantee — `Replication` (#1460), and the point-in-time limit on
-/// `Restore`. Do not read this table as a certification.
+/// Audited across all nine kinds. One entry below records a gap rather than a
+/// guarantee: the point-in-time limit on `Restore`. Do not read this table as
+/// a certification, and re-check a row against its code before relying on it —
+/// two rows here described gaps that had already been closed (#1459, #1460).
 ///
 /// The `AiAuthored` row states what the marker check ENFORCES, which is that a
 /// well-formed marker names this plan. It does not establish that a person
@@ -115,7 +116,7 @@ use serde::{Deserialize, Serialize};
 /// | `Gc` | candidate is provably derivable | Yes — re-derives against the live store and takes derivability from the fresh candidate, never the payload; fail-closed on hash mismatch |
 /// | `Restore` | rebuilt bytes are hash-exact | Point-in-time only — the hash is verified *before* the ledger row is reinstated, and nothing fences the object between the two |
 /// | `Compact` / `Archive` | policy gate | Yes — the gate runs at apply; a denied apply never reaches `execute_statement` |
-/// | `Replication` | source state matches what was reviewed | **Partly — see #1460.** Apply discovers once for comparison, then `run` discovers again and builds work from the second result; `config_snapshot` has no production apply-side reader |
+/// | `Replication` | source state + config match what was reviewed | Yes, since #1460. Apply compares the persisted `config_snapshot` WHOLE against a freshly fingerprinted load, and `run` re-applies the source-state check against the discovery the work is actually built from. Two stated limits remain: credentials are redacted in the snapshot, so a changed secret is not detected, and the state identity is credential-free by construction |
 /// | `AiAuthored` | a review marker naming the plan before a machine-authored change executes | Yes — unconditionally, since #1459. `apply_policy_gate` runs FIRST (so `Deny` / `RequireReview` keep their wording and precedence), then [`crate::commands::review::review_marker_state`] must return `Approved` for THIS plan id. `Allow` and `NotConfigured` return `Ok(())` without consulting the marker, so the check runs after them and policy can only TIGHTEN the gate, never waive it. It is parse-and-match, not file-exists, and it authenticates nobody — see the caveat below |
 /// | `Backfill` | reviewed closure + run-plan diagnostics | Yes for the closure — see the structural note on `run_apply_backfill_plan` |
 ///

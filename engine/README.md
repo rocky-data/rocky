@@ -173,9 +173,11 @@ denial or a review requirement, and a denied draft leaves nothing new on disk
 
 The other two carry their own guard. `pause_schedule` needs `confirm: true`.
 Only a human can resume a schedule, with
-`rocky state schedule resume <pipeline>`. `review_queue` can record the human
-sign-off that unblocks `rocky apply`. It needs `confirm: true`, and it refuses
-any plan that is not already in the pending review queue.
+`rocky state schedule resume <pipeline>`. `review_queue` can write the approval
+marker that unblocks `rocky apply`. It needs `confirm: true` from the caller,
+and it refuses any plan that is not already in the pending review queue. Rocky
+does not check that a person set `confirm`, so this is not a human sign-off in
+any sense the engine verifies. `rocky mcp --profile worker` does not serve it.
 
 To see what a rule resolves to before you rely on it, run
 `rocky policy check --principal agent --capability apply --model <name>`. It

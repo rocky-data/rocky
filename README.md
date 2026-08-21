@@ -181,14 +181,13 @@ Rocky type-checks every change an agent writes. The agent produces a plan. A pla
               │
      ┌────────┴────────┬──────────────────┐
      │ require review  │ allow            │ deny
-     ▼                 │                  ▼
-  ┌──────────────┐     │        ┌───────────────────┐
-  │ an approval  │     │        │ refused. No SQL   │
-  │ marker, then │     │        │ runs, so there is │
-  │ it applies   │     │        │ nothing to undo.  │
-  └──────┬───────┘     │        └─────────┬─────────┘
-         │             │                  │
-         └──────┬──────┘                  │
+     ▼                 ▼                  ▼
+  ┌───────────────────────────┐ ┌───────────────────┐
+  │ an AI-authored plan needs │ │ refused. No SQL   │
+  │ an approval marker naming │ │ runs, so there is │
+  │ it. BOTH branches cross   │ │ nothing to undo.  │
+  │ this check.               │ └─────────┬─────────┘
+  └─────────────┬─────────────┘           │
                 ▼                         │
      ┌────────────────────┐               │
      │ the warehouse runs │               │
@@ -241,7 +240,7 @@ Full detail: [Operating Rocky with agents](https://rocky-data.dev/concepts/opera
 
 ## Declare a data product
 
-You write one spec file. `products/<name>.toml` states what the product must be: its grain, its columns, its checks, and how fresh it has to be. The spec adds no new runtime machinery. Every field lowers onto something the engine already checks, such as a contract or the model's sidecar metadata. A field that cannot lower is refused when the spec is parsed.
+You write one spec file. `products/<name>.toml` states what the product must be: its grain, its columns, its checks, and how fresh it has to be. The spec adds no new runtime machinery. A field either lowers onto something the engine already has, such as a contract or the model's sidecar, or it is refused when the spec is parsed. Not every field ends up as an engine check: freshness is observed by the loop after the apply, not enforced at compile time.
 
 ```
    products/<name>.toml
@@ -250,15 +249,19 @@ You write one spec file. `products/<name>.toml` states what the product must be:
           │                          tags, and identity collisions
           ├── rocky product approve  freezes the revision as a snapshot
           │                          addressed by its digest
-          ├── rocky product compile  renders the model's contract, then
-          │                          merges spec-owned sidecar metadata
+          ├── rocky product compile  one phase per call: renders the
+          │                          contract, or merges the sidecar
           │
           └── rocky fulfill <name>   drives these verbs, and the drafting
                                      agent between them. Stops at each gate
                                      with the exact next command to run
 ```
 
-`rocky fulfill` starts a drafting agent on the worker MCP profile. That profile serves the read and inspect tools, the compile and test loop, and two draft tools. It serves nothing else, and a tool added later stays out until someone adds it deliberately. The runner then re-reads what the agent wrote from disk, re-verifies it, and hands it to the same governed `propose` as any other agent change.
+`rocky fulfill` runs the drafting agent as a subprocess. You choose the command in `[fulfill.driver]`. The worker sees only the environment variables you allowlist, and the whole task runs in one process group the loop kills when the task ends.
+
+Rocky ships a narrowed MCP surface for that worker. `rocky mcp --profile worker` serves the read and inspect tools, the compile and test loop, and two draft tools. It serves nothing else, and a tool added later stays out until someone adds it deliberately. Point your driver command at it. The engine does not force the command you configure to use it.
+
+The runner then re-reads what the agent wrote from disk, re-verifies it, and hands it to the same governed `propose` as any other agent change.
 
 The plan records the digest of the approved spec. A bare `rocky apply` refuses a product-bound plan. You run `rocky apply <plan-id> --expect-spec-digest <digest>`, and it refuses when the digest you pass does not match the one on the plan. `rocky fulfill` is experimental.
 
