@@ -405,7 +405,7 @@ Three rules keep that boundary in place:
 
 - The generators (`ai_contract`, `ai_test`, `explain_model`) return **drafts** and mutate nothing. Hand a draft to the `draft_contract` or `draft_check` write tool, or save it to disk and run `compile` and `test` yourself.
 - `governance_preview` and `drift_preview` are **read-only** previews.
-- The server does not apply. `rocky apply` is the only step that reaches the warehouse, and no MCP tool runs it. `review_queue` can write a plan's approval marker, so treat approval as a step the server can take: it needs `confirm: true` from the caller, and it refuses a plan that is not already in the pending review queue. `rocky mcp --profile worker` does not serve `review_queue`.
+- The server does not apply. `rocky apply` is the only step that reaches the warehouse, and no MCP tool runs it. `review_queue` can write a plan's approval marker, so treat approval as a step the server can take. It needs `confirm: true` from the caller. It refuses a plan that is not already in the pending review queue. `rocky mcp --profile worker` does not serve it.
 
 ### Tools
 
