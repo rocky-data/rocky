@@ -19,15 +19,27 @@
 # a model argument.
 #
 # Prerequisites:
-#   - rocky binary built at engine/target/release/rocky
-#     (run `cargo build --release --bin rocky` from engine/ if missing)
+#   - rocky binary built at engine/target/debug/rocky (what `just codegen`
+#     builds) or engine/target/release/rocky; set ROCKY_BIN to override.
+#     Build with `cargo build --bin rocky` from engine/ if missing.
+#     Fixture bytes are identical under either profile — verified by a
+#     two-profile byte-diff of every generated fixture.
 #   - duckdb CLI on PATH (used to seed the playground.duckdb file)
 
 set -euo pipefail
 
 readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 readonly WORKSPACE_ROOT="$(dirname "$SCRIPT_DIR")"
-readonly ROCKY="$WORKSPACE_ROOT/engine/target/release/rocky"
+# Resolve the binary: explicit override wins, then debug (what `just codegen`
+# builds), then release. Preferring debug keeps `just codegen && just
+# regen-fixtures` to ONE compile; release still works for anyone who has it.
+if [[ -n "${ROCKY_BIN:-}" ]]; then
+    readonly ROCKY="$ROCKY_BIN"
+elif [[ -x "$WORKSPACE_ROOT/engine/target/debug/rocky" ]]; then
+    readonly ROCKY="$WORKSPACE_ROOT/engine/target/debug/rocky"
+else
+    readonly ROCKY="$WORKSPACE_ROOT/engine/target/release/rocky"
+fi
 readonly POC="$WORKSPACE_ROOT/examples/playground/pocs/00-foundations/01-replication-basics"
 readonly PARTITION_POC="$WORKSPACE_ROOT/examples/playground/pocs/02-performance/03-partition-checksum"
 readonly NORMALIZER="$SCRIPT_DIR/_normalize_fixture.py"
@@ -43,7 +55,7 @@ fi
 
 if [[ ! -x "$ROCKY" ]]; then
     echo "Error: rocky binary not found at $ROCKY" >&2
-    echo "Build it with: cd engine && cargo build --release --bin rocky" >&2
+    echo "Build it with: cd engine && cargo build --bin rocky" >&2
     exit 1
 fi
 if ! command -v duckdb >/dev/null 2>&1; then

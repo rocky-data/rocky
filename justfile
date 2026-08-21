@@ -111,17 +111,22 @@ codegen-all: codegen regen-fixtures
 
 # Export JSON schemas from the engine's typed CLI output structs.
 #
-# Builds the rocky binary in release mode and reuses it. The release
-# build is shared with `regen-fixtures` (which expects
-# engine/target/release/rocky), so a single `just codegen && just
-# regen-fixtures` invocation only compiles the engine once.
+# Builds the rocky binary with the DEV profile deliberately. Codegen output is
+# serialized `schemars` JSON — no optimization pass can change it — and a
+# two-profile byte-diff (schemas + openapi + dagster fixtures) confirmed the
+# release and debug binaries produce identical bytes. The release build cost
+# ~7 minutes against ~40 seconds for debug over the same warm dependencies,
+# and it was the single largest step in the codegen-drift CI job.
+#
+# The binary is shared with `regen-fixtures` (which resolves it the same way),
+# so `just codegen && just regen-fixtures` compiles the engine once.
 codegen-rust:
-    cd engine && cargo run --quiet --release --bin rocky -- export-schemas ../schemas
+    cd engine && cargo run --quiet --bin rocky -- export-schemas ../schemas
 
 # Generate the OpenAPI 3.1 document for the `rocky serve` HTTP API from the
 # same typed schema registry as `codegen-rust` plus the `/api/v1` route table.
 #
-# Reuses the release binary built by `codegen-rust` (it runs after it in the
+# Reuses the binary built by `codegen-rust` (it runs after it in the
 # `codegen` aggregate), so a `just codegen` run compiles the engine only once.
 # The document is validated against the OpenAPI 3.1 meta-schema offline before
 # it is written; a structurally invalid or dangling-ref document fails here.
@@ -129,7 +134,7 @@ codegen-rust:
 # `schemas/` (avoiding the export-schemas count-guard). codegen-drift CI fails
 # if the committed document is stale.
 codegen-openapi:
-    cd engine && cargo run --quiet --release --bin rocky -- export-openapi ../docs/public/openapi.json
+    cd engine && cargo run --quiet --bin rocky -- export-openapi ../docs/public/openapi.json
 
 # Regenerate Pydantic v2 models in the rocky-sdk package from schemas/
 # (writes to sdk/python/src/rocky_sdk/types_generated/). dagster-rocky

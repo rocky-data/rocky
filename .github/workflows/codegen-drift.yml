@@ -64,13 +64,30 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # Pinned: an unpinned `stable` let the 1.98.0 release land mid-day
+          # (2026-08-20) and turn required checks red with no code change,
+          # while cache-busting every Rust job at once. Bump deliberately.
+          toolchain: 1.98.0
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: engine
+          # Bumped when codegen moved from the release profile to dev. A cache
+          # entry is immutable per key, so without a new namespace this job
+          # would keep restoring the old entry — which holds release artifacts
+          # this job no longer builds — and never shrink. The old `v0-rust-drift-*`
+          # entries age out by LRU (or `gh cache delete` them once).
+          prefix-key: v1-rust-drift-dev
+          # Save only from main — see the note in engine-ci.yml. PR runs restore
+          # from main's entry and do not mint their own multi-GB duplicate.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install cmake (for DuckDB)
-        run: sudo apt-get update && sudo apt-get install -y cmake
+        # Present on the current ubuntu-24.04 image, but the `ubuntu-latest`
+        # alias is mutable — guard on the binary, not on the image, so this is
+        # a no-op today and still self-heals if a future image drops cmake.
+        run: command -v cmake >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y cmake; }
 
       - name: Free disk space and add swap
         run: |
@@ -110,10 +127,6 @@ jobs:
         run: uv sync --dev
         working-directory: sdk/python
 
-      - name: uv sync (dagster)
-        run: uv sync --dev
-        working-directory: integrations/dagster
-
       - name: npm install (vscode)
         run: npm ci
         working-directory: editors/vscode
@@ -127,9 +140,12 @@ jobs:
         run: cargo test -p rocky-cli --lib commands::export_schemas
         working-directory: engine
 
-      # `just codegen-rust` uses `cargo run --release`, which builds the
-      # rocky binary in release mode. The same binary is reused by
-      # `just regen-fixtures` below — no second build needed.
+      # `just codegen-rust` builds the rocky binary with the DEV profile and
+      # `just regen-fixtures` below resolves the same binary — one compile for
+      # both steps. Dev is deliberate: codegen output is serialized schemars
+      # JSON, and a two-profile byte-diff (schemas + openapi + fixtures)
+      # confirmed release and debug emit identical bytes, for a fraction of
+      # the build time. See the justfile note on `codegen-rust`.
       - name: Run full codegen
         run: just codegen
 
