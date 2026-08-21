@@ -93,16 +93,24 @@ project, not across project boundaries.
 `rocky branch create` and `rocky run --branch <name>` give you isolated branches
 for development and review. A branch today is a schema prefix: models for branch
 `feature_x` materialize under a `branch__feature_x` namespace, so a branch never
-touches a production table. Approval writes a signed artifact under
-`.rocky/approvals/<branch>/`, and promotion verifies that signature before it
-merges the branch forward.
+touches a production table. Approval writes an artifact under
+`.rocky/approvals/<branch>/`. Before promotion merges the branch forward, it
+checks four things on that artifact: the blake3 digest over its own contents
+still matches, the branch state hash has not moved, the approval is not older
+than `max_age_seconds`, and the approver's email is in `allowed_signers`.
+
+The digest is not a cryptographic signature. It is unkeyed, so it detects an
+artifact edited after it was written, and it does not authenticate the
+approver. The approver's email is a self-asserted git identity that is hashed
+with the rest of the artifact. Anything that can write the approvals directory
+can set that email and recompute the digest.
 
 What you get today is schema-prefix isolation, not a warehouse-native zero-copy
 clone. Delta `SHALLOW CLONE` and Snowflake zero-copy `CLONE` would make branch
 creation near-instant and free of storage cost. That integration is a follow-up,
 not what runs now.
 
-**Partial.** Schema-prefix branches with signed approval and promotion ship today. Warehouse-native clones do not.
+**Partial.** Schema-prefix branches with digest-checked approval and promotion ship today. Warehouse-native clones do not. Nor do signed approvals.
 
 ### Per-model cost
 
@@ -264,7 +272,7 @@ surprised.
 | Schema drift handling (ignore / safe widen / drop-and-recreate) | Shipped | Explicit graded response with a grace period. |
 | Dialect-divergence lint (`P001`) | Shipped | Opt-in via `--target-dialect`; error severity. |
 | VS Code trust overlays | Shipped | Exactly four: Drift, Breaking, Replay, Governance. |
-| Branches | Partial | Schema-prefix isolation with signed approval/promotion; no warehouse-native zero-copy clones yet. |
+| Branches | Partial | Schema-prefix isolation with digest-checked approval/promotion (unkeyed, so it detects tamper but authenticates nobody); no warehouse-native zero-copy clones yet. |
 | Replay | Partial | Deterministic recording + ledger verification, plus re-execution (`rocky replay --execute --verify`, local or `--warehouse`) for deterministic content-addressed models; mutable-source models are `non_replayable`, non-deterministic recipes flagged. |
 | Content-addressed writes | Partial | Single-writer Delta/UniForm; no multi-writer, broad schema evolution, or deletion vectors yet. |
 | Per-model cost | Partial | Billing-exact on BigQuery; a duration × DBU-rate estimate on Databricks and Snowflake; zero on DuckDB. Databricks surfaces scanned bytes for observability; Snowflake's warehouse-reported-bytes plumbing is the follow-up. |
