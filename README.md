@@ -241,7 +241,7 @@ Full detail: [Operating Rocky with agents](https://rocky-data.dev/concepts/opera
 
 ## Declare a data product
 
-You write one spec file. `products/<name>.toml` states what the product must be: its grain, its columns, its checks, and how fresh it has to be. The spec adds no new runtime machinery. Every field lowers onto something the engine already checks, such as a contract, declarative tests, or sidecar metadata. A field that cannot lower is refused when the spec is parsed.
+You write one spec file. `products/<name>.toml` states what the product must be: its grain, its columns, its checks, and how fresh it has to be. The spec adds no new runtime machinery. Every field lowers onto something the engine already checks, such as a contract or the model's sidecar metadata. A field that cannot lower is refused when the spec is parsed.
 
 ```
    products/<name>.toml
@@ -250,8 +250,8 @@ You write one spec file. `products/<name>.toml` states what the product must be:
           │                          tags, and identity collisions
           ├── rocky product approve  freezes the revision as a snapshot
           │                          addressed by its digest
-          ├── rocky product compile  lowers the spec onto a contract and
-          │                          declarative tests
+          ├── rocky product compile  renders the model's contract, then
+          │                          merges spec-owned sidecar metadata
           │
           └── rocky fulfill <name>   drives the steps above in order, and
                                      stops at each gate with the exact
