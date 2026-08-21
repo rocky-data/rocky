@@ -245,10 +245,10 @@ You write one spec file. `products/<name>.toml` states what the product must be:
 ```
    products/<name>.toml
           │
-          ├── rocky product verify   checks the trust posture, the masking
-          │                          tags, and identity collisions
           ├── rocky product approve  freezes the revision as a snapshot
           │                          addressed by its digest
+          ├── rocky product verify   checks the trust posture, the masking
+          │                          tags, and identity collisions
           ├── rocky product compile  one phase per call: renders the
           │                          contract, or merges the sidecar
           │                          (grain, non-null columns and checks
@@ -257,11 +257,14 @@ You write one spec file. `products/<name>.toml` states what the product must be:
           └── rocky fulfill <name>   drives these verbs, and the drafting
                                      agent between them. Stops at each gate
                                      with the exact next command to run
+
+   The loop stops for spec approval FIRST, then verifies, then lowers.
+   Each verb also runs on its own, in any order you need.
 ```
 
 `rocky fulfill` runs the drafting agent as a subprocess. You choose the command in `[fulfill.driver]`. The worker sees only the environment variables you allowlist, and the whole task runs in one process group the loop kills when the task ends.
 
-Rocky ships a narrowed MCP surface for that worker. `rocky mcp --profile worker` serves the read and inspect tools, the compile and test loop, and two draft tools. It serves nothing else, and a tool added later stays out until someone adds it deliberately. Point your driver command at it. The engine does not force the command you configure to use it.
+Rocky ships a narrowed MCP surface for that worker. `rocky mcp --profile worker` serves the read and inspect tools, the compile and test loop, and two draft tools. It serves no other tools, and a tool added later stays out until someone adds it deliberately. The MCP prompts stay available in both profiles. Point your driver command at it. The engine does not force the command you configure to use it.
 
 The runner then re-reads what the agent wrote from disk, re-verifies it, and hands it to the same governed `propose` as any other agent change.
 
