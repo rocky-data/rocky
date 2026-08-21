@@ -77,7 +77,7 @@ The full boundary, and how it applies to any agent rather than just this loop, i
 
 ## Repair rounds
 
-A red verification sends the loop back to the agent for a repair round. The repair rewrites the merged sidecar file, which is exactly what it is meant to do, and the loop recovers and carries on to propose.
+A red verification sends the loop back to the agent for a repair round. The repair rewrites the merged sidecar file, which is exactly what it is meant to do. If the next verification is green the loop carries on to propose. A repair is not guaranteed to work: one that leaves the verification red is retried up to the repair budget, and a product that exhausts that budget stops at `blocked` with the last failure printed. What no longer happens is the loop reporting its own repair as tampering.
 
 The loop authorizes that write rather than assuming it. Before it dispatches a repair worker it re-checks **every** hash the committed manifest records. Drift there had no authorized writer, so it is tamper: the product moves to `blocked` and nothing is rewritten. Only when every file verifies does the loop demote the manifest to its contract-only phase, which returns the sidecar to the writable set. The next merge re-records the hashes from what it merged. Hashes are only ever written by the commit protocol.
 

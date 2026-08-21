@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::fulfill::{FulfillState, FulfillStateRecord};
+use crate::fulfill::FulfillState;
 use crate::product::lowering::{
     Lowering, contract_rel, lower_phase_a, lower_phase_b, manifest_rel, sidecar_rel, sql_rel,
     state_dir_rel,
@@ -56,6 +56,7 @@ use crate::product::manifest::{
     verify_artifact_hashes,
 };
 use crate::product::spec::{ParsedSpec, SpecRejected, SpecResult};
+use crate::state::StateStore;
 
 /// Suffix of a staged (not yet renamed) file, written next to its final.
 pub const STAGED_SUFFIX: &str = ".ff-staged";
@@ -1210,7 +1211,13 @@ fn run_phase_b_with_ops(
 /// [`demote_merged_manifest_to_phase_a`], which is `pub(crate)` and
 /// unreachable from any other crate (pinned by the out-of-crate
 /// compile-fail proof in `rocky-core-compiletest`). This is the only
-/// public way in, and it demands the loop's compare-and-swapped record:
+/// public way in, and it demands the loop's compare-and-swapped record —
+/// which it READS from `store` rather than accepting as an argument. A
+/// [`FulfillStateRecord`] is publicly constructible, so a
+/// caller-supplied one would be a permission slip the caller writes
+/// itself; reading the store makes the claim answerable only by the
+/// record that actually won the CAS. Every condition below is checked
+/// against that stored record:
 ///
 /// - the record is THIS product's (`product_id` matches the spec), so a
 ///   record fetched for another product grants nothing here;
@@ -1241,7 +1248,7 @@ pub fn reopen_for_drafting(
     project_root: &Path,
     spec_path: &str,
     parsed: &ParsedSpec,
-    decided: &FulfillStateRecord,
+    store: &StateStore,
 ) -> SpecResult<ReopenOutcome> {
     let product_id = parsed.product_id();
     let undecided = |why: String| {
@@ -1255,9 +1262,27 @@ pub fn reopen_for_drafting(
             ),
         )
     };
+    // The evidence is READ HERE, from the state store, and never
+    // accepted as an argument. A `FulfillStateRecord` is publicly
+    // constructible, so taking one from the caller would let any caller
+    // mint its own permission slip; taking the store makes the caller
+    // prove the claim against the record that actually won the CAS.
+    let decided = store
+        .fulfill_state_get(&parsed.product().name)
+        .map_err(|err| {
+            SpecRejected::new(
+                "reopen-state-unreadable",
+                format!("could not read the fulfillment record for {product_id}: {err}"),
+            )
+        })?;
+    let Some(decided) = decided else {
+        return Err(undecided(
+            "no fulfillment record exists, so nothing decided a drafting round".to_string(),
+        ));
+    };
     if decided.product_id != product_id {
         return Err(undecided(format!(
-            "the supplied fulfillment record belongs to {} ",
+            "the stored fulfillment record belongs to {} ",
             decided.product_id
         )));
     }
@@ -1386,6 +1411,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    // Only the reopen's evidence tests build a record; production code
+    // reads one out of the store and never names the type.
+    use crate::fulfill::FulfillStateRecord;
     use crate::product::manifest::{ManifestPhase, assert_total};
     use crate::product::spec::parse_spec_bytes;
 
@@ -1801,17 +1829,66 @@ mod tests {
         record
     }
 
+    /// A state store at `dir/state.redb` holding exactly `record` for
+    /// `revenue_daily` — the reopen reads the store, so a test that
+    /// wants a record observed has to actually persist it.
+    fn store_holding(dir: &Path, record: Option<&FulfillStateRecord>) -> StateStore {
+        let store = StateStore::open(&dir.join("state.redb")).expect("state store");
+        if let Some(record) = record {
+            let row = crate::fulfill::FulfillJournalRow {
+                seq: 0,
+                at: None,
+                event: "seeded".to_string(),
+                from_state: None,
+                to_state: record.state.tag().to_string(),
+                spec_digest: None,
+                plan_id: None,
+                idempotency_key: None,
+            };
+            let outcome = store
+                .fulfill_state_cas("revenue_daily", None, record, &row)
+                .expect("seed the record");
+            assert_eq!(outcome, crate::fulfill::FulfillCas::Won);
+        }
+        store
+    }
+
     #[test]
     fn the_reopen_demotes_only_on_the_loops_decided_record() {
         let dir = tempfile::tempdir().expect("tempdir");
         let project = seeded_project(dir.path());
         let parsed = parsed_d3();
         full_flow(&project, &parsed);
+        let store = store_holding(dir.path(), Some(&decided_record(&parsed)));
 
-        let outcome = reopen_for_drafting(&project, SPEC_PATH, &parsed, &decided_record(&parsed))
+        let outcome = reopen_for_drafting(&project, SPEC_PATH, &parsed, &store)
             .expect("the decided record opens the window");
         assert_eq!(outcome, ReopenOutcome::Reopened);
         assert_eq!(committed(&project).phase, ManifestPhase::LoweredContract);
+    }
+
+    #[test]
+    fn the_reopen_refuses_when_the_store_holds_no_record_at_all() {
+        // The forgery case the evidence gate exists for: a caller that
+        // never won a CAS has nothing in the store to point at, and
+        // cannot supply a record of its own because the entry does not
+        // take one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        full_flow(&project, &parsed);
+        let before = snapshot(&project);
+        let store = store_holding(dir.path(), None);
+
+        let error =
+            reopen_for_drafting(&project, SPEC_PATH, &parsed, &store).expect_err("no record");
+        assert_eq!(error.code, "reopen-undecided");
+        assert!(
+            error.message.contains("no fulfillment record exists"),
+            "{error}"
+        );
+        assert_eq!(snapshot(&project), before, "a refusal mutates nothing");
+        assert_eq!(committed(&project).phase, ManifestPhase::Merged);
     }
 
     /// One refusal case: why it must refuse, how to build the record
@@ -1871,9 +1948,11 @@ mod tests {
             let parsed = parsed_d3();
             full_flow(&project, &parsed);
             let before = snapshot(&project);
+            // The record has to be PERSISTED to be observed — that is
+            // the point of reading the store rather than an argument.
+            let store = store_holding(dir.path(), Some(&build(&parsed)));
 
-            let error =
-                reopen_for_drafting(&project, SPEC_PATH, &parsed, &build(&parsed)).expect_err(why);
+            let error = reopen_for_drafting(&project, SPEC_PATH, &parsed, &store).expect_err(why);
             assert_eq!(error.code, "reopen-undecided", "{why}: {error}");
             assert!(
                 error.message.contains(expected_fragment),

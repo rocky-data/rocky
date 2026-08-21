@@ -788,7 +788,13 @@ pub fn product_compile(
     state_path: Option<&Path>,
     product_name: &str,
 ) -> Result<ProductCompileOutput> {
-    super::product::product_compile_in(root, config_path, state_path, product_name)
+    super::product::product_compile_in(
+        root,
+        config_path,
+        state_path,
+        product_name,
+        super::product::CompileCaller::FulfillLoop,
+    )
 }
 
 /// Read-only product status. Invariant guarded: reporting never mutates
