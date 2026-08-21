@@ -498,7 +498,7 @@ rocky plan --filter client=acme
 rocky apply <plan-id>
 ```
 
-Apply an AI-authored plan. The bare apply is refused until a human signs off:
+Apply an AI-authored plan. The bare apply is refused until an approval marker names that plan:
 
 ```bash
 rocky review <plan-id> --approve

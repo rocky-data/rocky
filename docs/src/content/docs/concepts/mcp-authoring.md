@@ -126,7 +126,7 @@ returns an empty result rather than failing.
 
 ### Write path (draft tools)
 
-These are the safe way for an agent to change the project. Each one writes into
+These are the governed way for an agent to change the project. Each one writes into
 the project's `models/` directory and **compiles in the same call**, so you get
 the type-check with the write. Each one is also checked against your policy
 rules. A `draft_*` tool never applies a change to the warehouse.
@@ -151,7 +151,7 @@ one ends at a proposed plan or an enumerated gap, never at an applied change.
 
 | Prompt | What it walks |
 |---|---|
-| `build_model` | inspect_schema → sample_rows → profile_column → compile → plan preview → propose. Stops at the human approval gate. |
+| `build_model` | inspect_schema → sample_rows → profile_column → compile → plan preview → propose. Stops at the approval gate. |
 | `find_untested_models` | compile → identify untested models → `ai_test` / `ai_contract` → `draft_check` / `draft_contract` → propose. Stops at the gate. |
 | `add_tests_to_pks` | inspect_schema → identify key columns → `draft_check` (uniqueness + not-null) → propose. |
 | `summarize_project` | A read-only project tour; proposes nothing — points at `find_untested_models` / `build_model` for next steps. |
@@ -182,13 +182,13 @@ tools on the allowlist and end at a hand-off to the trusted runner — never at
 
 The write path has three gates. No single call passes all three. A `draft_*`
 call passes two: the compiler type-checks what it wrote, then Rocky evaluates
-your `[policy]` rules before the call returns. The third gate is a human, and it
-sits at apply time. `propose` records an AI-authored plan and returns a
+your `[policy]` rules before the call returns. The third gate is the approval
+marker, and it sits at apply time. `propose` records an AI-authored plan and returns a
 `plan_id`; it executes nothing:
 
 ```bash
-rocky review <plan_id> --approve    # human sign-off, required
-rocky apply  <plan_id>              # only runs after approval
+rocky review <plan_id> --approve    # writes the approval marker
+rocky apply  <plan_id>              # refused until that marker names it
 ```
 
 A bare `rocky apply <plan_id>` on an unapproved AI-authored plan is rejected by
