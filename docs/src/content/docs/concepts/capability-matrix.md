@@ -160,10 +160,10 @@ the plan. Three properties of that gate, as it ships today:
   machine, not who wrote the bytes. Signed approvals are a planned
   hardening, not a shipped one.
 
-The first two properties are newer than engine v1.70.1. Releases up to and
+The first two properties arrived in engine v1.71.0. Releases up to and
 including v1.70.1 check only that a marker file exists, and skip even that
-when a `[policy]` rule resolves to `allow`. Upgrade before you rely on the
-floor.
+when a `[policy]` rule resolves to `allow`. Upgrade to v1.71.0 or later before
+you rely on the floor.
 
 Gate: `run_apply_ai_authored_plan`,
 `engine/crates/rocky-cli/src/commands/apply.rs`. Marker shape and the
