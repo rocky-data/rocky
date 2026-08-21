@@ -43,8 +43,8 @@ Four more words appear across the rows, always with the same meaning:
 | [Classification tag completeness](#classification-tag-completeness) | Not enforced: Rocky warns (W004). Nothing blocks. |
 | [Masking application](#masking-application) | Adapter-dependent: Databricks only, attempted |
 | [Freshness](#freshness) | Declared metadata, not enforced. One opt-in run-time check, replication pipelines only. |
-| [Human review of AI-authored plans](#human-review-of-ai-authored-plans) | Rocky-guaranteed: enforced floor at apply |
-| [Audit ledger](#audit-ledger) | Rocky records it: attempted for ordinary rules, durable for budget and `verify_after` decisions |
+| [Human review of AI-authored plans](#human-review-of-ai-authored-plans) | Rocky-guaranteed: enforced floor at apply. The marker is checked, the approver is not authenticated. |
+| [Audit ledger](#audit-ledger) | Rocky records it: attempted for ordinary rules, durable for budget and `verify_after` decisions. Some refusals produce no row. |
 | [Byte-identical replay](#byte-identical-replay) | One write path only: content-addressed S3/UniForm. Elsewhere, recorded when available. |
 | [Rollback after a bad apply](#rollback-after-a-bad-apply) | No automatic restoration. Rocky halts; recovery is yours. |
 | [Grain and uniqueness](#grain-and-uniqueness) | Test-time assertion, not enforced at build |
@@ -149,9 +149,11 @@ demand: `engine/crates/rocky-core/src/schedule/demand.rs`. Run-time check:
 ## Human review of AI-authored plans
 
 **Rocky-guaranteed: enforced at apply, as a floor.** A plan proposed by an agent is marked
-AI-authored. `rocky apply` refuses to execute it until a human runs
-`rocky review <plan-id> --approve`, which writes an approval marker next to
-the plan. Three properties of that gate, as it ships today:
+AI-authored. `rocky apply` refuses to execute it unless an approval marker is
+present that parses and names that exact plan. `rocky review <plan-id> --approve`
+is the command that writes that marker. What apply enforces is the marker check,
+not the identity of the approver. Three properties of that gate, as it ships
+today:
 
 - **It is a floor.** The marker check runs on every AI-authored apply,
   whatever your `[policy]` rules say. A policy `allow` cannot waive it; a
@@ -180,12 +182,15 @@ three gates".
 ## Audit ledger
 
 **Rocky recording: attempted for ordinary rules, durable for the two gating kinds.**
-Policy-decision recording is best-effort for ordinary rules: at a mutating
-seam (`rocky apply`, promote), Rocky writes each decision to a
-`policy_decisions` table in the embedded redb state store, and when that
-write fails it warns and continues. Decisions relevant to an autonomy
-budget or to `verify_after` are durable instead: when they cannot be
-persisted, the apply fails closed. `rocky audit` lists the decisions.
+Policy-decision recording is best-effort for ordinary rules. At a mutating seam
+— `rocky apply` and promote, plus the `draft_*` and `propose` tools, which run
+the same evaluator into the same sink — Rocky writes each evaluated decision to
+a `policy_decisions` table in the embedded redb state store, and when that write
+fails it warns and continues. Some refusals never reach the table at all,
+because the gate can return a verdict before any rule is evaluated. Decisions
+relevant to an autonomy budget or to `verify_after` are durable instead: when
+they cannot be persisted, the apply fails closed. Treat the ledger as a
+best-effort record rather than proof that a decision happened. `rocky audit` lists the decisions.
 `rocky audit --for <table|run|plan>` assembles the custody chain for one
 subject: who proposed, what policy decided, what the plan changed, which runs
 materialized it, and what verification found. A link with no recorded signal
