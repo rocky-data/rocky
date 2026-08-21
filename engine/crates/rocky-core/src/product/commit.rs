@@ -1211,13 +1211,9 @@ fn run_phase_b_with_ops(
 /// [`demote_merged_manifest_to_phase_a`], which is `pub(crate)` and
 /// unreachable from any other crate (pinned by the out-of-crate
 /// compile-fail proof in `rocky-core-compiletest`). This is the only
-/// public way in, and it demands the loop's compare-and-swapped record —
-/// which it READS from `store` rather than accepting as an argument. A
-/// [`FulfillStateRecord`] is publicly constructible, so a
-/// caller-supplied one would be a permission slip the caller writes
-/// itself; reading the store makes the claim answerable only by the
-/// record that actually won the CAS. Every condition below is checked
-/// against that stored record:
+/// public way in, and it reads the decision out of `store` rather than
+/// taking it as an argument. Every condition below is checked against
+/// that stored record:
 ///
 /// - the record is THIS product's (`product_id` matches the spec), so a
 ///   record fetched for another product grants nothing here;
@@ -1228,16 +1224,27 @@ fn run_phase_b_with_ops(
 /// - the owner stamp names THIS process. Stamping it means winning the
 ///   record's CAS, which is what "the loop decided" reduces to on disk.
 ///
-/// # What the owner stamp does and does not prove
+/// # Exactly what this gate is worth
 ///
-/// It proves the caller is the process that holds the record — a
-/// concurrent `rocky product …` process carries a different pid and is
-/// refused. It is not an authentication: the stamp is reuse-proofed by
-/// the ownership probe the loop runs at acquire time (which pairs the
-/// pid with the owner's start time), not by this check, and a hostile
-/// local process that can write the state store can write any record it
-/// likes — the v0 threat model concedes that adversary outright. This
-/// gate closes OUR surface area, not that one.
+/// It prevents a demotion the loop did not decide: an accidental one, or
+/// one from another code path in this binary that reaches for the
+/// transition without a round behind it. That is the failure it exists
+/// for, and it holds — the conditions are answered by persisted state,
+/// not by anything the caller says about itself.
+///
+/// It is NOT a defense against a deliberate in-process caller. `store`
+/// is a caller-chosen [`StateStore`], and opening one at an arbitrary
+/// path and writing a record into it are both public operations, so code
+/// running inside this process can construct a store that satisfies
+/// every condition. Nothing in-process can prevent that: such a caller
+/// already holds every capability the process holds, including simply
+/// rewriting the files this function would have written. It is outside
+/// the boundary, not a hole in it.
+///
+/// The owner check pairs the pid with the process start time
+/// ([`crate::process::stamp_is_this_process`]), so a dead owner's
+/// recycled pid is not mistaken for ours, and an unconfirmable stamp
+/// fails closed.
 ///
 /// # Errors
 ///
@@ -1292,14 +1299,15 @@ pub fn reopen_for_drafting(
             decided.state.tag()
         )));
     }
-    let me = std::process::id();
-    if decided.owner_pid != Some(me) {
+    if !crate::process::stamp_is_this_process(decided.owner_pid, decided.owner_start_time) {
+        let me = std::process::id();
         let owner = decided
             .owner_pid
             .map(|pid| format!("pid {pid}"))
             .unwrap_or_else(|| "no one".to_string());
         return Err(undecided(format!(
-            "the record is owned by {owner}, not this process (pid {me})"
+            "the record is owned by {owner}, not this process (pid {me}); a stamp whose \
+             process start time does not match is a dead owner's, not ours"
         )));
     }
     demote_merged_manifest_to_phase_a(project_root, spec_path, parsed)
@@ -1818,6 +1826,9 @@ mod tests {
 
     /// The record a loop that DECIDED a drafting round leaves on disk:
     /// this product, at `drafting`, owner stamp = this process.
+    ///
+    /// The stamp carries this process's REAL start time, because the
+    /// gate pairs the pid with it — a pid alone no longer passes.
     fn decided_record(parsed: &ParsedSpec) -> FulfillStateRecord {
         let mut record = FulfillStateRecord::new(
             FulfillState::Drafting,
@@ -1825,7 +1836,13 @@ mod tests {
             Some(parsed.digest.clone()),
             None,
         );
-        record.owner_pid = Some(std::process::id());
+        let pid = std::process::id();
+        record.owner_pid = Some(pid);
+        record.owner_start_time = Some(
+            crate::process::process_liveness(pid)
+                .expect("probe this process")
+                .expect("this process is alive"),
+        );
         record
     }
 
@@ -1903,7 +1920,7 @@ mod tests {
     fn the_reopen_refuses_every_record_that_is_not_the_loops_decision() {
         // Each case removes exactly ONE element of the decision, so a
         // passing case cannot be carried by the others.
-        let cases: [UndecidedCase; 4] = [
+        let cases: [UndecidedCase; 6] = [
             (
                 "no owner stamp at all — nobody won the record's CAS",
                 |parsed: &ParsedSpec| {
@@ -1921,6 +1938,24 @@ mod tests {
                     record
                 },
                 "not this process",
+            ),
+            (
+                "OUR pid, but a dead owner's start time — a recycled pid",
+                |parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.owner_start_time = Some(1);
+                    record
+                },
+                "process start time does not match",
+            ),
+            (
+                "our pid with NO recorded start time — unconfirmable, so not ours",
+                |parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.owner_start_time = None;
+                    record
+                },
+                "process start time does not match",
             ),
             (
                 "the loop is not in a drafting round",

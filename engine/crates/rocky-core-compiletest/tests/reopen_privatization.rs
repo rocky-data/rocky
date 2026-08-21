@@ -1,8 +1,22 @@
 //! The structural half of the drafting-window reopen gate (#1493):
 //! `rocky-core`'s raw manifest demotion is `pub(crate)` and cannot be named
-//! from outside the crate, so the ONLY way to reopen a drafting window is the
-//! evidence-gated [`reopen_for_drafting`], which demands the fulfillment
-//! loop's compare-and-swapped record.
+//! from outside the crate, so the only way in from another crate is
+//! `reopen_for_drafting`, which reads its evidence from a state store.
+//!
+//! # What this proves, exactly
+//!
+//! Two things, both structural: the raw demotion is not nameable out-of-crate,
+//! and the public entry takes a `&StateStore` — it reads the decision rather
+//! than accepting one as an argument.
+//!
+//! It does NOT prove provenance. The store is chosen by the caller, and opening
+//! one at an arbitrary path and writing a record into it are both public
+//! operations, so code running inside this process can build a store that
+//! satisfies the gate. That is not a hole: an in-process caller already holds
+//! every capability the process holds. The gate stops a demotion the loop did
+//! not decide — accidental, or from another code path — and these tests pin the
+//! shape that makes that true. Nothing here is a claim about a deliberate
+//! in-process actor.
 //!
 //! Proof shape — one out-of-crate compile, keyed on the stable error CODE
 //! (`E0603`, "item is private"), never on version-specific diagnostic prose.
@@ -55,13 +69,16 @@ const PRIVATE_TRANSITIONS: [&str; 1] = ["demote_merged_manifest_to_phase_a"];
 /// evidence parameter is a `&StateStore` — the store it reads the decision
 /// from — and NOT a `&FulfillStateRecord`.
 ///
-/// That distinction is the whole gate. `FulfillStateRecord` has public fields
-/// and a public constructor, so a version of this entry that ACCEPTED one would
-/// let any caller mint its own permission slip: build a record at `Drafting`
-/// with the current pid, hand it in, demote a merged generation without ever
-/// winning a state-store CAS. Taking the store instead makes the claim
-/// answerable only by what is actually persisted. Swapping the parameter back
-/// to a record is a type error here, not a silently passing test.
+/// The distinction matters. `FulfillStateRecord` has public fields and a public
+/// constructor, so a version of this entry that ACCEPTED one would let ANY
+/// caller — including an ordinary code path with no ill intent — build a record
+/// at `Drafting` carrying the current pid and demote a merged generation
+/// without a round behind it. Taking the store makes the conditions answerable
+/// by persisted state instead. Swapping the parameter back to a record is a
+/// type error here, not a silently passing test.
+///
+/// This pins the parameter's TYPE. It says nothing about where the store came
+/// from — see the module docs on what is and is not proved.
 ///
 /// Naming `rocky_core` also keeps the dependency edge live for `cargo-machete`;
 /// that edge is what co-locates the rlib the negative test discovers.

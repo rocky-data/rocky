@@ -834,18 +834,7 @@ pub fn run_product_verify(config_path: &Path, product_name: &str, output_json: b
 /// read as the owner. A stamp whose start time we cannot confirm is
 /// NOT ours — the guard fails closed and refuses.
 fn stamp_belongs_to_this_process(record: &FulfillStateRecord) -> bool {
-    let Some(pid) = record.owner_pid else {
-        return false;
-    };
-    if pid != std::process::id() {
-        return false;
-    }
-    // Same pid: only OUR start time proves it is the same process.
-    match rocky_core::process::process_liveness(pid) {
-        Ok(Some(start_time)) => record.owner_start_time == Some(start_time),
-        // The probe failed or found nothing. Unknown is not "mine".
-        Ok(None) | Err(_) => false,
-    }
+    rocky_core::process::stamp_is_this_process(record.owner_pid, record.owner_start_time)
 }
 
 /// The inner compile: verify, then run the next lowering phase through

@@ -107,3 +107,29 @@ fn imp_process_liveness(pid: u32) -> Result<Option<u64>, String> {
     let _ = pid;
     Err("no process start-time probe exists for this platform".to_string())
 }
+
+/// Does an `(owner_pid, owner_start_time)` stamp name THIS process?
+///
+/// The one definition of "this record is mine", shared by every gate
+/// that needs it, so the gates cannot drift apart.
+///
+/// Both halves are required. A pid alone is not an identity: a process
+/// that dies leaves its stamp behind, and the operating system will
+/// eventually hand that number to something unrelated. Pairing it with
+/// the start time this module reads makes the answer reuse-proof.
+///
+/// Fails CLOSED. A stamp with no pid, no recorded start time, or one
+/// whose start time cannot be confirmed is not ours — "unknown" is
+/// never "mine".
+pub fn stamp_is_this_process(owner_pid: Option<u32>, owner_start_time: Option<u64>) -> bool {
+    let Some(pid) = owner_pid else {
+        return false;
+    };
+    if pid != std::process::id() {
+        return false;
+    }
+    match process_liveness(pid) {
+        Ok(Some(start_time)) => owner_start_time == Some(start_time),
+        Ok(None) | Err(_) => false,
+    }
+}
