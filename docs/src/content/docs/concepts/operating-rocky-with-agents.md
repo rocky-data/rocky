@@ -185,8 +185,9 @@ safe direction.
 fulfillment loop runs its drafting agent in a separate process group, and kills
 the whole group when the task ends. A descendant that calls `setsid` and then
 forks twice is re-parented by the operating system, and survives that kill. A
-test pins this behaviour so it cannot quietly become a claim. Sandboxing at the
-operating-system level is the planned fix. Tracked in
+test exhibits that escape, so the limit cannot quietly turn into a false
+guarantee. Sandboxing at the operating-system level is the planned fix. Tracked
+in
 [#1491](https://github.com/rocky-data/rocky/issues/1491).
 
 **A directory swapped mid-write is still a race.** The fulfillment loop commits
