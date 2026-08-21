@@ -65,6 +65,9 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_core::config::RockyConfig",
     "rocky_core::config::load_rocky_config",
     // The state vocabulary + the CAS store (WP-E1's tables).
+    // `DraftingRound` is the PERSISTED drafting-round identity (#1493):
+    // a resume dispatches the round the machine decided, not a default.
+    "rocky_core::fulfill::DraftingRound",
     "rocky_core::fulfill::FulfillCas",
     "rocky_core::fulfill::FulfillJournalRow",
     "rocky_core::fulfill::FulfillState",

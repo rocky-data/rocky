@@ -113,6 +113,34 @@ impl FulfillState {
     }
 }
 
+/// Which drafting round a dispatch is: the first pass at the model, or a
+/// repair of a red verification (#1493).
+///
+/// The two rounds hand the worker a different brief and a different
+/// budget, so a resume must dispatch the one the machine decided. The
+/// `Default` is [`Self::Draft`], which is what a record written before
+/// this field existed deserializes to — the pre-existing behaviour, so
+/// an upgrade never changes a running product's round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftingRound {
+    /// The first drafting pass for this generation.
+    #[default]
+    Draft,
+    /// A repair pass after the verify bundle came back red.
+    Repair,
+}
+
+impl DraftingRound {
+    /// The stable tag (journal text, refusal messages).
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Repair => "repair",
+        }
+    }
+}
+
 /// The current fulfillment record of one product (key `product:<name>`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FulfillStateRecord {
@@ -150,6 +178,23 @@ pub struct FulfillStateRecord {
     /// Verify-red → repair-drafting cycles consumed.
     #[serde(default)]
     pub repair_rounds: u32,
+    /// Which drafting round the machine dispatched into the CURRENT
+    /// drafting window (#1493).
+    ///
+    /// Persisted because a resume reads the record, not the decision
+    /// that produced it: a crash after the repair transition commits but
+    /// before the worker is dispatched would otherwise re-enter as a
+    /// plain draft, handing the worker the drafting brief and the
+    /// drafting budget for a round the machine decided was a repair.
+    ///
+    /// It is NOT derivable from [`Self::repair_rounds`]: that counter
+    /// survives the supersession and re-approval paths, so a fresh
+    /// generation's FIRST draft can legitimately carry a non-zero count.
+    ///
+    /// Meaningful only while the state is
+    /// [`FulfillState::Drafting`]; every dispatch rewrites it.
+    #[serde(default)]
+    pub drafting_round: DraftingRound,
     /// The loop process currently driving this product. `None` = the
     /// record is released (every clean stop clears it); a stamp that
     /// outlives its process is what the takeover probe detects.
@@ -192,6 +237,7 @@ impl FulfillStateRecord {
             idempotency_key: None,
             drafting_attempts: 0,
             repair_rounds: 0,
+            drafting_round: DraftingRound::Draft,
             owner_pid: None,
             owner_start_time: None,
             driver_pgid: None,
