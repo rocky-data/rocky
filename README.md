@@ -251,6 +251,8 @@ You write one spec file. `products/<name>.toml` states what the product must be:
           │                          addressed by its digest
           ├── rocky product compile  one phase per call: renders the
           │                          contract, or merges the sidecar
+          │                          (grain, non-null columns and checks
+          │                          become declarative [[tests]])
           │
           └── rocky fulfill <name>   drives these verbs, and the drafting
                                      agent between them. Stops at each gate
