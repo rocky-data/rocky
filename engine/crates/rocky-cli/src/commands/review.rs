@@ -12,8 +12,10 @@
 //! 3. Without `--approve`: report the findings (dry run); the plan stays
 //!    blocked.
 //! 4. With `--approve`: write a review marker at
-//!    `<root>/.rocky/plans/<plan_id>.reviewed.json`. The marker is the human
-//!    sign-off; `rocky apply` checks for its presence before executing.
+//!    `<root>/.rocky/plans/<plan_id>.reviewed.json`. `rocky apply` checks the
+//!    marker's CONTENTS before executing, not just its presence: it must parse
+//!    and name that exact plan. The marker is unsigned, so it records that an
+//!    approval was made on this machine, not who made it.
 //!
 //! The marker is written even when breaking changes exist — the human
 //! approving has seen the report and is explicitly signing off on them. The
