@@ -97,8 +97,13 @@ touches a production table. `rocky branch approve` writes an artifact under
 `.rocky/approvals/<branch>/`.
 
 The gate that reads those artifacts is off by default. Set
-`[branch.approval] required = true` to turn it on. With it off, `branch
-promote` does not read the directory at all. With it on, promotion loads every
+`[branch.approval] required = true` to turn it on. With it off, the promote
+path does not read the directory at all.
+
+With it on, the gate runs when the promote plan is built. That is `rocky plan
+promote`, and bare `rocky branch promote <name>`, which builds a plan first.
+Applying a promote plan that already exists does not repeat the check, so the
+approvals are the ones that were valid at plan time. The gate loads every
 artifact for the branch and counts the valid ones against `min_approvers`. An
 artifact is valid when its blake3 digest still matches its own contents, its
 recorded branch state hash matches the branch now, and it is not older than
