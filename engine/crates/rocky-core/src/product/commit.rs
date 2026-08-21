@@ -994,9 +994,33 @@ pub fn recover_generation(project_root: &Path, parsed: &ParsedSpec) -> SpecResul
             }
             continue;
         }
-        if prev.exists() {
+        // The JOURNAL decides whether a backup should exist — not the
+        // filesystem. This record is documented as "filesystem-mutation
+        // authority" at recovery time, and restoring on `prev.exists()`
+        // alone contradicted that: a partial `.ff-prev` left by an earlier
+        // failed attempt would be renamed over the final, undoing a commit
+        // the journal never recorded a backup for (#1502).
+        if entry.has_prev && prev.exists() {
             std::fs::rename(&prev, final_path)
                 .map_err(|err| io_reject("restoring", final_path, &err))?;
+        } else if !entry.has_prev && prev.exists() {
+            // A backup the journal does not know about. Refusing is the
+            // conservative half of the trade this module already made: the
+            // producer deliberately leaves a failed backup in place rather
+            // than unlink under a race, so recovery must not treat one as
+            // trustworthy content. Nothing is deleted here either — the
+            // operator is told what to look at.
+            return Err(SpecRejected::new(
+                "commit-unexpected-backup",
+                format!(
+                    "{} exists but the staging journal records no backup for {}. \
+                     Recovery will not restore a backup it did not create. \
+                     Inspect that file and remove it once you have confirmed \
+                     it is not needed, then re-run.",
+                    prev.display(),
+                    final_path.display()
+                ),
+            ));
         } else if !entry.has_prev
             && final_path.is_file()
             && std::fs::read(final_path)
@@ -1464,6 +1488,58 @@ mod tests {
         assert_eq!(without_orphans(snapshot(&project)), before);
         run_phase_b(&project, SPEC_PATH, &parsed).expect("restages cleanly");
         assert_eq!(committed(&project).phase, ManifestPhase::Merged);
+    }
+
+    /// Recovery must not restore a backup the journal never recorded.
+    ///
+    /// The producer deliberately leaves a failed `.ff-prev` in place rather
+    /// than unlink it under a race (#1482's review rejected both a plain and
+    /// an inode-checked unlink). So an orphan from an earlier failed attempt
+    /// can sit next to a final whose journal entry says `has_prev: false`.
+    /// Renaming it over the final would undo a commit using content the
+    /// journal never vouched for (#1502).
+    #[test]
+    fn recovery_refuses_a_backup_the_journal_does_not_know_about() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        let models = project.join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+
+        // A committed final, and beside it an orphan `.ff-prev` — the shape a
+        // failed backup write leaves, since the producer deliberately does
+        // not unlink under a race (#1482).
+        let final_path = models.join("revenue_daily.contract.toml");
+        write_file(&final_path, b"the committed contract");
+        let orphan = prev_sibling(&final_path);
+        write_file(&orphan, b"orphan bytes from a failed earlier attempt");
+
+        // A journal that records NO backup for that final.
+        write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[serde_json::json!({
+                "final": "models/revenue_daily.contract.toml",
+                "staged_sha": content_digest(b"the committed contract"),
+                "has_prev": false,
+            })]),
+        );
+
+        let error = recover_generation(&project, &parsed_d3())
+            .expect_err("an unrecorded backup must refuse recovery");
+        assert_eq!(error.code, "commit-unexpected-backup");
+
+        // Nothing restored, nothing deleted: the final keeps its own bytes
+        // and the orphan is left for the operator to inspect.
+        assert_eq!(
+            std::fs::read(&final_path).expect("final intact"),
+            b"the committed contract",
+            "the orphan must not have been renamed over the final"
+        );
+        assert_eq!(
+            std::fs::read(&orphan).expect("orphan intact"),
+            b"orphan bytes from a failed earlier attempt",
+            "recovery must not delete a file it did not create"
+        );
     }
 
     #[test]
