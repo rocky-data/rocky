@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`[rules] no_new_nullable` is now enforced.** The rule parsed since it was introduced and ran nowhere — the product lowering layer knew, and refused to emit the key precisely because "the engine parses that rule and enforces it nowhere, so emitting it would promise a guard that does not run." A nullable output column the contract does not declare in `[[columns]]` is now an error (**E014**). Setting the rule with no `[[columns]]` is also E014: without a declared baseline, "new" has no meaning, and refusing beats the two silent readings (every nullable column is new, or none is). **Enforcement is opt-in** — `no_new_nullable` defaults to false, so this can only fail a project that explicitly asked for the guard. (#1467)
+
 ### Fixed
 
 - **`rocky run --watch` and `rocky watch` now honour SIGINT reliably, and honour SIGTERM at all.** Both loops built a fresh `tokio::signal::ctrl_c()` future on every iteration. When the file-change arm won, that future was dropped — and tokio discards a signal that arrives while no listener is registered. Between the debounce window and the inner run registering its own handler, a Ctrl-C was therefore both ignored *and* non-fatal, because tokio had already replaced the default disposition; the watcher kept running and a second Ctrl-C was needed. The registration is now built once, before the first iteration, and never dropped. Separately, neither loop had a SIGTERM arm at all, so after the first run the watcher could not be stopped by `timeout`, a CI job cancellation, or a container eviction — only by SIGKILL. Both now stop cleanly on either signal. (#1405)

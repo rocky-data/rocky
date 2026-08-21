@@ -115,8 +115,15 @@ pub fn sql_rel(parsed: &ParsedSpec) -> String {
 /// and `[rules] required` lists EVERY declared column (the grain is a
 /// subset of it).
 ///
-/// Never `no_new_nullable`: the engine parses that rule and enforces it
-/// nowhere, so emitting it would promise a guard that does not run.
+/// Never `no_new_nullable` — but the reason has changed. It used to be that
+/// the engine parsed the rule and enforced it nowhere, so emitting it would
+/// promise a guard that does not run. It IS enforced now (E014, #1467).
+///
+/// It stays off this list because emitting it is a product-layer decision
+/// nobody has taken: a generated contract that sets it would make every
+/// undeclared nullable column in a lowered model an error, and whether that
+/// is the right default for generated contracts is not this function's call.
+/// Turning it on is now a real option rather than a false promise.
 pub fn render_contract(parsed: &ParsedSpec) -> Vec<u8> {
     let product = parsed.product();
     let mut lines: Vec<String> = vec![
@@ -965,8 +972,10 @@ mod tests {
 
     #[test]
     fn the_contract_never_emits_the_inert_surfaces() {
-        // The never-emit list: the contract must not dress inert engine
-        // surfaces up as enforcement.
+        // The never-emit list. `no_new_nullable` is no longer inert (E014,
+        // #1467) — it stays here because emitting it is an unmade
+        // product-layer decision, not because it would be a false promise.
+        // The others are still inert engine surfaces.
         let contract = String::from_utf8(render_contract(&parsed_d3())).expect("utf-8");
         for inert in [
             "no_new_nullable",
