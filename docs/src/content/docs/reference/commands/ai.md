@@ -381,19 +381,20 @@ What leaves your machine is bounded: warehouse queries go to your warehouse; the
 The server **never materializes anything**. No tool runs SQL that changes your warehouse. An agent can write project files and record a plan. One tool, `review_queue`, can also write the approval marker for a plan that is already in the pending review queue.
 
 ```
-   agent, through rocky mcp                human
-   ────────────────────────                ──────────────────────────
+   through rocky mcp                       through the CLI
+   ─────────────────                       ───────────────
    draft_model     ──writes──► models/<name>.sql + sidecar
    draft_contract  ──writes──► models/<model>.contract.toml
    draft_check     ──writes──► [[tests]] in the sidecar
         │
         ▼
    propose         ──writes──► .rocky/plans/<plan-id>.json
-        │
-        │ review_queue, with confirm: true, writes the
-        │ marker for a plan already in the pending queue
-        ▼
+                                        │
+                                        ▼
                               rocky review <plan-id> --approve
+                              writes the approval marker. The
+                              review_queue MCP tool writes it
+                              too, with confirm: true.
                                         │
                                         ▼
                               rocky apply <plan-id> ──► warehouse
