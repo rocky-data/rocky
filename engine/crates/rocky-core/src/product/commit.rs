@@ -1542,6 +1542,60 @@ mod tests {
         );
     }
 
+    /// The refusal must be a PAUSE, not a dead end.
+    ///
+    /// `recover_generation` refuses mid-loop, so entries handled before the
+    /// orphan may already be rolled back when it returns — the tree is left
+    /// partially restored. That is only acceptable if the operator can act
+    /// on the message and finish the job, so this asserts the whole
+    /// sequence: refuse, clear the named file, re-run, complete.
+    ///
+    /// The journal is removed only AFTER the loop, which is what makes the
+    /// re-run possible.
+    #[test]
+    fn the_unexpected_backup_refusal_is_recoverable_by_re_running() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        let models = project.join("models");
+        std::fs::create_dir_all(&models).expect("mkdir");
+
+        let final_path = models.join("revenue_daily.contract.toml");
+        write_file(&final_path, b"the committed contract");
+        let orphan = prev_sibling(&final_path);
+        write_file(&orphan, b"orphan bytes from a failed earlier attempt");
+
+        write_journal(
+            &project,
+            "revenue_daily",
+            &forged_journal_payload(&[serde_json::json!({
+                "final": "models/revenue_daily.contract.toml",
+                "staged_sha": content_digest(b"the committed contract"),
+                "has_prev": false,
+            })]),
+        );
+
+        let error = recover_generation(&project, &parsed_d3()).expect_err("refuses on the orphan");
+        assert_eq!(error.code, "commit-unexpected-backup");
+
+        // The journal survives the refusal — without it the operator would
+        // be stranded, because recovery would then report "nothing to do".
+        assert!(
+            journal_path(&project, "revenue_daily").is_file(),
+            "the journal must survive a refusal or the rollback cannot be finished"
+        );
+
+        // The operator does what the message says.
+        std::fs::remove_file(&orphan).expect("operator clears the named file");
+
+        // And the re-run completes.
+        let action = recover_generation(&project, &parsed_d3()).expect("re-run completes");
+        assert_eq!(action, RecoveryAction::RolledBack);
+        assert!(
+            !journal_path(&project, "revenue_daily").exists(),
+            "a completed recovery consumes its journal"
+        );
+    }
+
     #[test]
     fn recovery_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
