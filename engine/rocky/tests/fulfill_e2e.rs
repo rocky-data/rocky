@@ -843,6 +843,113 @@ fn tamper_before_the_reopen_blocks_at_the_reopen() {
     assert_eq!(blocked_row.from_state.as_deref(), Some("drafting"));
 }
 
+/// Transcript file names by task kind — the driver writes
+/// `<stamp>-<kind>.log`, so this reports which ROUND actually reached a
+/// worker, independent of anything the loop says about itself.
+fn transcript_kinds(dir: &Path) -> Vec<String> {
+    let transcripts = dir
+        .join(".rocky/fulfillment")
+        .join(PRODUCT)
+        .join("transcripts");
+    let mut kinds: Vec<String> = std::fs::read_dir(&transcripts)
+        .expect("transcripts dir")
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_suffix(".log")
+                .and_then(|stem| stem.rsplit_once('-'))
+                .map(|(_, kind)| kind.to_string())
+        })
+        .collect();
+    kinds.sort();
+    kinds
+}
+
+/// #1493 (F2): the repair transition compare-and-swaps `drafting` and
+/// THEN dispatches its worker. A crash in between must resume as the
+/// same round — the repair brief and the repair budget — not silently
+/// downgrade to a plain draft.
+///
+/// The observable is which transcript the resumed round writes, because
+/// the driver names it after the task kind it was handed. Before the
+/// fix the resume produced a SECOND `drafting` transcript and no
+/// `repair` one.
+#[test]
+fn a_crash_between_the_repair_cas_and_its_worker_resumes_as_a_repair() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_repair(BAD_DRAFT_SQL, DRAFT_SQL));
+
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+    let (code, _j, _o, e) = rocky(dir, &["fulfill", "approve-spec", PRODUCT]);
+    assert_eq!(code, 0, "{e}");
+
+    // Crash after the repair transition is journaled, BEFORE the reopen
+    // and before any repair worker is dispatched.
+    let (code, _j, _o, _e) = rocky_env(
+        dir,
+        &["fulfill", PRODUCT],
+        &[("ROCKY_FULFILL_FAULT", "pre-repair-reopen")],
+    );
+    assert_ne!(code, 0, "the fault aborts the process");
+    assert_eq!(
+        transcript_kinds(dir),
+        vec!["drafting", "elicitation"],
+        "the crash lands before the repair worker runs"
+    );
+
+    // The record on disk carries the DECIDED round, which is the whole
+    // point: the resume reads this, not the decision that produced it.
+    {
+        let store = state_store(dir);
+        let record = store
+            .fulfill_state_get(PRODUCT)
+            .expect("reads")
+            .expect("recorded");
+        assert_eq!(record.state.tag(), "drafting");
+        assert_eq!(
+            record.drafting_round,
+            rocky_core::fulfill::DraftingRound::Repair,
+            "the repair transition must persist its round"
+        );
+    }
+
+    // Resume: the reopen runs, and the round dispatched is the REPAIR
+    // one — so the recorded repair SQL lands and the loop converges.
+    let (code, json, _o, e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "the resumed repair must converge: {e}");
+    let json = json.expect("json");
+    assert_eq!(json["state"], "needs_input", "{json}");
+
+    assert_eq!(
+        transcript_kinds(dir),
+        vec!["drafting", "elicitation", "repair"],
+        "the resumed round wrote a REPAIR transcript — a second 'drafting' \
+         one would mean the round was downgraded"
+    );
+
+    // And the budget it consumed is the repair one: still exactly one
+    // repair round, never re-counted by the resume.
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.event.starts_with("repair round"))
+            .count(),
+        1,
+        "the resume continues the decided round, it does not open a new one: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.event.starts_with("repair attempt")),
+        "the resumed dispatch is journaled as a repair: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.to_state == "blocked"),
+        "nothing blocks: {rows:?}"
+    );
+}
+
 /// A repair that never turns the verify green exhausts
 /// MAX_REPAIR_ROUNDS and blocks on the BUDGET — a plain red, never a
 /// tamper claim, with each round's reopen + re-merge journaled.
