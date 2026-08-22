@@ -207,19 +207,33 @@ fn mark_connect_failed(result: &mut conformance::ConformanceResult, reason: &str
     let Some(connect_test) = result.results.first_mut() else {
         return;
     };
-    match connect_test.status {
-        conformance::TestStatus::Passed => {
-            result.tests_passed = result.tests_passed.saturating_sub(1);
-        }
-        conformance::TestStatus::Skipped => {
-            result.tests_skipped = result.tests_skipped.saturating_sub(1);
-        }
-        // Already counted as a failure; do not double-count.
-        conformance::TestStatus::Failed => {}
-    }
     connect_test.status = conformance::TestStatus::Failed;
     connect_test.message = Some(reason.to_string());
-    result.tests_failed += 1;
+
+    // RECOUNT from the results, rather than patching deltas.
+    //
+    // Delta-patching is what produced the underflow this function was
+    // extracted to fix, and it had a second bug of the same family: the
+    // `Failed` arm carried a comment saying "already counted, do not
+    // double-count" while `tests_failed += 1` ran unconditionally below it,
+    // so overriding an already-failed spec counted it twice. Recounting
+    // makes every prior status correct by construction and removes the class
+    // rather than the instance.
+    result.tests_passed = result
+        .results
+        .iter()
+        .filter(|r| r.status == conformance::TestStatus::Passed)
+        .count();
+    result.tests_failed = result
+        .results
+        .iter()
+        .filter(|r| r.status == conformance::TestStatus::Failed)
+        .count();
+    result.tests_skipped = result
+        .results
+        .iter()
+        .filter(|r| r.status == conformance::TestStatus::Skipped)
+        .count();
     result.tests_run = result.tests_passed + result.tests_failed;
 }
 
@@ -227,6 +241,42 @@ fn mark_connect_failed(result: &mut conformance::ConformanceResult, reason: &str
 mod tests {
     use rocky_adapter_sdk::conformance::{self, TestStatus};
     use rocky_adapter_sdk::{AdapterCapabilities, AdapterManifest};
+
+    /// Overriding a spec that ALREADY failed must not count it twice.
+    ///
+    /// The delta-patching version had a `Failed` arm commented "already
+    /// counted, do not double-count" — while `tests_failed += 1` ran
+    /// unconditionally below it. Unreachable today (the first spec always
+    /// skips), so it was a latent defect whose comment claimed the opposite
+    /// of the code. Recounting from `results` makes it correct by
+    /// construction; this pins that.
+    #[test]
+    fn overriding_an_already_failed_connect_counts_it_once() {
+        let manifest = AdapterManifest {
+            name: "probe".into(),
+            version: "0".into(),
+            sdk_version: rocky_adapter_sdk::SDK_VERSION.into(),
+            dialect: "unknown".into(),
+            capabilities: AdapterCapabilities::warehouse_only(),
+            auth_methods: vec![],
+            config_schema: serde_json::Value::Null,
+        };
+        let mut result = conformance::run_conformance(&manifest, None);
+
+        // Force the state the dead arm was written for.
+        result.results[0].status = TestStatus::Failed;
+        super::mark_connect_failed(&mut result, "failed to initialize: probe");
+
+        assert_eq!(
+            result.tests_failed, 1,
+            "an already-failed spec must count once, not twice"
+        );
+        assert_eq!(
+            result.tests_passed + result.tests_failed + result.tests_skipped,
+            result.results.len(),
+            "every result counted exactly once"
+        );
+    }
 
     /// The init-failure path must not underflow its counters.
     ///
@@ -271,10 +321,18 @@ mod tests {
             skipped_before - 1,
             "the skipped count must lose the test that became a failure"
         );
-        assert!(
-            result.tests_run <= result.results.len(),
-            "tests_run underflowed: {}",
-            result.tests_run
+        // The accounting IDENTITY, not a bound. `tests_run <= results.len()`
+        // was satisfied in release by a wrapped `usize::MAX + 1 == 0`, so it
+        // could not see the underflow it was written for.
+        assert_eq!(
+            result.tests_passed + result.tests_failed + result.tests_skipped,
+            result.results.len(),
+            "every result must be counted exactly once"
+        );
+        assert_eq!(
+            result.tests_run,
+            result.tests_passed + result.tests_failed,
+            "tests_run counts real work: passed + failed"
         );
     }
 }
