@@ -146,8 +146,10 @@ An AI agent can author a plan. A bare `rocky apply` refuses to execute one. It
 runs the plan only when a marker file is present that parses and names that
 exact plan. `rocky review <plan-id> --approve` writes that marker.
 
-That check is a floor. It runs on every AI-authored apply whatever your
-`[policy]` block says, so an `allow` rule cannot waive it. A `[policy]` rule can
+That check is a floor, since engine v1.71.0. It runs on every AI-authored
+apply whatever your `[policy]` block says, so an `allow` rule cannot waive it.
+On v1.70.1 and earlier the marker was checked only when no `[policy]` block was
+configured, so a rule could let an agent-authored plan through unreviewed. A `[policy]` rule can
 only add restrictions on top. Rocky evaluates every model the plan touches and
 takes the most restrictive answer. The policy gate runs first, so a `deny`
 refuses before the marker is read at all.

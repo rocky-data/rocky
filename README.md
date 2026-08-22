@@ -212,7 +212,7 @@ The diagram shows the gate at `rocky apply`. The MCP `draft` and `propose` tools
 A rule can also name checks that must pass in that run. If one fails, or never ran, Rocky stops and records the failure. It cannot undo the write: the change stays until a human reverts it.
 
 - **You write the rules.** A `[policy]` rule in `rocky.toml` says what each principal may do, and where. The answer is allow, require review, or deny. Set `max_downstreams` to cap how far one change may reach.
-- **An AI-written plan needs an approval marker.** `rocky apply` refuses an AI-authored plan unless a marker file is present that parses and names that exact plan. That check runs whatever your rules say, so an `allow` rule cannot waive it. The marker is not signed, so it records that an approval was made on this machine, not who made it.
+- **An AI-written plan needs an approval marker.** `rocky apply` refuses an AI-authored plan unless a marker file is present that parses and names that exact plan. That check runs whatever your rules say, so an `allow` rule cannot waive it — since engine v1.71.0; on earlier versions a rule could waive it. The marker is not signed, so it records that an approval was made on this machine, not who made it.
 - **You can test the rules.** `[[policy.tests]]` scenarios run through the real evaluator, so `rocky policy test` catches an edit that opens a hole.
 - **You can ask what happened.** `rocky audit --for <table>` says who changed what, and under whose authority. `rocky review --queue` ranks what waits on you.
 - **Agents connect over MCP.** `rocky mcp` exposes 31 tools. Seven can write. Five of those pass the same rules; `pause_schedule` and `review_queue` carry their own guards.
