@@ -262,7 +262,7 @@ You write one spec file. `products/<name>.toml` states what the product must be:
    Each verb also runs on its own, in any order you need.
 ```
 
-`rocky fulfill` runs the drafting agent as a subprocess. You choose the command in `[fulfill.driver]`. The worker sees only the environment variables you allowlist, and the whole task runs in one process group the loop kills when the task ends.
+`rocky fulfill` runs the drafting agent through the driver you set in `[fulfill.driver]`. There are two. The subprocess driver runs a command you choose: the worker sees only the environment variables you allowlist, and the whole task runs in one process group the loop kills when the task ends. The replay driver runs a recorded session against the worker-profile MCP server instead, which is what CI uses.
 
 Rocky ships a narrowed MCP surface for that worker. `rocky mcp --profile worker` serves the read and inspect tools, the compile and test loop, and two draft tools. It serves no other tools, and a tool added later stays out until someone adds it deliberately. The MCP prompts stay available in both profiles. Point your driver command at it. The engine does not force the command you configure to use it.
 

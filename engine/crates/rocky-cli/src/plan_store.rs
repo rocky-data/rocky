@@ -83,10 +83,12 @@ use serde::{Deserialize, Serialize};
 /// > structurally cannot observe an invalid shape.
 ///
 /// Persisting a value is not the same as replaying the check that validated it.
-/// `ReplicationPlan.config_snapshot` is the counterexample: it is written at
-/// plan time and no production apply-side code reads it, so a plan whose
-/// adapter or destination changed between plan and apply is not detected by it.
-/// Guards over *derived* state — discovery output, compiled models, live
+/// `ReplicationPlan.config_snapshot` WAS the counterexample: it was written at
+/// plan time and no production apply-side code read it, so a plan whose adapter
+/// or destination changed between plan and apply went undetected. #1460 closed
+/// that specific hole — apply now compares the snapshot whole — but the SHAPE
+/// is the lesson here, not the instance, and it recurred often enough to be
+/// worth stating. Guards over *derived* state — discovery output, compiled models, live
 /// warehouse shape — are likewise only re-established where that derivation
 /// repeats at apply.
 ///
