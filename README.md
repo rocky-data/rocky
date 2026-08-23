@@ -215,7 +215,7 @@ A rule can also name checks that must pass in that run. If one fails, or never r
 - **An AI-written plan needs an approval marker.** `rocky apply` refuses an AI-authored plan unless a marker file is present that parses and names that exact plan. That check runs whatever your rules say, so an `allow` rule cannot waive it — since engine v1.71.0; on earlier versions a rule could waive it. The marker is not signed, so it records that an approval was made on this machine, not who made it.
 - **You can test the rules.** `[[policy.tests]]` scenarios run through the real evaluator, so `rocky policy test` catches an edit that opens a hole.
 - **You can ask what happened.** `rocky audit --for <table>` says who changed what, and under whose authority. `rocky review --queue` ranks what waits on you.
-- **Agents connect over MCP.** `rocky mcp` exposes 31 tools. Seven can write. Five of those pass the same rules; `pause_schedule` and `review_queue` carry their own guards.
+- **Agents connect over MCP.** `rocky mcp` exposes 31 tools. Six can write: five pass the same rules, and `pause_schedule` carries its own guard. Writing the approval marker is not on that list — `review_queue` lists the queue but cannot sign anything off unless you start the server as `rocky mcp --profile approver`.
 
 <p align="center">
   <img src="docs/public/demo-policy-enforce.gif" alt="an agent's change to a contracted model is planned, rocky apply run as the agent principal is denied by the policy plane with the rule named, and rocky audit shows the recorded decision" width="900" />
@@ -264,7 +264,7 @@ You write one spec file. `products/<name>.toml` states what the product must be:
 
 `rocky fulfill` runs the drafting agent through the driver you set in `[fulfill.driver]`. There are two. The subprocess driver runs a command you choose: the worker sees only the environment variables you allowlist, and the whole task runs in one process group the loop kills when the task ends. The replay driver runs a recorded session against the worker-profile MCP server instead, which is what CI uses.
 
-Rocky ships a narrowed MCP surface for that worker. `rocky mcp --profile worker` serves the read and inspect tools, the compile and test loop, and two draft tools. It serves no other tools, and a tool added later stays out until someone adds it deliberately. The MCP prompts stay available in both profiles. Point your driver command at it. The engine does not force the command you configure to use it.
+Rocky ships a narrowed MCP surface for that worker. `rocky mcp --profile worker` serves the read and inspect tools, the compile and test loop, and two draft tools. It serves no other tools, and a tool added later stays out until someone adds it deliberately. The MCP prompts stay available in every profile. Point your driver command at it. The engine does not force the command you configure to use it.
 
 The runner then re-reads what the agent wrote from disk, re-verifies it, and hands it to the same governed `propose` as any other agent change.
 

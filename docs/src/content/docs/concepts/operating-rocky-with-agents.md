@@ -149,12 +149,28 @@ recorded, the ledger does not give you that today.
 `rocky apply` refuses to run one unless an approval marker is present that parses
 and names that exact plan. `rocky review <plan-id> --approve` writes that marker.
 
-One MCP tool can write it too. `review_queue` writes the marker when it is
-called with `approve_plan_id` and `confirm: true`. It refuses any plan that is
-not already in the pending review queue. The `confirm` flag is set by the
-caller, and Rocky does not check that a person set it. `rocky mcp --profile
-worker` does not serve `review_queue`, so a drafting worker on that profile has
-no tool that writes a marker.
+One MCP tool can write it too, but only if you ask for that when you start the
+server. `review_queue` writes the marker when it is called with
+`approve_plan_id` and `confirm: true` — and that call is served on one profile
+only:
+
+```
+rocky mcp                      lists the queue, REFUSES to approve
+rocky mcp --profile approver   lists the queue, and may approve
+rocky mcp --profile worker     no review_queue at all
+```
+
+On any other profile the approve call is refused with the error code
+`approve_not_enabled`, nothing is written, and the message names the flag. The
+refusal comes before Rocky looks at the queue, so it does not depend on the
+plan, on `confirm`, or on the state store being readable.
+
+Be exact about what the opt-in buys you. It decides **whether this server can
+approve at all**, and only the operator who starts the server chooses it. It
+does not authenticate the approval: on `--profile approver`, `confirm` is still
+set by the caller, and Rocky still does not check that a person set it. So
+`--profile approver` gives you a server where an agent's `confirm` is
+sufficient. Start one only where that is what you want.
 
 Be exact about what this check verifies. It reads a file, parses it, and compares
 the plan id. It does not authenticate who approved, or that a person approved at

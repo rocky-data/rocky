@@ -167,19 +167,27 @@ check did not run at all, not only when a check fails. The write has already
 landed by then, so that failure halts and alerts you. It does not roll the
 write back.
 
-Most of the 31 MCP tools only read. Seven can write. Five go through that same
-policy evaluator: `draft_model`, `draft_contract`, `draft_check`,
-`draft_metadata`, and `propose`. In a governed scope the evaluator returns a
-denial or a review requirement, and a denied draft leaves nothing new on disk
-(`draft_metadata` restores the sidecar it patched).
+Most of the 31 MCP tools only read. On a default `rocky mcp` six can write.
+Five go through that same policy evaluator: `draft_model`, `draft_contract`,
+`draft_check`, `draft_metadata`, and `propose`. In a governed scope the
+evaluator returns a denial or a review requirement, and a denied draft leaves
+nothing new on disk (`draft_metadata` restores the sidecar it patched).
 
-The other two carry their own guard. `pause_schedule` needs `confirm: true`.
-Only a human can resume a schedule, with
-`rocky state schedule resume <pipeline>`. `review_queue` can write the approval
-marker that unblocks `rocky apply`. It needs `confirm: true` from the caller,
-and it refuses any plan that is not already in the pending review queue. Rocky
-does not check that a person set `confirm`, so this is not a human sign-off in
-any sense the engine verifies. `rocky mcp --profile worker` does not serve it.
+The sixth carries its own guard: `pause_schedule` needs `confirm: true`. Only a
+human can resume a schedule, with `rocky state schedule resume <pipeline>`.
+
+A seventh, `review_queue`, can write the approval marker that unblocks
+`rocky apply` — but only when the operator starts the server as
+`rocky mcp --profile approver`. A default server lists the queue and refuses
+the approve call with `approve_not_enabled`, writing nothing; `rocky mcp
+--profile worker` does not serve `review_queue` at all. The profile is fixed
+when the server starts, so an agent cannot turn approving on mid-session.
+
+Where it is served, the older caveat still holds: it needs `confirm: true` from
+the caller, it refuses any plan not already in the pending review queue, and
+Rocky does not check that a person set `confirm`. So `--profile approver` is not
+a human sign-off in any sense the engine verifies — it is you deciding that this
+server may sign off.
 
 To see what a rule resolves to before you rely on it, run
 `rocky policy check --principal agent --capability apply --model <name>`. It

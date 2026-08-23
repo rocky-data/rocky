@@ -364,6 +364,7 @@ rocky mcp [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--config <PATH>` | `PathBuf` | `rocky.toml` | Pipeline config file the server resolves the project from. The models directory is resolved as `<config-dir>/models`. |
+| `--profile <PROFILE>` | `default` \| `approver` \| `worker` | `default` | Which tool surface to serve. `default` serves all 31 tools but refuses `review_queue`'s approve action (listing the queue still works). `approver` serves the same 31 tools and allows that action, so the server can write approval markers. `worker` serves the minimal drafting allowlist for an untrusted worker. |
 
 The server is **stateless**: every tool call resolves the project from the config + models dir and compiles fresh, so it always reflects the current on-disk files. Logging goes to stderr (stdout is reserved for the MCP wire protocol).
 
@@ -378,7 +379,7 @@ What leaves your machine is bounded: warehouse queries go to your warehouse; the
 
 ### Safety model: the server does not materialize
 
-The server **never materializes anything**. No tool runs SQL that changes your warehouse. An agent can write project files and record a plan. One tool, `review_queue`, can also write the approval marker for a plan that is already in the pending review queue.
+The server **never materializes anything**. No tool runs SQL that changes your warehouse. An agent can write project files and record a plan. One tool, `review_queue`, can also write the approval marker for a plan that is already in the pending review queue — but only on `rocky mcp --profile approver`. The default server refuses that call.
 
 ```
    through rocky mcp                       through the CLI
@@ -394,7 +395,9 @@ The server **never materializes anything**. No tool runs SQL that changes your w
                               rocky review <plan-id> --approve
                               writes the approval marker. The
                               review_queue MCP tool writes it
-                              too, with confirm: true.
+                              too, with confirm: true — but ONLY
+                              on --profile approver. The default
+                              server refuses (approve_not_enabled).
                                         │
                                         ▼
                               rocky apply <plan-id> ──► warehouse
@@ -405,7 +408,7 @@ Three rules keep that boundary in place:
 
 - The generators (`ai_contract`, `ai_test`, `explain_model`) return **drafts** and mutate nothing. Hand a draft to the `draft_contract` or `draft_check` write tool, or save it to disk and run `compile` and `test` yourself.
 - `governance_preview` and `drift_preview` are **read-only** previews.
-- The server does not apply. `rocky apply` is the only step that WRITES to the warehouse, and no MCP tool runs it. Some tools do read the warehouse: `sample_rows`, `profile_column`, `inspect_schema`, and `drift_preview` issue queries against it. `review_queue` can write a plan's approval marker, so treat approval as a step the server can take. It needs `confirm: true` from the caller. It refuses a plan that is not already in the pending review queue. `rocky mcp --profile worker` does not serve it.
+- The server does not apply. `rocky apply` is the only step that WRITES to the warehouse, and no MCP tool runs it. Some tools do read the warehouse: `sample_rows`, `profile_column`, `inspect_schema`, and `drift_preview` issue queries against it. `review_queue` can write a plan's approval marker, but only on `rocky mcp --profile approver` — the default server refuses the call with `approve_not_enabled` and writes nothing. Where it is served it still needs `confirm: true` from the caller, and it still refuses a plan that is not already in the pending review queue. `rocky mcp --profile worker` does not serve `review_queue` at all. So treat approval as a step the server can take **only on a server you started for that purpose**; the profile is chosen at launch and an agent cannot change it mid-session.
 
 ### Tools
 
