@@ -132,7 +132,8 @@ starts where this one ended, so `rocky brief` writes state. The other windows,
 ```bash
 rocky serve          # HTTP API over the compiler's semantic graph
 rocky lsp            # Language Server Protocol for IDEs
-rocky mcp            # Model Context Protocol server (31 agent tools, 7 write)
+rocky mcp            # Model Context Protocol server (31 agent tools, 6 write;
+                     #   a 7th, approving, needs --profile approver)
 rocky load           # Load CSV, Parquet, or JSONL files from a directory
 rocky ai "<intent>"  # Generate a model from a natural-language description
 ```
