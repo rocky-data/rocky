@@ -2190,3 +2190,82 @@ fn editing_a_shared_test_definition_cannot_change_what_the_loop_executes() {
         "and it still names the remedy — a restore, not a verb: {message}"
     );
 }
+
+/// A record carrying NO check digest must hold, not pass.
+///
+/// This is the upgrade path, and it is the only way the `None` arm is
+/// reachable now that an unpinnable generation fails its verify bundle:
+/// a product mid-flight when the binary was upgraded has a record
+/// written before `checks_digest` existed, so it deserializes to `None`.
+///
+/// The rule that arm encodes is that absence of evidence is not evidence
+/// of absence — "every claim matched" is trivially true when no claim
+/// was made. Without this test the rule is unexercised: a mutation
+/// making `None` pass survives the entire suite, which is how it was
+/// found.
+#[test]
+fn a_record_with_no_recorded_digest_holds_rather_than_passing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+    let plan = drive_to_plan_review(dir);
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "apply+observe: {err}");
+    assert_eq!(
+        json.expect("json")["state"],
+        "observing",
+        "the baseline is a clean, pinned generation"
+    );
+
+    // Rewrite the record the way an older binary left it: everything
+    // else intact, no digest.
+    {
+        let store = state_store(dir);
+        let current = store
+            .fulfill_state_get(PRODUCT)
+            .expect("state")
+            .expect("record");
+        assert!(
+            current.checks_digest.is_some(),
+            "the fixture must start pinned, or this proves nothing"
+        );
+        let mut older = current.clone();
+        older.checks_digest = None;
+        let row = rocky_core::fulfill::FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: "test: simulate a record written before checks_digest existed".to_string(),
+            from_state: Some(current.state.tag().to_string()),
+            to_state: older.state.tag().to_string(),
+            spec_digest: older.spec_digest.clone(),
+            plan_id: older.plan_id.clone(),
+            idempotency_key: older.idempotency_key.clone(),
+        };
+        let outcome = store
+            .fulfill_state_cas(PRODUCT, Some(&current), &older, &row)
+            .expect("seed the unpinned record");
+        assert!(
+            matches!(outcome, rocky_core::fulfill::FulfillCas::Won),
+            "the seed must land"
+        );
+    }
+
+    // The checks on disk are unchanged and would pass. The loop must
+    // still refuse to call that health, because it cannot show they are
+    // the checks this generation verified.
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(code, 0, "a hold is a clean stop: {err}");
+    assert_ne!(
+        json["state"], "observing",
+        "an unpinned generation must not be reported healthy: {json}"
+    );
+    assert_eq!(json["state"], "applied", "{json}");
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("recorded no digest"),
+        "and it says exactly what is missing: {message}"
+    );
+}
