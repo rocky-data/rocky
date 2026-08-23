@@ -1957,6 +1957,14 @@ fn emptying_the_sidecar_cannot_turn_a_known_red_into_observing() {
         message.contains("not the ones that were approved"),
         "the stop says the checks on disk are not the approved ones: {message}"
     );
+    // And it names a way OUT. Re-running the loop would re-read the same
+    // diverged sidecar forever, so `rocky fulfill` is the one command
+    // that must NOT be offered here.
+    assert_eq!(
+        json["next_command"].as_str(),
+        Some(&format!("rocky product compile {PRODUCT}")[..]),
+        "the hold names the command that ends it: {json}"
+    );
 
     // The evidence and the budget both survive — otherwise the ceiling
     // could be refilled by editing a file.
@@ -1978,6 +1986,30 @@ fn emptying_the_sidecar_cannot_turn_a_known_red_into_observing() {
         "no round was spent on a reading that never ran"
     );
     drop(store);
+
+    // THE REMEDY IS REAL. Running the command the stop named must
+    // actually clear the gate — a well-worded instruction that does not
+    // work is worth no more than the wrong one.
+    let (code, _j, _o, err) = rocky(dir, &["product", "compile", PRODUCT]);
+    assert_eq!(code, 0, "the named remedy must run at this state: {err}");
+    assert!(
+        declared_check_count(dir) > 0,
+        "re-lowering restored the checks the product spec declares"
+    );
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(
+        code, 4,
+        "and the loop can read the checks again — the real red is back: {json}"
+    );
+    assert_eq!(json["state"], "observed_failing", "{json}");
+    assert!(
+        json["message"]
+            .as_str()
+            .expect("message")
+            .contains("violating row"),
+        "reporting the genuine finding, not the custody hold: {json}"
+    );
 
     // Restoring the approved sidecar makes it evaluable again — the gate
     // holds, it does not latch.

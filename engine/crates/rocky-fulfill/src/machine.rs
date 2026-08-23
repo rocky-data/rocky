@@ -315,6 +315,24 @@ pub enum ReceiptSummary {
     },
 }
 
+/// Why a reading of the declared checks could not be trusted.
+///
+/// The verdict alone is not enough to tell an operator what to do: both
+/// causes land the same `unevaluable` hold, but only one of them is
+/// resolved by running the loop again. Carrying the cause is what keeps
+/// the stop from printing a command that cannot fix the condition it
+/// just reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnevaluableCause {
+    /// The checks on disk are not the ones the approved generation
+    /// committed. Re-running the loop re-reads the same diverged file
+    /// and reports the same thing forever — the remedy is to re-lower.
+    CheckCustody,
+    /// The reading itself failed, or checks errored. Re-running can
+    /// genuinely resolve this one: the warehouse may answer next time.
+    Unreadable,
+}
+
 /// What the runner observed, for the state the record is in.
 ///
 /// Each variant is produced by exactly one gathering step in
@@ -486,6 +504,9 @@ pub enum Event {
         /// already journaled, carried only so the stop message reports
         /// the whole observation.
         prior_detail: String,
+        /// Why the reading is incomplete, when it is. `None` on a
+        /// reading that evaluated everything it declared.
+        cause: Option<UnevaluableCause>,
     },
     /// `blocked` re-entry with `--retry`.
     RetryRequested,
@@ -1345,6 +1366,7 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                     deferred,
                     detail,
                     prior_detail,
+                    cause,
                 } => decide_observation_checks(
                     observed,
                     &product,
@@ -1354,6 +1376,7 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                     deferred,
                     &detail,
                     &prior_detail,
+                    cause,
                     now,
                 ),
                 other => internal_mismatch(observed, &other),
@@ -1541,6 +1564,7 @@ fn decide_observation_checks(
     deferred: Option<usize>,
     detail: &str,
     prior_detail: &str,
+    cause: Option<UnevaluableCause>,
     now: DateTime<Utc>,
 ) -> Decision {
     let verdict = classify_checks(failed, errored, deferred);
@@ -1598,15 +1622,31 @@ fn decide_observation_checks(
                 _ => FulfillState::Applied,
             };
             let next = to_state(observed, landing, now);
+            // One verdict, two causes, two remedies. Printing "run the
+            // loop again" for a custody divergence would name a command
+            // that re-reads the same diverged file and reports the same
+            // thing forever — an instruction that cannot resolve what it
+            // was printed for is worse than no instruction.
+            let (next_command, remedy) = match cause {
+                Some(UnevaluableCause::CheckCustody) => (
+                    format!("rocky product compile {product}"),
+                    " — re-lowering rewrites the sidecar from the approved spec, which \
+                     restores every check the product declares and keeps any extra ones \
+                     already there; to make an edited check permanent instead, put it in \
+                     the product spec's `checks` and approve the spec again"
+                        .to_string(),
+                ),
+                _ => (format!("rocky fulfill {product}"), String::new()),
+            };
             Decision::AdvanceAndStop {
                 record: next,
                 event,
                 stop: Stop {
                     message: format!(
                         "product {product} is applied, but its declared data checks could not \
-                         be evaluated, so nothing here says the output is right: {whole}"
+                         be evaluated, so nothing here says the output is right: {whole}{remedy}"
                     ),
-                    next_command: Some(format!("rocky fulfill {product}")),
+                    next_command: Some(next_command),
                 },
             }
         }
@@ -3869,6 +3909,7 @@ mod tests {
             detail: "revenue_daily.client_id [unique] fail (error): 4 duplicate value(s) found"
                 .into(),
             prior_detail: "MAX(loaded_at) = t, lag 60s, budget 86400s".into(),
+            cause: (errored > 0 || deferred != Some(0)).then_some(UnevaluableCause::Unreadable),
         }
     }
 
@@ -4262,6 +4303,75 @@ mod tests {
         );
     }
 
+    /// A hold must name a command that can actually END the hold.
+    ///
+    /// Both causes land the same `unevaluable` verdict, but only one is
+    /// resolved by running the loop again. A custody divergence re-reads
+    /// the same diverged sidecar every time, so telling the operator to
+    /// re-run points them at an infinite loop — the product is not
+    /// stranded by its STATE, but by never being told the way out.
+    ///
+    /// Asserted as the SPECIFIC command per cause. A test that only
+    /// checked `next_command.is_some()` passes on the broken behaviour
+    /// and proves nothing.
+    #[test]
+    fn each_unevaluable_cause_names_the_remedy_that_resolves_it() {
+        let reading = |cause: Option<UnevaluableCause>| Event::ObservationChecks {
+            failed: 0,
+            errored: 0,
+            warned: 0,
+            deferred: None,
+            detail: "the declared checks on disk are not the ones that were approved".into(),
+            prior_detail: String::new(),
+            cause,
+        };
+
+        // Custody divergence: re-lowering is what puts the approved
+        // checks back, so that is what the stop must say.
+        let d = decide(
+            &rec(FulfillState::Applied),
+            reading(Some(UnevaluableCause::CheckCustody)),
+            now(),
+        );
+        let Decision::AdvanceAndStop { stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            stop.next_command.as_deref(),
+            Some("rocky product compile revenue_daily"),
+            "a diverged sidecar is not resolved by re-running the loop"
+        );
+        assert!(
+            stop.message
+                .contains("restores every check the product declares"),
+            "and the operator is told what re-lowering will DO to their edit: {}",
+            stop.message
+        );
+        assert!(
+            stop.message.contains("keeps any extra ones"),
+            "including that additions survive it: {}",
+            stop.message
+        );
+
+        // A transient read failure: re-running genuinely can resolve it.
+        for cause in [Some(UnevaluableCause::Unreadable), None] {
+            let d = decide(&rec(FulfillState::Applied), reading(cause.clone()), now());
+            let Decision::AdvanceAndStop { stop, .. } = d else {
+                panic!("expected AdvanceAndStop, got {d:?}");
+            };
+            assert_eq!(
+                stop.next_command.as_deref(),
+                Some("rocky fulfill revenue_daily"),
+                "the warehouse may answer next time, so re-running IS the remedy ({cause:?})"
+            );
+            assert!(
+                !stop.message.contains("re-lowering"),
+                "and it must not suggest rewriting the sidecar over a transient failure: {}",
+                stop.message
+            );
+        }
+    }
+
     /// The verdict ORDER is the decision. Positive evidence of failure
     /// outranks an incomplete reading; an incomplete reading outranks a
     /// clean tally.
@@ -4313,6 +4423,7 @@ mod tests {
                 deferred: Some(0),
                 detail: "x".repeat(MAX_OBSERVATION_DETAIL + 500),
                 prior_detail: String::new(),
+                cause: None,
             },
             now(),
         );

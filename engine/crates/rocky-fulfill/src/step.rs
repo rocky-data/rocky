@@ -35,7 +35,7 @@ use crate::briefs::{self, BriefContext};
 use crate::driver::{self, AgentDriver, DriverOutcome, TaskBrief, TaskBriefKind};
 use crate::machine::{
     self, ApplySummary, Decision, Event, PostureStatus, ProposeSummary, ReceiptSummary, Stop,
-    TaskKind,
+    TaskKind, UnevaluableCause,
 };
 use crate::store::{Acquired, Applied, StoreDriver};
 
@@ -896,6 +896,7 @@ impl Runner {
                     custody.join("; ")
                 ),
                 prior_detail,
+                cause: Some(UnevaluableCause::CheckCustody),
             });
         }
 
@@ -915,6 +916,7 @@ impl Runner {
                     deferred: None,
                     detail: format!("the declared data checks could not be read: {err:#}"),
                     prior_detail,
+                    cause: Some(UnevaluableCause::Unreadable),
                 });
             }
         };
@@ -925,6 +927,8 @@ impl Runner {
             deferred: Some(observed.unevaluated),
             detail: render_check_findings(&observed),
             prior_detail,
+            cause: (observed.errored > 0 || observed.unevaluated > 0)
+                .then_some(UnevaluableCause::Unreadable),
         })
     }
 
@@ -944,6 +948,7 @@ impl Runner {
                      cannot be asked what the applied output looks like"
                 .to_string(),
             prior_detail,
+            cause: Some(UnevaluableCause::Unreadable),
         })
     }
 
