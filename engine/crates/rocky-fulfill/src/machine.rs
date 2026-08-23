@@ -1132,12 +1132,21 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
             // without this row the bundle would leave no trace at all,
             // and "verify green" would be a claim with no record of
             // what green did and did not cover.
+            // `checks_digest: Some(_)` IS in this pattern, unlike
+            // `tests_deferred`. A generation whose check set could not be
+            // digested cannot be pinned, and an unpinnable generation is
+            // doomed rather than degraded: nothing after apply can
+            // re-enter `verifying` to pin one, so observation would hold
+            // terminally on a divergence it can never resolve. Failing
+            // the bundle here costs a repair round and, if it persists,
+            // a `blocked` a human can act on — which is what an
+            // unverifiable generation should cost.
             Event::VerifyBundle {
                 compile_green: true,
                 test_green: true,
                 posture_green: true,
                 manifest_total: true,
-                checks_digest,
+                checks_digest: Some(checks_digest),
                 detail,
                 ..
             } => {
@@ -1146,7 +1155,7 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 // model, and everything after it (propose, the human
                 // review window, apply) must run the SAME checks.
                 let mut next = to_state(observed, FulfillState::Verifying, now);
-                next.checks_digest = checks_digest;
+                next.checks_digest = Some(checks_digest);
                 Decision::AdvanceAndAct {
                     record: next,
                     event: verify_green_event(&detail),
@@ -1392,7 +1401,7 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                     deferred,
                     &detail,
                     &prior_detail,
-                    cause,
+                    cause.as_ref(),
                     now,
                 ),
                 other => internal_mismatch(observed, &other),
@@ -1580,7 +1589,7 @@ fn decide_observation_checks(
     deferred: Option<usize>,
     detail: &str,
     prior_detail: &str,
-    cause: Option<UnevaluableCause>,
+    cause: Option<&UnevaluableCause>,
     now: DateTime<Utc>,
 ) -> Decision {
     let verdict = classify_checks(failed, errored, deferred);
@@ -1643,13 +1652,32 @@ fn decide_observation_checks(
             // that re-reads the same diverged file and reports the same
             // thing forever — an instruction that cannot resolve what it
             // was printed for is worse than no instruction.
+            // The custody remedy is a RESTORE, not a command, and saying
+            // so is the only honest option available.
+            //
+            // `rocky product compile` was offered here and does not work
+            // for either drift class: it refuses outright on sidecar
+            // drift (`phase-a-tampered`), and on a `test_definitions.toml`
+            // edit it re-lowers the sidecar without touching the
+            // definitions, so the expansion still diverges. Nor can the
+            // loop adopt the edit — the only route into `verifying` is
+            // from `merged`, and an applied product can never reach it
+            // again, so no post-apply path can pin a new digest.
+            //
+            // What remains true: undo the edit and the digests match, or
+            // put the change in the spec and approve it, which writes a
+            // fresh record at `spec_approved` (outside this table, in the
+            // approve verb) and re-pins at that generation's own verify.
+            // `rocky fulfill` is named because it IS the command that
+            // resolves this — after the restore, which the message states
+            // first so the order is not a guess.
             let (next_command, remedy) = match cause {
                 Some(UnevaluableCause::CheckCustody) => (
-                    format!("rocky product compile {product}"),
-                    " — re-lowering rewrites the sidecar from the approved spec, which \
-                     restores every check the product declares and keeps any extra ones \
-                     already there; to make an edited check permanent instead, put it in \
-                     the product spec's `checks` and approve the spec again"
+                    format!("rocky fulfill {product}"),
+                    " — restore the file you changed and re-run; the loop cannot adopt an \
+                     edit here, because nothing after an apply can re-verify a new set of \
+                     checks. To keep the change instead, put it in the product spec's \
+                     `checks` and approve the spec again, which starts a new generation"
                         .to_string(),
                 ),
                 _ => (format!("rocky fulfill {product}"), String::new()),
@@ -4368,20 +4396,19 @@ mod tests {
         let Decision::AdvanceAndStop { stop, .. } = d else {
             panic!("expected AdvanceAndStop, got {d:?}");
         };
-        assert_eq!(
-            stop.next_command.as_deref(),
-            Some("rocky product compile revenue_daily"),
-            "a diverged sidecar is not resolved by re-running the loop"
-        );
         assert!(
-            stop.message
-                .contains("restores every check the product declares"),
-            "and the operator is told what re-lowering will DO to their edit: {}",
+            stop.message.contains("restore the file you changed"),
+            "the remedy is a RESTORE, stated before the command: {}",
             stop.message
         );
         assert!(
-            stop.message.contains("keeps any extra ones"),
-            "including that additions survive it: {}",
+            stop.message.contains("cannot adopt an edit here"),
+            "and the operator is told WHY the loop will not take their edit: {}",
+            stop.message
+        );
+        assert!(
+            stop.message.contains("approve the spec again"),
+            "with the route for keeping the change named too: {}",
             stop.message
         );
 
@@ -4397,8 +4424,8 @@ mod tests {
                 "the warehouse may answer next time, so re-running IS the remedy ({cause:?})"
             );
             assert!(
-                !stop.message.contains("re-lowering"),
-                "and it must not suggest rewriting the sidecar over a transient failure: {}",
+                !stop.message.contains("restore the file you changed"),
+                "and it must not tell them to undo an edit they did not make: {}",
                 stop.message
             );
         }

@@ -238,6 +238,21 @@ fn rocky_env(
     (out.status.code().unwrap_or(-1), json, stdout, stderr)
 }
 
+/// Create the target the recorded `DRAFT_SQL` would have produced.
+///
+/// For drills that seed a receipt instead of running an apply. The
+/// declared checks (grain uniqueness on `client_id`, `revenue_eur >= 0`)
+/// pass against this row, so observation reaches a real verdict rather
+/// than erroring on a missing table.
+fn materialize_target(dir: &Path) {
+    let conn = duckdb::Connection::open(dir.join("wh.duckdb")).expect("duckdb");
+    conn.execute_batch(&format!(
+        "CREATE SCHEMA IF NOT EXISTS out; \
+         CREATE OR REPLACE TABLE out.{PRODUCT} AS {DRAFT_SQL};"
+    ))
+    .expect("materialize the target");
+}
+
 fn state_store(dir: &Path) -> rocky_core::state::StateStore {
     rocky_core::state::StateStore::open(&dir.join("models/.rocky-state.redb")).expect("store")
 }
@@ -1272,9 +1287,16 @@ fn applying_unknown_receipt_arms_park_on_in_flight_and_resolve_on_success() {
     let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
     assert_eq!(code, 0);
     let json = json.expect("json");
-    // Applied via the receipt; observation runs (and may find the target
-    // missing — that is a finding to journal, not a failure).
-    assert_eq!(json["state"], "observing", "{json}");
+    // Applied via the receipt — and observation HOLDS, because this
+    // drill seeds a receipt instead of running an apply, so the target
+    // was never written and not one declared check can be evaluated.
+    //
+    // It used to assert `observing` here, over a read of nothing. That
+    // is the silent-zero this work package exists to remove, so the
+    // drill now asserts the honest terminal instead. The table-absence
+    // proof below is why it cannot simply materialize first: that proof
+    // IS the drill.
+    assert_eq!(json["state"], "applied", "{json}");
     let store = state_store(dir);
     let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
     let receipt_row = rows
@@ -1292,6 +1314,23 @@ fn applying_unknown_receipt_arms_park_on_in_flight_and_resolve_on_success() {
         )
         .expect("query");
     assert_eq!(table_exists, 0, "nothing executed: the receipt resolved it");
+
+    // With the target in place — what a real apply would have left — the
+    // same resume reaches `observing` on a genuine verdict. Both halves
+    // hold: nothing re-executed, AND health is claimed only once the
+    // declared checks could actually run.
+    //
+    // The store is dropped first: an open handle locks out the next
+    // binary invocation (the convention this file follows throughout).
+    drop(store);
+    materialize_target(dir);
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        json.expect("json")["state"],
+        "observing",
+        "the checks pass against the materialized target"
+    );
 }
 
 /// F3: the REAL `skipped_in_flight` arm — the loop reaches an ACTUAL
@@ -1959,13 +1998,16 @@ fn emptying_the_sidecar_cannot_turn_a_known_red_into_observing() {
         message.contains("not the ones this generation verified"),
         "the stop says the checks on disk are not the verified ones: {message}"
     );
-    // And it names a way OUT. Re-running the loop would re-read the same
-    // diverged sidecar forever, so `rocky fulfill` is the one command
-    // that must NOT be offered here.
-    assert_eq!(
-        json["next_command"].as_str(),
-        Some(&format!("rocky product compile {PRODUCT}")[..]),
-        "the hold names the command that ends it: {json}"
+    // And it names a way OUT — which is a RESTORE, stated before the
+    // command. No engine verb adopts a post-apply check change: nothing
+    // after an apply can re-enter `verifying` to pin a new digest.
+    assert!(
+        message.contains("restore the file you changed"),
+        "the hold states the manual step first: {message}"
+    );
+    assert!(
+        message.contains("approve the spec again"),
+        "and the route for keeping the change: {message}"
     );
 
     // The evidence and the budget both survive — otherwise the ceiling
@@ -1989,44 +2031,51 @@ fn emptying_the_sidecar_cannot_turn_a_known_red_into_observing() {
     );
     drop(store);
 
-    // THE REMEDY IS REAL. Running the command the stop named must
-    // actually clear the gate — a well-worded instruction that does not
-    // work is worth no more than the wrong one.
+    // THE REMEDY IS REAL — and it is the restore, not a verb.
+    //
+    // `rocky product compile` was offered here once and does NOT work:
+    // it byte-verifies before Phase B and refuses a drifted sidecar
+    // outright. Asserting that refusal keeps the message honest, because
+    // the moment someone re-offers the verb this test fails.
     let (code, _j, _o, err) = rocky(dir, &["product", "compile", PRODUCT]);
-    assert_eq!(code, 0, "the named remedy must run at this state: {err}");
-    assert!(
-        declared_check_count(dir) > 0,
-        "re-lowering restored the checks the product spec declares"
+    assert_ne!(
+        code, 0,
+        "re-lowering must NOT be presented as the remedy — it refuses drift"
     );
-    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
-    let json = json.expect("fulfill json");
-    assert_eq!(
-        code, 4,
-        "and the loop can read the checks again — the real red is back: {json}"
-    );
-    assert_eq!(json["state"], "observed_failing", "{json}");
     assert!(
-        json["message"]
-            .as_str()
-            .expect("message")
-            .contains("violating row"),
-        "reporting the genuine finding, not the custody hold: {json}"
+        err.contains("tampered") || err.contains("drift"),
+        "and it refuses for the reason the message relies on: {err}"
     );
 
-    // Restoring the approved sidecar makes it evaluable again — the gate
-    // holds, it does not latch.
-    std::fs::write(&sidecar, &text).expect("restore sidecar");
+    // Restoring is what works.
+    std::fs::write(&sidecar, &text).expect("restore the sidecar");
+    assert!(
+        declared_check_count(dir) > 0,
+        "the restored sidecar declares its checks again"
+    );
     let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
     let json = json.expect("fulfill json");
-    assert_eq!(code, 4, "the red is still there, and readable again");
-    assert_eq!(json["state"], "observed_failing", "{json}");
+    assert_eq!(code, 0, "the loop resumes its normal course: {json}");
+    // The record was already at `observed_failing`, so this reading is
+    // the CONFIRMING one: the gate held while the checks were unreadable,
+    // and the moment they are readable again the red is confirmed and a
+    // repair round runs — parking at the human gate, as any repair does.
+    assert_eq!(json["state"], "needs_input", "{json}");
     assert!(
-        json["message"]
-            .as_str()
-            .expect("message")
-            .contains("violating row"),
-        "and the real finding is reported again: {json}"
+        json["plan_id"].as_str().is_some_and(|p| !p.is_empty()),
+        "with a new plan for a human to review: {json}"
     );
+
+    // And the round was spent on the real finding, not on the custody
+    // hold — the gate never burned budget while it was holding.
+    let store = state_store(dir);
+    let rows = store.fulfill_journal_rows(PRODUCT).expect("journal");
+    assert!(
+        rows.iter()
+            .any(|r| r.event.starts_with("data repair round 1")),
+        "exactly one repair round, and only after the checks were readable"
+    );
+    drop(store);
 }
 
 /// The `[[use_test]]` bypass, end to end.
@@ -2136,9 +2185,8 @@ fn editing_a_shared_test_definition_cannot_change_what_the_loop_executes() {
         message.contains("something changed what would run"),
         "the digest over the EXPANDED set is what catches this: {message}"
     );
-    assert_eq!(
-        json["next_command"].as_str(),
-        Some(&format!("rocky product compile {PRODUCT}")[..]),
-        "and it still names the remedy: {json}"
+    assert!(
+        message.contains("restore the file you changed"),
+        "and it still names the remedy — a restore, not a verb: {message}"
     );
 }

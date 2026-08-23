@@ -731,7 +731,6 @@ mod tests {
         (tmp, models)
     }
 
-    #[test]
     /// The digest must be reproducible across loads, or the custody gate
     /// it backs reports divergence on every run and the loop never
     /// observes anything.

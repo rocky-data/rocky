@@ -570,15 +570,34 @@ impl Runner {
             ));
         }
 
+        // Pinned from the SAME loader that will execute them, so the
+        // verified set and the executed set are the same object.
+        //
+        // A failure here is NOT swallowed. `.ok()` used to turn it into
+        // `None`, and a `None` digest still went green — so a transient
+        // failure at verify would propose, pass a human review, apply,
+        // and only then be discovered by an observation that holds
+        // TERMINALLY, because nothing after apply can re-enter verify to
+        // pin a digest. Declining into a pass on the verify side is the
+        // same shape this work package removes on the observation side.
+        let checks_digest = match self.expanded_check_digest(&spec) {
+            Ok(digest) => Some(digest),
+            Err(why) => {
+                detail.push(format!(
+                    "could not digest the check set this bundle is verifying, so the \
+                     generation cannot be pinned: {why}"
+                ));
+                None
+            }
+        };
+
         Ok(Event::VerifyBundle {
             compile_green,
             test_green,
             posture_green,
             manifest_total,
             tests_deferred,
-            // Pinned from the SAME loader that will execute them, so the
-            // verified set and the executed set are the same object.
-            checks_digest: self.expanded_check_digest(&spec).ok(),
+            checks_digest,
             detail: detail.join(" | "),
         })
     }
