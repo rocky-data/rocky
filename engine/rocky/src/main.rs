@@ -4973,6 +4973,10 @@ mod tests {
     /// (macOS gets larger defaults; CI is where the overflow shows up).
     /// A scoped thread keeps the workaround local to test code; production
     /// `main()` uses the OS-default 8 MB thread stack and is unaffected.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "this IS the sanctioned wrapper the disallowed-methods entry points callers at"
+    )]
     fn try_parse_with_big_stack(args: &[&str]) -> Cli {
         std::thread::scope(|s| {
             std::thread::Builder::new()
@@ -5033,6 +5037,11 @@ mod tests {
     /// FF-WP1: `rocky review --status` parses by its literal flag name, and
     /// clap rejects combining it with `--approve` / `--queue`.
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
     fn review_status_flag_parses_and_conflicts() {
         let cli = try_parse_with_big_stack(&["rocky", "review", "abc123", "--status"]);
         match cli.command {
@@ -5137,6 +5146,11 @@ mod tests {
     /// Parse on the 8 MiB stack and return whether parsing *succeeded* — used
     /// by the conflict / requires tests (the recursive clap derive overflows
     /// the default test-thread stack).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
     fn parse_run_ok(args: &[&str]) -> bool {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         std::thread::scope(|s| {
@@ -5341,6 +5355,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
     fn plan_rejects_branch_with_shadow() {
         // clap should reject this combination at parse time via the
         // `conflicts_with_all = ["shadow", "shadow_schema"]` modifier.

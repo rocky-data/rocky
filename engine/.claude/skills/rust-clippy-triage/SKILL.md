@@ -13,7 +13,7 @@ description: Playbook for when `cargo clippy -- -D warnings` fires in the Rocky 
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-That means **any** clippy warning in **any** target (lib, bin, tests, examples, benches), across all feature combinations, fails CI. Baseline lint policy lives in a `[workspace.lints.clippy]` table in `engine/Cargo.toml` — `correctness = "deny"` plus a few warn-level lints (`needless_pass_by_value`, `redundant_closure_for_method_calls`, `cloned_instead_of_copied`, `large_enum_variant`). There is no `clippy.toml`. The policy is "correctness is a hard error; zero warnings overall."
+That means **any** clippy warning in **any** target (lib, bin, tests, examples, benches), across all feature combinations, fails CI. Baseline lint policy lives in a `[workspace.lints.clippy]` table in `engine/Cargo.toml` — `correctness = "deny"` plus a few warn-level lints (`needless_pass_by_value`, `redundant_closure_for_method_calls`, `cloned_instead_of_copied`, `large_enum_variant`). `engine/clippy.toml` holds only lints that need configuration DATA rather than a level — today a single `disallowed-methods` entry routing test code away from a bare `Cli::try_parse_from` (it overflows the 2 MB test-thread stack and aborts the test binary; parse through `try_parse_with_big_stack` in `main.rs`). Put lint levels in the Cargo.toml table, not there. The policy is "correctness is a hard error; zero warnings overall."
 
 ## When CI goes red — triage order
 

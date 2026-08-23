@@ -1,0 +1,15 @@
+# Clippy configuration for the Rocky engine workspace.
+#
+# Lint LEVELS live in `[workspace.lints.clippy]` in Cargo.toml; this file is
+# only for lints that need configuration data, which levels cannot express.
+disallowed-methods = [
+    # `Cli::try_parse_from` on a test thread overflows its 2 MB stack in a
+    # debug build — clap's generated parse code for this `Cli` is deep, and
+    # the failure aborts the whole test binary with "fatal runtime error:
+    # stack overflow", which reads as a crash rather than a test failure.
+    # Test code must parse through `try_parse_with_big_stack` (main.rs), or
+    # an equivalent 8 MB spawned thread. Production `main()` parses on the
+    # OS-default 8 MB main-thread stack and is unaffected, so this is a
+    # test-harness rule, not a product one.
+    { path = "clap::Parser::try_parse_from", reason = "parse via try_parse_with_big_stack: a 2 MB test-thread stack overflows and aborts the test binary" },
+]
