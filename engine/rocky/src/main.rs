@@ -2304,16 +2304,22 @@ enum Command {
     /// any MCP-capable agent harness can drive Rocky. Long-running: serves
     /// until the client disconnects. Materialization stays human-gated — the
     /// `propose` tool only writes an AI-authored plan; a human runs
-    /// `rocky review --approve` + `rocky apply`. Use `--profile worker` to
-    /// serve only the minimal drafting allowlist to an untrusted worker.
+    /// `rocky review --approve` + `rocky apply`. No profile writes a sign-off
+    /// marker unless you ask for one: `review_queue` lists the pending queue
+    /// everywhere, but its approve action is served ONLY on
+    /// `--profile approver`. Use `--profile worker` to serve only the minimal
+    /// drafting allowlist to an untrusted worker.
     Mcp {
         /// Pipeline config file the server resolves the project from.
         #[arg(long, default_value = "rocky.toml")]
         config: PathBuf,
-        /// Tool surface to serve. `default` exposes every tool; `worker` is
-        /// the minimal drafting allowlist for untrusted workers: the
-        /// read/inspect grounding tools, compile / test / breaking_change /
-        /// dependents, draft_model + draft_check, and the prompts — no
+        /// Tool surface to serve. `default` exposes every tool but REFUSES the
+        /// `review_queue` approve action (listing the queue still works);
+        /// `approver` is `default` plus that one action, for a server the
+        /// operator intends to be able to write human sign-off markers;
+        /// `worker` is the minimal drafting allowlist for untrusted workers:
+        /// the read/inspect grounding tools, compile / test / breaking_change
+        /// / dependents, draft_model + draft_check, and the prompts — no
         /// contract, metadata, propose, review, or schedule surface.
         #[arg(long, value_enum, default_value_t = McpProfileArg::Default)]
         profile: McpProfileArg,
@@ -2324,8 +2330,10 @@ enum Command {
 /// rocky-mcp crate stays clap-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum McpProfileArg {
-    /// Full tool surface (unchanged behavior).
+    /// Every tool, but `review_queue` cannot approve (it still lists).
     Default,
+    /// Every tool, and `review_queue` MAY approve — write a sign-off marker.
+    Approver,
     /// Minimal drafting-worker allowlist.
     Worker,
 }
@@ -2334,6 +2342,7 @@ impl From<McpProfileArg> for rocky_mcp::McpProfile {
     fn from(value: McpProfileArg) -> Self {
         match value {
             McpProfileArg::Default => rocky_mcp::McpProfile::Default,
+            McpProfileArg::Approver => rocky_mcp::McpProfile::Approver,
             McpProfileArg::Worker => rocky_mcp::McpProfile::Worker,
         }
     }
