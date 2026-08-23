@@ -62,6 +62,21 @@ pub enum FulfillState {
     Applied,
     /// Post-apply observation (staleness, checks).
     Observing,
+    /// Applied, and the applied output is failing its own declared data
+    /// checks.
+    ///
+    /// Distinct from [`Self::Observing`] on purpose: the checks a product
+    /// declares can only run against a materialised table, so they are
+    /// deferred at verify and first evaluated here. A red verdict must
+    /// never be recorded as a healthy `observing` — the output is live
+    /// and wrong, and a human reading the state must see that.
+    ///
+    /// Distinct from [`Self::Blocked`] too: this is a resting state the
+    /// loop moves forward out of. The next invocation re-reads the checks
+    /// (never assuming the last verdict) and, if they are still red,
+    /// spends one data-repair round. The evidence rides on
+    /// [`FulfillStateRecord::observation_detail`].
+    ObservedFailing,
     /// Stopped for a human.
     NeedsInput {
         /// What is needed (e.g. `spec_approval`, `policy`).
@@ -106,6 +121,7 @@ impl FulfillState {
             Self::ApplyingUnknown => "applying_unknown",
             Self::Applied => "applied",
             Self::Observing => "observing",
+            Self::ObservedFailing => "observed_failing",
             Self::NeedsInput { .. } => "needs_input",
             Self::Blocked { .. } => "blocked",
             Self::Superseded { .. } => "superseded",
@@ -129,6 +145,15 @@ pub enum DraftingRound {
     Draft,
     /// A repair pass after the verify bundle came back red.
     Repair,
+    /// A repair pass after the APPLIED output failed its own declared
+    /// data checks (`observed_failing`).
+    ///
+    /// Separate from [`Self::Repair`] because the worker gets different
+    /// evidence: a verify red is a compiler or contract defect, while
+    /// this one is a wrong number in a live table. The two also draw on
+    /// different budgets — see
+    /// [`FulfillStateRecord::data_repair_rounds`].
+    DataRepair,
 }
 
 impl DraftingRound {
@@ -137,6 +162,7 @@ impl DraftingRound {
         match self {
             Self::Draft => "draft",
             Self::Repair => "repair",
+            Self::DataRepair => "data_repair",
         }
     }
 }
@@ -178,6 +204,37 @@ pub struct FulfillStateRecord {
     /// Verify-red → repair-drafting cycles consumed.
     #[serde(default)]
     pub repair_rounds: u32,
+    /// Data-red → repair-drafting cycles consumed since the last clean
+    /// observation.
+    ///
+    /// A SEPARATE counter from [`Self::repair_rounds`], deliberately.
+    /// The shared counter is reset to 0 on every successful propose, so
+    /// a data-red cycle (red → repair → propose → apply → red again)
+    /// would reset it every lap and the ceiling would never bind. This
+    /// counter is reset only when an observation reads clean, on a
+    /// manual retry, and on supersession — never at propose — so
+    /// repeated data-reds do exhaust a bound.
+    ///
+    /// Both counters are compared against the same ceiling
+    /// (`MAX_REPAIR_ROUNDS`).
+    #[serde(default)]
+    pub data_repair_rounds: u32,
+    /// The observed evidence from the last red observation: which
+    /// declared checks failed and what they actually measured.
+    ///
+    /// Persisted for the same reason as [`Self::drafting_round`]: the
+    /// data-repair worker is dispatched in a later step than the
+    /// transition that decided it, and a crash in between must resume
+    /// into a dispatch that still carries the evidence. Without it the
+    /// worker would be told "a check failed" and nothing more.
+    ///
+    /// Written whenever the record enters
+    /// [`FulfillState::ObservedFailing`], and cleared on a clean
+    /// observation, a manual retry, and supersession. Length-capped
+    /// before it is written so a warehouse with many failing checks
+    /// cannot grow the record without bound.
+    #[serde(default)]
+    pub observation_detail: Option<String>,
     /// Which drafting round the machine dispatched into the CURRENT
     /// drafting window (#1493).
     ///
@@ -237,6 +294,8 @@ impl FulfillStateRecord {
             idempotency_key: None,
             drafting_attempts: 0,
             repair_rounds: 0,
+            data_repair_rounds: 0,
+            observation_detail: None,
             drafting_round: DraftingRound::Draft,
             owner_pid: None,
             owner_start_time: None,
@@ -396,6 +455,102 @@ mod tests {
         assert_eq!(older.repair_rounds, 2);
     }
 
+    /// The F3 record additions (`data_repair_rounds`,
+    /// `observation_detail`) follow the `drafting_round` discipline: a
+    /// record written before they existed must still parse, and a record
+    /// carrying them must still parse on a reader that does not know
+    /// them. Both are compared by the whole-record CAS, so a field that
+    /// changed representation between reads would make every CAS lose.
+    #[test]
+    fn the_f3_observation_fields_read_across_the_version_that_added_them() {
+        // A record as an older binary wrote it: neither key present.
+        let old = serde_json::json!({
+            "state": "observing",
+            "product_id": "product:revenue_daily",
+            "journal_seq": 9,
+            "repair_rounds": 1,
+        });
+        let parsed: FulfillStateRecord =
+            serde_json::from_value(old).expect("a pre-field record still parses");
+        assert_eq!(
+            parsed.data_repair_rounds, 0,
+            "an absent data-repair budget starts unspent, not exhausted"
+        );
+        assert_eq!(
+            parsed.observation_detail, None,
+            "an absent detail is no evidence, never empty evidence"
+        );
+        assert_eq!(
+            parsed.repair_rounds, 1,
+            "the two budgets are separate counters, read separately"
+        );
+
+        // Re-serializing and re-reading is stable, so an expected/current
+        // pair read either side of a write still compares equal.
+        let round_tripped: FulfillStateRecord =
+            serde_json::from_str(&serde_json::to_string(&parsed).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(round_tripped, parsed, "the CAS compares whole records");
+
+        // A record an older binary reads back: the unknown keys are
+        // ignored, not a hard error.
+        let mut newer = parsed.clone();
+        newer.data_repair_rounds = 2;
+        newer.observation_detail = Some("orders.total [not_null]: 3 NULL row(s)".to_string());
+        newer.drafting_round = DraftingRound::DataRepair;
+        let text = serde_json::to_string(&newer).expect("serialize");
+        assert!(text.contains("\"data_repair_rounds\":2"), "{text}");
+        assert!(text.contains("\"drafting_round\":\"data_repair\""), "{text}");
+        #[derive(serde::Deserialize)]
+        struct WithoutTheFields {
+            product_id: String,
+            repair_rounds: u32,
+        }
+        let older: WithoutTheFields =
+            serde_json::from_str(&text).expect("a reader without the fields must not fail");
+        assert_eq!(older.product_id, "product:revenue_daily");
+        assert_eq!(older.repair_rounds, 1);
+    }
+
+    /// `observed_failing` is a NEW variant of a `#[serde(tag = "state")]`
+    /// enum, which is a harder change than an added field: a reader that
+    /// does not know the variant fails outright rather than defaulting.
+    ///
+    /// That downgrade is caught one layer up, before any blob is read —
+    /// `fulfill_state` lives in a schema-versioned store, and the store
+    /// version was bumped with this variant so `[state]
+    /// on_schema_mismatch` engages at OPEN. This test pins the two
+    /// halves of that reasoning: the variant round-trips on a reader
+    /// that knows it, and is a hard error on one that does not (so the
+    /// version gate is load-bearing, not decorative).
+    #[test]
+    fn the_data_red_state_round_trips_and_is_a_hard_error_on_an_older_reader() {
+        let record = FulfillStateRecord::new(
+            FulfillState::ObservedFailing,
+            "product:revenue_daily".to_string(),
+            Some("sha256:aa".to_string()),
+            None,
+        );
+        let text = serde_json::to_string(&record).expect("serialize");
+        assert!(text.contains("\"state\":\"observed_failing\""), "{text}");
+        let back: FulfillStateRecord = serde_json::from_str(&text).expect("parses");
+        assert_eq!(back, record);
+
+        // The older reader's vocabulary, verbatim minus the new variant.
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case")]
+        enum OlderState {
+            Applied,
+            Observing,
+        }
+        let err = serde_json::from_str::<OlderState>(&text)
+            .expect_err("a reader without the variant must fail rather than guess");
+        assert!(
+            err.to_string().contains("observed_failing"),
+            "the failure must name the variant it could not read: {err}"
+        );
+    }
+
     #[test]
     fn state_tags_round_trip_through_serde() {
         // The tag() spelling and the serde wire tag must agree — journal
@@ -414,6 +569,7 @@ mod tests {
             FulfillState::ApplyingUnknown,
             FulfillState::Applied,
             FulfillState::Observing,
+            FulfillState::ObservedFailing,
             FulfillState::NeedsInput {
                 reason: "spec_approval".to_string(),
                 payload: String::new(),

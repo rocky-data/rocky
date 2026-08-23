@@ -1231,6 +1231,17 @@ pub(crate) fn product_approve_in(
     // hand-off — is deliberate: carrying the OLD generation's plan/key
     // pins onto the NEW digest is exactly the inheritance the
     // supersession exists to prevent.
+    //
+    // The complement is the stop set, and it is deliberate, not an
+    // oversight in a non-exhaustive `matches!`: `init`, `spec_approved`,
+    // `needs_input`, `blocked`, `observing` — and `observed_failing`.
+    // The data-red state is a REST state like `observing`: its apply is
+    // terminal, so no pinned key is in play, and no worker is running (a
+    // live group is caught by the `driver_pgid` arm below regardless).
+    // Re-approving out of it is a legitimate human fix — "the declared
+    // check was wrong, here is a corrected spec" — and refusing that
+    // would leave a product failing its checks with no way forward but
+    // the loop's own repair.
     if let Some(record) = &observed_state {
         let active_state = matches!(
             record.state,

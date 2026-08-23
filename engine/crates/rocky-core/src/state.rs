@@ -531,7 +531,33 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   record would let another pod observe a valid-looking approval whose
 ///   spec it cannot read or verify. Revisit to replicated only when
 ///   snapshot bytes gain durable replicated storage of their own.
-const CURRENT_SCHEMA_VERSION: u32 = 22;
+/// - **v23** — adds the fulfillment loop's post-apply data-check surface:
+///   the [`crate::fulfill::FulfillState::ObservedFailing`] state, the
+///   [`crate::fulfill::DraftingRound::DataRepair`] round, and two
+///   serde-additive [`crate::fulfill::FulfillStateRecord`] fields
+///   (`data_repair_rounds`, `observation_detail`). Not a table change —
+///   the redb table set is unchanged (`EXPECTED_TABLES` is untouched) —
+///   and a v22 blob (which lacks the fields) forward-deserializes with
+///   the counter 0 and the detail `None`, guarded by
+///   `fulfill::tests::the_f3_observation_fields_read_across_the_version_that_added_them`.
+///
+///   **Why this bump is load-bearing rather than bookkeeping:** the two
+///   fields are additive, but `observed_failing` is a NEW VARIANT of a
+///   `#[serde(tag = "state")]` enum. An added field forward-defaults; an
+///   unknown variant is a hard read failure. A v22 binary opening a v23
+///   store must therefore never reach that blob — and it does not,
+///   because the version check runs at OPEN and `[state]
+///   on_schema_mismatch` engages there ([`SchemaMismatchPolicy::Fail`]
+///   refuses with the version pair; [`SchemaMismatchPolicy::Recreate`]
+///   bootstraps a fresh store). A downgrade loses the in-flight loop
+///   record, which is acceptable precisely because `fulfill_state` is in
+///   [`LOCAL_ONLY_TABLE_NAMES`]: per-machine loop state a re-run
+///   rebuilds, not shared history. The variant's read behaviour under an
+///   older vocabulary is pinned by
+///   `fulfill::tests::the_data_red_state_round_trips_and_is_a_hard_error_on_an_older_reader`,
+///   so "the version gate is what protects the downgrade" stays true by
+///   test rather than by comment.
+const CURRENT_SCHEMA_VERSION: u32 = 23;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
