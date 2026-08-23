@@ -42,6 +42,7 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // second entry point rather than a widened `test_output`: this one
     // runs against the MATERIALISED table, and its result type drops the
     // generated SQL so worker-authored text cannot ride into a brief.
+    "rocky_cli::commands::fulfill_api::ObservedCheck",
     "rocky_cli::commands::fulfill_api::ObservedChecks",
     "rocky_cli::commands::fulfill_api::ReceiptLookup",
     // #1493 — the drafting-window reopen (typed outcome + the call).

@@ -500,7 +500,10 @@ mod tests {
         newer.drafting_round = DraftingRound::DataRepair;
         let text = serde_json::to_string(&newer).expect("serialize");
         assert!(text.contains("\"data_repair_rounds\":2"), "{text}");
-        assert!(text.contains("\"drafting_round\":\"data_repair\""), "{text}");
+        assert!(
+            text.contains("\"drafting_round\":\"data_repair\""),
+            "{text}"
+        );
         #[derive(serde::Deserialize)]
         struct WithoutTheFields {
             product_id: String,

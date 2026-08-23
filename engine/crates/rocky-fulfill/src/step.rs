@@ -1368,6 +1368,103 @@ fn fault_point(name: &str) {
 #[cfg(not(debug_assertions))]
 fn fault_point(_name: &str) {}
 
+#[cfg(all(test, feature = "duckdb"))]
+mod check_evidence {
+    use super::render_check_findings;
+    use rocky_cli::commands::fulfill_api::{ObservedCheck, ObservedChecks};
+
+    fn finding(column: Option<&str>, test_type: &str, detail: Option<&str>) -> ObservedCheck {
+        ObservedCheck {
+            model: "revenue_daily".to_string(),
+            column: column.map(str::to_string),
+            test_type: test_type.to_string(),
+            status: "fail".to_string(),
+            severity: "error".to_string(),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    /// The evidence must carry WHAT WAS MEASURED, not just that
+    /// something failed. A repair worker handed "a test failed" has
+    /// nothing to act on; handed the column and the count, it does.
+    #[test]
+    fn the_evidence_names_the_check_the_column_and_the_actual_value() {
+        let observed = ObservedChecks {
+            declared: 5,
+            executed: 5,
+            passed: 3,
+            failed: 2,
+            warned: 0,
+            errored: 0,
+            unevaluated: 0,
+            findings: vec![
+                finding(
+                    Some("client_id"),
+                    "unique",
+                    Some("4 duplicate value(s) found"),
+                ),
+                finding(
+                    None,
+                    "row_count_range",
+                    Some("row count 0 outside range [1, +inf)"),
+                ),
+            ],
+        };
+        let rendered = render_check_findings(&observed);
+        assert!(
+            rendered.contains("3 of 5 declared data checks passed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("revenue_daily.client_id [unique]"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("4 duplicate value(s) found"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("revenue_daily [row_count_range]"),
+            "a check with no column still renders cleanly: {rendered}"
+        );
+        assert!(
+            rendered.contains("row count 0 outside range [1, +inf)"),
+            "{rendered}"
+        );
+    }
+
+    /// "0 of 0 passed" and "12 of 12 passed" are very different
+    /// assurances, and the reader must be able to tell them apart. This
+    /// is the observation-side face of the #1495 rule.
+    #[test]
+    fn an_empty_pass_is_not_rendered_as_a_full_one() {
+        let nothing = ObservedChecks {
+            declared: 0,
+            executed: 0,
+            passed: 0,
+            failed: 0,
+            warned: 0,
+            errored: 0,
+            unevaluated: 0,
+            findings: vec![],
+        };
+        assert_eq!(
+            render_check_findings(&nothing),
+            "0 of 0 declared data checks passed"
+        );
+        let everything = ObservedChecks {
+            declared: 12,
+            executed: 12,
+            passed: 12,
+            ..nothing
+        };
+        assert_eq!(
+            render_check_findings(&everything),
+            "12 of 12 declared data checks passed"
+        );
+    }
+}
+
 #[cfg(test)]
 mod deferred_check_counting {
     use super::deferred_report;

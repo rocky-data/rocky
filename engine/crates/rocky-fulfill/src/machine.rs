@@ -3743,7 +3743,7 @@ mod tests {
     // =====================================================================
 
     #[test]
-    fn applied_observes_then_settles_into_observing() {
+    fn applied_journals_the_reading_then_reads_the_declared_checks() {
         let d = decide(&rec(FulfillState::Applied), Event::Reentry, now());
         assert_eq!(d, Decision::Act(TaskKind::Observe));
         let d = decide(
@@ -3755,10 +3755,19 @@ mod tests {
             },
             now(),
         );
-        let Decision::AdvanceAndStop { record, event, .. } = d else {
-            panic!("expected AdvanceAndStop, got {d:?}");
+        let Decision::AdvanceAndAct {
+            record,
+            event,
+            task,
+        } = d
+        else {
+            panic!("expected AdvanceAndAct, got {d:?}");
         };
-        assert_eq!(record.state, FulfillState::Observing);
+        // The staleness/test reading is journaled where it happened, but
+        // NO health is claimed yet: `observing` is not reachable until
+        // the declared checks have been read.
+        assert_eq!(record.state, FulfillState::Applied, "no state claimed yet");
+        assert_eq!(task, TaskKind::ObserveChecks);
         assert!(event.contains("staleness fresh"));
     }
 
@@ -3775,12 +3784,428 @@ mod tests {
             },
             now(),
         );
+        let Decision::AdvanceAndAct {
+            record,
+            event,
+            task,
+        } = d
+        else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Observing, "stays observing");
+        assert_eq!(task, TaskKind::ObserveChecks);
+        assert!(event.contains("tests RED"));
+        assert!(event.contains("staleness STALE"));
+    }
+
+    // =====================================================================
+    // F3 — the declared data checks, read against the APPLIED output
+    // =====================================================================
+
+    /// The reading, with everything green unless a field says otherwise.
+    fn checks(failed: usize, errored: usize, warned: usize, deferred: Option<usize>) -> Event {
+        Event::ObservationChecks {
+            failed,
+            errored,
+            warned,
+            deferred,
+            detail: "revenue_daily.client_id [unique] fail (error): 4 duplicate value(s) found"
+                .into(),
+        }
+    }
+
+    /// THE REGRESSION PIN. A clean reading still lands `observing`, from
+    /// both entry states, and it is the only verdict that does.
+    #[test]
+    fn a_clean_reading_is_the_only_path_to_observing() {
+        for from in [FulfillState::Applied, FulfillState::Observing] {
+            let mut prior = rec(from.clone());
+            // A product that spent budget on an earlier red arrives here
+            // carrying it; a closed cycle refills the ceiling.
+            prior.data_repair_rounds = 2;
+            prior.observation_detail = Some("stale evidence from the last red".into());
+            let d = decide(&prior, checks(0, 0, 0, Some(0)), now());
+            let Decision::AdvanceAndStop { record, event, .. } = d else {
+                panic!("expected AdvanceAndStop from {from:?}, got {d:?}");
+            };
+            assert_eq!(record.state, FulfillState::Observing, "from {from:?}");
+            assert_eq!(record.data_repair_rounds, 0, "the cycle closed");
+            assert_eq!(
+                record.observation_detail, None,
+                "evidence from a red that is no longer true must not survive it"
+            );
+            assert!(event.contains("green"), "{event}");
+        }
+    }
+
+    /// Freshness and warning-severity checks REPORT; they never route.
+    ///
+    /// Staleness is a scheduling fact far more often than a model defect,
+    /// and a `severity = "warning"` check is by definition one the
+    /// product did not declare disqualifying. Rewriting SQL on either
+    /// would spend a live-table cycle on something the rewrite cannot
+    /// fix.
+    #[test]
+    fn warnings_and_staleness_report_but_never_route_to_repair() {
+        // Stale, and its model tests red — the pre-F3 signals — with
+        // every declared check passing.
+        let d = decide(
+            &rec(FulfillState::Applied),
+            Event::ObservationDone {
+                test_green: false,
+                staleness_ok: Some(false),
+                detail: "lag 200000s, budget 86400s".into(),
+            },
+            now(),
+        );
+        assert!(
+            matches!(d, Decision::AdvanceAndAct { task, .. } if task == TaskKind::ObserveChecks),
+            "staleness routes nowhere on its own: {d:?}"
+        );
+        let d = decide(&rec(FulfillState::Applied), checks(0, 0, 7, Some(0)), now());
         let Decision::AdvanceAndStop { record, event, .. } = d else {
             panic!("expected AdvanceAndStop, got {d:?}");
         };
-        assert_eq!(record.state, FulfillState::Observing, "stays observing");
-        assert!(event.contains("tests RED"));
-        assert!(event.contains("staleness STALE"));
+        assert_eq!(
+            record.state,
+            FulfillState::Observing,
+            "seven warnings are seven reports, not a defect"
+        );
+        assert!(
+            event.contains("7 warned"),
+            "the count is journaled: {event}"
+        );
+    }
+
+    /// A first red is RECORDED, in a state that says what is wrong, and
+    /// the loop stops there. It does not repair on one reading.
+    #[test]
+    fn a_first_data_red_lands_the_visibly_distinct_state_and_stops() {
+        let d = decide(&rec(FulfillState::Applied), checks(1, 0, 0, Some(0)), now());
+        let Decision::AdvanceAndStop {
+            record,
+            event,
+            stop,
+        } = d
+        else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::ObservedFailing);
+        assert_ne!(
+            record.state,
+            FulfillState::Observing,
+            "a failing product must never be recorded as a healthy one"
+        );
+        assert_eq!(
+            record.data_repair_rounds, 0,
+            "recording a red spends nothing; only a confirmed one does"
+        );
+        assert_eq!(
+            record.observation_detail.as_deref(),
+            Some("revenue_daily.client_id [unique] fail (error): 4 duplicate value(s) found"),
+            "the evidence is persisted for the worker that must act on it"
+        );
+        assert!(event.contains("FAILING"), "{event}");
+        // The human-facing message names the check and the actual value,
+        // and promises the review gate rather than a silent fix.
+        assert!(
+            stop.message
+                .contains("failing its own declared data checks")
+        );
+        assert!(stop.message.contains("4 duplicate value(s) found"));
+        assert!(stop.message.contains("review"));
+    }
+
+    /// Resume honesty: entering the data-red state re-READS the checks.
+    /// Nothing loads the stored verdict.
+    #[test]
+    fn the_data_red_state_re_reads_the_checks_rather_than_assuming_the_verdict() {
+        let mut prior = rec(FulfillState::ObservedFailing);
+        prior.observation_detail = Some("the verdict from before the crash".into());
+        assert_eq!(
+            decide(&prior, Event::Reentry, now()),
+            Decision::Act(TaskKind::Observe),
+            "a crashed data-red resumes into a reading, never into its own last answer"
+        );
+        // And a re-read that comes back CLEAN releases it — a red is not
+        // a trap, it is the current answer.
+        let d = decide(&prior, checks(0, 0, 0, Some(0)), now());
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Observing);
+        assert_eq!(record.observation_detail, None);
+    }
+
+    /// A CONFIRMED red — a second, independent reading — spends exactly
+    /// one round and dispatches the data-repair brief.
+    #[test]
+    fn a_confirmed_data_red_spends_one_round_and_dispatches_the_data_repair_task() {
+        let mut prior = rec(FulfillState::ObservedFailing);
+        prior.data_repair_rounds = 1;
+        prior.drafting_attempts = 5;
+        prior.observation_detail = Some("the FIRST reading's evidence".into());
+        let d = decide(&prior, checks(2, 0, 0, Some(0)), now());
+        let Decision::AdvanceAndAct {
+            record,
+            event,
+            task,
+        } = d
+        else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(record.state, FulfillState::Drafting);
+        assert_eq!(task, TaskKind::DataRepair);
+        assert_eq!(record.data_repair_rounds, 2, "exactly one round spent");
+        assert_eq!(record.repair_rounds, 0, "the verify budget is untouched");
+        assert_eq!(record.drafting_attempts, 1, "a fresh compile-loop budget");
+        assert_eq!(
+            record.drafting_round,
+            DraftingRound::DataRepair,
+            "persisted WITH the deciding transition, so a crash before the \
+             worker starts resumes into the same round"
+        );
+        assert_eq!(
+            record.observation_detail.as_deref(),
+            Some("revenue_daily.client_id [unique] fail (error): 4 duplicate value(s) found"),
+            "the worker acts on what is true NOW, not on the first reading"
+        );
+        assert!(event.contains("data repair round 2"), "{event}");
+    }
+
+    /// An errored check is "cannot tell", and cannot tell is neither
+    /// health nor a licence to rewrite a model.
+    #[test]
+    fn an_errored_check_holds_and_never_reads_as_health() {
+        let d = decide(
+            &rec(FulfillState::Observing),
+            checks(0, 3, 0, Some(0)),
+            now(),
+        );
+        let Decision::AdvanceAndStop {
+            record,
+            event,
+            stop,
+        } = d
+        else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::Applied,
+            "applied, observation not concluded — never a healthy `observing`"
+        );
+        assert_eq!(record.data_repair_rounds, 0, "no round is spent on a guess");
+        assert!(event.contains("not evaluable"), "{event}");
+        assert!(stop.message.contains("could not be evaluated"));
+    }
+
+    /// A reading that cannot even count is not a reading of zero
+    /// problems — the #1495 rule, on the observation side.
+    #[test]
+    fn an_uncountable_reading_holds_rather_than_claiming_zero() {
+        for deferred in [None, Some(2)] {
+            let d = decide(
+                &rec(FulfillState::Applied),
+                checks(0, 0, 0, deferred),
+                now(),
+            );
+            let Decision::AdvanceAndStop { record, event, .. } = d else {
+                panic!("expected AdvanceAndStop for {deferred:?}, got {d:?}");
+            };
+            assert_eq!(
+                record.state,
+                FulfillState::Applied,
+                "an incomplete reading claims nothing: {deferred:?}"
+            );
+            assert!(event.contains("not evaluable"), "{event}");
+        }
+    }
+
+    /// No new news does not clear old news.
+    #[test]
+    fn an_unevaluable_reading_from_the_data_red_state_stays_failing() {
+        let mut prior = rec(FulfillState::ObservedFailing);
+        prior.observation_detail = Some("4 duplicate value(s) found".into());
+        let d = decide(&prior, checks(0, 1, 0, Some(0)), now());
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert_eq!(
+            record.state,
+            FulfillState::ObservedFailing,
+            "a product already known to be failing is not cleared by a reading \
+             that could not tell"
+        );
+        assert_eq!(
+            record.observation_detail.as_deref(),
+            Some("4 duplicate value(s) found"),
+            "and the last real evidence survives"
+        );
+    }
+
+    /// The ceiling binds: repeated data-reds land `blocked`, naming the
+    /// check. No unbounded repair cycle against a live table.
+    #[test]
+    fn repeated_data_reds_exhaust_the_ceiling_and_block_naming_the_check() {
+        for from in [FulfillState::Applied, FulfillState::ObservedFailing] {
+            let mut prior = rec(from.clone());
+            prior.data_repair_rounds = MAX_REPAIR_ROUNDS;
+            let d = decide(&prior, checks(1, 0, 0, Some(0)), now());
+            let Decision::AdvanceAndStop {
+                record,
+                event,
+                stop,
+            } = d
+            else {
+                panic!("expected AdvanceAndStop from {from:?}, got {d:?}");
+            };
+            let FulfillState::Blocked { reason } = &record.state else {
+                panic!("expected blocked from {from:?}, got {:?}", record.state);
+            };
+            assert!(
+                reason.contains("4 duplicate value(s) found"),
+                "the block names the check that would not go green: {reason}"
+            );
+            assert!(reason.contains(&MAX_REPAIR_ROUNDS.to_string()), "{reason}");
+            assert!(event.contains("budget exhausted"), "{event}");
+            assert_eq!(
+                stop.next_command.as_deref(),
+                Some("rocky fulfill revenue_daily --retry"),
+                "a human is the escalation, not another round"
+            );
+        }
+    }
+
+    /// The two budgets are separate because they RESET differently, and
+    /// this is the difference that makes the data ceiling bind at all.
+    ///
+    /// `decide_proposed` clears `repair_rounds` on every successful
+    /// propose. A data-red cycle proposes every lap (red → repair →
+    /// propose → apply → red), so a shared counter would be zeroed each
+    /// time and the ceiling would never be reached.
+    #[test]
+    fn a_propose_resets_the_verify_budget_and_never_the_data_budget() {
+        let mut prior = rec(FulfillState::Verifying);
+        prior.repair_rounds = 2;
+        prior.data_repair_rounds = 2;
+        let d = decide(
+            &prior,
+            Event::Proposed {
+                outcome: ProposeSummary::Written {
+                    plan_id: "plan-2".into(),
+                },
+                plan_payload_digest: None,
+                approved_digest: None,
+                idempotency_key: "k".into(),
+            },
+            now(),
+        );
+        let Decision::Advance { record, .. } = d else {
+            panic!("expected Advance, got {d:?}");
+        };
+        assert_eq!(record.repair_rounds, 0, "the verify cycle closed");
+        assert_eq!(
+            record.data_repair_rounds, 2,
+            "the data cycle has NOT closed — the output is not observed yet, \
+             and zeroing here is what would make the ceiling vacuous"
+        );
+    }
+
+    /// A human intervention refills both budgets and drops the evidence.
+    #[test]
+    fn a_retry_and_a_supersession_both_clear_the_data_budget_and_evidence() {
+        let mut blocked_rec = rec(FulfillState::Blocked {
+            reason: "the applied output still fails its declared data checks".into(),
+        });
+        blocked_rec.spec_digest = Some("sha256:aa".into());
+        blocked_rec.data_repair_rounds = MAX_REPAIR_ROUNDS;
+        blocked_rec.observation_detail = Some("4 duplicate value(s) found".into());
+        let Decision::Advance { record, .. } = decide(&blocked_rec, Event::RetryRequested, now())
+        else {
+            panic!("expected Advance");
+        };
+        assert_eq!(record.data_repair_rounds, 0);
+        assert_eq!(record.observation_detail, None);
+
+        let mut superseded = rec(FulfillState::Superseded {
+            old_digest: "sha256:aa".into(),
+            new_digest: "sha256:bb".into(),
+        });
+        superseded.data_repair_rounds = 2;
+        superseded.observation_detail = Some("4 duplicate value(s) found".into());
+        let Decision::Advance { record, .. } = decide(&superseded, Event::Reentry, now()) else {
+            panic!("expected Advance");
+        };
+        assert_eq!(record.data_repair_rounds, 0);
+        assert_eq!(
+            record.observation_detail, None,
+            "a new generation may not even declare the check the old one failed"
+        );
+    }
+
+    /// The verdict ORDER is the decision. Positive evidence of failure
+    /// outranks an incomplete reading; an incomplete reading outranks a
+    /// clean tally.
+    #[test]
+    fn the_check_verdict_ranks_evidence_above_an_incomplete_reading() {
+        // Failure wins even when the rest of the reading is unusable —
+        // one proven failure is enough to act on.
+        assert_eq!(
+            classify_checks(1, 9, None),
+            CheckVerdict::Failing,
+            "a proven failure is not withheld because other checks errored"
+        );
+        // Incomplete outranks clean: the tally alone looks identical.
+        assert_eq!(classify_checks(0, 1, Some(0)), CheckVerdict::Unevaluable);
+        assert_eq!(classify_checks(0, 0, None), CheckVerdict::Unevaluable);
+        assert_eq!(classify_checks(0, 0, Some(1)), CheckVerdict::Unevaluable);
+        // Clean is the narrow case: everything declared ran, none failed.
+        assert_eq!(classify_checks(0, 0, Some(0)), CheckVerdict::Clean);
+    }
+
+    /// The evidence is warehouse-shaped, so it is capped — and the cap
+    /// is announced, never silent.
+    #[test]
+    fn the_evidence_is_capped_on_a_char_boundary_and_says_so() {
+        let short = "revenue_daily.client_id [unique]: 4 duplicate value(s)";
+        assert_eq!(truncate_detail(short), short, "short evidence is untouched");
+
+        // Multi-byte characters straddling the cut: slicing at the raw
+        // byte index would panic.
+        let long = "é".repeat(MAX_OBSERVATION_DETAIL);
+        let capped = truncate_detail(&long);
+        assert!(capped.contains("evidence truncated"), "the loss is named");
+        assert!(
+            capped.starts_with("éé"),
+            "the head of the evidence survives: {}",
+            &capped[..8]
+        );
+        assert!(capped.len() < long.len());
+
+        // And the cap is what the record actually stores.
+        let mut prior = rec(FulfillState::Applied);
+        prior.data_repair_rounds = 0;
+        let d = decide(
+            &prior,
+            Event::ObservationChecks {
+                failed: 1,
+                errored: 0,
+                warned: 0,
+                deferred: Some(0),
+                detail: "x".repeat(MAX_OBSERVATION_DETAIL + 500),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndStop { record, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let stored = record.observation_detail.expect("evidence recorded");
+        assert!(
+            stored.len() < MAX_OBSERVATION_DETAIL + 100,
+            "the record does not grow without bound: {} bytes",
+            stored.len()
+        );
     }
 
     // =====================================================================
