@@ -5609,4 +5609,67 @@ mod tests {
             );
         }
     }
+
+    /// #1517 — the decision table for "may this server write a sign-off
+    /// marker?", enumerated over EVERY profile rather than sampled. Approving
+    /// is off unless the operator asked for it, and the `#[default]` variant
+    /// is one of the profiles that cannot.
+    ///
+    /// The `McpProfile::default()` assertion is the load-bearing one: the
+    /// whole issue was that the no-flag command pointed the wrong way, and
+    /// `#[derive(Default)]` + `#[default]` means moving that attribute one
+    /// variant down would silently arm approving for every existing agent.
+    #[test]
+    fn only_the_approver_profile_serves_the_approve_action() {
+        assert_eq!(
+            McpProfile::default(),
+            McpProfile::Default,
+            "the profile served with no flag is the one that cannot approve"
+        );
+        assert!(
+            !server_with(McpProfile::Default).approve_action_served(),
+            "default profile: approving is refused"
+        );
+        assert!(
+            !server_with(McpProfile::Worker).approve_action_served(),
+            "worker profile: approving is refused"
+        );
+        assert!(
+            server_with(McpProfile::Approver).approve_action_served(),
+            "approver profile: approving is served — the opt-in does something"
+        );
+    }
+
+    /// #1517 — the opt-in enables an ACTION, it does not add a TOOL.
+    ///
+    /// Two things ride on this. The `briefs.rs` excluded-tool golden derives
+    /// its list as default-minus-worker, so a refactor that tried to express
+    /// the approve opt-in by adding or removing a ROUTE would silently move
+    /// that golden. And the split itself: `review_queue` must still be served
+    /// on the default profile, because listing the queue stays available.
+    #[test]
+    fn approver_profile_adds_an_action_not_a_tool() {
+        let default_tools = server_with(McpProfile::Default).tool_names();
+        let approver_tools = server_with(McpProfile::Approver).tool_names();
+        assert_eq!(
+            default_tools, approver_tools,
+            "the approver profile serves exactly the default profile's tools"
+        );
+        assert!(
+            default_tools.iter().any(|t| t == "review_queue"),
+            "`review_queue` is still served on the default profile — listing is not gated"
+        );
+
+        // The worker profile is untouched by #1517: still the smaller
+        // allowlist, still with no `review_queue` at all.
+        let worker_tools = server_with(McpProfile::Worker).tool_names();
+        assert!(
+            worker_tools.len() < default_tools.len(),
+            "the worker profile is still a strict subset"
+        );
+        assert!(
+            !worker_tools.iter().any(|t| t == "review_queue"),
+            "the worker profile still serves no `review_queue` at all"
+        );
+    }
 }

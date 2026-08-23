@@ -4844,6 +4844,59 @@ mod tests {
     // resolve_output — `--output` default resolution
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // `rocky mcp --profile` — the #1517 approve opt-in
+    // -----------------------------------------------------------------------
+
+    /// The refusal message in `rocky-mcp` tells the operator to run `rocky mcp
+    /// --profile approver`. This proves clap actually PARSES that exact
+    /// spelling: `ValueEnum` derives the value name from the variant, so a
+    /// rename would leave the message pointing at a flag that errors out —
+    /// precisely the 3am failure the opt-in exists to prevent.
+    #[test]
+    fn mcp_profile_arg_accepts_approver() {
+        let cli = Cli::try_parse_from(["rocky", "mcp", "--profile", "approver"])
+            .expect("`--profile approver` is the spelling the refusal message names");
+        let Command::Mcp { profile, .. } = cli.command else {
+            panic!("expected the mcp command");
+        };
+        assert_eq!(profile, McpProfileArg::Approver);
+        assert_eq!(
+            rocky_mcp::McpProfile::from(profile),
+            rocky_mcp::McpProfile::Approver,
+            "the CLI mirror maps to the profile that serves approving"
+        );
+    }
+
+    /// `rocky mcp` with NO flag is the shape the issue was about: it must land
+    /// on the profile that refuses to approve.
+    #[test]
+    fn mcp_with_no_profile_flag_cannot_approve() {
+        let cli = Cli::try_parse_from(["rocky", "mcp"]).expect("bare `rocky mcp` parses");
+        let Command::Mcp { profile, .. } = cli.command else {
+            panic!("expected the mcp command");
+        };
+        assert_eq!(profile, McpProfileArg::Default);
+        assert_eq!(
+            rocky_mcp::McpProfile::from(profile),
+            rocky_mcp::McpProfile::Default,
+        );
+    }
+
+    /// The worker profile is untouched by #1517 — same spelling, same mapping.
+    #[test]
+    fn mcp_profile_arg_worker_is_unchanged() {
+        let cli = Cli::try_parse_from(["rocky", "mcp", "--profile", "worker"])
+            .expect("`--profile worker` still parses");
+        let Command::Mcp { profile, .. } = cli.command else {
+            panic!("expected the mcp command");
+        };
+        assert_eq!(
+            rocky_mcp::McpProfile::from(profile),
+            rocky_mcp::McpProfile::Worker,
+        );
+    }
+
     #[test]
     fn resolve_output_explicit_json_wins_over_tty() {
         assert_eq!(
