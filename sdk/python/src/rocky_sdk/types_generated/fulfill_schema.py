@@ -41,6 +41,6 @@ class FulfillOutput(BaseModel):
     """
     state: str
     """
-    The state the record was left in (its wire tag, e.g. `"needs_input"`, `"proposed"`, `"observing"`, `"blocked"`).
+    The state the record was left in (its wire tag, e.g. `"needs_input"`, `"proposed"`, `"observing"`, `"blocked"`, `"observed_failing"` — applied, and the applied output is failing a check the product declared about itself).
     """
     version: str
