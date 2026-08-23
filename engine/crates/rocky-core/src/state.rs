@@ -549,10 +549,24 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   because the version check runs at OPEN and `[state]
 ///   on_schema_mismatch` engages there ([`SchemaMismatchPolicy::Fail`]
 ///   refuses with the version pair; [`SchemaMismatchPolicy::Recreate`]
-///   bootstraps a fresh store). A downgrade loses the in-flight loop
-///   record, which is acceptable precisely because `fulfill_state` is in
-///   [`LOCAL_ONLY_TABLE_NAMES`]: per-machine loop state a re-run
-///   rebuilds, not shared history. The variant's read behaviour under an
+///   bootstraps a fresh store).
+///
+///   **What losing the record does and does not cost — stated carefully,
+///   because an earlier version of this note overclaimed.** `fulfill_state`
+///   is in [`LOCAL_ONLY_TABLE_NAMES`], so the record is per-machine loop
+///   state rather than shared history, and a re-run rebuilds the LOOP's
+///   position. It does not follow that the loss is free. The loop derives
+///   its proposal nonce from `journal_seq`, and a plan id is a hash of the
+///   plan payload, so a recreated state that reaches the same journal
+///   position can mint the same plan id — while `.rocky/plans/<id>.reviewed.json`
+///   sits outside this store and survives. A surviving marker would then
+///   approve a freshly-minted proposal. That is a pre-existing custody
+///   property, not something this bump introduces, but the bump is where
+///   the "losing it is fine" claim is written down, so it is corrected
+///   here rather than repeated. Tracked separately; do not rely on state
+///   loss being harmless.
+///
+///   The variant's read behaviour under an
 ///   older vocabulary is pinned by
 ///   `fulfill::tests::the_data_red_state_round_trips_and_is_a_hard_error_on_an_older_reader`,
 ///   so "the version gate is what protects the downgrade" stays true by
@@ -10772,7 +10786,14 @@ mod tests {
         // guarded by `test_v22_opens_and_creates_fulfill_tables`. Both are
         // local-only (the approval record points at snapshot bytes replication
         // does not transport — see the v22 stanza on CURRENT_SCHEMA_VERSION).
-        const EXPECTED_VERSION: u32 = 22;
+        //
+        // v23 adds the F3 data-red vocabulary to `FulfillStateRecord` and
+        // `FulfillState`. NO table change — `EXPECTED_TABLES` is deliberately
+        // unchanged below — so this stanza moves the version only. The
+        // record-shape and unknown-variant behaviour are guarded in
+        // `fulfill.rs`; what is pinned HERE is that the on-disk version moved
+        // with them, which is the thing the open-time mismatch gate reads.
+        const EXPECTED_VERSION: u32 = 23;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

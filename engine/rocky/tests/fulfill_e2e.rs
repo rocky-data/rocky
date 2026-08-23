@@ -1891,3 +1891,106 @@ fn a_crash_at_every_observation_seam_resumes_into_a_re_read() {
     assert_eq!(code, 0, "repaired apply: {err}");
     assert_eq!(json.expect("json")["state"], "observing");
 }
+
+/// Deleting a check must not beat fixing it.
+///
+/// The sidecar holding the declared `[[tests]]` is byte-verified against
+/// the committed lowering manifest at Phase B and then not looked at
+/// again until observation — which is after an apply, and arbitrarily
+/// later. Without a custody gate at that point, emptying the sidecar
+/// yields `declared = 0`, which tallies identically to "every declared
+/// check passed": the loop would transition a known-red product to a
+/// healthy `observing`, clear the evidence, and refund the repair budget,
+/// all while the bad table sits untouched.
+///
+/// That also makes the repair ceiling meaningless — alternate removing
+/// and restoring the checks and the budget refills every lap.
+///
+/// So a sidecar that no longer matches what was approved is UNEVALUABLE:
+/// the checks are not run, the state does not move, and the loop says
+/// why. Deliberately not `blocked` — a human editing their own models
+/// directory is ordinary and must not strand the product.
+#[test]
+fn emptying_the_sidecar_cannot_turn_a_known_red_into_observing() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_data_repair(DRAFT_SQL));
+
+    let plan = drive_to_plan_review(dir);
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 4, "the product is observed red first");
+    assert_eq!(json.expect("json")["state"], "observed_failing");
+    assert!(
+        declared_check_count(dir) > 0,
+        "the fixture must declare checks for this to mean anything"
+    );
+
+    // The attack: delete every declared check from the sidecar.
+    let sidecar = dir.join(format!("models/{PRODUCT}.toml"));
+    let text = std::fs::read_to_string(&sidecar).expect("sidecar");
+    let mut document: toml::Table = toml::from_str(&text).expect("sidecar parses");
+    document.remove("tests");
+    document.remove("use_test");
+    std::fs::write(&sidecar, toml::to_string(&document).expect("re-serialize"))
+        .expect("write sidecar");
+    assert_eq!(
+        declared_check_count(dir),
+        0,
+        "the sidecar now declares nothing — the tally a clean run would produce"
+    );
+
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_ne!(
+        json["state"], "observing",
+        "a product whose checks were DELETED must never read as healthy: {json}"
+    );
+    assert_eq!(
+        json["state"], "observed_failing",
+        "and the known red is not cleared by a reading that could not be trusted: {json} {err}"
+    );
+    assert_eq!(code, 4, "still the data-red exit code");
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("not the ones that were approved"),
+        "the stop says the checks on disk are not the approved ones: {message}"
+    );
+
+    // The evidence and the budget both survive — otherwise the ceiling
+    // could be refilled by editing a file.
+    let store = state_store(dir);
+    let record = store
+        .fulfill_state_get(PRODUCT)
+        .expect("state")
+        .expect("record");
+    assert!(
+        record
+            .observation_detail
+            .as_deref()
+            .is_some_and(|d| d.contains("violating row")),
+        "the recorded evidence survives: {:?}",
+        record.observation_detail
+    );
+    assert_eq!(
+        record.data_repair_rounds, 0,
+        "no round was spent on a reading that never ran"
+    );
+    drop(store);
+
+    // Restoring the approved sidecar makes it evaluable again — the gate
+    // holds, it does not latch.
+    std::fs::write(&sidecar, &text).expect("restore sidecar");
+    let (code, json, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(code, 4, "the red is still there, and readable again");
+    assert_eq!(json["state"], "observed_failing", "{json}");
+    assert!(
+        json["message"]
+            .as_str()
+            .expect("message")
+            .contains("violating row"),
+        "and the real finding is reported again: {json}"
+    );
+}
