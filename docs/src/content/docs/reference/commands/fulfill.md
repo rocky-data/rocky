@@ -14,10 +14,12 @@ rocky fulfill <product>
    ├─ spec approved ─▶ verify posture ─▶ lower contract ─▶ agent drafts SQL
    │                   (worker profile: read + compile/test + draft tools only)
    ├─ runner re-verifies from disk ─▶ governed propose ─▶ you: rocky review <plan> --approve
-   └─ digest-gated apply ─▶ observe (tests + freshness)
+   ├─ digest-gated apply ─▶ observe (tests + freshness + the declared data checks)
+   └─ a declared check FAILS on the live table ─▶ observed_failing ─▶ repair round
+                                               ─▶ a NEW plan ─▶ you approve again
 ```
 
-Every stop prints the state, why the loop stopped, and the next command. Exit codes: `0` clean stop (including a waiting ask and `observing`) · `2` blocked · `3` parked at `applying_unknown` for a human. `1` stays the generic command-error code, so a script can tell a parked receipt from a crashed command.
+Every stop prints the state, why the loop stopped, and the next command. Exit codes: `0` clean stop (including a waiting ask and `observing`) · `2` blocked · `3` parked at `applying_unknown` for a human · `4` `observed_failing` — the plan applied, and the applied output is failing a check the product declared about itself. `1` stays the generic command-error code, so a script can tell a parked receipt from a crashed command.
 
 ---
 
@@ -38,6 +40,41 @@ The loop trusts nothing it did not verify itself:
 - Only a `Succeeded` outcome is ever journaled as applied. An apply deflected as already-running keeps waiting. A resumed crash asks the idempotency store for an authoritative receipt; a backend that cannot answer leaves the state for a human, never a blind retry.
 
 `--retry` re-enters a `blocked` product after you fix the printed remedy.
+
+### When the applied output is wrong
+
+The checks your spec declares about its output — the grain, the `checks` list,
+the non-null columns — need a table to run against. They cannot run before the
+apply, so the loop reports them deferred at verify and runs them at observation,
+where the table finally exists.
+
+A check that FAILS there is different from every other failure the loop handles:
+the wrong data is already live. The loop does not roll it back. It does this
+instead:
+
+1. Records `observed_failing` — never a healthy-looking `observing` — and prints
+   which check failed and what it measured.
+2. On your next run, reads the checks AGAIN. A reading that has gone green
+   releases the product; nothing trusts the stored verdict.
+3. If it is still failing, spends one repair round: the drafting agent gets the
+   failing check and its actual values, and rewrites the model.
+4. Proposes the repaired model as a NEW plan. You review and approve it exactly
+   like the first one. The earlier approval buys it nothing — a bare apply of the
+   repaired plan refuses, and the plan carries a new id, so the marker you wrote
+   for the failing plan cannot be reused.
+
+Repair rounds are bounded. Repeated failures land `blocked`, naming the check
+that would not go green, so a product can never cycle you forever on a defect the
+agent cannot fix.
+
+Two things report rather than route. **Staleness** is usually a scheduling fact,
+not a model defect — rewriting SQL cannot fix a job that did not run.
+**Warning-severity checks** are ones you declared as not disqualifying. Both are
+printed and journaled; neither starts a repair.
+
+A check the loop cannot EVALUATE is not a check that passed. If a check errors —
+its SQL will not run, the column is missing — the loop holds at `applied` and
+says so, rather than claiming health or rewriting a model on a guess.
 
 Two invocations never fight: every state write is a compare-and-swap, and a loop that finds a live owner prints its pid and exits. A crashed owner is taken over automatically — a dead pid is detected by its start time, so a recycled pid never counts as alive.
 
