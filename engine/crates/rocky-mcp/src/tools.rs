@@ -41,7 +41,7 @@ const INSTRUCTIONS: &str = include_str!("../../../../.claude/skills/rocky-ai-wor
 /// banner re-frames it up front: name what is absent, and redirect every
 /// ending to the typed hand-off to the trusted runner.
 const WORKER_INSTRUCTIONS_BANNER: &str = "WORKER PROFILE ACTIVE: this server serves the minimal \
-drafting allowlist. The propose, review_queue, draft_contract, draft_metadata, and \
+drafting allowlist. The propose, review_queue, draft_contract, draft_check, draft_metadata, and \
 pause_schedule tools are NOT available in this session, and the workflow below is the full \
 authoring map, parts of which belong to the trusted runner. Where it reaches contract or \
 metadata authorship, or the propose -> review -> apply chain, STOP: end every workflow at the \
@@ -60,19 +60,23 @@ const WORKER_PROMPT_DESCRIPTIONS: &[(&str, &str)] = &[
         "build_model",
         "Guide the authoring of one Rocky model from a plain-language intent: inspect schema -> \
          sample rows -> profile columns -> draft_model -> compile-loop -> plan preview -> \
-         draft_check + test. Worker profile: ends at the typed hand-off to the trusted runner.",
+         test. Worker profile: checks are spec-owned here, so report what you would assert \
+         rather than writing it; ends at the typed hand-off to the trusted runner.",
     ),
     (
         "find_untested_models",
-        "Find models with no declarative tests and draft tests for them: catalog -> identify \
-         untested models -> ground with sample_rows / profile_column -> author the checks -> \
-         draft_check -> test. Worker profile: ends at the typed hand-off to the trusted runner.",
+        "Find models with no declarative tests: catalog -> identify untested models -> ground \
+         with sample_rows / profile_column -> describe the checks each one needs. Worker \
+         profile: checks are spec-owned here, so this ends in a REPORT, not a write — name \
+         the models, the columns, and the assertion each needs, and hand off to the trusted \
+         runner.",
     ),
     (
         "add_tests_to_pks",
-        "Add uniqueness + not-null tests to a model's primary-key / unique columns: \
-         inspect_schema -> confirm the keys with profile_column -> author the checks -> \
-         draft_check -> test. Worker profile: ends at the typed hand-off to the trusted runner.",
+        "Identify a model's primary-key / unique columns and the uniqueness + not-null tests \
+         they need: inspect_schema -> confirm the keys with profile_column. Worker profile: \
+         checks are spec-owned here, so this ends in a REPORT, not a write — name the keys \
+         you confirmed and the assertions they need, and hand off to the trusted runner.",
     ),
     (
         "summarize_project",
@@ -124,8 +128,9 @@ pub enum McpProfile {
     Approver,
     /// The minimal drafting-worker allowlist (`--profile worker`): read /
     /// inspect grounding tools, the compile/test/breaking-change/dependents
-    /// verification loop, `draft_model` + `draft_check`, and the prompts.
-    /// Everything else — including `draft_contract`, `draft_metadata`,
+    /// verification loop, `draft_model`, and the prompts.
+    /// Everything else — including `draft_contract`, `draft_check`,
+    /// `draft_metadata`,
     /// `review_queue`, `pause_schedule`, `propose`, and any FUTURE tool not
     /// explicitly allowlisted — is absent from the listing and returns
     /// tool-not-found when called.
@@ -137,19 +142,36 @@ pub enum McpProfile {
 /// consciously opt in here (the golden profile tests pin both surfaces).
 ///
 /// Rationale (FF-DESIGN D7 ⟦RTL-1,3⟧): the untrusted drafting worker needs
-/// grounding reads and the compile/test loop for `models/<model>.sql` plus
-/// append-only checks. Contracts and metadata are spec-owned in the
-/// fulfillment loop — a worker-writable contract detaches artifacts from the
-/// spec — and approval/propose/schedule surfaces must never reach it. The
-/// in-engine LLM generator tools (`ai_*`, `suggest_freshness_block`,
-/// `explain_model`) are omitted too: the worker brings its own model, and the
-/// governed metadata path is the runner's, not the worker's.
+/// grounding reads and the compile/test loop for `models/<model>.sql`.
+/// Contracts and metadata are spec-owned in the fulfillment loop — a
+/// worker-writable contract detaches artifacts from the spec — and
+/// approval/propose/schedule surfaces must never reach it. The in-engine LLM
+/// generator tools (`ai_*`, `suggest_freshness_block`, `explain_model`) are
+/// omitted too: the worker brings its own model, and the governed metadata
+/// path is the runner's, not the worker's.
+///
+/// `draft_check` is DELIBERATELY absent, and the reason is worth stating
+/// because the tool is harmless on the Default profile and was allowlisted
+/// here originally. A `[[tests]]` block's `expression` is raw-interpolated
+/// into `SELECT COUNT(*) FROM t WHERE NOT (<expression>)`
+/// (`rocky_core::tests`), whose own comment says the caller is responsible
+/// for sandboxing execution. That was satisfiable while the only caller was
+/// a human typing `rocky test --declarative`. It is not satisfiable now that
+/// the fulfillment loop evaluates the declared checks automatically after
+/// every apply (FF-WP-F3), holding warehouse credentials with no human in
+/// the loop — an untrusted worker able to append checks would be able to
+/// author SQL the loop then runs unattended.
+///
+/// Nothing is lost: the product spec's declared grain and `checks` already
+/// lower into the sidecar's `[[tests]]`, so the checks the loop evaluates
+/// are the ones the operator wrote and approved. Hand-appending them was
+/// redundant. The tool remains on the Default profile, where the caller is
+/// an operator-driven session rather than an untrusted drafting worker.
 const WORKER_PROFILE_TOOLS: &[&str] = &[
     "breaking_change",
     "catalog",
     "compile",
     "dependents",
-    "draft_check",
     "draft_model",
     "inspect_schema",
     "lineage",
@@ -680,6 +702,13 @@ impl RockyMcpServer {
 
     /// The `next_steps` reminder a successful `draft_check` result carries —
     /// profile-selected like [`Self::draft_model_next_steps`].
+    ///
+    /// The worker arm is unreachable in practice: `draft_check` left
+    /// `WORKER_PROFILE_TOOLS`, so a worker session cannot call the tool that
+    /// would produce this text. Kept, and kept correct, because the arm is
+    /// the thing that would be wrong first if the tool were ever
+    /// re-allowlisted — a defaulted or stale arm is how a re-admitted tool
+    /// would ship worker-facing text naming excluded verbs.
     fn draft_check_next_steps(&self) -> &'static str {
         match self.profile {
             McpProfile::Default | McpProfile::Approver => DRAFT_CHECK_NEXT_STEPS,
@@ -5671,5 +5700,60 @@ mod tests {
             !worker_tools.iter().any(|t| t == "review_queue"),
             "the worker profile still serves no `review_queue` at all"
         );
+    }
+
+    /// FF-WP-F3 — the untrusted worker cannot author a declarative check,
+    /// and nothing worker-facing invites it to try.
+    ///
+    /// This is a SECURITY boundary, not tidiness. A `[[tests]]` block's
+    /// `expression` is raw-interpolated into `SELECT COUNT(*) FROM t WHERE
+    /// NOT (<expression>)`, and `rocky_core::tests` says in so many words
+    /// that the caller must sandbox execution. That contract held while the
+    /// only caller was a human typing `rocky test --declarative`. F3 made
+    /// the caller an unattended loop holding warehouse credentials, which
+    /// no sandbox backs — so a worker able to append a check would be able
+    /// to author SQL the loop then executes after every apply.
+    ///
+    /// Asserted on the ROUTED surface rather than on the allowlist constant,
+    /// because the allowlist is an input to route removal and asserting it
+    /// against itself would prove nothing.
+    #[test]
+    fn the_worker_profile_neither_serves_draft_check_nor_names_it() {
+        let worker_tools = server_with(McpProfile::Worker).tool_names();
+        assert!(
+            !worker_tools.iter().any(|t| t == "draft_check"),
+            "a worker session must not be able to author SQL the loop later runs \
+             unattended; served tools were {worker_tools:?}"
+        );
+        // Still served where the caller is an operator, not an untrusted
+        // worker — the fix narrows a profile, it does not delete a tool.
+        for profile in [McpProfile::Default, McpProfile::Approver] {
+            assert!(
+                server_with(profile)
+                    .tool_names()
+                    .iter()
+                    .any(|t| t == "draft_check"),
+                "{profile:?} keeps `draft_check`"
+            );
+        }
+
+        // And no worker-facing TEXT steers toward it. A tool that is absent
+        // from the listing but still named in the instructions or a prompt
+        // description is the drift the brief validator exists to catch, one
+        // layer earlier.
+        let info = server_with(McpProfile::Worker).get_info();
+        let instructions = info.instructions.unwrap_or_default();
+        assert!(
+            instructions.contains("draft_check"),
+            "the worker banner must NAME the tool as absent, so a worker reading \
+             the full authoring map knows where it stops"
+        );
+        for (name, description) in WORKER_PROMPT_DESCRIPTIONS {
+            assert!(
+                !description.contains("draft_check"),
+                "worker prompt `{name}` steers toward a tool this profile does not \
+                 serve: {description}"
+            );
+        }
     }
 }

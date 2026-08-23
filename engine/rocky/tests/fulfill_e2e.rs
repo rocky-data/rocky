@@ -1494,6 +1494,10 @@ fn worker_profile_excluded_tools_are_not_found() {
         "propose",
         "review_queue",
         "draft_contract",
+        // FF-WP-F3: a check's `expression` is raw-interpolated into SQL the
+        // loop now EXECUTES unattended after every apply, so an untrusted
+        // worker must not be able to author one.
+        "draft_check",
         "draft_metadata",
         "pause_schedule",
     ]
