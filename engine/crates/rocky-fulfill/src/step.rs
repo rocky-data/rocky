@@ -424,7 +424,13 @@ impl Runner {
             TaskKind::Apply => self.apply(record).await,
             TaskKind::LookupReceipt => self.lookup_receipt(record),
             TaskKind::Observe => self.observe().await,
-            TaskKind::ObserveChecks { prior_detail } => self.observe_checks(prior_detail).await,
+            TaskKind::ObserveChecks { prior_detail } => {
+                // The digest this generation pinned at verify — read from
+                // the RECORD, so a resume compares against what was
+                // verified rather than against whatever is on disk now.
+                self.observe_checks(prior_detail, record.checks_digest.clone())
+                    .await
+            }
         }
     }
 
@@ -871,7 +877,11 @@ impl Runner {
     /// reporting zero problems. "Nothing failed" and "nothing ran" are
     /// different claims and only one of them is health.
     #[cfg(feature = "duckdb")]
-    async fn observe_checks(&self, prior_detail: String) -> Result<Event> {
+    async fn observe_checks(
+        &self,
+        prior_detail: String,
+        verified_digest: Option<String>,
+    ) -> Result<Event> {
         // Crash seam for the mid-observation drill: the staleness/test
         // reading is journaled, the declared checks are not read yet.
         // The resume must re-read them, not adopt the last verdict.
@@ -910,9 +920,52 @@ impl Runner {
         let mut custody: Vec<String> = status.artifact_problems.clone();
         if status.committed_phase.as_deref() != Some("merged") {
             custody.push(format!(
-                "the committed lowering phase is {:?}, so no approved set of checks exists to run",
+                "the committed lowering phase is {:?}, so no verified set of checks exists to run",
                 status.committed_phase
             ));
+        }
+
+        // THE AUTHORITATIVE COMPARISON — the executed set against the
+        // verified set.
+        //
+        // The artifact hashes above are necessary and NOT sufficient.
+        // They cover the files the manifest lists: the sidecar and the
+        // contract. But a sidecar's `[[use_test]]` entry names a check
+        // whose TYPE and SQL live in `models/test_definitions.toml` — a
+        // file that is not a lowering artifact, appears in no manifest,
+        // and is hashed nowhere. Edit it and the sidecar stays
+        // byte-identical, every recorded hash still matches, and the SQL
+        // about to run against the warehouse is different.
+        //
+        // So compare what the LOADER PRODUCES. That is the argument
+        // `count_declared_checks` already makes for counting, applied to
+        // custody: hash the expansion and no layer of indirection can
+        // slip underneath it, because every expansion has to land in
+        // that vector before it can run.
+        //
+        // A MISSING digest is a failure, not a pass. A truncated record,
+        // a record written before this field existed, or a build that
+        // cannot ask the loader all look like `None`, and none of them
+        // is a reason to execute. "Every claim matched" and "the claim I
+        // needed was made" are different questions.
+        match (
+            verified_digest.as_deref(),
+            self.expanded_check_digest(&spec),
+        ) {
+            (Some(verified), Ok(current)) if verified == current => {}
+            (Some(verified), Ok(current)) => custody.push(format!(
+                "the check set on disk digests to {current}, but the set this generation \
+                 verified was {verified} — something changed what would run"
+            )),
+            (Some(_), Err(why)) => custody.push(format!(
+                "the check set on disk could not be digested, so it cannot be compared with \
+                 the verified one: {why}"
+            )),
+            (None, _) => custody.push(
+                "this generation recorded no digest of the checks it verified, so there is \
+                 nothing to compare what is on disk against"
+                    .to_string(),
+            ),
         }
         if !custody.is_empty() {
             return Ok(Event::ObservationChecks {
@@ -969,7 +1022,11 @@ impl Runner {
     /// posture `count_declared_checks` takes at verify. The machine reads
     /// an unknown count as unevaluable and holds.
     #[cfg(not(feature = "duckdb"))]
-    async fn observe_checks(&self, prior_detail: String) -> Result<Event> {
+    async fn observe_checks(
+        &self,
+        prior_detail: String,
+        _verified_digest: Option<String>,
+    ) -> Result<Event> {
         fault_point("mid-observation");
         Ok(Event::ObservationChecks {
             failed: 0,

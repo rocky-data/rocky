@@ -298,8 +298,8 @@ fn drive_to_plan_review(dir: &Path) -> String {
 
     // 3. The loop lowers, drafts, merges, verifies, proposes, then asks
     //    for plan review.
-    let (code, json, _out, err) = rocky(dir, &["fulfill", PRODUCT]);
-    assert_eq!(code, 0, "drive to proposed: {err}");
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "drive to proposed: {err}{out}");
     let json = json.expect("fulfill json");
     assert_eq!(json["state"], "needs_input", "{json}");
     let plan_id = json["plan_id"].as_str().expect("plan pinned").to_string();
@@ -2024,5 +2024,119 @@ fn emptying_the_sidecar_cannot_turn_a_known_red_into_observing() {
             .expect("message")
             .contains("violating row"),
         "and the real finding is reported again: {json}"
+    );
+}
+
+/// The `[[use_test]]` bypass, end to end.
+///
+/// A sidecar's `[[use_test]]` entry carries a NAME and a binding. The
+/// check's type and its SQL live in `models/test_definitions.toml`,
+/// which is not a lowering artifact, appears in no manifest, and is
+/// hashed nowhere. So editing that one file changes the SQL the loop is
+/// about to run while the sidecar stays byte-identical and every
+/// recorded artifact hash still matches.
+///
+/// The assertion that makes this test worth having is the SECOND one:
+/// that `artifact_problems` is empty at the moment the gate fires. That
+/// is what proves the sidecar-hash check walked straight past this and
+/// the digest over the expanded set is what caught it. Without it, the
+/// test would pass on a gate that merely noticed the sidecar changed.
+#[test]
+fn editing_a_shared_test_definition_cannot_change_what_the_loop_executes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json_with_data_repair(DRAFT_SQL));
+
+    // The reference cannot be pre-placed: Phase A refuses a cold start
+    // when the sidecar already exists (`model-collision`). It goes in at
+    // the seam where the drafting worker has just written the sidecar and
+    // Phase B has not merged yet — the same window a worker's own
+    // `[[use_test]]` would arrive through. Phase B preserves it (not a
+    // spec-owned key), so the digest the verify bundle pins covers the
+    // expansion.
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "elicit: {err}");
+    assert_eq!(json.expect("json")["state"], "needs_input");
+    let (code, _j, _o, err) = rocky(dir, &["fulfill", "approve-spec", PRODUCT]);
+    assert_eq!(code, 0, "approve-spec: {err}");
+
+    let (code, _j, _o, _e) = rocky_env(
+        dir,
+        &["fulfill", PRODUCT],
+        &[("ROCKY_FULFILL_FAULT", "post-drafting")],
+    );
+    assert_ne!(code, 0, "the fault aborts after drafting, before Phase B");
+
+    std::fs::write(
+        dir.join("models/test_definitions.toml"),
+        "[revenue_is_positive]\ntype = \"expression\"\nexpression = \"revenue_eur >= 0\"\n",
+    )
+    .expect("definitions");
+    let sidecar_path = dir.join(format!("models/{PRODUCT}.toml"));
+    let drafted = std::fs::read_to_string(&sidecar_path).expect("the worker wrote a sidecar");
+    std::fs::write(
+        &sidecar_path,
+        format!("{drafted}\n[[use_test]]\nname = \"revenue_is_positive\"\n"),
+    )
+    .expect("sidecar with a use_test reference");
+
+    // Resume: Phase B merges, the bundle verifies, and a plan is pinned.
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "resume to proposed: {err}{out}");
+    let json = json.expect("fulfill json");
+    assert_eq!(json["state"], "needs_input", "{json}");
+    let plan = json["plan_id"].as_str().expect("plan pinned").to_string();
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+    let (code, _j, _o, _e) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 4, "the product applies and is observed red");
+
+    // The reference must have survived the merge, or this proves nothing.
+    let sidecar_before = std::fs::read(&sidecar_path).expect("sidecar");
+    assert!(
+        String::from_utf8_lossy(&sidecar_before).contains("use_test"),
+        "the fixture needs the reference to survive Phase B: {}",
+        String::from_utf8_lossy(&sidecar_before)
+    );
+
+    // THE EDIT: only the shared definition, and it now asserts the
+    // opposite of what was verified.
+    std::fs::write(
+        dir.join("models/test_definitions.toml"),
+        "[revenue_is_positive]\ntype = \"expression\"\nexpression = \"revenue_eur < 999999\"\n",
+    )
+    .expect("edited definitions");
+    assert_eq!(
+        std::fs::read(&sidecar_path).expect("sidecar"),
+        sidecar_before,
+        "the sidecar must be byte-identical — that is the whole bypass"
+    );
+
+    // The sidecar-hash check sees nothing wrong. This is the control.
+    let (code, status, _o, err) = rocky(dir, &["product", "status", PRODUCT]);
+    assert_eq!(code, 0, "product status: {err}");
+    let status = status.expect("status json");
+    assert_eq!(
+        status["artifact_problems"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        0,
+        "every recorded artifact hash still matches — the sidecar check is blind here: {status}"
+    );
+
+    // And the loop still refuses to run them.
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(code, 4, "still held, not clean: {err} {json}");
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("something changed what would run"),
+        "the digest over the EXPANDED set is what catches this: {message}"
+    );
+    assert_eq!(
+        json["next_command"].as_str(),
+        Some(&format!("rocky product compile {PRODUCT}")[..]),
+        "and it still names the remedy: {json}"
     );
 }
