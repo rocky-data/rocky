@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Per-assert mutation pass: prove each of run.sh's 10 asserts is NON-VACUOUS.
+# Per-assert mutation pass: prove each of run.sh's 11 asserts is NON-VACUOUS.
 #
 # For each assert n, run.sh carries a guarded `MUTATE=n` hook that breaks THAT
 # assert's engine gate (a lying digest, a dropped contract column, an un-stripped

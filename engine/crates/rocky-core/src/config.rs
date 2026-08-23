@@ -3153,7 +3153,8 @@ pub struct PolicyTest {
 #[serde(deny_unknown_fields)]
 pub struct FulfillConfig {
     /// Directory of brief overrides (`elicitation.md`, `drafting.md`,
-    /// `repair.md`). A file present there replaces the compiled default
+    /// `repair.md`, `data-repair.md`). A file present there replaces the
+    /// compiled default
     /// of the same name; absent files fall back. Must be a plain
     /// RELATIVE path inside the project — the loop resolves it through
     /// the staged commit's containment primitive, so an absolute path,

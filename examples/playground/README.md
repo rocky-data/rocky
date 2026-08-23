@@ -130,7 +130,7 @@ How Rocky keeps a language model honest. A generated model goes through the comp
 | [05-schema-grounded-validation](pocs/03-ai/05-schema-grounded-validation) | **Trust arc 5** — `ValidationContext` schema grounding + compile-verify retry loop |
 | [06-mcp-grounding](pocs/03-ai/06-mcp-grounding) | `rocky mcp` server — a schema-only model compiles but reconciles wrong; sampling the data via the MCP tools fixes it (creds-free `run.sh`) |
 | [07-policy](pocs/03-ai/07-policy) | `rocky policy test` — scenario assertions pin an agent `[policy]` so a careless edit that opens a hole becomes a red CI check (creds-free `run.sh`) |
-| [08-fulfillment-walking-skeleton](pocs/03-ai/08-fulfillment-walking-skeleton) | `rocky fulfill` — the whole spec → lower → human gate → digest-gated apply loop on one binary; creds-free replay `run.sh` (10 asserts + mutation pass), plus `run-live.sh` where a real `claude -p` worker drafts it end to end |
+| [08-fulfillment-walking-skeleton](pocs/03-ai/08-fulfillment-walking-skeleton) | `rocky fulfill` — the whole spec → lower → human gate → digest-gated apply loop on one binary; creds-free replay `run.sh` (11 asserts + mutation pass, including a post-apply data-red routed back through repair and a second human review), plus `run-live.sh` where a real `claude -p` worker drafts it end to end |
 
 ### 04 — Governance (11 POCs · Databricks / DuckDB)
 
