@@ -1192,7 +1192,9 @@ fn fault_at_digest_recompute_to_apply_resumes_through_applying_unknown() {
         "the resume went through applying_unknown: {tags:?}"
     );
     assert_eq!(
-        rows.iter().filter(|r| r.to_state == "applied").count(),
+        rows.iter()
+            .filter(|r| r.event.starts_with("applied ("))
+            .count(),
         1,
         "exactly one applied row"
     );
