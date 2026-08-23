@@ -324,9 +324,21 @@ pub enum ReceiptSummary {
 /// just reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnevaluableCause {
-    /// The checks on disk are not the ones the approved generation
-    /// committed. Re-running the loop re-reads the same diverged file
-    /// and reports the same thing forever — the remedy is to re-lower.
+    /// The checks on disk are not the ones this generation VERIFIED.
+    ///
+    /// Re-running the loop re-reads the same diverged files and reports
+    /// the same thing forever, so the stop must not offer it bare. The
+    /// remedy is a RESTORE: put back what changed, and the digests match
+    /// again. No engine verb adopts the change instead — `rocky product
+    /// compile` refuses sidecar drift outright, and on a
+    /// `test_definitions.toml` edit it re-lowers the sidecar without
+    /// touching the definitions, so the expansion still diverges. Nor can
+    /// the loop adopt it: the only route into `verifying` is from
+    /// `merged`, which an applied product can never reach again, so
+    /// nothing after an apply can pin a new digest.
+    ///
+    /// To keep the change, it belongs in the product spec, and a fresh
+    /// approval starts a new generation that pins at its own verify.
     CheckCustody,
     /// The reading itself failed, or checks errored. Re-running can
     /// genuinely resolve this one: the warehouse may answer next time.
@@ -4386,8 +4398,9 @@ mod tests {
             cause,
         };
 
-        // Custody divergence: re-lowering is what puts the approved
-        // checks back, so that is what the stop must say.
+        // Custody divergence: a RESTORE is what puts the verified checks
+        // back — no verb adopts the edit — so that is what the stop must
+        // say, and it must say it before naming any command.
         let d = decide(
             &rec(FulfillState::Applied),
             reading(Some(UnevaluableCause::CheckCustody)),
