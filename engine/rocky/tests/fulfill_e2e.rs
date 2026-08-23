@@ -1678,24 +1678,33 @@ fn a_data_red_after_apply_routes_to_repair_behind_a_new_human_gate() {
     // verify-repair one — pinned by transcript kind, because a
     // data-repair dispatched as a plain repair would hand the worker a
     // brief about a compiler error it cannot act on.
-    let mut kinds: Vec<String> = std::fs::read_dir(
+    // Transcripts are named `<stamp>-<kind>.log`. Matched by SUFFIX with
+    // `data-repair` tried first: splitting on the last dash cannot tell a
+    // data-repair from a plain repair, and telling them apart is the
+    // whole point — a data-red dispatched as a verify-repair would hand
+    // the worker a brief about a compiler error it cannot act on.
+    let kind_of = |name: &str| -> &'static str {
+        let stem = name.trim_end_matches(".log");
+        for kind in ["data-repair", "elicitation", "drafting", "repair"] {
+            if stem.ends_with(&format!("-{kind}")) {
+                return kind;
+            }
+        }
+        "unrecognised"
+    };
+    let mut kinds: Vec<&'static str> = std::fs::read_dir(
         dir.join(".rocky/fulfillment")
             .join(PRODUCT)
             .join("transcripts"),
     )
     .expect("transcripts")
-    .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-    .filter_map(|name| {
-        name.rsplit_once('-')
-            .map(|(_, kind)| kind.trim_end_matches(".log").to_string())
-    })
+    .map(|e| kind_of(&e.expect("entry").file_name().to_string_lossy()))
     .collect();
-    kinds.sort();
+    kinds.sort_unstable();
     assert_eq!(
         kinds,
-        vec!["data".to_string(), "elicitation".to_string()],
-        "one elicitation and one data-repair round (the '-repair' suffix splits \
-         on the last dash); no plain drafting repair ran"
+        vec!["data-repair", "drafting", "elicitation"],
+        "the round ran on the DATA-repair brief; no verify-repair round was dispatched"
     );
 }
 
