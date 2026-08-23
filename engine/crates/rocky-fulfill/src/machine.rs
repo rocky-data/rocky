@@ -3899,6 +3899,17 @@ mod tests {
     // F3 — the declared data checks, read against the APPLIED output
     // =====================================================================
 
+    /// A rendered reading in the shape `step::render_check_findings`
+    /// actually produces — the "N of M" prefix included.
+    ///
+    /// Fixtures that omit the prefix silently weaken every message
+    /// assertion made against them: the assertion still passes or fails,
+    /// but about a string production never emits. Shared as a constant so
+    /// the exact-match assertions and the message assertions cannot drift
+    /// apart.
+    const CHECK_DETAIL: &str = "3 of 4 declared data checks passed; \
+         revenue_daily.client_id [unique] fail (error): 4 duplicate value(s) found";
+
     /// The reading, with everything green unless a field says otherwise.
     fn checks(failed: usize, errored: usize, warned: usize, deferred: Option<usize>) -> Event {
         Event::ObservationChecks {
@@ -3906,8 +3917,7 @@ mod tests {
             errored,
             warned,
             deferred,
-            detail: "revenue_daily.client_id [unique] fail (error): 4 duplicate value(s) found"
-                .into(),
+            detail: CHECK_DETAIL.into(),
             prior_detail: "MAX(loaded_at) = t, lag 60s, budget 86400s".into(),
             cause: (errored > 0 || deferred != Some(0)).then_some(UnevaluableCause::Unreadable),
         }
@@ -4002,7 +4012,7 @@ mod tests {
         );
         assert_eq!(
             record.observation_detail.as_deref(),
-            Some("revenue_daily.client_id [unique] fail (error): 4 duplicate value(s) found"),
+            Some(CHECK_DETAIL),
             "the evidence is persisted for the worker that must act on it"
         );
         assert!(event.contains("FAILING"), "{event}");
@@ -4067,7 +4077,7 @@ mod tests {
         );
         assert_eq!(
             record.observation_detail.as_deref(),
-            Some("revenue_daily.client_id [unique] fail (error): 4 duplicate value(s) found"),
+            Some(CHECK_DETAIL),
             "the worker acts on what is true NOW, not on the first reading"
         );
         assert!(event.contains("data repair round 2"), "{event}");

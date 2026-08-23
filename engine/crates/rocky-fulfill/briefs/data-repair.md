@@ -42,5 +42,5 @@ the model to fit it. Say so in the SQL's comments and get as close as
 the data honestly allows; a human reads this before anything ships.
 
 Stop when compile and test are green. Everything you write is
-re-verified from disk and then goes to a human for review; you cannot
-and must not propose.
+re-verified from disk and then goes to a human for review;
+you cannot and must not propose.
