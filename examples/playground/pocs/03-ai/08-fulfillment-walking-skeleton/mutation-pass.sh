@@ -37,6 +37,8 @@ declare -a WHAT=(
   "9e:append a malformed declaration (unique, no column) so the declarative run ERRORS (errored!=0)"
   "9w:append a failing warning-severity test -> WARNED!=0 while exit stays 0 (the silent-pass hole)"
   "10:skip backdating so the data never goes stale"
+  "11:skip injecting the duplicate so no declared check fails post-apply (the data-red branch never runs)"
+  "11h:skip the FRESH review of the repaired plan (a data-red must not inherit the failing plan's approval)"
 )
 
 echo "=================================================================="
@@ -74,6 +76,6 @@ echo
 echo "Ledger (assert | broken gate | observed | verdict):"
 printf '%s' "$LEDGER"
 echo
-echo "Mutation pass: $pass / $total gate mutations caught (10 asserts; assert 2 has two — totality + repair evidence; assert 9 has three — failed + errored + warned)."
+echo "Mutation pass: $pass / $total gate mutations caught (11 asserts; assert 2 has two — totality + repair evidence; assert 9 has three — failed + errored + warned; assert 11 has two — the data-red itself and the fresh human gate behind it)."
 [ "$pass" = "$total" ] || { echo "MUTATION PASS INCOMPLETE — $((total - pass)) mutation(s) not caught."; exit 1; }
 echo "Every broken gate is caught. The replay lane is a real gate exerciser."
