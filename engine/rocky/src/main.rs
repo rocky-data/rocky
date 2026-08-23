@@ -4855,8 +4855,11 @@ mod tests {
     /// precisely the 3am failure the opt-in exists to prevent.
     #[test]
     fn mcp_profile_arg_accepts_approver() {
-        let cli = Cli::try_parse_from(["rocky", "mcp", "--profile", "approver"])
-            .expect("`--profile approver` is the spelling the refusal message names");
+        // `try_parse_with_big_stack`, not a bare `try_parse_from`: clap's
+        // generated parse code for this `Cli` overflows the 2 MB test-thread
+        // stack in a debug build. See that helper's comment — production
+        // `main()` parses on the OS-default 8 MB stack and is unaffected.
+        let cli = try_parse_with_big_stack(&["rocky", "mcp", "--profile", "approver"]);
         let Command::Mcp { profile, .. } = cli.command else {
             panic!("expected the mcp command");
         };
@@ -4872,7 +4875,7 @@ mod tests {
     /// on the profile that refuses to approve.
     #[test]
     fn mcp_with_no_profile_flag_cannot_approve() {
-        let cli = Cli::try_parse_from(["rocky", "mcp"]).expect("bare `rocky mcp` parses");
+        let cli = try_parse_with_big_stack(&["rocky", "mcp"]);
         let Command::Mcp { profile, .. } = cli.command else {
             panic!("expected the mcp command");
         };
@@ -4886,8 +4889,7 @@ mod tests {
     /// The worker profile is untouched by #1517 — same spelling, same mapping.
     #[test]
     fn mcp_profile_arg_worker_is_unchanged() {
-        let cli = Cli::try_parse_from(["rocky", "mcp", "--profile", "worker"])
-            .expect("`--profile worker` still parses");
+        let cli = try_parse_with_big_stack(&["rocky", "mcp", "--profile", "worker"]);
         let Command::Mcp { profile, .. } = cli.command else {
             panic!("expected the mcp command");
         };
