@@ -1527,18 +1527,6 @@ mod tests {
         Ok(())
     }
 
-    /// Digest-stability golden (FF-WP1): a `RunPlan` that does not use the
-    /// optional product-identity fields must serialize to byte-identical JSON —
-    /// and therefore hash to the identical `plan_id` — as it did before those
-    /// fields existed. Every pre-existing plan id, and every id for a plan
-    /// authored without product identity, stays stable.
-    ///
-    /// The golden strings below were captured from the tree BEFORE the fields
-    /// were added (same literals, minus the two new `None`s). If this test
-    /// fails, a serialization-affecting change to `RunPlan` has broken plan-id
-    /// stability for existing plans — that is a release blocker, not a
-    /// fixture to refresh.
-    #[test]
     /// Every field at its default — the shape the golden ids below are
     /// taken over. Shared with `the_idempotency_key_alone_moves_the_plan_id`
     /// so the two cannot drift apart silently; a new `RunPlan` field
@@ -1574,6 +1562,17 @@ mod tests {
         }
     }
 
+    /// Digest-stability golden (FF-WP1): a `RunPlan` that does not use the
+    /// optional product-identity fields must serialize to byte-identical JSON —
+    /// and therefore hash to the identical `plan_id` — as it did before those
+    /// fields existed. Every pre-existing plan id, and every id for a plan
+    /// authored without product identity, stays stable.
+    ///
+    /// The golden strings below were captured from the tree BEFORE the fields
+    /// were added (same literals, minus the two new `None`s). If this test
+    /// fails, a serialization-affecting change to `RunPlan` has broken plan-id
+    /// stability for existing plans — that is a release blocker, not a
+    /// fixture to refresh.
     #[test]
     fn run_plan_without_product_fields_keeps_legacy_bytes_and_plan_id() -> anyhow::Result<()> {
         fn baseline() -> crate::output::RunPlan {

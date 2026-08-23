@@ -540,7 +540,10 @@ mod tests {
         assert_eq!(back, record);
 
         // The older reader's vocabulary, verbatim minus the new variant.
-        #[derive(serde::Deserialize)]
+        // `Debug` is required by `expect_err` below, which must render the
+        // Ok side when the read unexpectedly SUCCEEDS — the failure mode
+        // this test exists to catch.
+        #[derive(serde::Deserialize, Debug)]
         #[serde(tag = "state", rename_all = "snake_case")]
         enum OlderState {
             Applied,

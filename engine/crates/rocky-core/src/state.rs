@@ -563,8 +563,9 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   approve a freshly-minted proposal. That is a pre-existing custody
 ///   property, not something this bump introduces, but the bump is where
 ///   the "losing it is fine" claim is written down, so it is corrected
-///   here rather than repeated. Tracked separately; do not rely on state
-///   loss being harmless.
+///   here rather than repeated. Tracked as
+///   [#1525](https://github.com/rocky-data/rocky/issues/1525); do not
+///   rely on state loss being harmless.
 ///
 ///   The variant's read behaviour under an
 ///   older vocabulary is pinned by
