@@ -87,9 +87,11 @@ pub fn run_fulfill_approve_spec(
 /// `rocky fulfill <product>` — drive the reconciler one invocation
 /// forward. Exit codes: 0 = advanced to a clean stop (including
 /// `needs_input` asks and `observing`), 2 = `blocked`, 3 = parked at
-/// `applying_unknown` for a human. 3 is deliberate: 1 is the CLI's
-/// generic-error code, and a caller scripting the loop must be able to
-/// tell "a human must resolve the receipt" from "the command fell
+/// `applying_unknown` for a human, 4 = `observed_failing` — applied, and
+/// the applied output is failing its own declared data checks. Each
+/// non-zero code is deliberate: 1 is the CLI's generic-error code, and a
+/// caller scripting the loop must be able to tell "a human must resolve
+/// the receipt" and "the live output is wrong" from "the command fell
 /// over".
 pub async fn run_fulfill(
     config_path: &Path,
@@ -170,6 +172,18 @@ pub async fn run_fulfill(
     match &released.state {
         FulfillState::Blocked { .. } => std::process::exit(2),
         FulfillState::ApplyingUnknown => std::process::exit(3),
+        // Applied, and failing its own declared checks. Written out
+        // rather than left to the wildcard: the wildcard means "a clean
+        // stop", and this stop is the opposite of clean — a scripted
+        // caller that treated it as success would ship a product whose
+        // live output contradicts what it declared about itself.
+        //
+        // 4, not 2: `blocked` means the loop cannot proceed without a
+        // human, while this state proceeds on its own next invocation.
+        // Collapsing them would lose exactly the distinction the exit
+        // codes exist to draw, the same reason `applying_unknown` is 3
+        // rather than the CLI's generic 1.
+        FulfillState::ObservedFailing => std::process::exit(4),
         _ => Ok(()),
     }
 }
@@ -282,6 +296,12 @@ impl Runner {
             | FulfillState::ApplyingUnknown
             | FulfillState::Applied
             | FulfillState::Observing
+            // A cold entry at the data-red state yields `Reentry`, which
+            // the machine answers with `TaskKind::Observe` — the checks
+            // are READ again. Nothing here loads the stored verdict, so
+            // a crash between the red and its repair cannot resume into
+            // an assumption.
+            | FulfillState::ObservedFailing
             | FulfillState::Superseded { .. }
             | FulfillState::Blocked { .. } => Event::Reentry,
         })
@@ -396,6 +416,7 @@ impl Runner {
             TaskKind::Elicit => self.run_elicitation(record).await,
             TaskKind::Draft => self.run_drafting(record, TaskBriefKind::Drafting).await,
             TaskKind::Repair => self.run_drafting(record, TaskBriefKind::Repair).await,
+            TaskKind::DataRepair => self.run_drafting(record, TaskBriefKind::DataRepair).await,
             TaskKind::VerifyBundle => self.verify_bundle(),
             TaskKind::Propose => self.propose(record).await,
             TaskKind::PollMarker => self.poll_marker(record),
@@ -403,6 +424,7 @@ impl Runner {
             TaskKind::Apply => self.apply(record).await,
             TaskKind::LookupReceipt => self.lookup_receipt(record),
             TaskKind::Observe => self.observe().await,
+            TaskKind::ObserveChecks => self.observe_checks().await,
         }
     }
 
@@ -805,8 +827,75 @@ impl Runner {
         }))
     }
 
+    /// Post-apply reading of the product's DECLARED data checks — the
+    /// checks the verify bundle could only report deferred, run at last
+    /// against the materialised table.
+    ///
+    /// Scoped to the product's output model, and executed through the
+    /// same typed core `rocky test --declarative` uses, so the loop can
+    /// never bless data the CLI calls broken.
+    ///
+    /// A read that cannot answer says so (`deferred: None`) rather than
+    /// reporting zero problems. "Nothing failed" and "nothing ran" are
+    /// different claims and only one of them is health.
+    #[cfg(feature = "duckdb")]
+    async fn observe_checks(&self) -> Result<Event> {
+        // Crash seam for the mid-observation drill: the staleness/test
+        // reading is journaled, the declared checks are not read yet.
+        // The resume must re-read them, not adopt the last verdict.
+        fault_point("mid-observation");
+        let spec = self.approved_spec()?;
+        let model = spec.parsed.output_model().to_string();
+        let observed = match fulfill_api::observe_declarative_checks(
+            &self.config_path,
+            &self.models_dir,
+            &model,
+        )
+        .await
+        {
+            Ok(observed) => observed,
+            Err(err) => {
+                return Ok(Event::ObservationChecks {
+                    failed: 0,
+                    errored: 0,
+                    warned: 0,
+                    deferred: None,
+                    detail: format!("the declared data checks could not be read: {err:#}"),
+                });
+            }
+        };
+        Ok(Event::ObservationChecks {
+            failed: observed.failed,
+            errored: observed.errored,
+            warned: observed.warned,
+            deferred: Some(observed.unevaluated),
+            detail: render_check_findings(&observed),
+        })
+    }
+
+    /// Without the duckdb feature there is no declarative check runner to
+    /// ask, so the reading is unavailable rather than invented — the same
+    /// posture `count_declared_checks` takes at verify. The machine reads
+    /// an unknown count as unevaluable and holds.
+    #[cfg(not(feature = "duckdb"))]
+    async fn observe_checks(&self) -> Result<Event> {
+        fault_point("mid-observation");
+        Ok(Event::ObservationChecks {
+            failed: 0,
+            errored: 0,
+            warned: 0,
+            deferred: None,
+            detail: "this build has no duckdb feature, so the declarative check runner \
+                     cannot be asked what the applied output looks like"
+                .to_string(),
+        })
+    }
+
     /// Post-apply observation: scoped tests + the typed staleness read.
     async fn observe(&self) -> Result<Event> {
+        // Crash seam for the post-apply pre-observation drill: the apply
+        // is journaled and terminal, nothing has been observed yet.
+        fault_point("pre-observation");
         let spec = self.approved_spec()?;
         let model = spec.parsed.output_model().to_string();
         let mut detail: Vec<String> = Vec::new();
@@ -943,6 +1032,7 @@ impl Runner {
                     output_model: self.product.clone(),
                     outbox_dir: dir.join("outbox").display().to_string(),
                     verify_detail: String::new(),
+                    observation_detail: String::new(),
                 },
             )?,
             product: self.product.clone(),
@@ -1041,9 +1131,11 @@ impl Runner {
         // on the ON-DISK manifest phase, never the task kind, so a
         // resume that crashed between the repair CAS and the reopen
         // still reopens (or still blocks).
-        if kind == TaskBriefKind::Repair {
+        if kind.reopens_the_window() {
             // Crash seam for the reopen drill: the repair transition is
-            // journaled, the window not yet reopened.
+            // journaled, the window not yet reopened. Both repair kinds
+            // hit it — the data-red round reopens exactly like the
+            // verify-red one, which is what keeps it un-privileged.
             fault_point("pre-repair-reopen");
         }
         match fulfill_api::product_reopen_drafting(&self.root, &self.state_path, &self.product)? {
@@ -1061,6 +1153,21 @@ impl Runner {
             }
             _ => String::new(),
         };
+        // The evidence is read from the RECORD, not from a value carried
+        // in memory across the transition: the round and its evidence
+        // were persisted by the same CAS that decided the repair, so a
+        // resume dispatches with the same brief content rather than an
+        // empty one. A data-repair round with no recorded evidence is a
+        // bug, and says so where the worker will read it, instead of
+        // silently handing over a blank.
+        let observation_detail = match kind {
+            TaskBriefKind::DataRepair => record.observation_detail.clone().unwrap_or_else(|| {
+                "(no observed evidence was recorded for this round — this is a rocky-fulfill \
+                 bug; re-read the checks before changing anything)"
+                    .to_string()
+            }),
+            _ => String::new(),
+        };
         let brief = TaskBrief {
             kind,
             text: briefs::render(
@@ -1074,6 +1181,7 @@ impl Runner {
                     output_model: spec.parsed.output_model().to_string(),
                     outbox_dir: dir.join("outbox").display().to_string(),
                     verify_detail,
+                    observation_detail,
                 },
             )?,
             product: self.product.clone(),
@@ -1185,6 +1293,52 @@ fn deferred_report(counted: Result<usize, String>) -> (Option<usize>, Option<Str
         Ok(count) => (Some(count), machine::deferred_note(count)),
         Err(why) => (None, Some(machine::uncounted_deferred_note(&why))),
     }
+}
+
+/// Render a check reading as the evidence a human and a repair worker
+/// both act on.
+///
+/// One line per non-passing check: which model, which column, which
+/// check, and WHAT IT MEASURED. "3 declared data checks failed" tells a
+/// worker nothing it can act on; `orders.customer_id [not_null]: 3 NULL
+/// row(s) found` tells it where to look.
+///
+/// Passing checks are summarised, not listed — the count is the useful
+/// part, and a long green list would push the findings out of view.
+#[cfg(feature = "duckdb")]
+fn render_check_findings(observed: &fulfill_api::ObservedChecks) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for finding in &observed.findings {
+        let column = finding
+            .column
+            .as_deref()
+            .map(|c| format!(".{c}"))
+            .unwrap_or_default();
+        let detail = finding
+            .detail
+            .as_deref()
+            .map(|d| format!(": {d}"))
+            .unwrap_or_default();
+        lines.push(format!(
+            "{}{column} [{}] {} ({}){detail}",
+            finding.model, finding.test_type, finding.status, finding.severity
+        ));
+    }
+    if lines.is_empty() {
+        // Both halves are said out loud. "0 of 0 passed" and "12 of 12
+        // passed" are very different assurances and the reader must be
+        // able to tell them apart at a glance.
+        return format!(
+            "{} of {} declared data checks passed",
+            observed.passed, observed.declared
+        );
+    }
+    format!(
+        "{} of {} declared data checks passed; {}",
+        observed.passed,
+        observed.declared,
+        lines.join(" | ")
+    )
 }
 
 fn render_refusal(refusal: &fulfill_api::PolicyRefusal) -> String {

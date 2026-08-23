@@ -36,6 +36,13 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_cli::commands::fulfill_api::ProductBinding",
     "rocky_cli::commands::fulfill_api::ProposeOutcome",
     "rocky_cli::commands::fulfill_api::ProposeRequest",
+    // F3 — the post-apply reading of the DECLARED data checks: the same
+    // typed core `rocky test --declarative` runs, scoped to the
+    // product's output model. DELIBERATE addition, and deliberately a
+    // second entry point rather than a widened `test_output`: this one
+    // runs against the MATERIALISED table, and its result type drops the
+    // generated SQL so worker-authored text cannot ride into a brief.
+    "rocky_cli::commands::fulfill_api::ObservedChecks",
     "rocky_cli::commands::fulfill_api::ReceiptLookup",
     // #1493 — the drafting-window reopen (typed outcome + the call).
     "rocky_cli::commands::fulfill_api::ReopenOutcome",
@@ -50,6 +57,7 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // expansion, which reading the sidecar's raw array misses).
     "rocky_cli::commands::fulfill_api::declarative_test_count",
     "rocky_cli::commands::fulfill_api::lookup_apply_receipt",
+    "rocky_cli::commands::fulfill_api::observe_declarative_checks",
     "rocky_cli::commands::fulfill_api::observe_max_time_column",
     "rocky_cli::commands::fulfill_api::print_json",
     "rocky_cli::commands::fulfill_api::product_approve",

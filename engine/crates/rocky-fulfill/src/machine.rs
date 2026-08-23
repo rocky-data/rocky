@@ -455,6 +455,32 @@ pub enum Event {
         /// Rendered findings, journaled.
         detail: String,
     },
+    /// The product's declared data checks were read against the APPLIED
+    /// output — the checks the verify bundle could only report deferred,
+    /// finally evaluable because the table now exists.
+    ObservationChecks {
+        /// Checks that failed at `severity = "error"`. The only signal
+        /// that routes to a repair round: positive evidence that the
+        /// live output contradicts something the product declared about
+        /// itself.
+        failed: usize,
+        /// Checks whose execution errored. NOT a failure — the runner
+        /// could not tell whether the data is right, and guessing in
+        /// either direction is worse than holding.
+        errored: usize,
+        /// Checks that failed at `severity = "warning"`. Reported, never
+        /// routed: a warning is by definition not a defect the product
+        /// declared as disqualifying.
+        warned: usize,
+        /// Declared checks that produced no verdict at all. `None` when
+        /// the read failed outright, so even the count is unknown —
+        /// distinct from `Some(0)`, which positively claims every
+        /// declared check was evaluated (the #1495 rule, applied to the
+        /// observation side).
+        deferred: Option<usize>,
+        /// The rendered evidence: which checks, and what they measured.
+        detail: String,
+    },
     /// `blocked` re-entry with `--retry`.
     RetryRequested,
     /// A plain re-entry with nothing new observed (resume dispatch).
@@ -483,6 +509,10 @@ pub enum TaskKind {
     Draft,
     /// Dispatch the repair driver task (same supervision).
     Repair,
+    /// Dispatch the data-repair driver task: same supervision, same
+    /// reopened drafting window, different brief — the worker is handed
+    /// the failing check and what it measured, not a compiler error.
+    DataRepair,
     /// Run Phase-B metadata merge through the staged commit.
     RunPhaseB,
     /// Run the runner's own verification bundle (compile, test,
@@ -500,6 +530,10 @@ pub enum TaskKind {
     LookupReceipt,
     /// The post-apply observation (scoped test + staleness read).
     Observe,
+    /// Read the product's declared data checks against the applied
+    /// output. Separate from [`Self::Observe`] so each event has exactly
+    /// one producer, and so the crash seam between the two is real.
+    ObserveChecks,
 }
 
 /// A stop: the loop can go no further without a human (or an external
@@ -1255,50 +1289,47 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
         },
 
         // ------------------------------------------------------------------
-        // applied → observation checks → observing
+        // applied      | apply result | observation → observing
+        // observing    | runner       | staleness/test findings journaled
+        // observed_failing | red checks | re-read → repair round, or blocked
+        //
+        // One arm for all three: every entry does the SAME two readings,
+        // in the same order, and the verdict — not the state it was read
+        // from — decides where the record lands. That is what makes
+        // "a crash mid-observation re-reads the checks" structural
+        // rather than a property of one code path: `Reentry` from any of
+        // the three observes again, and nothing carries the last verdict
+        // forward.
+        //
+        // The staleness/test reading is journaled where it happens, and
+        // only then are the DECLARED checks read. Landing `observing` on
+        // the first event would record health before the one signal that
+        // can contradict it had been looked at.
         // ------------------------------------------------------------------
-        FulfillState::Applied => match event {
-            Event::Reentry => Decision::Act(TaskKind::Observe),
-            Event::ObservationDone {
-                test_green,
-                staleness_ok,
-                detail,
-            } => {
-                let next = to_state(observed, FulfillState::Observing, now);
-                Decision::AdvanceAndStop {
-                    record: next,
+        FulfillState::Applied | FulfillState::Observing | FulfillState::ObservedFailing => {
+            match event {
+                Event::Reentry => Decision::Act(TaskKind::Observe),
+                Event::ObservationDone {
+                    test_green,
+                    staleness_ok,
+                    detail,
+                } => Decision::AdvanceAndAct {
+                    record: to_state(observed, observed.state.clone(), now),
                     event: observation_event(test_green, staleness_ok, &detail),
-                    stop: Stop {
-                        message: format!("product {product} is applied; {detail}"),
-                        next_command: None,
-                    },
-                }
+                    task: TaskKind::ObserveChecks,
+                },
+                Event::ObservationChecks {
+                    failed,
+                    errored,
+                    warned,
+                    deferred,
+                    detail,
+                } => decide_observation_checks(
+                    observed, &product, failed, errored, warned, deferred, &detail, now,
+                ),
+                other => internal_mismatch(observed, &other),
             }
-            other => internal_mismatch(observed, &other),
-        },
-
-        // ------------------------------------------------------------------
-        // observing | staleness/test findings journaled
-        // ------------------------------------------------------------------
-        FulfillState::Observing => match event {
-            Event::Reentry => Decision::Act(TaskKind::Observe),
-            Event::ObservationDone {
-                test_green,
-                staleness_ok,
-                detail,
-            } => {
-                let next = to_state(observed, FulfillState::Observing, now);
-                Decision::AdvanceAndStop {
-                    record: next,
-                    event: observation_event(test_green, staleness_ok, &detail),
-                    stop: Stop {
-                        message: format!("product {product} is live; {detail}"),
-                        next_command: None,
-                    },
-                }
-            }
-            other => internal_mismatch(observed, &other),
-        },
+        }
 
         // ------------------------------------------------------------------
         // superseded | old/new digests journaled |
@@ -1312,6 +1343,11 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 next.idempotency_key = None;
                 next.drafting_attempts = 0;
                 next.repair_rounds = 0;
+                // A new approved generation inherits no budget and no
+                // evidence: the checks it declares may not even be the
+                // checks the old one failed.
+                next.data_repair_rounds = 0;
+                next.observation_detail = None;
                 Decision::Advance {
                     record: next,
                     event: format!("re-entering at spec_approved ({new_digest})"),
@@ -1335,6 +1371,11 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 next.idempotency_key = None;
                 next.drafting_attempts = 0;
                 next.repair_rounds = 0;
+                // A human asked for another attempt after reading the
+                // remedy, so both budgets refill and the stale evidence
+                // goes — the next observation reads the checks fresh.
+                next.data_repair_rounds = 0;
+                next.observation_detail = None;
                 Decision::Advance {
                     record: next,
                     event: "manual retry".to_string(),
@@ -1435,6 +1476,166 @@ fn decide_marker(
 }
 
 /// The propose-outcome decision at `verifying`.
+/// The post-apply verdict on the product's declared data checks — the
+/// F3 routing decision.
+///
+/// Three landings, and which one is reached depends only on the reading:
+///
+/// ```text
+///   clean        → observing              (budget reset, evidence cleared)
+///   unevaluable  → applied                (from applied/observing)
+///                → observed_failing       (from observed_failing — no new
+///                                          news does not clear old news)
+///   failing      → observed_failing       first sighting: record and stop
+///                → drafting(data_repair)  confirmed: spend one round
+///                → blocked                budget exhausted, naming the check
+/// ```
+///
+/// The two-step failing path is deliberate. The bad data is ALREADY
+/// applied, so nothing is gained by racing: the first red is recorded in
+/// a state a human can see, and only a second reading — a fresh read from
+/// a fresh invocation, never the stored verdict — spends a repair round.
+/// A transient warehouse blip therefore cannot burn budget, and the
+/// "post-data-red pre-repair" crash seam has a real resting state to
+/// resume from.
+///
+/// Forward-only: no arm here rolls anything back. The repaired output
+/// re-enters at drafting and leaves through the same propose → human
+/// review → apply gates as any other change.
+#[allow(clippy::too_many_arguments)]
+fn decide_observation_checks(
+    observed: &FulfillStateRecord,
+    product: &str,
+    failed: usize,
+    errored: usize,
+    warned: usize,
+    deferred: Option<usize>,
+    detail: &str,
+    now: DateTime<Utc>,
+) -> Decision {
+    let verdict = classify_checks(failed, errored, deferred);
+    let event = observation_checks_event(&verdict, failed, errored, warned, deferred, detail);
+    match verdict {
+        // Every declared check ran, none failed. This is the ONLY path
+        // to `observing`, and it is where the data-repair budget resets:
+        // the cycle closed, so the next red starts from a full ceiling.
+        CheckVerdict::Clean => {
+            let mut next = to_state(observed, FulfillState::Observing, now);
+            next.data_repair_rounds = 0;
+            next.observation_detail = None;
+            Decision::AdvanceAndStop {
+                record: next,
+                event,
+                stop: Stop {
+                    message: format!("product {product} is live; {detail}"),
+                    next_command: None,
+                },
+            }
+        }
+        // Something could not be evaluated. Never `observing`: claiming
+        // health on checks that did not run is the exact dishonesty this
+        // work package exists to remove. Never a repair round either —
+        // "cannot tell" is not "the data is wrong", and rewriting a
+        // model on a suspicion spends a live-table cycle on a guess.
+        //
+        // This is where the loop diverges from `rocky test
+        // --declarative`, which exits non-zero when a check errors. The
+        // CLI is reporting to a human who will read the error; the loop
+        // is deciding whether to rewrite a model, and the honest answer
+        // to an unreadable check is to stop and say so.
+        CheckVerdict::Unevaluable => {
+            let landing = match &observed.state {
+                // No new news does not clear old news: a product already
+                // known to be failing stays failing.
+                FulfillState::ObservedFailing => FulfillState::ObservedFailing,
+                // "Applied, observation not concluded" — the honest
+                // state, and the one whose re-entry re-reads.
+                _ => FulfillState::Applied,
+            };
+            let next = to_state(observed, landing, now);
+            Decision::AdvanceAndStop {
+                record: next,
+                event,
+                stop: Stop {
+                    message: format!(
+                        "product {product} is applied, but its declared data checks could not \
+                         be evaluated, so nothing here says the output is right: {detail}"
+                    ),
+                    next_command: Some(format!("rocky fulfill {product}")),
+                },
+            }
+        }
+        CheckVerdict::Failing => {
+            // One ceiling, two counters. `repair_rounds` cannot serve
+            // here: `decide_proposed` resets it to 0 on every successful
+            // propose, and a data-red cycle proposes every lap, so the
+            // bound would never bind. See `FulfillStateRecord::
+            // data_repair_rounds`.
+            if observed.data_repair_rounds >= MAX_REPAIR_ROUNDS {
+                let record = blocked(
+                    observed,
+                    format!(
+                        "the applied output still fails its declared data checks after \
+                         {MAX_REPAIR_ROUNDS} repair rounds: {detail}"
+                    ),
+                    now,
+                );
+                return blocked_stop(
+                    record,
+                    format!("data repair budget exhausted: {detail}"),
+                    product,
+                    detail,
+                );
+            }
+            match &observed.state {
+                // Confirmed by a second, independent reading: spend one
+                // round. The evidence is refreshed from THIS reading —
+                // the worker must act on what is true now, not on what
+                // was true when the red was first recorded.
+                FulfillState::ObservedFailing => {
+                    let mut next = to_state(observed, FulfillState::Drafting, now);
+                    next.data_repair_rounds = observed.data_repair_rounds + 1;
+                    next.drafting_attempts = 1;
+                    // Persisted WITH the transition that decided them, so
+                    // a crash before the worker starts resumes into the
+                    // same round carrying the same evidence (#1493's
+                    // lesson, applied to the data-red path).
+                    next.drafting_round = DraftingRound::DataRepair;
+                    next.observation_detail = Some(truncate_detail(detail));
+                    Decision::AdvanceAndAct {
+                        record: next,
+                        event: format!(
+                            "data repair round {} ({detail})",
+                            observed.data_repair_rounds + 1
+                        ),
+                        task: round_task(DraftingRound::DataRepair),
+                    }
+                }
+                // First sighting: record it and stop. The state says
+                // plainly that the live output is failing its own
+                // declared checks — it is never a healthy `observing`.
+                _ => {
+                    let mut next = to_state(observed, FulfillState::ObservedFailing, now);
+                    next.observation_detail = Some(truncate_detail(detail));
+                    Decision::AdvanceAndStop {
+                        record: next,
+                        event,
+                        stop: Stop {
+                            message: format!(
+                                "product {product} is applied, and the applied output is failing \
+                                 its own declared data checks: {detail} — re-run to confirm the \
+                                 reading and start a repair round (the repaired model goes back \
+                                 through review before it applies)"
+                            ),
+                            next_command: Some(format!("rocky fulfill {product}")),
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn decide_proposed(
     observed: &FulfillStateRecord,
     product: &str,
@@ -1685,7 +1886,92 @@ fn round_task(round: DraftingRound) -> TaskKind {
     match round {
         DraftingRound::Draft => TaskKind::Draft,
         DraftingRound::Repair => TaskKind::Repair,
+        DraftingRound::DataRepair => TaskKind::DataRepair,
     }
+}
+
+/// The longest `observation_detail` the record will carry.
+///
+/// The evidence is warehouse-shaped: a model can declare many checks and
+/// every one of them can fail at once. The record is compare-and-set as a
+/// whole on every transition, so an unbounded string is an unbounded cost
+/// on every subsequent write. Truncation is visible, never silent — the
+/// marker says what was dropped.
+const MAX_OBSERVATION_DETAIL: usize = 4000;
+
+/// Cap the observed evidence at [`MAX_OBSERVATION_DETAIL`], on a char
+/// boundary, with a marker naming the loss.
+///
+/// Pure so the boundary behaviour is pinned by test rather than by
+/// reading: slicing a multi-byte string at a byte index panics, and the
+/// evidence is the one field in the record built from data the loop does
+/// not author.
+fn truncate_detail(detail: &str) -> String {
+    if detail.len() <= MAX_OBSERVATION_DETAIL {
+        return detail.to_string();
+    }
+    let mut end = MAX_OBSERVATION_DETAIL;
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}… [evidence truncated at {MAX_OBSERVATION_DETAIL} bytes]",
+        &detail[..end]
+    )
+}
+
+/// The three-way verdict on a reading of the declared data checks.
+///
+/// Named rather than inlined because the ORDER of the arms is the whole
+/// decision: positive evidence of failure outranks a partial reading, and
+/// a partial reading outranks a clean tally. Inverting the last two would
+/// let "we could not evaluate anything" render as health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckVerdict {
+    /// At least one declared check failed at `severity = "error"`.
+    Failing,
+    /// Nothing failed, but the reading is incomplete — some check
+    /// errored, or the read could not evaluate everything it declared.
+    Unevaluable,
+    /// Every declared check was evaluated and none failed. Warnings may
+    /// be present; a warning is not a defect.
+    Clean,
+}
+
+/// Classify a check reading. See [`CheckVerdict`] for why the order is
+/// load-bearing.
+fn classify_checks(failed: usize, errored: usize, deferred: Option<usize>) -> CheckVerdict {
+    if failed > 0 {
+        return CheckVerdict::Failing;
+    }
+    if errored > 0 || deferred != Some(0) {
+        return CheckVerdict::Unevaluable;
+    }
+    CheckVerdict::Clean
+}
+
+/// The journal event for one reading of the declared data checks.
+fn observation_checks_event(
+    verdict: &CheckVerdict,
+    failed: usize,
+    errored: usize,
+    warned: usize,
+    deferred: Option<usize>,
+    detail: &str,
+) -> String {
+    let head = match verdict {
+        CheckVerdict::Failing => "declared data checks FAILING",
+        CheckVerdict::Unevaluable => "declared data checks not evaluable",
+        CheckVerdict::Clean => "declared data checks green",
+    };
+    let deferred = match deferred {
+        Some(n) => n.to_string(),
+        None => "unknown".to_string(),
+    };
+    format!(
+        "observation: {head} ({failed} failed, {errored} errored, {warned} warned, \
+         {deferred} unevaluated): {detail}"
+    )
 }
 
 /// The ONE wording for unevaluated declared data checks.

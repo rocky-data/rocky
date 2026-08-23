@@ -30,6 +30,7 @@ use crate::driver::TaskBriefKind;
 const DEFAULT_ELICITATION: &str = include_str!("../briefs/elicitation.md");
 const DEFAULT_DRAFTING: &str = include_str!("../briefs/drafting.md");
 const DEFAULT_REPAIR: &str = include_str!("../briefs/repair.md");
+const DEFAULT_DATA_REPAIR: &str = include_str!("../briefs/data-repair.md");
 
 /// The frozen no-propose sentence every worker-authoring brief carries.
 pub const NO_PROPOSE_SENTENCE: &str = "you cannot and must not propose";
@@ -136,6 +137,10 @@ pub struct BriefContext {
     pub outbox_dir: String,
     /// The red verification detail (repair briefs).
     pub verify_detail: String,
+    /// The observed evidence from a red post-apply reading of the
+    /// product's declared data checks (data-repair briefs): which checks
+    /// failed and what they measured.
+    pub observation_detail: String,
 }
 
 /// The compiled default for `kind`.
@@ -144,6 +149,7 @@ pub fn default_brief(kind: TaskBriefKind) -> &'static str {
         TaskBriefKind::Elicitation => DEFAULT_ELICITATION,
         TaskBriefKind::Drafting => DEFAULT_DRAFTING,
         TaskBriefKind::Repair => DEFAULT_REPAIR,
+        TaskBriefKind::DataRepair => DEFAULT_DATA_REPAIR,
     }
 }
 
@@ -188,11 +194,16 @@ pub fn load_template(
 /// Render the brief for `kind`: template placeholders substituted from
 /// the context. Unknown placeholders are left as-is (an override may
 /// carry prose braces); the known set is `{product}`, `{intent}`,
-/// `{sources}`, `{model}`, `{outbox_dir}`, `{verify_detail}`.
+/// `{sources}`, `{model}`, `{outbox_dir}`, `{verify_detail}`,
+/// `{observation_detail}`.
 ///
 /// Validation runs on the TEMPLATE, before substitution: the context's
-/// `intent`/`verify_detail` are quoted data (the spec's own words, the
-/// verifier's own findings), not instructions this crate authors.
+/// `intent`/`verify_detail`/`observation_detail` are quoted data (the
+/// spec's own words, the verifier's own findings, the check runner's own
+/// measurements), not instructions this crate authors. What keeps that
+/// true for `observation_detail` in particular is upstream: the
+/// observation façade carries counts and bounds and deliberately drops
+/// the generated SQL, so no worker-authored text rides in on it.
 pub fn render(
     kind: TaskBriefKind,
     project_root: &Path,
@@ -215,18 +226,20 @@ pub fn render(
         .replace("{sources}", &sources)
         .replace("{model}", &ctx.output_model)
         .replace("{outbox_dir}", &ctx.outbox_dir)
-        .replace("{verify_detail}", &ctx.verify_detail))
+        .replace("{verify_detail}", &ctx.verify_detail)
+        .replace("{observation_detail}", &ctx.observation_detail))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn all_kinds() -> [TaskBriefKind; 3] {
+    fn all_kinds() -> [TaskBriefKind; 4] {
         [
             TaskBriefKind::Elicitation,
             TaskBriefKind::Drafting,
             TaskBriefKind::Repair,
+            TaskBriefKind::DataRepair,
         ]
     }
 
@@ -247,6 +260,7 @@ mod tests {
         assert!(brief.contains("Stop when compile/test are green"));
         assert!(brief.contains(NO_PROPOSE_SENTENCE));
         assert!(default_brief(TaskBriefKind::Repair).contains(NO_PROPOSE_SENTENCE));
+        assert!(default_brief(TaskBriefKind::DataRepair).contains(NO_PROPOSE_SENTENCE));
     }
 
     /// There is NO textual carve-out: the compiled defaults pass by
@@ -310,6 +324,7 @@ mod tests {
             output_model: "revenue_daily".to_string(),
             outbox_dir: "/tmp/outbox".to_string(),
             verify_detail: String::new(),
+            observation_detail: String::new(),
         };
         let rendered =
             render(TaskBriefKind::Elicitation, root.path(), None, &ctx).expect("renders");
