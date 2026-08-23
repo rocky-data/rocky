@@ -68,15 +68,16 @@ const WORKER_PROMPT_DESCRIPTIONS: &[(&str, &str)] = &[
         "Find models with no declarative tests: catalog -> identify untested models -> ground \
          with sample_rows / profile_column -> describe the checks each one needs. Worker \
          profile: checks are spec-owned here, so this ends in a REPORT, not a write — name \
-         the models, the columns, and the assertion each needs, and hand off to the trusted \
-         runner.",
+         the models, the columns, and the assertion each needs, and end at the typed \
+         hand-off to the trusted runner.",
     ),
     (
         "add_tests_to_pks",
         "Identify a model's primary-key / unique columns and the uniqueness + not-null tests \
          they need: inspect_schema -> confirm the keys with profile_column. Worker profile: \
          checks are spec-owned here, so this ends in a REPORT, not a write — name the keys \
-         you confirmed and the assertions they need, and hand off to the trusted runner.",
+         you confirmed and the assertions they need, and end at the typed hand-off to the \
+         trusted runner.",
     ),
     (
         "summarize_project",
