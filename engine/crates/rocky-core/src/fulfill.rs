@@ -219,6 +219,24 @@ pub struct FulfillStateRecord {
     /// (`MAX_REPAIR_ROUNDS`).
     #[serde(default)]
     pub data_repair_rounds: u32,
+    /// Digest over the EXPANDED check set the runner verified for this
+    /// generation — `ModelConfig.tests` after every `[[use_test]]`
+    /// reference is resolved, which is the vector the runner iterates.
+    ///
+    /// Recorded when the verify bundle goes green, and re-computed at
+    /// observation so the checks that RUN are the checks that were
+    /// verified. Hashing the expansion rather than the files behind it is
+    /// what makes this cover `models/test_definitions.toml`: a sidecar's
+    /// `[[use_test]]` entry carries only a name and a binding, while the
+    /// check's type and SQL live in that shared file, which is not a
+    /// lowering artifact and is hashed nowhere.
+    ///
+    /// `None` means no digest was recorded, which is a custody FAILURE at
+    /// observation, never a pass — "the claim I need was made" and "every
+    /// claim matched" are different questions, and an absent digest
+    /// answers the second one perfectly.
+    #[serde(default)]
+    pub checks_digest: Option<String>,
     /// The observed evidence from the last red observation: which
     /// declared checks failed and what they actually measured.
     ///
@@ -295,6 +313,7 @@ impl FulfillStateRecord {
             drafting_attempts: 0,
             repair_rounds: 0,
             data_repair_rounds: 0,
+            checks_digest: None,
             observation_detail: None,
             drafting_round: DraftingRound::Draft,
             owner_pid: None,

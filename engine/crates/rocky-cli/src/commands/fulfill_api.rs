@@ -40,6 +40,13 @@ pub use crate::commands::test::test_output;
 // runner's own loader so the counted set is the executed set.
 #[cfg(feature = "duckdb")]
 pub use crate::commands::test::declarative_test_count;
+// A digest over the EXPANDED check set — the vector the runner iterates,
+// after `[[use_test]]` references are resolved. Hashing the expansion
+// rather than the files it came from is what makes the custody check
+// cover `models/test_definitions.toml`, which is not a lowering artifact
+// and is hashed nowhere.
+#[cfg(feature = "duckdb")]
+pub use crate::commands::test::declarative_check_digest;
 // The loop's stop report (registered in export-schemas as `fulfill`),
 // and the one JSON printer, so the loop's whole rocky-cli surface stays
 // this module.

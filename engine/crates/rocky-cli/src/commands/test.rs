@@ -235,6 +235,38 @@ pub fn declarative_test_count(models_dir: &Path, model: &str) -> Result<usize> {
     Ok(found.config.tests.len())
 }
 
+/// A digest over the EXPANDED check set a model would execute.
+///
+/// Hashes what the loader actually produces — `ModelConfig.tests` after
+/// every `[[use_test]]` reference has been resolved — rather than the
+/// files it produced them from. That distinction is the whole point: a
+/// sidecar's `[[use_test]]` entry carries only a name and a binding, and
+/// the check's TYPE and SQL come from `models/test_definitions.toml`,
+/// which is not a lowering artifact and is not hashed anywhere. Hashing
+/// the source files therefore misses an edit to a shared definition,
+/// while hashing the expansion cannot — and cannot be bypassed by a
+/// future layer of indirection either, because any expansion has to land
+/// in this same vector before it can run.
+///
+/// Deterministic: the vector is file order (inline tests, then resolved
+/// references in reference order), `TestDecl` serializes its fields in
+/// declaration order, and no field is a map or set. Pinned by
+/// `the_check_digest_is_stable_across_loads`.
+///
+/// An unknown model is an error, never a digest over an empty set — the
+/// same rule [`declarative_test_count`] follows, for the same reason.
+#[cfg(feature = "duckdb")]
+pub fn declarative_check_digest(models_dir: &Path, model: &str) -> Result<String> {
+    let all_models = load_all_models(models_dir)?;
+    let found = all_models
+        .iter()
+        .find(|loaded| loaded.config.name == model)
+        .ok_or_else(|| anyhow::Error::new(ModelNotFound(model.to_string())))?;
+    let bytes = serde_json::to_vec(&found.config.tests)
+        .context("failed to serialize the expanded check set")?;
+    Ok(rocky_core::product::manifest::content_digest(&bytes))
+}
+
 /// Model names, for [`reject_unknown_model`] — which takes `&[String]` so it
 /// can serve both the declarative path (loaded `Model`s) and the compiled
 /// path (`TestResult::all_models`).
@@ -673,7 +705,7 @@ fn test_type_label(tt: &TestType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{declarative_test_count, load_all_models};
+    use super::{declarative_check_digest, declarative_test_count, load_all_models};
 
     /// Write a one-model project whose sidecar carries `sidecar_extra`,
     /// plus a named-test registry. Returns the models dir.
@@ -696,6 +728,65 @@ mod tests {
             ),
         )
         .expect("write model sidecar");
+        (tmp, models)
+    }
+
+    #[test]
+    /// The digest must be reproducible across loads, or the custody gate
+    /// it backs reports divergence on every run and the loop never
+    /// observes anything.
+    ///
+    /// Also the load-bearing half: the digest must MOVE when the shared
+    /// `test_definitions.toml` changes, even though the model sidecar is
+    /// byte-identical. That is the whole bypass — a `[[use_test]]` entry
+    /// names a check whose SQL lives in that file, which no manifest
+    /// hashes — and a digest that did not move here would be a gate that
+    /// reports clean while the executed SQL changed.
+    #[test]
+    fn the_check_digest_is_stable_across_loads_and_moves_with_the_definitions() {
+        let (_tmp, models) = project_with_use_test("amount > 0");
+        let first = declarative_check_digest(&models, "orders").expect("digest");
+        let second = declarative_check_digest(&models, "orders").expect("digest");
+        assert_eq!(first, second, "the same files must digest the same");
+
+        // Change ONLY the shared definition. The sidecar is untouched.
+        let sidecar_before = std::fs::read(models.join("orders.toml")).expect("sidecar readable");
+        let (_tmp2, edited) = project_with_use_test("amount > -1000000");
+        let sidecar_after = std::fs::read(edited.join("orders.toml")).expect("sidecar readable");
+        assert_eq!(
+            sidecar_before, sidecar_after,
+            "the fixture must differ ONLY in test_definitions.toml, or this proves nothing"
+        );
+        let moved = declarative_check_digest(&edited, "orders").expect("digest");
+        assert_ne!(
+            first, moved,
+            "editing the shared definition changes what would execute, so the digest \
+             must move — the sidecar hash alone cannot see this"
+        );
+    }
+
+    /// A model sidecar whose only check is a `[[use_test]]` reference,
+    /// plus the shared definition that gives it its SQL.
+    fn project_with_use_test(expression: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir_all(&models).expect("models dir");
+        std::fs::write(
+            models.join("_defaults.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"out\"\n",
+        )
+        .expect("defaults");
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS amount").expect("sql");
+        std::fs::write(
+            models.join("orders.toml"),
+            "name = \"orders\"\n\n[[use_test]]\nname = \"positive_amount\"\ncolumn = \"amount\"\n",
+        )
+        .expect("sidecar");
+        std::fs::write(
+            models.join("test_definitions.toml"),
+            format!("[positive_amount]\ntype = \"expression\"\nexpression = \"{expression}\"\n"),
+        )
+        .expect("definitions");
         (tmp, models)
     }
 

@@ -56,6 +56,10 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // execute, so the deferred count the verify bundle reports is the
     // executed set by construction (it includes `[[use_test]]`
     // expansion, which reading the sidecar's raw array misses).
+    // F3 — the custody digest over the EXPANDED check set, so an edit to
+    // a shared `test_definitions.toml` cannot change what observation
+    // executes without the loop noticing.
+    "rocky_cli::commands::fulfill_api::declarative_check_digest",
     "rocky_cli::commands::fulfill_api::declarative_test_count",
     "rocky_cli::commands::fulfill_api::lookup_apply_receipt",
     "rocky_cli::commands::fulfill_api::observe_declarative_checks",

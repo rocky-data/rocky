@@ -421,6 +421,13 @@ pub enum Event {
         /// Reported, never gated: deferred is not a failure, so this
         /// field is deliberately absent from the green pattern below.
         tests_deferred: Option<usize>,
+        /// Digest over the EXPANDED check set this bundle verified, when
+        /// it could be computed. Recorded on the green transition and
+        /// re-checked at observation, so an edit to a shared
+        /// `test_definitions.toml` cannot change what runs without the
+        /// loop noticing. `None` when this build or this bundle could not
+        /// ask the loader — which makes observation hold, never pass.
+        checks_digest: Option<String>,
         /// Rendered detail. Carries the deferred-checks note on the
         /// paths that counted, plus the red legs' reasons when there
         /// are any.
@@ -1130,13 +1137,22 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 test_green: true,
                 posture_green: true,
                 manifest_total: true,
+                checks_digest,
                 detail,
                 ..
-            } => Decision::AdvanceAndAct {
-                record: to_state(observed, FulfillState::Verifying, now),
-                event: verify_green_event(&detail),
-                task: TaskKind::Propose,
-            },
+            } => {
+                // The green verdict is where the executed check set is
+                // pinned: this is the last point the runner validated the
+                // model, and everything after it (propose, the human
+                // review window, apply) must run the SAME checks.
+                let mut next = to_state(observed, FulfillState::Verifying, now);
+                next.checks_digest = checks_digest;
+                Decision::AdvanceAndAct {
+                    record: next,
+                    event: verify_green_event(&detail),
+                    task: TaskKind::Propose,
+                }
+            }
             Event::VerifyBundle { detail, .. } => {
                 if observed.repair_rounds >= MAX_REPAIR_ROUNDS {
                     let record = blocked(
@@ -2976,6 +2992,7 @@ mod tests {
             manifest_total: true,
             tests_deferred: Some(tests_deferred),
             detail: deferred_note(tests_deferred).unwrap_or_default(),
+            checks_digest: Some("sha256:verified".to_string()),
         }
     }
 
@@ -3073,6 +3090,7 @@ mod tests {
                 manifest_total: true,
                 tests_deferred: None,
                 detail: note.clone(),
+                checks_digest: Some("sha256:verified".to_string()),
             },
             now(),
         );
@@ -3102,6 +3120,7 @@ mod tests {
                 manifest_total: true,
                 tests_deferred: Some(6),
                 detail: "test failures: revenue_daily: binder error".into(),
+                checks_digest: Some("sha256:verified".to_string()),
             },
             now(),
         );
@@ -3126,6 +3145,7 @@ mod tests {
                 manifest_total: true,
                 tests_deferred: Some(6),
                 detail: "E012 on revenue_eur".into(),
+                checks_digest: Some("sha256:verified".to_string()),
             },
             now(),
         );
@@ -3167,6 +3187,7 @@ mod tests {
                 manifest_total: true,
                 tests_deferred: None,
                 detail: "E012 on revenue_eur".into(),
+                checks_digest: Some("sha256:verified".to_string()),
             },
             now(),
         );
@@ -3275,6 +3296,7 @@ mod tests {
                 manifest_total: true,
                 tests_deferred: Some(6),
                 detail: "unique(client_id,date) failed".into(),
+                checks_digest: Some("sha256:verified".to_string()),
             },
             now(),
         );

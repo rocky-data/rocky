@@ -570,6 +570,9 @@ impl Runner {
             posture_green,
             manifest_total,
             tests_deferred,
+            // Pinned from the SAME loader that will execute them, so the
+            // verified set and the executed set are the same object.
+            checks_digest: self.expanded_check_digest(&spec).ok(),
             detail: detail.join(" | "),
         })
     }
@@ -609,6 +612,32 @@ impl Runner {
         Err(
             "this build has no duckdb feature, so the declarative test loader \
              cannot be asked what it would run"
+                .to_string(),
+        )
+    }
+
+    /// Digest the EXPANDED check set through the runner's own loader.
+    ///
+    /// Same discipline as `count_declared_checks`, and for the same
+    /// reason: the counted set must be the executed set by construction.
+    /// This is its custody twin — hashing the loader's output rather
+    /// than the files behind it, so a `[[use_test]]` reference resolved
+    /// out of a shared `test_definitions.toml` is covered even though
+    /// that file is not a lowering artifact.
+    #[cfg(feature = "duckdb")]
+    fn expanded_check_digest(&self, spec: &ApprovedSpec) -> Result<String, String> {
+        fulfill_api::declarative_check_digest(&self.models_dir, spec.parsed.output_model())
+            .map_err(|err| format!("{err:#}"))
+    }
+
+    /// Without the duckdb feature there is no loader to ask, so no digest
+    /// is invented. Declining here makes observation HOLD (an absent
+    /// digest is a custody failure), never pass.
+    #[cfg(not(feature = "duckdb"))]
+    fn expanded_check_digest(&self, _spec: &ApprovedSpec) -> Result<String, String> {
+        Err(
+            "this build has no duckdb feature, so the declarative loader cannot be asked \
+             what it would execute"
                 .to_string(),
         )
     }
@@ -689,6 +718,9 @@ impl Runner {
                     posture_green: true,
                     manifest_total: true,
                     tests_deferred: None,
+                    // A red bundle pins nothing: this arm never reaches
+                    // the green transition that records the digest.
+                    checks_digest: None,
                     detail: format!("propose failed before the policy gate: {err}"),
                 });
             }
@@ -891,8 +923,8 @@ impl Runner {
                 // would be the exact silent-zero this gate exists to stop.
                 deferred: None,
                 detail: format!(
-                    "the declared checks on disk are not the ones that were approved, so they \
-                     were NOT run: {}",
+                    "the declared checks on disk are not the ones this generation verified, \
+                     so they were NOT run: {}",
                     custody.join("; ")
                 ),
                 prior_detail,

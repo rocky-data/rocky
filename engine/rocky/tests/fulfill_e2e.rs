@@ -1954,8 +1954,8 @@ fn emptying_the_sidecar_cannot_turn_a_known_red_into_observing() {
     assert_eq!(code, 4, "still the data-red exit code");
     let message = json["message"].as_str().expect("message");
     assert!(
-        message.contains("not the ones that were approved"),
-        "the stop says the checks on disk are not the approved ones: {message}"
+        message.contains("not the ones this generation verified"),
+        "the stop says the checks on disk are not the verified ones: {message}"
     );
     // And it names a way OUT. Re-running the loop would re-read the same
     // diverged sidecar forever, so `rocky fulfill` is the one command
