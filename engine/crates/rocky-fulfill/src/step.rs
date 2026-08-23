@@ -424,7 +424,7 @@ impl Runner {
             TaskKind::Apply => self.apply(record).await,
             TaskKind::LookupReceipt => self.lookup_receipt(record),
             TaskKind::Observe => self.observe().await,
-            TaskKind::ObserveChecks => self.observe_checks().await,
+            TaskKind::ObserveChecks { prior_detail } => self.observe_checks(prior_detail).await,
         }
     }
 
@@ -839,7 +839,7 @@ impl Runner {
     /// reporting zero problems. "Nothing failed" and "nothing ran" are
     /// different claims and only one of them is health.
     #[cfg(feature = "duckdb")]
-    async fn observe_checks(&self) -> Result<Event> {
+    async fn observe_checks(&self, prior_detail: String) -> Result<Event> {
         // Crash seam for the mid-observation drill: the staleness/test
         // reading is journaled, the declared checks are not read yet.
         // The resume must re-read them, not adopt the last verdict.
@@ -861,6 +861,7 @@ impl Runner {
                     warned: 0,
                     deferred: None,
                     detail: format!("the declared data checks could not be read: {err:#}"),
+                    prior_detail,
                 });
             }
         };
@@ -870,6 +871,7 @@ impl Runner {
             warned: observed.warned,
             deferred: Some(observed.unevaluated),
             detail: render_check_findings(&observed),
+            prior_detail,
         })
     }
 
@@ -878,7 +880,7 @@ impl Runner {
     /// posture `count_declared_checks` takes at verify. The machine reads
     /// an unknown count as unevaluable and holds.
     #[cfg(not(feature = "duckdb"))]
-    async fn observe_checks(&self) -> Result<Event> {
+    async fn observe_checks(&self, prior_detail: String) -> Result<Event> {
         fault_point("mid-observation");
         Ok(Event::ObservationChecks {
             failed: 0,
@@ -888,6 +890,7 @@ impl Runner {
             detail: "this build has no duckdb feature, so the declarative check runner \
                      cannot be asked what the applied output looks like"
                 .to_string(),
+            prior_detail,
         })
     }
 

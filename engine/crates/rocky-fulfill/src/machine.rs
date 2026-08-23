@@ -479,7 +479,13 @@ pub enum Event {
         /// observation side).
         deferred: Option<usize>,
         /// The rendered evidence: which checks, and what they measured.
+        /// This is what reaches the repair worker, so it stays pure
+        /// evidence — the staleness/test reading rides beside it.
         detail: String,
+        /// The staleness/test reading from earlier in the same pass,
+        /// already journaled, carried only so the stop message reports
+        /// the whole observation.
+        prior_detail: String,
     },
     /// `blocked` re-entry with `--retry`.
     RetryRequested,
@@ -492,7 +498,14 @@ pub enum Event {
 // ---------------------------------------------------------------------------
 
 /// A task the runner performs next; its outcome is the next [`Event`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: [`Self::ObserveChecks`] carries the reading that came
+/// before it, because the two halves of an observation must end in ONE
+/// message to the human. Splitting them into two tasks is what gives the
+/// crash seam between them a real resting point; letting the second half
+/// forget the first is what would quietly drop the staleness finding out
+/// of the stop.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskKind {
     /// Dispatch the elicitation driver task, then do the confined
     /// candidate write.
@@ -533,7 +546,12 @@ pub enum TaskKind {
     /// Read the product's declared data checks against the applied
     /// output. Separate from [`Self::Observe`] so each event has exactly
     /// one producer, and so the crash seam between the two is real.
-    ObserveChecks,
+    ObserveChecks {
+        /// The staleness/test reading already journaled this pass,
+        /// carried so the final stop reports the whole observation
+        /// rather than only its second half.
+        prior_detail: String,
+    },
 }
 
 /// A stop: the loop can go no further without a human (or an external
@@ -1316,7 +1334,9 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 } => Decision::AdvanceAndAct {
                     record: to_state(observed, observed.state.clone(), now),
                     event: observation_event(test_green, staleness_ok, &detail),
-                    task: TaskKind::ObserveChecks,
+                    task: TaskKind::ObserveChecks {
+                        prior_detail: detail,
+                    },
                 },
                 Event::ObservationChecks {
                     failed,
@@ -1324,8 +1344,17 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                     warned,
                     deferred,
                     detail,
+                    prior_detail,
                 } => decide_observation_checks(
-                    observed, &product, failed, errored, warned, deferred, &detail, now,
+                    observed,
+                    &product,
+                    failed,
+                    errored,
+                    warned,
+                    deferred,
+                    &detail,
+                    &prior_detail,
+                    now,
                 ),
                 other => internal_mismatch(observed, &other),
             }
@@ -1511,9 +1540,25 @@ fn decide_observation_checks(
     warned: usize,
     deferred: Option<usize>,
     detail: &str,
+    prior_detail: &str,
     now: DateTime<Utc>,
 ) -> Decision {
     let verdict = classify_checks(failed, errored, deferred);
+    // One observation, one message. The staleness/test reading is
+    // already in the journal; repeating it here is what keeps a single
+    // `rocky fulfill` stop from reporting half of what it looked at.
+    let whole = if prior_detail.is_empty() {
+        detail.to_string()
+    } else {
+        format!("{prior_detail} | {detail}")
+    };
+    // `applied` on the pass that first reaches it, `live` thereafter —
+    // the pre-F3 wording, kept because it is the difference between
+    // "this just shipped" and "this is running".
+    let standing = match &observed.state {
+        FulfillState::Applied => "applied",
+        _ => "live",
+    };
     let event = observation_checks_event(&verdict, failed, errored, warned, deferred, detail);
     match verdict {
         // Every declared check ran, none failed. This is the ONLY path
@@ -1527,7 +1572,7 @@ fn decide_observation_checks(
                 record: next,
                 event,
                 stop: Stop {
-                    message: format!("product {product} is live; {detail}"),
+                    message: format!("product {product} is {standing}; {whole}"),
                     next_command: None,
                 },
             }
@@ -1559,7 +1604,7 @@ fn decide_observation_checks(
                 stop: Stop {
                     message: format!(
                         "product {product} is applied, but its declared data checks could not \
-                         be evaluated, so nothing here says the output is right: {detail}"
+                         be evaluated, so nothing here says the output is right: {whole}"
                     ),
                     next_command: Some(format!("rocky fulfill {product}")),
                 },
@@ -1623,7 +1668,7 @@ fn decide_observation_checks(
                         stop: Stop {
                             message: format!(
                                 "product {product} is applied, and the applied output is failing \
-                                 its own declared data checks: {detail} — re-run to confirm the \
+                                 its own declared data checks: {whole} — re-run to confirm the \
                                  reading and start a repair round (the repaired model goes back \
                                  through review before it applies)"
                             ),
@@ -3767,7 +3812,14 @@ mod tests {
         // NO health is claimed yet: `observing` is not reachable until
         // the declared checks have been read.
         assert_eq!(record.state, FulfillState::Applied, "no state claimed yet");
-        assert_eq!(task, TaskKind::ObserveChecks);
+        assert_eq!(
+            task,
+            TaskKind::ObserveChecks {
+                prior_detail: "lag 60s, budget 86400s".to_string()
+            },
+            "the reading is carried forward, so the final stop reports the whole \
+             observation and not only its second half"
+        );
         assert!(event.contains("staleness fresh"));
     }
 
@@ -3793,7 +3845,12 @@ mod tests {
             panic!("expected AdvanceAndAct, got {d:?}");
         };
         assert_eq!(record.state, FulfillState::Observing, "stays observing");
-        assert_eq!(task, TaskKind::ObserveChecks);
+        assert_eq!(
+            task,
+            TaskKind::ObserveChecks {
+                prior_detail: "lag 200000s, budget 86400s".to_string()
+            }
+        );
         assert!(event.contains("tests RED"));
         assert!(event.contains("staleness STALE"));
     }
@@ -3811,6 +3868,7 @@ mod tests {
             deferred,
             detail: "revenue_daily.client_id [unique] fail (error): 4 duplicate value(s) found"
                 .into(),
+            prior_detail: "MAX(loaded_at) = t, lag 60s, budget 86400s".into(),
         }
     }
 
@@ -3859,7 +3917,8 @@ mod tests {
             now(),
         );
         assert!(
-            matches!(d, Decision::AdvanceAndAct { task, .. } if task == TaskKind::ObserveChecks),
+            matches!(&d, Decision::AdvanceAndAct { task, .. }
+                if matches!(task, TaskKind::ObserveChecks { .. })),
             "staleness routes nowhere on its own: {d:?}"
         );
         let d = decide(&rec(FulfillState::Applied), checks(0, 0, 7, Some(0)), now());
@@ -4144,6 +4203,65 @@ mod tests {
         );
     }
 
+    /// One observation, one message — and the standing word is the one
+    /// the reader had before F3.
+    ///
+    /// Splitting the observation into two readings must not cost the
+    /// human half the answer: the staleness finding is journaled by the
+    /// first reading and would otherwise vanish from the stop, which is
+    /// the only place most people ever look. And the first pass still
+    /// says "applied" while later ones say "live" — that difference is
+    /// how a reader tells a fresh ship from a running product.
+    #[test]
+    fn one_observation_reports_as_one_message_with_the_standing_word_intact() {
+        let d = decide(&rec(FulfillState::Applied), checks(0, 0, 0, Some(0)), now());
+        let Decision::AdvanceAndStop { stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(
+            stop.message.contains("is applied;"),
+            "the first pass to reach it says applied: {}",
+            stop.message
+        );
+        assert!(
+            stop.message.contains("lag 60s, budget 86400s"),
+            "the staleness reading must survive into the stop: {}",
+            stop.message
+        );
+        assert!(
+            stop.message.contains("declared data checks"),
+            "and so must the check reading: {}",
+            stop.message
+        );
+
+        let d = decide(
+            &rec(FulfillState::Observing),
+            checks(0, 0, 0, Some(0)),
+            now(),
+        );
+        let Decision::AdvanceAndStop { stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(
+            stop.message.contains("is live;"),
+            "a product already observed says live: {}",
+            stop.message
+        );
+
+        // A red stop carries the whole observation too — the human
+        // deciding whether to let a repair run needs both halves.
+        let d = decide(&rec(FulfillState::Applied), checks(1, 0, 0, Some(0)), now());
+        let Decision::AdvanceAndStop { stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        assert!(stop.message.contains("lag 60s"), "{}", stop.message);
+        assert!(
+            stop.message.contains("4 duplicate value(s) found"),
+            "{}",
+            stop.message
+        );
+    }
+
     /// The verdict ORDER is the decision. Positive evidence of failure
     /// outranks an incomplete reading; an incomplete reading outranks a
     /// clean tally.
@@ -4194,6 +4312,7 @@ mod tests {
                 warned: 0,
                 deferred: Some(0),
                 detail: "x".repeat(MAX_OBSERVATION_DETAIL + 500),
+                prior_detail: String::new(),
             },
             now(),
         );
