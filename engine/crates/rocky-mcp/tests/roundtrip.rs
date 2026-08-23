@@ -141,7 +141,9 @@ async fn worker_profile_tools_list_is_the_minimal_allowlist() {
             "catalog",
             "compile",
             "dependents",
-            "draft_check",
+            // `draft_check` is deliberately absent: a check's expression is
+            // raw-interpolated into SQL the loop executes unattended after
+            // an apply, so the untrusted profile must not author one.
             "draft_model",
             "inspect_schema",
             "lineage",
@@ -3006,13 +3008,22 @@ async fn worker_profile_descriptions_and_next_steps_end_at_the_handoff() {
     .as_object()
     .unwrap()
     .clone();
-    let check = client
+    // `draft_check` must NOT be served here. A check's `expression` is
+    // raw-interpolated into the SQL the loop executes unattended after every
+    // apply, so an untrusted worker able to author one would be writing SQL
+    // the warehouse later runs with credentials. This asserts it at the
+    // PROTOCOL level — absent from the router the worker actually talks to,
+    // not merely filtered out of a constant a test could read back to itself.
+    let refused = client
         .call_tool(CallToolRequestParams::new("draft_check").with_arguments(check_args))
-        .await
-        .expect("draft_check call");
-    assert_ne!(check.is_error, Some(true), "draft_check succeeds");
+        .await;
+    let err = refused.expect_err("draft_check must not be served to the worker profile");
+    assert!(
+        err.to_string().contains("tool not found"),
+        "draft_check must be refused as absent, not fail some other way: {err}"
+    );
 
-    for (tool, result) in [("draft_model", &draft), ("draft_check", &check)] {
+    for (tool, result) in [("draft_model", &draft)] {
         let next_steps = result.structured_content.as_ref().expect("structured")["next_steps"]
             .as_str()
             .expect("next_steps is a string")
