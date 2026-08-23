@@ -749,6 +749,115 @@ pub async fn observe_max_time_column(
     })
 }
 
+/// One declared check that did not pass, as the loop may quote it.
+///
+/// Deliberately NARROWER than the CLI's `DeclarativeTestResult`: it drops
+/// the generated `sql`. That SQL is built from sidecar `[[tests]]` a
+/// worker can append through `draft_check`, and the loop's next move on a
+/// red observation is to hand this evidence to a worker as a task brief.
+/// Brief validation runs on the TEMPLATE, before substitution, so
+/// anything interpolated is unvalidated text — keeping worker-authored
+/// SQL out of the type means it cannot reach a brief by accident. The
+/// `detail` strings the runner produces are counts and bounds
+/// (`"3 NULL row(s) found"`, `"row count 0 outside range [1, +inf)"`),
+/// never warehouse cell values, so the evidence stays useful without
+/// carrying data.
+#[cfg(feature = "duckdb")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedCheck {
+    /// The model the check belongs to.
+    pub model: String,
+    /// The column under test, when the check names one.
+    pub column: Option<String>,
+    /// The check type (`not_null`, `unique`, `row_count_range`, ...).
+    pub test_type: String,
+    /// `"fail"` or `"error"` (passes are not carried).
+    pub status: String,
+    /// The declared severity, `"error"` or `"warning"`.
+    pub severity: String,
+    /// What the check actually measured.
+    pub detail: Option<String>,
+}
+
+/// The post-apply reading of a product's declared data checks.
+#[cfg(feature = "duckdb")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedChecks {
+    /// Checks the model loader expanded for this model.
+    pub declared: usize,
+    /// Checks that actually executed.
+    pub executed: usize,
+    /// Checks that passed.
+    pub passed: usize,
+    /// Checks that failed at `severity = "error"`.
+    pub failed: usize,
+    /// Checks that failed at `severity = "warning"`.
+    pub warned: usize,
+    /// Checks whose execution errored — no verdict on the data.
+    pub errored: usize,
+    /// Declared checks that produced no result at all.
+    pub unevaluated: usize,
+    /// The non-passing checks, for the human and the repair brief.
+    pub findings: Vec<ObservedCheck>,
+}
+
+/// Run the product's declared data checks against the MATERIALISED
+/// output, after apply.
+///
+/// Invariant guarded: this is the same execution path `rocky test
+/// --declarative` takes — one shared typed core
+/// ([`crate::commands::test::declarative_run`]), not a second check
+/// engine. The set executed is the set the model loader expands, which is
+/// the set [`declarative_test_count`] reports as deferred at verify: the
+/// loop counts and executes from one source, so "N deferred" at verify
+/// and "N evaluated" at observation describe the same checks rather than
+/// two re-derivations that have to be kept in step by hand.
+///
+/// Scoped to one model — the product's output model. A product is
+/// answerable for what it declared about its own output, not for the rest
+/// of the project.
+#[cfg(feature = "duckdb")]
+pub async fn observe_declarative_checks(
+    config_path: &Path,
+    models_dir: &Path,
+    model: &str,
+) -> Result<ObservedChecks> {
+    let run =
+        crate::commands::test::declarative_run(config_path, models_dir, None, Some(model)).await?;
+    let (declared, passed, failed, warned, errored, unevaluated) = (
+        run.declared,
+        run.passed(),
+        run.failed(),
+        run.warned(),
+        run.errored(),
+        run.unevaluated(),
+    );
+    let executed = run.results.len();
+    let findings = run
+        .results
+        .into_iter()
+        .filter(|r| r.status != "pass")
+        .map(|r| ObservedCheck {
+            model: r.model,
+            column: r.column,
+            test_type: r.test_type,
+            status: r.status,
+            severity: r.severity,
+            detail: r.detail,
+        })
+        .collect();
+    Ok(ObservedChecks {
+        declared,
+        executed,
+        passed,
+        failed,
+        warned,
+        errored,
+        unevaluated,
+        findings,
+    })
+}
+
 /// The adapter a pipeline's target names.
 fn pipeline_target_adapter(pipeline: &rocky_core::config::PipelineConfig) -> String {
     use rocky_core::config::PipelineConfig;

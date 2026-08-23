@@ -242,15 +242,75 @@ fn model_names(models: &[rocky_core::models::Model]) -> Vec<String> {
     models.iter().map(|m| m.config.name.clone()).collect()
 }
 
-/// Execute `rocky test --declarative`: run `[[tests]]` from model sidecars
-/// against the configured warehouse adapter.
-pub async fn run_declarative_tests(
+/// One declarative run, typed: what the loader said should run, and what
+/// actually ran.
+///
+/// The two counts are the honesty carrier. They are derived from ONE
+/// [`load_all_models`] call — so there is no second reading to drift —
+/// but on two independent predicates: `declared` counts the expanded
+/// `[[tests]]` of every model the selection names, while `results` is
+/// produced by the execution loop. A caller can therefore tell "every
+/// declared check ran and passed" from "nothing ran", which are the same
+/// tally otherwise. Today the two counts always agree; the point is that
+/// a future short-circuit in the execution loop shows up as a shortfall
+/// instead of silently reading as health.
+pub(crate) struct DeclarativeRun {
+    /// Expanded `[[tests]]` the loader produced for the selected models.
+    pub(crate) declared: usize,
+    /// One entry per check the runner actually executed.
+    pub(crate) results: Vec<DeclarativeTestResult>,
+}
+
+impl DeclarativeRun {
+    /// Checks the loader declared that produced no result at all.
+    pub(crate) fn unevaluated(&self) -> usize {
+        self.declared.saturating_sub(self.results.len())
+    }
+
+    /// Checks that failed at `severity = "error"` — the applied output
+    /// contradicting something the product declared about itself.
+    pub(crate) fn failed(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|r| r.status == "fail" && r.severity == "error")
+            .count()
+    }
+
+    /// Checks that failed at `severity = "warning"`: reported, never
+    /// treated as a defect.
+    pub(crate) fn warned(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|r| r.status == "fail" && r.severity == "warning")
+            .count()
+    }
+
+    /// Checks whose execution errored — the runner could not tell
+    /// whether the data is right.
+    pub(crate) fn errored(&self) -> usize {
+        self.results.iter().filter(|r| r.status == "error").count()
+    }
+
+    /// Checks that passed.
+    pub(crate) fn passed(&self) -> usize {
+        self.results.iter().filter(|r| r.status == "pass").count()
+    }
+}
+
+/// Load, select, and execute the declarative checks — the typed core of
+/// `rocky test --declarative`.
+///
+/// [`run_declarative_tests`] is this function plus reporting and the exit
+/// rule, and the fulfillment loop's observation façade is this function
+/// plus a verdict. Sharing it is deliberate: a second check engine that
+/// drifted from the one `rocky test` runs would let the loop bless data
+/// the CLI calls broken.
+pub(crate) async fn declarative_run(
     config_path: &Path,
     models_dir: &Path,
     pipeline_name: Option<&str>,
     model_filter: Option<&str>,
-    output_json: bool,
-) -> Result<()> {
+) -> Result<DeclarativeRun> {
     // 1. Load config + adapter registry.
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
@@ -280,6 +340,20 @@ pub async fn run_declarative_tests(
     // former must stay exit 0; only the latter is an error.
     reject_unknown_model(model_filter, &model_names(&all_models))?;
 
+    // The declared count, on the NAME predicate alone — deliberately not
+    // the has-tests closure below. A model the selection names but whose
+    // checks never reach the execution loop is a shortfall a caller can
+    // see, not a silent zero.
+    let selected = |m: &&rocky_core::models::Model| match model_filter {
+        Some(filter) => m.config.name == filter,
+        None => true,
+    };
+    let declared: usize = all_models
+        .iter()
+        .filter(selected)
+        .map(|m| m.config.tests.len())
+        .sum();
+
     // 3. Filter to models that have [[tests]] declared.
     let models_with_tests: Vec<_> = all_models
         .iter()
@@ -295,7 +369,37 @@ pub async fn run_declarative_tests(
         })
         .collect();
 
-    if models_with_tests.is_empty() {
+    // 4. Execute each test.
+    let mut results = Vec::new();
+    for model in &models_with_tests {
+        let target = &model.config.target;
+        let fq_table = format!("{}.{}.{}", target.catalog, target.schema, target.table);
+        debug!(model = %model.config.name, tests = model.config.tests.len(), "running declarative tests");
+
+        for test_decl in &model.config.tests {
+            let result =
+                execute_one_test(test_decl, &model.config.name, &fq_table, &warehouse_adapter)
+                    .await;
+            results.push(result);
+        }
+    }
+
+    Ok(DeclarativeRun { declared, results })
+}
+
+/// Execute `rocky test --declarative`: run `[[tests]]` from model sidecars
+/// against the configured warehouse adapter.
+pub async fn run_declarative_tests(
+    config_path: &Path,
+    models_dir: &Path,
+    pipeline_name: Option<&str>,
+    model_filter: Option<&str>,
+    output_json: bool,
+) -> Result<()> {
+    let run = declarative_run(config_path, models_dir, pipeline_name, model_filter).await?;
+    let results = run.results;
+
+    if results.is_empty() {
         info!("no declarative tests found in models directory");
         if output_json {
             let output = TestOutput {
@@ -314,21 +418,6 @@ pub async fn run_declarative_tests(
             println!("No declarative tests found.");
         }
         return Ok(());
-    }
-
-    // 4. Execute each test.
-    let mut results = Vec::new();
-    for model in &models_with_tests {
-        let target = &model.config.target;
-        let fq_table = format!("{}.{}.{}", target.catalog, target.schema, target.table);
-        debug!(model = %model.config.name, tests = model.config.tests.len(), "running declarative tests");
-
-        for test_decl in &model.config.tests {
-            let result =
-                execute_one_test(test_decl, &model.config.name, &fq_table, &warehouse_adapter)
-                    .await;
-            results.push(result);
-        }
     }
 
     // 5. Tally results.
