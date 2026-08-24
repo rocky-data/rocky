@@ -515,7 +515,8 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 ///                                                   excluded_tool
 ///   7  tools/call   -> ok: result next_steps       swept: draft_next_steps_are_
 ///                                                   profile_selected
-///   8  tools/call   -> ok: other result text       PARTIAL — see below
+///   8  tools/call   -> ok: other result text       PARTIAL — two DIFFERENT
+///                                                   reasons, split below
 ///   9  tools/call   -> err: remediation_hint       OPEN — not swept
 /// ```
 ///
@@ -561,22 +562,35 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// to the same text), breaking-change finding messages, `skipped_reason`,
 /// test-failure text, unavailability `reason`s. Its sweep drives all 12
 /// worker-served tools and serialises each WHOLE result, with the compile
-/// forced RED so the diagnostic path is really exercised. What it CANNOT
-/// claim is completeness, for two different reasons:
+/// forced RED so the diagnostic path is really exercised.
 ///
-///  - Rocky-authored STATIC templates are written per call site across
-///    rocky-compiler, rocky-core and rocky-cli, for consumers that are
-///    mostly not this worker. There is no table to audit; reaching all of
-///    them means driving every constructor. That is the same shape as (9),
-///    and it gets the same honest status rather than a better one.
-///  - INTERPOLATED spans are structurally unsweepable. A diagnostic quotes
-///    the user's own model and column names, so a project with a model
-///    named `propose_v2` produces worker-facing text no rule Rocky ships
-///    can fix. Identifier-boundary matching shrinks this a lot — a column
-///    called `proposal_id` is no longer a match — but it does not remove
-///    it, and no runtime filter exists on surfaces 4, 5 or 7 either. This
-///    is a BOUNDARY, not a bug: naming it is the honest move, and pretending
-///    the sweep covers it would be the over-claim.
+/// What it CANNOT claim is completeness — for two reasons that are NOT the
+/// same kind of thing, and the ninth review round asked for them split
+/// because the second was laundering the first:
+///
+///  - UNFINISHED AUDIT COVERAGE (fixable, nobody has done it). Rocky-authored
+///    STATIC templates are written per call site across rocky-compiler,
+///    rocky-core and rocky-cli, for consumers that are mostly not this
+///    worker. There is no table to audit, so reaching all of them means
+///    driving every constructor — which this harness does not. That is work
+///    not yet done, the same shape as (9). It is not a property of the
+///    problem, and it must not inherit the next bullet's excuse.
+///  - A REAL LEXICAL BOUNDARY (unfixable by any rule Rocky ships). A
+///    diagnostic interpolates the user's own model and column names. If a
+///    project contains an identifier that IS an excluded tool name —
+///    a model literally called `propose` — the diagnostic quoting it names
+///    an excluded tool, and no rule Rocky ships can reword someone's model.
+///
+///    The collision is narrower than it was, and the example this comment
+///    used to give was WRONG: `propose_v2` does NOT collide, because `_` is
+///    an identifier byte, so `contains_identifier` rejects it at the
+///    boundary exactly as it rejects `proposal_id` and `propose_only`. Only
+///    an EXACT identifier collides. A wrong example makes a true boundary
+///    look invented, which is why it is corrected rather than dropped.
+///
+/// The distinction matters operationally: the first bullet closes by doing
+/// the audit, the second never closes. Reporting them as one PARTIAL let
+/// the unfinished half borrow the finished half's excuse.
 ///
 /// (9) IS THE OPEN GAP, stated rather than glossed. A `ToolError`'s
 /// `remediation_hint` is guidance, it is served to the worker, and it is
@@ -6561,6 +6575,11 @@ mod tests {
             "unknown column: proposed_amount",
             "model `proposer` has no unique key",
             "the config literal propose_only is frozen",
+            // The corrected boundary example. Two review rounds cited
+            // `propose_v2` as the collision no rule can fix; `_` is an
+            // identifier byte, so it never collided. Pinned here so the
+            // comment that now says so cannot drift back.
+            "column not found on model `propose_v2`",
             "unoptimized scan on `events`",
         ] {
             assert_eq!(
@@ -6576,6 +6595,11 @@ mod tests {
             "a plan you already proposed",
             "write the proposal, then stop",
             "or optimize the query to reduce scan volume",
+            // The collision that IS real: an EXACT user identifier. This is
+            // what the boundary paragraph on `WORKER_GUIDANCE_SURFACES`
+            // describes, and it fires because there is nothing lexical left
+            // to tell it apart from the tool name.
+            "column not found on model `propose`",
         ] {
             assert!(
                 names_excluded_tool(steering, &excluded).is_some(),

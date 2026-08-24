@@ -3227,17 +3227,27 @@ fn worker_excluded_tools(config_path: &Path) -> Vec<String> {
 ///  - It proves the results of the paths driven below carry no excluded
 ///    name. Every result is swept as its WHOLE serialized JSON, so a field
 ///    added later is covered without this test knowing the shape.
-///  - It does NOT prove every Rocky-authored diagnostic is clean. There is
-///    no table of diagnostic text to audit: constructors are written per
-///    call site across rocky-compiler, rocky-core and rocky-cli, for
-///    consumers that are mostly not this worker. Reaching all of them means
-///    driving every constructor — the same reason surface 9 is OPEN.
-///  - It CANNOT prove the interpolated spans are clean. A diagnostic quotes
-///    the user's own model and column names. A project with a model named
-///    `propose_v2` produces text no rule Rocky ships can fix. Identifier
-///    boundaries shrink that surface a lot (`proposal_id` no longer
-///    matches); they do not remove it, and no runtime filter exists on the
-///    other swept surfaces either.
+///  - UNFINISHED AUDIT COVERAGE, not a boundary. It does NOT prove every
+///    Rocky-authored diagnostic is clean. There is no table of diagnostic
+///    text to audit: constructors are written per call site across
+///    rocky-compiler, rocky-core and rocky-cli, for consumers that are
+///    mostly not this worker. Reaching all of them means driving every
+///    constructor, which this harness does not — the same reason surface 9
+///    is OPEN. That is work not yet done, and it closes by doing it.
+///  - A REAL LEXICAL BOUNDARY, which never closes. It CANNOT prove the
+///    interpolated spans are clean, because a diagnostic quotes the user's
+///    own model and column names. A project containing an identifier that
+///    IS an excluded tool name — a model literally called `propose` —
+///    produces text no rule Rocky ships can fix.
+///
+///    The example this comment used to give was WRONG: `propose_v2` does
+///    NOT collide, because `_` is an identifier byte, so the boundary rule
+///    rejects it exactly as it rejects `proposal_id` and `propose_only`.
+///    Only an EXACT identifier collides. Corrected rather than dropped — a
+///    wrong example makes a true boundary look invented.
+///
+/// The two are stated separately because reporting them as one PARTIAL let
+/// the unfinished audit borrow the boundary's excuse.
 #[tokio::test]
 async fn worker_result_text_names_no_excluded_tool() {
     let dir = TempDir::new().unwrap();
