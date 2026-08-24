@@ -473,7 +473,12 @@ pub struct LoadedCheckSet {
     /// The digest over that model's expanded checks AND its target.
     digest: String,
     /// The warehouse those checks execute against, resolved from the
-    /// config BEFORE this handle — and therefore its digest — existed.
+    /// config before this handle existed — but AFTER `digest`, which
+    /// [`Self::bind`] computes first. The appositive that used to sit
+    /// here ("and therefore its digest") had those two lines the wrong
+    /// way round. Only the HANDLE orders them: both fields are set
+    /// together or the constructor fails, so `digest()` is never
+    /// readable while `warehouse` is still open.
     /// Held as the live adapter, not as a name: nothing later re-reads
     /// `rocky.toml` to decide where the query goes.
     warehouse: Arc<dyn WarehouseAdapter>,

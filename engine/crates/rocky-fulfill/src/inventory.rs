@@ -49,9 +49,12 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // digest and then hands the same handle to
     // `observe_declarative_checks`, which consumes it, so the compared
     // set and the executed set are one object rather than two reads of
-    // the same directory — and the warehouse is resolved before the
-    // digest exists, so no config edit after the comparison can reroute
-    // the query. `BindFailure` is its two-remedy error: a check set that
+    // the same directory — and the warehouse is bound before the digest
+    // is READABLE (`bind` computes the digest first and resolves the
+    // adapter second, then returns both together, so there is no handle
+    // whose digest can be read while its warehouse is still open), so
+    // no config edit after the comparison can reroute the query.
+    // `BindFailure` is its two-remedy error: a check set that
     // will not load is the custody gate's business, an unresolvable
     // warehouse is not, and printing the custody remedy for a config
     // typo would name a fix that cannot work.

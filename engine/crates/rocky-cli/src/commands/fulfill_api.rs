@@ -60,10 +60,30 @@ pub use crate::commands::test::{CHECK_SET_DIGEST_SCHEME, check_set_digest_scheme
 // set, with the warehouse it runs against already bound. The custody
 // gate compares `digest()` and then hands this same handle to
 // `observe_declarative_checks`, which consumes it — so the set that was
-// compared is the set that runs, against the warehouse that was resolved
-// before the digest existed, with no second read of the filesystem in
-// between. `BindFailure` keeps a config problem from being reported as a
-// custody divergence, whose remedy would not fix it.
+// compared is the set that runs, against the warehouse the handle
+// already holds.
+//
+// THE ORDER, as it actually is. `bind` digests the check set FIRST and
+// resolves the adapter SECOND. So the warehouse is NOT "resolved before
+// the digest existed" — this comment said that and had the two lines of
+// `LoadedCheckSet::bind` in the wrong order. What holds is EXPOSURE
+// order, which is the property the reroute argument needs anyway: `bind`
+// is the only constructor and returns both halves or neither, so no
+// caller can read `digest()` from a handle whose warehouse is still
+// unresolved, and `run(self)` takes no config path to resolve a
+// different one.
+//
+// It is also NOT "no second read of the filesystem in between", which
+// this comment also claimed — flatly contradicting `LoadedCheckSet`'s
+// own type doc one crate over, which disowns that exact sentence by
+// name. `resolve_warehouse_adapter` reads `rocky.toml` AFTER the digest
+// is computed, and the bound adapter keeps reading files while it runs
+// (Snowflake key-pair auth re-reads its PEM inside per-request
+// `get_token`). The guarantee is caller substitution, not filesystem
+// quiescence.
+//
+// `BindFailure` keeps a config problem from being reported as a custody
+// divergence, whose remedy would not fix it.
 #[cfg(feature = "duckdb")]
 pub use crate::commands::test::{BindFailure, LoadedCheckSet};
 // The loop's stop report (registered in export-schemas as `fulfill`),
