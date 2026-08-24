@@ -174,11 +174,25 @@ pub enum McpProfile {
 /// not something this allowlist claims to solve.
 ///
 /// Nothing is lost by removing it: the product spec's declared grain and
-/// `checks` already lower into the sidecar's `[[tests]]`, so the checks the
-/// loop evaluates are the ones the operator wrote and approved.
-/// Hand-appending them was redundant. The tool remains on the Default
-/// profile, where the caller is an operator-driven session rather than an
-/// untrusted drafting worker.
+/// `checks` already lower into the sidecar's `[[tests]]`, so the worker has
+/// no need to append one. Hand-appending them was redundant.
+///
+/// Note what that does NOT say. It does not say the evaluated checks are
+/// only the ones the operator approved — the paragraph above is the reason
+/// why. A check written straight to the sidecar is PINNED, not rejected:
+/// Phase B preserves it, and the digest the loop pins at `verifying` is
+/// taken AFTER that merge, so the worker's check is inside the set the
+/// generation verifies and is evaluated like any other.
+///
+/// The post-apply custody digest does not close that either, and claiming
+/// it does would be the same over-claim one paragraph later. It compares
+/// what is on disk against what the generation verified, so it catches a
+/// set that MOVED after verification — not one that was already wrong when
+/// the digest was taken. The allowlist closes a route; the digest closes a
+/// window. Neither judges a check's content; that is #1515.
+///
+/// The tool remains on the Default profile, where the caller is an
+/// operator-driven session rather than an untrusted drafting worker.
 const WORKER_PROFILE_TOOLS: &[&str] = &[
     "breaking_change",
     "catalog",

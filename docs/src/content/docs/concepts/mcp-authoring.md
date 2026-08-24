@@ -190,7 +190,8 @@ closes the tool route. It does not confine the worker's filesystem, and the
 lowering keeps a check it finds in a sidecar, so a worker that can write
 files can still write one. What catches a check changed after the plan was
 verified is the fulfillment loop's own custody digest, which refuses to run
-a check set that is not the one it approved.
+a check set that is not the one it verified. A check already on disk at that
+moment is inside the verified set, so nothing catches that one.
 
 The prompt names are the same in both profiles, but under the worker profile
 the workflow prompts are served as worker variants: they orchestrate only

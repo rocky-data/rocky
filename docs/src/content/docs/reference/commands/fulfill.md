@@ -33,8 +33,8 @@ rocky fulfill revenue_daily
 
 The loop trusts nothing it did not verify itself:
 
-- The drafting agent runs in its own process group on a worker-profile MCP server. It can read, compile, test, and draft models. It cannot touch contracts, metadata, proposals, reviews, or schedules. The whole group is killed when the task ends, so helpers and accidental stragglers do not outlive the task. A process that puts itself in a new session with `setsid` leaves the group and is beyond any process-group kill — that is part of the hostile-local-agent residual below, not a covered case.
-- After drafting, every spec-owned artifact is byte-verified against the committed lowering manifest. Drift means `blocked` — the loop names the tampered file.
+- The drafting agent runs in its own process group on a worker-profile MCP server. That server offers it read, compile, test, and `draft_model`. It offers no tool for contracts, metadata, data checks, proposals, reviews, or schedules. That is a closed tool route, not a limit on the agent. The agent is an ordinary process in your project directory, so one that can write files can write those files directly. The later gates are what catch that, not the tool list. The whole group is killed when the task ends, so helpers and accidental stragglers do not outlive the task. A process that puts itself in a new session with `setsid` leaves the group and is beyond any process-group kill — that is part of the hostile-local-agent residual below, not a covered case.
+- After drafting, every spec-owned artifact is byte-verified against the committed lowering manifest. Drift means `blocked` — the loop names the tampered file. The manifest covers the files the lowering emits: the contract and the model sidecar. It does not cover `models/test_definitions.toml`, which a `[[use_test]]` entry resolves against. The check-set comparison described below covers that.
 - The plan reaches the review queue only through the engine's one governed propose path, as the `agent` principal, under your `[policy]`.
 - The apply recomputes the spec digest from the approved snapshot and passes `--expect-spec-digest`. The engine refuses a mismatch even if the loop did not.
 - Only a `Succeeded` outcome is ever journaled as applied. An apply deflected as already-running keeps waiting. A resumed crash asks the idempotency store for an authoritative receipt; a backend that cannot answer leaves the state for a human, never a blind retry.
@@ -75,6 +75,20 @@ printed and journaled; neither starts a repair.
 A check the loop cannot EVALUATE is not a check that passed. If a check errors —
 its SQL will not run, the column is missing — the loop holds at `applied` and
 says so, rather than claiming health or rewriting a model on a guess.
+
+Before it runs any of them, the loop compares the checks on disk with the set it
+verified for this plan. It compares what the model loader produces, so a
+`[[use_test]]` entry edited in `models/test_definitions.toml` is covered even
+though no manifest lists that file. The comparison also covers the table the
+checks run against, and the warehouse is fixed at the same moment, so a later
+edit to `rocky.toml` cannot move the query. A set that does not match is not run:
+the loop holds and tells you to put back what changed.
+
+Be exact about what that buys you. It catches a change made AFTER the plan was
+verified. A check that was already on disk at that point is part of the verified
+set, so this comparison does not question it — including one an agent wrote
+there. Verification pins the check set; it does not judge it. To know what will
+run, read the model's sidecar.
 
 Two invocations never fight: every state write is a compare-and-swap, and a loop that finds a live owner prints its pid and exits. A crashed owner is taken over automatically — a dead pid is detected by its start time, so a recycled pid never counts as alive.
 
