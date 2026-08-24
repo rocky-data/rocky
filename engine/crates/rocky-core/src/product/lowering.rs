@@ -817,6 +817,116 @@ mod tests {
         );
     }
 
+    /// WHAT THE SPEC CAN CARRY — pinned because a remedy quotes it.
+    ///
+    /// The fulfillment loop's custody stop tells an operator that
+    /// `output.checks` "always lowers to an error-severity `expression`
+    /// test", and that a typed shape, a `warning` severity, or a
+    /// `filter` has no spec spelling at all. That sentence is only true
+    /// while this function stays as narrow as it is now, so the claim is
+    /// pinned on the MECHANISM rather than on the message's wording.
+    ///
+    /// Teaching `checks` a severity, a column binding, or a typed shape
+    /// fails here — and the failure names the message that has to be
+    /// corrected with it (`UnevaluableCause::CheckCustody` in
+    /// `rocky-fulfill`'s `machine.rs`).
+    #[test]
+    fn spec_checks_lower_only_to_error_severity_expression_tests() {
+        let spec = br#"
+[product]
+name = "many_checks"
+intent = "pin what output.checks can express"
+
+[product.source]
+tables = ["poc.raw.orders"]
+
+[product.output]
+grain = ["id"]
+columns = [
+  { name = "id",     type = "Int64", nullable = false },
+  { name = "amount", type = "Int64", nullable = true },
+]
+checks = ["amount >= 0", "id < 1000000"]
+
+[product.trust]
+agent = "propose_only"
+"#;
+        fn str_at<'a>(test: &'a TomlTable, key: &str) -> Option<&'a str> {
+            match test.get(key) {
+                Some(TomlValue::String(text)) => Some(text.as_str()),
+                _ => None,
+            }
+        }
+
+        let parsed = parse_spec_bytes(spec, "products/many_checks.toml").expect("parses");
+        let generated = generated_tests(&parsed);
+
+        // Tier 1: every `checks` entry, and nothing else, lowers to an
+        // `expression` test.
+        let expressions: Vec<&TomlTable> = generated
+            .iter()
+            .filter(|test| str_at(test, "type") == Some("expression"))
+            .collect();
+        assert_eq!(
+            expressions.len(),
+            2,
+            "one expression test per declared check: {generated:?}"
+        );
+        for test in &expressions {
+            assert_eq!(
+                str_at(test, "severity"),
+                Some("error"),
+                "the severity is hard-coded, so a `warning` check cannot be expressed: {test:?}"
+            );
+            assert!(
+                test.get("column").is_none() && test.get("filter").is_none(),
+                "a check carries no column and no filter, so neither can be expressed: {test:?}"
+            );
+            assert_eq!(
+                test.keys().map(String::as_str).collect::<Vec<_>>(),
+                vec!["type", "expression", "severity"],
+                "three keys and no more — a new one would widen what `checks` can say: {test:?}"
+            );
+        }
+
+        // Tier 2: the two OTHER spec fields that reach `[[tests]]`, so
+        // the message can name them. Nothing here comes from `checks`.
+        let kinds: Vec<Option<&str>> = generated.iter().map(|test| str_at(test, "type")).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Some("unique"),   // from `output.grain`
+                Some("not_null"), // from `output.columns[].nullable`
+                Some("expression"),
+                Some("expression"),
+            ],
+            "grain and columns are the only other spec routes into a check: {generated:?}"
+        );
+
+        // Tier 3: everything else the engine's test vocabulary offers
+        // has NO spec route. `generated_tests` can emit exactly four
+        // type tags, so a `row_count_range`, an `accepted_values`, an
+        // `in_range`, a `regex_match`, or a `relationships` cannot come
+        // from a spec at all.
+        let emitted: std::collections::BTreeSet<&str> = generated
+            .iter()
+            .filter_map(|test| str_at(test, "type"))
+            .collect();
+        for unreachable in [
+            "row_count_range",
+            "accepted_values",
+            "in_range",
+            "regex_match",
+            "relationships",
+        ] {
+            assert!(
+                !emitted.contains(unreachable),
+                "`{unreachable}` has no spec spelling — the custody remedy says the restore \
+                 is the whole answer for it"
+            );
+        }
+    }
+
     // ----- goldens -----
 
     #[test]

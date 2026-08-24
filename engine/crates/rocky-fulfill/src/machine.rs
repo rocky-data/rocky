@@ -339,13 +339,29 @@ pub enum UnevaluableCause {
     /// generation, so nothing after an apply can pin a new digest.
     ///
     /// To keep the change it belongs in the product spec — but not from
-    /// here. A first custody divergence lands the record back at
-    /// `applied`, and `rocky product approve` refuses `applied`, pinned
-    /// against the real verb by
+    /// here, and not every change fits. A first custody divergence lands
+    /// the record back at `applied`, and `rocky product approve` refuses
+    /// `applied`, pinned against the real verb by
     /// `approving_refuses_at_applied_and_permits_at_observing` in
     /// rocky-cli. So the order is: restore, re-run until the loop leaves
     /// `applied`, and only then change and approve the spec — which
     /// starts a new generation that pins at its own verify.
+    ///
+    /// WHAT FITS is narrower than "the spec", and the message says so.
+    /// `output.checks` is `Vec<String>` — opaque SQL booleans
+    /// (`product::spec::OutputSpec`) — and the lowering turns every one
+    /// of them into an `expression` test at `severity = "error"`
+    /// (`product::lowering::generated_tests`). A `not_null` comes from
+    /// `output.columns[].nullable` and row identity from `output.grain`.
+    /// Nothing else has a spec spelling: a typed shape
+    /// (`row_count_range`, `unique`, `accepted_values`, `in_range`,
+    /// `regex_match`, `relationships`), a `warning` severity, a
+    /// `filter`, or a `[[use_test]]` reference cannot be expressed, so
+    /// for those the restore is the whole remedy. Pinned from the
+    /// lowering side by
+    /// `spec_checks_lower_only_to_error_severity_expression_tests` in
+    /// rocky-core, so teaching `checks` a new shape fails a test that
+    /// names this message.
     CheckCustody,
     /// The reading itself failed, or checks errored. Re-running can
     /// genuinely resolve this one: the warehouse may answer next time.
@@ -1708,6 +1724,17 @@ fn decide_observation_checks(
             // `rocky fulfill` is named because it IS the command that
             // resolves this — after the restore, which the message states
             // first so the order is not a guess.
+            //
+            // The spec route is also QUALIFIED, because it does not fit
+            // every divergence. `output.checks` is a list of opaque SQL
+            // boolean strings and the lowering turns each one into an
+            // `expression` test at `severity = "error"` — so a changed
+            // `row_count_range`, a `warning` severity, a `filter`, or a
+            // `[[use_test]]` reference has no spec spelling at all.
+            // Naming `checks` bare told an operator to carry a change
+            // the field cannot hold, which is the same defect as naming
+            // a command that cannot run. See `UnevaluableCause` for the
+            // grounding and the lowering-side pin.
             let (next_command, remedy) = match cause {
                 Some(UnevaluableCause::CheckCustody) => (
                     format!("rocky fulfill {product}"),
@@ -1716,9 +1743,15 @@ fn decide_observation_checks(
                      checks. To keep the change instead, take it in this order: restore, \
                      re-run until the loop leaves `applied` (`observing` when the checks \
                      pass, `observed_failing` when one is genuinely red), and only then put \
-                     the change in the product spec's `checks` and approve the spec again. \
-                     Approving is refused while the state is `applied`, so that order is \
-                     not optional"
+                     the change in the product spec and approve the spec again. Approving \
+                     is refused while the state is `applied`, so that order is not \
+                     optional. Check first that the spec can hold your change: \
+                     `output.checks` takes a SQL boolean and always lowers it to an \
+                     error-severity `expression` test, `output.columns` takes a not-null, \
+                     and `output.grain` takes row identity. A typed shape such as \
+                     `row_count_range` or `unique`, a `warning` severity, a `filter`, or a \
+                     `[[use_test]]` reference has no spec spelling — for those the restore \
+                     is the whole remedy"
                         .to_string(),
                 ),
                 _ => (format!("rocky fulfill {product}"), String::new()),
@@ -4488,6 +4521,35 @@ mod tests {
             "and WHY that order is forced is stated, so it does not read as a preference: \
              {message}"
         );
+
+        // AND THE SPEC ROUTE IS QUALIFIED. It used to say "put the
+        // change in the product spec's `checks`" flat out. `checks` is a
+        // list of opaque SQL boolean strings that the lowering turns
+        // into `expression` tests at `severity = "error"`
+        // (`spec_checks_lower_only_to_error_severity_expression_tests`
+        // in rocky-core pins that), so for a changed `row_count_range`,
+        // a `warning` severity, or a `filter`, the sentence named a
+        // route the field cannot carry. That is the same defect as
+        // naming a command that cannot run, and it must not come back.
+        assert!(
+            message.contains("always lowers it to an error-severity `expression` test"),
+            "what `output.checks` can carry is stated, not implied: {message}"
+        );
+        assert!(
+            message.contains("has no spec spelling"),
+            "and the shapes it CANNOT carry are called out, so the spec route is never \
+             offered for a change it would silently distort: {message}"
+        );
+        assert!(
+            at("has no spec spelling") < at("the restore is the whole remedy"),
+            "with the honest fallback stated right after them: {message}"
+        );
+        for shape in ["row_count_range", "`warning` severity", "`filter`"] {
+            assert!(
+                message.contains(shape),
+                "each unrepresentable shape is named — {shape} is missing: {message}"
+            );
+        }
 
         // A transient read failure: re-running genuinely can resolve it.
         for cause in [Some(UnevaluableCause::Unreadable), None] {
