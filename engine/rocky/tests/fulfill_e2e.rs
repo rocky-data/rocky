@@ -2080,6 +2080,92 @@ fn emptying_the_sidecar_cannot_turn_a_known_red_into_observing() {
     drop(store);
 }
 
+/// A BROKEN CONFIG IS NOT A CUSTODY DIVERGENCE.
+///
+/// The check set and the warehouse are now bound together — one call
+/// reads the models directory and `rocky.toml` and hands back a handle
+/// that owns both — so a config failure and a check-set failure arrive
+/// at the same place. They must not leave through the same exit.
+///
+/// The custody hold's remedy is "restore the file you changed … then
+/// put the change in the product spec". That is the right instruction
+/// for an edited sidecar and a useless one for a mistyped adapter name:
+/// there is nothing to restore into the verified set, and no spec field
+/// carries a warehouse. Re-running after fixing the config genuinely
+/// resolves it, which is the `Unreadable` remedy.
+///
+/// So the assertion that earns this test is the NEGATIVE one — the stop
+/// must not say "restore the file you changed". Collapsing the two
+/// failures into one error passes an assertion that only checks the
+/// product held.
+#[test]
+fn an_unresolvable_warehouse_holds_without_the_custody_remedy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+    let plan_id = drive_to_plan_review(dir);
+    approve_and_apply(dir, &plan_id);
+
+    // THE BREAKAGE: the config still parses and the pipeline still
+    // resolves — only the adapter it names is gone. Nothing under
+    // `models/` is touched, so the check digest is unchanged and the
+    // custody comparison has no complaint to make.
+    let broken = rocky_toml().replace(
+        "[pipeline.p.target]\nadapter = \"default\"",
+        "[pipeline.p.target]\nadapter = \"no_such_warehouse\"",
+    );
+    assert!(
+        broken.contains("no_such_warehouse"),
+        "the fixture must actually rewrite the target adapter"
+    );
+    std::fs::write(dir.join("rocky.toml"), &broken).expect("broken config");
+
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    // Exit 0 and `applied`: a clean stop carrying an ask. Exit 4 is
+    // reserved for `observed_failing`, and nothing here says the output is
+    // wrong — only that it could not be read.
+    assert_eq!(
+        code, 0,
+        "an unevaluable reading is a clean stop: {err}{out}"
+    );
+    assert_eq!(
+        json["state"], "applied",
+        "it holds where it is rather than claiming a healthy `observing`: {json}"
+    );
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("the warehouse the declared checks run against could not be resolved"),
+        "the stop names what actually failed: {message}"
+    );
+    assert!(
+        !message.contains("restore the file you changed"),
+        "a config problem must NOT print the custody remedy — there is no file to \
+         restore into the verified set: {message}"
+    );
+    assert!(
+        !message.contains("put the change in the product spec"),
+        "and it must not send the operator to a spec field that cannot hold a \
+         warehouse: {message}"
+    );
+    assert_eq!(
+        json["next_command"].as_str(),
+        Some(format!("rocky fulfill {PRODUCT}").as_str()),
+        "re-running after fixing the config IS the remedy here: {json}"
+    );
+
+    // And it is genuinely recoverable: restore the config and the same
+    // command clears the hold.
+    std::fs::write(dir.join("rocky.toml"), rocky_toml()).expect("restore config");
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "the printed remedy has to work: {err}{out}");
+    assert_eq!(
+        json.expect("fulfill json")["state"],
+        "observing",
+        "the product returns to a healthy reading once the warehouse resolves"
+    );
+}
+
 /// The `[[use_test]]` bypass, end to end.
 ///
 /// A sidecar's `[[use_test]]` entry carries a NAME and a binding. The
