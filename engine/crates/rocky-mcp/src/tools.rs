@@ -163,11 +163,22 @@ pub enum McpProfile {
 /// the loop — an untrusted worker able to append checks would be able to
 /// author SQL the loop then runs unattended.
 ///
-/// Nothing is lost: the product spec's declared grain and `checks` already
-/// lower into the sidecar's `[[tests]]`, so the checks the loop evaluates
-/// are the ones the operator wrote and approved. Hand-appending them was
-/// redundant. The tool remains on the Default profile, where the caller is
-/// an operator-driven session rather than an untrusted drafting worker.
+/// **What this closes, exactly.** Removing `draft_check` closes the MCP
+/// route it was served over. It does NOT make a worker unable to author a
+/// check: the subprocess driver runs an arbitrary command with the project
+/// root as its working directory and no filesystem confinement, and Phase B
+/// PRESERVES a worker-added `[[tests]]` block rather than discarding it
+/// (`rocky_core::product::lowering`). A worker with a file writer can still
+/// write the sidecar. That is the conceded local-process boundary, tracked
+/// by #1491 (an OS sandbox for the worker) and #1515 (trusted custody) —
+/// not something this allowlist claims to solve.
+///
+/// Nothing is lost by removing it: the product spec's declared grain and
+/// `checks` already lower into the sidecar's `[[tests]]`, so the checks the
+/// loop evaluates are the ones the operator wrote and approved.
+/// Hand-appending them was redundant. The tool remains on the Default
+/// profile, where the caller is an operator-driven session rather than an
+/// untrusted drafting worker.
 const WORKER_PROFILE_TOOLS: &[&str] = &[
     "breaking_change",
     "catalog",
@@ -5703,8 +5714,8 @@ mod tests {
         );
     }
 
-    /// FF-WP-F3 — the untrusted worker cannot author a declarative check,
-    /// and nothing worker-facing invites it to try.
+    /// FF-WP-F3 — no worker-profile MCP route authors a declarative
+    /// check, and nothing worker-facing invites the worker to try.
     ///
     /// This is a SECURITY boundary, not tidiness. A `[[tests]]` block's
     /// `expression` is raw-interpolated into `SELECT COUNT(*) FROM t WHERE
@@ -5712,8 +5723,17 @@ mod tests {
     /// that the caller must sandbox execution. That contract held while the
     /// only caller was a human typing `rocky test --declarative`. F3 made
     /// the caller an unattended loop holding warehouse credentials, which
-    /// no sandbox backs — so a worker able to append a check would be able
-    /// to author SQL the loop then executes after every apply.
+    /// no sandbox backs — so a check served to an untrusted worker is SQL
+    /// the loop later executes after every apply.
+    ///
+    /// BE EXACT ABOUT THE SCOPE. This proves the MCP route is gone. It
+    /// does not prove a worker cannot author a check: the subprocess
+    /// driver runs an arbitrary command in the project root with no
+    /// filesystem confinement, and Phase B preserves a worker-added
+    /// `[[tests]]` block. A worker holding a file writer can still write
+    /// the sidecar — the conceded local-process boundary, tracked by
+    /// #1491 and #1515. The post-apply custody digest is what catches a
+    /// sidecar edited after the generation was verified.
     ///
     /// Asserted on the ROUTED surface rather than on the allowlist constant,
     /// because the allowlist is an input to route removal and asserting it
@@ -5723,8 +5743,8 @@ mod tests {
         let worker_tools = server_with(McpProfile::Worker).tool_names();
         assert!(
             !worker_tools.iter().any(|t| t == "draft_check"),
-            "a worker session must not be able to author SQL the loop later runs \
-             unattended; served tools were {worker_tools:?}"
+            "no worker-profile route may serve check authorship (a file writer still \
+             can — #1491/#1515); served tools were {worker_tools:?}"
         );
         // Still served where the caller is an operator, not an untrusted
         // worker — the fix narrows a profile, it does not delete a tool.

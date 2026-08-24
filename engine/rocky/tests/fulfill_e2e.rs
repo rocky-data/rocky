@@ -1536,8 +1536,10 @@ fn worker_profile_excluded_tools_are_not_found() {
         "review_queue",
         "draft_contract",
         // FF-WP-F3: a check's `expression` is raw-interpolated into SQL the
-        // loop now EXECUTES unattended after every apply, so an untrusted
-        // worker must not be able to author one.
+        // loop now EXECUTES unattended after every apply, so the worker
+        // profile must not SERVE one. The probe proves the route is gone;
+        // it does not prove the worker cannot author a check — a file
+        // writer still can, and that boundary is #1491 / #1515.
         "draft_check",
         "draft_metadata",
         "pause_schedule",

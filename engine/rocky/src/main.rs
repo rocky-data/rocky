@@ -2321,8 +2321,8 @@ enum Command {
         /// operator intends to be able to write human sign-off markers;
         /// `worker` is the minimal drafting allowlist for untrusted workers:
         /// the read/inspect grounding tools, compile / test / breaking_change
-        /// / dependents, draft_model + draft_check, and the prompts — no
-        /// contract, metadata, propose, review, or schedule surface.
+        /// / dependents, draft_model, and the prompts — no check, contract,
+        /// metadata, propose, review, or schedule surface.
         #[arg(long, value_enum, default_value_t = McpProfileArg::Default)]
         profile: McpProfileArg,
     },

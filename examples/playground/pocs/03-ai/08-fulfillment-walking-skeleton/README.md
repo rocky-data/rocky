@@ -196,12 +196,13 @@ into the sidecar tests (a composite-unique test from the grain, an expression
 test per check), so hand-authored `[[tests]]` are redundant and easy to malform.
 Be precise about what this is: **cooperative prompt steering, not enforcement.**
 The worker still holds raw `Write`/`Edit`, and the lowering PRESERVES a
-worker-authored sidecar test — nothing in the engine discards it. The POC also
-drops `draft_check` from the live worker's tool allowlist, which removes the
-easiest path to that mistake but does not architecturally prevent a determined
-worker from editing the sidecar. The digest-gated apply and human review are the
-real gates; the drafting brief is only a nudge toward a clean, redundant-free
-sidecar.
+worker-authored sidecar test — nothing in the engine discards it. The engine
+also drops `draft_check` from the worker MCP profile, which removes the easiest
+path to that mistake but does not architecturally prevent a determined worker
+from editing the sidecar (that is #1491's OS sandbox, not this). The
+digest-gated apply, the post-apply check-custody digest, and human review are
+the real gates; the drafting brief is only a nudge toward a clean,
+redundant-free sidecar.
 
 ## Run
 

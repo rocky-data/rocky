@@ -334,11 +334,18 @@ pub enum UnevaluableCause {
     /// `test_definitions.toml` edit it re-lowers the sidecar without
     /// touching the definitions, so the expansion still diverges. Nor can
     /// the loop adopt it: the only route into `verifying` is from
-    /// `merged`, which an applied product can never reach again, so
-    /// nothing after an apply can pin a new digest.
+    /// `merged` (the `Merged` arm of [`decide`] is the sole transition
+    /// into it), and no post-apply event re-enters `merged` in the SAME
+    /// generation, so nothing after an apply can pin a new digest.
     ///
-    /// To keep the change, it belongs in the product spec, and a fresh
-    /// approval starts a new generation that pins at its own verify.
+    /// To keep the change it belongs in the product spec — but not from
+    /// here. A first custody divergence lands the record back at
+    /// `applied`, and `rocky product approve` refuses `applied`, pinned
+    /// against the real verb by
+    /// `approving_refuses_at_applied_and_permits_at_observing` in
+    /// rocky-cli. So the order is: restore, re-run until the loop leaves
+    /// `applied`, and only then change and approve the spec — which
+    /// starts a new generation that pins at its own verify.
     CheckCustody,
     /// The reading itself failed, or checks errored. Re-running can
     /// genuinely resolve this one: the warehouse may answer next time.

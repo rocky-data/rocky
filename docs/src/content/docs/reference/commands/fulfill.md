@@ -12,7 +12,7 @@ rocky fulfill <product>
    │
    ├─ no spec yet ──▶ agent drafts a candidate ──▶ you: rocky fulfill approve-spec <product>
    ├─ spec approved ─▶ verify posture ─▶ lower contract ─▶ agent drafts SQL
-   │                   (worker profile: read + compile/test + draft tools only)
+   │                   (worker profile: read + compile/test + draft_model only)
    ├─ runner re-verifies from disk ─▶ governed propose ─▶ you: rocky review <plan> --approve
    ├─ digest-gated apply ─▶ observe (tests + freshness + the declared data checks)
    └─ a declared check FAILS on the live table ─▶ observed_failing ─▶ repair round

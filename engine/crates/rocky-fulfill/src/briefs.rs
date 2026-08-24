@@ -54,9 +54,15 @@ pub const EXCLUDED_WORKER_TOOLS: &[&str] = &[
     // Left the worker allowlist with FF-WP-F3: a `[[tests]]` expression is
     // raw-interpolated into the check SQL, and the fulfillment loop now
     // EXECUTES the declared checks unattended after every apply — so a
-    // worker able to append one could author SQL the loop then runs with
-    // warehouse credentials and no human in the loop. The spec's declared
-    // grain and `checks` already lower into the sidecar, so nothing is lost.
+    // check served to a worker is SQL the loop then runs with warehouse
+    // credentials and no human in the loop. The spec's declared grain and
+    // `checks` already lower into the sidecar, so nothing is lost.
+    //
+    // The removal closes the MCP route only. A worker with a file writer
+    // can still append to the sidecar, and the lowering preserves what it
+    // finds there — the conceded local-process boundary (#1491, #1515).
+    // What catches a post-verify sidecar change is the observation-time
+    // custody digest, not this list.
     "draft_check",
     "draft_contract",
     "draft_metadata",

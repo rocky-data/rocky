@@ -143,7 +143,9 @@ async fn worker_profile_tools_list_is_the_minimal_allowlist() {
             "dependents",
             // `draft_check` is deliberately absent: a check's expression is
             // raw-interpolated into SQL the loop executes unattended after
-            // an apply, so the untrusted profile must not author one.
+            // an apply, so the untrusted profile must not serve one. This
+            // closes the MCP route only — a worker with a file writer can
+            // still write the sidecar (#1491, #1515).
             "draft_model",
             "inspect_schema",
             "lineage",
@@ -3010,10 +3012,20 @@ async fn worker_profile_descriptions_and_next_steps_end_at_the_handoff() {
     .clone();
     // `draft_check` must NOT be served here. A check's `expression` is
     // raw-interpolated into the SQL the loop executes unattended after every
-    // apply, so an untrusted worker able to author one would be writing SQL
-    // the warehouse later runs with credentials. This asserts it at the
-    // PROTOCOL level — absent from the router the worker actually talks to,
-    // not merely filtered out of a constant a test could read back to itself.
+    // apply, so a check served to an untrusted worker is SQL the warehouse
+    // later runs with credentials. This asserts it at the PROTOCOL level —
+    // absent from the router the worker actually talks to, not merely
+    // filtered out of a constant a test could read back to itself.
+    //
+    // WHAT THIS PROVES, AND WHAT IT DOES NOT. It proves the MCP route is
+    // closed. It does NOT prove the worker cannot author a check. The
+    // subprocess driver runs an arbitrary command with the project root as
+    // its working directory and no filesystem confinement, and Phase B
+    // PRESERVES a worker-added `[[tests]]` block rather than discarding it.
+    // A worker holding a file writer can still write the sidecar. That is
+    // the conceded local-process boundary, tracked by #1491 (an OS sandbox
+    // for the worker) and #1515 (trusted custody); the post-apply custody
+    // digest is what catches a sidecar changed after verify.
     let refused = client
         .call_tool(CallToolRequestParams::new("draft_check").with_arguments(check_args))
         .await;

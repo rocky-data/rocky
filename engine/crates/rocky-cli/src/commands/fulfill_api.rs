@@ -767,9 +767,11 @@ pub async fn observe_max_time_column(
 /// One declared check that did not pass, as the loop may quote it.
 ///
 /// Deliberately NARROWER than the CLI's `DeclarativeTestResult`: it drops
-/// the generated `sql`. That SQL is built from sidecar `[[tests]]` a
-/// worker can append through `draft_check`, and the loop's next move on a
-/// red observation is to hand this evidence to a worker as a task brief.
+/// the generated `sql`. That SQL is built from sidecar `[[tests]]`, which
+/// a worker holding a file writer can still append — `draft_check` left
+/// the worker MCP profile, but nothing confines the worker's filesystem
+/// (#1491) — and the loop's next move on a red observation is to hand
+/// this evidence to a worker as a task brief.
 /// Brief validation runs on the TEMPLATE, before substitution, so
 /// anything interpolated is unvalidated text — keeping worker-authored
 /// SQL out of the type means it cannot reach a brief by accident. The
