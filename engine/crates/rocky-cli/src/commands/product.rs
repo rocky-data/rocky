@@ -2851,16 +2851,42 @@ effect = "require_review"
             assert_eq!(approval.spec_digest, first.spec_digest);
         }
 
-        // HALF TWO — `observing` accepts. That is where the restore +
-        // re-run puts the product, and it is what makes the ordering the
-        // remedy prints a working sequence rather than a suggestion.
+        // HALF TWO — `observed_failing` accepts.
+        //
+        // Driven FIRST, and driven at all, because the custody stop names
+        // it: a restore + re-run lands `observing` when the checks pass
+        // and `observed_failing` when one is genuinely red, and the red
+        // path is the common one. Reading it out of the `matches!` list
+        // would prove nothing — that list is the thing under test. If
+        // this refused, the printed sequence would strand every operator
+        // whose checks are actually failing.
+        put(FulfillState::ObservedFailing);
+        let from_red = product_approve_in(&root, &state_path, "revenue_daily")
+            .expect("approving from `observed_failing` must be permitted");
+        assert!(!from_red.already_approved);
+        assert_eq!(from_red.previous_state.as_deref(), Some("observed_failing"));
+        assert_ne!(
+            from_red.spec_digest, first.spec_digest,
+            "the edited spec is the newly approved revision"
+        );
+
+        // HALF THREE — `observing` accepts too. That is where the restore
+        // + re-run puts a product whose checks pass, and it is what makes
+        // the ordering the remedy prints a working sequence rather than a
+        // suggestion.
+        //
+        // A second edit is needed: the approval above already adopted the
+        // first one, so re-approving the same digest would take the
+        // idempotent path and prove nothing about the state gate.
+        std::fs::write(&spec_path, format!("{edited}\n# a second reviewer note\n"))
+            .expect("edit again");
         put(FulfillState::Observing);
         let output = product_approve_in(&root, &state_path, "revenue_daily")
             .expect("approving from `observing` must be permitted");
         assert!(!output.already_approved);
         assert_ne!(
-            output.spec_digest, first.spec_digest,
-            "the edited spec is the newly approved revision"
+            output.spec_digest, from_red.spec_digest,
+            "the second edit is a new revision, so this is a real approval"
         );
         assert_eq!(output.previous_state.as_deref(), Some("observing"));
     }

@@ -826,10 +826,18 @@ pub struct ObservedChecks {
 /// ([`crate::commands::test::execute_declarative`], which
 /// `declarative_run` also calls), not a second check engine. The set
 /// executed is the set the model loader expands, which is the set
-/// [`declarative_test_count`] reports as deferred at verify: the loop
-/// counts and executes from one source, so "N deferred" at verify and
-/// "N evaluated" at observation describe the same checks rather than
-/// two re-derivations that have to be kept in step by hand.
+/// [`declarative_test_count`] reports as deferred at verify: both go
+/// through the runner's OWN loader, so "N deferred" at verify and "N
+/// evaluated" at observation are the same predicate rather than two
+/// re-derivations that have to be kept in step by hand.
+///
+/// Be exact about how far that goes. It is one LOADER, not one read.
+/// The verify-time count, the verify-time digest, and this execution
+/// are three separate reads at three separate times, and files can
+/// change between them. What ties the set that RUNS to the set that
+/// was APPROVED is the digest comparison the caller makes against this
+/// handle — not the shared loader. The shared loader only guarantees
+/// the two numbers mean the same thing about an unchanged directory.
 ///
 /// Invariant guarded, second: what runs is the snapshot the caller
 /// already digested. `checks` is an OWNED [`LoadedCheckSet`] and is
