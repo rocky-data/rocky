@@ -910,6 +910,15 @@ const WORKER_GUIDANCE_SURFACES: usize = 9;
 ///    a worker — which is exactly how a checked `replace` differs from a
 ///    plain one.
 ///
+/// "BOTH DIRECTIONS" WAS TRUE OF ZERO MATCHES ONLY, until the tenth round.
+/// This path tested `contains` and then replaced EVERY occurrence, while
+/// [`WORKER_INSTRUCTIONS_REWRITES`] one surface over required exactly one
+/// match. So a duplicated needle here silently rewrote a second passage
+/// nobody reviewed — the failure the instruction path refuses — and the
+/// sentence above described a guarantee only one of the two surfaces had.
+/// [`worker_tool_description`] now enforces the same exactly-once rule, and
+/// it is a free function so a test can drive the duplicate case.
+///
 /// Construction, not compile time — the same correction as
 /// [`WORKER_INSTRUCTIONS_REWRITES`]. Drift here compiles and then aborts
 /// `rocky mcp --profile worker` at startup.
@@ -1021,6 +1030,51 @@ fn worker_instructions(excluded: &[String], rewrites: &[(&str, &str)]) -> Result
         body = body.replace(needle, replacement);
     }
     Ok(format!("{}{body}", worker_instructions_banner(excluded)))
+}
+
+/// One [`WORKER_TOOL_DESCRIPTIONS`] rewrite applied to a tool's served
+/// description.
+///
+/// REFUSES unless the needle matches EXACTLY ONCE — the same rule
+/// [`worker_instructions`] enforces, and the tenth round's finding 3 is that
+/// the two did not agree. This path required only `contains` and then
+/// replaced EVERY occurrence, so a needle that appeared twice silently
+/// rewrote a second passage nobody reviewed. Instruction rewrites refused
+/// that and tool-description rewrites did not, which made "the projections
+/// fail closed" true of one of the two surfaces it was claimed for.
+///
+/// Both directions, and both matter for the same reason as one surface over:
+///
+///  - ZERO matches means the description was edited under the projection. A
+///    silent no-op replace serves the DEFAULT text — which names `propose` —
+///    to a worker.
+///  - MORE THAN ONE means `replace` edits a passage the table's author did
+///    not read. A projection that rewrites text nobody reviewed is not a
+///    projection.
+///
+/// A FREE FUNCTION rather than an inline loop body, for the reason
+/// [`worker_instructions`] takes its table as a parameter: the real
+/// descriptions match once, so the refusal is unreachable in-process and
+/// "it fails closed" would be an untested claim about the very path this
+/// round exists to correct claims on. Taking `current` as an argument lets a
+/// test hand it a description that HAS drifted.
+fn worker_tool_description(
+    tool: &str,
+    current: &str,
+    needle: &str,
+    replacement: &str,
+) -> Result<String, String> {
+    let hits = current.matches(needle).count();
+    if hits != 1 {
+        return Err(format!(
+            "WORKER_TOOL_DESCRIPTIONS rewrite for '{tool}' matched {hits} times, not once — \
+             zero means the default description was edited under the projection and a \
+             no-op replace would serve the DEFAULT text to a worker; more than one means \
+             the replace would rewrite a passage nobody reviewed. Re-project it \
+             deliberately. Needle: {needle:?}"
+        ));
+    }
+    Ok(current.replace(needle, replacement))
 }
 
 /// Whether `needle` occurs in `haystack` at IDENTIFIER BOUNDARIES — neither
@@ -1645,14 +1699,8 @@ impl RockyMcpServer {
                 let current = route.attr.description.as_deref().ok_or_else(|| {
                     format!("WORKER_TOOL_DESCRIPTIONS names undescribed tool '{name}'")
                 })?;
-                if !current.contains(needle) {
-                    return Err(format!(
-                        "WORKER_TOOL_DESCRIPTIONS rewrite for '{name}' no longer matches its \
-                         description — a silent no-op replace would serve the DEFAULT text \
-                         to a worker, so this refuses instead. Needle: {needle:?}"
-                    ));
-                }
-                route.attr.description = Some(current.replace(needle, replacement).into());
+                route.attr.description =
+                    Some(worker_tool_description(name, current, needle, replacement)?.into());
             }
         }
         Ok(Self {
@@ -6920,6 +6968,18 @@ mod tests {
     /// capabilities: `tools` and `prompts`, and nothing else. Enabling
     /// resources, completions or logging fails here and forces a revisit
     /// of the count instead of quietly invalidating it.
+    ///
+    /// TENTH ROUND, finding 3 — asserted as the whole serialized KEY SET,
+    /// not as three `is_none()` checks. Those named `resources`,
+    /// `completions` and `logging` and stopped there, while rmcp 3.1.2's
+    /// `ServerCapabilities` also carries `experimental` and `extensions`
+    /// (SEP-1724, keyed by extension id — the tasks extension lives there).
+    /// Enumerating the fields a test knows about is the same defect as
+    /// enumerating the fields a sweep knows about, one struct over, so the
+    /// fix is the same: read what the value actually serializes. Every
+    /// field is `skip_serializing_if = "Option::is_none"`, so an absent
+    /// capability contributes no key and a NEW one added by a future rmcp
+    /// fails here the moment it is enabled.
     #[test]
     fn the_server_opens_no_guidance_channel_beyond_tools_and_prompts() {
         let next = WORKER_GUIDANCE_SURFACES + 1;
@@ -6929,21 +6989,22 @@ mod tests {
             McpProfile::Worker,
         ] {
             let capabilities = server_with(profile).get_info().capabilities;
-            assert!(capabilities.tools.is_some(), "tools stays served");
-            assert!(capabilities.prompts.is_some(), "prompts stays served");
-            assert!(
-                capabilities.resources.is_none(),
-                "a resources channel would be guidance surface {next}; enabling one \
-                 invalidates WORKER_GUIDANCE_SURFACES, so extend the enumeration rather \
-                 than this test: {capabilities:?}"
-            );
-            assert!(
-                capabilities.completions.is_none(),
-                "so would completions, as surface {next}: {capabilities:?}"
-            );
-            assert!(
-                capabilities.logging.is_none(),
-                "so would logging, as surface {next}: {capabilities:?}"
+            let serialized = serde_json::to_value(&capabilities).expect("capabilities serialize");
+            let mut keys: Vec<&str> = serialized
+                .as_object()
+                .expect("capabilities serialize as an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["prompts", "tools"],
+                "the {profile:?} profile declares a capability beyond tools and prompts. \
+                 Any other channel — resources, completions, logging, experimental, an \
+                 SEP-1724 extension — carries a tenth KIND of served text and would be \
+                 guidance surface {next}; extend WORKER_GUIDANCE_SURFACES and its sweeps \
+                 rather than this assertion: {serialized}"
             );
         }
     }
@@ -7101,6 +7162,91 @@ mod tests {
         ] {
             RockyMcpServer::try_new_with_profile(PathBuf::from("rocky.toml"), profile)
                 .unwrap_or_else(|e| panic!("{profile:?} profile must build today: {e}"));
+        }
+    }
+
+    /// TENTH ROUND, finding 3 — the OTHER rewrite path refuses the same
+    /// way, and this test is the reason the check moved into a free
+    /// function.
+    ///
+    /// The tool-description rewrite required only `contains` and then
+    /// replaced EVERY occurrence, while the instruction rewrite one surface
+    /// over required exactly one match. So "both projections fail closed"
+    /// was true of one of them: a duplicated needle here rewrote a second
+    /// passage nobody reviewed, silently.
+    ///
+    /// Driven on a synthetic description rather than a real one, for the
+    /// same reason the sibling test above drives a synthetic table: the
+    /// shipped descriptions match once, so the refusal is unreachable
+    /// in-process and the claim would be untested on exactly the path this
+    /// round exists to correct claims about.
+    #[test]
+    fn the_tool_description_projection_refuses_on_drift_in_both_directions() {
+        // ZERO — the default description was edited under the projection.
+        let gone = worker_tool_description(
+            "plan_preview",
+            "Preview the SQL Rocky would run.",
+            "before proposing a materialization.",
+            "before you hand off to the trusted runner.",
+        )
+        .expect_err("a needle that matches nothing must refuse");
+        assert!(
+            gone.contains("matched 0 times"),
+            "the refusal says how many times it matched: {gone}"
+        );
+
+        // MORE THAN ONE — the failure this path used to take silently. The
+        // old code called `contains`, saw true, and then replaced BOTH
+        // occurrences; the second one is a passage the table's author never
+        // read.
+        let many = worker_tool_description(
+            "plan_preview",
+            "Read the SQL first. Read the SQL after the fix too.",
+            "Read the SQL",
+            "Call `plan_preview`",
+        )
+        .expect_err("a needle that matches more than once must refuse");
+        assert!(
+            many.contains("matched 2 times") && many.contains("not once"),
+            "the refusal distinguishes the two directions: {many}"
+        );
+
+        // EXACTLY ONE — the live shape, and it rewrites only that
+        // occurrence.
+        let ok = worker_tool_description(
+            "plan_preview",
+            "Preview the SQL before proposing a materialization.",
+            "before proposing a materialization.",
+            "before you hand off to the trusted runner.",
+        )
+        .expect("the matching case still rewrites");
+        assert_eq!(
+            ok,
+            "Preview the SQL before you hand off to the trusted runner."
+        );
+
+        // And the two paths now agree. Neither table may carry a needle
+        // that matches its source more than once — this drives the real
+        // tables, so an entry added later with a duplicated needle fails
+        // here rather than at a worker's startup.
+        let default = RockyMcpServer::new(PathBuf::from("rocky.toml"));
+        for (name, needle, _) in WORKER_TOOL_DESCRIPTIONS {
+            let description = default
+                .tool_router
+                .map
+                .get(*name)
+                .unwrap_or_else(|| panic!("default profile serves '{name}'"))
+                .attr
+                .description
+                .as_deref()
+                .unwrap_or_default();
+            assert_eq!(
+                description.matches(needle).count(),
+                1,
+                "the WORKER_TOOL_DESCRIPTIONS needle for '{name}' must match its default \
+                 description exactly once, or the rewrite edits a passage nobody reviewed: \
+                 {needle:?}"
+            );
         }
     }
 
