@@ -1680,6 +1680,24 @@ fn decide_observation_checks(
             // put the change in the spec and approve it, which writes a
             // fresh record at `spec_approved` (outside this table, in the
             // approve verb) and re-pins at that generation's own verify.
+            //
+            // Those two are SEQUENTIAL, not alternatives. This arm lands
+            // the record back at `applied` (see `landing` above), and
+            // `rocky product approve` refuses every in-flight state,
+            // `applied` included — grounded by
+            // `approving_refuses_at_applied_and_permits_at_observing` in
+            // rocky-cli, which drives the real verb from both states. So
+            // the spec route does not open until the restore has let the
+            // loop finish observing and leave `applied`. The message
+            // prints that order: a remedy whose second half is refused
+            // from the state it is printed in is not a remedy.
+            //
+            //   custody stop ──▶ applied ──(approve REFUSED)
+            //        │
+            //        └─ restore ─▶ rocky fulfill ─▶ observing / observed_failing
+            //                                              │
+            //                                              └─ approve is accepted here
+            //
             // `rocky fulfill` is named because it IS the command that
             // resolves this — after the restore, which the message states
             // first so the order is not a guess.
@@ -1688,8 +1706,12 @@ fn decide_observation_checks(
                     format!("rocky fulfill {product}"),
                     " — restore the file you changed and re-run; the loop cannot adopt an \
                      edit here, because nothing after an apply can re-verify a new set of \
-                     checks. To keep the change instead, put it in the product spec's \
-                     `checks` and approve the spec again, which starts a new generation"
+                     checks. To keep the change instead, take it in this order: restore, \
+                     re-run until the loop leaves `applied` (`observing` when the checks \
+                     pass, `observed_failing` when one is genuinely red), and only then put \
+                     the change in the product spec's `checks` and approve the spec again. \
+                     Approving is refused while the state is `applied`, so that order is \
+                     not optional"
                         .to_string(),
                 ),
                 _ => (format!("rocky fulfill {product}"), String::new()),
@@ -4423,6 +4445,41 @@ mod tests {
             stop.message.contains("approve the spec again"),
             "with the route for keeping the change named too: {}",
             stop.message
+        );
+
+        // AND IT IS AN ORDER, not a menu. This arm lands the record at
+        // `applied`, and `rocky product approve` refuses `applied` —
+        // pinned against the real verb by
+        // `approving_refuses_at_applied_and_permits_at_observing` in
+        // rocky-cli. So "approve the spec again" is unreachable from the
+        // state this message is printed in until the restore + re-run
+        // has moved the product off `applied`.
+        //
+        // Asserted by POSITION. Substring presence passed on the broken
+        // wording too — it named both steps and implied neither order.
+        let message = &stop.message;
+        let at = |needle: &str| {
+            message
+                .find(needle)
+                .unwrap_or_else(|| panic!("the remedy must contain {needle:?}: {message}"))
+        };
+        assert!(
+            at("restore the file you changed") < at("re-run until the loop leaves `applied`"),
+            "the restore comes first: {message}"
+        );
+        assert!(
+            at("re-run until the loop leaves `applied`") < at("approve the spec again"),
+            "the re-run comes before the approval, because the approval is refused at \
+             `applied`: {message}"
+        );
+        assert!(
+            message.contains("`observing`"),
+            "the state the operator waits for is named, not left as a guess: {message}"
+        );
+        assert!(
+            message.contains("Approving is refused while the state is `applied`"),
+            "and WHY that order is forced is stated, so it does not read as a preference: \
+             {message}"
         );
 
         // A transient read failure: re-running genuinely can resolve it.

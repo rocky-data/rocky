@@ -2764,6 +2764,107 @@ effect = "require_review"
         assert!(unchanged.already_approved);
     }
 
+    /// The custody hold's remedy depends on THIS: `applied` refuses an
+    /// approval, `observing` accepts one.
+    ///
+    /// A post-apply check-custody divergence lands the product back at
+    /// `applied` (`machine::decide_observation_checks`). The stop tells
+    /// the operator they may keep their edit by putting it in the spec
+    /// and approving it — and that second half cannot be run from the
+    /// state it is printed in, because `applied` is in the in-flight
+    /// refusal set above. So the message has to state an ORDER: restore,
+    /// re-run until the loop leaves `applied`, and only then approve.
+    ///
+    /// This test is the ground under that ordering. It is deliberately
+    /// not a reading of the `matches!` list — that list is the thing
+    /// being checked, and asserting it against itself would prove
+    /// nothing. Both halves go through the real verb.
+    #[test]
+    fn approving_refuses_at_applied_and_permits_at_observing() {
+        use rocky_core::fulfill::{FulfillJournalRow, FulfillState};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, _config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        let first = product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+        // Drive the record to `state`, the way the loop would.
+        let put = |state: FulfillState| {
+            let store = StateStore::open(&state_path).expect("opens");
+            let observed = store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            let mut next = observed.clone();
+            next.state = state.clone();
+            next.driver_pgid = None;
+            next.driver_leader_start_time = None;
+            store
+                .fulfill_state_cas(
+                    "revenue_daily",
+                    Some(&observed),
+                    &next,
+                    &FulfillJournalRow {
+                        seq: 0,
+                        at: None,
+                        event: format!("test: to {}", state.tag()),
+                        from_state: None,
+                        to_state: state.tag().to_string(),
+                        spec_digest: None,
+                        plan_id: None,
+                        idempotency_key: None,
+                    },
+                )
+                .expect("cas");
+        };
+
+        // A spec edit makes a NEW digest — the case the remedy describes.
+        let spec_path = root.join("products/revenue_daily.toml");
+        let edited = format!(
+            "{}\n# a check the operator wants to keep\n",
+            std::fs::read_to_string(&spec_path).expect("read")
+        );
+        std::fs::write(&spec_path, &edited).expect("edit");
+
+        // HALF ONE — `applied` refuses. This is the state a first custody
+        // divergence lands in, so the printed "approve the spec again"
+        // cannot be executed there.
+        put(FulfillState::Applied);
+        let err = product_approve_in(&root, &state_path, "revenue_daily")
+            .expect_err("approving from `applied` must refuse");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("[approval-refused-in-flight]"),
+            "the refusal is the in-flight one: {rendered}"
+        );
+        assert!(
+            rendered.contains("'applied'"),
+            "and it names the state the operator is standing in: {rendered}"
+        );
+        // Nothing moved: the approval still names the first digest.
+        {
+            let store = StateStore::open(&state_path).expect("opens");
+            let approval = store
+                .product_approval_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            assert_eq!(approval.spec_digest, first.spec_digest);
+        }
+
+        // HALF TWO — `observing` accepts. That is where the restore +
+        // re-run puts the product, and it is what makes the ordering the
+        // remedy prints a working sequence rather than a suggestion.
+        put(FulfillState::Observing);
+        let output = product_approve_in(&root, &state_path, "revenue_daily")
+            .expect("approving from `observing` must be permitted");
+        assert!(!output.already_approved);
+        assert_ne!(
+            output.spec_digest, first.spec_digest,
+            "the edited spec is the newly approved revision"
+        );
+        assert_eq!(output.previous_state.as_deref(), Some("observing"));
+    }
+
     #[test]
     fn a_crash_between_snapshot_and_transaction_leaves_only_the_orphan_file() {
         // The E4 crash drill at the file/txn boundary: run ONLY the first
