@@ -381,9 +381,9 @@ pub fn excluded_mention_forms(tool: &str) -> Vec<String> {
 /// What it does NOT buy: a legitimate English word that IS the tool name
 /// still matches, because it is byte-identical at both boundaries. The
 /// E027 budget diagnostic said "or optimize the query" and `optimize` is
-/// an excluded tool; boundaries leave that hit exactly where it was. The
-/// remedy there is the reword the rule's own doc prescribes, not a
-/// narrower matcher.
+/// an excluded tool; boundaries left that hit exactly where it was, and it
+/// was closed by rewording E027 (`rocky_compiler::diagnostic`), which is
+/// the remedy the rule's own doc prescribes — not a narrower matcher.
 ///
 /// Deliberately a SECOND implementation of the same primitive
 /// `rocky_fulfill::briefs` uses, and not a shared one — see the SCOPE

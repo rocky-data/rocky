@@ -337,6 +337,16 @@ impl Diagnostic {
     ///
     /// Emitted when the DAG-propagated cost estimate for a model exceeds the
     /// `max_usd` value declared in the model's `[budget]` sidecar block.
+    ///
+    /// The suggestion on all four E027 constructors says "reduce the query's
+    /// scan volume" and deliberately does not say "optimize". A diagnostic
+    /// is served to an untrusted MCP drafting worker through `compile` and
+    /// `draft_model`, and `optimize` is a tool the worker profile does not
+    /// serve — so the word steers it at a verb it cannot call. Rocky owns
+    /// this sentence, so the remedy is the reword; the sweep that catches a
+    /// regression is `worker_result_text_names_no_excluded_tool` in
+    /// `rocky-mcp/tests/roundtrip.rs` (this crate cannot depend on
+    /// rocky-mcp — the dependency runs the other way).
     #[must_use]
     pub fn budget_exceeded(model: &str, projected_usd: f64, ceiling_usd: f64) -> Self {
         Self::error(
@@ -346,7 +356,7 @@ impl Diagnostic {
         )
         .with_suggestion(format!(
             "raise [budget] max_usd above ${ceiling_usd:.4} in the model sidecar, \
-             or optimize the query to reduce scan volume"
+             or reduce the query's scan volume"
         ))
     }
 
@@ -366,7 +376,7 @@ impl Diagnostic {
         )
         .with_suggestion(format!(
             "raise [budget] max_bytes_scanned above {ceiling_bytes} in the model sidecar, \
-             or optimize the query to reduce scan volume"
+             or reduce the query's scan volume"
         ))
     }
 
@@ -385,7 +395,7 @@ impl Diagnostic {
         )
         .with_suggestion(format!(
             "raise [budget] max_usd above ${ceiling_usd:.4} in the model sidecar, \
-             or optimize the query to reduce scan volume"
+             or reduce the query's scan volume"
         ))
     }
 
@@ -408,7 +418,7 @@ impl Diagnostic {
         )
         .with_suggestion(format!(
             "raise [budget] max_bytes_scanned above {ceiling_bytes} in the model sidecar, \
-             or optimize the query to reduce scan volume"
+             or reduce the query's scan volume"
         ))
     }
 
