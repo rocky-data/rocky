@@ -130,6 +130,16 @@ fn worker_instructions_banner(excluded: &[String]) -> String {
 /// <verb>` invocation, which is what makes the banner true rather than
 /// nearly true, and a derived scan asserts it.
 ///
+/// WHAT THE SCAN CHECKS, stated here because the eleventh round's finding 3
+/// was that this paragraph out-claimed it. It takes every
+/// identifier-bounded `rocky` in the lowercased body — so unbackticked and
+/// any case — and refuses the word that follows unless a reviewed prose
+/// list exempts it. It does NOT know the CLI's verb set: that enum is
+/// private to the `rocky` binary crate, which depends on this one. The
+/// guarantee is therefore "no unexempted word follows `rocky`", which is
+/// wider than the old literal and still not the same sentence as "the CLI
+/// is unreachable".
+///
 /// A PROJECTION, NOT A FORK. The canonical `.claude/skills/rocky-ai-workflow`
 /// file is untouched — it is correct guidance for the default profile, where
 /// the record/review/apply chain is the real workflow, and it is mirrored
@@ -225,7 +235,10 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // The projected body now contains NO `rocky <verb>` invocation at all,
     // which is what makes the banner true rather than nearly true. That is
     // asserted as a derived scan, not as a per-string check — see
-    // `worker_instructions_are_projected_and_default_stays_verbatim`.
+    // `worker_instructions_are_projected_and_default_stays_verbatim`, and
+    // read the bound stated there: the scan refuses any unexempted word
+    // after `rocky`, in any case and backticked or not, but it does not
+    // know the CLI's verb set.
     (
         "Run `rocky compile --output json`. The result gives you every existing model and \
          source table with its typed columns.",
@@ -6150,6 +6163,83 @@ fn rel_display(root: &Path, path: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// Every word that may follow the word "rocky" in the projected worker
+    /// instructions WITHOUT being a CLI route.
+    ///
+    /// Each one is the second half of a phrase in the skill, and none is an
+    /// invocation:
+    ///
+    /// - `and` — "SQL is first-class in Rocky **and** you are fluent in it."
+    /// - `data` — "…build or change a Rocky **data** model."
+    /// - `dsl` — "the `.rocky` **DSL** exists and is fully supported". The
+    ///   file extension, not the CLI name.
+    /// - `model` — "…asked to build or change a Rocky **model**."
+    /// - `models` — "# Authoring Rocky **models** as an agent"
+    /// - `rather` — "…authoring on Rocky **rather** than emitting bare SQL."
+    ///
+    /// A PROSE LIST, NOT A VERB LIST — see the scan's own comment in
+    /// `worker_instructions_are_projected_and_default_stays_verbatim` for
+    /// why the verb set is unreachable from this crate. The consequence to
+    /// keep in mind when this test fails: the fix is usually to rewrite the
+    /// sentence as a served action, and only sometimes to add a word here.
+    /// Add one only after reading the sentence it came from.
+    ///
+    /// The list is kept as bare strings on purpose. Per-entry comments here
+    /// get reflowed onto the wrong neighbour by rustfmt, which turns the
+    /// justification into a lie about the word above it.
+    const ROCKY_PROSE_FOLLOWERS: &[&str] = &["and", "data", "dsl", "model", "models", "rather"];
+
+    /// Every word that follows an identifier-bounded `rocky` in `lower`, in
+    /// order of appearance. `lower` must already be lowercase.
+    ///
+    /// Identifier-bounded on both sides, by the same rule
+    /// [`contains_identifier`] uses, so `rocky_sdk` and `unrocky` do not
+    /// match. "Follows" skips the markup that sits between a word and its
+    /// neighbour — spaces, backticks, asterisks — then takes the leading
+    /// run of `[a-z-]`. A `rocky` followed by punctuation or by the end of
+    /// the text contributes nothing: there is no word to judge.
+    ///
+    /// THE RIGHT BOUNDARY ALSO COUNTS `-`, and only the right one. A
+    /// hyphen binds the next word into a compound NAME — `rocky-config`,
+    /// `rocky-ai-workflow`, both skills this document cites — and a
+    /// compound name is not an invocation: the CLI form is always
+    /// `rocky<space><verb>`. Without this the scan reported `-config` as a
+    /// route. The left boundary keeps the plain identifier rule, so a
+    /// hyphenated word ENDING in "rocky" cannot hide a route behind it.
+    ///
+    /// Backtick-agnostic and, because the input is lowercased, also
+    /// case-insensitive. Those are exactly the two holes the eleventh
+    /// round's finding 3 named in the literal `` "`rocky " `` scan this
+    /// replaces.
+    fn rocky_followers(lower: &str) -> Vec<&str> {
+        let bytes = lower.as_bytes();
+        let is_ident = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(offset) = lower[from..].find("rocky") {
+            let start = from + offset;
+            let end = start + "rocky".len();
+            from = start + 1;
+            let before_ok = start == 0 || !is_ident(bytes[start - 1]);
+            let after_ok = end == bytes.len() || !(is_ident(bytes[end]) || bytes[end] == b'-');
+            if !before_ok || !after_ok {
+                continue;
+            }
+            let rest = &lower[end..];
+            let skipped = rest
+                .find(|c: char| !matches!(c, ' ' | '\t' | '\n' | '\r' | '`' | '*'))
+                .unwrap_or(rest.len());
+            let rest = &rest[skipped..];
+            let word_end = rest
+                .find(|c: char| !(c.is_ascii_lowercase() || c == '-'))
+                .unwrap_or(rest.len());
+            if word_end > 0 {
+                out.push(&rest[..word_end]);
+            }
+        }
+        out
+    }
+
     #[test]
     fn render_cell_passes_short_strings_through() {
         assert_eq!(
@@ -6820,24 +6910,88 @@ mod tests {
         //
         // DERIVED, not per-string, and that is the whole upgrade. The old
         // pin named one sentence, so the other three imperatives — and any
-        // fifth the skill grows — were invisible to it. This scans the
-        // projected body for the SHAPE `` `rocky <verb>` `` and admits
-        // none. A new CLI invocation in the skill now fails here instead of
-        // being served to a worker under a banner that forbids it.
-        let cli_routes: Vec<&str> = body
-            .match_indices("`rocky ")
-            .map(|(at, _)| {
-                let rest = &body[at + 1..];
-                let end = rest.find('`').unwrap_or(rest.len());
-                &rest[..end]
-            })
+        // fifth the skill grows — were invisible to it.
+        //
+        // ELEVENTH ROUND, finding 3 — the tenth round's scan matched the
+        // literal "`rocky ": lowercase, and backticked. `Run rocky compile`
+        // and ``Run `Rocky compile` `` both preserve every needle above and
+        // pass it clean. No leak today, and the bound was stated honestly;
+        // the defect was the sentence around it, which claimed any new CLI
+        // invocation fails here. It did not. Widened rather than narrowed,
+        // because the scan is cheap and it is the CLAIM that keeps going
+        // stale.
+        //
+        // WHAT THE WIDENED SCAN ACTUALLY DOES, so the claim and the code
+        // say the same thing: it finds every identifier-bounded `rocky` in
+        // the lowercased body — case-insensitive and backtick-agnostic —
+        // takes the word that follows, and refuses any word not on
+        // `ROCKY_PROSE_FOLLOWERS`.
+        //
+        // A PROSE ALLOWLIST, NOT A VERB LIST, and the reason is a
+        // dependency direction rather than a preference. The clap `Command`
+        // enum is private to the `rocky` binary crate
+        // (`engine/rocky/src/main.rs`), and that crate depends on this one.
+        // Deriving the verb set here would invert the dependency. So the
+        // rule fails CLOSED on an unknown follower instead: a new
+        // `rocky <verb>` fails without anyone listing the verb, and a new
+        // English phrase after "Rocky" fails until someone reads it and
+        // adds the word deliberately. The cost is a test edit on an
+        // innocent rewording; the alternative is a hand-maintained verb
+        // list that goes stale silently, which is the failure this round
+        // exists to stop repeating.
+        let followers = rocky_followers(&body_lower);
+        let routes: Vec<&str> = followers
+            .iter()
+            .copied()
+            .filter(|word| !ROCKY_PROSE_FOLLOWERS.contains(word))
             .collect();
         assert!(
-            cli_routes.is_empty(),
-            "the projected body still routes the worker through the CLI ({cli_routes:?}), \
+            routes.is_empty(),
+            "the projected body still routes the worker through the CLI ({routes:?}), \
              while the umbrella rewrite above it forbids shell routes categorically — \
-             rewrite each one as the served action: {body}"
+             rewrite each one as the served action, or, if the word is prose rather than a \
+             verb, add it to ROCKY_PROSE_FOLLOWERS after reading the sentence: {body}"
         );
+        // The scan must actually SEE the word — a body where "rocky" never
+        // occurs would satisfy the assertion above vacuously, and so would
+        // a broken matcher.
+        assert!(
+            !followers.is_empty(),
+            "the scan found no `rocky` at all in the projected body, so the assertion above \
+             proved nothing: {body}"
+        );
+        // NO DEAD ENTRIES. Every allowed word must still occur in the body.
+        // Two things fall out of this, and the second is the point:
+        //
+        //  - A sentence the skill drops takes its exemption with it,
+        //    instead of leaving a hole for a later route of the same word.
+        //  - A CLI verb cannot be PRE-AUTHORIZED. Adding "compile" here to
+        //    smooth a future edit fails immediately, because no such
+        //    follower exists yet. The exemption and the sentence have to
+        //    arrive together, where a reviewer sees both.
+        for allowed in ROCKY_PROSE_FOLLOWERS {
+            assert!(
+                followers.contains(allowed),
+                "ROCKY_PROSE_FOLLOWERS still exempts `{allowed}`, which no longer follows \
+                 `rocky` anywhere in the projected body — drop the entry rather than \
+                 leaving a standing exemption: {followers:?}"
+            );
+        }
+        // And it must catch what the old literal scan missed. Both forms
+        // preserve every needle in this test; only the widened rule sees
+        // them.
+        for missed in [
+            "Run rocky compile to check your work.",
+            "Run `Rocky compile` to check your work.",
+            "ROCKY COMPILE is the fast feedback loop.",
+        ] {
+            let probe = format!("{body}\n\n{missed}").to_lowercase();
+            let probe_followers = rocky_followers(&probe);
+            assert!(
+                probe_followers.contains(&"compile"),
+                "the widened scan must see `{missed}` — the literal it replaced did not"
+            );
+        }
         // And the served actions REPLACED them, rather than the sentences
         // being deleted: a worker with no instruction is not the outcome
         // wanted here, exactly as in PROPERTY 3 above.
