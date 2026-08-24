@@ -56,6 +56,15 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // warehouse is not, and printing the custody remedy for a config
     // typo would name a fix that cannot work.
     "rocky_cli::commands::fulfill_api::BindFailure",
+    // F3 — the check-set digest's PREIMAGE SCHEME tag and the predicate
+    // that reads it. DELIBERATE addition: a persisted digest is an
+    // opaque string, so without asking this question the loop reports a
+    // build that hashes different fields as "something changed what
+    // would run", and prints a restore remedy no restore can satisfy at
+    // a state where re-approving is refused. The tag makes the two
+    // facts distinguishable; the loop routes the scheme one to
+    // `blocked`, which has a working exit.
+    "rocky_cli::commands::fulfill_api::CHECK_SET_DIGEST_SCHEME",
     "rocky_cli::commands::fulfill_api::LoadedCheckSet",
     "rocky_cli::commands::fulfill_api::ReceiptLookup",
     // #1493 — the drafting-window reopen (typed outcome + the call).
@@ -72,6 +81,7 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // F3 — the custody digest over the EXPANDED check set, so an edit to
     // a shared `test_definitions.toml` cannot change what observation
     // executes without the loop noticing.
+    "rocky_cli::commands::fulfill_api::check_set_digest_scheme_is_current",
     "rocky_cli::commands::fulfill_api::declarative_check_digest",
     "rocky_cli::commands::fulfill_api::declarative_test_count",
     "rocky_cli::commands::fulfill_api::lookup_apply_receipt",

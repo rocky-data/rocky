@@ -944,6 +944,39 @@ impl Runner {
             ));
         }
 
+        // THE SCHEME QUESTION COMES BEFORE THE COMPARISON, because a
+        // digest taken under a different preimage cannot be equal or
+        // unequal to this one in any useful sense — asking whether the
+        // strings match reports "something changed what would run" for
+        // a directory nobody touched.
+        //
+        // Ordered AFTER the artifact hashes and BEFORE the bind. A real
+        // tamper outranks it: those problems are found without the
+        // digest and their remedy genuinely is a restore. And there is
+        // no reason to resolve a warehouse for a check set that is not
+        // going to run.
+        if custody.is_empty()
+            && let Some(verified) = verified_digest.as_deref()
+            && !fulfill_api::check_set_digest_scheme_is_current(verified)
+        {
+            return Ok(Event::ObservationChecks {
+                failed: 0,
+                errored: 0,
+                warned: 0,
+                // Not `Some(0)`, for the same reason as every other
+                // hold: no check ran, and a zero would read as health.
+                deferred: None,
+                detail: format!(
+                    "the digest this generation pinned ({verified}) was taken under an older \
+                     check-set scheme; this build digests `{}`, so the two were never \
+                     comparable and the declared checks were NOT run",
+                    fulfill_api::CHECK_SET_DIGEST_SCHEME
+                ),
+                prior_detail,
+                cause: Some(UnevaluableCause::CheckSchemeChanged),
+            });
+        }
+
         // THE AUTHORITATIVE COMPARISON — the executed set against the
         // verified set.
         //
@@ -967,6 +1000,19 @@ impl Runner {
         // cannot ask the loader all look like `None`, and none of them
         // is a reason to execute. "Every claim matched" and "the claim I
         // needed was made" are different questions.
+        //
+        // A digest from a DIFFERENT SCHEME is a third thing, and it
+        // leaves before the comparison below rather than failing it.
+        // The stored value is opaque, so a strict compare cannot tell
+        // "the checks moved" from "this build hashes a different
+        // preimage than the build that pinned this" — and it reports
+        // the second as the first, with a remedy ("restore the file you
+        // changed") that no restore can satisfy, at a landing state
+        // (`applied`) where re-approving is refused. That is a hold an
+        // operator cannot clear. `check_set_digest_scheme_is_current`
+        // is the question that separates them; see
+        // `CHECK_SET_DIGEST_SCHEME` for why the tag rides outside the
+        // hash.
         //
         // ONE BIND. `LoadedCheckSet::bind` reads the models directory
         // and `rocky.toml` once each and OWNS both results; its digest

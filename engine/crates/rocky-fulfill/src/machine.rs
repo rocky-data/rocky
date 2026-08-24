@@ -317,11 +317,16 @@ pub enum ReceiptSummary {
 
 /// Why a reading of the declared checks could not be trusted.
 ///
-/// The verdict alone is not enough to tell an operator what to do: both
-/// causes land the same `unevaluable` hold, but only one of them is
-/// resolved by running the loop again. Carrying the cause is what keeps
-/// the stop from printing a command that cannot fix the condition it
-/// just reported.
+/// The verdict alone is not enough to tell an operator what to do: the
+/// causes share one `unevaluable` verdict but need three different
+/// remedies, and one of them needs a different LANDING STATE as well.
+/// Carrying the cause is what keeps the stop from printing a command
+/// that cannot fix the condition it just reported.
+///
+/// [`decide_observation`] matches every variant explicitly. A new cause
+/// therefore has to state its own landing and remedy at the point it is
+/// added; it cannot inherit the custody one, which would print "restore
+/// the file you changed" at someone whose problem no restore can fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnevaluableCause {
     /// The checks on disk are not the ones this generation VERIFIED.
@@ -372,6 +377,34 @@ pub enum UnevaluableCause {
     /// the composite-grain arm in rocky-core, so teaching `checks` a
     /// new shape fails a test that names this message.
     CheckCustody,
+    /// The pinned digest and the recomputed one were taken under
+    /// DIFFERENT preimage schemes, so they were never comparable.
+    ///
+    /// Not a custody divergence, and it must never be reported as one.
+    /// Nothing on disk is in doubt: the generation was pinned by a build
+    /// whose `CheckSetPreimage` covered different fields, and this build
+    /// cannot reproduce that value. The custody remedy is a RESTORE, and
+    /// no restore changes a hash algorithm — printing it here is the
+    /// exact "instruction that cannot resolve what it was printed for"
+    /// the custody arm exists to avoid. It would also land at `applied`,
+    /// where `rocky product approve` is refused, so the operator would
+    /// have neither of the two routes out.
+    ///
+    /// This one lands `blocked` instead, which is a state a human can
+    /// act on: `rocky fulfill <product> --retry` re-enters at
+    /// `spec_approved` (the `Blocked` arm of [`decide`]) and the fresh
+    /// generation pins its own digest at its own `verifying`, under the
+    /// current scheme. `rocky product approve` is also accepted from
+    /// `blocked` — it is in the stop set, not the in-flight set
+    /// (`product.rs`) — so re-approving a corrected spec works too.
+    ///
+    /// Reachable today only from a record written by an intermediate
+    /// build of this work package: `checks_digest` does not exist on
+    /// `main`, so no released binary has ever written an untagged one.
+    /// It is here for the NEXT preimage change, which the rule on
+    /// `CheckSetPreimage` positively invites, and which would otherwise
+    /// strand every generation a released build had pinned.
+    CheckSchemeChanged,
     /// The reading itself failed, or checks errored. Re-running can
     /// genuinely resolve this one: the warehouse may answer next time.
     Unreadable,
@@ -1497,6 +1530,17 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                 // goes — the next observation reads the checks fresh.
                 next.data_repair_rounds = 0;
                 next.observation_detail = None;
+                // The check-set pin goes with it. The re-entry is at
+                // `spec_approved`, and the only route to an observation
+                // from there runs through `verifying`, which pins a
+                // fresh digest — so this is behaviour-neutral today.
+                // It is cleared anyway so no value from an older
+                // preimage scheme can outlive the retry that was
+                // printed to escape it, and so any future path that
+                // reached observation without re-verifying would find
+                // `None` and hold, rather than compare against a stale
+                // pin.
+                next.checks_digest = None;
                 Decision::Advance {
                     record: next,
                     event: "manual retry".to_string(),
@@ -1682,6 +1726,37 @@ fn decide_observation_checks(
         // is deciding whether to rewrite a model, and the honest answer
         // to an unreadable check is to stop and say so.
         CheckVerdict::Unevaluable => {
+            // A digest pinned under an older PREIMAGE SCHEME is handled
+            // before anything else, because it is the one cause whose
+            // landing state differs. Everything below assumes the two
+            // digests were comparable and one of them moved; this one
+            // says they were never comparable at all.
+            //
+            // It cannot land at `applied` like the others. That state is
+            // the honest "observation not concluded" holding pattern for
+            // conditions a later run can resolve — and this one cannot:
+            // re-running recomputes the same current-scheme digest and
+            // compares it against the same old-scheme value, forever.
+            // `applied` is also in `rocky product approve`'s in-flight
+            // refusal set, so the operator would be left with no route
+            // out at all. `blocked` has two: `--retry` re-enters at
+            // `spec_approved` and the fresh generation pins its own
+            // digest at its own verify, and `approve` is accepted from
+            // the stop set.
+            if matches!(cause, Some(UnevaluableCause::CheckSchemeChanged)) {
+                let reason = format!(
+                    "{detail} — nothing on disk changed, and no restore alters a hash \
+                     algorithm. Re-running this generation cannot resolve it either: only \
+                     a fresh generation pins a digest, at its own verify"
+                );
+                let record = blocked(observed, reason, now);
+                return blocked_stop(
+                    record,
+                    "check-set digest scheme changed under an applied generation".to_string(),
+                    product,
+                    detail,
+                );
+            }
             let landing = match &observed.state {
                 // No new news does not clear old news: a product already
                 // known to be failing stays failing.
@@ -1691,11 +1766,12 @@ fn decide_observation_checks(
                 _ => FulfillState::Applied,
             };
             let next = to_state(observed, landing, now);
-            // One verdict, two causes, two remedies. Printing "run the
-            // loop again" for a custody divergence would name a command
-            // that re-reads the same diverged file and reports the same
-            // thing forever — an instruction that cannot resolve what it
-            // was printed for is worse than no instruction.
+            // One verdict, three causes, three remedies. Printing "run
+            // the loop again" for a custody divergence would name a
+            // command that re-reads the same diverged file and reports
+            // the same thing forever — an instruction that cannot
+            // resolve what it was printed for is worse than no
+            // instruction.
             // The custody remedy is a RESTORE, not a command, and saying
             // so is the only honest option available.
             //
@@ -1779,7 +1855,16 @@ fn decide_observation_checks(
                      restore is the whole remedy"
                         .to_string(),
                 ),
-                _ => (format!("rocky fulfill {product}"), String::new()),
+                // Enumerated, not defaulted. A `_ =>` here is how a
+                // fourth cause would silently acquire "re-run the loop"
+                // — the remedy that is right only when re-running can
+                // change the answer. `CheckSchemeChanged` is listed and
+                // unreachable because it returned above; writing it out
+                // means a variant added later has to come to this match
+                // and choose.
+                Some(UnevaluableCause::CheckSchemeChanged)
+                | Some(UnevaluableCause::Unreadable)
+                | None => (format!("rocky fulfill {product}"), String::new()),
             };
             Decision::AdvanceAndStop {
                 record: next,
@@ -4631,6 +4716,46 @@ mod tests {
             assert!(
                 !stop.message.contains("restore the file you changed"),
                 "and it must not tell them to undo an edit they did not make: {}",
+                stop.message
+            );
+        }
+
+        // AND THE SCHEME CAUSE GETS A DIFFERENT LANDING, not just
+        // different words. `applied` is the holding pattern for
+        // conditions a later run can resolve, and it is in `rocky
+        // product approve`'s in-flight refusal set — so a cause that
+        // re-running can never resolve must not land there, or the
+        // operator has no exit at all. It goes to `blocked`, whose
+        // `--retry` re-enters at `spec_approved` and pins a fresh
+        // digest at the new generation's own verify.
+        for state in [FulfillState::Applied, FulfillState::ObservedFailing] {
+            let d = decide(
+                &rec(state.clone()),
+                reading(Some(UnevaluableCause::CheckSchemeChanged)),
+                now(),
+            );
+            let Decision::AdvanceAndStop { record, stop, .. } = d else {
+                panic!("expected AdvanceAndStop, got {d:?}");
+            };
+            assert!(
+                matches!(record.state, FulfillState::Blocked { .. }),
+                "a scheme mismatch lands where a human can act, from {state:?}: {:?}",
+                record.state
+            );
+            assert_eq!(
+                stop.next_command.as_deref(),
+                Some("rocky fulfill revenue_daily --retry"),
+                "and the printed command starts the generation that re-pins: {stop:?}"
+            );
+            assert!(
+                !stop.message.contains("restore the file you changed"),
+                "no restore alters a hash algorithm, so the custody remedy must not leak \
+                 into this arm: {}",
+                stop.message
+            );
+            assert!(
+                !stop.message.contains("put the change in the product spec"),
+                "and no spec field carries a digest scheme: {}",
                 stop.message
             );
         }

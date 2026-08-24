@@ -48,6 +48,14 @@ pub use crate::commands::test::declarative_test_count;
 // and nothing is about to run.
 #[cfg(feature = "duckdb")]
 pub use crate::commands::test::declarative_check_digest;
+// The digest's SCHEME predicate. A persisted digest is opaque, so the
+// loop cannot tell "the checks moved" from "this binary hashes a
+// different preimage than the build that pinned this" without asking.
+// The two need different remedies: the first is a restore, the second
+// no restore can ever fix, and reporting the second as the first is a
+// custody hold with an instruction that cannot resolve it.
+#[cfg(feature = "duckdb")]
+pub use crate::commands::test::{CHECK_SET_DIGEST_SCHEME, check_set_digest_scheme_is_current};
 // The OBSERVATION-time entry: one owned, digested snapshot of the check
 // set, with the warehouse it runs against already bound. The custody
 // gate compares `digest()` and then hands this same handle to

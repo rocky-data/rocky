@@ -2357,3 +2357,149 @@ fn a_record_with_no_recorded_digest_holds_rather_than_passing() {
         "and it says exactly what is missing: {message}"
     );
 }
+
+/// A DIGEST FROM AN OLDER PREIMAGE SCHEME IS NOT A CUSTODY DIVERGENCE.
+///
+/// The persisted `checks_digest` is an opaque string, and the
+/// comparison at observation is exact. So the day the preimage changes
+/// — which `CheckSetPreimage`'s own rule invites, and which this work
+/// package already did once when it folded `[target]` in — every
+/// generation the previous build pinned mismatches on a directory
+/// nobody touched.
+///
+/// Reported as custody, that is unrecoverable. The remedy printed is
+/// "restore the file you changed", and no restore changes a hash
+/// algorithm. The landing is `applied`, where `rocky product approve`
+/// is refused. Both exits are closed, permanently, by an upgrade.
+///
+/// The scheme tag makes the two facts separable, and this drives the
+/// separation end to end: seed the record with the untagged digest an
+/// intermediate build wrote, and the loop must say the two were never
+/// comparable, must NOT print the restore, and must land somewhere a
+/// human can act — `blocked`, whose `--retry` starts a generation that
+/// re-pins under the current scheme.
+///
+/// The recovery half is the point. A test that only asserted the new
+/// message would pass over a hold just as permanent as the one it
+/// replaced.
+#[test]
+fn a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+    write_project(dir, &session_json(&[]));
+    let plan = drive_to_plan_review(dir);
+    let (code, _j, _o, err) = rocky(dir, &["review", &plan, "--approve"]);
+    assert_eq!(code, 0, "review approve: {err}");
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    assert_eq!(code, 0, "apply+observe: {err}");
+    assert_eq!(
+        json.expect("json")["state"],
+        "observing",
+        "the baseline is a clean, pinned generation"
+    );
+
+    // Seed the record the way a build BEFORE the scheme tag left it:
+    // the same hash, without the `checks/N:` prefix. Nothing on disk
+    // moves, so the check set itself is beyond suspicion — which is
+    // exactly the case a strict compare gets wrong.
+    {
+        let store = state_store(dir);
+        let current = store
+            .fulfill_state_get(PRODUCT)
+            .expect("state")
+            .expect("record");
+        let pinned = current
+            .checks_digest
+            .clone()
+            .expect("the fixture must start pinned, or this proves nothing");
+        let (scheme, hash) = pinned
+            .split_once(':')
+            .expect("a pinned digest carries its scheme");
+        assert_eq!(
+            scheme, "checks/1",
+            "this test strips the CURRENT scheme tag; update it when the scheme is bumped"
+        );
+        let mut older = current.clone();
+        older.checks_digest = Some(hash.to_string());
+        let row = rocky_core::fulfill::FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: "test: simulate a digest pinned under an older preimage scheme".to_string(),
+            from_state: Some(current.state.tag().to_string()),
+            to_state: older.state.tag().to_string(),
+            spec_digest: older.spec_digest.clone(),
+            plan_id: older.plan_id.clone(),
+            idempotency_key: older.idempotency_key.clone(),
+        };
+        let outcome = store
+            .fulfill_state_cas(PRODUCT, Some(&current), &older, &row)
+            .expect("seed the old-scheme record");
+        assert!(
+            matches!(outcome, rocky_core::fulfill::FulfillCas::Won),
+            "the seed must land"
+        );
+    }
+
+    let (code, json, _o, err) = rocky(dir, &["fulfill", PRODUCT]);
+    let json = json.expect("fulfill json");
+    assert_eq!(code, 2, "blocked exits 2: {err} {json}");
+    assert_eq!(
+        json["state"], "blocked",
+        "it must land where a human can act, not in the `applied` holding pattern that \
+         refuses `rocky product approve`: {json}"
+    );
+    let message = json["message"].as_str().expect("message");
+    assert!(
+        message.contains("was taken under an older check-set scheme"),
+        "the stop says the two were never comparable, not that something changed: {message}"
+    );
+    // THE ASSERTIONS THAT EARN THIS TEST are the negative ones. A
+    // change that routed the scheme mismatch back through the custody
+    // arm would still pass an assertion that only checked the product
+    // held.
+    assert!(
+        !message.contains("restore the file you changed"),
+        "no restore changes a hash algorithm, so the custody remedy must not be printed \
+         here: {message}"
+    );
+    assert!(
+        !message.contains("something changed what would run"),
+        "and nothing on disk changed — saying so would accuse an operator of an edit they \
+         did not make: {message}"
+    );
+    assert_eq!(
+        json["next_command"].as_str(),
+        Some(format!("rocky fulfill {PRODUCT} --retry").as_str()),
+        "and the printed command is the one that starts a generation this build can pin: \
+         {json}"
+    );
+
+    // THE REMEDY IS EXECUTED. `--retry` re-enters at `spec_approved`,
+    // and the fresh generation pins its own digest at its own verify —
+    // so the product comes back, rather than trading one permanent hold
+    // for another.
+    let (code, json, out, err) = rocky(dir, &["fulfill", PRODUCT, "--retry"]);
+    assert_eq!(code, 0, "the printed remedy has to work: {err}{out}");
+    let json = json.expect("fulfill json");
+    assert_eq!(
+        json["state"], "needs_input",
+        "the retry re-enters the loop at the next gate rather than staying blocked: {json}"
+    );
+
+    // And the re-pinned digest is tagged, so the next observation
+    // compares like for like.
+    let store = state_store(dir);
+    let record = store
+        .fulfill_state_get(PRODUCT)
+        .expect("state")
+        .expect("record");
+    assert!(
+        record
+            .checks_digest
+            .as_deref()
+            .is_none_or(|d| d.starts_with("checks/1:")),
+        "a digest pinned after the retry carries the current scheme: {:?}",
+        record.checks_digest
+    );
+    drop(store);
+}

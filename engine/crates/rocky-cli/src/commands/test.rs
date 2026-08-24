@@ -250,6 +250,10 @@ pub fn declarative_test_count(models_dir: &Path, model: &str) -> Result<usize> {
 /// the declarative path ignores the per-model override and runs every
 /// check through the pipeline's adapter, so hashing it would raise
 /// custody holds over a value that cannot change what happens.
+///
+/// **Adding or removing a field here MUST bump
+/// [`CHECK_SET_DIGEST_SCHEME`].** That rule is the whole reason the
+/// scheme tag exists — see its docs.
 #[cfg(feature = "duckdb")]
 #[derive(serde::Serialize)]
 struct CheckSetPreimage<'a> {
@@ -257,6 +261,57 @@ struct CheckSetPreimage<'a> {
     tests: &'a [rocky_core::tests::TestDecl],
     /// The table those checks are generated against.
     target: &'a rocky_core::models::TargetConfig,
+}
+
+/// The preimage scheme every [`check_set_digest`] result declares, as a
+/// prefix on the digest string.
+///
+/// **Outside the hash, on purpose.** A version folded INTO the preimage
+/// changes the hash and nothing else: the result is still a bare
+/// `sha256:<hex>`, indistinguishable from one taken under any other
+/// scheme, so a reader holding a persisted digest cannot tell "the
+/// checks changed" from "this binary hashes different things now". The
+/// tag has to be readable without the preimage, so it is a prefix.
+///
+/// What it prevents. A persisted `checks_digest` is compared at
+/// post-apply observation against a digest recomputed HERE, and a
+/// mismatch is reported as a custody divergence whose printed remedy is
+/// "restore the file you changed". Change the preimage — which the
+/// comment on [`CheckSetPreimage`] positively invites, and which this
+/// work package already did once by folding `target` in — and every
+/// generation pinned by the previous build mismatches on an untouched
+/// directory. It lands at `applied`, where `rocky product approve` is
+/// refused, and no restore can change a hash algorithm. That is an
+/// unrecoverable hold, produced by an upgrade rather than by anything
+/// an operator did.
+///
+/// With the tag, a mismatched SCHEME is a different fact from a
+/// mismatched DIGEST, and the loop can say so and route it to a remedy
+/// that works (`UnevaluableCause::CheckSchemeChanged` — a `blocked`
+/// whose `--retry` starts a fresh generation that re-pins at its own
+/// verify).
+///
+/// So: bump this whenever [`CheckSetPreimage`] changes shape. Old
+/// values are never re-derived — there is deliberately no scheme-1
+/// compatibility path, because a second live preimage is a second thing
+/// to keep correct, and the whole point is that the OLD generation
+/// cannot be certified by a binary that no longer computes its digest.
+#[cfg(feature = "duckdb")]
+pub const CHECK_SET_DIGEST_SCHEME: &str = "checks/1";
+
+/// Whether `digest` was produced by the scheme this binary computes.
+///
+/// An untagged value (anything a build before the tag existed wrote) is
+/// NOT current, and neither is a future tag. Both mean the same thing to
+/// the observation gate: the comparison is unavailable, which is not the
+/// same as the comparison failing.
+#[cfg(feature = "duckdb")]
+#[must_use]
+pub fn check_set_digest_scheme_is_current(digest: &str) -> bool {
+    match digest.split_once(':') {
+        Some((scheme, _)) => scheme == CHECK_SET_DIGEST_SCHEME,
+        None => false,
+    }
 }
 
 /// THE ONE PLACE a check-set digest is computed.
@@ -286,6 +341,11 @@ struct CheckSetPreimage<'a> {
 ///
 /// An unknown model is an error, never a digest over an empty set — the
 /// same rule [`declarative_test_count`] follows, for the same reason.
+///
+/// The result is SCHEME-TAGGED (`checks/1:sha256:…`). The tag is added
+/// here rather than inside `content_digest`, which is the shared spec /
+/// manifest hash — changing that function's output format would change
+/// every spec digest in the product plane too.
 #[cfg(feature = "duckdb")]
 fn check_set_digest(models: &[rocky_core::models::Model], model: &str) -> Result<String> {
     let found = models
@@ -297,7 +357,8 @@ fn check_set_digest(models: &[rocky_core::models::Model], model: &str) -> Result
         target: &found.config.target,
     })
     .context("failed to serialize the expanded check set")?;
-    Ok(rocky_core::product::manifest::content_digest(&bytes))
+    let hash = rocky_core::product::manifest::content_digest(&bytes);
+    Ok(format!("{CHECK_SET_DIGEST_SCHEME}:{hash}"))
 }
 
 /// A digest over the EXPANDED check set a model would execute.
@@ -930,7 +991,10 @@ fn test_type_label(tt: &TestType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{declarative_check_digest, declarative_test_count, load_all_models};
+    use super::{
+        CHECK_SET_DIGEST_SCHEME, check_set_digest_scheme_is_current, declarative_check_digest,
+        declarative_test_count, load_all_models,
+    };
 
     /// Write a one-model project whose sidecar carries `sidecar_extra`,
     /// plus a named-test registry. Returns the models dir.
@@ -986,6 +1050,56 @@ mod tests {
             first, moved,
             "editing the shared definition changes what would execute, so the digest \
              must move — the sidecar hash alone cannot see this"
+        );
+    }
+
+    /// Every digest DECLARES the preimage it was taken over, and the
+    /// declaration is readable without the preimage.
+    ///
+    /// This is the property the whole scheme tag exists for. The
+    /// persisted `checks_digest` is compared at post-apply observation
+    /// against a digest recomputed by whatever binary is running then. A
+    /// bare `sha256:<hex>` cannot say which fields it covered, so a
+    /// build that changed `CheckSetPreimage` reads every older pin as
+    /// "the checks moved" — a custody hold whose printed remedy is a
+    /// restore, at a state where re-approving is refused. Unrecoverable,
+    /// and caused by an upgrade rather than by anything anyone did.
+    ///
+    /// Two halves, and the second is the one that would rot: the tag is
+    /// present, and the predicate the loop routes on actually reads it.
+    /// A predicate that answered `true` for an untagged value would let
+    /// exactly the stranded case back through, silently.
+    #[test]
+    fn a_check_digest_declares_its_preimage_scheme_outside_the_hash() {
+        let (_tmp, models) = project("");
+        let digest = declarative_check_digest(&models, "orders").expect("digest");
+        let (scheme, hash) = digest
+            .split_once(':')
+            .expect("the scheme rides as a prefix, not inside the hash");
+        assert_eq!(scheme, CHECK_SET_DIGEST_SCHEME);
+        assert!(
+            hash.starts_with("sha256:"),
+            "and the hash itself is untouched underneath it: {digest}"
+        );
+        assert!(
+            check_set_digest_scheme_is_current(&digest),
+            "a digest this build produced is current by construction: {digest}"
+        );
+
+        // THE HALF THAT EARNS THE TEST. `hash` is exactly what a build
+        // before the tag wrote, and it must NOT read as current — that
+        // value is the stranded generation.
+        assert!(
+            !check_set_digest_scheme_is_current(hash),
+            "an untagged digest is from an older scheme, not a matching one: {hash}"
+        );
+        assert!(
+            !check_set_digest_scheme_is_current("checks/99:sha256:abc"),
+            "and so is a scheme this build does not compute"
+        );
+        assert!(
+            !check_set_digest_scheme_is_current(""),
+            "a value with no separator at all cannot claim the current scheme"
         );
     }
 
