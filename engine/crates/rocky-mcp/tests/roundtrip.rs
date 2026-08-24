@@ -2859,53 +2859,84 @@ async fn authoring_trajectories_orchestrate_tools_and_stop_at_the_gate() {
     client.cancel().await.unwrap();
 }
 
-/// FF-WP1 fix round (finding 7) — the worker-profile GOLDEN prompt surface:
-/// every workflow prompt served under `--profile worker` (1) never mentions a
-/// tool the profile excludes (`propose`, `draft_contract`, `draft_metadata`,
-/// `ai_test`, `ai_contract`, `review_queue`, `pause_schedule`) and (2) ends
-/// at an explicit hand-off to the trusted runner. The default-profile golden
-/// tests above pin the other surface, so a prompt edit must consciously pick
-/// its profiles.
+/// FF-WP1 fix round (finding 7), extended by the F3 red team — the
+/// worker-profile GOLDEN prompt surface: every prompt BODY served under
+/// `--profile worker` (1) never names a tool the profile excludes and (2)
+/// ends at an explicit hand-off to the trusted runner. The default-profile
+/// golden tests above pin the other surface, so a prompt edit must
+/// consciously pick its profiles.
+///
+/// Two things here are DERIVED rather than written down, and both are the
+/// finding this test was rewritten for.
+///
+/// - **The excluded list** comes from the two real routers (default minus
+///   worker), exactly as `tools.rs`'s unit sweep and `briefs.rs` build
+///   theirs. A hand-picked literal is how `draft_check` slipped: the F3
+///   work package removed it from the worker allowlist while three prompt
+///   bodies still instructed it, and the literal here did not name it, so
+///   this test went green over three messages steering the worker at a
+///   tool that answers tool-not-found.
+/// - **The prompt set** comes from `prompts/list`, not a written-out
+///   vector. The same defect had a second half: `prompts/list`
+///   DESCRIPTIONS were swept and the `prompts/get` BODIES were not, and a
+///   sweep over a hand-written four could never have covered a fifth
+///   prompt added later. Arguments are synthesised from each prompt's own
+///   declared `arguments`, so a new prompt with new arguments is swept
+///   with nothing to remember.
 #[tokio::test]
 async fn worker_profile_prompts_end_at_the_runner_handoff() {
     let dir = TempDir::new().unwrap();
     write_project(dir.path(), &dir.path().join("test.duckdb"));
-    let server = RockyMcpServer::new_with_profile(
-        dir.path().join("rocky.toml"),
-        rocky_mcp::McpProfile::Worker,
+    let config_path = dir.path().join("rocky.toml");
+
+    // DERIVED, not hand-picked: every tool the default profile serves and
+    // the worker profile does not. `tool_names()` reads the same router
+    // the constructor filtered, so this can never disagree with what
+    // `tools/list` serves.
+    let worker_tools =
+        RockyMcpServer::new_with_profile(config_path.clone(), rocky_mcp::McpProfile::Worker)
+            .tool_names();
+    let excluded_tool_mentions: Vec<String> = RockyMcpServer::new(config_path.clone())
+        .tool_names()
+        .into_iter()
+        .filter(|name| !worker_tools.contains(name))
+        .collect();
+    assert!(
+        excluded_tool_mentions.iter().any(|n| n == "draft_check"),
+        "the worker profile still excludes `draft_check`, so the sweep must cover it: \
+         {excluded_tool_mentions:?}"
     );
+
+    let server = RockyMcpServer::new_with_profile(config_path, rocky_mcp::McpProfile::Worker);
     let client = connect(server).await;
 
-    // Tools the worker profile excludes — no worker prompt may instruct them.
-    // (`ai_test`/`ai_contract` also cover the excluded-generator class.)
-    const EXCLUDED_TOOL_MENTIONS: &[&str] = &[
-        "propose",
-        "draft_contract",
-        "draft_metadata",
-        "ai_test",
-        "ai_contract",
-        "review_queue",
-        "pause_schedule",
-    ];
+    // ENUMERATED from the served router, not written down here.
+    let prompts = client.list_all_prompts().await.expect("list prompts");
+    assert_eq!(
+        prompts.len(),
+        5,
+        "the worker profile serves all 5 prompts; update the expectations below, not this \
+         sweep, when one is added"
+    );
 
-    let build_args = serde_json::json!({ "intent": "daily revenue" })
-        .as_object()
-        .unwrap()
-        .clone();
-    let model_args = serde_json::json!({ "model": "orders" })
-        .as_object()
-        .unwrap()
-        .clone();
-    let prompts: Vec<(&str, Option<serde_json::Map<String, serde_json::Value>>)> = vec![
-        ("build_model", Some(build_args)),
-        ("find_untested_models", None),
-        ("add_tests_to_pks", Some(model_args)),
-        ("fix_failing_test", None),
-    ];
-
-    for (name, args) in prompts {
-        let mut params = GetPromptRequestParams::new(name);
-        if let Some(args) = args {
+    for prompt in &prompts {
+        let name = prompt.name.clone();
+        // Synthesised from the prompt's OWN declared arguments, so a new
+        // prompt needs no edit here. `add_tests_to_pks` / `fix_failing_test`
+        // take a model name and `build_model` takes free text, and a
+        // placeholder is fine for both: this sweeps guidance text, not
+        // behaviour that depends on the value.
+        let mut args = serde_json::Map::new();
+        for declared in prompt.arguments.iter().flatten() {
+            let value = if declared.name == "model" {
+                "orders"
+            } else {
+                "daily revenue"
+            };
+            args.insert(declared.name.clone(), serde_json::json!(value));
+        }
+        let mut params = GetPromptRequestParams::new(name.clone());
+        if !args.is_empty() {
             params = params.with_arguments(args);
         }
         let result = client
@@ -2914,12 +2945,23 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
             .unwrap_or_else(|e| panic!("get_prompt {name}: {e}"));
         let haystack = prompt_text(&result);
 
-        for excluded in EXCLUDED_TOOL_MENTIONS {
+        for excluded in &excluded_tool_mentions {
             assert!(
-                !haystack.contains(excluded),
+                !haystack.contains(excluded.as_str()),
                 "worker-profile `{name}` must not instruct excluded tool `{excluded}`; \
                  full text:\n{haystack}"
             );
+        }
+
+        // The read-only summary prompt is profile-invariant: it has no
+        // worker branch and no hand-off, because it never drafts anything.
+        // Every other prompt ends at the runner.
+        if name == "summarize_project" {
+            assert!(
+                haystack.to_lowercase().contains("read-only"),
+                "summarize_project stays the read-only orientation under the worker profile"
+            );
+            continue;
         }
         assert!(
             haystack.contains("HAND OFF") && haystack.contains("trusted runner"),
@@ -2936,17 +2978,6 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
             );
         }
     }
-
-    // The read-only summary prompt is profile-invariant.
-    let summary = client
-        .get_prompt(GetPromptRequestParams::new("summarize_project"))
-        .await
-        .expect("get_prompt summarize_project");
-    let haystack = prompt_text(&summary);
-    assert!(
-        haystack.to_lowercase().contains("read-only"),
-        "summarize_project stays the read-only orientation under the worker profile"
-    );
 
     client.cancel().await.unwrap();
 }

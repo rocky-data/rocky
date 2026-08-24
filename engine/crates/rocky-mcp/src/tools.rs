@@ -3776,21 +3776,25 @@ impl RockyMcpServer {
                          often a suggestion), fix against them, and loop until clean.\n\
                          6. plan_preview — read the exact SQL Rocky would execute and confirm \
                          it matches the intent.\n\
-                         7. draft_check — encode what you learned while sampling as append-only \
-                         `[[tests]]` assertions (grain uniqueness, not-null, value domains), \
-                         then run them with the `test` tool. Contracts and metadata are \
-                         SPEC-OWNED in this profile — do not author them; note a \
-                         contract-shaped invariant in your handoff instead.\n\n\
+                         7. test — run the project's LOCAL tests (the compiled model tests \
+                         and unit tests). That is the only suite you can run here. The \
+                         checks the product spec declares — its grain, its not-null columns, \
+                         its `checks` list — are lowered into the sidecar for you and need \
+                         the applied table to run against, so they are deferred until after \
+                         the apply and cannot pass or fail during drafting. They are \
+                         SPEC-OWNED, and so are the contract and the model metadata: do not \
+                         author any of them. Report an assertion you believe is missing in \
+                         your handoff instead.\n\n\
                          RECONCILE DISCIPLINE (the step that separates a model that compiles \
                          from a model that is correct): check literal values and units against \
                          the sampled data, not just the schema. A `WHERE status = 'completed'` \
                          that returns zero rows because the data actually holds 'COMPLETE' \
                          compiles perfectly and is wrong.\n\n\
-                         STOP when the draft compiles clean and its checks pass, and HAND OFF \
-                         to the trusted runner: report the drafted files, the invariants you \
-                         encoded, and anything you flagged. Do not record plans, approve \
-                         changes, or apply anything on your own — those verbs belong to the \
-                         trusted runner and are not served in this profile."
+                         STOP when the draft compiles clean and the local tests pass, and \
+                         HAND OFF to the trusted runner: report the drafted files, what you \
+                         verified in the data, and anything you flagged. Do not record plans, \
+                         approve changes, or apply anything on your own — those verbs belong \
+                         to the trusted runner and are not served in this profile."
                     ),
                 ),
             ];
@@ -3873,14 +3877,14 @@ impl RockyMcpServer {
             let messages = vec![
                 PromptMessage::new_text(
                     Role::Assistant,
-                    "I'll find the models that carry no declarative tests, author tests \
-                     grounded in their real data, and end with the drafted checks handed off \
-                     to the trusted runner. I draft; the runner reviews and applies.",
+                    "I'll find the models that carry no declarative tests and say exactly \
+                     what each one needs, grounded in its real data. Checks are spec-owned \
+                     here, so I report; I do not write them.",
                 ),
                 PromptMessage::new_text(
                     Role::User,
-                    "Find the untested models in this Rocky project and draft tests for them, \
-                     using the MCP tools at each step:\n\n\
+                    "Find the untested models in this Rocky project and REPORT what each one \
+                     needs, using the MCP tools at each step:\n\n\
                      1. catalog — enumerate every model with its declared tests, checks, and \
                      contract. Treat a model with no checks, no contract, and no test files as \
                      untested. Prioritise leaf/marts models and anything carrying a primary key \
@@ -3890,23 +3894,23 @@ impl RockyMcpServer {
                      learn its null rate, distinct count, and domain. The schema says a column \
                      exists; only the data tells you whether it is unique, non-null, or \
                      bounded.\n\
-                     3. Author the checks YOURSELF from what you observed — grain uniqueness, \
-                     not-null, value ranges, referential integrity — and write them with \
-                     draft_check: it appends the `[[tests]]` blocks to the model and compiles \
-                     in the same call. Contracts are SPEC-OWNED in this profile — when an \
-                     invariant is contract-shaped (required/protected columns), note it in \
-                     your handoff instead of authoring it.\n\
-                     4. Run the new checks via the `test` tool. Fix against any diagnostic and \
-                     re-run until clean.\n\n\
-                     RECONCILE DISCIPLINE: a test that asserts the wrong invariant passes and \
-                     is still wrong. Confirm the grain, the not-null columns, and the value \
-                     domain against the sampled data before you encode them — do not assume \
-                     `id` is unique or `status` is non-null without checking.\n\n\
-                     STOP when the checks pass, and HAND OFF to the trusted runner: report \
-                     which models you covered, the invariants you encoded, and anything you \
-                     flagged as contract-shaped. Do not record plans, approve changes, or \
-                     apply anything on your own — those verbs belong to the trusted runner and \
-                     are not served in this profile.",
+                     3. Write down, per model, the assertion the data supports — grain \
+                     uniqueness, not-null, value ranges, referential integrity — and the \
+                     numbers you saw. Do NOT write any of it into the project. Checks, \
+                     contracts, and model metadata are all SPEC-OWNED in this profile: they \
+                     come from the product spec, and an assertion nobody approved would run \
+                     unattended against the warehouse after every apply.\n\
+                     4. Use the `test` tool to run the project's LOCAL tests, so your report \
+                     says whether the project is green as it stands today.\n\n\
+                     RECONCILE DISCIPLINE: an invariant you name that is wrong is worse than \
+                     none — someone will approve it. Confirm the grain, the not-null columns, \
+                     and the value domain against the sampled data before you name them; do \
+                     not assume `id` is unique or `status` is non-null without checking.\n\n\
+                     STOP when the report is complete, and HAND OFF to the trusted runner: \
+                     name the models you covered, the assertion each one needs with the \
+                     evidence behind it, and anything you flagged as contract-shaped. Do not \
+                     record plans, approve changes, or apply anything on your own — those \
+                     verbs belong to the trusted runner and are not served in this profile.",
                 ),
             ];
             return Ok(GetPromptResult::new(messages).with_description(
@@ -3987,16 +3991,17 @@ impl RockyMcpServer {
             let messages = vec![
                 PromptMessage::new_text(
                     Role::Assistant,
-                    "I'll identify the primary-key and unique columns, author uniqueness and \
-                     not-null tests grounded in the real data, and end with the drafted checks \
-                     handed off to the trusted runner. A declared key is a claim; the data is \
-                     what proves it.",
+                    "I'll identify the primary-key and unique columns and prove them against \
+                     the real data, then report the uniqueness and not-null assertions they \
+                     need. Checks are spec-owned here, so I report; I do not write them. A \
+                     declared key is a claim; the data is what proves it.",
                 ),
                 PromptMessage::new_text(
                     Role::User,
                     format!(
-                        "Add uniqueness + not-null tests to the key columns of {scope} in this \
-                         Rocky project, using the MCP tools at each step:\n\n\
+                        "Identify the key columns of {scope} in this Rocky project and REPORT \
+                         the uniqueness + not-null assertions they need, using the MCP tools \
+                         at each step:\n\n\
                          1. inspect_schema — read the typed columns. Identify the primary-key / \
                          unique / grain columns: an explicit key in the sidecar, an `id`-shaped \
                          column, or the columns that define the model's grain.\n\
@@ -4004,19 +4009,23 @@ impl RockyMcpServer {
                          actually unique (distinct count == row count) and non-null before you \
                          assert it. A column named `id` that has duplicates or nulls is not a \
                          key — find that out now, from the data.\n\
-                         3. Author a uniqueness check and a not-null check for each confirmed \
-                         key column yourself, then write them with draft_check — it merges the \
-                         `[[tests]]` blocks into the model and compiles in the same call, \
-                         policy-gated.\n\
-                         4. Run the new checks via the `test` tool. Loop until clean.\n\n\
-                         RECONCILE DISCIPLINE: only assert uniqueness/not-null on columns the \
-                         profile actually shows to be unique/non-null. Encoding a wrong key \
-                         invariant is worse than none — it green-lights a future run that \
-                         should have failed.\n\n\
-                         STOP when the checks pass, and HAND OFF to the trusted runner: report \
-                         the key columns you confirmed and the tests you encoded. Do not \
-                         record plans, approve changes, or apply anything on your own — those \
-                         verbs belong to the trusted runner and are not served in this profile."
+                         3. Write down the uniqueness and not-null assertion each confirmed \
+                         key column needs, with the distinct count, row count, and null count \
+                         you measured. Do NOT write any of it into the project: checks are \
+                         SPEC-OWNED in this profile, they come from the product spec, and an \
+                         assertion nobody approved would run unattended against the warehouse \
+                         after every apply.\n\
+                         4. Use the `test` tool to run the project's LOCAL tests, so your \
+                         report says whether the project is green as it stands today.\n\n\
+                         RECONCILE DISCIPLINE: only name uniqueness/not-null on columns the \
+                         profile actually shows to be unique/non-null. Proposing a wrong key \
+                         invariant is worse than none — someone will approve it, and it \
+                         green-lights a future run that should have failed.\n\n\
+                         STOP when the report is complete, and HAND OFF to the trusted \
+                         runner: report the key columns you confirmed, the evidence behind \
+                         each one, and the assertions they need. Do not record plans, approve \
+                         changes, or apply anything on your own — those verbs belong to the \
+                         trusted runner and are not served in this profile."
                     ),
                 ),
             ];
@@ -4084,7 +4093,8 @@ impl RockyMcpServer {
             PromptMessage::new_text(
                 Role::Assistant,
                 "I'll summarize this Rocky project from the catalog and lineage. This is a \
-                 read-only orientation — I will not edit, propose, or apply anything.",
+                 read-only orientation — I will not edit anything, record a plan, or apply \
+                 anything.",
             ),
             PromptMessage::new_text(
                 Role::User,
@@ -4101,7 +4111,7 @@ impl RockyMcpServer {
                  4. Call out gaps an owner would care about: untested leaf models, PII columns \
                  with no mask, models with no contract, or long undocumented dependency chains. \
                  Frame these as observations, not actions.\n\n\
-                 This is purely informational — do NOT write SQL, draft tests, propose a plan, or \
+                 This is purely informational — do NOT write SQL, draft tests, record a plan, or \
                  apply anything. If the user then wants to act on a gap, the find_untested_models \
                  or build_model trajectory is the next step.",
             ),
@@ -4648,15 +4658,30 @@ const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or 
 /// item 5c): the default reminder instructs `propose`, a tool this profile
 /// does not serve — the worker's loop ends at the typed hand-off to the
 /// trusted runner instead.
+///
+/// It also has to be exact about which suite the `test` tool runs, because
+/// the two are easy to conflate and only one is reachable here. The `test`
+/// tool runs `commands::test_output`, i.e. `rocky_engine::test_runner`'s
+/// compiled model tests plus the unit tests. It does NOT run the
+/// declarative check set — that is `rocky test --declarative`, a different
+/// path, and the product's declared checks live there. Those checks also
+/// need the applied table to exist, so the fulfillment loop reports them
+/// DEFERRED at verify and evaluates them only at post-apply observation
+/// (FF-WP-F3). Telling the worker to loop until they pass names an
+/// outcome that cannot occur during drafting, which is the same defect
+/// class as naming a tool the profile does not serve.
 const WORKER_DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
      the warehouse. Continue the drafting loop: fix any error diagnostics above and re-draft \
-     (or `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, and run \
-     the `test` tool until the checks the product already declares pass. Those checks are \
-     spec-owned here — do not add one of your own; if the data needs an invariant the spec does \
-     not state, say so in the SQL's comments. When the draft is clean and its checks pass, STOP \
-     and end at the typed hand-off to the trusted runner: report the drafted files, what you \
-     verified, and anything you flagged. Recording, review, and apply belong to the trusted \
-     runner — never act on them yourself.";
+     (or `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, and the \
+     `test` tool to run the project's LOCAL tests. Those local tests are the only suite you \
+     can run here. The checks the product spec declares — its grain, its not-null columns, its \
+     `checks` list — are lowered into the sidecar for you and need the applied table to run \
+     against, so they are deferred until after the apply and cannot pass or fail while you are \
+     drafting. They are spec-owned: do not add one of your own. If the data needs an invariant \
+     the spec does not state, say so in the SQL's comments. When the draft compiles clean and \
+     the local tests pass, STOP and end at the typed hand-off to the trusted runner: report the \
+     drafted files, what you verified, and anything you flagged. Recording, review, and apply \
+     belong to the trusted runner — never act on them yourself.";
 
 /// The authoring-loop reminder every successful `draft_contract` response
 /// carries. The contract is written and compile-validated, never applied.
