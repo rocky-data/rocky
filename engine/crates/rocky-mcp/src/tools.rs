@@ -597,7 +597,17 @@ const WORKER_TOOL_DESCRIPTIONS: &[(&str, &str, &str)] = &[
 /// is to REWORD, never to relax the rule, and the reason is the reader
 /// rather than the matcher: a worker that has just been told `propose` is
 /// not available cannot tell the two senses apart either.
+///
+/// A BLANK tool name yields NO forms. It cannot arrive over MCP — both
+/// routers are built from `#[tool]` attributes — but this is a `pub fn` on
+/// a library crate, so a caller can pass one. Deriving from `""` would
+/// otherwise hand the sweep `"ing"`, `"ed"`, `"es"`, `"s"` and `"al"` as
+/// live matchers, and `"s"` is an identifier in plenty of ordinary English.
+/// A name that names nothing must match nothing.
 pub fn excluded_mention_forms(tool: &str) -> Vec<String> {
+    if tool.trim().is_empty() {
+        return Vec::new();
+    }
     let stem = tool.strip_suffix('e').unwrap_or(tool);
     let mut forms = vec![tool.to_string()];
     forms.extend(
@@ -665,7 +675,23 @@ fn worker_instructions(excluded: &[String]) -> String {
 /// would mean this crate importing that one, backwards.) The two now agree
 /// on boundaries and still differ on inflections: refusing a valid
 /// operator config costs more than rewording a sentence Rocky owns.
+///
+/// An EMPTY needle returns `false`, and the guard is a panic fix rather
+/// than a taste call. `"".find("")` succeeds at every byte offset, so the
+/// scan advanced `from` past the end of `haystack` and the next
+/// `haystack[from..]` panicked with an out-of-range index — but only when
+/// the last byte was an identifier byte, which is why it read as a
+/// harmless edge case. `contains_identifier("abc ", "")` returned `true`;
+/// `contains_identifier("abc", "")` aborted the process.
+///
+/// It is not reachable over MCP (every excluded name comes from a router),
+/// but [`names_excluded_tool`] is public API and a caller can supply the
+/// empty string. An empty needle is not an identifier, so it matches
+/// nothing.
 fn contains_identifier(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
     let bytes = haystack.as_bytes();
     let is_ident = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
     let mut from = 0;
@@ -6433,6 +6459,52 @@ mod tests {
         assert!(
             contains_identifier("propose_only, then propose", "propose"),
             "the scan does not stop at the first embedded occurrence"
+        );
+    }
+
+    /// An EMPTY needle matches nothing and, more to the point, does not
+    /// abort the process (ninth review round).
+    ///
+    /// `"".find("")` succeeds at every offset, so the unguarded scan walked
+    /// `from` one past the end and indexed `haystack[from..]` out of range.
+    /// The shape matters: the run-off only happens when NO offset satisfies
+    /// the boundary test, which needs a haystack whose LAST byte is an
+    /// identifier byte. `"abc "` returned `true` at the space and never
+    /// reached the end; `"abc"` panicked. A probe on the first shape would
+    /// have reported the bug absent.
+    ///
+    /// Not reachable over MCP — both routers supply real tool names — but
+    /// [`names_excluded_tool`] is exported from the crate root, so a caller
+    /// can hand it one.
+    #[test]
+    fn an_empty_needle_matches_nothing_and_does_not_panic() {
+        // The shape that PANICKED: every byte fails the boundary test, so
+        // the scan ran off the end.
+        assert!(
+            !contains_identifier("abc", ""),
+            "an empty needle is not an identifier"
+        );
+        // The shape that did NOT panic, kept so a future narrowing cannot
+        // reintroduce the run-off by only fixing the loud case.
+        assert!(
+            !contains_identifier("abc ", ""),
+            "and it does not match at a non-identifier byte either"
+        );
+        assert!(!contains_identifier("", ""), "empty haystack, empty needle");
+
+        // One level up: a blank tool name derives NO forms. Without this,
+        // the stem-plus-suffix rule yields `ing`/`ed`/`es`/`s`/`al`, and
+        // `s` is an identifier in ordinary English — every swept surface
+        // would start failing on prose.
+        assert!(
+            excluded_mention_forms("").is_empty(),
+            "a blank tool name names nothing"
+        );
+        assert!(excluded_mention_forms("  ").is_empty(), "whitespace too");
+        assert_eq!(
+            names_excluded_tool("the s in this sentence", &["".to_string()]),
+            None,
+            "a blank excluded name matches no prose, and does not panic"
         );
     }
 
