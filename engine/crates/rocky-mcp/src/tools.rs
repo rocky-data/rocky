@@ -121,12 +121,18 @@ fn worker_instructions_banner(excluded: &[String]) -> String {
 /// What the worker may no longer do is reach any of those steps by a route
 /// this server does not serve.
 ///
-/// Both drift directions fail at CONSTRUCTION, exactly like
-/// [`WORKER_TOOL_DESCRIPTIONS`]: a needle that no longer matches panics
-/// rather than silently serving the default sentence to a worker, and a
-/// needle that matches more than once panics rather than rewriting a
+/// Both drift directions REFUSE at CONSTRUCTION, exactly like
+/// [`WORKER_TOOL_DESCRIPTIONS`]: a needle that no longer matches aborts
+/// startup rather than silently serving the default sentence to a worker,
+/// and a needle that matches more than once aborts rather than rewriting a
 /// passage nobody reviewed. An edit to the skill therefore forces a
 /// conscious re-projection instead of quietly re-opening this hole.
+///
+/// CONSTRUCTION, not compile time. The operands are compile-time constants,
+/// so nothing here depends on user input — but nothing verifies the match
+/// until a server is built. An edit to the skill compiles and then refuses
+/// at `rocky mcp --profile worker` startup. A TEST is what keeps the frozen
+/// constants lined up; see [`RockyMcpServer::try_new_with_profile`].
 const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // The frontmatter `description` — the first thing in the served text.
     (
@@ -684,14 +690,18 @@ const WORKER_GUIDANCE_SURFACES: usize = 9;
 /// description is a paragraph, and a duplicated paragraph is a paragraph
 /// that will drift. Only the steering sentence is stated here.
 ///
-/// Both drift directions fail at CONSTRUCTION, not at review:
+/// Both drift directions REFUSE at CONSTRUCTION, not at review:
 ///
 ///  - a tool that leaves [`WORKER_PROFILE_TOOLS`] (or is renamed) orphans
-///    its entry, and the lookup panics;
+///    its entry, and the lookup refuses;
 ///  - an edit to the steering sentence makes the needle miss, and the
-///    replacement panics rather than silently serving the default text to
+///    replacement refuses rather than silently serving the default text to
 ///    a worker — which is exactly how a checked `replace` differs from a
 ///    plain one.
+///
+/// Construction, not compile time — the same correction as
+/// [`WORKER_INSTRUCTIONS_REWRITES`]. Drift here compiles and then aborts
+/// `rocky mcp --profile worker` at startup.
 ///
 /// The direction neither guard covers is a NEW worker-served tool whose
 /// description names an excluded verb. That is what the sweep is for.
@@ -759,10 +769,7 @@ pub fn excluded_mention_forms(tool: &str) -> Vec<String> {
 /// The `instructions` a worker session is served: the derived banner, then
 /// the skill body with [`WORKER_INSTRUCTIONS_REWRITES`] applied.
 ///
-/// Panics at CONSTRUCTION if any needle does not match exactly once. Both
-/// halves matter and neither is reachable from user input — every operand
-/// is a compile-time constant, so the check is deterministic and a test
-/// catches it:
+/// REFUSES if any needle does not match exactly once. Both halves matter:
 ///
 ///  - ZERO matches means the skill was edited under the projection. A
 ///    silent no-op replace would serve the DEFAULT sentence to a worker,
@@ -770,20 +777,39 @@ pub fn excluded_mention_forms(tool: &str) -> Vec<String> {
 ///  - MORE THAN ONE match means `replace` would rewrite a second passage
 ///    nobody reviewed. A projection that edits text its author did not read
 ///    is not a projection.
-fn worker_instructions(excluded: &[String]) -> String {
+///
+/// WHEN THE CHECK RUNS, corrected. Every operand is a compile-time constant
+/// — [`INSTRUCTIONS`] is an `include_str!` of the skill file — but the
+/// match itself is never verified at compile time. It runs at server
+/// CONSTRUCTION, on the live `rocky mcp --profile worker` path. An edit to
+/// the skill compiles cleanly and then refuses at startup. The guarantee
+/// that the frozen constants still line up is a TEST, not a build
+/// invariant, and calling it one overstated it.
+///
+/// The refusal aborts startup; it never serves a partial projection. See
+/// [`RockyMcpServer::try_new_with_profile`] for why that is the fail-closed
+/// choice and not the softened one.
+///
+/// `rewrites` is a parameter rather than a direct read of
+/// [`WORKER_INSTRUCTIONS_REWRITES`] so a test can hand it a table that HAS
+/// drifted. Otherwise the refusal is unreachable in-process — the real
+/// table matches, which is the point — and "it refuses on drift" would be
+/// an untested claim about a path this round exists to correct claims on.
+fn worker_instructions(excluded: &[String], rewrites: &[(&str, &str)]) -> Result<String, String> {
     let mut body = INSTRUCTIONS.to_string();
-    for (needle, replacement) in WORKER_INSTRUCTIONS_REWRITES {
+    for (needle, replacement) in rewrites {
         let hits = body.matches(needle).count();
-        assert_eq!(
-            hits, 1,
-            "WORKER_INSTRUCTIONS_REWRITES needle matched {hits} times, not once — the \
-             rocky-ai-workflow skill changed under the worker projection. Re-project it \
-             deliberately; this fails at construction so a worker is never served the \
-             default sentence. Needle: {needle:?}"
-        );
+        if hits != 1 {
+            return Err(format!(
+                "WORKER_INSTRUCTIONS_REWRITES needle matched {hits} times, not once — the \
+                 rocky-ai-workflow skill changed under the worker projection. Re-project it \
+                 deliberately; this refuses at construction so a worker is never served the \
+                 default sentence. Needle: {needle:?}"
+            ));
+        }
         body = body.replace(needle, replacement);
     }
-    format!("{}{body}", worker_instructions_banner(excluded))
+    Ok(format!("{}{body}", worker_instructions_banner(excluded)))
 }
 
 /// Whether `needle` occurs in `haystack` at IDENTIFIER BOUNDARIES — neither
@@ -1306,6 +1332,46 @@ impl RockyMcpServer {
     /// descriptions are rewritten here to the
     /// [`WORKER_PROMPT_DESCRIPTIONS`] variants for the same reason.
     pub fn new_with_profile(config_path: PathBuf, profile: McpProfile) -> Self {
+        Self::try_new_with_profile(config_path, profile).unwrap_or_else(|drift| {
+            panic!(
+                "the {profile:?} profile's guidance projection no longer matches its source: \
+                 {drift}"
+            )
+        })
+    }
+
+    /// [`Self::new_with_profile`], refusing instead of panicking when the
+    /// worker projection has drifted from its source.
+    ///
+    /// WHY THIS EXISTS, stated precisely because the claim it corrects was
+    /// wrong. The three worker projections are CHECKED rewrites: a needle
+    /// that stops matching, or matches twice, or names a route that is no
+    /// longer served, must never be applied silently — a no-op replace
+    /// serves the DEFAULT sentence to a worker, which is the hole the whole
+    /// [`WORKER_INSTRUCTIONS_REWRITES`] table closes.
+    ///
+    /// The comments here used to call that a build invariant. It is not.
+    /// Every operand IS a compile-time constant — [`INSTRUCTIONS`] is an
+    /// `include_str!` of the skill file — but nothing verifies the match at
+    /// compile time. The check runs at server CONSTRUCTION, which
+    /// [`crate::serve_stdio`] reaches on the live `rocky mcp --profile
+    /// worker` path. An edit to the skill therefore COMPILES, and then
+    /// fails when the server starts. What actually guarantees the frozen
+    /// constants still line up is a TEST
+    /// (`worker_instructions_are_projected_and_default_stays_verbatim`),
+    /// which is a weaker guarantee than the word "invariant" implies. They
+    /// match today; nothing triggers this at runtime as things stand.
+    ///
+    /// Both failure modes ABORT STARTUP. That is deliberate and is not the
+    /// part being softened: a server that starts with degraded guidance is
+    /// strictly worse than one that does not start, because the degradation
+    /// is quiet and this defect class has been found nine times. What
+    /// changes is only the diagnostic — an operator gets a named refusal
+    /// instead of a Rust backtrace.
+    ///
+    /// [`Self::new_with_profile`] keeps panicking, and every test builds
+    /// through it, so the drift still fails loudly wherever it is checked.
+    pub fn try_new_with_profile(config_path: PathBuf, profile: McpProfile) -> Result<Self, String> {
         let root = config_path
             .parent()
             .map(Path::to_path_buf)
@@ -1343,44 +1409,42 @@ impl RockyMcpServer {
             // authorship, and the text below it told the worker to
             // strengthen assertions and append tests. Projected now, by the
             // same checked-rewrite mechanism as the descriptions above.
-            instructions = worker_instructions(&excluded);
+            instructions = worker_instructions(&excluded, WORKER_INSTRUCTIONS_REWRITES)?;
             // FF-WP1 fix round 2 (item 5b): the static prompt descriptions
             // instruct the default workflow (they name tools this profile
             // excludes) — swap in the worker descriptions. A rename that
-            // orphans an entry panics HERE, at construction, so every test
-            // that builds a worker server catches the drift.
+            // orphans an entry is refused HERE, at construction, so every
+            // test that builds a worker server catches the drift.
             for (name, description) in WORKER_PROMPT_DESCRIPTIONS {
-                prompt_router
-                    .map
-                    .get_mut(*name)
-                    .unwrap_or_else(|| {
-                        panic!("WORKER_PROMPT_DESCRIPTIONS names unrouted prompt '{name}'")
-                    })
-                    .attr
-                    .description = Some((*description).to_string());
+                let route = prompt_router.map.get_mut(*name).ok_or_else(|| {
+                    format!("WORKER_PROMPT_DESCRIPTIONS names unrouted prompt '{name}'")
+                })?;
+                route.attr.description = Some((*description).to_string());
             }
             // F3 red team (finding 3): the same problem one surface over.
             // `tools/list` descriptions are static too, and three of them
             // steered the worker at `propose`. Rewritten AFTER the removals
             // above, so the table can only name a tool this profile still
-            // serves — an entry for a removed tool orphans and panics here.
+            // serves — an entry for a removed tool orphans and is refused
+            // here.
             for (name, needle, replacement) in WORKER_TOOL_DESCRIPTIONS {
-                let route = tool_router.map.get_mut(*name).unwrap_or_else(|| {
-                    panic!("WORKER_TOOL_DESCRIPTIONS names unserved tool '{name}'")
-                });
-                let current = route.attr.description.as_deref().unwrap_or_else(|| {
-                    panic!("WORKER_TOOL_DESCRIPTIONS names undescribed tool '{name}'")
-                });
-                assert!(
-                    current.contains(needle),
-                    "WORKER_TOOL_DESCRIPTIONS rewrite for '{name}' no longer matches its \
-                     description — a silent no-op replace would serve the DEFAULT text to a \
-                     worker, so this fails at construction instead"
-                );
+                let route = tool_router.map.get_mut(*name).ok_or_else(|| {
+                    format!("WORKER_TOOL_DESCRIPTIONS names unserved tool '{name}'")
+                })?;
+                let current = route.attr.description.as_deref().ok_or_else(|| {
+                    format!("WORKER_TOOL_DESCRIPTIONS names undescribed tool '{name}'")
+                })?;
+                if !current.contains(needle) {
+                    return Err(format!(
+                        "WORKER_TOOL_DESCRIPTIONS rewrite for '{name}' no longer matches its \
+                         description — a silent no-op replace would serve the DEFAULT text \
+                         to a worker, so this refuses instead. Needle: {needle:?}"
+                    ));
+                }
                 route.attr.description = Some(current.replace(needle, replacement).into());
             }
         }
-        Self {
+        Ok(Self {
             config_path,
             models_dir,
             root,
@@ -1388,7 +1452,7 @@ impl RockyMcpServer {
             instructions,
             tool_router,
             prompt_router,
-        }
+        })
     }
 
     fn state_path(&self) -> PathBuf {
@@ -6672,6 +6736,59 @@ mod tests {
             contains_identifier("propose_only, then propose", "propose"),
             "the scan does not stop at the first embedded occurrence"
         );
+    }
+
+    /// The projection REFUSES on drift, in both directions, and every
+    /// profile builds cleanly today (ninth review round).
+    ///
+    /// This check is not a build invariant, and the comments that called it
+    /// one were wrong. Every operand is a compile-time constant, but
+    /// nothing verifies the match until a server is CONSTRUCTED — which
+    /// `serve_stdio` does on the live `rocky mcp --profile worker` path. An
+    /// edit to the skill compiles and then fails at startup. This test is
+    /// the guarantee that the frozen constants still line up, so it is
+    /// worth stating that a test is all it is.
+    ///
+    /// Driven through a deliberately-drifted table, because the real one
+    /// matches: without that, "it refuses on drift" would be an untested
+    /// claim on the exact path this round is correcting claims about.
+    #[test]
+    fn the_worker_projection_refuses_on_drift_rather_than_panicking() {
+        let excluded = worker_excluded_tool_mentions();
+
+        // ZERO matches — the skill was edited under the projection. The
+        // silent no-op replace this prevents would serve the DEFAULT
+        // sentence to a worker.
+        let gone = worker_instructions(
+            &excluded,
+            &[("a sentence the skill file does not contain", "…")],
+        )
+        .expect_err("a needle that matches nothing must refuse");
+        assert!(
+            gone.contains("matched 0 times"),
+            "the refusal says how many times it matched: {gone}"
+        );
+
+        // MORE THAN ONE match — `replace` would rewrite a passage nobody
+        // reviewed. `SQL` occurs many times in the skill body.
+        let many = worker_instructions(&excluded, &[("SQL", "…")])
+            .expect_err("a needle that matches more than once must refuse");
+        assert!(
+            !many.contains("matched 0 times") && many.contains("not once"),
+            "the refusal distinguishes the two directions: {many}"
+        );
+
+        // And the real tables build every profile, today. `try_*` is the
+        // live path; `new_with_profile` keeps panicking so tests still fail
+        // loudly, and both must agree that nothing has drifted.
+        for profile in [
+            McpProfile::Default,
+            McpProfile::Approver,
+            McpProfile::Worker,
+        ] {
+            RockyMcpServer::try_new_with_profile(PathBuf::from("rocky.toml"), profile)
+                .unwrap_or_else(|e| panic!("{profile:?} profile must build today: {e}"));
+        }
     }
 
     /// An EMPTY needle matches nothing and, more to the point, does not
