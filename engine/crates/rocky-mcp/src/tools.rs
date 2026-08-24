@@ -35,18 +35,193 @@ use crate::result_types::*;
 /// untouched.
 const INSTRUCTIONS: &str = include_str!("../../../../.claude/skills/rocky-ai-workflow/SKILL.md");
 
-/// Prepended to the served `instructions` under the worker profile (FF-WP1
-/// fix round 2, item 5a). The skill text below the banner is the FULL
-/// authoring workflow — including verbs this profile does not serve — so the
-/// banner re-frames it up front: name what is absent, and redirect every
-/// ending to the typed hand-off to the trusted runner.
-const WORKER_INSTRUCTIONS_BANNER: &str = "WORKER PROFILE ACTIVE: this server serves the minimal \
-drafting allowlist. The propose, review_queue, draft_contract, draft_check, draft_metadata, and \
-pause_schedule tools are NOT available in this session, and the workflow below is the full \
-authoring map, parts of which belong to the trusted runner. Where it reaches contract or \
-metadata authorship, or the propose -> review -> apply chain, STOP: end every workflow at the \
-typed hand-off to the trusted runner instead — report the drafted files, the invariants you \
-encoded, and anything you flagged. The runner records, reviews, and applies.\n\n";
+/// Prepended to the served `instructions` under the worker profile.
+///
+/// DERIVED from the excluded set, not written out. The old banner named six
+/// tools by hand while the profile excluded nineteen — the same hand-picked
+/// literal this round removed from the wire test one surface over. A tool
+/// that leaves [`WORKER_PROFILE_TOOLS`] now appears here automatically.
+///
+/// The banner is the ONE worker surface that names excluded tools on
+/// purpose: saying "`propose` is not available" is the opposite of steering
+/// at it. Everything below the banner is the projected skill body, which
+/// names none of them ([`WORKER_INSTRUCTIONS_REWRITES`]).
+///
+/// It leads with what is absent, then states the two things the projection
+/// cannot state as forcefully in flowing prose: checks / contracts /
+/// metadata are spec-owned by ANY route, and every workflow ends at the
+/// typed hand-off.
+fn worker_instructions_banner(excluded: &[String]) -> String {
+    let names = excluded.join(", ");
+    format!(
+        "WORKER PROFILE ACTIVE. This server serves the minimal drafting allowlist. These \
+         tools are NOT available in this session: {names}. The workflow below has been \
+         rewritten for this profile. CHECKS, CONTRACTS AND METADATA ARE SPEC-OWNED HERE: \
+         do not author one, and do not append one to a sidecar by any other route either. \
+         Report what you would assert — name the column, the invariant, and the evidence \
+         — and let the trusted runner encode it. Where the workflow reaches recording a \
+         plan, reviewing it, approving it, or applying it, STOP. End every workflow at \
+         the typed hand-off to the trusted runner: report the drafted files, what you \
+         verified, and anything you flagged. The runner records, reviews, and applies.\n\n"
+    )
+}
+
+/// The worker-profile projection of the served [`INSTRUCTIONS`], as
+/// `(sentence to replace, replacement)`.
+///
+/// WHY THIS EXISTS. The instructions were the one surface left EXEMPT from
+/// the excluded-name sweep, on the argument that a disclaiming banner over
+/// verbatim text is honest. The F3 red team round 2 rejected that, and was
+/// right: the banner stopped the worker at contract authorship, metadata
+/// authorship, and the record/review/apply chain — but NOT at CHECK
+/// authorship, while the text below it actively told the worker to
+/// strengthen assertions, append tests through the draft tools, and encode
+/// invariants as checks. So the largest guidance surface instructed exactly
+/// the thing removing `draft_check` from the allowlist exists to stop, and a
+/// worker-written check is raw SQL the fulfillment loop later runs with
+/// warehouse credentials.
+///
+/// Two facts make it worse than a stale sentence. `rocky mcp --profile
+/// worker` is directly invocable, and the driver's task brief is
+/// out-of-band and optional — so the served instructions are the ONLY
+/// guidance surface GUARANTEED to reach a worker session. And "honest, not
+/// safe" is not a status this list should ever carry: every other row is
+/// held to what the text SAYS, not to whether a disclaimer precedes it.
+///
+/// A PROJECTION, NOT A FORK. The canonical `.claude/skills/rocky-ai-workflow`
+/// file is untouched — it is correct guidance for the default profile, where
+/// the record/review/apply chain is the real workflow, and it is mirrored
+/// byte-identically into `.agents/skills/` under a CI drift gate. What
+/// changes is what the WORKER is served. Ten sentences are rewritten out of
+/// a 74-line document; the authoring loop itself — inspect, sample, write,
+/// compile-loop, preview, read the JSON, the anti-patterns — is served
+/// unchanged, because that part is the same job in both profiles.
+///
+/// Both drift directions fail at CONSTRUCTION, exactly like
+/// [`WORKER_TOOL_DESCRIPTIONS`]: a needle that no longer matches panics
+/// rather than silently serving the default sentence to a worker, and a
+/// needle that matches more than once panics rather than rewriting a
+/// passage nobody reviewed. An edit to the skill therefore forces a
+/// conscious re-projection instead of quietly re-opening this hole.
+const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
+    // The frontmatter `description` — the first thing in the served text.
+    (
+        "compile-loop → plan → propose → review → apply workflow",
+        "compile-loop → plan → hand-off workflow",
+    ),
+    // The thesis sentence.
+    (
+        "The shape of the job: **you propose, Rocky's compiler verifies, an approval marker \
+         gates the apply.**",
+        "The shape of the job: **you draft, Rocky's compiler verifies, and the trusted runner \
+         takes it from there.**",
+    ),
+    // Step 6 — the first of the three check-authorship steers.
+    (
+        "Add or strengthen assertions that encode what you learned from sampling — they become \
+         the contract that protects the model from future drift.",
+        "Do NOT add or strengthen assertions here — checks are spec-owned in this session, and \
+         the spec's grain and `checks` already lower into the sidecar for you. Report the \
+         assertions your sampling justifies instead: the column, the invariant, and the \
+         evidence.",
+    ),
+    (
+        "## Shipping safely: propose → review → apply",
+        "## Shipping safely: draft → verify → hand off",
+    ),
+    // The numbered chain. Replaced whole: every step of it is the runner's.
+    (
+        "1. **Propose.** Generate the plan that materializes your change (it is recorded as an \
+         *AI-authored* plan with a `plan_id`). A propose can also bind the plan to a product \
+         identity — `product_id` plus `spec_digest`, both together or neither. A product-bound \
+         plan refuses a bare `rocky apply`; the applier must pass `rocky apply <plan-id> \
+         --expect-spec-digest <digest>` with the digest of the approved spec. When you do not \
+         work for a product runner, omit both fields.",
+        "1. **Hand off.** Report the drafted files, the compile result, the SQL you previewed, \
+         and every invariant you would have encoded. That report is your last step.",
+    ),
+    (
+        "2. **Review.** Run `rocky review <plan-id>`. This compiles your working tree against \
+         the base ref and runs the semantic breaking-change classifier, then reports the delta \
+         — added/removed/retyped columns, anything downstream consumers depend on. Read it.",
+        "2. **The runner takes it from there.** Recording the plan, running the breaking-change \
+         classifier over it, obtaining the human approval marker, and executing the change all \
+         happen outside this session.",
+    ),
+    (
+        "3. **Approve.** `rocky review <plan-id> --approve` writes the approval marker. \
+         Approving over breaking changes is allowed. The marker is written even when the \
+         classifier could not run: if either tree fails to compile, findings are absent and \
+         `breaking_change_count` falls back to 0. So a marker is not evidence a delta was \
+         computed — raise the findings explicitly.\n4. **Apply.** Only after the approval marker \
+         exists does `rocky apply <plan-id>` execute.",
+        "3. **Nothing you can do stands in for that.** A clean compile is not approval, and no \
+         report you write is a sign-off. If you believe a change is urgent, say so in the \
+         report.",
+    ),
+    (
+        "Your job ends at *propose* and at *surfacing the review report clearly*. The approval \
+         is a human decision; do not approve on the user's behalf unless they explicitly tell \
+         you to.",
+        "Your job ends at the typed hand-off, and at surfacing what you found clearly. The \
+         approval is a human decision made outside this session.",
+    ),
+    // The second check-authorship steer — and the most direct one.
+    (
+        "Hand-editing them is detected as tampering. Your surface is the SQL, plus tests you \
+         append through the draft tools.",
+        "Hand-editing them is detected as tampering. Your surface is the SQL, and only the SQL. \
+         Checks are spec-owned the same way: the spec's declared grain and `checks` lower into \
+         the sidecar's `[[tests]]`, so there is nothing for you to append, by this server or by \
+         any file you can write. An invariant the spec does not state belongs in your report.",
+    ),
+    (
+        "- A product-bound propose carries `product_id` + `spec_digest` of the **approved** \
+         revision, and the apply requires `--expect-spec-digest`. If the spec moves after your \
+         draft, the generation is superseded — expect a refusal, not a merge of generations.",
+        "- The runner binds its plan to the `spec_digest` of the **approved** revision. If the \
+         spec moves after your draft, the generation is superseded — expect a refusal, not a \
+         merge of generations.",
+    ),
+    // The third check-authorship steer.
+    (
+        "encode it as a **contract** (`required`/`protected` columns) or a **check** \
+         (assertion), not just as a `WHERE` clause. That moves the invariant into the typed \
+         substrate, so the human reviews *the invariant* and the compiler enforces it on every \
+         future run.",
+        "REPORT it — the column, the invariant, and the evidence — instead of burying it in a \
+         `WHERE` clause. Contracts and checks are spec-owned in this session, so the runner is \
+         who moves the invariant into the typed substrate, where the human reviews *the \
+         invariant* and the compiler enforces it on every future run.",
+    ),
+    // The metadata section. Replaced WHOLE — the paragraph is a how-to for
+    // a tool this profile does not serve, so trimming its first sentence
+    // would leave the rest dangling off a tool that is no longer named.
+    (
+        "## Metadata is a governed write too\n\nFreshness expectations and column \
+         classifications live in the model's sidecar (`models/<model>.toml`). To author them as \
+         an agent, use the `draft_metadata` MCP tool — never string-append to the sidecar. It \
+         takes a structured patch: a `freshness` block (`expected_lag_seconds`, optional \
+         `time_column` and `severity`), a `classifications` map (column → tag, e.g. `email = \
+         \"pii\"`), or both. The tool parses the sidecar as TOML and merges the patch \
+         (`freshness` replaces the whole table; `classifications` merges per column), compiles \
+         with the write, and checks your policy rules against the model **as patched** — a \
+         patch that adds the first `pii` tag is judged by that tag. A denied patch restores the \
+         prior sidecar exactly. A sidecar the tool cannot parse is never overwritten. Note the \
+         trade: comments in the sidecar are dropped when it is re-serialized.",
+        "## Metadata is spec-owned here\n\nFreshness expectations and column classifications \
+         live in the model's sidecar (`models/<model>.toml`). They are lowered from the product \
+         spec, so they are not yours to write in this session — not through this server, and \
+         not by editing the file. If a column looks like it carries personal data, or a table \
+         looks staler than the spec assumes, put that in your report and name the column. The \
+         runner owns the write.",
+    ),
+    (
+        "- Applying without review, or approving your own AI-authored plan.",
+        "- Doing anything past the hand-off: recording, reviewing, approving, or applying.\n- \
+         Writing a check, a contract, or a metadata block. Report the invariant instead.",
+    ),
+];
 
 /// Worker-profile `prompts/list` descriptions (FF-WP1 fix round 2, item 5b):
 /// the static `#[prompt(description = ...)]` strings instruct the DEFAULT
@@ -106,6 +281,14 @@ pub struct RockyMcpServer {
     /// prompts: the worker profile serves variants that end at the handoff to
     /// the trusted runner instead of instructing tools the profile excludes.
     profile: McpProfile,
+    /// The `instructions` this profile serves, resolved at construction.
+    ///
+    /// Built here rather than in [`RockyMcpServer::get_info`] because the
+    /// worker projection is a CHECKED rewrite that panics on drift, and it
+    /// belongs at the same point as the prompt- and tool-description
+    /// rewrites: one place where every profile's guidance is decided, and
+    /// `get_info` stays a plain read.
+    instructions: String,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -231,7 +414,8 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 ///
 /// ```text
 ///   #  surface                                    status
-///   1  initialize   -> instructions                EXEMPT by design — see below
+///   1  initialize   -> instructions                swept: worker_instructions_are_
+///                                                   projected_and_default_stays_verbatim
 ///   2  prompts/list -> description                 swept: worker_prompt_descriptions_
 ///                                                   name_no_excluded_tool
 ///   3  prompts/get  -> message bodies              swept: worker_profile_prompts_end_
@@ -249,22 +433,33 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 ///   9  tools/call   -> err: remediation_hint       OPEN — not swept
 /// ```
 ///
-/// NINE SURFACES: FIVE SWEPT, ONE PARTIAL, ONE NOT SERVED, ONE EXEMPT BY
-/// DESIGN, ONE OPEN. Not "all swept" — that sentence has now been believed
-/// five times about a set that was incomplete, which is the whole reason
-/// for the count.
+/// NINE SURFACES: SIX SWEPT, ONE PARTIAL, ONE NOT SERVED, ONE OPEN. Not
+/// "all swept" — that sentence has now been believed five times about a set
+/// that was incomplete, which is the whole reason for the count.
 ///
-/// (1) IS EXEMPT, NOT SWEPT, and the distinction is not a formality. The
-/// instructions are the compiled authoring skill served VERBATIM to both
-/// profiles, and that skill names `propose` throughout — deliberately, so
-/// the guidance never forks from the canonical file. What the worker gets
-/// instead is [`WORKER_INSTRUCTIONS_BANNER`] prepended, naming those tools
-/// as NOT available. So the excluded-name sweep every other row runs would
-/// fail here by construction, and `instructions_carry_the_worker_banner_
-/// and_stay_verbatim_by_default` pins something different: the banner is
-/// present, names the tools, and the text below it is byte-unchanged.
-/// Reading that row as "swept" would be the same over-claim this
-/// enumeration exists to stop.
+/// (1) WAS EXEMPT AND IS NOW SWEPT, and how it fell is worth keeping. The
+/// argument for exempting it was that the instructions are the canonical
+/// authoring skill served VERBATIM under a disclaiming banner, so forking
+/// them would let the guidance drift from the canonical file. That made the
+/// row HONEST. It did not make it SAFE, and the F3 red team round 2 said so:
+/// the banner stopped the worker at contract authorship, metadata
+/// authorship and the record/review/apply chain, but NOT at CHECK
+/// authorship — while the skill below it told the worker to strengthen
+/// assertions, append tests through the draft tools, and encode invariants
+/// as checks. The largest guidance surface instructed exactly the thing
+/// removing `draft_check` exists to stop.
+///
+/// The fix keeps what the exemption was protecting. The canonical skill is
+/// untouched and still correct for the default profile; what forks is what
+/// the WORKER is served, through [`WORKER_INSTRUCTIONS_REWRITES`] — the
+/// same checked-rewrite mechanism as rows 2 and 4, where a needle that
+/// stops matching panics at construction instead of silently serving the
+/// default sentence.
+///
+/// The banner stays, and it is the ONE worker surface that names excluded
+/// tools on purpose — saying "`propose` is not available" is the opposite
+/// of steering at it. It is derived from the routers now, so it can no
+/// longer name six of nineteen.
 ///
 /// (6) IS NOT SERVED, and is listed precisely because it nearly was. rmcp
 /// emits no `output_schema` for any tool here, so the result-type doc
@@ -311,16 +506,24 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// that, so enabling one fails a test and forces a revisit of this comment
 /// instead of silently opening surface 10.
 ///
-/// SCOPE: this counts the MCP SESSION. A worker also receives the driver's
-/// TASK BRIEF, which is out-of-band — written to the task outbox, not
-/// served over this protocol — and has its own gate in
+/// SCOPE: this counts the MCP SESSION. A worker MAY also receive the
+/// driver's TASK BRIEF, which is out-of-band — written to the task outbox,
+/// not served over this protocol — and has its own gate in
 /// `rocky_fulfill::briefs`: an override naming an excluded tool is
-/// REFUSED, not swept. That gate matches at identifier boundaries, so it
-/// deliberately admits `applying` and the config literal `propose_only`,
-/// which the rule here would flag. The two rules differ because the jobs
-/// differ: a false positive here costs a reword, a false positive there
-/// rejects a legitimate operator config. The shipped default brief texts
-/// carry no inflection of an excluded name.
+/// REFUSED, not swept.
+///
+/// "MAY" is load-bearing, and it is why row 1 could not stay exempt. The
+/// worker profile is directly invocable as `rocky mcp --profile worker`,
+/// and no brief is guaranteed to accompany it. So the served instructions
+/// are the ONLY guidance surface a worker session is certain to read, and
+/// "the brief also says not to" was never a defense available to this list.
+///
+/// The two rules now agree on identifier boundaries and differ on ONE axis:
+/// the brief gate matches EXACT names, this one derives inflections. The
+/// jobs differ, and so does the cost of a false positive — here it costs a
+/// reword of text Rocky owns, there it rejects a legitimate operator
+/// config. The shipped default brief texts carry no inflection of an
+/// excluded name.
 ///
 /// Surface 7 has one worker-served producer: `draft_model`. `draft_check`
 /// also carries `next_steps`, but it left [`WORKER_PROFILE_TOOLS`], so a
@@ -404,6 +607,36 @@ pub fn excluded_mention_forms(tool: &str) -> Vec<String> {
             .filter(|form| form != tool),
     );
     forms
+}
+
+/// The `instructions` a worker session is served: the derived banner, then
+/// the skill body with [`WORKER_INSTRUCTIONS_REWRITES`] applied.
+///
+/// Panics at CONSTRUCTION if any needle does not match exactly once. Both
+/// halves matter and neither is reachable from user input — every operand
+/// is a compile-time constant, so the check is deterministic and a test
+/// catches it:
+///
+///  - ZERO matches means the skill was edited under the projection. A
+///    silent no-op replace would serve the DEFAULT sentence to a worker,
+///    which is the hole this whole table closes.
+///  - MORE THAN ONE match means `replace` would rewrite a second passage
+///    nobody reviewed. A projection that edits text its author did not read
+///    is not a projection.
+fn worker_instructions(excluded: &[String]) -> String {
+    let mut body = INSTRUCTIONS.to_string();
+    for (needle, replacement) in WORKER_INSTRUCTIONS_REWRITES {
+        let hits = body.matches(needle).count();
+        assert_eq!(
+            hits, 1,
+            "WORKER_INSTRUCTIONS_REWRITES needle matched {hits} times, not once — the \
+             rocky-ai-workflow skill changed under the worker projection. Re-project it \
+             deliberately; this fails at construction so a worker is never served the \
+             default sentence. Needle: {needle:?}"
+        );
+        body = body.replace(needle, replacement);
+    }
+    format!("{}{body}", worker_instructions_banner(excluded))
 }
 
 /// Whether `needle` occurs in `haystack` at IDENTIFIER BOUNDARIES — neither
@@ -917,17 +1150,37 @@ impl RockyMcpServer {
         let models_dir = root.join("models");
         let mut tool_router = Self::tool_router();
         let mut prompt_router = Self::prompt_router();
+        let mut instructions = INSTRUCTIONS.to_string();
         if profile == McpProfile::Worker {
-            let all: Vec<String> = tool_router
+            let mut all: Vec<String> = tool_router
                 .list_all()
                 .into_iter()
                 .map(|t| t.name.to_string())
+                .collect();
+            all.sort();
+            // DERIVED here, from the full router, before anything is
+            // removed — this is the only point where both surfaces exist at
+            // once. The banner reads it, so a tool that leaves the
+            // allowlist is named as unavailable without anyone editing a
+            // literal.
+            let excluded: Vec<String> = all
+                .iter()
+                .filter(|name| !WORKER_PROFILE_TOOLS.contains(&name.as_str()))
+                .cloned()
                 .collect();
             for name in all {
                 if !WORKER_PROFILE_TOOLS.contains(&name.as_str()) {
                     tool_router.remove_route(&name);
                 }
             }
+            // F3 red team round 2 (finding 1): the served `instructions`
+            // were EXEMPT from the sweep on the argument that a disclaiming
+            // banner over verbatim text is honest. It was honest and not
+            // safe — the banner never stopped the worker at CHECK
+            // authorship, and the text below it told the worker to
+            // strengthen assertions and append tests. Projected now, by the
+            // same checked-rewrite mechanism as the descriptions above.
+            instructions = worker_instructions(&excluded);
             // FF-WP1 fix round 2 (item 5b): the static prompt descriptions
             // instruct the default workflow (they name tools this profile
             // excludes) — swap in the worker descriptions. A rename that
@@ -969,6 +1222,7 @@ impl RockyMcpServer {
             models_dir,
             root,
             profile,
+            instructions,
             tool_router,
             prompt_router,
         }
@@ -4526,10 +4780,10 @@ impl ServerHandler for RockyMcpServer {
         // announcing "you may approve here" to the agent would push the wrong
         // way (#1517). The capability is discoverable where it is used — in
         // `review_queue`'s own description.
-        let instructions = match self.profile {
-            McpProfile::Default | McpProfile::Approver => INSTRUCTIONS.to_string(),
-            McpProfile::Worker => format!("{WORKER_INSTRUCTIONS_BANNER}{INSTRUCTIONS}"),
-        };
+        // Resolved at construction (see the `instructions` field): the
+        // default and approver profiles carry the skill text byte-unchanged,
+        // the worker carries the derived banner + the projected body.
+        let instructions = self.instructions.clone();
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
@@ -5795,58 +6049,110 @@ mod tests {
         RockyMcpServer::new_with_profile(PathBuf::from("rocky.toml"), profile)
     }
 
-    /// Item 5a — served `instructions` per profile: the worker profile
-    /// prepends the banner (worker profile named, the five excluded tools
-    /// named as NOT available, the hand-off named as the ending) and serves
-    /// the skill text below it UNCHANGED; the default profile serves the
-    /// skill text verbatim, byte-identical to the compiled file.
+    /// Surface 1 — the served `instructions`, per profile.
+    ///
+    /// The default and approver profiles get the skill text byte-identical
+    /// to the compiled file. The worker gets a DERIVED banner plus a
+    /// PROJECTED body.
+    ///
+    /// This asserts the PROPERTY, not the presence of words, and the
+    /// distinction is the finding it replaces. The old version looped five
+    /// hardcoded names — omitting `draft_check`, the one tool whose removal
+    /// started this round — and its per-name assertion was
+    /// `contains(tool) && contains("not available")`, whose second conjunct
+    /// does not move with `tool`. It proved the phrase "not available"
+    /// appeared once, anywhere. Both halves are derived from the routers
+    /// now, so no name can be omitted and no conjunct is loop-invariant.
     #[test]
-    fn instructions_carry_the_worker_banner_and_stay_verbatim_by_default() {
-        let default_info = server_with(McpProfile::Default).get_info();
-        assert_eq!(
-            default_info.instructions.as_deref(),
-            Some(INSTRUCTIONS),
-            "default-profile instructions are the skill text, byte-unchanged"
-        );
+    fn worker_instructions_are_projected_and_default_stays_verbatim() {
+        for profile in [McpProfile::Default, McpProfile::Approver] {
+            assert_eq!(
+                server_with(profile).get_info().instructions.as_deref(),
+                Some(INSTRUCTIONS),
+                "{profile:?}-profile instructions are the skill text, byte-unchanged"
+            );
+        }
 
+        let excluded = worker_excluded_tool_mentions();
+        let banner = worker_instructions_banner(&excluded);
         let worker_info = server_with(McpProfile::Worker).get_info();
         let worker = worker_info
             .instructions
             .as_deref()
             .expect("worker profile serves instructions");
         assert!(
-            worker.starts_with(WORKER_INSTRUCTIONS_BANNER),
+            worker.starts_with(&banner),
             "worker instructions start with the banner"
         );
-        assert!(
-            worker.ends_with(INSTRUCTIONS),
-            "the skill text below the banner is byte-unchanged"
-        );
+        let body = &worker[banner.len()..];
+
+        // PROPERTY 1 — the projected body names NO excluded tool, in any
+        // inflection. This is the same assertion every other swept surface
+        // runs, and it is why the row moved from EXEMPT to swept. It fails
+        // on the unprojected skill, which names `propose` six times and
+        // `draft_metadata` once.
         assert_eq!(
-            worker.len(),
-            WORKER_INSTRUCTIONS_BANNER.len() + INSTRUCTIONS.len(),
-            "banner + skill text and nothing else"
+            names_excluded_tool(body, &excluded),
+            None,
+            "the projected instructions body must not name an excluded tool in any form"
         );
-        let banner_lower = WORKER_INSTRUCTIONS_BANNER.to_lowercase();
+        assert_ne!(
+            body, INSTRUCTIONS,
+            "the body must actually BE projected — an unchanged body means the rewrites \
+             silently no-opped"
+        );
+
+        // PROPERTY 2 — the body stops the worker at CHECK authorship, which
+        // is the specific hole. The old banner stopped it at contract and
+        // metadata authorship and at the record/review/apply chain, while
+        // the text below told it to strengthen assertions and append tests.
+        let body_lower = body.to_lowercase();
         assert!(
-            banner_lower.contains("worker profile"),
-            "the banner says which profile is active"
+            body_lower.contains("checks are spec-owned"),
+            "the projected body must say checks are spec-owned: {body}"
         );
-        for tool in [
-            "propose",
-            "review_queue",
-            "draft_contract",
-            "draft_metadata",
-            "pause_schedule",
-        ] {
+        assert!(
+            body_lower.contains("do not add or strengthen assertions"),
+            "the projected body must reverse the `strengthen assertions` steer: {body}"
+        );
+        assert!(
+            !body_lower.contains("tests you append"),
+            "the `tests you append through the draft tools` steer must be gone: {body}"
+        );
+        assert!(
+            body_lower.contains("hand-off") || body_lower.contains("hand off"),
+            "the projected body ends at the hand-off: {body}"
+        );
+
+        // PROPERTY 3 — the banner names EVERY excluded tool, derived. The
+        // banner is the one worker surface that names them deliberately:
+        // saying a tool is unavailable is the opposite of steering at it.
+        let banner_lower = banner.to_lowercase();
+        let (prohibition, _) = banner_lower
+            .split_once("not available in this session:")
+            .expect("the banner states the prohibition once, before the name list");
+        assert!(
+            prohibition.contains("worker profile"),
+            "the banner says which profile is active: {banner}"
+        );
+        assert!(
+            !excluded.is_empty(),
+            "the derived excluded set must be non-empty or this proves nothing"
+        );
+        for tool in &excluded {
             assert!(
-                banner_lower.contains(tool) && banner_lower.contains("not available"),
-                "the banner names `{tool}` as not available"
+                banner_lower.contains(&tool.to_lowercase()),
+                "the banner must name `{tool}` — derived from the routers, so a tool that \
+                 leaves the allowlist cannot be omitted by forgetting to list it: {banner}"
             );
         }
         assert!(
+            banner_lower.contains("spec-owned"),
+            "the banner names checks/contracts/metadata as spec-owned: {banner}"
+        );
+        assert!(
             banner_lower.contains("hand-off") && banner_lower.contains("trusted runner"),
-            "the banner redirects every ending to the trusted-runner hand-off"
+            "the banner redirects every ending to the trusted-runner hand-off: {banner}"
         );
     }
 
