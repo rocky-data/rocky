@@ -3030,13 +3030,38 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
         // said "draft tests" and `add_tests_to_pks` said "Add key tests"
         // while both bodies were report-only.
         //
-        // HAND-WRITTEN, and that is a real weakness — this file's own
-        // convention is to derive. Nothing exists to derive it FROM: the
-        // spec-owned nouns live in a banner format string, not a router.
-        // It is kept as an honest backstop for a class the derived name
-        // rule structurally cannot see, because neither promise names a
-        // tool. The general defence is finding 1's lesson — read what the
-        // text tells the worker to DO — not this list.
+        // HAND-WRITTEN, which is this file's own anti-pattern, so the
+        // alternative was TESTED rather than dismissed.
+        //
+        // The obvious derivation is from the WITHHELD CAPABILITIES, read
+        // off the excluded tool names the routers already give us:
+        // `draft_check` is the capability "draft a check", so generate
+        // "<verb> <noun>" from every `<verb>_<noun>` excluded name. Run
+        // against the two strings that actually shipped, that derivation
+        // produces `draft check` / `draft checks` / `draft a check` and
+        // MATCHES NEITHER.
+        //
+        // Two gaps, and both are instructive:
+        //
+        //  - A SYNONYM gap. `draft_check` writes a `[[tests]]` block. The
+        //    tool noun is "check" and the artifact noun is "tests", so a
+        //    rule derived from the NAME cannot reach the word the text
+        //    actually used.
+        //  - A VERB gap. "Add key tests" uses "add", which appears in no
+        //    tool name at all.
+        //
+        // So the derivation would have looked like coverage while catching
+        // nothing that happened. A named boundary beats that. The list
+        // stays hand-written, and the honest statement is that it is a
+        // backstop, not a rule: the general defence is finding 1's lesson
+        // — read what the served text tells the worker to DO.
+        //
+        // The wider point, and the reason this is written out. Every
+        // derived rule in this crate is LEXICAL. Lexical derivation closes
+        // the NAME axis completely and the MEANING axis not at all. Both
+        // of this round's findings were meaning-axis: an instruction that
+        // named no tool, and a promise that named no tool. Neither could
+        // have been found by any rule here, and both were found by reading.
         for promise in [
             "draft tests",
             "draft the tests",

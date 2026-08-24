@@ -6481,10 +6481,16 @@ mod tests {
             // carries (ninth round, finding 2). These two surfaces are one
             // field apart and say nearly the same thing; guarding only the
             // one that was caught is how the next round finds the sibling.
-            // Kept in sync deliberately — see the sweep in
-            // `worker_profile_prompts_end_at_the_runner_handoff`, which
-            // documents why the list is hand-written and what its weakness
-            // is.
+            //
+            // Hand-written, and deliberately so: deriving the promises from
+            // the withheld capabilities (`draft_check` ⇒ "draft a check")
+            // was tried against the two strings that shipped and matched
+            // NEITHER — `draft_check` writes a `[[tests]]` block, so the
+            // tool noun and the artifact noun are different words, and
+            // "Add key tests" uses a verb no tool name carries. The full
+            // reasoning is on the sibling sweep in
+            // `worker_profile_prompts_end_at_the_runner_handoff`; keep the
+            // two lists identical.
             let description_lower = description.to_lowercase();
             for promise in [
                 "draft tests",
