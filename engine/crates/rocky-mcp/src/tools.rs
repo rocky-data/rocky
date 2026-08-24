@@ -110,12 +110,32 @@ fn worker_instructions_banner(excluded: &[String]) -> String {
 /// identifier rule was fixed NOT to match — a name-based sweep could never
 /// have reached it.
 ///
+/// WHAT THE TENTH ROUND ADDED — the CONTRADICTION, which is a different
+/// failure from a stale steer. The ninth round's umbrella rewrite forbids
+/// shell routes CATEGORICALLY ("a shell, a file you write yourself, a
+/// direct warehouse connection — is out of bounds, even where nothing stops
+/// you"), and four `rocky <verb>` imperatives were then deliberately KEPT,
+/// on the argument that they name actions this profile serves and only the
+/// ROUTE differs. That discriminator is true and it does not survive its
+/// own banner: served text that forbids a route and then instructs it four
+/// times is not followable, whichever half is right.
+///
+/// It is closed by REWRITING them to the served action rather than by
+/// narrowing the banner, and the reason is the reader again. A banner that
+/// forbade shell routes only to WITHHELD actions would make the worker
+/// classify each route at read time, and nothing served to it supports that
+/// classification: the banner lists withheld TOOLS, not withheld CLI verbs,
+/// and the mapping between the two is not served at all. Rewriting needs no
+/// judgement from the reader. The projected body now carries NO `rocky
+/// <verb>` invocation, which is what makes the banner true rather than
+/// nearly true, and a derived scan asserts it.
+///
 /// A PROJECTION, NOT A FORK. The canonical `.claude/skills/rocky-ai-workflow`
 /// file is untouched — it is correct guidance for the default profile, where
 /// the record/review/apply chain is the real workflow, and it is mirrored
 /// byte-identically into `.agents/skills/` under a CI drift gate. What
-/// changes is what the WORKER is served. Eighteen passages are rewritten out
-/// of a 74-line document; the authoring loop itself — inspect, sample,
+/// changes is what the WORKER is served. Twenty-seven passages are rewritten
+/// out of a 74-line document; the authoring loop itself — inspect, sample,
 /// write, compile-loop, preview, read the JSON, the anti-patterns — is
 /// served unchanged, because that part is the same job in both profiles.
 /// What the worker may no longer do is reach any of those steps by a route
@@ -150,6 +170,15 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
          shell, a file you write yourself, a direct warehouse connection — is out of bounds, \
          even where nothing stops you.",
     ),
+    // TENTH ROUND, finding 1D — the CLI pointer the umbrella rewrite above
+    // left standing. That rewrite now says a shell is out of bounds; the
+    // very next clause sent the worker off to read the full CLI command
+    // surface.
+    (
+        "For the config format see the `rocky-config` skill; for the full command surface \
+         see the `rocky` skill.",
+        "For the config format see the `rocky-config` skill.",
+    ),
     // The thesis sentence.
     (
         "The shape of the job: **you propose, Rocky's compiler verifies, an approval marker \
@@ -171,6 +200,37 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
          by editing files yourself. It writes `models/<name>.sql` for you, and creates only a \
          minimal `name` + `intent` sidecar — it never invents a strategy or a target, because \
          routing is spec-owned here.",
+    ),
+    // TENTH ROUND, finding 1D — the four surviving CLI imperatives, and
+    // the reason they are REWRITTEN rather than excused.
+    //
+    // The previous round kept them on the argument that `rocky compile`,
+    // `rocky plan` and `rocky test` name actions this profile SERVES, so
+    // only the ROUTE differed. That discriminator is real, and it is not
+    // available here: the umbrella rewrite four entries up forbids shell
+    // routes CATEGORICALLY — "a shell, a file you write yourself, a direct
+    // warehouse connection — is out of bounds, even where nothing stops
+    // you". Text that forbids a route and then instructs it four times is
+    // not a projection a worker can follow, whichever half is right.
+    //
+    // Of the two ways to close it, this is the one that REMOVES the
+    // contradiction. Narrowing the banner to forbid shell routes only to
+    // WITHHELD actions relocates it: the worker would have to classify
+    // each route at read time, and the served text gives it nothing to
+    // classify against — the banner names withheld TOOLS, not withheld
+    // CLI verbs, and the mapping between them is not served at all.
+    // Rewriting to the served action needs no such judgement, and it is
+    // the rule every other entry in this table already follows.
+    //
+    // The projected body now contains NO `rocky <verb>` invocation at all,
+    // which is what makes the banner true rather than nearly true. That is
+    // asserted as a derived scan, not as a per-string check — see
+    // `worker_instructions_are_projected_and_default_stays_verbatim`.
+    (
+        "Run `rocky compile --output json`. The result gives you every existing model and \
+         source table with its typed columns.",
+        "Call the `inspect_schema` tool. It returns every existing model and source table \
+         with its typed columns.",
     ),
     // The sampling route. The named alternatives are a direct database
     // connection and a raw SQL shell, which is the capability the whole
@@ -195,6 +255,35 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
          strategy or a target. Both are spec-owned here, and `draft_model` resolves them from \
          the project's conventions. Keep the SQL minimal and readable.",
     ),
+    // TENTH ROUND, finding 1D — imperatives two and three.
+    (
+        "Run `rocky compile --output json` and read `diagnostics`",
+        "Call the `compile` tool and read its `diagnostics`",
+    ),
+    (
+        "Run `rocky plan` to see exactly what would execute.",
+        "Call the `plan_preview` tool to see exactly what would execute.",
+    ),
+    // TENTH ROUND, findings 1B and 1D together — the fourth imperative,
+    // whose replacement also has to be exact about WHICH suite it runs.
+    // `rocky test` and the `test` tool are the same code path
+    // (`commands::test_output` → `rocky_engine::test_runner`), and neither
+    // "exercises assertions (uniqueness, not-null, accepted values,
+    // ranges)": `run_tests` compiles the project and materializes every
+    // model against an in-memory DuckDB, and `run_unit_tests` runs the
+    // fixture-driven `[[test]]` blocks. The declarative check set is
+    // `rocky test --declarative`, a different runner, and its checks need
+    // an applied table besides. Rewriting the route while carrying the
+    // wrong claim forward would ship a fresh false promise on the surface
+    // this table exists to remove them from.
+    (
+        "**Test.** Run `rocky test` to exercise assertions (uniqueness, not-null, accepted \
+         values, ranges).",
+        "**Test.** Call the `test` tool. It compiles the project, materializes every model \
+         against a local DuckDB, and runs the fixture-driven `[[test]]` blocks. That local \
+         suite is the only one you can run here — the checks the product spec declares are \
+         evaluated by the trusted runner after an apply.",
+    ),
     // Step 6 — the first of the three check-authorship steers.
     (
         "Add or strengthen assertions that encode what you learned from sampling — they become \
@@ -207,6 +296,26 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     (
         "## Shipping safely: propose → review → apply",
         "## Shipping safely: draft → verify → hand off",
+    ),
+    // TENTH ROUND, finding 1D — the section's opening paragraph, which
+    // survived every previous pass because it names no excluded tool and
+    // reads as a PROHIBITION. It still carries a `rocky <verb>` route, and
+    // its last clause ("treat the review as yours to surface") casts the
+    // worker as the one who surfaces the review — a role the three
+    // rewrites below take away from it.
+    (
+        "**Never apply an AI-authored change directly.** A bare `rocky apply` of an \
+         AI-authored plan is refused by design — an agent can confidently write a model \
+         that drops a column or rewrites a result, so the apply waits on a review step. The \
+         engine checks that an approval marker parses and names that exact plan. It does \
+         not check who wrote the marker, so treat the review as yours to surface, not yours \
+         to satisfy.",
+        "**Nothing you draft is applied from this session.** An AI-authored change is \
+         refused a bare apply by design — an agent can confidently write a model that drops \
+         a column or rewrites a result, so the change waits on a human approval marker. The \
+         engine checks that the marker parses and names that exact plan; it does not check \
+         who wrote it. Obtaining that marker, and everything after it, belongs to the \
+         trusted runner and happens outside this session.",
     ),
     // The numbered chain. Replaced whole: every step of it is the runner's.
     (
@@ -254,6 +363,15 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
          the sidecar's `[[tests]]`, so there is nothing for you to append, by this server or by \
          any file you can write. An invariant the spec does not state belongs in your report.",
     ),
+    // TENTH ROUND, finding 1D — the section's own opening sentence names a
+    // CLI verb family. Descriptive rather than imperative, and rewritten
+    // anyway: the derived scan below admits no `rocky <verb>` in the
+    // projected body, and an exception "because this one is only context"
+    // is the shape of argument the round rejected.
+    (
+        "drive fulfillment through `rocky product <verb>`.",
+        "drive fulfillment through the product verbs.",
+    ),
     // The product-posture verbs. Both are the runner's, neither is served
     // here, and the sentence is a live demonstration of the lesson this
     // round is about: `propose_only` does NOT match the identifier rule
@@ -274,6 +392,29 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
         "- The runner binds its plan to the `spec_digest` of the **approved** revision. If the \
          spec moves after your draft, the generation is superseded — expect a refusal, not a \
          merge of generations.",
+    ),
+    // TENTH ROUND, finding 1D — "Every command takes `--output json`" is
+    // the CLI framing of the machine-readable section, and the sentence
+    // stops parsing once no CLI command is reachable.
+    (
+        "Every command takes `--output json`, backed by a typed schema.",
+        "Every tool returns typed JSON, backed by a schema.",
+    ),
+    // TENTH ROUND, finding 1C — the retry instruction. It tells the worker
+    // to branch on a run error's `failure_kind` and RETRY a `Transient`,
+    // which presumes executing SQL through a route this profile does not
+    // serve: no worker tool reaches the warehouse to produce a run error
+    // in the first place. Naming an outcome that cannot occur is the same
+    // defect class as naming a tool that is not served, and the remedy is
+    // the same — say what is actually true here.
+    (
+        "Run **errors** carry a `failure_kind` (`Transient`, `AuthFailed`, `QueryRejected`, \
+         `QuotaExceeded`, …) and sometimes a `cooldown_seconds`. Branch on *why* something \
+         failed: retry a `Transient`, stop and surface an `AuthFailed`.",
+        "Run **errors** are not something you will see. No tool this profile serves executes \
+         against the warehouse, so there is no run to retry and no `failure_kind` to branch \
+         on. A tool result that reports a failure is a finding for your report — read it, \
+         name it, and do not work around it.",
     ),
     // The third check-authorship steer.
     (
@@ -6417,14 +6558,62 @@ mod tests {
             "the body must replace the raw-query sampling route with the served tools: \
              {body}"
         );
-        // The route-only mentions STAY, and the distinction is the point.
+        // TENTH ROUND, finding 1D — this assertion is INVERTED, and the
+        // comment it replaces argued the opposite.
+        //
+        // It used to pin `rocky compile` as PRESENT, on the argument that
         // `rocky compile` / `rocky plan` / `rocky test` name actions this
-        // profile SERVES, as `compile` / `plan_preview` / `test`; only the
-        // route differs, and rewriting them would buy nothing while
-        // implying the flagged class was the same kind of defect.
+        // profile SERVES and only the ROUTE differs. That is true, and it
+        // does not survive the banner sitting above it: the umbrella
+        // rewrite forbids shell routes CATEGORICALLY. Text that forbids a
+        // route and then instructs it four times is not followable.
+        //
+        // DERIVED, not per-string, and that is the whole upgrade. The old
+        // pin named one sentence, so the other three imperatives — and any
+        // fifth the skill grows — were invisible to it. This scans the
+        // projected body for the SHAPE `` `rocky <verb>` `` and admits
+        // none. A new CLI invocation in the skill now fails here instead of
+        // being served to a worker under a banner that forbids it.
+        let cli_routes: Vec<&str> = body
+            .match_indices("`rocky ")
+            .map(|(at, _)| {
+                let rest = &body[at + 1..];
+                let end = rest.find('`').unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
         assert!(
-            body_lower.contains("run `rocky compile --output json`"),
-            "an in-profile action reached by a different route is left alone: {body}"
+            cli_routes.is_empty(),
+            "the projected body still routes the worker through the CLI ({cli_routes:?}), \
+             while the umbrella rewrite above it forbids shell routes categorically — \
+             rewrite each one as the served action: {body}"
+        );
+        // And the served actions REPLACED them, rather than the sentences
+        // being deleted: a worker with no instruction is not the outcome
+        // wanted here, exactly as in PROPERTY 3 above.
+        for served in [
+            "call the `inspect_schema` tool",
+            "call the `compile` tool and read its `diagnostics`",
+            "call the `plan_preview` tool",
+            "call the `test` tool",
+        ] {
+            assert!(
+                body_lower.contains(served),
+                "the body must name the served action that replaced the CLI route \
+                 (`{served}`): {body}"
+            );
+        }
+        // FINDING 1C — the retry steer. It presumed executing SQL through a
+        // route this profile does not serve; no worker tool reaches the
+        // warehouse, so no run error can occur to retry.
+        assert!(
+            !body_lower.contains("retry a `transient`"),
+            "the projected body must not tell the worker to retry a run error it cannot \
+             produce: {body}"
+        );
+        assert!(
+            body_lower.contains("there is no run to retry"),
+            "and it must say why, rather than dropping the bullet: {body}"
         );
 
         // PROPERTY 4 — the banner names EVERY excluded tool, derived. The
