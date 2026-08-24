@@ -3151,6 +3151,12 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
 /// This test does not claim to be the whole sweep, because "this is the
 /// whole sweep" is the sentence that has been wrong five times.
 ///
+/// TENTH ROUND, finding 2 — surfaces 2, 4 and 5 here were FIELD sweeps
+/// while the enumeration in `tools.rs` claimed every row matched its
+/// channel's whole serialized payload. They now serialize the whole
+/// `Prompt` and the whole `Tool`. Nothing leaked through the omitted
+/// fields; the false GUARANTEE was the finding.
+///
 /// TWO THINGS ARE DERIVED, and both are the finding this was rewritten
 /// for. The excluded-tool set comes from the two real routers, replacing a
 /// hand-picked literal of seven names that was already the anti-pattern
@@ -3224,16 +3230,25 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
          projection closed: {body}"
     );
 
-    // Surface 2: every listed prompt description, as served over the wire.
+    // Surface 2: every listed prompt, as served over the wire.
+    //
+    // TENTH ROUND, finding 2 — the WHOLE `Prompt`, not its `description`.
+    // The enumeration in `tools.rs` claims every row matches the whole
+    // serialized payload of its channel, "so a field added later is covered
+    // without any test knowing the shape". That was true of row 3 and of no
+    // other row: this one read `description` alone, while rmcp 3.1.2's
+    // `Prompt` also carries `title`, `arguments` (each with its own
+    // `description`), `icons` and `_meta`. No leak was demonstrated in the
+    // omitted fields — the false claim is the finding, not a leak.
     let prompts = client.list_all_prompts().await.expect("list prompts");
     assert_eq!(prompts.len(), 5, "the worker profile keeps all 5 prompts");
     for prompt in &prompts {
-        let description = prompt.description.as_deref().unwrap_or_default();
+        let whole = serde_json::to_string(prompt).expect("prompt serializes");
         assert_eq!(
-            rocky_mcp::names_excluded_tool(description, &excluded),
+            rocky_mcp::names_excluded_tool(&whole, &excluded),
             None,
-            "worker `prompts/list` description of '{}' must not name an excluded tool: \
-             {description}",
+            "worker `prompts/list` entry for '{}' must not name an excluded tool anywhere \
+             in what it serves: {whole}",
             prompt.name
         );
     }
@@ -3244,9 +3259,14 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
     // sweep; the description half is finding 3, and the schema half is
     // swept here because it is the same kind of text one field away.
     //
-    // The schema is matched as its serialized JSON, so a doc comment on any
-    // parameter field is covered wherever schemars put it, at any nesting
-    // depth, without this test knowing the shape.
+    // TENTH ROUND, finding 2 — those two fields are now swept as the WHOLE
+    // `Tool`, for the same reason as surface 2 above. rmcp 3.1.2's `Tool`
+    // also carries `title`, `output_schema`, `annotations` (which has its
+    // own `title`), `icons` and `_meta`; selecting two of seven fields is
+    // not the future-field guarantee the enumeration claimed. Serializing
+    // the whole value keeps the nested-schema coverage the field-selecting
+    // version bought — a doc comment on any parameter field is still
+    // covered wherever schemars put it, at any depth.
     let tools = client.list_all_tools().await.expect("list tools");
     assert_eq!(
         tools.len(),
@@ -3254,20 +3274,28 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
         "the wire surface is the router surface, or this sweeps the wrong set"
     );
     for tool in &tools {
-        let description = tool.description.as_deref().unwrap_or_default();
+        let whole = serde_json::to_string(tool).expect("tool serializes");
         assert_eq!(
-            rocky_mcp::names_excluded_tool(description, &excluded),
+            rocky_mcp::names_excluded_tool(&whole, &excluded),
             None,
-            "worker `tools/list` description of '{}' must not name an excluded tool: \
-             {description}",
+            "worker `tools/list` entry for '{}' must not name an excluded tool anywhere in \
+             what it serves: {whole}",
             tool.name
         );
-        let schema = serde_json::to_string(&tool.input_schema).expect("schema serializes");
-        assert_eq!(
-            rocky_mcp::names_excluded_tool(&schema, &excluded),
-            None,
-            "worker `tools/list` input schema of '{}' must not name an excluded tool: \
-             {schema}",
+        // The description and the input schema are the two fields that ever
+        // carried a violation, so their PRESENCE is pinned: a `Tool` that
+        // served neither would satisfy the sweep above while sweeping
+        // nothing.
+        assert!(
+            tool.description.is_some(),
+            "`{}` serves no description — the sweep above would then be reading an \
+             envelope with no guidance in it",
+            tool.name
+        );
+        assert!(
+            whole.contains("input_schema") || whole.contains("inputSchema"),
+            "`{}`'s serialized entry must carry its input schema, or the nested-parameter \
+             coverage is gone: {whole}",
             tool.name
         );
     }
@@ -3502,10 +3530,28 @@ async fn worker_result_text_names_no_excluded_tool() {
 
     // Now sweep those three, plus every other worker tool that runs offline
     // here, as WHOLE serialized results.
+    //
+    // TENTH ROUND, finding 2 — "whole" now means the whole `CallToolResult`,
+    // not its `structured_content`. The three assertions above still read
+    // the structured half, because they are about a specific field's value;
+    // the SWEEP takes the envelope rmcp actually serialises, which also
+    // carries `content` (the text block a client renders when it ignores
+    // structured output), `is_error`, `result_type` and `_meta`. Selecting
+    // one field of five is not the future-field guarantee the enumeration
+    // claimed for every row.
     let mut results = vec![
-        ("compile", compiled.clone()),
-        ("draft_model", drafted.clone()),
-        ("breaking_change", skipped.clone()),
+        (
+            "compile",
+            serde_json::to_value(&compile).expect("serializes"),
+        ),
+        (
+            "draft_model",
+            serde_json::to_value(&draft).expect("serializes"),
+        ),
+        (
+            "breaking_change",
+            serde_json::to_value(&breaking).expect("serializes"),
+        ),
     ];
     let model_arg = serde_json::json!({ "model": "orders" })
         .as_object()
@@ -3536,12 +3582,28 @@ async fn worker_result_text_names_no_excluded_tool() {
             .call_tool(request)
             .await
             .unwrap_or_else(|e| panic!("`{tool}` call: {e}"));
+        // Both halves must be THERE — the sweep below reads the whole
+        // envelope, and an envelope with neither would pass it while
+        // carrying none of the text this row exists to sweep.
+        //
+        // `content` is not decorative: `CallToolResult::structured` fills it
+        // with `value.to_string()`, so it is a SECOND rendering of the same
+        // guidance, and it is what a client that ignores structured output
+        // shows the worker. That is the channel reading `structured_content`
+        // alone discarded.
+        assert!(
+            called.structured_content.is_some(),
+            "`{tool}` returns structured content, or the whole-envelope sweep below reads \
+             an empty result"
+        );
+        assert!(
+            !called.content.is_empty(),
+            "`{tool}` returns a text content block too — the second rendering the whole \
+             envelope exists to cover"
+        );
         results.push((
             tool,
-            called
-                .structured_content
-                .clone()
-                .unwrap_or_else(|| panic!("`{tool}` returns structured content")),
+            serde_json::to_value(&called).expect("result serializes"),
         ));
     }
     assert_eq!(
@@ -3566,6 +3628,12 @@ async fn worker_result_text_names_no_excluded_tool() {
     // a field added to `ToolError` is covered without this test knowing the
     // shape.
     //
+    // TENTH ROUND, finding 2 — "whole envelope" now means the whole
+    // `CallToolResult`, as with the success sweep above. Reading
+    // `structured_content` alone discarded `content`, which is the text
+    // block a client renders when it does not read structured output, and
+    // that is exactly a channel a worker reads.
+    //
     // STILL PARTIAL, and the label is not softened. What is driven here is
     // the ARGUMENT-VALIDATION arm of the tools that have one — the errors a
     // harness can reach offline. Policy denials, warehouse failures and
@@ -3584,11 +3652,22 @@ async fn worker_result_text_names_no_excluded_tool() {
             "dependents",
             serde_json::json!({ "model": "no_such_model" }),
         ),
-        // `inspect_schema`, `catalog`, `test` and `breaking_change` are
-        // absent on purpose: they ignore their arguments (or take none), so
-        // no argument-validation arm exists to drive. Named here rather
-        // than silently omitted — an unexplained gap in a list like this is
-        // how the last five rounds started.
+        // TENTH ROUND, finding 2 — `test` WAS in the "no argument
+        // validation" list below, and it does not belong there. It takes an
+        // optional `model` and rejects an unknown one as `model_not_found`
+        // (`tools.rs`'s `test` arm over `commands::ModelNotFound`, which
+        // `commands::test_output` raises through `reject_unknown_model`).
+        // So the row drives NINE reachable argument failures, not eight,
+        // and the comment that excused the ninth was wrong about the code.
+        ("test", serde_json::json!({ "model": "no_such_model" })),
+        // `inspect_schema`, `catalog` and `breaking_change` are absent on
+        // purpose, and this was RE-VERIFIED rather than inherited: the
+        // first two bind their `Parameters` to `_params` and never read
+        // them, and `breaking_change` takes a git `base` whose failure mode
+        // is a SUCCESSFUL result carrying `skipped_reason` (driven above),
+        // not an error. Named here rather than silently omitted — an
+        // unexplained gap in a list like this is how the last five rounds
+        // started, and an unchecked one is how this entry was wrong.
         (
             "sample_rows",
             serde_json::json!({ "model": "no_such_model" }),
@@ -3623,9 +3702,16 @@ async fn worker_result_text_names_no_excluded_tool() {
             "`{tool}`'s envelope carries BOTH text fields, or the sweep below is \
              inventorying the wrong thing: {envelope}"
         );
-        errors.push((tool, envelope));
+        // The error envelope carries the same second rendering as the
+        // success one, and it is the half a non-structured client shows.
+        assert!(
+            !called.content.is_empty(),
+            "`{tool}`'s error result carries a text content block too — the channel \
+             reading `structured_content` alone discarded"
+        );
+        errors.push((tool, serde_json::to_value(&called).expect("serializes")));
     }
-    assert_eq!(errors.len(), 8, "eight reachable error paths are driven");
+    assert_eq!(errors.len(), 9, "nine reachable error paths are driven");
     for (tool, envelope) in &errors {
         let whole = serde_json::to_string(envelope).expect("envelope serializes");
         assert_eq!(

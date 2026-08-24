@@ -656,31 +656,45 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 ///   #  surface                                    status
 ///   1  initialize   -> instructions                swept: worker_instructions_are_
 ///                                                   projected_and_default_stays_verbatim
-///   2  prompts/list -> description                 swept: worker_prompt_descriptions_
-///                                                   name_no_excluded_tool
+///   2  prompts/list -> THE WHOLE Prompt            swept: worker_profile_guidance_
+///        (description, title, arguments,            surfaces_name_no_excluded_tool
+///         icons, _meta)
 ///   3  prompts/get  -> THE WHOLE RESULT             swept: worker_profile_prompts_end_
 ///        (messages AND description)                  at_the_runner_handoff
-///   4  tools/list   -> tool description            swept: worker_tool_descriptions_
-///                                                   name_no_excluded_tool
-///   5  tools/list   -> input_schema text           swept: worker_profile_guidance_
-///                                                   surfaces_name_no_excluded_tool
+///   4  tools/list   -> tool description            swept: worker_profile_guidance_
+///   5  tools/list   -> input_schema text            surfaces_name_no_excluded_tool,
+///        (4 and 5 are two FIELDS of one             as THE WHOLE Tool — which also
+///         channel; the sweep takes the whole        covers title, annotations,
+///         Tool, so both are covered at once)       icons and _meta
 ///   6  tools/list   -> output_schema text          NOT SERVED — pinned absent by
 ///                                                   worker_result_text_names_no_
 ///                                                   excluded_tool
 ///   7  tools/call   -> ok: result next_steps       swept: draft_next_steps_are_
-///                                                   profile_selected
-///   8  tools/call   -> ok: other result text       PARTIAL — two DIFFERENT
-///                                                   reasons, split below
-///   9  tools/call   -> err: THE WHOLE ToolError    PARTIAL — argument arms
-///        (message AND remediation_hint AND          swept, the rest OPEN
-///         policy_rule AND the plan fields)
+///        (a FIELD of row 8's channel)               profile_selected
+///   8  tools/call   -> ok: THE WHOLE CallToolResult PARTIAL — two DIFFERENT
+///        (structured_content AND content AND        reasons, split below
+///         is_error AND result_type AND _meta)
+///   9  tools/call   -> err: THE WHOLE CallToolResult PARTIAL — argument arms
+///        (the ToolError body — message,             swept, the rest OPEN
+///         remediation_hint, policy_rule, the
+///         plan fields — AND the envelope)
 /// ```
+///
+/// THE ROWS ARE NOT ALL CHANNELS, and pretending they are is what the
+/// heading below used to do. Rows 4 and 5 are two FIELDS of one `tools/list`
+/// entry, and row 7 is one field of row 8's result. They keep their numbers,
+/// because `WORKER_GUIDANCE_SURFACES` counts the places a worker is served
+/// text and renumbering would break every reference to "surface 9" in this
+/// crate for no safety gain. What changed is the SWEEP: each of those field
+/// rows is now covered by a sweep over its whole channel, so the guarantee
+/// holds even where the row label does not.
 ///
 /// NINE SURFACES: SIX SWEPT, TWO PARTIAL, ONE NOT SERVED. Not "all swept" —
 /// that sentence has now been believed five times about a set that was
 /// incomplete, which is the whole reason for the count.
 ///
-/// EVERY ROW IS A CHANNEL, NOT A FIELD, and the ninth round is why. Rows 3
+/// EVERY ROW'S SWEEP READS A WHOLE CHANNEL, NOT A FIELD, and the ninth
+/// round is why. Rows 3
 /// and 9 used to name one field each — `prompts/get`'s message bodies, and
 /// `ToolError`'s `remediation_hint`. Both were wrong by omission.
 /// `GetPromptResult` also carries a `description`, which no sweep read, and
@@ -693,6 +707,31 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// so a field added later is covered without any test knowing the shape.
 /// Adding a "surface 10" for `description` would have bought a surface 11
 /// for the next field: enumerating fields is precisely what lost here.
+///
+/// THAT SENTENCE WAS TRUE OF ROW 3 AND OF NO OTHER ROW, and the tenth round
+/// is why it is worth writing down twice. Row 3 did serialise the whole
+/// `GetPromptResult`. Rows 2, 4, 5, 8 and 9 kept SELECTING fields under the
+/// same heading: `prompts/list` read `description`, `tools/list` read
+/// `description` + `input_schema`, and both call sweeps read
+/// `structured_content` and dropped the `CallToolResult` around it. Against
+/// frozen rmcp 3.1.2 the omitted fields are real — `Prompt` also carries
+/// `title` / `arguments` / `icons` / `_meta`, `Tool` also carries `title` /
+/// `output_schema` / `annotations` / `icons` / `_meta`, and
+/// `CallToolResult` also carries `content` / `is_error` / `result_type` /
+/// `_meta`. No leak was demonstrated in any of them; the FALSE GUARANTEE
+/// was the finding, and a guarantee is exactly the kind of claim this list
+/// exists to keep honest.
+///
+/// One of those omissions was not merely theoretical. `content` is filled by
+/// `CallToolResult::structured` with `value.to_string()` — a second
+/// rendering of the same guidance, and the one a client that ignores
+/// structured output shows the worker. It is now swept, and asserted
+/// non-empty so the sweep cannot degrade into reading an empty vector.
+///
+/// So the honest form of the guarantee is about the SWEEPS, not the row
+/// labels: every row is covered by a sweep over the whole serialized payload
+/// of the channel that carries it. Rows 4, 5 and 7 name fields; their
+/// channels (`Tool`, and row 8's `CallToolResult`) are what the sweeps read.
 ///
 /// (1) WAS EXEMPT AND IS NOW SWEPT, and how it fell is worth keeping. The
 /// argument for exempting it was that the instructions are the canonical
@@ -767,10 +806,24 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// `remediation_hint`, plus `policy_rule` and the flattened plan-handoff
 /// fields; all of them are guidance, and all of them reach the worker.
 ///
-/// What is swept is the ARGUMENT-VALIDATION arm of the eight worker-served
+/// What is swept is the ARGUMENT-VALIDATION arm of the NINE worker-served
 /// tools that have one, each as a WHOLE serialized envelope, with the
 /// failure asserted first so a call that silently succeeded cannot pass as
-/// coverage. What is NOT swept is every other arm — policy denials,
+/// coverage.
+///
+/// NINE, not eight, and the correction matters more than the number. The
+/// list of tools EXCUSED from this row said `inspect_schema`, `catalog`,
+/// `test` and `breaking_change` "ignore their arguments (or take none)".
+/// `test` does not: it takes an optional `model` and rejects an unknown one
+/// as `model_not_found`, through `commands::test_output`'s
+/// `reject_unknown_model`. A written-out excuse read as coverage for a
+/// reachable arm nobody drove — which is the failure mode the excuse itself
+/// was added to prevent. The other three were re-verified rather than
+/// inherited: `inspect_schema` and `catalog` bind `_params` and never read
+/// them, and `breaking_change`'s bad-`base` path returns a SUCCESSFUL result
+/// with `skipped_reason` set, not an error.
+///
+/// What is NOT swept is every other arm — policy denials,
 /// warehouse failures, internal errors — because reaching them means
 /// driving every error path of every served tool, which no harness here
 /// does, and the hints are written per call site so there is no table to
