@@ -213,9 +213,9 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 // and the matching rule (F3 red team, finding 3)
 // ---------------------------------------------------------------------------
 
-/// EVERY guidance surface a worker session is served, counted — because
-/// this defect class has now been found FIVE times, and every fix was
-/// believed complete when it shipped.
+/// Every guidance surface an MCP worker session is served, counted —
+/// because this defect class has now been found FIVE times, and every fix
+/// was believed complete when it shipped.
 ///
 /// The history is the reason this is a list rather than a habit. Round 1
 /// fixed the prompt `description`s. Round 2 found the prompt BODIES.
@@ -227,35 +227,60 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// exact-name rule cannot see.
 ///
 /// ```text
-///   #  surface                                swept by
-///   1  initialize  -> instructions            instructions_carry_the_worker_banner_and_
-///                                             stay_verbatim_by_default
-///   2  prompts/list -> description            worker_prompt_descriptions_name_no_excluded_tool
-///   3  prompts/get  -> message bodies         worker_profile_prompts_end_at_the_runner_handoff
-///   4  tools/list   -> tool description       worker_tool_descriptions_name_no_excluded_tool
-///   5  tools/list   -> input_schema text      worker_profile_guidance_surfaces_name_no_
-///                                             excluded_tool (wire)
-///   6  tools/call   -> result next_steps      draft_next_steps_are_profile_selected
-///   7  tools/call   -> error remediation_hint NOT SWEPT — see below
+///   #  surface                                status
+///   1  initialize  -> instructions            EXEMPT by design — see below
+///   2  prompts/list -> description            swept: worker_prompt_descriptions_name_
+///                                             no_excluded_tool
+///   3  prompts/get  -> message bodies         swept: worker_profile_prompts_end_at_
+///                                             the_runner_handoff
+///   4  tools/list   -> tool description       swept: worker_tool_descriptions_name_
+///                                             no_excluded_tool
+///   5  tools/list   -> input_schema text      swept: worker_profile_guidance_surfaces_
+///                                             name_no_excluded_tool (wire)
+///   6  tools/call   -> result next_steps      swept: draft_next_steps_are_profile_selected
+///   7  tools/call   -> error remediation_hint OPEN — not swept
 /// ```
 ///
-/// SEVEN. The list is closed at the PROTOCOL level rather than by
-/// inspection: [`RockyMcpServer::get_info`] enables `tools` and `prompts`
-/// and nothing else, so there is no `resources/read`, no completion and
-/// no logging channel able to carry an eighth kind of text.
-/// `the_server_opens_no_guidance_channel_beyond_tools_and_prompts` pins
-/// that, so enabling one fails a test and forces a revisit of this
-/// comment instead of silently opening surface 8.
+/// SEVEN SURFACES: FIVE SWEPT, ONE EXEMPT BY DESIGN, ONE OPEN. Not "all
+/// swept" — that sentence has now been believed four times about a set
+/// that was incomplete, which is the whole reason for the count.
+///
+/// (1) IS EXEMPT, NOT SWEPT, and the distinction is not a formality. The
+/// instructions are the compiled authoring skill served VERBATIM to both
+/// profiles, and that skill names `propose` throughout — deliberately, so
+/// the guidance never forks from the canonical file. What the worker gets
+/// instead is [`WORKER_INSTRUCTIONS_BANNER`] prepended, naming those tools
+/// as NOT available. So the excluded-name sweep every other row runs would
+/// fail here by construction, and `instructions_carry_the_worker_banner_
+/// and_stay_verbatim_by_default` pins something different: the banner is
+/// present, names the tools, and the text below it is byte-unchanged.
+/// Reading that row as "swept" would be the same over-claim this
+/// enumeration exists to stop.
 ///
 /// (7) IS THE OPEN GAP, stated rather than glossed. A `ToolError`'s
 /// `remediation_hint` is guidance, it is served to the worker, and it is
-/// not swept: reaching every hint means driving every error path of
-/// every served tool, which no harness here does, and the hints are
-/// written per call site so there is no table to audit instead. Read
-/// this as "surfaces 1-6 are swept and 7 is known and open" — NOT as
-/// "all surfaces are swept". That second sentence has now been believed
-/// four times about a set that was incomplete, which is the whole reason
-/// for the count.
+/// not swept: reaching every hint means driving every error path of every
+/// served tool, which no harness here does, and the hints are written per
+/// call site so there is no table to audit instead.
+///
+/// THE LIST IS CLOSED AT THE PROTOCOL LEVEL rather than by inspection.
+/// [`RockyMcpServer::get_info`] enables `tools` and `prompts` and nothing
+/// else, so there is no `resources/read`, no completion and no logging
+/// channel able to carry an eighth kind of text.
+/// `the_server_opens_no_guidance_channel_beyond_tools_and_prompts` pins
+/// that, so enabling one fails a test and forces a revisit of this comment
+/// instead of silently opening surface 8.
+///
+/// SCOPE: this counts the MCP SESSION. A worker also receives the driver's
+/// TASK BRIEF, which is out-of-band — written to the task outbox, not
+/// served over this protocol — and has its own gate in
+/// `rocky_fulfill::briefs`: an override naming an excluded tool is
+/// REFUSED, not swept. That gate matches at identifier boundaries, so it
+/// deliberately admits `applying` and the config literal `propose_only`,
+/// which the rule here would flag. The two rules differ because the jobs
+/// differ: a false positive here costs a reword, a false positive there
+/// rejects a legitimate operator config. The shipped default brief texts
+/// carry no inflection of an excluded name.
 ///
 /// Surface 6 has one worker-served producer: `draft_model`. `draft_check`
 /// also carries `next_steps`, but it left [`WORKER_PROFILE_TOOLS`], so a

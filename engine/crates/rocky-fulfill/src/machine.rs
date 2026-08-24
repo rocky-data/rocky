@@ -399,9 +399,10 @@ pub enum UnevaluableCause {
     /// drives it end to end.
     ///
     /// (Reading `product.rs`, `rocky product approve` is also ACCEPTED
-    /// here — `blocked` is in `product_approve_in`'s stop set, not its
-    /// in-flight set. Accepted is not recovered, and the earlier version
-    /// of this note stopped at the first half. Re-approving the
+    /// here: `blocked` is in `product_approve_in`'s stop set, and the
+    /// clean stop's `release` clears the `driver_pgid` that its second
+    /// refusal arm reads. Accepted is not recovered, and the earlier
+    /// version of this note stopped at the first half. Re-approving the
     /// UNCHANGED spec takes that function's same-digest early return: it
     /// verifies the snapshot and returns having written no approval
     /// record, no state record and no journal row, so the record is
@@ -1781,12 +1782,16 @@ fn decide_observation_checks(
             //     and the fresh generation pins its own digest at its
             //     own verify. This is the exit that always works, and it
             //     is the one the stop message prints.
-            //  2. `rocky product approve` — permitted, but it only MOVES
-            //     the record for a NEW spec digest. `blocked` is absent
-            //     from `product_approve_in`'s in-flight refusal set, so
-            //     the verb is accepted; re-approving the UNCHANGED spec
-            //     then takes that function's same-digest early return,
-            //     which verifies the snapshot and returns having written
+            //  2. `rocky product approve` — permitted, but under TWO
+            //     conditions, and it only MOVES the record under a third.
+            //     `product_approve_in` refuses on `active_state ||
+            //     driver_pgid.is_some()`. `blocked` is absent from
+            //     `active_state`, and `blocked()` here does NOT clear
+            //     `driver_pgid` — `step.rs`'s `release` does, on every
+            //     clean stop, which is what leaves the record approvable
+            //     at rest. Then: re-approving the UNCHANGED spec takes
+            //     that function's same-digest early return, which
+            //     verifies the snapshot and returns having written
             //     nothing — no approval record, no state record, no
             //     journal row — so the record is still blocked
             //     afterwards. Only a new digest reaches the CAS that
@@ -1823,13 +1828,13 @@ fn decide_observation_checks(
                 // the unknown as a side effect. So the message states the
                 // limit and keeps the same exit.
                 let reason = format!(
-                    "{detail} — the manifested artifacts still match and the lowering is \
-                     committed, but the expanded check set was never loaded here, so \
-                     whether an unmanifested file such as `models/test_definitions.toml` \
-                     also moved is UNKNOWN. Either way no restore alters a hash algorithm. \
-                     Re-running this generation cannot resolve it either: only a fresh \
-                     generation pins a digest, at its own verify — and that re-pin covers \
-                     the whole expansion, so it settles the unknown too"
+                    "{detail} — the manifested artifacts still match, and the lowering is \
+                     committed. The expanded check set was never loaded here. So whether an \
+                     unmanifested file such as `models/test_definitions.toml` also moved is \
+                     UNKNOWN. No restore alters a hash algorithm either way. Re-running this \
+                     generation cannot resolve it: only a fresh generation pins a digest, at \
+                     its own verify. That re-pin covers the whole expansion, so it settles \
+                     the unknown too"
                 );
                 let record = blocked(observed, reason, now);
                 return blocked_stop(

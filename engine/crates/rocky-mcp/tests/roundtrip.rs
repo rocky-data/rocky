@@ -2994,10 +2994,13 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
 /// Four of the seven surfaces `WORKER_GUIDANCE_SURFACES` enumerates are
 /// checked here as the worker actually receives them: prompt descriptions
 /// (2), tool descriptions (4), tool input schemas (5) and result
-/// `next_steps` (6). The other three are covered elsewhere or open, and
-/// the enumeration in `tools.rs` says which is which — this test does not
-/// claim to be the whole sweep, because "this is the whole sweep" is the
-/// sentence that has been wrong four times.
+/// `next_steps` (6). Of the other three, one more is swept at unit level
+/// (3, the prompt bodies), one is EXEMPT because the instructions serve
+/// the full authoring skill verbatim under a disclaiming banner (1), and
+/// one is OPEN (7, error `remediation_hint`). Five swept, one exempt, one
+/// open — the enumeration in `tools.rs` carries the reasons. This test
+/// does not claim to be the whole sweep, because "this is the whole
+/// sweep" is the sentence that has been wrong four times.
 ///
 /// TWO THINGS ARE DERIVED, and both are the finding this was rewritten
 /// for. The excluded-tool set comes from the two real routers, replacing a
