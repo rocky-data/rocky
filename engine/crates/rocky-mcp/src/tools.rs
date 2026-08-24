@@ -88,14 +88,38 @@ fn worker_instructions_banner(excluded: &[String]) -> String {
 /// safe" is not a status this list should ever carry: every other row is
 /// held to what the text SAYS, not to whether a disclaimer precedes it.
 ///
+/// WHAT THE NINTH ROUND ADDED, and the reason it is the most useful entry
+/// in this table's history. The first pass rewrote every passage that NAMED
+/// an excluded tool, and a name-based sweep then read the result as clean.
+/// It was not: two sentences that name no tool at all still told the worker
+/// to write a model's `.toml` sidecar "for materialization", strategy and
+/// target included. That contradicts the banner's spec-owned-metadata
+/// prohibition sitting three paragraphs above it, and it routes around
+/// `draft_model`, which deliberately writes only a minimal `name` + `intent`
+/// document and never invents routing.
+///
+/// THE LESSON, stated because it generalises past this table: a rewrite that
+/// strips a tool NAME while leaving the INSTRUCTION passes every name-based
+/// sweep and changes nothing. Read each entry by asking what the served text
+/// now tells the worker to DO — not which words it no longer contains. The
+/// three further entries that came out of re-reading on that lens are the
+/// evidence it is not a one-off: the umbrella sentence granted the whole
+/// `rocky` CLI, the sampling step sent the worker at a raw database query,
+/// and the product section handed it the runner's posture verbs. One of
+/// those three quotes `propose_only`, which is exactly the string the
+/// identifier rule was fixed NOT to match — a name-based sweep could never
+/// have reached it.
+///
 /// A PROJECTION, NOT A FORK. The canonical `.claude/skills/rocky-ai-workflow`
 /// file is untouched — it is correct guidance for the default profile, where
 /// the record/review/apply chain is the real workflow, and it is mirrored
 /// byte-identically into `.agents/skills/` under a CI drift gate. What
-/// changes is what the WORKER is served. Ten sentences are rewritten out of
-/// a 74-line document; the authoring loop itself — inspect, sample, write,
-/// compile-loop, preview, read the JSON, the anti-patterns — is served
-/// unchanged, because that part is the same job in both profiles.
+/// changes is what the WORKER is served. Eighteen passages are rewritten out
+/// of a 74-line document; the authoring loop itself — inspect, sample,
+/// write, compile-loop, preview, read the JSON, the anti-patterns — is
+/// served unchanged, because that part is the same job in both profiles.
+/// What the worker may no longer do is reach any of those steps by a route
+/// this server does not serve.
 ///
 /// Both drift directions fail at CONSTRUCTION, exactly like
 /// [`WORKER_TOOL_DESCRIPTIONS`]: a needle that no longer matches panics
@@ -109,12 +133,61 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
         "compile-loop → plan → propose → review → apply workflow",
         "compile-loop → plan → hand-off workflow",
     ),
+    // The umbrella licence. It grants the CLI, and the CLI is every verb
+    // this profile withholds — so the sentence hands back by one route what
+    // the allowlist removed by another.
+    (
+        "It assumes you can run the `rocky` CLI (or call the equivalent tools) and read its \
+         `--output json`.",
+        "It assumes you call the tools this server serves and read their JSON results. Those \
+         tools are your whole surface here. Reaching the same effect by another route — a \
+         shell, a file you write yourself, a direct warehouse connection — is out of bounds, \
+         even where nothing stops you.",
+    ),
     // The thesis sentence.
     (
         "The shape of the job: **you propose, Rocky's compiler verifies, an approval marker \
          gates the apply.**",
         "The shape of the job: **you draft, Rocky's compiler verifies, and the trusted runner \
          takes it from there.**",
+    ),
+    // NINTH ROUND, finding 1 — the first of two sidecar-authorship steers,
+    // and the reason the round blocked. Every rewrite above strips a tool
+    // NAME; this sentence names none and still tells the worker to write a
+    // sidecar "for materialization". It contradicts the banner's
+    // spec-owned-metadata prohibition and bypasses `draft_model`, which
+    // deliberately writes only a minimal `name` + `intent` document and
+    // never invents routing.
+    (
+        "Write models as **raw SQL** (`models/<name>.sql` + a `<name>.toml` sidecar for \
+         materialization).",
+        "Write models as **raw SQL**, and write them with the `draft_model` tool rather than \
+         by editing files yourself. It writes `models/<name>.sql` for you, and creates only a \
+         minimal `name` + `intent` sidecar — it never invents a strategy or a target, because \
+         routing is spec-owned here.",
+    ),
+    // The sampling route. The named alternatives are a direct database
+    // connection and a raw SQL shell, which is the capability the whole
+    // allowlist exists to withhold — `sample_rows` and `profile_column` are
+    // the bounded reads this profile serves instead.
+    (
+        "On the DuckDB playground that's a direct query (`duckdb <path> \"SELECT * FROM \
+         <table> USING SAMPLE 20 ROWS\"`) or `rocky shell`; against a warehouse, sample \
+         through the adapter.",
+        "Use the `sample_rows` tool for that, and `profile_column` to measure one column's \
+         null rate, distinct count, and range. Those two are the whole sampling surface here: \
+         do not open a database connection of your own, and do not run SQL you wrote against \
+         the warehouse.",
+    ),
+    // NINTH ROUND, finding 1 — the second sidecar-authorship steer, and the
+    // more explicit of the two: it names the strategy and the target.
+    (
+        "3. **Write the model.** Author the SQL and its `.toml` sidecar (materialization \
+         strategy, target). Keep it minimal and readable.",
+        "3. **Write the model.** Author the SQL, and hand it to `draft_model`. The SQL is your \
+         whole surface — do not write the `.toml` sidecar, and do not choose a materialization \
+         strategy or a target. Both are spec-owned here, and `draft_model` resolves them from \
+         the project's conventions. Keep the SQL minimal and readable.",
     ),
     // Step 6 — the first of the three check-authorship steers.
     (
@@ -174,6 +247,19 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
          Checks are spec-owned the same way: the spec's declared grain and `checks` lower into \
          the sidecar's `[[tests]]`, so there is nothing for you to append, by this server or by \
          any file you can write. An invariant the spec does not state belongs in your report.",
+    ),
+    // The product-posture verbs. Both are the runner's, neither is served
+    // here, and the sentence is a live demonstration of the lesson this
+    // round is about: `propose_only` does NOT match the identifier rule
+    // (`_` is an identifier byte), so it passed every name-based sweep
+    // while telling the worker to go inspect the gate posture.
+    (
+        "- `rocky product verify <name>` tells you (and the runner) whether the frozen \
+         `propose_only` posture is in place before any drafting starts; `rocky product status \
+         <name>` reports the lowering, approval, and state without writing.",
+        "- The runner checks the frozen posture and the lowering state before your drafting \
+         starts. Neither check is yours to run, and neither is served here. Work from the \
+         files and the tool results in front of you.",
     ),
     (
         "- A product-bound propose carries `product_id` + `spec_digest` of the **approved** \
@@ -6150,7 +6236,63 @@ mod tests {
             "the projected body ends at the hand-off: {body}"
         );
 
-        // PROPERTY 3 — the banner names EVERY excluded tool, derived. The
+        // PROPERTY 3 — the body does not INSTRUCT a withheld action, even
+        // where it names no withheld tool. This is the ninth round's
+        // finding, and it is a different assertion from PROPERTY 1 on
+        // purpose: every needle below names no tool at all, so PROPERTY 1
+        // read the unprojected text as clean while it told the worker to
+        // write a model's `.toml` sidecar including strategy and target —
+        // contradicting the banner three paragraphs up, and routing around
+        // `draft_model`, which writes only a minimal `name` + `intent`
+        // document and never invents routing.
+        //
+        // Asserted as the ABSENCE of the steer plus the PRESENCE of the
+        // redirect, because absence alone is satisfiable by deleting the
+        // paragraph, and a worker with no instruction is not the outcome
+        // wanted here.
+        for steer in [
+            // Finding 1: the two sidecar-authorship sentences.
+            "sidecar for materialization",
+            "author the sql and its `.toml` sidecar",
+            // Re-reading the whole body on the same lens found three more.
+            // Each licenses a route this profile withholds, and each named
+            // no excluded tool — the last one quotes `propose_only`, the
+            // exact string the identifier rule was fixed NOT to match.
+            "you can run the `rocky` cli",
+            "`rocky shell`",
+            "rocky product verify",
+        ] {
+            assert!(
+                !body_lower.contains(steer),
+                "the projected body still instructs `{steer}` — a withheld action the \
+                 name-based sweep cannot see: {body}"
+            );
+        }
+        assert!(
+            body_lower.contains("do not write the `.toml` sidecar"),
+            "the body must redirect sidecar authorship at `draft_model`, not merely drop \
+             the sentence: {body}"
+        );
+        assert!(
+            body_lower.contains("hand it to `draft_model`"),
+            "the body must name the tool that performs the write it just withheld: {body}"
+        );
+        assert!(
+            body_lower.contains("do not open a database connection of your own"),
+            "the body must replace the raw-query sampling route with the served tools: \
+             {body}"
+        );
+        // The route-only mentions STAY, and the distinction is the point.
+        // `rocky compile` / `rocky plan` / `rocky test` name actions this
+        // profile SERVES, as `compile` / `plan_preview` / `test`; only the
+        // route differs, and rewriting them would buy nothing while
+        // implying the flagged class was the same kind of defect.
+        assert!(
+            body_lower.contains("run `rocky compile --output json`"),
+            "an in-profile action reached by a different route is left alone: {body}"
+        );
+
+        // PROPERTY 4 — the banner names EVERY excluded tool, derived. The
         // banner is the one worker surface that names them deliberately:
         // saying a tool is unavailable is the opposite of steering at it.
         let banner_lower = banner.to_lowercase();
