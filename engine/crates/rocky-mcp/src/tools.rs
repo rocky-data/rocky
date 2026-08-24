@@ -654,8 +654,12 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 ///
 /// ```text
 ///   #  surface                                    status
-///   1  initialize   -> instructions                swept: worker_instructions_are_
-///                                                   projected_and_default_stays_verbatim
+///   1  initialize   -> THE WHOLE RESULT            swept: worker_instructions_are_
+///        (instructions AND capabilities AND         projected_and_default_stays_verbatim
+///         serverInfo AND protocolVersion —
+///         the banner is spliced out, being
+///         the one surface that names
+///         excluded tools on purpose)
 ///   2  prompts/list -> THE WHOLE Prompt            swept: worker_profile_guidance_
 ///        (description, title, arguments,            surfaces_name_no_excluded_tool
 ///         icons, _meta)
@@ -710,17 +714,28 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 ///
 /// THAT SENTENCE WAS TRUE OF ROW 3 AND OF NO OTHER ROW, and the tenth round
 /// is why it is worth writing down twice. Row 3 did serialise the whole
-/// `GetPromptResult`. Rows 2, 4, 5, 8 and 9 kept SELECTING fields under the
-/// same heading: `prompts/list` read `description`, `tools/list` read
-/// `description` + `input_schema`, and both call sweeps read
-/// `structured_content` and dropped the `CallToolResult` around it. Against
-/// frozen rmcp 3.1.2 the omitted fields are real — `Prompt` also carries
-/// `title` / `arguments` / `icons` / `_meta`, `Tool` also carries `title` /
+/// `GetPromptResult`. Rows 1, 2, 4, 5, 8 and 9 kept SELECTING fields under
+/// the same heading: `initialize` read `instructions`, `prompts/list` read
+/// `description`, `tools/list` read `description` + `input_schema`, and both
+/// call sweeps read `structured_content` and dropped the `CallToolResult`
+/// around it. Against frozen rmcp 3.1.2 the omitted fields are real —
+/// `InitializeResult` also carries `protocolVersion` / `capabilities` /
+/// `serverInfo` / `_meta` (and its `Implementation` carries `title` /
+/// `description` / `icons` / `websiteUrl`), `Prompt` also carries `title` /
+/// `arguments` / `icons` / `_meta`, `Tool` also carries `title` /
 /// `output_schema` / `annotations` / `icons` / `_meta`, and
 /// `CallToolResult` also carries `content` / `is_error` / `result_type` /
 /// `_meta`. No leak was demonstrated in any of them; the FALSE GUARANTEE
 /// was the finding, and a guarantee is exactly the kind of claim this list
 /// exists to keep honest.
+///
+/// ROW 1 WAS FOUND LAST AND BY THE AUTHOR, on the work the other rows'
+/// correction produced — writing "every row is covered by a sweep over the
+/// whole payload of its channel" and then checking row 1 against it. That
+/// ordering is the point, not a boast: the general defence on this list has
+/// always been "read what the served text DOES", and the sibling defence is
+/// to read every claim this file makes back against the code it describes,
+/// including a claim written five minutes ago.
 ///
 /// One of those omissions was not merely theoretical. `content` is filled by
 /// `CallToolResult::structured` with `value.to_string()` — a second
@@ -736,12 +751,18 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// without this test being edited. Rows 2 and 4/5 are different: their
 /// omitted fields (`title`, `arguments[].description`, `annotations`) are
 /// independently settable, and a mutation into `title` is caught by the
-/// widened sweep and was invisible to the field-selecting one.
+/// widened sweep and was invisible to the field-selecting one. Row 1 sits
+/// with rows 8 and 9 on this axis rather than with 2 and 4/5: its newly
+/// covered fields are all `None` under
+/// `Implementation::from_build_env()`, so widening it found nothing either.
+/// The mutation that proves the sweep works has to POPULATE one first.
 ///
 /// So the honest form of the guarantee is about the SWEEPS, not the row
 /// labels: every row is covered by a sweep over the whole serialized payload
 /// of the channel that carries it. Rows 4, 5 and 7 name fields; their
 /// channels (`Tool`, and row 8's `CallToolResult`) are what the sweeps read.
+/// Row 1 removes exactly one thing before matching — the banner, which names
+/// excluded tools deliberately — and nothing else.
 ///
 /// (1) WAS EXEMPT AND IS NOW SWEPT, and how it fell is worth keeping. The
 /// argument for exempting it was that the instructions are the canonical
@@ -6584,6 +6605,45 @@ mod tests {
             "worker instructions start with the banner"
         );
         let body = &worker[banner.len()..];
+
+        // ROW 1 IS THE WHOLE `initialize` RESULT, not the `instructions`
+        // field. Found while correcting finding 2, on the work that
+        // correction produced — the enumeration's new sentence says every
+        // row is covered by a sweep over the whole serialized payload of
+        // its channel, and this row read one field of five.
+        //
+        // rmcp 3.1.2's `InitializeResult` also carries `protocolVersion`,
+        // `capabilities`, `serverInfo` and `_meta`, and `Implementation`
+        // carries `title`, `description`, `icons` and `websiteUrl` besides
+        // `name` and `version` — four free-text fields on the channel a
+        // worker reads at handshake, before it reads anything else.
+        // `Implementation::from_build_env()` leaves all four `None`, so
+        // nothing leaks today. The UNBACKED GUARANTEE was the defect, the
+        // same shape as rows 2 and 4/5: no leak, a claim the sweep did not
+        // support.
+        //
+        // THE BANNER IS SPLICED OUT, and it is the only thing removed. The
+        // banner names every excluded tool ON PURPOSE — saying `propose` is
+        // not available is the opposite of steering at it — so sweeping it
+        // would fire on the one surface designed to name them. Everything
+        // else the handshake serves is swept as-is, so a `title` or a
+        // `description` set on `Implementation` later is covered without
+        // this test knowing the shape.
+        let mut handshake =
+            serde_json::to_value(&worker_info).expect("initialize result serializes");
+        handshake["instructions"] = serde_json::Value::String(body.to_string());
+        assert!(
+            handshake.get("serverInfo").is_some() && handshake.get("capabilities").is_some(),
+            "the handshake must carry serverInfo and capabilities, or this sweeps an \
+             envelope with the newly-covered fields missing: {handshake}"
+        );
+        let handshake = handshake.to_string();
+        assert_eq!(
+            names_excluded_tool(&handshake, &excluded),
+            None,
+            "the worker `initialize` result must not name an excluded tool anywhere \
+             outside the banner: {handshake}"
+        );
 
         // PROPERTY 1 — the projected body names NO excluded tool, in any
         // inflection. This is the same assertion every other swept surface
