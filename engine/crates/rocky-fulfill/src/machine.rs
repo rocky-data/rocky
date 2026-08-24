@@ -4480,7 +4480,12 @@ mod tests {
             errored: 0,
             warned: 0,
             deferred: None,
-            detail: "the declared checks on disk are not the ones that were approved".into(),
+            // "verified", not "approved" — the set this compares against
+            // is the one the generation pinned at `verifying`, and no
+            // human is ever shown it (see the README paragraph and
+            // `WORKER_PROFILE_TOOLS`). A fixture that says "approved"
+            // teaches the wrong word to the next reader of this test.
+            detail: "the declared checks on disk are not the ones this generation verified".into(),
             prior_detail: String::new(),
             cause,
         };
