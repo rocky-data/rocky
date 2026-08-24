@@ -3040,6 +3040,41 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
     let server = RockyMcpServer::new_with_profile(config_path, rocky_mcp::McpProfile::Worker);
     let client = connect(server).await;
 
+    // Surface 1: the served `instructions`, ON THE WIRE. Checked here as
+    // well as at unit level because this is the surface the whole round is
+    // about, and because a reviewer running only the integration tests must
+    // not read their silence as coverage.
+    //
+    // Split in two, because the two halves have opposite properties. The
+    // BANNER names excluded tools deliberately — saying `propose` is not
+    // available is the opposite of steering at it — and must name EVERY
+    // member of the derived set. The BODY below it must name none of them.
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .expect("the worker profile serves instructions over the wire");
+    let (banner, body) = instructions
+        .split_once("\n\n---\n")
+        .map(|(banner, body)| (banner.to_string(), format!("---\n{body}")))
+        .expect("the banner precedes the skill frontmatter");
+    assert_eq!(
+        rocky_mcp::names_excluded_tool(&body, &excluded),
+        None,
+        "the worker `instructions` BODY must not name an excluded tool: {body}"
+    );
+    for tool in &excluded {
+        assert!(
+            banner.to_lowercase().contains(&tool.to_lowercase()),
+            "the worker `instructions` BANNER must name `{tool}` as unavailable — derived \
+             from the routers, so shrinking the list to a literal fails here: {banner}"
+        );
+    }
+    assert!(
+        body.to_lowercase().contains("checks are spec-owned"),
+        "the body must stop the worker at CHECK authorship, which is the hole this \
+         projection closed: {body}"
+    );
+
     // Surface 2: every listed prompt description, as served over the wire.
     let prompts = client.list_all_prompts().await.expect("list prompts");
     assert_eq!(prompts.len(), 5, "the worker profile keeps all 5 prompts");
