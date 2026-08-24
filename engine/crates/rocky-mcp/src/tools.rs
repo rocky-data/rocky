@@ -189,10 +189,10 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
          (assertion), not just as a `WHERE` clause. That moves the invariant into the typed \
          substrate, so the human reviews *the invariant* and the compiler enforces it on every \
          future run.",
-        "REPORT it — the column, the invariant, and the evidence — instead of burying it in a \
-         `WHERE` clause. Contracts and checks are spec-owned in this session, so the runner is \
-         who moves the invariant into the typed substrate, where the human reviews *the \
-         invariant* and the compiler enforces it on every future run.",
+        "REPORT it. Name the column, the invariant, and the evidence. Do not bury it in a \
+         `WHERE` clause, and do not encode it yourself: contracts and checks are spec-owned in \
+         this session. The runner moves the invariant into the typed substrate, where the human \
+         reviews *the invariant* and the compiler enforces it on every future run.",
     ),
     // The metadata section. Replaced WHOLE — the paragraph is a how-to for
     // a tool this profile does not serve, so trimming its first sentence
