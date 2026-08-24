@@ -353,9 +353,7 @@ const WORKER_TOOL_DESCRIPTIONS: &[(&str, &str, &str)] = &[
 /// English — that "Proposing" meant "suggesting". The remedy when it does
 /// is to REWORD, never to relax the rule, and the reason is the reader
 /// rather than the matcher: a worker that has just been told `propose` is
-/// not available cannot tell the two senses apart either. Measured over
-/// the whole current surface — 12 served tools, 5 prompts, 19 excluded
-/// names, every form — it fires exactly twice, and both were real.
+/// not available cannot tell the two senses apart either.
 pub fn excluded_mention_forms(tool: &str) -> Vec<String> {
     let stem = tool.strip_suffix('e').unwrap_or(tool);
     let mut forms = vec![tool.to_string()];
@@ -368,17 +366,62 @@ pub fn excluded_mention_forms(tool: &str) -> Vec<String> {
     forms
 }
 
+/// Whether `needle` occurs in `haystack` at IDENTIFIER BOUNDARIES — neither
+/// neighbouring byte is `[a-z0-9_]`. Both arguments must already be
+/// lowercase.
+///
+/// This is the F3 round-2 fix. The rule was a raw `contains`, which is not
+/// an identifier detector: it read `proposal` inside a user's column named
+/// `proposal_id` and `propose` inside the config literal `propose_only`.
+/// That matters more the wider the swept surface gets — a compiler
+/// diagnostic quotes the user's own model and column names back at the
+/// worker, so a raw-substring rule turns every unlucky identifier in the
+/// user's project into a guidance violation Rocky cannot reword.
+///
+/// What it does NOT buy: a legitimate English word that IS the tool name
+/// still matches, because it is byte-identical at both boundaries. The
+/// E027 budget diagnostic said "or optimize the query" and `optimize` is
+/// an excluded tool; boundaries leave that hit exactly where it was. The
+/// remedy there is the reword the rule's own doc prescribes, not a
+/// narrower matcher.
+///
+/// Deliberately a SECOND implementation of the same primitive
+/// `rocky_fulfill::briefs` uses, and not a shared one — see the SCOPE
+/// paragraph on [`WORKER_GUIDANCE_SURFACES`] for why the two rules stay
+/// separate. (The dependency runs rocky-fulfill → rocky-mcp, so sharing
+/// would mean this crate importing that one, backwards.) The two now agree
+/// on boundaries and still differ on inflections: refusing a valid
+/// operator config costs more than rewording a sentence Rocky owns.
+fn contains_identifier(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_';
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !is_ident(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_ident(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// The excluded tool a guidance string names, and the form it used —
 /// `None` when the string names none of them.
 ///
 /// Case-insensitive: a sentence-initial "Proposing" is the same steer as
 /// a mid-sentence one, and only the second would survive an exact match.
+/// Matched at identifier boundaries ([`contains_identifier`]), so the rule
+/// detects an identifier rather than a byte run.
 pub fn names_excluded_tool(haystack: &str, excluded: &[String]) -> Option<(String, String)> {
     let lower = haystack.to_lowercase();
     excluded.iter().find_map(|tool| {
         excluded_mention_forms(tool)
             .into_iter()
-            .find(|form| lower.contains(&form.to_lowercase()))
+            .find(|form| contains_identifier(&lower, &form.to_lowercase()))
             .map(|form| (tool.clone(), form))
     })
 }
@@ -5981,6 +6024,69 @@ mod tests {
             names_excluded_tool("preview the generated SQL", &excluded),
             None,
             "unrelated prose does not match"
+        );
+    }
+
+    /// The rule is an IDENTIFIER detector, not a byte-run detector (F3
+    /// round 2, finding 3).
+    ///
+    /// The raw `contains` it replaces read every excluded name inside any
+    /// longer identifier. That was tolerable while the swept surface was
+    /// text Rocky writes, and is not now that the sweep reaches compiler
+    /// diagnostics, which quote the USER's model and column names back at
+    /// the worker — Rocky cannot reword someone's column.
+    ///
+    /// Both directions are asserted, because a matcher that stops firing
+    /// is the failure mode the sweep exists to catch.
+    #[test]
+    fn the_mention_rule_matches_identifiers_not_byte_runs() {
+        let excluded = vec!["propose".to_string(), "optimize".to_string()];
+
+        for user_text in [
+            "column `proposal_id` not found on model `orders`",
+            "unknown column: proposed_amount",
+            "model `proposer` has no unique key",
+            "the config literal propose_only is frozen",
+            "unoptimized scan on `events`",
+        ] {
+            assert_eq!(
+                names_excluded_tool(user_text, &excluded),
+                None,
+                "'{user_text}' names no tool — the name is inside a longer identifier"
+            );
+        }
+
+        for steering in [
+            "then `propose` to record a plan",
+            "before proposing a materialization",
+            "a plan you already proposed",
+            "write the proposal, then stop",
+            "or optimize the query to reduce scan volume",
+        ] {
+            assert!(
+                names_excluded_tool(steering, &excluded).is_some(),
+                "'{steering}' names an excluded tool at identifier boundaries and must fire"
+            );
+        }
+    }
+
+    /// The boundary rule is byte-exact about the neighbours, including the
+    /// ends of the string and non-identifier punctuation.
+    #[test]
+    fn identifier_boundaries_are_the_neighbouring_bytes() {
+        assert!(contains_identifier("propose", "propose"), "whole string");
+        assert!(contains_identifier("`propose`", "propose"), "backticks");
+        assert!(contains_identifier("propose.", "propose"), "trailing stop");
+        assert!(contains_identifier("(propose)", "propose"), "parenthesised");
+        assert!(contains_identifier("re-propose", "propose"), "hyphen");
+        assert!(!contains_identifier("propose_only", "propose"), "suffix _");
+        assert!(!contains_identifier("xpropose", "propose"), "prefix alpha");
+        assert!(!contains_identifier("propose2", "propose"), "suffix digit");
+        // A later occurrence still matches when an earlier one is embedded:
+        // the scan advances rather than stopping at the first byte run.
+        assert!(
+            contains_identifier("propose_only, then propose", "propose"),
+            "the scan does not stop at the first embedded occurrence"
         );
     }
 
