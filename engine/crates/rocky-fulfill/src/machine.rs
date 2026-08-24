@@ -394,9 +394,15 @@ pub enum UnevaluableCause {
     /// act on: `rocky fulfill <product> --retry` re-enters at
     /// `spec_approved` (the `Blocked` arm of [`decide`]) and the fresh
     /// generation pins its own digest at its own `verifying`, under the
-    /// current scheme. `rocky product approve` is also accepted from
-    /// `blocked` — it is in the stop set, not the in-flight set
-    /// (`product.rs`) — so re-approving a corrected spec works too.
+    /// current scheme. That is the printed remedy, and
+    /// `a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works`
+    /// drives it end to end.
+    ///
+    /// (Reading `product.rs`, `rocky product approve` should also be
+    /// accepted here — `blocked` is in its stop set, not its in-flight
+    /// set. Read from the code, NOT exercised by a test, and not the
+    /// command the stop prints. Stated as an observation rather than a
+    /// guarantee.)
     ///
     /// Reachable today only from a record written by an intermediate
     /// build of this work package: `checks_digest` does not exist on

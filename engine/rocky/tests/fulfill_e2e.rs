@@ -2486,20 +2486,30 @@ fn a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works() {
         "the retry re-enters the loop at the next gate rather than staying blocked: {json}"
     );
 
-    // And the re-pinned digest is tagged, so the next observation
-    // compares like for like.
+    // AND THE OLD-SCHEME VALUE IS GONE, replaced rather than carried.
+    // `--retry` clears the pin, and the run above went on through
+    // `verifying` — which re-pins — before stopping at the plan gate.
+    // So the record here is pinned again, under the CURRENT scheme, and
+    // the next observation compares like for like.
+    //
+    // Asserted positively (`Some` that starts with the tag), not as
+    // "None or tagged". The state here is `needs_input`, and an
+    // `is_none_or` would silently pass through its `None` branch the
+    // day the retry stopped one transition earlier — proving nothing
+    // about the tagging it appears to check.
     let store = state_store(dir);
     let record = store
         .fulfill_state_get(PRODUCT)
         .expect("state")
         .expect("record");
+    let repinned = record
+        .checks_digest
+        .as_deref()
+        .expect("the retry ran through `verifying`, which pins a digest");
     assert!(
-        record
-            .checks_digest
-            .as_deref()
-            .is_none_or(|d| d.starts_with("checks/1:")),
-        "a digest pinned after the retry carries the current scheme: {:?}",
-        record.checks_digest
+        repinned.starts_with("checks/1:"),
+        "the new generation pins under the CURRENT scheme, so the old value is replaced \
+         rather than carried: {repinned}"
     );
     drop(store);
 }
