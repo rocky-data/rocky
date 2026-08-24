@@ -2945,13 +2945,39 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
             .unwrap_or_else(|e| panic!("get_prompt {name}: {e}"));
         let haystack = prompt_text(&result);
 
-        // The rule is `names_excluded_tool`, not `contains` — the third
-        // thing here that is derived rather than written down, and the one
-        // that caught a violation on THIS surface after two rounds of
-        // believing it clean: the `add_tests_to_pks` worker body said
-        // "Proposing a wrong key invariant", which an exact-name compare
-        // reads as prose. See the rule's own doc for why the remedy is to
-        // reword rather than to relax it.
+        // TWO HAYSTACKS, TWO JOBS (ninth round, finding 2).
+        //
+        // The NAME rule runs over the WHOLE serialized result, not over a
+        // chosen field. `prompt_text` reads `messages`, and
+        // `GetPromptResult` also carries a `description` that no sweep
+        // read — which is how two worker descriptions went on promising a
+        // write ("draft tests", "Add key tests") while their bodies were
+        // report-only.
+        //
+        // Row 3 is therefore defined by CHANNEL, not by field: everything
+        // `prompts/get` returns. Adding a "surface 10" for `description`
+        // would have bought a surface 11 for the next field — enumerating
+        // fields is exactly what lost here.
+        let whole = serde_json::to_string(&result).expect("prompt result serializes");
+        assert_eq!(
+            rocky_mcp::names_excluded_tool(&whole, &excluded_tool_mentions),
+            None,
+            "worker-profile `{name}` must not name an excluded tool anywhere in its \
+             `prompts/get` result; whole result:\n{whole}"
+        );
+
+        // The ANCHOR assertions keep reading `messages`, because they are
+        // about what the body instructs. Deliberately not merged with the
+        // sweep above: a `description` that happens to contain the word
+        // would otherwise satisfy a body assertion.
+        //
+        // The rule is `names_excluded_tool`, not `contains` — derived
+        // rather than written down, and it caught a violation on THIS
+        // surface after two rounds of believing it clean: the
+        // `add_tests_to_pks` worker body said "Proposing a wrong key
+        // invariant", which an exact-name compare reads as prose. See the
+        // rule's own doc for why the remedy is to reword rather than to
+        // relax it.
         assert_eq!(
             rocky_mcp::names_excluded_tool(&haystack, &excluded_tool_mentions),
             None,
@@ -2981,6 +3007,53 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
                 haystack.contains(allowed),
                 "worker-profile `{name}` still orchestrates in-profile tool `{allowed}`; \
                  full text:\n{haystack}"
+            );
+        }
+
+        // The DESCRIPTION must agree with the body about where the work
+        // ends (ninth round, finding 2). Both fields of this result are
+        // guidance; a description that promises an ending the body
+        // withholds is a contradiction served in one payload, and it is
+        // the field half that went unchecked.
+        let description = result
+            .description
+            .as_deref()
+            .unwrap_or_else(|| panic!("worker-profile `{name}` returns a description"));
+        let description_lower = description.to_lowercase();
+        assert!(
+            description_lower.contains("runner handoff"),
+            "worker-profile `{name}`'s `prompts/get` description must end where its body \
+             ends — at the runner handoff: {description}"
+        );
+
+        // And it must not PROMISE a spec-owned write. `find_untested_models`
+        // said "draft tests" and `add_tests_to_pks` said "Add key tests"
+        // while both bodies were report-only.
+        //
+        // HAND-WRITTEN, and that is a real weakness — this file's own
+        // convention is to derive. Nothing exists to derive it FROM: the
+        // spec-owned nouns live in a banner format string, not a router.
+        // It is kept as an honest backstop for a class the derived name
+        // rule structurally cannot see, because neither promise names a
+        // tool. The general defence is finding 1's lesson — read what the
+        // text tells the worker to DO — not this list.
+        for promise in [
+            "draft tests",
+            "draft the tests",
+            "add tests",
+            "add key tests",
+            "write tests",
+            "draft checks",
+            "add checks",
+            "write checks",
+            "draft a contract",
+            "add a contract",
+            "write metadata",
+        ] {
+            assert!(
+                !description_lower.contains(promise),
+                "worker-profile `{name}`'s description promises `{promise}`, which is \
+                 spec-owned here and which its body does not do: {description}"
             );
         }
     }
@@ -3405,6 +3478,82 @@ async fn worker_result_text_names_no_excluded_tool() {
             rocky_mcp::names_excluded_tool(&whole, &excluded),
             None,
             "worker `{tool}` result text must not name an excluded tool: {whole}"
+        );
+    }
+
+    // Surface 9 — the ERROR envelope, which the enumeration inventoried as
+    // `remediation_hint` alone. A `ToolError` carries `message` too, plus
+    // `policy_rule` and the flattened plan-handoff fields, and every one of
+    // them is served text. Same fix as row 3: sweep the WHOLE envelope, so
+    // a field added to `ToolError` is covered without this test knowing the
+    // shape.
+    //
+    // STILL PARTIAL, and the label is not softened. What is driven here is
+    // the ARGUMENT-VALIDATION arm of the tools that have one — the errors a
+    // harness can reach offline. Policy denials, warehouse failures and
+    // internal errors are not driven, so the row stays OPEN in the
+    // enumeration for the reason it always was: the hints are written per
+    // call site and there is no table to audit.
+    let mut errors = Vec::new();
+    for (tool, args) in [
+        ("compile", serde_json::json!({ "model": "no_such_model" })),
+        (
+            "plan_preview",
+            serde_json::json!({ "model": "no_such_model" }),
+        ),
+        ("lineage", serde_json::json!({ "model": "no_such_model" })),
+        (
+            "dependents",
+            serde_json::json!({ "model": "no_such_model" }),
+        ),
+        // `inspect_schema`, `catalog`, `test` and `breaking_change` are
+        // absent on purpose: they ignore their arguments (or take none), so
+        // no argument-validation arm exists to drive. Named here rather
+        // than silently omitted — an unexplained gap in a list like this is
+        // how the last five rounds started.
+        (
+            "sample_rows",
+            serde_json::json!({ "model": "no_such_model" }),
+        ),
+        (
+            "profile_column",
+            serde_json::json!({ "model": "orders", "column": "no_such_column" }),
+        ),
+        ("list", serde_json::json!({ "kind": "not_a_kind" })),
+        (
+            "draft_model",
+            serde_json::json!({ "name": "../escape", "sql": "SELECT 1", "intent": "x" }),
+        ),
+    ] {
+        let called = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(obj(args)))
+            .await
+            .unwrap_or_else(|e| panic!("`{tool}` error-path call: {e}"));
+        // THE PROBE MUST EXHIBIT THE CONDITION: a call that SUCCEEDED
+        // sweeps a success envelope and reports green either way.
+        assert_eq!(
+            called.is_error,
+            Some(true),
+            "`{tool}` must FAIL here or this sweeps no error envelope at all: {called:?}"
+        );
+        let envelope = called
+            .structured_content
+            .clone()
+            .unwrap_or_else(|| panic!("`{tool}` error returns a structured envelope"));
+        assert!(
+            envelope.get("message").is_some() && envelope.get("remediation_hint").is_some(),
+            "`{tool}`'s envelope carries BOTH text fields, or the sweep below is \
+             inventorying the wrong thing: {envelope}"
+        );
+        errors.push((tool, envelope));
+    }
+    assert_eq!(errors.len(), 8, "eight reachable error paths are driven");
+    for (tool, envelope) in &errors {
+        let whole = serde_json::to_string(envelope).expect("envelope serializes");
+        assert_eq!(
+            rocky_mcp::names_excluded_tool(&whole, &excluded),
+            None,
+            "worker `{tool}` ERROR envelope must not name an excluded tool: {whole}"
         );
     }
 

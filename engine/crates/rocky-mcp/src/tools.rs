@@ -504,8 +504,8 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 ///                                                   projected_and_default_stays_verbatim
 ///   2  prompts/list -> description                 swept: worker_prompt_descriptions_
 ///                                                   name_no_excluded_tool
-///   3  prompts/get  -> message bodies              swept: worker_profile_prompts_end_
-///                                                   at_the_runner_handoff
+///   3  prompts/get  -> THE WHOLE RESULT             swept: worker_profile_prompts_end_
+///        (messages AND description)                  at_the_runner_handoff
 ///   4  tools/list   -> tool description            swept: worker_tool_descriptions_
 ///                                                   name_no_excluded_tool
 ///   5  tools/list   -> input_schema text           swept: worker_profile_guidance_
@@ -517,12 +517,28 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 ///                                                   profile_selected
 ///   8  tools/call   -> ok: other result text       PARTIAL — two DIFFERENT
 ///                                                   reasons, split below
-///   9  tools/call   -> err: remediation_hint       OPEN — not swept
+///   9  tools/call   -> err: THE WHOLE ToolError    PARTIAL — argument arms
+///        (message AND remediation_hint AND          swept, the rest OPEN
+///         policy_rule AND the plan fields)
 /// ```
 ///
-/// NINE SURFACES: SIX SWEPT, ONE PARTIAL, ONE NOT SERVED, ONE OPEN. Not
-/// "all swept" — that sentence has now been believed five times about a set
-/// that was incomplete, which is the whole reason for the count.
+/// NINE SURFACES: SIX SWEPT, TWO PARTIAL, ONE NOT SERVED. Not "all swept" —
+/// that sentence has now been believed five times about a set that was
+/// incomplete, which is the whole reason for the count.
+///
+/// EVERY ROW IS A CHANNEL, NOT A FIELD, and the ninth round is why. Rows 3
+/// and 9 used to name one field each — `prompts/get`'s message bodies, and
+/// `ToolError`'s `remediation_hint`. Both were wrong by omission.
+/// `GetPromptResult` also carries a `description`, which no sweep read, and
+/// which is where two worker prompts went on promising a write their bodies
+/// withheld. `ToolError` also carries `message`, `policy_rule` and the
+/// flattened plan-handoff fields, all of them served text.
+///
+/// The fix is structural rather than additive. A row now covers everything
+/// its channel returns, and its sweep matches the WHOLE serialized payload,
+/// so a field added later is covered without any test knowing the shape.
+/// Adding a "surface 10" for `description` would have bought a surface 11
+/// for the next field: enumerating fields is precisely what lost here.
 ///
 /// (1) WAS EXEMPT AND IS NOW SWEPT, and how it fell is worth keeping. The
 /// argument for exempting it was that the instructions are the canonical
@@ -592,19 +608,40 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// the audit, the second never closes. Reporting them as one PARTIAL let
 /// the unfinished half borrow the finished half's excuse.
 ///
-/// (9) IS THE OPEN GAP, stated rather than glossed. A `ToolError`'s
-/// `remediation_hint` is guidance, it is served to the worker, and it is
-/// not swept: reaching every hint means driving every error path of every
-/// served tool, which no harness here does, and the hints are written per
-/// call site so there is no table to audit instead.
+/// (9) IS PARTIAL, and was previously inventoried as one field of an
+/// envelope that has four. A `ToolError` carries `message` AND
+/// `remediation_hint`, plus `policy_rule` and the flattened plan-handoff
+/// fields; all of them are guidance, and all of them reach the worker.
 ///
-/// THE LIST IS CLOSED AT THE PROTOCOL LEVEL rather than by inspection.
+/// What is swept is the ARGUMENT-VALIDATION arm of the eight worker-served
+/// tools that have one, each as a WHOLE serialized envelope, with the
+/// failure asserted first so a call that silently succeeded cannot pass as
+/// coverage. What is NOT swept is every other arm — policy denials,
+/// warehouse failures, internal errors — because reaching them means
+/// driving every error path of every served tool, which no harness here
+/// does, and the hints are written per call site so there is no table to
+/// audit instead. That residue is UNFINISHED AUDIT COVERAGE, the same
+/// category as (8)'s first bullet: it closes by doing the work.
+///
+/// THE CHANNELS ARE CLOSED AT THE PROTOCOL LEVEL; THE FIELDS ARE NOT.
 /// [`RockyMcpServer::get_info`] enables `tools` and `prompts` and nothing
 /// else, so there is no `resources/read`, no completion and no logging
-/// channel able to carry a tenth kind of text.
+/// channel able to carry a tenth KIND of text, and
 /// `the_server_opens_no_guidance_channel_beyond_tools_and_prompts` pins
-/// that, so enabling one fails a test and forces a revisit of this comment
+/// that — enabling one fails a test and forces a revisit of this comment
 /// instead of silently opening surface 10.
+///
+/// That bound is real and it is narrower than it once read here. A
+/// capability gate closes the set of CHANNELS. It cannot close the set of
+/// FIELDS inside a channel: `GetPromptResult` grew a `description` this
+/// enumeration never counted, and no capability flag would have announced
+/// it. Nothing at the protocol level stops a struct gaining a field.
+///
+/// Which is exactly why every row above matches the WHOLE serialized
+/// payload of its channel rather than a field it went looking for. The
+/// capability bound and the whole-payload sweeps are two halves of one
+/// argument: the first closes the channels, the second is what covers the
+/// fields the first cannot see.
 ///
 /// SCOPE: this counts the MCP SESSION. A worker MAY also receive the
 /// driver's TASK BRIEF, which is out-of-band — written to the task outbox,
@@ -4571,9 +4608,14 @@ impl RockyMcpServer {
                      verbs belong to the trusted runner and are not served in this profile.",
                 ),
             ];
+            // NINTH ROUND, finding 2. This said "draft tests" while the
+            // body above it is report-only — the description promised a
+            // write the prompt withholds. It names no excluded tool, so
+            // the name-based sweep read it as clean, and the sweep did not
+            // read this field at all.
             return Ok(GetPromptResult::new(messages).with_description(
-                "Find untested Rocky models and draft tests (worker profile, ends at the \
-                 runner handoff)",
+                "Find untested Rocky models and REPORT the assertions each one needs \
+                 (worker profile, ends at the runner handoff)",
             ));
         }
         let messages = vec![
@@ -4687,8 +4729,12 @@ impl RockyMcpServer {
                     ),
                 ),
             ];
+            // NINTH ROUND, finding 2 — the sibling of the one on
+            // `find_untested_models`. "Add key tests to X" promised the
+            // write; the body reports the assertions and stops.
             return Ok(GetPromptResult::new(messages).with_description(format!(
-                "Add key tests to {scope} (worker profile, ends at the runner handoff)"
+                "REPORT the key assertions {scope} needs (worker profile, ends at the \
+                 runner handoff)"
             )));
         }
         let messages = vec![
