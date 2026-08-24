@@ -235,7 +235,38 @@ pub fn declarative_test_count(models_dir: &Path, model: &str) -> Result<usize> {
     Ok(found.config.tests.len())
 }
 
-/// A digest over the EXPANDED check set a model would execute.
+/// Exactly what a check-set digest covers: everything
+/// [`execute_declarative`] reads out of a loaded model, and nothing else.
+///
+/// That loop reads two fields and no others — `tests` (WHAT runs) and
+/// `target` (the `catalog.schema.table` the generated SQL names, i.e.
+/// WHERE it runs). Digesting `tests` alone left a hole: a sidecar
+/// rewrite that touched only `[target]` produced the same digest and a
+/// different table, so the comparison went green while the approved
+/// query ran somewhere else.
+///
+/// The rule for adding a field here is the loop above: digest it when
+/// execution reads it. `ModelConfig.adapter` is deliberately absent —
+/// the declarative path ignores the per-model override and runs every
+/// check through the pipeline's adapter, so hashing it would raise
+/// custody holds over a value that cannot change what happens.
+#[cfg(feature = "duckdb")]
+#[derive(serde::Serialize)]
+struct CheckSetPreimage<'a> {
+    /// The expanded `[[tests]]` vector the runner iterates.
+    tests: &'a [rocky_core::tests::TestDecl],
+    /// The table those checks are generated against.
+    target: &'a rocky_core::models::TargetConfig,
+}
+
+/// THE ONE PLACE a check-set digest is computed.
+///
+/// Both sides of the custody comparison come through here — the
+/// verify-time [`declarative_check_digest`] and the observation-time
+/// [`LoadedCheckSet::bind`]. Two preimages that drifted apart would
+/// mismatch on an untouched directory, and that reads as a legitimate
+/// custody divergence: a hold nobody can diagnose and no restore can
+/// clear. One function, so they cannot drift.
 ///
 /// Hashes what the loader actually produces — `ModelConfig.tests` after
 /// every `[[use_test]]` reference has been resolved — rather than the
@@ -249,43 +280,108 @@ pub fn declarative_test_count(models_dir: &Path, model: &str) -> Result<usize> {
 /// in this same vector before it can run.
 ///
 /// Deterministic: the vector is file order (inline tests, then resolved
-/// references in reference order), `TestDecl` serializes its fields in
-/// declaration order, and no field is a map or set. Pinned by
-/// `the_check_digest_is_stable_across_loads`.
+/// references in reference order), `TestDecl` and `TargetConfig`
+/// serialize their fields in declaration order, and no field is a map or
+/// set. Pinned by `the_check_digest_is_stable_across_loads`.
 ///
 /// An unknown model is an error, never a digest over an empty set — the
 /// same rule [`declarative_test_count`] follows, for the same reason.
+#[cfg(feature = "duckdb")]
+fn check_set_digest(models: &[rocky_core::models::Model], model: &str) -> Result<String> {
+    let found = models
+        .iter()
+        .find(|loaded| loaded.config.name == model)
+        .ok_or_else(|| anyhow::Error::new(ModelNotFound(model.to_string())))?;
+    let bytes = serde_json::to_vec(&CheckSetPreimage {
+        tests: &found.config.tests,
+        target: &found.config.target,
+    })
+    .context("failed to serialize the expanded check set")?;
+    Ok(rocky_core::product::manifest::content_digest(&bytes))
+}
+
+/// A digest over the EXPANDED check set a model would execute.
 ///
 /// Digests one load and drops it. That is right where nothing is about
 /// to execute — the verify bundle pins a value for a later comparison.
 /// A caller that will RUN the checks must use [`LoadedCheckSet`]
 /// instead, which keeps the digested snapshot and executes that same
 /// one.
+///
+/// Resolves NO warehouse adapter, on purpose. This is the verify-time
+/// side: it only needs a value to pin. Making it read `rocky.toml` would
+/// turn an unloadable config at verify into an absent digest, and an
+/// absent digest dooms the whole generation at observation — a config
+/// problem punished as a custody failure.
 #[cfg(feature = "duckdb")]
 pub fn declarative_check_digest(models_dir: &Path, model: &str) -> Result<String> {
-    Ok(LoadedCheckSet::load(models_dir, model)?.digest.clone())
+    check_set_digest(&load_all_models(models_dir)?, model)
 }
 
-/// One loaded, digested check set — the snapshot that is compared
-/// against the pinned digest and then executed.
+/// Why [`LoadedCheckSet::bind`] could not hand back a runnable handle.
+///
+/// Two failures, two different remedies, so they are two variants. A
+/// check set that will not load is the custody gate's business — the
+/// operator restores what changed. An unresolvable warehouse is not: the
+/// remedy is to fix `rocky.toml` (or wait out a warehouse that is down)
+/// and re-run. Collapsing them into one error would print the custody
+/// remedy — "restore the file you changed … put the change in the
+/// product spec" — at someone whose config has a typo.
+#[cfg(feature = "duckdb")]
+#[derive(Debug)]
+pub enum BindFailure {
+    /// The models directory would not load, or it holds no such model.
+    CheckSet(anyhow::Error),
+    /// The config would not load, or it names no resolvable adapter.
+    Warehouse(anyhow::Error),
+}
+
+#[cfg(feature = "duckdb")]
+impl std::fmt::Display for BindFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CheckSet(err) | Self::Warehouse(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+/// One loaded, digested, warehouse-BOUND check set — the snapshot that
+/// is compared against the pinned digest and then executed.
 ///
 /// This type exists because the custody gate is a
-/// time-of-check/time-of-use problem. Digesting through one
-/// [`load_all_models`] call and then executing through a SECOND one
-/// compares snapshot A and runs snapshot B: a rewrite of
-/// `models/test_definitions.toml` (or of a sidecar) between the two
-/// slips past a matching digest and the loop executes SQL nobody
-/// approved. Every explicit refusal arm around it fails closed
-/// correctly; that gap is the one that does not reach an arm at all.
+/// time-of-check/time-of-use problem. The comparison is only worth
+/// making if nothing between it and the execution can change what runs
+/// or where it runs. Three reads used to sit in that window, and each
+/// one was a way past a matching digest:
 ///
-/// So the snapshot is OWNED. [`Self::load`] reads the filesystem once
-/// and keeps the whole loaded vector; [`Self::digest`] is that vector's
-/// digest; [`Self::run`] CONSUMES the handle to execute it. There is no
-/// path from a digest to an execution that reads disk again, and no
-/// caller can supply a different model filter — the filter is
-/// `self.model`, fixed when the digest was taken. A future edit that
-/// re-introduced a second load would have to delete this type to
-/// compile.
+/// ```text
+///   digest ─── models reread ────┐
+///          ├── target reread ────┼──▶ compare ──▶ EXECUTE
+///          └── rocky.toml reread ┘        (a rewrite in here was invisible)
+/// ```
+///
+///  - A second [`load_all_models`] call compared snapshot A and ran
+///    snapshot B, so a rewrite of a sidecar or of
+///    `models/test_definitions.toml` slipped past.
+///  - `[target]` is read by the execution loop but was outside the
+///    digest, so a target-only sidecar rewrite kept the digest and
+///    moved the table.
+///  - The warehouse adapter was resolved from `rocky.toml` AFTER the
+///    comparison, so a config rewrite rerouted the approved query to a
+///    different warehouse.
+///
+/// So the snapshot is OWNED and the warehouse is BOUND. [`Self::bind`]
+/// reads the filesystem — models and config — and keeps both; the
+/// target rides inside [`check_set_digest`]'s preimage; [`Self::run`]
+/// CONSUMES the handle to execute it.
+///
+/// The property is structural, not a comment: `run` takes NO arguments.
+/// A function with no path parameter cannot open a file, so
+/// re-introducing any of the three reads means changing this signature
+/// and every caller — a compile error, not a review catch. The same
+/// shape is pushed one layer up: `observe_declarative_checks` takes the
+/// handle and nothing else. And no caller can supply a different model
+/// filter — the filter is `self.model`, fixed when the digest was taken.
 #[cfg(feature = "duckdb")]
 pub struct LoadedCheckSet {
     /// Every model the loader produced, in loader order — kept whole so
@@ -299,29 +395,48 @@ pub struct LoadedCheckSet {
     /// The model whose expanded checks [`Self::digest`] covers, and the
     /// only model [`Self::run`] executes.
     model: String,
-    /// The digest over that model's expanded `ModelConfig.tests`.
+    /// The digest over that model's expanded checks AND its target.
     digest: String,
+    /// The warehouse those checks execute against, resolved from the
+    /// config BEFORE this handle — and therefore its digest — existed.
+    /// Held as the live adapter, not as a name: nothing later re-reads
+    /// `rocky.toml` to decide where the query goes.
+    warehouse: Arc<dyn WarehouseAdapter>,
 }
 
 #[cfg(feature = "duckdb")]
 impl LoadedCheckSet {
-    /// Load the project once and digest `model`'s expanded check set.
+    /// Read the project and the config once each, digest `model`'s
+    /// expanded check set, and bind the warehouse it will run against.
+    ///
+    /// The ONLY constructor. "A handle exists" therefore means "the
+    /// warehouse is already resolved", so there is no half-bound state
+    /// for a later read to fill in.
+    ///
+    /// Check set first, warehouse second: a caller that gets
+    /// [`BindFailure::CheckSet`] gets the same error
+    /// [`declarative_check_digest`] would have given it for the same
+    /// directory, rather than that error being masked by a config
+    /// problem. (`declarative_run` orders these the other way round, and
+    /// says why on its own helper — it has no digest to protect.)
     ///
     /// An unknown model is an error, never a digest over an empty set.
-    pub fn load(models_dir: &Path, model: &str) -> Result<Self> {
-        let models = load_all_models(models_dir)?;
-        let found = models
-            .iter()
-            .find(|loaded| loaded.config.name == model)
-            .ok_or_else(|| anyhow::Error::new(ModelNotFound(model.to_string())))?;
-        let bytes = serde_json::to_vec(&found.config.tests)
-            .context("failed to serialize the expanded check set")?;
-        let digest = rocky_core::product::manifest::content_digest(&bytes);
+    pub fn bind(
+        models_dir: &Path,
+        model: &str,
+        config_path: &Path,
+        pipeline_name: Option<&str>,
+    ) -> std::result::Result<Self, BindFailure> {
+        let models = load_all_models(models_dir).map_err(BindFailure::CheckSet)?;
+        let digest = check_set_digest(&models, model).map_err(BindFailure::CheckSet)?;
+        let warehouse = resolve_warehouse_adapter(config_path, pipeline_name)
+            .map_err(BindFailure::Warehouse)?;
         Ok(Self {
             model: model.to_string(),
             digest,
             models,
             models_dir: models_dir.to_path_buf(),
+            warehouse,
         })
     }
 
@@ -334,19 +449,15 @@ impl LoadedCheckSet {
     ///
     /// Takes `self` by value on purpose: the handle a caller compared
     /// is the handle that runs, and it cannot be compared again
-    /// afterwards against something else. Deliberately takes NO model
-    /// filter — widening the filter would execute checks the digest
-    /// never covered.
-    pub(crate) async fn run(
-        self,
-        config_path: &Path,
-        pipeline_name: Option<&str>,
-    ) -> Result<DeclarativeRun> {
-        let warehouse_adapter = resolve_warehouse_adapter(config_path, pipeline_name)?;
+    /// afterwards against something else. Takes nothing ELSE on
+    /// purpose either — see the type docs. `self.models_dir` is used
+    /// only to name the directory in the empty-project refusal; it is
+    /// never opened.
+    pub(crate) async fn run(self) -> Result<DeclarativeRun> {
         execute_declarative(
             &self.models,
             &self.models_dir,
-            &warehouse_adapter,
+            &self.warehouse,
             Some(&self.model),
         )
         .await

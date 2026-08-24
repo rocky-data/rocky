@@ -968,16 +968,47 @@ impl Runner {
         // is a reason to execute. "Every claim matched" and "the claim I
         // needed was made" are different questions.
         //
-        // ONE LOAD. `LoadedCheckSet::load` reads the models directory
-        // once and OWNS the result; its digest is that snapshot's, and
+        // ONE BIND. `LoadedCheckSet::bind` reads the models directory
+        // and `rocky.toml` once each and OWNS both results; its digest
+        // covers the snapshot AND the target, and
         // `observe_declarative_checks` consumes the same handle to
-        // execute it. Digesting through one read and executing through a
-        // second would compare snapshot A and run snapshot B — a
-        // rewrite landing between them matches the pinned digest and
-        // then runs unapproved SQL, which is the one shape none of the
-        // refusal arms below can see.
-        let loaded = fulfill_api::LoadedCheckSet::load(&self.models_dir, &model);
-        let verified_set = match (verified_digest.as_deref(), loaded) {
+        // execute it against the same bound warehouse. Digesting
+        // through one read and executing through a second would compare
+        // snapshot A and run snapshot B — a rewrite landing between
+        // them matches the pinned digest and then runs unapproved SQL,
+        // which is the one shape none of the refusal arms below can
+        // see. The handle's `run` takes no arguments, so re-opening
+        // that window is a compile error rather than a review catch.
+        let bound = fulfill_api::LoadedCheckSet::bind(
+            &self.models_dir,
+            &model,
+            &self.config_path,
+            // No pipeline filter: the same default `rocky test
+            // --declarative` resolves.
+            None,
+        );
+        // A WAREHOUSE failure is not a custody divergence and must not
+        // be reported as one. Nothing about the check set is in doubt —
+        // `rocky.toml` would not load, or the adapter it names would not
+        // resolve. The custody remedy ("restore the file you changed …
+        // then put the change in the product spec") cannot fix that,
+        // while fixing the config and re-running genuinely can, so it
+        // leaves through the `Unreadable` exit instead.
+        //
+        // Held aside rather than returned on the spot: a real custody
+        // divergence OUTRANKS it. Both are true at once when someone
+        // edits a sidecar and the config, and the restore is the
+        // instruction that matters.
+        let mut warehouse_problem: Option<String> = None;
+        let verified_set = match (verified_digest.as_deref(), bound) {
+            (None, _) => {
+                custody.push(
+                    "this generation recorded no digest of the checks it verified, so there \
+                     is nothing to compare what is on disk against"
+                        .to_string(),
+                );
+                None
+            }
             (Some(verified), Ok(set)) if verified == set.digest() => Some(set),
             (Some(verified), Ok(set)) => {
                 custody.push(format!(
@@ -987,19 +1018,15 @@ impl Runner {
                 ));
                 None
             }
-            (Some(_), Err(why)) => {
+            (Some(_), Err(fulfill_api::BindFailure::CheckSet(why))) => {
                 custody.push(format!(
                     "the check set on disk could not be digested, so it cannot be compared \
                      with the verified one: {why:#}"
                 ));
                 None
             }
-            (None, _) => {
-                custody.push(
-                    "this generation recorded no digest of the checks it verified, so there \
-                     is nothing to compare what is on disk against"
-                        .to_string(),
-                );
+            (Some(_), Err(fulfill_api::BindFailure::Warehouse(why))) => {
+                warehouse_problem = Some(format!("{why:#}"));
                 None
             }
         };
@@ -1020,11 +1047,25 @@ impl Runner {
                 cause: Some(UnevaluableCause::CheckCustody),
             });
         }
+        if let Some(why) = warehouse_problem {
+            return Ok(Event::ObservationChecks {
+                failed: 0,
+                errored: 0,
+                warned: 0,
+                deferred: None,
+                detail: format!(
+                    "the warehouse the declared checks run against could not be resolved, \
+                     so they were NOT run: {why}"
+                ),
+                prior_detail,
+                cause: Some(UnevaluableCause::Unreadable),
+            });
+        }
         // Unreachable by construction: every arm that failed to produce
-        // a set pushed onto `custody`, and a non-empty `custody`
-        // returned above. Written as a hold rather than an `expect` so
-        // the compiler's totality check has an honest answer instead of
-        // a panic on a user-reachable path.
+        // a set either pushed onto `custody` or set `warehouse_problem`,
+        // and both returned above. Written as a hold rather than an
+        // `expect` so the compiler's totality check has an honest answer
+        // instead of a panic on a user-reachable path.
         let Some(verified_set) = verified_set else {
             return Ok(Event::ObservationChecks {
                 failed: 0,
@@ -1037,21 +1078,20 @@ impl Runner {
             });
         };
 
-        let observed =
-            match fulfill_api::observe_declarative_checks(&self.config_path, verified_set).await {
-                Ok(observed) => observed,
-                Err(err) => {
-                    return Ok(Event::ObservationChecks {
-                        failed: 0,
-                        errored: 0,
-                        warned: 0,
-                        deferred: None,
-                        detail: format!("the declared data checks could not be read: {err:#}"),
-                        prior_detail,
-                        cause: Some(UnevaluableCause::Unreadable),
-                    });
-                }
-            };
+        let observed = match fulfill_api::observe_declarative_checks(verified_set).await {
+            Ok(observed) => observed,
+            Err(err) => {
+                return Ok(Event::ObservationChecks {
+                    failed: 0,
+                    errored: 0,
+                    warned: 0,
+                    deferred: None,
+                    detail: format!("the declared data checks could not be read: {err:#}"),
+                    prior_detail,
+                    cause: Some(UnevaluableCause::Unreadable),
+                });
+            }
+        };
         Ok(Event::ObservationChecks {
             failed: observed.failed,
             errored: observed.errored,
