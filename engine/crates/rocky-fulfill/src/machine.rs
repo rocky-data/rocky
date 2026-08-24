@@ -352,16 +352,25 @@ pub enum UnevaluableCause {
     /// (`product::spec::OutputSpec`) — and the lowering turns every one
     /// of them into an `expression` test at `severity = "error"`
     /// (`product::lowering::generated_tests`). A `not_null` comes from
-    /// `output.columns[].nullable` and row identity from `output.grain`.
-    /// Nothing else has a spec spelling: a typed shape
-    /// (`row_count_range`, `unique`, `accepted_values`, `in_range`,
+    /// an `output.columns` entry with `nullable = false`. And
+    /// `output.grain` lowers to exactly ONE uniqueness check: `unique`
+    /// on a single grain column, or `composite` + `kind = "unique"`
+    /// over several.
+    ///
+    /// That last one is the correction. The message used to list
+    /// `unique` flat among the shapes with no spec spelling, which is
+    /// false — the declared grain IS a uniqueness check, and the
+    /// lowering emits it in both arms. What has no spelling is
+    /// uniqueness that is not the grain: a `unique` on some other
+    /// column, a second one, or a `composite` whose `kind` is not
+    /// `unique`. Alongside it: another typed shape
+    /// (`row_count_range`, `accepted_values`, `in_range`,
     /// `regex_match`, `relationships`), a `warning` severity, a
-    /// `filter`, or a `[[use_test]]` reference cannot be expressed, so
-    /// for those the restore is the whole remedy. Pinned from the
-    /// lowering side by
-    /// `spec_checks_lower_only_to_error_severity_expression_tests` in
-    /// rocky-core, so teaching `checks` a new shape fails a test that
-    /// names this message.
+    /// `filter`, or a `[[use_test]]` reference. For those the restore
+    /// is the whole remedy. Pinned from the lowering side by
+    /// `spec_checks_lower_only_to_error_severity_expression_tests` and
+    /// the composite-grain arm in rocky-core, so teaching `checks` a
+    /// new shape fails a test that names this message.
     CheckCustody,
     /// The reading itself failed, or checks errored. Re-running can
     /// genuinely resolve this one: the warehouse may answer next time.
@@ -1735,6 +1744,19 @@ fn decide_observation_checks(
             // the field cannot hold, which is the same defect as naming
             // a command that cannot run. See `UnevaluableCause` for the
             // grounding and the lowering-side pin.
+            //
+            // The QUALIFICATION itself then over-corrected, and that is
+            // the same defect with the sign flipped. It listed `unique`
+            // flat among the unspellable shapes, but `output.grain`
+            // lowers straight to one — `unique` on a single grain
+            // column, `composite` + `kind = "unique"` over several
+            // (`product::lowering::generated_tests`, pinned there in
+            // both arms). What has no spelling is uniqueness that is
+            // NOT the declared grain. An over-claim about our own gate
+            // and an under-claim about our own spec both send an
+            // operator down a route the code does not support, so the
+            // sentence is checked in both directions by
+            // `applied_unevaluable_holds_and_names_the_restore`.
             let (next_command, remedy) = match cause {
                 Some(UnevaluableCause::CheckCustody) => (
                     format!("rocky fulfill {product}"),
@@ -1747,11 +1769,14 @@ fn decide_observation_checks(
                      is refused while the state is `applied`, so that order is not \
                      optional. Check first that the spec can hold your change: \
                      `output.checks` takes a SQL boolean and always lowers it to an \
-                     error-severity `expression` test, `output.columns` takes a not-null, \
-                     and `output.grain` takes row identity. A typed shape such as \
-                     `row_count_range` or `unique`, a `warning` severity, a `filter`, or a \
-                     `[[use_test]]` reference has no spec spelling — for those the restore \
-                     is the whole remedy"
+                     error-severity `expression` test, a not-null comes from an \
+                     `output.columns` entry with `nullable = false`, and `output.grain` \
+                     lowers to exactly one uniqueness check — `unique` on a single grain \
+                     column, or `composite` with `kind = \"unique\"` over several. Anything \
+                     else has no spec spelling: a uniqueness check that is not the declared \
+                     grain, another typed shape such as `row_count_range`, a `warning` \
+                     severity, a `filter`, or a `[[use_test]]` reference. For those the \
+                     restore is the whole remedy"
                         .to_string(),
                 ),
                 _ => (format!("rocky fulfill {product}"), String::new()),
@@ -4550,6 +4575,42 @@ mod tests {
                 "each unrepresentable shape is named — {shape} is missing: {message}"
             );
         }
+
+        // AND THE QUALIFICATION IS ITSELF QUALIFIED — the same defect
+        // with the sign flipped. Fixing the over-claim produced an
+        // under-claim: the sentence listed `unique` flat among the
+        // shapes with no spec spelling, when `output.grain` lowers
+        // DIRECTLY to a single-column `unique` or a `composite` +
+        // `kind = "unique"` (`product::lowering::generated_tests`,
+        // pinned in both arms in rocky-core). So it is checked in BOTH
+        // directions here: the grain's uniqueness is stated as
+        // spellable, and the uniqueness that is not spellable is
+        // qualified rather than the whole shape.
+        assert!(
+            message.contains("`output.grain` lowers to exactly one uniqueness check"),
+            "the declared grain IS a uniqueness check the spec can spell, and the message \
+             says so instead of listing `unique` as unreachable: {message}"
+        );
+        for spelled in [
+            "`unique` on a single grain column",
+            "`composite` with `kind = \"unique\"`",
+        ] {
+            assert!(
+                message.contains(spelled),
+                "both grain arms are named — {spelled} is missing: {message}"
+            );
+        }
+        assert!(
+            message.contains("a uniqueness check that is not the declared grain"),
+            "and the uniqueness that genuinely has no spelling is the NON-grain one, stated \
+             as such rather than as `unique` bare: {message}"
+        );
+        assert!(
+            at("`output.grain` lowers to exactly one uniqueness check")
+                < at("has no spec spelling"),
+            "what the spec CAN hold is stated before what it cannot, so the operator reads \
+             the route before the refusal: {message}"
+        );
 
         // A transient read failure: re-running genuinely can resolve it.
         for cause in [Some(UnevaluableCause::Unreadable), None] {

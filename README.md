@@ -268,7 +268,7 @@ Rocky ships a narrowed MCP surface for that worker. `rocky mcp --profile worker`
 
 The worker cannot write a data check through that server. Be exact about what that buys you: it closes the tool route, and nothing more. The worker runs as a normal process in your project directory, so a worker that can write files can still write a check into a sidecar.
 
-The loop does compare the checks it is about to run with the set the plan was verified against, and refuses to run a set that does not match. That catches a change made after verification. It does not catch a check that was already there when the plan was verified — that one is inside the approved set and runs like any other. Read the model's sidecar if you want to know what will run.
+The loop does compare the checks it is about to run with the set the plan was verified against, and refuses to run a set that does not match. That catches a change made after verification. It does not catch a check that was already there when the plan was verified — that one is inside the verified set and runs like any other. Verified is not approved: the loop pins that set itself, and nothing shows it to you or asks you to sign it off. Read the model's sidecar if you want to know what will run.
 
 The runner then re-reads what the agent wrote from disk, re-verifies it, and hands it to the same governed `propose` as any other agent change.
 
