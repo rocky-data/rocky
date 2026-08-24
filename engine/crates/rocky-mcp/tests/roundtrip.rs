@@ -3064,16 +3064,29 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
 /// FF-WP1 fix round 2 (item 5), extended by the F3 red team (finding 3) —
 /// the worker-profile guidance surfaces ON THE WIRE.
 ///
-/// Four of the seven surfaces `WORKER_GUIDANCE_SURFACES` enumerates are
-/// checked here as the worker actually receives them: prompt descriptions
-/// (2), tool descriptions (4), tool input schemas (5) and result
-/// `next_steps` (6). Of the other three, one more is swept at unit level
-/// (3, the prompt bodies), one is EXEMPT because the instructions serve
-/// the full authoring skill verbatim under a disclaiming banner (1), and
-/// one is OPEN (7, error `remediation_hint`). Five swept, one exempt, one
-/// open — the enumeration in `tools.rs` carries the reasons. This test
-/// does not claim to be the whole sweep, because "this is the whole
-/// sweep" is the sentence that has been wrong four times.
+/// Five of the NINE surfaces `WORKER_GUIDANCE_SURFACES` enumerates are
+/// checked here as the worker actually receives them: the served
+/// `instructions` (1), prompt descriptions (2), tool descriptions (4),
+/// tool input schemas (5) and the draft result's `next_steps` (7).
+///
+/// The other four live elsewhere in this file or in the crate's unit
+/// tests: the whole `prompts/get` result (3) in
+/// `worker_profile_prompts_end_at_the_runner_handoff`, and the successful
+/// result text (8), the pinned-absent `output_schema` (6) and the error
+/// envelope (9) in `worker_result_text_names_no_excluded_tool`. Six swept,
+/// two PARTIAL, one NOT SERVED — the enumeration in `tools.rs` carries the
+/// reasons, and it is the one place to update.
+///
+/// THIS HEADER WAS ITSELF STALE, and saying so is the point. It described
+/// a SEVEN-row enumeration, called surface 1 EXEMPT after it had been
+/// projected and swept, numbered `next_steps` as 6 while the sibling test
+/// in this same file correctly numbered `output_schema` 6, and called row
+/// 9 `remediation_hint` alone and OPEN. Prose about a gate rots faster
+/// than the gate, and a test file that disagrees with itself about which
+/// surface is which is the cheapest possible finding to hand a reviewer.
+///
+/// This test does not claim to be the whole sweep, because "this is the
+/// whole sweep" is the sentence that has been wrong five times.
 ///
 /// TWO THINGS ARE DERIVED, and both are the finding this was rewritten
 /// for. The excluded-tool set comes from the two real routers, replacing a
@@ -3196,7 +3209,9 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
         );
     }
 
-    // Surface 6: the draft tools' next_steps.
+    // Surface 7: the draft tools' next_steps. (Numbered 6 here until the
+    // ninth round, while the sibling test in this file correctly numbered
+    // `output_schema` 6 — the file disagreed with itself.)
     let draft = client
         .call_tool(
             CallToolRequestParams::new("draft_model").with_arguments(draft_args(

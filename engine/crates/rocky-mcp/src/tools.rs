@@ -6477,6 +6477,35 @@ mod tests {
                     prompt.name
                 );
             }
+            // The same write-promise backstop the `prompts/get` description
+            // carries (ninth round, finding 2). These two surfaces are one
+            // field apart and say nearly the same thing; guarding only the
+            // one that was caught is how the next round finds the sibling.
+            // Kept in sync deliberately — see the sweep in
+            // `worker_profile_prompts_end_at_the_runner_handoff`, which
+            // documents why the list is hand-written and what its weakness
+            // is.
+            let description_lower = description.to_lowercase();
+            for promise in [
+                "draft tests",
+                "draft the tests",
+                "add tests",
+                "add key tests",
+                "write tests",
+                "draft checks",
+                "add checks",
+                "write checks",
+                "draft a contract",
+                "add a contract",
+                "write metadata",
+            ] {
+                assert!(
+                    !description_lower.contains(promise),
+                    "worker-profile `prompts/list` description of '{}' promises \
+                     `{promise}`, which is spec-owned in this profile: {description}",
+                    prompt.name
+                );
+            }
         }
     }
 
