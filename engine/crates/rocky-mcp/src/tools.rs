@@ -402,19 +402,39 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     ),
     // TENTH ROUND, finding 1C — the retry instruction. It tells the worker
     // to branch on a run error's `failure_kind` and RETRY a `Transient`,
-    // which presumes executing SQL through a route this profile does not
-    // serve: no worker tool reaches the warehouse to produce a run error
-    // in the first place. Naming an outcome that cannot occur is the same
-    // defect class as naming a tool that is not served, and the remedy is
-    // the same — say what is actually true here.
+    // which presumes materializing a pipeline through a route this profile
+    // does not serve: no worker tool runs one, so no run error can occur to
+    // retry. Naming an outcome that cannot occur is the same defect class
+    // as naming a tool that is not served, and the remedy is the same —
+    // say what is actually true here.
+    //
+    // ELEVENTH ROUND, finding 2 — and the tenth round's replacement said
+    // something ELSE that is not true. It read "no tool this profile serves
+    // executes against the warehouse". Three do: `sample_rows` and
+    // `profile_column` both require live credentials and issue queries, and
+    // `inspect_schema` lists the warehouse's tables best-effort to ground a
+    // source the project never declared. The correction to a contradiction
+    // reached for a stronger claim than the contradiction needed, which is
+    // this branch's signature defect.
+    //
+    // DERIVED FROM THE ALLOWLIST, entry by entry, not from the sentence it
+    // replaces. Nine of the twelve reach no adapter at all —
+    // `breaking_change` (git + an in-process compile), `catalog`,
+    // `compile`, `dependents`, `draft_model`, `lineage`, `list`,
+    // `plan_preview` (offline; it reads the config only to pick a dialect)
+    // and `test` (its own in-memory DuckDB). The other three read. None of
+    // the twelve runs or materializes anything, and that — not "no
+    // warehouse access" — is what makes a run error unreachable here.
     (
         "Run **errors** carry a `failure_kind` (`Transient`, `AuthFailed`, `QueryRejected`, \
          `QuotaExceeded`, …) and sometimes a `cooldown_seconds`. Branch on *why* something \
          failed: retry a `Transient`, stop and surface an `AuthFailed`.",
-        "Run **errors** are not something you will see. No tool this profile serves executes \
-         against the warehouse, so there is no run to retry and no `failure_kind` to branch \
-         on. A tool result that reports a failure is a finding for your report — read it, \
-         name it, and do not work around it.",
+        "Run **errors** are not something you will see. No tool this profile serves runs or \
+         materializes anything, so there is no run to retry and no `failure_kind` to branch \
+         on. Three tools do READ the warehouse: `sample_rows` and `profile_column` query it \
+         directly, and `inspect_schema` lists its tables when it can. A read that fails comes \
+         back as that tool's own error, not as a run outcome. A tool result that reports a \
+         failure is a finding for your report — read it, name it, and do not work around it.",
     ),
     // The third check-authorship steer.
     (
@@ -6833,9 +6853,9 @@ mod tests {
                  (`{served}`): {body}"
             );
         }
-        // FINDING 1C — the retry steer. It presumed executing SQL through a
-        // route this profile does not serve; no worker tool reaches the
-        // warehouse, so no run error can occur to retry.
+        // FINDING 1C — the retry steer. It presumed materializing a pipeline
+        // through a route this profile does not serve; no worker tool runs
+        // one, so no run error can occur to retry.
         assert!(
             !body_lower.contains("retry a `transient`"),
             "the projected body must not tell the worker to retry a run error it cannot \
@@ -6845,6 +6865,30 @@ mod tests {
             body_lower.contains("there is no run to retry"),
             "and it must say why, rather than dropping the bullet: {body}"
         );
+        // ELEVENTH ROUND, finding 2 — and the reason it says must be the
+        // TRUE one. The tenth round's replacement justified the bullet with
+        // "no tool this profile serves executes against the warehouse",
+        // which is false: `sample_rows`, `profile_column` and
+        // `inspect_schema` are all on the allowlist and all read it. Pinned
+        // in BOTH directions, because dropping the over-claim without
+        // stating what replaces it would let the next rewrite reinstate it.
+        assert!(
+            !body_lower.contains("serves executes against the warehouse"),
+            "the projected body must not claim no served tool reaches the warehouse — \
+             `sample_rows`, `profile_column` and `inspect_schema` all do: {body}"
+        );
+        for reader in ["sample_rows", "profile_column", "inspect_schema"] {
+            assert!(
+                WORKER_PROFILE_TOOLS.contains(&reader),
+                "`{reader}` must still be on the allowlist, or the sentence naming it as a \
+                 warehouse reader is stale"
+            );
+            assert!(
+                body_lower.contains(reader),
+                "the body must name `{reader}` as a tool that reads the warehouse, rather \
+                 than denying that any tool does: {body}"
+            );
+        }
 
         // PROPERTY 4 — the banner names EVERY excluded tool, derived. The
         // banner is the one worker surface that names them deliberately:
