@@ -525,8 +525,7 @@ async fn execute_declarative(
 
         for test_decl in &model.config.tests {
             let result =
-                execute_one_test(test_decl, &model.config.name, &fq_table, &warehouse_adapter)
-                    .await;
+                execute_one_test(test_decl, &model.config.name, &fq_table, warehouse_adapter).await;
             results.push(result);
         }
     }

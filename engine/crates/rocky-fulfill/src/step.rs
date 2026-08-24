@@ -1037,25 +1037,21 @@ impl Runner {
             });
         };
 
-        let observed = match fulfill_api::observe_declarative_checks(
-            &self.config_path,
-            verified_set,
-        )
-        .await
-        {
-            Ok(observed) => observed,
-            Err(err) => {
-                return Ok(Event::ObservationChecks {
-                    failed: 0,
-                    errored: 0,
-                    warned: 0,
-                    deferred: None,
-                    detail: format!("the declared data checks could not be read: {err:#}"),
-                    prior_detail,
-                    cause: Some(UnevaluableCause::Unreadable),
-                });
-            }
-        };
+        let observed =
+            match fulfill_api::observe_declarative_checks(&self.config_path, verified_set).await {
+                Ok(observed) => observed,
+                Err(err) => {
+                    return Ok(Event::ObservationChecks {
+                        failed: 0,
+                        errored: 0,
+                        warned: 0,
+                        deferred: None,
+                        detail: format!("the declared data checks could not be read: {err:#}"),
+                        prior_detail,
+                        cause: Some(UnevaluableCause::Unreadable),
+                    });
+                }
+            };
         Ok(Event::ObservationChecks {
             failed: observed.failed,
             errored: observed.errored,
