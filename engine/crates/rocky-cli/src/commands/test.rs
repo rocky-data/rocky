@@ -436,13 +436,27 @@ impl std::fmt::Display for BindFailure {
 /// target rides inside [`check_set_digest`]'s preimage; [`Self::run`]
 /// CONSUMES the handle to execute it.
 ///
-/// The property is structural, not a comment: `run` takes NO arguments.
-/// A function with no path parameter cannot open a file, so
-/// re-introducing any of the three reads means changing this signature
-/// and every caller — a compile error, not a review catch. The same
-/// shape is pushed one layer up: `observe_declarative_checks` takes the
-/// handle and nothing else. And no caller can supply a different model
-/// filter — the filter is `self.model`, fixed when the digest was taken.
+/// The property that is structural is CALLER SUBSTITUTION, and it is
+/// worth stating exactly, because the obvious stronger claim is false.
+/// [`Self::run`] takes no models directory, no config path, and no
+/// model filter, and it consumes `self` — so no caller can hand this
+/// handle a different snapshot, point it at a different warehouse, or
+/// widen its scope, and doing any of those means changing this
+/// signature and every caller. That is a compile error rather than a
+/// review catch, and it is the whole guarantee.
+///
+/// It is NOT "nothing reads a file after the digest", and this must not
+/// be written as if it were. `models_dir` is a field on the handle, so
+/// `run` could re-open the directory without any signature changing at
+/// all — only the fact that it does not, and the comment on that field,
+/// stop it. And the bound adapter reads files of its own while
+/// executing: Snowflake key-pair auth reads its PEM inside `get_token`,
+/// which runs per request. The guarantee is about which snapshot and
+/// which warehouse a caller can select, not about filesystem
+/// quiescence.
+///
+/// The same shape is pushed one layer up: `observe_declarative_checks`
+/// takes the handle and nothing else.
 #[cfg(feature = "duckdb")]
 pub struct LoadedCheckSet {
     /// Every model the loader produced, in loader order — kept whole so

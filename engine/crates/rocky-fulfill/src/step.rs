@@ -1023,8 +1023,24 @@ impl Runner {
         // snapshot A and run snapshot B — a rewrite landing between
         // them matches the pinned digest and then runs unapproved SQL,
         // which is the one shape none of the refusal arms below can
-        // see. The handle's `run` takes no arguments, so re-opening
-        // that window is a compile error rather than a review catch.
+        // see. The handle's `run` takes no models directory and no
+        // config path and consumes the handle, so a caller cannot
+        // supply a second snapshot or a second warehouse — that
+        // substitution is a compile error rather than a review catch.
+        //
+        // Stated that narrowly on purpose. It is NOT "nothing reads a
+        // file after the digest": the handle keeps its `models_dir`
+        // field, and the bound adapter opens files of its own while
+        // executing. The closed window is a caller swapping what runs
+        // or where, not filesystem quiescence.
+        //
+        // And it does NOT bind this observation to the warehouse the
+        // APPLY used. The digest covers the check set and its target
+        // table; the adapter is resolved from whatever `rocky.toml`
+        // names right now. Re-routing the config after the apply and
+        // before the observation therefore certifies a different
+        // warehouse. That gap is open, reported, and Hugo's call — see
+        // the F3 review notes.
         let bound = fulfill_api::LoadedCheckSet::bind(
             &self.models_dir,
             &model,

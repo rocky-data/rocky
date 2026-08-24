@@ -1375,12 +1375,19 @@ mod tests {
     /// cannot reroute the approved query.
     ///
     /// `rocky.toml` is deliberately NOT in the digest — it is
-    /// operator-owned infrastructure, and hashing it would turn every
-    /// credential rotation into a custody hold whose printed remedy (a
-    /// restore) is not what the operator wants. Binding is the answer
-    /// instead: `LoadedCheckSet::bind` resolves the adapter, and
-    /// `run(self)` takes no arguments, so nothing later can read the
-    /// config again.
+    /// operator-owned infrastructure, and hashing it raw would turn
+    /// every credential rotation into a custody hold whose printed
+    /// remedy (a restore) is not what the operator wants. Binding is
+    /// the answer instead: `LoadedCheckSet::bind` resolves the adapter,
+    /// and `run(self)` takes no config path and consumes the handle, so
+    /// no caller can hand it a warehouse resolved from a different
+    /// config.
+    ///
+    /// Precisely that, and no more. It is not a claim that nothing
+    /// reads a file after the bind — the bound adapter reads its own
+    /// (Snowflake key-pair auth reads its PEM inside per-request
+    /// `get_token`). What is closed is CALLER SUBSTITUTION of the
+    /// warehouse, which is what this test drives.
     ///
     /// The fixture exhibits the condition it claims: after the rewrite,
     /// a FRESH bind against the same config really does reach a
