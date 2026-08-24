@@ -398,11 +398,16 @@ pub enum UnevaluableCause {
     /// `a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works`
     /// drives it end to end.
     ///
-    /// (Reading `product.rs`, `rocky product approve` should also be
-    /// accepted here — `blocked` is in its stop set, not its in-flight
-    /// set. Read from the code, NOT exercised by a test, and not the
-    /// command the stop prints. Stated as an observation rather than a
-    /// guarantee.)
+    /// (Reading `product.rs`, `rocky product approve` is also ACCEPTED
+    /// here — `blocked` is in `product_approve_in`'s stop set, not its
+    /// in-flight set. Accepted is not recovered, and the earlier version
+    /// of this note stopped at the first half. Re-approving the
+    /// UNCHANGED spec takes that function's same-digest early return: it
+    /// verifies the snapshot and returns having written no approval
+    /// record, no state record and no journal row, so the record is
+    /// still blocked. Only a NEW digest reaches the CAS that moves it to
+    /// `spec_approved`. Read from the code, NOT exercised by a test, and
+    /// not the command the stop prints.)
     ///
     /// Reachable today only from a record written by an intermediate
     /// build of this work package: `checks_digest` does not exist on
@@ -1745,10 +1750,31 @@ fn decide_observation_checks(
             // compares it against the same old-scheme value, forever.
             // `applied` is also in `rocky product approve`'s in-flight
             // refusal set, so the operator would be left with no route
-            // out at all. `blocked` has two: `--retry` re-enters at
-            // `spec_approved` and the fresh generation pins its own
-            // digest at its own verify, and `approve` is accepted from
-            // the stop set.
+            // out at all. `blocked` has two exits, and the SECOND IS
+            // CONDITIONAL. That distinction is the correction: this
+            // comment used to say only "`approve` is accepted from the
+            // stop set", which checks that the verb is PERMITTED here
+            // and reads as if that meant it recovers. Those are
+            // different properties, and only one of them was verified.
+            //
+            //  1. `--retry` — unconditional. `Event::RetryRequested` on
+            //     `Blocked` re-enters at `spec_approved` (or `init` when
+            //     no spec digest is recorded), clears `checks_digest`,
+            //     and the fresh generation pins its own digest at its
+            //     own verify. This is the exit that always works, and it
+            //     is the one the stop message prints.
+            //  2. `rocky product approve` — permitted, but it only MOVES
+            //     the record for a NEW spec digest. `blocked` is absent
+            //     from `product_approve_in`'s in-flight refusal set, so
+            //     the verb is accepted; re-approving the UNCHANGED spec
+            //     then takes that function's same-digest early return,
+            //     which verifies the snapshot and returns having written
+            //     nothing — no approval record, no state record, no
+            //     journal row — so the record is still blocked
+            //     afterwards. Only a new digest reaches the CAS that
+            //     replaces the fulfillment record with `spec_approved`.
+            //     The exit is therefore "edit the spec, then approve",
+            //     never "approve again".
             if matches!(cause, Some(UnevaluableCause::CheckSchemeChanged)) {
                 let reason = format!(
                     "{detail} — nothing on disk changed, and no restore alters a hash \
