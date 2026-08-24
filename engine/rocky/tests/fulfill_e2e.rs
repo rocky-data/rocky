@@ -2464,8 +2464,24 @@ fn a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works() {
     );
     assert!(
         !message.contains("something changed what would run"),
-        "and nothing on disk changed — saying so would accuse an operator of an edit they \
-         did not make: {message}"
+        "and no comparison here says anything did — saying so would accuse an operator of \
+         an edit that was never checked for: {message}"
+    );
+    // THE OTHER DIRECTION, which this test used to get wrong in its own
+    // prose: the message must not claim disk is CLEAN either. The scheme
+    // branch returns before the check set is loaded, so an edit to
+    // unmanifested `models/test_definitions.toml` can sit underneath this
+    // stop undetected. Custody here is unknown, and the stop has to say
+    // so — asserted positively, because "does not say clean" is satisfied
+    // by a message that says nothing at all.
+    assert!(
+        !message.contains("nothing on disk changed"),
+        "the expanded check set was never loaded here, so the stop cannot claim disk is \
+         unchanged: {message}"
+    );
+    assert!(
+        message.contains("UNKNOWN"),
+        "it must name the custody it did NOT establish, not quietly omit it: {message}"
     );
     assert_eq!(
         json["next_command"].as_str(),

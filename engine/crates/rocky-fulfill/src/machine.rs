@@ -1794,10 +1794,42 @@ fn decide_observation_checks(
             //     The exit is therefore "edit the spec, then approve",
             //     never "approve again".
             if matches!(cause, Some(UnevaluableCause::CheckSchemeChanged)) {
+                // WHAT THIS ARM MAY AND MAY NOT SAY ABOUT DISK.
+                //
+                // It used to say "nothing on disk changed". That is an
+                // over-claim of exactly the kind this work package keeps
+                // finding, and it is now inside the new code: the scheme
+                // branch in `step.rs` returns BEFORE binding the check
+                // set, so no expansion is loaded and nothing is compared.
+                // An edit to `models/test_definitions.toml` is invisible
+                // to every hash that DID run — the file is not a lowering
+                // artifact and appears in no manifest — so it can sit
+                // underneath a scheme mismatch perfectly happily.
+                //
+                // What the branch does prove is narrower, and it is worth
+                // stating rather than dropping: the arm is gated on
+                // `custody.is_empty()`, so the manifested artifacts were
+                // checked and matched, and the lowering is committed at
+                // `merged`. Beyond those, disk custody here is UNKNOWN,
+                // not clean.
+                //
+                //   manifested artifacts ─▶ compared, matched
+                //   expanded check set   ─▶ NEVER LOADED (returned first)
+                //   test_definitions.toml─▶ inside that expansion ⇒ unknown
+                //
+                // Unknown does not change the remedy: a hash algorithm is
+                // not restorable either way, and `--retry` re-pins the
+                // whole expansion under the current scheme, which settles
+                // the unknown as a side effect. So the message states the
+                // limit and keeps the same exit.
                 let reason = format!(
-                    "{detail} — nothing on disk changed, and no restore alters a hash \
-                     algorithm. Re-running this generation cannot resolve it either: only \
-                     a fresh generation pins a digest, at its own verify"
+                    "{detail} — the manifested artifacts still match and the lowering is \
+                     committed, but the expanded check set was never loaded here, so \
+                     whether an unmanifested file such as `models/test_definitions.toml` \
+                     also moved is UNKNOWN. Either way no restore alters a hash algorithm. \
+                     Re-running this generation cannot resolve it either: only a fresh \
+                     generation pins a digest, at its own verify — and that re-pin covers \
+                     the whole expansion, so it settles the unknown too"
                 );
                 let record = blocked(observed, reason, now);
                 return blocked_stop(
@@ -4806,6 +4838,25 @@ mod tests {
             assert!(
                 !stop.message.contains("put the change in the product spec"),
                 "and no spec field carries a digest scheme: {}",
+                stop.message
+            );
+            // AND IT MUST NOT OVER-CORRECT INTO A CLEAN CLAIM. `step.rs`
+            // returns on the scheme question BEFORE loading the check
+            // set, so an edit to unmanifested
+            // `models/test_definitions.toml` is neither detected nor
+            // excluded here. The message once said "nothing on disk
+            // changed", which is the custody assurance this arm is in no
+            // position to give. Both halves are pinned: the false claim
+            // is absent, and the honest one is present — a negative
+            // alone passes for a message that simply says nothing.
+            assert!(
+                !stop.message.contains("nothing on disk changed"),
+                "the expanded check set was never loaded, so this arm cannot certify disk: {}",
+                stop.message
+            );
+            assert!(
+                stop.message.contains("UNKNOWN"),
+                "it names the custody it did not establish: {}",
                 stop.message
             );
         }
