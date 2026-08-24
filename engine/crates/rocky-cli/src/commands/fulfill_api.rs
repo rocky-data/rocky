@@ -44,9 +44,17 @@ pub use crate::commands::test::declarative_test_count;
 // after `[[use_test]]` references are resolved. Hashing the expansion
 // rather than the files it came from is what makes the custody check
 // cover `models/test_definitions.toml`, which is not a lowering artifact
-// and is hashed nowhere.
+// and is hashed nowhere. This is the VERIFY-time entry: it pins a value
+// and nothing is about to run.
 #[cfg(feature = "duckdb")]
 pub use crate::commands::test::declarative_check_digest;
+// The OBSERVATION-time entry: one owned, digested snapshot of the check
+// set. The custody gate compares `digest()` and then hands this same
+// handle to `observe_declarative_checks`, which consumes it — so the
+// set that was compared is the set that runs, with no second read of
+// the filesystem in between.
+#[cfg(feature = "duckdb")]
+pub use crate::commands::test::LoadedCheckSet;
 // The loop's stop report (registered in export-schemas as `fulfill`),
 // and the one JSON printer, so the loop's whole rocky-cli surface stays
 // this module.
@@ -813,12 +821,21 @@ pub struct ObservedChecks {
 ///
 /// Invariant guarded: this is the same execution path `rocky test
 /// --declarative` takes — one shared typed core
-/// ([`crate::commands::test::declarative_run`]), not a second check
-/// engine. The set executed is the set the model loader expands, which is
-/// the set [`declarative_test_count`] reports as deferred at verify: the
-/// loop counts and executes from one source, so "N deferred" at verify
-/// and "N evaluated" at observation describe the same checks rather than
+/// ([`crate::commands::test::execute_declarative`], which
+/// `declarative_run` also calls), not a second check engine. The set
+/// executed is the set the model loader expands, which is the set
+/// [`declarative_test_count`] reports as deferred at verify: the loop
+/// counts and executes from one source, so "N deferred" at verify and
+/// "N evaluated" at observation describe the same checks rather than
 /// two re-derivations that have to be kept in step by hand.
+///
+/// Invariant guarded, second: what runs is the snapshot the caller
+/// already digested. `checks` is an OWNED [`LoadedCheckSet`] and is
+/// consumed here, so the custody comparison and the execution cannot
+/// read the filesystem twice — a rewrite between them has no window.
+/// The model and the models directory come from that handle too; this
+/// function cannot be pointed at a different model than the one whose
+/// digest was compared.
 ///
 /// Scoped to one model — the product's output model. A product is
 /// answerable for what it declared about its own output, not for the rest
@@ -826,11 +843,9 @@ pub struct ObservedChecks {
 #[cfg(feature = "duckdb")]
 pub async fn observe_declarative_checks(
     config_path: &Path,
-    models_dir: &Path,
-    model: &str,
+    checks: LoadedCheckSet,
 ) -> Result<ObservedChecks> {
-    let run =
-        crate::commands::test::declarative_run(config_path, models_dir, None, Some(model)).await?;
+    let run = checks.run(config_path, None).await?;
     let (declared, passed, failed, warned, errored, unevaluated) = (
         run.declared,
         run.passed(),

@@ -255,16 +255,102 @@ pub fn declarative_test_count(models_dir: &Path, model: &str) -> Result<usize> {
 ///
 /// An unknown model is an error, never a digest over an empty set — the
 /// same rule [`declarative_test_count`] follows, for the same reason.
+///
+/// Digests one load and drops it. That is right where nothing is about
+/// to execute — the verify bundle pins a value for a later comparison.
+/// A caller that will RUN the checks must use [`LoadedCheckSet`]
+/// instead, which keeps the digested snapshot and executes that same
+/// one.
 #[cfg(feature = "duckdb")]
 pub fn declarative_check_digest(models_dir: &Path, model: &str) -> Result<String> {
-    let all_models = load_all_models(models_dir)?;
-    let found = all_models
-        .iter()
-        .find(|loaded| loaded.config.name == model)
-        .ok_or_else(|| anyhow::Error::new(ModelNotFound(model.to_string())))?;
-    let bytes = serde_json::to_vec(&found.config.tests)
-        .context("failed to serialize the expanded check set")?;
-    Ok(rocky_core::product::manifest::content_digest(&bytes))
+    Ok(LoadedCheckSet::load(models_dir, model)?.digest.clone())
+}
+
+/// One loaded, digested check set — the snapshot that is compared
+/// against the pinned digest and then executed.
+///
+/// This type exists because the custody gate is a
+/// time-of-check/time-of-use problem. Digesting through one
+/// [`load_all_models`] call and then executing through a SECOND one
+/// compares snapshot A and runs snapshot B: a rewrite of
+/// `models/test_definitions.toml` (or of a sidecar) between the two
+/// slips past a matching digest and the loop executes SQL nobody
+/// approved. Every explicit refusal arm around it fails closed
+/// correctly; that gap is the one that does not reach an arm at all.
+///
+/// So the snapshot is OWNED. [`Self::load`] reads the filesystem once
+/// and keeps the whole loaded vector; [`Self::digest`] is that vector's
+/// digest; [`Self::run`] CONSUMES the handle to execute it. There is no
+/// path from a digest to an execution that reads disk again, and no
+/// caller can supply a different model filter — the filter is
+/// `self.model`, fixed when the digest was taken. A future edit that
+/// re-introduced a second load would have to delete this type to
+/// compile.
+#[cfg(feature = "duckdb")]
+pub struct LoadedCheckSet {
+    /// Every model the loader produced, in loader order — kept whole so
+    /// the execution core sees exactly what a plain declarative run
+    /// sees (the empty-project refusal and the unknown-model refusal
+    /// both read this vector).
+    models: Vec<rocky_core::models::Model>,
+    /// Where the snapshot was read from. Carried for the refusal
+    /// message only — never re-read.
+    models_dir: std::path::PathBuf,
+    /// The model whose expanded checks [`Self::digest`] covers, and the
+    /// only model [`Self::run`] executes.
+    model: String,
+    /// The digest over that model's expanded `ModelConfig.tests`.
+    digest: String,
+}
+
+#[cfg(feature = "duckdb")]
+impl LoadedCheckSet {
+    /// Load the project once and digest `model`'s expanded check set.
+    ///
+    /// An unknown model is an error, never a digest over an empty set.
+    pub fn load(models_dir: &Path, model: &str) -> Result<Self> {
+        let models = load_all_models(models_dir)?;
+        let found = models
+            .iter()
+            .find(|loaded| loaded.config.name == model)
+            .ok_or_else(|| anyhow::Error::new(ModelNotFound(model.to_string())))?;
+        let bytes = serde_json::to_vec(&found.config.tests)
+            .context("failed to serialize the expanded check set")?;
+        let digest = rocky_core::product::manifest::content_digest(&bytes);
+        Ok(Self {
+            model: model.to_string(),
+            digest,
+            models,
+            models_dir: models_dir.to_path_buf(),
+        })
+    }
+
+    /// The digest of the snapshot this handle owns.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Execute the checks of the snapshot this handle owns.
+    ///
+    /// Takes `self` by value on purpose: the handle a caller compared
+    /// is the handle that runs, and it cannot be compared again
+    /// afterwards against something else. Deliberately takes NO model
+    /// filter — widening the filter would execute checks the digest
+    /// never covered.
+    pub(crate) async fn run(
+        self,
+        config_path: &Path,
+        pipeline_name: Option<&str>,
+    ) -> Result<DeclarativeRun> {
+        let warehouse_adapter = resolve_warehouse_adapter(config_path, pipeline_name)?;
+        execute_declarative(
+            &self.models,
+            &self.models_dir,
+            &warehouse_adapter,
+            Some(&self.model),
+        )
+        .await
+    }
 }
 
 /// Model names, for [`reject_unknown_model`] — which takes `&[String]` so it
@@ -344,17 +430,46 @@ pub(crate) async fn declarative_run(
     model_filter: Option<&str>,
 ) -> Result<DeclarativeRun> {
     // 1. Load config + adapter registry.
+    let warehouse_adapter = resolve_warehouse_adapter(config_path, pipeline_name)?;
+
+    // 2. Load all models.
+    let all_models = load_all_models(models_dir)?;
+
+    execute_declarative(&all_models, models_dir, &warehouse_adapter, model_filter).await
+}
+
+/// Resolve the warehouse adapter the declarative checks execute against.
+///
+/// Split out so [`declarative_run`] and [`LoadedCheckSet::run`] resolve
+/// it identically. Config resolution stays FIRST in `declarative_run`,
+/// so an unloadable config still reports itself before an empty models
+/// directory does.
+fn resolve_warehouse_adapter(
+    config_path: &Path,
+    pipeline_name: Option<&str>,
+) -> Result<Arc<dyn WarehouseAdapter>> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
     ))?;
     let (_, pipeline) = registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    let warehouse_adapter = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
+    adapter_registry.warehouse_adapter(pipeline.target_adapter())
+}
 
-    // 2. Load all models.
-    let all_models = load_all_models(models_dir)?;
-
+/// Select and execute the declarative checks of an ALREADY-LOADED
+/// project snapshot.
+///
+/// Takes the models as a borrowed slice rather than a directory: this
+/// is the seam that lets a caller digest a snapshot and execute that
+/// same snapshot (see [`LoadedCheckSet`]). Nothing here touches the
+/// filesystem.
+async fn execute_declarative(
+    all_models: &[rocky_core::models::Model],
+    models_dir: &Path,
+    warehouse_adapter: &Arc<dyn WarehouseAdapter>,
+    model_filter: Option<&str>,
+) -> Result<DeclarativeRun> {
     // The loader is deliberately tolerant of a missing or empty directory
     // (`models_loader::load_project_models` returns an empty Vec, pinned by
     // its own `a_missing_directory_yields_no_models` test), so this path used
@@ -370,7 +485,7 @@ pub(crate) async fn declarative_run(
     // short-circuits first, so a model that exists but declares no tests is
     // indistinguishable there from a name that does not exist at all. The
     // former must stay exit 0; only the latter is an error.
-    reject_unknown_model(model_filter, &model_names(&all_models))?;
+    reject_unknown_model(model_filter, &model_names(all_models))?;
 
     // The declared count, on the NAME predicate alone — deliberately not
     // the has-tests closure below. A model the selection names but whose

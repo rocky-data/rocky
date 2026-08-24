@@ -44,6 +44,12 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // generated SQL so worker-authored text cannot ride into a brief.
     "rocky_cli::commands::fulfill_api::ObservedCheck",
     "rocky_cli::commands::fulfill_api::ObservedChecks",
+    // F3 — the OWNED, digested check-set snapshot. DELIBERATE addition:
+    // the custody gate compares this handle's digest and then hands the
+    // same handle to `observe_declarative_checks`, which consumes it, so
+    // the compared set and the executed set are one object rather than
+    // two reads of the same directory.
+    "rocky_cli::commands::fulfill_api::LoadedCheckSet",
     "rocky_cli::commands::fulfill_api::ReceiptLookup",
     // #1493 — the drafting-window reopen (typed outcome + the call).
     "rocky_cli::commands::fulfill_api::ReopenOutcome",

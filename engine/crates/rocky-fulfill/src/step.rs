@@ -967,25 +967,42 @@ impl Runner {
         // cannot ask the loader all look like `None`, and none of them
         // is a reason to execute. "Every claim matched" and "the claim I
         // needed was made" are different questions.
-        match (
-            verified_digest.as_deref(),
-            self.expanded_check_digest(&spec),
-        ) {
-            (Some(verified), Ok(current)) if verified == current => {}
-            (Some(verified), Ok(current)) => custody.push(format!(
-                "the check set on disk digests to {current}, but the set this generation \
-                 verified was {verified} — something changed what would run"
-            )),
-            (Some(_), Err(why)) => custody.push(format!(
-                "the check set on disk could not be digested, so it cannot be compared with \
-                 the verified one: {why}"
-            )),
-            (None, _) => custody.push(
-                "this generation recorded no digest of the checks it verified, so there is \
-                 nothing to compare what is on disk against"
-                    .to_string(),
-            ),
-        }
+        //
+        // ONE LOAD. `LoadedCheckSet::load` reads the models directory
+        // once and OWNS the result; its digest is that snapshot's, and
+        // `observe_declarative_checks` consumes the same handle to
+        // execute it. Digesting through one read and executing through a
+        // second would compare snapshot A and run snapshot B — a
+        // rewrite landing between them matches the pinned digest and
+        // then runs unapproved SQL, which is the one shape none of the
+        // refusal arms below can see.
+        let loaded = fulfill_api::LoadedCheckSet::load(&self.models_dir, &model);
+        let verified_set = match (verified_digest.as_deref(), loaded) {
+            (Some(verified), Ok(set)) if verified == set.digest() => Some(set),
+            (Some(verified), Ok(set)) => {
+                custody.push(format!(
+                    "the check set on disk digests to {}, but the set this generation \
+                     verified was {verified} — something changed what would run",
+                    set.digest()
+                ));
+                None
+            }
+            (Some(_), Err(why)) => {
+                custody.push(format!(
+                    "the check set on disk could not be digested, so it cannot be compared \
+                     with the verified one: {why:#}"
+                ));
+                None
+            }
+            (None, _) => {
+                custody.push(
+                    "this generation recorded no digest of the checks it verified, so there \
+                     is nothing to compare what is on disk against"
+                        .to_string(),
+                );
+                None
+            }
+        };
         if !custody.is_empty() {
             return Ok(Event::ObservationChecks {
                 failed: 0,
@@ -1003,11 +1020,26 @@ impl Runner {
                 cause: Some(UnevaluableCause::CheckCustody),
             });
         }
+        // Unreachable by construction: every arm that failed to produce
+        // a set pushed onto `custody`, and a non-empty `custody`
+        // returned above. Written as a hold rather than an `expect` so
+        // the compiler's totality check has an honest answer instead of
+        // a panic on a user-reachable path.
+        let Some(verified_set) = verified_set else {
+            return Ok(Event::ObservationChecks {
+                failed: 0,
+                errored: 0,
+                warned: 0,
+                deferred: None,
+                detail: "the verified check set was not available to run".to_string(),
+                prior_detail,
+                cause: Some(UnevaluableCause::CheckCustody),
+            });
+        };
 
         let observed = match fulfill_api::observe_declarative_checks(
             &self.config_path,
-            &self.models_dir,
-            &model,
+            verified_set,
         )
         .await
         {
