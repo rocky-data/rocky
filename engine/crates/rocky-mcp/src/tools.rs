@@ -728,6 +728,16 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// structured output shows the worker. It is now swept, and asserted
 /// non-empty so the sweep cannot degrade into reading an empty vector.
 ///
+/// AND THE HONEST LIMIT OF THAT: because rmcp derives `content` from the
+/// same `Value`, the bytes are identical today, so widening rows 8 and 9
+/// found nothing and could not have. What it buys is the guarantee the
+/// heading claims — a field added to the envelope, or a result constructed
+/// with `content` that is NOT a copy of the structured half, is covered
+/// without this test being edited. Rows 2 and 4/5 are different: their
+/// omitted fields (`title`, `arguments[].description`, `annotations`) are
+/// independently settable, and a mutation into `title` is caught by the
+/// widened sweep and was invisible to the field-selecting one.
+///
 /// So the honest form of the guarantee is about the SWEEPS, not the row
 /// labels: every row is covered by a sweep over the whole serialized payload
 /// of the channel that carries it. Rows 4, 5 and 7 name fields; their
