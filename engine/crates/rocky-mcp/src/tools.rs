@@ -2005,9 +2005,12 @@ impl RockyMcpServer {
     }
 
     #[tool(
-        description = "Run the project's DuckDB-backed local tests (contracts + assertions) and \
-         return pass/fail counts plus per-failure detail. Use after writing or changing a model. \
-         Pass `model` to scope the run to one model's tests."
+        description = "Run the project's DuckDB-backed local tests and return pass/fail counts \
+         plus per-failure detail. Covers BOTH local suites: executing each model, and the \
+         fixture-driven `[[test]]` blocks declared in model sidecars. `failures` carries both, \
+         each tagged with its `suite`; `models` and `unit_tests` hold the per-suite counts. \
+         Branch on `all_passed` — it is true only when both suites are clean. Use after writing \
+         or changing a model. Pass `model` to scope the run to one model's tests."
     )]
     async fn test(&self, params: Parameters<TestArgs>) -> ToolResult<TestResult> {
         let output = commands::test_output(&self.models_dir, None, params.0.model.as_deref())
@@ -2025,18 +2028,68 @@ impl RockyMcpServer {
                     ),
                 }
             })?;
-        let failures = output
+        // BOTH suites, aggregated. `test_output` records the fixture
+        // `[[test]]` run in a SEPARATE `unit_tests` summary, and this result
+        // used to drop it: a project whose models all execute but whose
+        // fixture test fails came back as `failures: []`, which is the
+        // vacuous pass this work package exists to remove. The worker prompt
+        // tells a worker to stop when the tests pass, so the empty list
+        // stopped it on a failing test.
+        let models = TestSuiteCounts {
+            total: output.total,
+            passed: output.passed,
+            failed: output.failures.len(),
+        };
+        let mut failures: Vec<TestFailureLite> = output
             .failures
             .into_iter()
             .map(|f| TestFailureLite {
                 name: f.name,
                 error: f.error,
+                suite: "model".to_string(),
             })
             .collect();
+        // Absent `unit_tests` means the project declares no `[[test]]`
+        // block. That is zero tests, not zero failures of an unrun suite,
+        // and the counts say so rather than the field going missing.
+        let unit_tests = match &output.unit_tests {
+            Some(summary) => TestSuiteCounts {
+                total: summary.total,
+                passed: summary.passed,
+                failed: summary.failed,
+            },
+            None => TestSuiteCounts {
+                total: 0,
+                passed: 0,
+                failed: 0,
+            },
+        };
+        if let Some(summary) = output.unit_tests {
+            for result in summary.results.into_iter().filter(|r| !r.passed) {
+                // `run_one_unit_test` sets `error` on every failure path, so
+                // the fallback is unreachable today. It is here because a
+                // failure that reports no reason at all is worse than one
+                // that reports a row count — the worker has to see SOMETHING
+                // to act on.
+                let mismatches = result.mismatches.len();
+                let error = result
+                    .error
+                    .unwrap_or_else(|| format!("{mismatches} row(s) did not match `expect`"));
+                failures.push(TestFailureLite {
+                    name: format!("{}::{}", result.model, result.test),
+                    error,
+                    suite: "unit".to_string(),
+                });
+            }
+        }
+        let all_passed = failures.is_empty();
         Ok(Json(TestResult {
-            total: output.total,
-            passed: output.passed,
+            total: models.total + unit_tests.total,
+            passed: models.passed + unit_tests.passed,
             failures,
+            all_passed,
+            models,
+            unit_tests,
         }))
     }
 
@@ -5221,14 +5274,18 @@ impl RockyMcpServer {
                          by any route, this server or a file you can write. Record the \
                          finding (which assertion, what the data actually holds) in your \
                          handoff.\n\
-                         4. compile, then re-run the `test` tool. Loop until the failure is \
-                         genuinely resolved, not silenced.\n\n\
+                         4. compile, then re-run the `test` tool. Read `all_passed`, not the \
+                         model counts: it is true only when the model runs AND the fixture \
+                         `[[test]]` blocks are both clean, and each entry in `failures` says \
+                         which suite it came from. Loop until the failure is genuinely \
+                         resolved, not silenced.\n\n\
                          RECONCILE DISCIPLINE: the whole point is to check the data, not just \
                          the schema. A uniqueness test failing because the grain is actually \
                          composite (two columns, not one) is a real finding you can only see \
                          in the rows.\n\n\
-                         STOP when the tests pass (or the remaining failures are diagnosed as \
-                         wrong tests), and HAND OFF to the trusted runner: report what you \
+                         STOP when `all_passed` is true (or the remaining failures are \
+                         diagnosed as wrong tests), and HAND OFF to the trusted runner: \
+                         report what you \
                          fixed and what you diagnosed. Do not record plans, approve changes, \
                          or apply anything on your own — those verbs belong to the trusted \
                          runner and are not served in this profile."
@@ -5253,9 +5310,10 @@ impl RockyMcpServer {
                 format!(
                     "Diagnose and fix the failing tests in {scope}, using the MCP tools at each \
                      step:\n\n\
-                     1. test — run the declarative tests and read which assertions fail, on which \
-                     model, and the failing-row count. Each failure names the invariant it \
-                     checks.\n\
+                     1. test — run the project's LOCAL suites and read which ones fail, on which \
+                     model. The tool runs each model against DuckDB AND the fixture `[[test]]` \
+                     blocks in the sidecars; every entry in `failures` says which suite it came \
+                     from.\n\
                      2. For each failure, ground the cause before deciding the fix: profile_column \
                      the implicated columns (the ones the assertion references) to see their \
                      actual null rate, distinct count, and value domain, and sample_rows to look \
@@ -5266,8 +5324,9 @@ impl RockyMcpServer {
                      the test encodes an invariant the data was never meant to hold — fix the \
                      assertion. Do not weaken a test just to make it pass; that hides the \
                      defect.\n\
-                     4. compile, then re-run the `test` tool. Loop until the failure is genuinely \
-                     resolved, not silenced.\n\
+                     4. compile, then re-run the `test` tool. Read `all_passed`, not the model \
+                     counts: it is true only when both suites are clean. Loop until the failure \
+                     is genuinely resolved, not silenced.\n\
                      5. propose — generate the plan recording the fix. It is an AI-authored plan \
                      with a plan_id.\n\n\
                      RECONCILE DISCIPLINE: the whole point is to check the data, not just the \

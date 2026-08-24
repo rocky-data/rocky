@@ -475,6 +475,129 @@ async fn test_tool_scopes_to_a_model_and_refuses_unknown() {
     client.cancel().await.unwrap();
 }
 
+/// F3 round 11, finding 1 — A FAILING FIXTURE `[[test]]` MUST NOT COME BACK
+/// GREEN.
+///
+/// `commands::test_output` runs two suites and records them separately: each
+/// model executed against DuckDB, and the fixture-driven `[[test]]` blocks in
+/// the sidecars. The MCP result read only the first. A project whose models
+/// all execute but whose fixture test FAILS came back as `failures: []` —
+/// byte-identical to a clean run, and `is_error` unset either way.
+///
+/// That is the vacuous-pass class the work package exists to remove, and the
+/// worker prompt turned it from latent into live: `fix_failing_test` promises
+/// unit-test results and tells the worker to stop when the tests pass. A
+/// worker read the empty list, saw green, and stopped with a failing test on
+/// disk.
+///
+/// THE PROJECT IS BUILT SO THE TWO SUITES DISAGREE, which is the only shape
+/// that can catch this. `orders` is self-contained (`SELECT 1 AS id, …`), so
+/// executing it succeeds — the model suite is genuinely green. Its `[[test]]`
+/// expects `id = 2`, so the fixture run genuinely fails. Before the fix the
+/// result reported the green half and dropped the red one.
+///
+/// `failures` is asserted FIRST and on its own, because that is the field a
+/// worker reads and the field that was empty. An assertion that only checked
+/// the newly-added `all_passed` / `unit_tests` fields would fail before the
+/// fix for the wrong reason — those keys were simply absent — and would not
+/// demonstrate the false green at all.
+#[tokio::test]
+async fn a_failing_fixture_test_is_reported_not_swallowed() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    // Append a fixture test the model cannot satisfy: `orders` emits
+    // `id = 1`, the expectation demands `id = 2`.
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let mut toml = std::fs::read_to_string(&sidecar).unwrap();
+    toml.push_str(
+        "\n[[test]]\nname = \"orders_start_at_two\"\n\n\
+         [test.expect]\nrows = [ { id = 2, status = \"COMPLETE\" } ]\n",
+    );
+    std::fs::write(&sidecar, toml).unwrap();
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("test"))
+        .await
+        .expect("test call");
+    let sc = result.structured_content.expect("test result");
+
+    // THE REGRESSION. Empty here is the false green.
+    let failures = sc["failures"].as_array().expect("failures is a list");
+    assert!(
+        !failures.is_empty(),
+        "a failing fixture `[[test]]` must appear in `failures` — an empty list is the \
+         vacuous pass a worker stops on: {sc:?}"
+    );
+
+    // The model suite really is clean, so the failure could only have come
+    // from the fixture run. Without this the test would also pass on a
+    // project that was simply broken.
+    assert_eq!(sc["models"]["failed"], serde_json::json!(0), "{sc:?}");
+    assert_eq!(sc["models"]["passed"], serde_json::json!(1), "{sc:?}");
+
+    assert_eq!(sc["unit_tests"]["total"], serde_json::json!(1), "{sc:?}");
+    assert_eq!(sc["unit_tests"]["failed"], serde_json::json!(1), "{sc:?}");
+    assert_eq!(
+        sc["all_passed"],
+        serde_json::json!(false),
+        "`all_passed` is the field the prompt tells a worker to branch on: {sc:?}"
+    );
+
+    // The entry names its suite and the test, so a worker can act on it
+    // rather than guessing which half of the run broke.
+    let unit_failure = failures
+        .iter()
+        .find(|f| f["suite"] == serde_json::json!("unit"))
+        .unwrap_or_else(|| panic!("a unit-suite failure entry: {sc:?}"));
+    assert_eq!(
+        unit_failure["name"],
+        serde_json::json!("orders::orders_start_at_two"),
+        "{sc:?}"
+    );
+    assert!(
+        !unit_failure["error"]
+            .as_str()
+            .expect("error text")
+            .is_empty(),
+        "the failure carries a reason: {sc:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// The other half of the same contract: a project with NO `[[test]]` block
+/// reports the fixture suite as zero, not as absent.
+///
+/// "None declared" and "all passed" are different facts. An omitted field
+/// states neither, and the omission is what let the failing case above go
+/// unnoticed for as long as it did.
+#[tokio::test]
+async fn a_project_with_no_fixture_tests_reports_zero_not_absent() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let result = client
+        .call_tool(CallToolRequestParams::new("test"))
+        .await
+        .expect("test call");
+    let sc = result.structured_content.expect("test result");
+
+    assert_eq!(sc["unit_tests"]["total"], serde_json::json!(0), "{sc:?}");
+    assert_eq!(sc["unit_tests"]["failed"], serde_json::json!(0), "{sc:?}");
+    assert_eq!(sc["all_passed"], serde_json::json!(true), "{sc:?}");
+    assert_eq!(
+        sc["total"], sc["models"]["total"],
+        "with no fixture tests the aggregate is the model suite: {sc:?}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 /// FF-WP1: `review_queue` filters the listing by `product_id` via
 /// integrity-checked plan reads — and a pending plan whose file no longer
 /// passes its integrity check surfaces as a WARNING entry, never a silent
