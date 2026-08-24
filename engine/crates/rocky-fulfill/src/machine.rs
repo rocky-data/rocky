@@ -409,12 +409,30 @@ pub enum UnevaluableCause {
     /// `spec_approved`. Read from the code, NOT exercised by a test, and
     /// not the command the stop prints.)
     ///
-    /// Reachable today only from a record written by an intermediate
-    /// build of this work package: `checks_digest` does not exist on
-    /// `main`, so no released binary has ever written an untagged one.
-    /// It is here for the NEXT preimage change, which the rule on
-    /// `CheckSetPreimage` positively invites, and which would otherwise
-    /// strand every generation a released build had pinned.
+    /// REACHABILITY, without the narrowing this note used to carry. It
+    /// said "reachable today only from a record written by an
+    /// intermediate build of this work package", which reads as
+    /// near-unreachable and was used that way in a review. Only half of
+    /// it is true, and the half that is true does not carry the
+    /// conclusion:
+    ///
+    ///  - TRUE: `checks_digest` never shipped on `main`, so no RELEASED
+    ///    binary has written an untagged one.
+    ///  - Every build of this branch from before the scheme tag DID
+    ///    write one, and those pins persist in redb across the upgrade —
+    ///    nothing migrates a stored record.
+    ///  - The loop re-reads that stored record on the next `rocky
+    ///    fulfill`, so upgrade and resume compose into this arm without
+    ///    anyone doing anything unusual.
+    ///  - `a_digest_from_an_older_scheme_blocks_with_a_remedy_that_works`
+    ///    seeds exactly that persisted state and drives this arm on
+    ///    every CI run.
+    ///
+    /// So this is an exercised path, not a theoretical one. The
+    /// versioning also covers the NEXT preimage change, which the rule
+    /// on `CheckSetPreimage` positively invites, and which would
+    /// otherwise strand every generation a released build had pinned —
+    /// but that is the second reason, not the only one.
     CheckSchemeChanged,
     /// The reading itself failed, or checks errored. Re-running can
     /// genuinely resolve this one: the warehouse may answer next time.
