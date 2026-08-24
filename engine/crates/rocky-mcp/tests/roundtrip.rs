@@ -3229,6 +3229,35 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
         "the body must stop the worker at CHECK authorship, which is the hole this \
          projection closed: {body}"
     );
+    // TENTH ROUND — and the WHOLE handshake, not the `instructions` field.
+    // The header above says a reviewer running only the integration tests
+    // must not read their silence as coverage; that argument applies to the
+    // rest of the initialize result too. `InitializeResult` also carries
+    // `protocolVersion`, `capabilities` and `serverInfo`, whose
+    // `Implementation` has `title` / `description` / `icons` / `websiteUrl`
+    // — free text a worker reads before anything else. All four are `None`
+    // under `from_build_env()`, so nothing leaks; the unbacked guarantee was
+    // the defect. The banner is spliced out and nothing else is, because it
+    // is the one surface that names excluded tools on purpose.
+    let mut handshake = serde_json::to_value(
+        client
+            .peer_info()
+            .expect("the worker profile completes the handshake"),
+    )
+    .expect("initialize result serializes");
+    handshake["instructions"] = serde_json::Value::String(body.clone());
+    assert!(
+        handshake.get("serverInfo").is_some() && handshake.get("capabilities").is_some(),
+        "the handshake must carry serverInfo and capabilities, or this sweeps an envelope \
+         with the newly-covered fields missing: {handshake}"
+    );
+    let handshake = handshake.to_string();
+    assert_eq!(
+        rocky_mcp::names_excluded_tool(&handshake, &excluded),
+        None,
+        "the worker `initialize` result must not name an excluded tool anywhere outside \
+         the banner: {handshake}"
+    );
 
     // Surface 2: every listed prompt, as served over the wire.
     //
