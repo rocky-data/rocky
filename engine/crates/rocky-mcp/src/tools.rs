@@ -4650,12 +4650,13 @@ const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or 
 /// trusted runner instead.
 const WORKER_DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
      the warehouse. Continue the drafting loop: fix any error diagnostics above and re-draft \
-     (or `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, and \
-     encode what you verified as append-only checks with `draft_check`, executed via the `test` \
-     tool. When the draft is clean and its checks pass, STOP and end at the typed hand-off to \
-     the trusted runner: report the drafted files, the invariants you encoded, and anything you \
-     flagged. Recording, review, and apply belong to the trusted runner — never act on them \
-     yourself.";
+     (or `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, and run \
+     the `test` tool until the checks the product already declares pass. Those checks are \
+     spec-owned here — do not add one of your own; if the data needs an invariant the spec does \
+     not state, say so in the SQL's comments. When the draft is clean and its checks pass, STOP \
+     and end at the typed hand-off to the trusted runner: report the drafted files, what you \
+     verified, and anything you flagged. Recording, review, and apply belong to the trusted \
+     runner — never act on them yourself.";
 
 /// The authoring-loop reminder every successful `draft_contract` response
 /// carries. The contract is written and compile-validated, never applied.
@@ -5463,15 +5464,27 @@ mod tests {
     /// Tools the worker profile does not serve — no worker-served guidance
     /// surface may name them (the instructions BANNER is the one deliberate
     /// exception: naming them as absent is its job).
-    const WORKER_EXCLUDED_TOOL_MENTIONS: &[&str] = &[
-        "propose",
-        "review_queue",
-        "draft_contract",
-        "draft_metadata",
-        "pause_schedule",
-        "ai_test",
-        "ai_contract",
-    ];
+    ///
+    /// DERIVED from the two real routers, not hand-picked. It used to be a
+    /// literal list, and that is exactly how `draft_check` slipped: this
+    /// work package removed it from `WORKER_PROFILE_TOOLS` while
+    /// `WORKER_DRAFT_NEXT_STEPS` still told the worker to call it, and the
+    /// hand-picked list did not name it, so the sweep below went green over
+    /// a message instructing a tool that answers tool-not-found. A list that
+    /// has to be edited in lockstep with the allowlist is a list that will
+    /// not be. `briefs.rs` already derives its twin the same way and for the
+    /// same reason.
+    fn worker_excluded_tool_mentions() -> Vec<String> {
+        let served: std::collections::BTreeSet<String> = server_with(McpProfile::Worker)
+            .tool_names()
+            .into_iter()
+            .collect();
+        server_with(McpProfile::Default)
+            .tool_names()
+            .into_iter()
+            .filter(|name| !served.contains(name))
+            .collect()
+    }
 
     fn server_with(profile: McpProfile) -> RockyMcpServer {
         // `get_info` and the routers never touch the filesystem, so an
@@ -5548,9 +5561,9 @@ mod tests {
                 .description
                 .as_deref()
                 .unwrap_or_else(|| panic!("prompt '{}' has a description", prompt.name));
-            for excluded in WORKER_EXCLUDED_TOOL_MENTIONS {
+            for excluded in &worker_excluded_tool_mentions() {
                 assert!(
-                    !description.contains(excluded),
+                    !description.contains(excluded.as_str()),
                     "worker-profile description of '{}' must not name excluded tool \
                      `{excluded}`: {description}",
                     prompt.name
@@ -5652,9 +5665,9 @@ mod tests {
             worker_server.draft_model_next_steps(),
             worker_server.draft_check_next_steps(),
         ] {
-            for excluded in WORKER_EXCLUDED_TOOL_MENTIONS {
+            for excluded in &worker_excluded_tool_mentions() {
                 assert!(
-                    !next_steps.contains(excluded),
+                    !next_steps.contains(excluded.as_str()),
                     "worker next_steps must not name excluded tool `{excluded}`: {next_steps}"
                 );
             }
