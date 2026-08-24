@@ -3010,6 +3010,44 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
             );
         }
 
+        // TENTH ROUND, finding 1 — two steers that name no excluded tool,
+        // so `names_excluded_tool` above reads both as clean. Absence is
+        // the only thing that pins them, and the paired presence check
+        // below is what stops "delete the sentence" from passing.
+        let haystack_lower = haystack.to_lowercase();
+        for steer in [
+            // The CARVE-OUT. `fix_failing_test` reserved "test edits beyond
+            // append-only checks" for the runner, which leaves append-only
+            // checks AVAILABLE to the worker — the exact capability
+            // removing `draft_check` from the allowlist exists to stop. It
+            // is reachable: the worker runs in the project root, and Phase
+            // B PRESERVES a worker-added `[[tests]]` block
+            // (`rocky_core::product::lowering`).
+            "append-only",
+            // The FALSE PROMISE. The `test` tool calls
+            // `commands::test_output` — the compiled model tests plus the
+            // unit tests. The declarative check set runs through `rocky
+            // test --declarative`, a different path this profile does not
+            // serve, and its checks need an applied table besides. Same
+            // defect `WORKER_DRAFT_NEXT_STEPS` already corrects one surface
+            // over.
+            "run the declarative tests",
+            "the declarative tests and read",
+        ] {
+            assert!(
+                !haystack_lower.contains(steer),
+                "worker-profile `{name}` still instructs `{steer}` — a withheld action or a \
+                 suite this profile cannot run, and one the name-based sweep cannot see; \
+                 full text:\n{haystack}"
+            );
+        }
+        assert!(
+            haystack_lower.contains("local tests")
+                || haystack_lower.contains("local model and unit tests"),
+            "worker-profile `{name}` must say WHICH suite the `test` tool runs, not merely \
+             drop the wrong claim; full text:\n{haystack}"
+        );
+
         // The DESCRIPTION must agree with the body about where the work
         // ends (ninth round, finding 2). Both fields of this result are
         // guidance; a description that promises an ending the body

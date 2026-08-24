@@ -352,12 +352,19 @@ const WORKER_PROMPT_DESCRIPTIONS: &[(&str, &str)] = &[
          grouped overview of models, their grain, governance, tests, and DAG shape. Read-only — \
          no edits, nothing recorded.",
     ),
+    // TENTH ROUND, finding 1. This said "failing declarative tests: run
+    // `test`", and the `test` tool does not run them — it runs the project's
+    // LOCAL model and unit tests (`commands::test_output`). The declarative
+    // check set is `rocky test --declarative`, a different path this profile
+    // does not serve. Same false promise `WORKER_DRAFT_NEXT_STEPS` already
+    // corrects one surface over; see that constant for the full reasoning.
     (
         "fix_failing_test",
-        "Diagnose and fix failing declarative tests: run `test` -> for each failure \
-         profile_column the implicated columns to ground the cause -> redraft the model SQL \
-         with draft_model where the SQL is wrong. Worker profile: ends at the typed hand-off \
-         to the trusted runner.",
+        "Diagnose and fix failing local tests: run `test` — the project's LOCAL model and \
+         unit tests, the only suite served here — then for each failure profile_column the \
+         implicated columns to ground the cause -> redraft the model SQL with draft_model \
+         where the SQL is wrong. Worker profile: ends at the typed hand-off to the trusted \
+         runner.",
     ),
 ];
 
@@ -4923,8 +4930,11 @@ impl RockyMcpServer {
                     format!(
                         "Diagnose and fix the failing tests in {scope}, using the MCP tools at \
                          each step:\n\n\
-                         1. test — run the declarative tests and read which assertions fail, on \
-                         which model, and the failing-row count.\n\
+                         1. test — run the project's LOCAL model and unit tests, and read \
+                         which assertions fail, on which model, and the failing-row count. \
+                         That local suite is the only one you can run here: the checks the \
+                         product spec declares are evaluated by the trusted runner after an \
+                         apply, not by this tool.\n\
                          2. For each failure, ground the cause before deciding the fix: \
                          profile_column the implicated columns to see their actual null rate, \
                          distinct count, and value domain, and sample_rows to look at offending \
@@ -4933,8 +4943,9 @@ impl RockyMcpServer {
                          duplicates / nulls / out-of-domain values it shouldn't), redraft it \
                          with draft_model — on an existing model it replaces the SQL and \
                          preserves the sidecar's metadata. If the TEST encodes a wrong \
-                         invariant, do NOT weaken or rewrite it in this profile: test edits \
-                         beyond append-only checks are the trusted runner's — record the \
+                         invariant, do NOT weaken it, rewrite it, or append a new one: EVERY \
+                         test edit is the trusted runner's here, and checks are spec-owned \
+                         by any route, this server or a file you can write. Record the \
                          finding (which assertion, what the data actually holds) in your \
                          handoff.\n\
                          4. compile, then re-run the `test` tool. Loop until the failure is \
@@ -6512,6 +6523,21 @@ mod tests {
                     prompt.name
                 );
             }
+            // TENTH ROUND, finding 1 — the same false promise about which
+            // suite `test` runs, on the LIST description rather than the
+            // body. `fix_failing_test` said "failing declarative tests: run
+            // `test`", and `test` calls `commands::test_output` — the
+            // compiled model tests plus the unit tests. The declarative set
+            // is `rocky test --declarative`, a path this profile does not
+            // serve. Pinned here because this field is one hop from the
+            // prompt body and was fixed separately from it.
+            assert!(
+                !description_lower.contains("declarative tests: run `test`"),
+                "worker-profile `prompts/list` description of '{}' claims the `test` tool \
+                 runs the declarative check set; it runs the LOCAL model + unit tests: \
+                 {description}",
+                prompt.name
+            );
         }
     }
 
