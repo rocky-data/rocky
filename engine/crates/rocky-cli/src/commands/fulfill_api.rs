@@ -1173,4 +1173,104 @@ mod tests {
             );
         });
     }
+
+    /// THE TOCTOU PIN: the checks that RUN are the checks that were
+    /// DIGESTED, even when the files change in between.
+    ///
+    /// The custody gate reads a digest, compares it with the value this
+    /// generation pinned at verify, and only then executes. If the
+    /// digest came from one read of the models directory and the
+    /// execution from a second, the comparison says nothing about what
+    /// ran: a rewrite landing between them passes the gate and the loop
+    /// executes SQL nobody approved. That shape reaches none of the
+    /// gate's refusal arms — they all fire on a digest that MISMATCHES,
+    /// and this one matches.
+    ///
+    /// So the fixture rewrites the sidecar after the load, and the
+    /// rewrite is built to flip the VERDICT, not just a count: the
+    /// digested set holds one check that passes, and the set on disk
+    /// holds two more that fail. A second read would report failures.
+    /// The owned snapshot reports the pass it was digested with.
+    #[test]
+    fn the_checks_that_run_are_the_snapshot_that_was_digested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let config = config_with_state(root, "");
+        let models = root.join("models");
+        write_file(
+            &models.join("orders.sql"),
+            b"SELECT 1 AS id, NULL AS status\n",
+        );
+        // The APPROVED set: one check, and it passes against the seeded
+        // table below.
+        let approved = b"name = \"orders\"\n\n\
+             [target]\ncatalog = \"wh\"\nschema = \"out\"\ntable = \"orders\"\n\n\
+             [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n";
+        write_file(&models.join("orders.toml"), approved);
+
+        let cfg = rocky_core::config::load_rocky_config(&config).expect("config");
+        let registry = crate::registry::AdapterRegistry::from_config(&cfg).expect("registry");
+        let warehouse = registry.warehouse_adapter("default").expect("adapter");
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            for statement in [
+                "CREATE SCHEMA IF NOT EXISTS out",
+                "CREATE TABLE out.orders (id BIGINT, status VARCHAR)",
+                "INSERT INTO out.orders VALUES (1, NULL), (2, NULL)",
+            ] {
+                warehouse.execute_query(statement).await.expect(statement);
+            }
+
+            // 1. Load and digest — the custody comparison's input.
+            let loaded = LoadedCheckSet::load(&models, "orders").expect("loads");
+            let digested = loaded.digest().to_string();
+
+            // 2. The rewrite the gate must not be fooled by. `status` is
+            //    NULL in every row and the table holds 2 rows, so both
+            //    added checks FAIL.
+            write_file(
+                &models.join("orders.toml"),
+                b"name = \"orders\"\n\n\
+                  [target]\ncatalog = \"wh\"\nschema = \"out\"\ntable = \"orders\"\n\n\
+                  [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n\n\
+                  [[tests]]\ntype = \"not_null\"\ncolumn = \"status\"\n\n\
+                  [[tests]]\ntype = \"row_count_range\"\nmin = 99\n",
+            );
+            // The fixture must actually exhibit the condition: a FRESH
+            // load now digests differently, so a second read really
+            // would run a different set.
+            let after = LoadedCheckSet::load(&models, "orders").expect("loads");
+            assert_ne!(
+                digested,
+                after.digest(),
+                "the rewrite must change what a re-load would execute, or this proves nothing"
+            );
+
+            // 3. Execute the handle from step 1.
+            let observed = observe_declarative_checks(&config, loaded)
+                .await
+                .expect("observes");
+            assert_eq!(
+                observed.declared, 1,
+                "the declared count is the digested snapshot's, not the file's: {observed:?}"
+            );
+            assert_eq!(
+                observed.executed, 1,
+                "exactly the digested check ran: {observed:?}"
+            );
+            assert_eq!(
+                observed.passed, 1,
+                "and it is the passing one: {observed:?}"
+            );
+            assert_eq!(
+                observed.failed, 0,
+                "a re-read would have run the two failing checks written after the digest: \
+                 {observed:?}"
+            );
+            assert!(
+                observed.findings.is_empty(),
+                "no finding can come from a check the digest never covered: {observed:?}"
+            );
+        });
+    }
 }
