@@ -3128,9 +3128,10 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
 /// the worker-profile guidance surfaces ON THE WIRE.
 ///
 /// Five of the NINE surfaces `WORKER_GUIDANCE_SURFACES` enumerates are
-/// checked here as the worker actually receives them: the served
-/// `instructions` (1), prompt descriptions (2), tool descriptions (4),
-/// tool input schemas (5) and the draft result's `next_steps` (7).
+/// checked here as the worker actually receives them: the whole
+/// `initialize` result (1), the whole listed `Prompt` (2), the whole listed
+/// `Tool` — its description (4) and its input schema (5) together — and
+/// the draft result's `next_steps` (7).
 ///
 /// The other four live elsewhere in this file or in the crate's unit
 /// tests: the whole `prompts/get` result (3) in
@@ -3195,15 +3196,17 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
     let server = RockyMcpServer::new_with_profile(config_path, rocky_mcp::McpProfile::Worker);
     let client = connect(server).await;
 
-    // Surface 1: the served `instructions`, ON THE WIRE. Checked here as
-    // well as at unit level because this is the surface the whole round is
-    // about, and because a reviewer running only the integration tests must
-    // not read their silence as coverage.
+    // Surface 1: the whole `initialize` result, ON THE WIRE. Checked here
+    // as well as at unit level because this is the surface the whole round
+    // is about, and because a reviewer running only the integration tests
+    // must not read their silence as coverage.
     //
-    // Split in two, because the two halves have opposite properties. The
-    // BANNER names excluded tools deliberately — saying `propose` is not
-    // available is the opposite of steering at it — and must name EVERY
-    // member of the derived set. The BODY below it must name none of them.
+    // The `instructions` field is taken first and split in two, because the
+    // two halves have opposite properties. The BANNER names excluded tools
+    // deliberately — saying `propose` is not available is the opposite of
+    // steering at it — and must name EVERY member of the derived set. The
+    // BODY below it must name none of them. The rest of the handshake is
+    // swept after them.
     let instructions = client
         .peer_info()
         .and_then(|info| info.instructions.clone())
