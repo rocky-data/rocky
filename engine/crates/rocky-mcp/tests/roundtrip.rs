@@ -3082,6 +3082,37 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
         // would have bought a surface 11 for the next field — enumerating
         // fields is exactly what lost here.
         let whole = serde_json::to_string(&result).expect("prompt result serializes");
+        // ELEVENTH ROUND, finding 4 — the row's field list in
+        // `WORKER_GUIDANCE_SURFACES` named only `messages` and
+        // `description`, while rmcp 3.1.2's `GetPromptResult` also carries
+        // `resultType` and `_meta`. The list was stale, not the coverage:
+        // the sweep below reads the whole value.
+        //
+        // AND `resultType` IS NOT ON THE WIRE, which the first attempt at
+        // this correction asserted the opposite of. `GetPromptResult::new`
+        // does set `Some(ResultType::COMPLETE)`, but `get_info` pins
+        // `ProtocolVersion::V_2024_11_05`, and rmcp's server handler calls
+        // `strip_result_type_for_legacy_peer()` for any peer older than
+        // `2026-07-28`. So the field is defined, set, and then cleared
+        // before it is serialized.
+        //
+        // Pinned in the direction that is TRUE, so a protocol-version bump
+        // fails here and the row gets re-read rather than quietly gaining a
+        // field nobody swept on purpose.
+        let shape: serde_json::Value =
+            serde_json::from_str(&whole).expect("prompt result is an object");
+        assert!(
+            shape.get("messages").is_some(),
+            "`prompts/get` must serialize `messages`, or the field list on row 3 of \
+             WORKER_GUIDANCE_SURFACES is describing a shape this crate no longer \
+             serves: {whole}"
+        );
+        assert!(
+            shape.get("resultType").is_none(),
+            "`resultType` is stripped for peers older than 2026-07-28, and this server \
+             pins 2024-11-05 — if it is on the wire the negotiated version moved, and \
+             row 3's field list needs re-reading: {whole}"
+        );
         assert_eq!(
             rocky_mcp::names_excluded_tool(&whole, &excluded_tool_mentions),
             None,
@@ -3392,13 +3423,25 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
     // serialized payload of its channel, "so a field added later is covered
     // without any test knowing the shape". That was true of row 3 and of no
     // other row: this one read `description` alone, while rmcp 3.1.2's
-    // `Prompt` also carries `title`, `arguments` (each with its own
+    // `Prompt` also carries `name`, `title`, `arguments` (each with its own
     // `description`), `icons` and `_meta`. No leak was demonstrated in the
     // omitted fields — the false claim is the finding, not a leak.
     let prompts = client.list_all_prompts().await.expect("list prompts");
     assert_eq!(prompts.len(), 5, "the worker profile keeps all 5 prompts");
+    // ELEVENTH ROUND, finding 4 — the row's field list omitted `name`,
+    // which is the one field of the six that is ALWAYS on the wire. The
+    // sweep below already covered it, so this pins the shape the list
+    // describes rather than adding coverage: a prompt named after an
+    // excluded tool would fire on `name` alone.
     for prompt in &prompts {
         let whole = serde_json::to_string(prompt).expect("prompt serializes");
+        let shape: serde_json::Value = serde_json::from_str(&whole).expect("prompt is an object");
+        assert!(
+            shape.get("name").is_some(),
+            "`prompts/list` must serialize `name`, or the field list on row 2 of \
+             WORKER_GUIDANCE_SURFACES is describing a shape this crate no longer \
+             serves: {whole}"
+        );
         assert_eq!(
             rocky_mcp::names_excluded_tool(&whole, &excluded),
             None,

@@ -688,16 +688,17 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// ```text
 ///   #  surface                                    status
 ///   1  initialize   -> THE WHOLE RESULT            swept: worker_instructions_are_
-///        (instructions AND capabilities AND         projected_and_default_stays_verbatim
-///         serverInfo AND protocolVersion —
+///        (protocolVersion, capabilities,            projected_and_default_stays_verbatim
+///         serverInfo, instructions, _meta —
 ///         the banner is spliced out, being
 ///         the one surface that names
 ///         excluded tools on purpose)
 ///   2  prompts/list -> THE WHOLE Prompt            swept: worker_profile_guidance_
-///        (description, title, arguments,            surfaces_name_no_excluded_tool
-///         icons, _meta)
+///        (name, title, description,                 surfaces_name_no_excluded_tool
+///         arguments, icons, _meta)
 ///   3  prompts/get  -> THE WHOLE RESULT             swept: worker_profile_prompts_end_
-///        (messages AND description)                  at_the_runner_handoff
+///        (resultType, description, messages,         at_the_runner_handoff
+///         _meta)
 ///   4  tools/list   -> tool description            swept: worker_profile_guidance_
 ///   5  tools/list   -> input_schema text            surfaces_name_no_excluded_tool,
 ///        (4 and 5 are two FIELDS of one             as THE WHOLE Tool — which also
@@ -744,6 +745,33 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// so a field added later is covered without any test knowing the shape.
 /// Adding a "surface 10" for `description` would have bought a surface 11
 /// for the next field: enumerating fields is precisely what lost here.
+///
+/// WHAT THE PARENTHESISED FIELD LISTS ARE, and are not. They are a reading
+/// aid for rmcp 3.1.2's shapes, not the coverage rule — the sweep is the
+/// serialized value, and it reads whatever serde emits. The eleventh
+/// round's finding 4 was that three of them had gone stale against the
+/// crate: row 1 omitted `_meta`, row 2 omitted `name`, and row 3 omitted
+/// both `resultType` and `_meta`. No coverage hole, because the sweeps
+/// already read the whole value; the LISTS were wrong, which is the same
+/// defect class as a claim that out-runs its check.
+///
+/// Most of those fields carry `skip_serializing_if = "Option::is_none"`, so
+/// while they are `None` they are absent from the payload and the sweep
+/// reads nothing there. That is the intended behaviour rather than a gap:
+/// an absent field serves a worker no text, and the first populated value
+/// is swept without anyone editing a test. `Prompt::name` and
+/// `GetPromptResult::messages` are the two that are always present.
+///
+/// `resultType` IS NOT ON THE WIRE AT ALL, and the first attempt at this
+/// correction wrote the opposite — caught by pinning it rather than by
+/// reading the type. rmcp's constructors do set
+/// `Some(ResultType::COMPLETE)`, and then the server handler calls
+/// `strip_result_type_for_legacy_peer()` for any peer older than
+/// `2026-07-28`. [`RockyMcpServer::get_info`] pins
+/// `ProtocolVersion::V_2024_11_05`, so every result this server sends is
+/// stripped. It applies to row 8's `result_type` as well, for the same
+/// reason and by the same call. Reading a field off the struct is not
+/// evidence it reaches a worker.
 ///
 /// THAT SENTENCE WAS TRUE OF ROW 3 AND OF NO OTHER ROW, and the tenth round
 /// is why it is worth writing down twice. Row 3 did serialise the whole
