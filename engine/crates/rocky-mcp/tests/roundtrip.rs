@@ -2945,13 +2945,19 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
             .unwrap_or_else(|e| panic!("get_prompt {name}: {e}"));
         let haystack = prompt_text(&result);
 
-        for excluded in &excluded_tool_mentions {
-            assert!(
-                !haystack.contains(excluded.as_str()),
-                "worker-profile `{name}` must not instruct excluded tool `{excluded}`; \
-                 full text:\n{haystack}"
-            );
-        }
+        // The rule is `names_excluded_tool`, not `contains` — the third
+        // thing here that is derived rather than written down, and the one
+        // that caught a violation on THIS surface after two rounds of
+        // believing it clean: the `add_tests_to_pks` worker body said
+        // "Proposing a wrong key invariant", which an exact-name compare
+        // reads as prose. See the rule's own doc for why the remedy is to
+        // reword rather than to relax it.
+        assert_eq!(
+            rocky_mcp::names_excluded_tool(&haystack, &excluded_tool_mentions),
+            None,
+            "worker-profile `{name}` must not instruct an excluded tool in any form; \
+             full text:\n{haystack}"
+        );
 
         // The read-only summary prompt is profile-invariant: it has no
         // worker branch and no hand-off, because it never drafts anything.
@@ -2982,47 +2988,104 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
     client.cancel().await.unwrap();
 }
 
-/// FF-WP1 fix round 2 (item 5) — the worker-profile guidance surfaces ON THE
-/// WIRE: the `prompts/list` descriptions and the draft tools' `next_steps`
-/// name no tool the profile excludes and end at the trusted-runner hand-off.
-/// (The default surfaces are byte-pinned by the rocky-mcp unit goldens; the
+/// FF-WP1 fix round 2 (item 5), extended by the F3 red team (finding 3) —
+/// the worker-profile guidance surfaces ON THE WIRE.
+///
+/// Four of the seven surfaces `WORKER_GUIDANCE_SURFACES` enumerates are
+/// checked here as the worker actually receives them: prompt descriptions
+/// (2), tool descriptions (4), tool input schemas (5) and result
+/// `next_steps` (6). The other three are covered elsewhere or open, and
+/// the enumeration in `tools.rs` says which is which — this test does not
+/// claim to be the whole sweep, because "this is the whole sweep" is the
+/// sentence that has been wrong four times.
+///
+/// TWO THINGS ARE DERIVED, and both are the finding this was rewritten
+/// for. The excluded-tool set comes from the two real routers, replacing a
+/// hand-picked literal of seven names that was already the anti-pattern
+/// its sibling test above documents — the real set is nineteen. And the
+/// match is `names_excluded_tool`, which reads inflections: two of the
+/// three tool-description violations here were `propose`, but the third
+/// was "proposing", and an exact compare called it clean.
+///
+/// (The default surfaces are pinned by the rocky-mcp unit goldens; the
 /// existing default-profile draft tests here pin the `propose` ending.)
 #[tokio::test]
-async fn worker_profile_descriptions_and_next_steps_end_at_the_handoff() {
+async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
     let dir = TempDir::new().unwrap();
     write_project(dir.path(), &dir.path().join("test.duckdb"));
-    let server = RockyMcpServer::new_with_profile(
-        dir.path().join("rocky.toml"),
-        rocky_mcp::McpProfile::Worker,
+    let config_path = dir.path().join("rocky.toml");
+
+    // DERIVED from the two real routers, exactly as the prompt-body sweep
+    // above and `briefs.rs` derive theirs. The literal this replaces named
+    // seven tools; the profile actually excludes nineteen, so twelve
+    // excluded verbs could have appeared in any of these surfaces and the
+    // test would have stayed green.
+    let worker_tools =
+        RockyMcpServer::new_with_profile(config_path.clone(), rocky_mcp::McpProfile::Worker)
+            .tool_names();
+    let excluded: Vec<String> = RockyMcpServer::new(config_path.clone())
+        .tool_names()
+        .into_iter()
+        .filter(|name| !worker_tools.contains(name))
+        .collect();
+    assert!(
+        excluded.len() > 7,
+        "the derived set must be wider than the literal it replaced, or this change bought \
+         nothing: {excluded:?}"
     );
+
+    let server = RockyMcpServer::new_with_profile(config_path, rocky_mcp::McpProfile::Worker);
     let client = connect(server).await;
 
-    const EXCLUDED_TOOL_MENTIONS: &[&str] = &[
-        "propose",
-        "review_queue",
-        "draft_contract",
-        "draft_metadata",
-        "pause_schedule",
-        "ai_test",
-        "ai_contract",
-    ];
-
-    // Surface (b): every listed prompt description, as served over the wire.
+    // Surface 2: every listed prompt description, as served over the wire.
     let prompts = client.list_all_prompts().await.expect("list prompts");
     assert_eq!(prompts.len(), 5, "the worker profile keeps all 5 prompts");
     for prompt in &prompts {
         let description = prompt.description.as_deref().unwrap_or_default();
-        for excluded in EXCLUDED_TOOL_MENTIONS {
-            assert!(
-                !description.contains(excluded),
-                "worker `prompts/list` description of '{}' must not name `{excluded}`: \
-                 {description}",
-                prompt.name
-            );
-        }
+        assert_eq!(
+            rocky_mcp::names_excluded_tool(description, &excluded),
+            None,
+            "worker `prompts/list` description of '{}' must not name an excluded tool: \
+             {description}",
+            prompt.name
+        );
     }
 
-    // Surface (c): the draft tools' next_steps.
+    // Surfaces 4 and 5: the `tools/list` entry itself — the DESCRIPTION the
+    // worker reads to choose a tool, and the INPUT SCHEMA it reads to fill
+    // one in. Both are served text and both were outside every previous
+    // sweep; the description half is finding 3, and the schema half is
+    // swept here because it is the same kind of text one field away.
+    //
+    // The schema is matched as its serialized JSON, so a doc comment on any
+    // parameter field is covered wherever schemars put it, at any nesting
+    // depth, without this test knowing the shape.
+    let tools = client.list_all_tools().await.expect("list tools");
+    assert_eq!(
+        tools.len(),
+        worker_tools.len(),
+        "the wire surface is the router surface, or this sweeps the wrong set"
+    );
+    for tool in &tools {
+        let description = tool.description.as_deref().unwrap_or_default();
+        assert_eq!(
+            rocky_mcp::names_excluded_tool(description, &excluded),
+            None,
+            "worker `tools/list` description of '{}' must not name an excluded tool: \
+             {description}",
+            tool.name
+        );
+        let schema = serde_json::to_string(&tool.input_schema).expect("schema serializes");
+        assert_eq!(
+            rocky_mcp::names_excluded_tool(&schema, &excluded),
+            None,
+            "worker `tools/list` input schema of '{}' must not name an excluded tool: \
+             {schema}",
+            tool.name
+        );
+    }
+
+    // Surface 6: the draft tools' next_steps.
     let draft = client
         .call_tool(
             CallToolRequestParams::new("draft_model").with_arguments(draft_args(
@@ -3066,22 +3129,24 @@ async fn worker_profile_descriptions_and_next_steps_end_at_the_handoff() {
         "draft_check must be refused as absent, not fail some other way: {err}"
     );
 
-    for (tool, result) in [("draft_model", &draft)] {
-        let next_steps = result.structured_content.as_ref().expect("structured")["next_steps"]
-            .as_str()
-            .expect("next_steps is a string")
-            .to_string();
-        for excluded in EXCLUDED_TOOL_MENTIONS {
-            assert!(
-                !next_steps.contains(excluded),
-                "worker `{tool}` next_steps must not name `{excluded}`: {next_steps}"
-            );
-        }
-        assert!(
-            next_steps.contains("hand-off to the trusted runner"),
-            "worker `{tool}` next_steps end at the runner hand-off: {next_steps}"
-        );
-    }
+    // ONE producer, deliberately — `draft_model` is the only worker-served
+    // tool that returns a `next_steps`. `draft_check` carries one too and is
+    // swept at unit level instead, because the assertion just above proves
+    // it is unreachable over this wire. Written straight through rather than
+    // as a one-element loop, so the count is visible instead of implied.
+    let next_steps = draft.structured_content.as_ref().expect("structured")["next_steps"]
+        .as_str()
+        .expect("next_steps is a string")
+        .to_string();
+    assert_eq!(
+        rocky_mcp::names_excluded_tool(&next_steps, &excluded),
+        None,
+        "worker `draft_model` next_steps must not name an excluded tool: {next_steps}"
+    );
+    assert!(
+        next_steps.contains("hand-off to the trusted runner"),
+        "worker `draft_model` next_steps end at the runner hand-off: {next_steps}"
+    );
 
     client.cancel().await.unwrap();
 }

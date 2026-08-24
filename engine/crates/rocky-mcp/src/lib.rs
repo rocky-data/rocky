@@ -42,7 +42,7 @@ mod tools;
 use rmcp::{ServiceExt, transport::stdio};
 
 pub use error::{ToolError, ToolErrorCode, ToolResult};
-pub use tools::{McpProfile, RockyMcpServer};
+pub use tools::{McpProfile, RockyMcpServer, excluded_mention_forms, names_excluded_tool};
 
 /// Serve the Rocky MCP server over stdio until the client disconnects.
 ///

@@ -209,6 +209,156 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Worker-profile guidance surfaces — the enumeration, the rewrite table,
+// and the matching rule (F3 red team, finding 3)
+// ---------------------------------------------------------------------------
+
+/// EVERY guidance surface a worker session is served, counted — because
+/// this defect class has now been found FIVE times, and every fix was
+/// believed complete when it shipped.
+///
+/// The history is the reason this is a list rather than a habit. Round 1
+/// fixed the prompt `description`s. Round 2 found the prompt BODIES.
+/// Round 2's own follow-up found the draft `next_steps`. The F3 red team
+/// then found `tools/list` TOOL DESCRIPTIONS, three of them still
+/// steering the worker at `propose`. And extending the sweep to cover
+/// those found a fifth instance on a surface swept since round 2: the
+/// `add_tests_to_pks` worker prompt body said "Proposing", which an
+/// exact-name rule cannot see.
+///
+/// ```text
+///   #  surface                                swept by
+///   1  initialize  -> instructions            instructions_carry_the_worker_banner_and_
+///                                             stay_verbatim_by_default
+///   2  prompts/list -> description            worker_prompt_descriptions_name_no_excluded_tool
+///   3  prompts/get  -> message bodies         worker_profile_prompts_end_at_the_runner_handoff
+///   4  tools/list   -> tool description       worker_tool_descriptions_name_no_excluded_tool
+///   5  tools/list   -> input_schema text      worker_profile_guidance_surfaces_name_no_
+///                                             excluded_tool (wire)
+///   6  tools/call   -> result next_steps      draft_next_steps_are_profile_selected
+///   7  tools/call   -> error remediation_hint NOT SWEPT — see below
+/// ```
+///
+/// SEVEN. The list is closed at the PROTOCOL level rather than by
+/// inspection: [`RockyMcpServer::get_info`] enables `tools` and `prompts`
+/// and nothing else, so there is no `resources/read`, no completion and
+/// no logging channel able to carry an eighth kind of text.
+/// `the_server_opens_no_guidance_channel_beyond_tools_and_prompts` pins
+/// that, so enabling one fails a test and forces a revisit of this
+/// comment instead of silently opening surface 8.
+///
+/// (7) IS THE OPEN GAP, stated rather than glossed. A `ToolError`'s
+/// `remediation_hint` is guidance, it is served to the worker, and it is
+/// not swept: reaching every hint means driving every error path of
+/// every served tool, which no harness here does, and the hints are
+/// written per call site so there is no table to audit instead. Read
+/// this as "surfaces 1-6 are swept and 7 is known and open" — NOT as
+/// "all surfaces are swept". That second sentence has now been believed
+/// four times about a set that was incomplete, which is the whole reason
+/// for the count.
+///
+/// Surface 6 has one worker-served producer: `draft_model`. `draft_check`
+/// also carries `next_steps`, but it left [`WORKER_PROFILE_TOOLS`], so a
+/// worker session cannot reach it — its worker text is still kept correct
+/// (see [`RockyMcpServer::draft_check_next_steps`]) because it is what
+/// would be wrong first if the tool were re-admitted.
+///
+/// Test-gated because nothing in the server reads the number — the value
+/// is the enumeration above it and the anchor it gives the capability
+/// test. It is a constant rather than a comment so that grepping
+/// `WORKER_GUIDANCE_SURFACES` reaches the list from either end.
+#[cfg(test)]
+const WORKER_GUIDANCE_SURFACES: usize = 7;
+
+/// The worker-profile rewrites of `#[tool(description = ...)]` text, as
+/// `(tool, sentence to replace, replacement)`.
+///
+/// A REWRITE, not a second copy of the description. The prompt side
+/// duplicates whole strings ([`WORKER_PROMPT_DESCRIPTIONS`]), which works
+/// there because those strings are one sentence each; `draft_model`'s
+/// description is a paragraph, and a duplicated paragraph is a paragraph
+/// that will drift. Only the steering sentence is stated here.
+///
+/// Both drift directions fail at CONSTRUCTION, not at review:
+///
+///  - a tool that leaves [`WORKER_PROFILE_TOOLS`] (or is renamed) orphans
+///    its entry, and the lookup panics;
+///  - an edit to the steering sentence makes the needle miss, and the
+///    replacement panics rather than silently serving the default text to
+///    a worker — which is exactly how a checked `replace` differs from a
+///    plain one.
+///
+/// The direction neither guard covers is a NEW worker-served tool whose
+/// description names an excluded verb. That is what the sweep is for.
+const WORKER_TOOL_DESCRIPTIONS: &[(&str, &str, &str)] = &[
+    (
+        "breaking_change",
+        "Self-check blast radius BEFORE propose.",
+        "Self-check blast radius BEFORE you hand off to the trusted runner.",
+    ),
+    (
+        "plan_preview",
+        "before proposing a materialization.",
+        "before you hand off to the trusted runner.",
+    ),
+    (
+        "draft_model",
+        "a draft is inert until you `propose` it and a human reviews it.",
+        "a draft is inert until the trusted runner records a plan for it and a human \
+         reviews it.",
+    ),
+];
+
+/// The forms of an excluded tool name that no worker-served guidance
+/// string may contain: the exact name plus mechanically derived English
+/// inflections (`propose` → `proposing`, `proposed`, `proposes`,
+/// `proposal`).
+///
+/// DERIVED, not listed. A hand-written variant table would be the same
+/// defect as a hand-written excluded-tool list, one level down — and that
+/// list is precisely how `draft_check` slipped past a green sweep.
+///
+/// The inflections are what made this rule find anything. `plan_preview`
+/// said "before proposing a materialization" and the `add_tests_to_pks`
+/// worker prompt said "Proposing a wrong key invariant"; both steer at a
+/// verb the profile does not serve, and an exact-name sweep read both as
+/// clean.
+///
+/// IT IS A WORD RULE, NOT A SEMANTIC ONE, and it can fire on ordinary
+/// English — that "Proposing" meant "suggesting". The remedy when it does
+/// is to REWORD, never to relax the rule, and the reason is the reader
+/// rather than the matcher: a worker that has just been told `propose` is
+/// not available cannot tell the two senses apart either. Measured over
+/// the whole current surface — 12 served tools, 5 prompts, 19 excluded
+/// names, every form — it fires exactly twice, and both were real.
+pub fn excluded_mention_forms(tool: &str) -> Vec<String> {
+    let stem = tool.strip_suffix('e').unwrap_or(tool);
+    let mut forms = vec![tool.to_string()];
+    forms.extend(
+        ["ing", "ed", "es", "s", "al"]
+            .into_iter()
+            .map(|suffix| format!("{stem}{suffix}"))
+            .filter(|form| form != tool),
+    );
+    forms
+}
+
+/// The excluded tool a guidance string names, and the form it used —
+/// `None` when the string names none of them.
+///
+/// Case-insensitive: a sentence-initial "Proposing" is the same steer as
+/// a mid-sentence one, and only the second would survive an exact match.
+pub fn names_excluded_tool(haystack: &str, excluded: &[String]) -> Option<(String, String)> {
+    let lower = haystack.to_lowercase();
+    excluded.iter().find_map(|tool| {
+        excluded_mention_forms(tool)
+            .into_iter()
+            .find(|form| lower.contains(&form.to_lowercase()))
+            .map(|form| (tool.clone(), form))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tool input parameter structs (schemars 1.x — rmcp's `Parameters<T>` bound).
 // ---------------------------------------------------------------------------
 
@@ -684,6 +834,26 @@ impl RockyMcpServer {
                     })
                     .attr
                     .description = Some((*description).to_string());
+            }
+            // F3 red team (finding 3): the same problem one surface over.
+            // `tools/list` descriptions are static too, and three of them
+            // steered the worker at `propose`. Rewritten AFTER the removals
+            // above, so the table can only name a tool this profile still
+            // serves — an entry for a removed tool orphans and panics here.
+            for (name, needle, replacement) in WORKER_TOOL_DESCRIPTIONS {
+                let route = tool_router.map.get_mut(*name).unwrap_or_else(|| {
+                    panic!("WORKER_TOOL_DESCRIPTIONS names unserved tool '{name}'")
+                });
+                let current = route.attr.description.as_deref().unwrap_or_else(|| {
+                    panic!("WORKER_TOOL_DESCRIPTIONS names undescribed tool '{name}'")
+                });
+                assert!(
+                    current.contains(needle),
+                    "WORKER_TOOL_DESCRIPTIONS rewrite for '{name}' no longer matches its \
+                     description — a silent no-op replace would serve the DEFAULT text to a \
+                     worker, so this fails at construction instead"
+                );
+                route.attr.description = Some(current.replace(needle, replacement).into());
             }
         }
         Self {
@@ -4018,9 +4188,9 @@ impl RockyMcpServer {
                          4. Use the `test` tool to run the project's LOCAL tests, so your \
                          report says whether the project is green as it stands today.\n\n\
                          RECONCILE DISCIPLINE: only name uniqueness/not-null on columns the \
-                         profile actually shows to be unique/non-null. Proposing a wrong key \
-                         invariant is worse than none — someone will approve it, and it \
-                         green-lights a future run that should have failed.\n\n\
+                         profile actually shows to be unique/non-null. Naming a wrong key \
+                         invariant is worse than naming none — someone will approve it, and \
+                         it green-lights a future run that should have failed.\n\n\
                          STOP when the report is complete, and HAND OFF to the trusted \
                          runner: report the key columns you confirmed, the evidence behind \
                          each one, and the assertions they need. Do not record plans, approve \
@@ -5586,14 +5756,13 @@ mod tests {
                 .description
                 .as_deref()
                 .unwrap_or_else(|| panic!("prompt '{}' has a description", prompt.name));
-            for excluded in &worker_excluded_tool_mentions() {
-                assert!(
-                    !description.contains(excluded.as_str()),
-                    "worker-profile description of '{}' must not name excluded tool \
-                     `{excluded}`: {description}",
-                    prompt.name
-                );
-            }
+            assert_eq!(
+                names_excluded_tool(description, &worker_excluded_tool_mentions()),
+                None,
+                "worker-profile description of '{}' must not name an excluded tool in any \
+                 form: {description}",
+                prompt.name
+            );
             if prompt.name != "summarize_project" {
                 assert!(
                     description.contains("hand-off to the trusted runner"),
@@ -5659,6 +5828,137 @@ mod tests {
         }
     }
 
+    /// F3 red team, finding 3 — SURFACE 4: every `tools/list` description
+    /// the worker profile serves. Swept over the whole filtered router, so
+    /// a tool added to [`WORKER_PROFILE_TOOLS`] later cannot dodge it.
+    ///
+    /// This is the surface the previous three rounds missed. Three served
+    /// descriptions steered at `propose`: `breaking_change` and
+    /// `draft_model` by name, and `plan_preview` as "proposing" — which
+    /// only the inflection half of [`names_excluded_tool`] can see.
+    #[test]
+    fn worker_tool_descriptions_name_no_excluded_tool() {
+        let server = server_with(McpProfile::Worker);
+        let excluded = worker_excluded_tool_mentions();
+        let tools = server.tool_router.list_all();
+        assert_eq!(
+            tools.len(),
+            WORKER_PROFILE_TOOLS.len(),
+            "the sweep covers the whole worker surface, not a sample"
+        );
+        for tool in &tools {
+            let description = tool
+                .description
+                .as_deref()
+                .unwrap_or_else(|| panic!("tool '{}' has a description", tool.name));
+            assert_eq!(
+                names_excluded_tool(description, &excluded),
+                None,
+                "worker-profile description of '{}' must not name an excluded tool in any \
+                 form: {description}",
+                tool.name
+            );
+        }
+    }
+
+    /// The other half of the rewrite — the DEFAULT descriptions keep the
+    /// sentences the worker profile replaces, and never gain the
+    /// replacements.
+    ///
+    /// Asserted as needle-present + replacement-absent rather than as a
+    /// byte pin of three paragraphs. A byte pin of prose that long rots
+    /// into a copy nobody rereads; this checks the two facts that matter
+    /// and stays true across an unrelated edit. The construction-time
+    /// `assert!` in `new_with_profile` covers the same needle from the
+    /// other side, so a reworded sentence cannot silently become a no-op.
+    #[test]
+    fn the_worker_description_rewrites_do_not_leak_into_the_default_surface() {
+        let default_server = server_with(McpProfile::Default);
+        for (name, needle, replacement) in WORKER_TOOL_DESCRIPTIONS {
+            let route = default_server
+                .tool_router
+                .map
+                .get(*name)
+                .unwrap_or_else(|| panic!("default profile serves '{name}'"));
+            let description = route.attr.description.as_deref().unwrap_or_default();
+            assert!(
+                description.contains(needle),
+                "the default description of '{name}' still carries the sentence the worker \
+                 profile rewrites: {description}"
+            );
+            assert!(
+                !description.contains(replacement),
+                "and never the worker replacement: {description}"
+            );
+        }
+    }
+
+    /// The guidance-surface count is closed at the PROTOCOL level.
+    ///
+    /// [`WORKER_GUIDANCE_SURFACES`] enumerates seven places a worker is
+    /// served text. That enumeration is only trustworthy if no eighth
+    /// CHANNEL can open without anyone noticing — so this pins the served
+    /// capabilities: `tools` and `prompts`, and nothing else. Enabling
+    /// resources, completions or logging fails here and forces a revisit
+    /// of the count instead of quietly invalidating it.
+    #[test]
+    fn the_server_opens_no_guidance_channel_beyond_tools_and_prompts() {
+        let next = WORKER_GUIDANCE_SURFACES + 1;
+        for profile in [
+            McpProfile::Default,
+            McpProfile::Approver,
+            McpProfile::Worker,
+        ] {
+            let capabilities = server_with(profile).get_info().capabilities;
+            assert!(capabilities.tools.is_some(), "tools stays served");
+            assert!(capabilities.prompts.is_some(), "prompts stays served");
+            assert!(
+                capabilities.resources.is_none(),
+                "a resources channel would be guidance surface {next}; enabling one \
+                 invalidates WORKER_GUIDANCE_SURFACES, so extend the enumeration rather \
+                 than this test: {capabilities:?}"
+            );
+            assert!(
+                capabilities.completions.is_none(),
+                "so would completions, as surface {next}: {capabilities:?}"
+            );
+            assert!(
+                capabilities.logging.is_none(),
+                "so would logging, as surface {next}: {capabilities:?}"
+            );
+        }
+    }
+
+    /// The matching rule itself, in both directions — the exact name and
+    /// the inflections, and no match on an unrelated word.
+    ///
+    /// Driven on the two strings that were actually wrong, so this test
+    /// fails if the rule is ever narrowed back to an exact-name compare.
+    #[test]
+    fn the_mention_rule_reads_inflections_not_just_the_bare_name() {
+        let excluded = vec!["propose".to_string()];
+        assert_eq!(
+            names_excluded_tool("then `propose` to record a plan", &excluded),
+            Some(("propose".to_string(), "propose".to_string())),
+            "the exact name still matches"
+        );
+        let (tool, form) = names_excluded_tool("before proposing a materialization", &excluded)
+            .expect(
+                "`proposing` steers at `propose`; an exact-name sweep read this as clean and \
+                 shipped it to the worker",
+            );
+        assert_eq!((tool.as_str(), form.as_str()), ("propose", "proposing"));
+        assert!(
+            names_excluded_tool("Proposing a wrong key invariant", &excluded).is_some(),
+            "and case-insensitively, or a sentence-initial verb slips through"
+        );
+        assert_eq!(
+            names_excluded_tool("preview the generated SQL", &excluded),
+            None,
+            "unrelated prose does not match"
+        );
+    }
+
     /// Item 5c — the profile-selected draft `next_steps`: the worker variants
     /// name no excluded tool and end at the trusted-runner hand-off; the
     /// default variants are byte-unchanged (pinned), still ending at
@@ -5690,12 +5990,11 @@ mod tests {
             worker_server.draft_model_next_steps(),
             worker_server.draft_check_next_steps(),
         ] {
-            for excluded in &worker_excluded_tool_mentions() {
-                assert!(
-                    !next_steps.contains(excluded.as_str()),
-                    "worker next_steps must not name excluded tool `{excluded}`: {next_steps}"
-                );
-            }
+            assert_eq!(
+                names_excluded_tool(next_steps, &worker_excluded_tool_mentions()),
+                None,
+                "worker next_steps must not name an excluded tool in any form: {next_steps}"
+            );
             assert!(
                 next_steps.contains("hand-off to the trusted runner"),
                 "worker next_steps end at the runner hand-off: {next_steps}"
