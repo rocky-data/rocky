@@ -3154,6 +3154,232 @@ async fn worker_profile_guidance_surfaces_name_no_excluded_tool() {
     client.cancel().await.unwrap();
 }
 
+/// The excluded-tool set, DERIVED from the two real routers: every tool the
+/// default profile serves that the worker profile does not.
+fn worker_excluded_tools(config_path: &Path) -> Vec<String> {
+    let worker =
+        RockyMcpServer::new_with_profile(config_path.to_path_buf(), rocky_mcp::McpProfile::Worker)
+            .tool_names();
+    RockyMcpServer::new(config_path.to_path_buf())
+        .tool_names()
+        .into_iter()
+        .filter(|name| !worker.contains(name))
+        .collect()
+}
+
+/// F3 red team round 2, finding 2 — the SUCCESSFUL-RESULT guidance surface,
+/// which every previous count omitted.
+///
+/// The enumeration counted `next_steps` and the error `remediation_hint`. It
+/// did not count the free text a tool carries when it SUCCEEDS: diagnostic
+/// messages and suggestions, breaking-change finding messages, the
+/// skipped-gate reason, test-failure text, unavailability reasons. That text
+/// is guidance by any reading — a worker acts on a `suggestion` exactly as
+/// it acts on a `next_steps`.
+///
+/// And it already misfired. Four E027 budget constructors suggested "or
+/// optimize the query to reduce scan volume"; `optimize` is a tool this
+/// profile does not serve. The previous sweep drove one GREEN `draft_model`
+/// and never a red compile, so it could not see it.
+///
+/// TWO PRODUCERS, not one. `compile` and `draft_model` both return
+/// `diagnostics: Vec<DiagnosticLite>`, so the same diagnostic text reaches a
+/// worker by two routes. Both are driven red here.
+///
+/// WHAT THIS PROVES AND WHAT IT DOES NOT — the honest half, because
+/// "everything is swept" is the sentence this enumeration exists to stop.
+///
+///  - It proves the results of the paths driven below carry no excluded
+///    name. Every result is swept as its WHOLE serialized JSON, so a field
+///    added later is covered without this test knowing the shape.
+///  - It does NOT prove every Rocky-authored diagnostic is clean. There is
+///    no table of diagnostic text to audit: constructors are written per
+///    call site across rocky-compiler, rocky-core and rocky-cli, for
+///    consumers that are mostly not this worker. Reaching all of them means
+///    driving every constructor — the same reason surface 9 is OPEN.
+///  - It CANNOT prove the interpolated spans are clean. A diagnostic quotes
+///    the user's own model and column names. A project with a model named
+///    `propose_v2` produces text no rule Rocky ships can fix. Identifier
+///    boundaries shrink that surface a lot (`proposal_id` no longer
+///    matches); they do not remove it, and no runtime filter exists on the
+///    other swept surfaces either.
+#[tokio::test]
+async fn worker_result_text_names_no_excluded_tool() {
+    let dir = TempDir::new().unwrap();
+    // The DuckDB file stem must equal the declared catalog (`warehouse`) so
+    // the three-part ref `warehouse.out.orders` resolves — same convention
+    // the sample_rows tests use.
+    let db_path = dir.path().join("warehouse.duckdb");
+    write_project(dir.path(), &db_path);
+    write_target_defaults(dir.path());
+    // Make `compile` RED, and red with a SUGGESTION — a breached `[budget]`
+    // ceiling is E027, whose suggestion is prose Rocky writes rather than a
+    // name it echoes back. That is the text that was wrong.
+    std::fs::write(
+        dir.path().join("models").join("orders.toml"),
+        "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \
+         \"warehouse\"\nschema = \"out\"\ntable = \"orders\"\n\n[budget]\nmax_usd = \
+         0.0000001\nmax_bytes_scanned = 1\n",
+    )
+    .unwrap();
+    materialize_orders(&db_path, "out", "(1,'COMPLETE')").await;
+
+    let config_path = dir.path().join("rocky.toml");
+    let excluded = worker_excluded_tools(&config_path);
+    let server = RockyMcpServer::new_with_profile(config_path, rocky_mcp::McpProfile::Worker);
+    let client = connect(server).await;
+
+    // THE PROBE MUST EXHIBIT THE CONDITION. A green compile would sweep text
+    // that carries no diagnostic at all and report success either way, which
+    // is precisely how the old sweep stayed green over a real violation.
+    let compile = client
+        .call_tool(CallToolRequestParams::new("compile"))
+        .await
+        .expect("compile call");
+    let compiled = compile.structured_content.as_ref().expect("structured");
+    assert_eq!(
+        compiled["has_errors"],
+        serde_json::json!(true),
+        "the fixture must compile RED or this sweeps text that was never emitted: {compiled}"
+    );
+    let diagnostics = compiled["diagnostics"]
+        .as_array()
+        .expect("diagnostics array");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d["code"] == serde_json::json!("E027")),
+        "the budget breach must surface as E027: {compiled}"
+    );
+    assert!(
+        diagnostics.iter().any(|d| d.get("suggestion").is_some()),
+        "at least one diagnostic must carry a SUGGESTION — the field the \
+         violation lived in: {compiled}"
+    );
+
+    // The second producer: `draft_model` carries its own `diagnostics`, so a
+    // diagnostic reaches the worker by two routes. Drive it red too.
+    //
+    // Re-drafting `orders` is what makes it red, and deliberately so:
+    // `draft_model` preserve-merges an existing sidecar, so the `[budget]`
+    // block survives the write and the same E027 lands in this result. Bad
+    // SQL would NOT work — Rocky's inference is best-effort and an unknown
+    // column against a known upstream is `Unknown`, not an error (verified:
+    // `SELECT missing_col FROM orders` compiles clean).
+    let draft = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 1 AS id, 'COMPLETE' AS status",
+                "re-draft, to sweep draft_model's own diagnostics",
+            )),
+        )
+        .await
+        .expect("draft_model call");
+    let drafted = draft.structured_content.as_ref().expect("structured");
+    assert_eq!(
+        drafted["has_errors"],
+        serde_json::json!(true),
+        "the re-draft must compile RED or draft_model's diagnostics are empty: {drafted}"
+    );
+    assert!(
+        drafted["diagnostics"]
+            .as_array()
+            .expect("diagnostics array")
+            .iter()
+            .any(|d| d["code"] == serde_json::json!("E027") && d.get("suggestion").is_some()),
+        "draft_model must carry the SAME diagnostic text `compile` does, suggestion \
+         included — that is what makes it a second route: {drafted}"
+    );
+
+    // `breaking_change` in a non-git tree sets `skipped_reason` — a distinct
+    // free-text field on a SUCCESSFUL result, and one no previous sweep read.
+    let breaking = client
+        .call_tool(CallToolRequestParams::new("breaking_change"))
+        .await
+        .expect("breaking_change call");
+    let skipped = breaking.structured_content.as_ref().expect("structured");
+    assert!(
+        skipped.get("skipped_reason").is_some(),
+        "the non-git fixture must set skipped_reason or that field goes unswept: {skipped}"
+    );
+
+    // Now sweep those three, plus every other worker tool that runs offline
+    // here, as WHOLE serialized results.
+    let mut results = vec![
+        ("compile", compiled.clone()),
+        ("draft_model", drafted.clone()),
+        ("breaking_change", skipped.clone()),
+    ];
+    let model_arg = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let obj = |v: serde_json::Value| v.as_object().unwrap().clone();
+    for (tool, args) in [
+        ("plan_preview", None),
+        ("catalog", None),
+        ("inspect_schema", None),
+        ("test", None),
+        ("list", Some(obj(serde_json::json!({ "kind": "models" })))),
+        ("lineage", Some(model_arg.clone())),
+        ("dependents", Some(model_arg.clone())),
+        ("sample_rows", Some(model_arg.clone())),
+        (
+            "profile_column",
+            Some(obj(
+                serde_json::json!({ "model": "orders", "column": "status" }),
+            )),
+        ),
+    ] {
+        let mut request = CallToolRequestParams::new(tool);
+        if let Some(args) = args {
+            request = request.with_arguments(args);
+        }
+        let called = client
+            .call_tool(request)
+            .await
+            .unwrap_or_else(|e| panic!("`{tool}` call: {e}"));
+        results.push((
+            tool,
+            called
+                .structured_content
+                .clone()
+                .unwrap_or_else(|| panic!("`{tool}` returns structured content")),
+        ));
+    }
+    assert_eq!(
+        results.len(),
+        12,
+        "every one of the 12 worker-served tools is driven, or the sweep has a hole"
+    );
+
+    for (tool, result) in &results {
+        let whole = serde_json::to_string(result).expect("result serializes");
+        assert_eq!(
+            rocky_mcp::names_excluded_tool(&whole, &excluded),
+            None,
+            "worker `{tool}` result text must not name an excluded tool: {whole}"
+        );
+    }
+
+    // Surface 6: `output_schema` is NOT served, so the result-type doc
+    // comments schemars would put there never reach the worker. That matters
+    // because those doc comments DO name excluded tools (`DraftModelResult`'s
+    // `next_steps` doc spells out the `propose` chain). Pinned, so opting in
+    // fails here rather than silently opening a surface.
+    for tool in client.list_all_tools().await.expect("list tools") {
+        assert!(
+            tool.output_schema.is_none(),
+            "`{}` now serves an output_schema — the result-type doc comments are \
+             suddenly worker-served text and must be swept before this is enabled",
+            tool.name
+        );
+    }
+
+    client.cancel().await.unwrap();
+}
+
 /// The default profile's `build_model` still ends at `propose` — the worker
 /// variant did not leak into the default surface (both golden pins together
 /// force a conscious per-profile choice on any prompt edit).

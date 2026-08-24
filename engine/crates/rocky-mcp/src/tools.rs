@@ -214,36 +214,45 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 /// Every guidance surface an MCP worker session is served, counted —
-/// because this defect class has now been found FIVE times, and every fix
+/// because this defect class has now been found SIX times, and every fix
 /// was believed complete when it shipped.
 ///
 /// The history is the reason this is a list rather than a habit. Round 1
 /// fixed the prompt `description`s. Round 2 found the prompt BODIES.
 /// Round 2's own follow-up found the draft `next_steps`. The F3 red team
 /// then found `tools/list` TOOL DESCRIPTIONS, three of them still
-/// steering the worker at `propose`. And extending the sweep to cover
-/// those found a fifth instance on a surface swept since round 2: the
+/// steering the worker at `propose`. Extending the sweep to cover those
+/// found a fifth instance on a surface swept since round 2: the
 /// `add_tests_to_pks` worker prompt body said "Proposing", which an
-/// exact-name rule cannot see.
+/// exact-name rule cannot see. And F3 round 2 found the sixth in the one
+/// place this list did not look at all — the text a tool carries when it
+/// SUCCEEDS. Four E027 budget constructors suggested "or optimize the
+/// query", and `optimize` is a tool this profile does not serve.
 ///
 /// ```text
-///   #  surface                                status
-///   1  initialize  -> instructions            EXEMPT by design — see below
-///   2  prompts/list -> description            swept: worker_prompt_descriptions_name_
-///                                             no_excluded_tool
-///   3  prompts/get  -> message bodies         swept: worker_profile_prompts_end_at_
-///                                             the_runner_handoff
-///   4  tools/list   -> tool description       swept: worker_tool_descriptions_name_
-///                                             no_excluded_tool
-///   5  tools/list   -> input_schema text      swept: worker_profile_guidance_surfaces_
-///                                             name_no_excluded_tool (wire)
-///   6  tools/call   -> result next_steps      swept: draft_next_steps_are_profile_selected
-///   7  tools/call   -> error remediation_hint OPEN — not swept
+///   #  surface                                    status
+///   1  initialize   -> instructions                EXEMPT by design — see below
+///   2  prompts/list -> description                 swept: worker_prompt_descriptions_
+///                                                   name_no_excluded_tool
+///   3  prompts/get  -> message bodies              swept: worker_profile_prompts_end_
+///                                                   at_the_runner_handoff
+///   4  tools/list   -> tool description            swept: worker_tool_descriptions_
+///                                                   name_no_excluded_tool
+///   5  tools/list   -> input_schema text           swept: worker_profile_guidance_
+///                                                   surfaces_name_no_excluded_tool
+///   6  tools/list   -> output_schema text          NOT SERVED — pinned absent by
+///                                                   worker_result_text_names_no_
+///                                                   excluded_tool
+///   7  tools/call   -> ok: result next_steps       swept: draft_next_steps_are_
+///                                                   profile_selected
+///   8  tools/call   -> ok: other result text       PARTIAL — see below
+///   9  tools/call   -> err: remediation_hint       OPEN — not swept
 /// ```
 ///
-/// SEVEN SURFACES: FIVE SWEPT, ONE EXEMPT BY DESIGN, ONE OPEN. Not "all
-/// swept" — that sentence has now been believed four times about a set
-/// that was incomplete, which is the whole reason for the count.
+/// NINE SURFACES: FIVE SWEPT, ONE PARTIAL, ONE NOT SERVED, ONE EXEMPT BY
+/// DESIGN, ONE OPEN. Not "all swept" — that sentence has now been believed
+/// five times about a set that was incomplete, which is the whole reason
+/// for the count.
 ///
 /// (1) IS EXEMPT, NOT SWEPT, and the distinction is not a formality. The
 /// instructions are the compiled authoring skill served VERBATIM to both
@@ -257,7 +266,38 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// Reading that row as "swept" would be the same over-claim this
 /// enumeration exists to stop.
 ///
-/// (7) IS THE OPEN GAP, stated rather than glossed. A `ToolError`'s
+/// (6) IS NOT SERVED, and is listed precisely because it nearly was. rmcp
+/// emits no `output_schema` for any tool here, so the result-type doc
+/// comments schemars would put there never reach a worker — and those doc
+/// comments name excluded tools freely (`DraftModelResult::next_steps`
+/// spells out the whole `propose` chain). Opting in would turn all of
+/// `result_types.rs` into worker-served text in one commit. Pinned absent
+/// so that commit fails a test.
+///
+/// (8) IS PARTIAL, and the word is chosen carefully. It covers the free
+/// text a SUCCESSFUL result carries besides `next_steps`: diagnostic
+/// `message`/`suggestion` (from `compile` AND `draft_model` — two routes
+/// to the same text), breaking-change finding messages, `skipped_reason`,
+/// test-failure text, unavailability `reason`s. Its sweep drives all 12
+/// worker-served tools and serialises each WHOLE result, with the compile
+/// forced RED so the diagnostic path is really exercised. What it CANNOT
+/// claim is completeness, for two different reasons:
+///
+///  - Rocky-authored STATIC templates are written per call site across
+///    rocky-compiler, rocky-core and rocky-cli, for consumers that are
+///    mostly not this worker. There is no table to audit; reaching all of
+///    them means driving every constructor. That is the same shape as (9),
+///    and it gets the same honest status rather than a better one.
+///  - INTERPOLATED spans are structurally unsweepable. A diagnostic quotes
+///    the user's own model and column names, so a project with a model
+///    named `propose_v2` produces worker-facing text no rule Rocky ships
+///    can fix. Identifier-boundary matching shrinks this a lot — a column
+///    called `proposal_id` is no longer a match — but it does not remove
+///    it, and no runtime filter exists on surfaces 4, 5 or 7 either. This
+///    is a BOUNDARY, not a bug: naming it is the honest move, and pretending
+///    the sweep covers it would be the over-claim.
+///
+/// (9) IS THE OPEN GAP, stated rather than glossed. A `ToolError`'s
 /// `remediation_hint` is guidance, it is served to the worker, and it is
 /// not swept: reaching every hint means driving every error path of every
 /// served tool, which no harness here does, and the hints are written per
@@ -266,10 +306,10 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// THE LIST IS CLOSED AT THE PROTOCOL LEVEL rather than by inspection.
 /// [`RockyMcpServer::get_info`] enables `tools` and `prompts` and nothing
 /// else, so there is no `resources/read`, no completion and no logging
-/// channel able to carry an eighth kind of text.
+/// channel able to carry a tenth kind of text.
 /// `the_server_opens_no_guidance_channel_beyond_tools_and_prompts` pins
 /// that, so enabling one fails a test and forces a revisit of this comment
-/// instead of silently opening surface 8.
+/// instead of silently opening surface 10.
 ///
 /// SCOPE: this counts the MCP SESSION. A worker also receives the driver's
 /// TASK BRIEF, which is out-of-band — written to the task outbox, not
@@ -282,7 +322,7 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// rejects a legitimate operator config. The shipped default brief texts
 /// carry no inflection of an excluded name.
 ///
-/// Surface 6 has one worker-served producer: `draft_model`. `draft_check`
+/// Surface 7 has one worker-served producer: `draft_model`. `draft_check`
 /// also carries `next_steps`, but it left [`WORKER_PROFILE_TOOLS`], so a
 /// worker session cannot reach it — its worker text is still kept correct
 /// (see [`RockyMcpServer::draft_check_next_steps`]) because it is what
@@ -293,7 +333,7 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
 /// test. It is a constant rather than a comment so that grepping
 /// `WORKER_GUIDANCE_SURFACES` reaches the list from either end.
 #[cfg(test)]
-const WORKER_GUIDANCE_SURFACES: usize = 7;
+const WORKER_GUIDANCE_SURFACES: usize = 9;
 
 /// The worker-profile rewrites of `#[tool(description = ...)]` text, as
 /// `(tool, sentence to replace, replacement)`.
@@ -5963,8 +6003,8 @@ mod tests {
 
     /// The guidance-surface count is closed at the PROTOCOL level.
     ///
-    /// [`WORKER_GUIDANCE_SURFACES`] enumerates seven places a worker is
-    /// served text. That enumeration is only trustworthy if no eighth
+    /// [`WORKER_GUIDANCE_SURFACES`] enumerates nine places a worker is
+    /// served text. That enumeration is only trustworthy if no tenth
     /// CHANNEL can open without anyone noticing — so this pins the served
     /// capabilities: `tools` and `prompts`, and nothing else. Enabling
     /// resources, completions or logging fails here and forces a revisit
