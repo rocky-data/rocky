@@ -283,18 +283,54 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // no field that names one.
     //
     // The needle is now the whole step, because the default sentence it
-    // replaces carries two CLI routes (`rocky plan` and `rocky apply`) and
-    // a partial rewrite would leave one standing for the verb scan in
+    // replaces carries three CLI routes (`rocky emit-sql`, `rocky plan` and
+    // `rocky apply`) and a partial rewrite would leave one standing for the
+    // verb scan in
     // `worker_instructions_are_projected_and_default_stays_verbatim`.
+    //
+    // SIXTEENTH ROUND, finding 2 — the DEFAULT sentence changed under this
+    // needle, and the change is bigger than the wording. The old step told
+    // every default and approver client to "Run `rocky plan`", called the
+    // result offline, and said a model it cannot render is skipped. Three
+    // things were wrong at once, and only the first was reported:
+    //
+    //  - `rocky plan` is NOT offline. `commands::plan` builds an
+    //    `AdapterRegistry`, calls `discovery_adapter.discover()`, and its
+    //    own budget-check comment says plan "already performs live
+    //    warehouse I/O (discovery, governance)".
+    //  - Bare `rocky plan` never prints a TRANSFORMATION model's SQL at
+    //    all. Every `output.statements` push in `plan()` is in the
+    //    replication loop; the one transformation site is gated behind
+    //    `if let Some(model) = run_options.model`.
+    //  - On a transformation-only project — the shape steps 1-4 teach you
+    //    to build — `rocky plan` REFUSES, with or without `--model`:
+    //    `registry::resolve_replication_pipeline` rejects a non-replication
+    //    pipeline. So the step sent an agent at a command that exits 1.
+    //
+    // Verified by running the binary against
+    // `examples/playground/pocs/00-foundations/00-playground-default`, not
+    // by reading the call graph. The skipping claim was true of the OFFLINE
+    // preview core the step never actually invoked.
+    //
+    // `rocky emit-sql` is the verb that does what the step asks: offline,
+    // every model in dependency order, works on a transformation-only
+    // project, and reports what it could not render on stderr instead of
+    // dropping it silently. The default profile has no `emit_sql` TOOL, so
+    // the sentence naming the MCP equivalent sits directly beside it.
     (
-        "Run `rocky plan` and read the SQL it prints. It is a preview, not a transcript. \
-         The plan is generated offline. There is no live source schema and no compute \
-         warehouse. So a transformation that cannot be rendered that way is skipped, and \
-         it is not named. An incremental table previews the 1970 sentinel watermark, not \
-         the real one. A replication `MERGE` on any dialect but Databricks previews a \
-         canonical shape, not the column list the runner resolves at execute time. And \
-         `rocky apply` recompiles the project rather than replaying the file. Confirm the \
-         SQL it does print matches your intent.",
+        "Read your model's generated SQL before you ship it. `rocky emit-sql` renders it \
+         offline: no live source schema, no compute warehouse. It prints the models in \
+         dependency order and reports on stderr any it could not render. Over MCP the \
+         equivalent is the `plan_preview` tool, which renders the same way but drops what \
+         it cannot render without naming it. `rocky plan` is a different command, not this \
+         step. It needs a replication pipeline, connects to the source to discover tables, \
+         and prints replication SQL. It refuses a transformation-only project. Bare \
+         `rocky plan` never prints a transformation model's SQL; `rocky plan --model \
+         <name>` does, rendered offline. In replication SQL an incremental table previews \
+         the 1970 sentinel watermark, not the real one. A `MERGE` on any dialect but \
+         Databricks previews a canonical shape, not the column list the runner resolves at \
+         execute time. And `rocky apply` recompiles the project rather than replaying the \
+         file. Confirm the SQL you read matches your intent.",
         "Call the `plan_preview` tool and read the SQL it returns. It renders offline. It \
          is not the whole plan: a model whose SQL cannot be rendered offline is SKIPPED, \
          and the result does not name it. So a model missing from the statements means \
@@ -7259,13 +7295,25 @@ mod tests {
         //
         // The claim is false for the CLI too, on the same grounding the
         // reviewer used against `docs/reference/glossary.md`: `rocky plan`
-        // renders offline (`plan.rs::replication_copy_sql` degrades a
-        // non-Databricks `MERGE` to a canonical shape via
-        // `preview_merge_shape`, and an incremental table previews the 1970
-        // sentinel watermark), `rocky plan --model` routes through
-        // `plan_preview_output` and skips what it cannot render, and
-        // `rocky apply` RECOMPILES the project rather than replaying the
-        // persisted plan (`plan.rs`'s run-plan blueprint doc).
+        // renders its replication SQL STATICALLY, before any of it runs
+        // (`plan.rs::replication_copy_sql` degrades a non-Databricks
+        // `MERGE` to a canonical shape via `preview_merge_shape`, and an
+        // incremental table previews the 1970 sentinel watermark),
+        // `rocky plan --model` routes through `plan_preview_output` and
+        // skips what it cannot render, and `rocky apply` RECOMPILES the
+        // project rather than replaying the persisted plan (`plan.rs`'s
+        // run-plan blueprint doc).
+        //
+        // SIXTEENTH ROUND, finding 2 — this justification USED TO SAY
+        // "`rocky plan` renders offline", and that is the over-correction
+        // the finding names. `commands::plan` builds an `AdapterRegistry`
+        // and calls `discovery_adapter.discover()`; its own budget-check
+        // comment says plan "already performs live warehouse I/O
+        // (discovery, governance)". Statically-rendered is the property
+        // that makes the canonical `MERGE` and the 1970 sentinel true.
+        // Offline is a different property, and `rocky plan` does not have
+        // it. Correcting an over-claim is where this branch keeps
+        // manufacturing the opposite one.
         //
         // Pinned on the served text rather than on the file, because the
         // file is only a defect while the server serves it.
