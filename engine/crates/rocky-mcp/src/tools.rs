@@ -480,6 +480,26 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // goes, or `sample_rows` starts requiring a compiled model name, this
     // sentence becomes wrong advice at the exact moment a worker needs it —
     // worse than the promise it replaced, because it is the fallback.
+    //
+    // THIRTEENTH ROUND, finding 1 — and the sentence that replaced the
+    // over-claim carried a smaller one of its own. It said `sample_rows` and
+    // `profile_column` BOTH "surface a failed read as that tool's own
+    // error". True of `profile_column`'s counts; false of its `top_values`,
+    // which is a SECOND warehouse query taking `Err(_) => Vec::new()` before
+    // the tool returns success. So the same shape a third time, on the tool
+    // named as the counter-example to it:
+    //
+    //   sample_rows      read fails ─▶ ToolError::warehouse_error
+    //   profile_column   counts fail ─▶ ToolError::warehouse_error
+    //                    top_values fail ─▶ empty list, Ok(success)
+    //   inspect_schema   adapter or discovery fails ─▶ no tables, Ok(success)
+    //
+    // Same scope rule as the round above: the CLAIM moves, not the tool.
+    // `ProfileColumnResult` already carries `unavailable`/`reason`, so wiring
+    // this one would be cheap — and it is still a change to the tool's
+    // contract, which is not what this branch does. The text now calls
+    // `top_values` best-effort and names the three states an empty list does
+    // not tell apart, so a worker cannot read it as a fact about the column.
     (
         "Run **errors** carry a `failure_kind` (`Transient`, `AuthFailed`, `QueryRejected`, \
          `QuotaExceeded`, …) and sometimes a `cooldown_seconds`. Branch on *why* something \
@@ -487,15 +507,19 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
         "Run **errors** are not something you will see. No tool this profile serves runs or \
          materializes a pipeline, so there is no run to retry and no `failure_kind` to branch \
          on. Some tools DO read the warehouse. `sample_rows` and `profile_column` query it \
-         directly, and `inspect_schema` lists its tables when it can. `sample_rows` and \
-         `profile_column` surface a failed read as that tool's own error, not as a run \
-         outcome. `inspect_schema` does not. The physical tables it adds to `sources` are \
-         best-effort: when the warehouse cannot be read it reports none of them and still \
-         returns success. A table missing from `sources` is therefore inconclusive, not proof \
-         the table is absent. Ask `sample_rows` for that table before you conclude it is \
-         absent — it either reads the table or fails with a readable error. A tool result \
-         that reports a failure is a finding for your report — read it, name it, and do not \
-         work around it.",
+         directly, and `inspect_schema` lists its tables when it can. Not every one of those \
+         reads reports its own failure. `sample_rows` does: a read it cannot complete comes \
+         back as that tool's own error, not as a run outcome. `profile_column` does for the \
+         counts it returns, but its `top_values` is a second query and is best-effort — when \
+         that query fails the tool still returns success with an empty list, and nothing in \
+         the result says so. An empty `top_values` does not distinguish a high-cardinality \
+         column, an all-null one, and a failed query. `inspect_schema` is best-effort in the \
+         same way: when the warehouse cannot be read it reports none of its physical tables \
+         and still returns success. A table missing from `sources` is therefore inconclusive, \
+         not proof the table is absent. Ask `sample_rows` for that table before you conclude \
+         it is absent — it either reads the table or fails with a readable error. A tool \
+         result that reports a failure is a finding for your report — read it, name it, and \
+         do not work around it.",
     ),
     // The third check-authorship steer.
     (
@@ -3328,6 +3352,24 @@ impl RockyMcpServer {
         // counts — what `min`/`max` alone can't reveal (e.g. that `status`
         // holds 'COMPLETE', not 'completed'). One extra grouped query, run only
         // when the cardinality makes it cheap.
+        //
+        // THIS SECOND READ IS BEST-EFFORT, AND SAYS SO NOWHERE IN THE RESULT.
+        // The primary query above surfaces its failure as
+        // `ToolError::warehouse_error`. This one takes `Err(_) => Vec::new()`
+        // and the tool then returns SUCCESS: a transient failure here yields a
+        // non-zero `distinct` beside an empty `top_values`, which is also what
+        // a high-cardinality column and an all-null one produce. `unavailable`
+        // and `reason` below are set to `false`/`None` unconditionally, so
+        // nothing distinguishes the three.
+        //
+        // That makes this the THIRD best-effort warehouse read on these tools
+        // that reports success on failure — the two in `inspect_schema` are
+        // the others. It is a product pattern, not three accidents, and it is
+        // filed as one defect. NOT fixed here: wiring `unavailable`/`reason`
+        // is cheap but it is a change to the tool's contract, and this branch
+        // corrects CLAIMS about behaviour rather than behaviour. The worker
+        // guidance in `WORKER_INSTRUCTIONS_REWRITES` describes `top_values` as
+        // best-effort instead of promising an error it does not raise.
         let top_values = if distinct > 0 && distinct <= PROFILE_TOP_VALUES_MAX as u64 {
             let q = format!(
                 "SELECT CAST({col} AS {string_type}) AS v, COUNT(*) AS c FROM {} \
@@ -7210,6 +7252,39 @@ mod tests {
             body_lower.contains("ask `sample_rows` for that table"),
             "the body must name the reader that DOES fail loudly for the same table, or the \
              caveat above leaves the worker with no way to tell inconclusive from absent: \
+             {body}"
+        );
+        // THIRTEENTH ROUND, finding 1 — the same defect one tool over, in the
+        // sentence that fixed the one above it. `profile_column` was named as
+        // a counter-example to `inspect_schema`, and it is one only for its
+        // PRIMARY query. Its `top_values` is a second warehouse query taking
+        // `Err(_) => Vec::new()`, after which the tool returns success — so a
+        // worker reading an empty list as a fact about the column is reading
+        // a possible failure as data. Pinned in both directions, like the
+        // pair above: dropping the caveat is the cheap edit, and the
+        // over-claim came back the moment nothing held it.
+        assert!(
+            !body_lower.contains(
+                "`sample_rows` and `profile_column` surface a failed read as that tool's own \
+                 error"
+            ),
+            "the projected body must not promise `profile_column` surfaces EVERY failed read \
+             as its own error — its `top_values` query returns an empty list and the tool \
+             still succeeds: {body}"
+        );
+        assert!(
+            body_lower.contains("`top_values` is a second query and is best-effort"),
+            "the body must disclose `profile_column`'s optional second read as best-effort, \
+             or the worker has no reason to distrust an empty `top_values`: {body}"
+        );
+        // AND the caveat has to say what the empty list fails to tell apart.
+        // "Best-effort" alone reads as "sometimes missing"; the actionable
+        // fact is that a failure is indistinguishable from two ordinary
+        // outcomes, because nothing in the result separates them.
+        assert!(
+            body_lower.contains("an empty `top_values` does not distinguish"),
+            "and it must say what an empty `top_values` does NOT tell apart — a \
+             high-cardinality column, an all-null one, and a failed query all produce it: \
              {body}"
         );
         // TWELFTH ROUND, finding 2 — NO COUNT IS PINNED HERE, DELIBERATELY.
