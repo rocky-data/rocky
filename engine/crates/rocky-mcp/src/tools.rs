@@ -1161,6 +1161,16 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// `tests/fixtures/served_text.golden`. Any edit to any of that text fails
 /// the test until someone re-blesses the file.
 ///
+/// "WHOLE SERIALIZED PAYLOAD" WAS NOT TRUE OF ROW 1 WHEN IT WAS FIRST
+/// WRITTEN, and the fifteenth round is why it is called out rather than
+/// quietly corrected. The golden hashed `instructions` alone — one field of
+/// an `InitializeResult` that also carries `protocolVersion`,
+/// `capabilities`, `serverInfo` and `_meta` — while its heading claimed the
+/// channel. That is the SAME field-selection defect the eleventh round
+/// found in rows 1, 2, 4, 5, 8 and 9 of the sweeps above, reproduced inside
+/// the guard built to catch it. It now hashes the serialized
+/// `InitializeResult`.
+///
 /// The reason it exists is the limit of every other rule on this list. All
 /// of them are LEXICAL — they look for a word. An arbitrary paraphrase
 /// defeats a negative-substring pin, and no lexical rule can catch a

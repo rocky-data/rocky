@@ -5389,15 +5389,43 @@ async fn served_text_digests(
     let client = connect(server).await;
     let mut out = std::collections::BTreeMap::new();
 
-    // Surface 1 — the served `instructions`, whole. The banner is NOT
-    // spliced out here: this golden is about drift, and a banner that
-    // changes because the allowlist changed is exactly the kind of change
-    // that should need a re-bless.
-    let instructions = client
-        .peer_info()
-        .and_then(|info| info.instructions.clone())
-        .expect("every profile serves instructions");
-    record(&mut out, "instructions", &instructions, nonce);
+    // Surface 1 — the WHOLE `InitializeResult`, not its `instructions`.
+    //
+    // FIFTEENTH ROUND, finding 2 — this hashed `instructions` alone, which
+    // is field selection under a heading that claims a channel. That is
+    // the exact defect the eleventh round found in the sweeps and this
+    // golden was built to catch: the guard against the class had
+    // instantiated the class.
+    //
+    // What the omission left unpinned is real. `initialize` also carries
+    // `protocolVersion`, `capabilities`, `serverInfo` and `_meta`, and the
+    // `serverInfo` `Implementation` carries `title`, `description`, `icons`
+    // and `websiteUrl` besides its name and version. A server title or
+    // description added later is text a client shows the operator, and
+    // under the old key it moved without moving the golden.
+    //
+    // Pinning the whole value is CHEAP here, which is why there is no
+    // carve-out. `Implementation::from_build_env()` expands `env!` inside
+    // rmcp, so `serverInfo` is rmcp's own name and version — NOT
+    // rocky-mcp's — and the row therefore does not churn on a Rocky release
+    // bump. It moves on an rmcp upgrade, which is a change that should
+    // force someone to re-read what this server announces.
+    //
+    // The banner is NOT spliced out: this golden is about drift, and a
+    // banner that changes because the allowlist changed is exactly the kind
+    // of change that should need a re-bless.
+    let initialize = client.peer_info().expect("every profile serves peer info");
+    assert!(
+        initialize.instructions.is_some(),
+        "every profile serves instructions; a golden over an initialize result without \
+         them pins the wrong thing"
+    );
+    record(
+        &mut out,
+        "initialize",
+        &serde_json::to_string(&*initialize).expect("initialize result serializes"),
+        nonce,
+    );
 
     // Surfaces 2 and 3 — the whole listed `Prompt`, and the whole
     // `prompts/get` result for it. Arguments are synthesised from each
@@ -5492,11 +5520,19 @@ fn render_golden(table: &std::collections::BTreeMap<String, String>) -> String {
 /// question is still a person's job, which is why the failure message asks
 /// for it by name.
 ///
-/// WHAT IT COVERS: surfaces 1–5 of `WORKER_GUIDANCE_SURFACES` — the served
-/// `instructions`, the whole listed `Prompt`, the whole `prompts/get`
+/// WHAT IT COVERS: surfaces 1–5 of `WORKER_GUIDANCE_SURFACES` — the whole
+/// `initialize` result, the whole listed `Prompt`, the whole `prompts/get`
 /// result, and the whole listed `Tool` — for the DEFAULT and WORKER
 /// profiles. Both, because a one-sided edit to the two near-identical
 /// `build_model` bodies is how round thirteen's defect nearly shipped.
+///
+/// EVERY ROW HASHES THE WHOLE SERIALIZED VALUE OF ITS CHANNEL, and the
+/// fifteenth round is why that sentence is here rather than assumed. Row 1
+/// hashed `instructions` alone — one field of an `InitializeResult` that
+/// also carries `protocolVersion`, `capabilities`, `serverInfo` and
+/// `_meta`. Field selection is the defect the eleventh round found in the
+/// sweeps, and this golden reproduced it while being the guard against it.
+/// A new row must hash a serialized value, never a field read off one.
 ///
 /// WHAT IT DOES NOT COVER, said plainly rather than left to be discovered:
 /// surfaces 7, 8 and 9 — the text a `tools/call` carries when it succeeds
