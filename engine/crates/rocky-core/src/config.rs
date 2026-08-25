@@ -6669,8 +6669,15 @@ token = "pat"
 
     /// The one shape the tolerant policy cannot save, pinned so the
     /// diagnostic stays useful: a placeholder written as a BARE TOML value
-    /// was never valid TOML, so it fails to parse — and the error must still
-    /// name the variable, which the parser alone cannot know.
+    /// was never valid TOML, so it fails to parse.
+    ///
+    /// The assertion is on the HINT CLAUSE, not merely on the variable name.
+    /// A first draft asserted the name alone and was not fix-sensitive:
+    /// `toml`'s own error quotes the offending line, which contains the
+    /// `${VAR}` text, so it named the variable with the hint plumbing
+    /// reverted. What this change actually adds is the LABELLED attribution —
+    /// "this variable is not set" rather than a `$` the operator has to
+    /// interpret — and that is what is pinned.
     #[test]
     fn env_tolerant_load_names_an_unresolved_var_in_a_parse_error() {
         assert!(
@@ -6691,6 +6698,11 @@ token = "pat"
         assert!(
             rendered.contains("ROCKY_DEFINITELY_NOT_SET_BARE_PORT"),
             "the parse error must name the unresolved variable, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("env vars are not set"),
+            "the parse error must say WHY the variable appears, not leave the \
+             operator to decode a stray `$`, got: {rendered}"
         );
     }
 
