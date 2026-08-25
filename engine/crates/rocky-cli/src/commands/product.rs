@@ -49,7 +49,8 @@ use rocky_core::fulfill::{
 };
 use rocky_core::policy::{self, ModelAttributes};
 use rocky_core::product::commit::{
-    RecoveryAction, committed_manifest, recover_generation, run_phase_a, run_phase_b,
+    RecoveryAction, ReopenOutcome, committed_manifest, recover_generation, reopen_for_drafting,
+    run_phase_a, run_phase_b,
 };
 use rocky_core::product::lowering::{manifest_rel, sidecar_rel, state_dir_rel};
 use rocky_core::product::manifest::{
@@ -818,6 +819,24 @@ pub fn run_product_verify(config_path: &Path, product_name: &str, output_json: b
 // compile
 // ---------------------------------------------------------------------------
 
+/// Is this process the one whose stamp is on `record`?
+///
+/// The in-flight guard's whole basis (#1493). It is DERIVED from what
+/// this process actually is — its pid paired with its own start time,
+/// read from the OS — never asserted by a caller. An earlier version
+/// took a caller-supplied "who is asking" argument; that let the public
+/// façade hand the loop's exemption to anyone who called it, so the
+/// exemption is gone and there is no argument left to abuse.
+///
+/// The start time is what makes this reuse-proof. A pid alone would be
+/// wrong in the fail-open direction: a killed loop leaves its stamp
+/// behind, and an unrelated process that later recycles that pid would
+/// read as the owner. A stamp whose start time we cannot confirm is
+/// NOT ours — the guard fails closed and refuses.
+fn stamp_belongs_to_this_process(record: &FulfillStateRecord) -> bool {
+    rocky_core::process::stamp_is_this_process(record.owner_pid, record.owner_start_time)
+}
+
 /// The inner compile: verify, then run the next lowering phase through
 /// the staged commit protocol.
 ///
@@ -860,12 +879,53 @@ pub(crate) fn product_compile_in(
         Some(store) => store.product_approval_get(product_name)?,
         None => None,
     };
+    // No state store means no fulfillment record can exist, so no loop
+    // can own this product.
+    let observed_state = match &state_store {
+        Some(store) => store.fulfill_state_get(product_name)?,
+        None => None,
+    };
     let mut approval_echo = None;
     let mut spec_matches_approval = None;
     if let Some(record) = &approval {
         verify_approval_snapshot(root, record)?;
         spec_matches_approval = Some(record.spec_digest == parsed.digest);
         approval_echo = Some(approval_output(record));
+    }
+
+    // Compile picks its phase from what is on disk, so it must never run
+    // concurrently with a fulfillment loop that owns this product. The
+    // loop's drafting window is exactly the interval where the manifest
+    // says Phase A while last round's sidecar is still on disk: a
+    // `rocky product compile` landing there re-merges and re-pins that
+    // stale sidecar, which makes the loop's own repair look like tamper
+    // all over again (#1493). Refuse while any in-flight stamp is
+    // present — the same shape `product_approve_in` uses below.
+    //
+    // The loop's OWN compile passes, because the stamp it reads is the
+    // one it wrote: same pid AND same process start time. Nothing here
+    // is supplied by the caller, so no entry point can hand out the
+    // loop's identity.
+    if let Some(record) = &observed_state
+        && !stamp_belongs_to_this_process(record)
+        && (record.owner_pid.is_some() || record.driver_pgid.is_some())
+    {
+        let who = match (record.owner_pid, record.driver_pgid) {
+            (Some(pid), _) => format!("a fulfillment loop (pid {pid}) owns it"),
+            (None, Some(pgid)) => {
+                format!("a worker process group (pgid {pgid}) is recorded as live")
+            }
+            (None, None) => unreachable!("guarded by the condition above"),
+        };
+        bail!(
+            "[compile-refused-in-flight] refusing to compile product '{product_name}' \
+             while fulfillment work is in flight ({who}). Compiling now could re-merge \
+             and re-pin artifacts the loop is mid-round on. Stop the running \
+             `rocky fulfill` loop (or let it reach its next stop — needs_input, blocked, \
+             or observing), then re-run; nothing was written. If that loop is already \
+             gone, `rocky fulfill {product_name}` sweeps the dead owner by its start \
+             time and takes the record over."
+        );
     }
 
     let sidecar_present = root.join(sidecar_rel(&parsed)).is_file();
@@ -1451,6 +1511,34 @@ pub fn run_product_status(
 pub(crate) fn product_recover_in(root: &Path, product_name: &str) -> Result<RecoveryAction> {
     let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
     recover_generation(root, &parsed).map_err(|reject| anyhow::anyhow!("{reject}"))
+}
+
+/// The loop's (re)opening of a drafting window (#1493): byte-verify the
+/// committed MERGED generation in full, then demote its manifest to
+/// Phase A through the staged commit. See
+/// [`rocky_core::product::commit::reopen_for_drafting`] for the
+/// protocol.
+///
+/// This wrapper only opens the state store and resolves the spec. The
+/// decision evidence is read inside [`reopen_for_drafting`] itself, from
+/// that store — never handed to it — so no caller anywhere can
+/// manufacture the evidence by building a record of its own.
+///
+/// # Errors
+///
+/// Whatever the core reopen refuses (`reopen-undecided` when no record
+/// exists or it is not the loop's decided round), plus the spec load and
+/// the store open.
+pub(crate) fn product_reopen_in(
+    root: &Path,
+    state_path: &Path,
+    product_name: &str,
+) -> Result<ReopenOutcome> {
+    let parsed = load_spec(root, product_name).map_err(|reject| anyhow::anyhow!("{reject}"))?;
+    let spec_path = spec_rel(product_name);
+    let store = open_state_store(state_path)?;
+    reopen_for_drafting(root, &spec_path, &parsed, &store)
+        .map_err(|reject| anyhow::anyhow!("{reject}"))
 }
 
 #[cfg(test)]
@@ -2220,6 +2308,286 @@ effect = "require_review"
                 .journal_seq,
             1,
             "a no-op re-approve appends no journal row"
+        );
+    }
+
+    /// #1493 F3: `compile` picks its phase from what is on disk, so a
+    /// concurrent run during the loop's drafting window would re-merge
+    /// and re-pin the PREVIOUS round's sidecar — making the loop's own
+    /// repair look like tamper again. It refuses for a foreign owner,
+    /// the same shape the D2 approve guard uses.
+    #[test]
+    fn compiling_a_product_a_live_loop_owns_refuses() {
+        use rocky_core::fulfill::{FulfillJournalRow, FulfillState};
+
+        let row = |event: &str, to: &str| FulfillJournalRow {
+            seq: 0,
+            at: None,
+            event: event.to_string(),
+            from_state: None,
+            to_state: to.to_string(),
+            spec_digest: None,
+            plan_id: None,
+            idempotency_key: None,
+        };
+
+        // Each case is a DIFFERENT in-flight stamp, and each must refuse
+        // on its own.
+        for (why, owner_pid, driver_pgid, expect) in [
+            (
+                "a live loop owns the record",
+                Some(31337u32),
+                None,
+                "pid 31337",
+            ),
+            (
+                "only a worker group is stamped",
+                None,
+                Some(4242u32),
+                "pgid 4242",
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (root, config) = project_with_config(dir.path(), &passing_config());
+            let state_path = temp_state_path(dir.path());
+            product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+            {
+                let store = StateStore::open(&state_path).expect("opens");
+                let observed = store
+                    .fulfill_state_get("revenue_daily")
+                    .expect("reads")
+                    .expect("recorded");
+                let mut drafting = observed.clone();
+                drafting.state = FulfillState::Drafting;
+                drafting.owner_pid = owner_pid;
+                drafting.owner_start_time = owner_pid.map(|_| 1);
+                drafting.driver_pgid = driver_pgid;
+                store
+                    .fulfill_state_cas(
+                        "revenue_daily",
+                        Some(&observed),
+                        &drafting,
+                        &row("drafting", "drafting"),
+                    )
+                    .expect("cas");
+            }
+
+            let err = product_compile_in(&root, &config, Some(&state_path), "revenue_daily")
+                .expect_err(why);
+            let rendered = format!("{err:#}");
+            assert!(
+                rendered.contains("[compile-refused-in-flight]"),
+                "{why}: {rendered}"
+            );
+            assert!(
+                rendered.contains(expect),
+                "{why}: names who owns it: {rendered}"
+            );
+            assert!(
+                rendered.contains("rocky fulfill revenue_daily"),
+                "{why}: a stale stamp is recoverable, and the refusal must say how: \
+                 {rendered}"
+            );
+
+            // Nothing was compiled: no manifest, no artifacts.
+            assert!(
+                committed_manifest(&root, "revenue_daily")
+                    .expect("reads")
+                    .is_none(),
+                "{why}: a refusal must not commit a generation"
+            );
+            assert!(
+                !root.join("models/revenue_daily.contract.toml").exists(),
+                "{why}: a refusal must write no artifacts"
+            );
+        }
+    }
+
+    /// The other half of F3: a process compiling a product IT owns is
+    /// not refused. That is the loop's own Phase A / Phase B step, and a
+    /// guard that blocked it would deadlock the loop at Phase A.
+    ///
+    /// The stamp here is this process's REAL identity — its pid and the
+    /// start time the OS reports — because that is the only thing the
+    /// guard accepts. The record also carries a live worker group, so
+    /// this pins that owning the record is what passes, not the absence
+    /// of other stamps.
+    #[test]
+    fn the_owning_process_compiles_its_own_product() {
+        use rocky_core::fulfill::{FulfillJournalRow, FulfillState};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+        let me = std::process::id();
+        let my_start = rocky_core::process::process_liveness(me)
+            .expect("probe this process")
+            .expect("this process is alive");
+
+        {
+            let store = StateStore::open(&state_path).expect("opens");
+            let observed = store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            let mut drafting = observed.clone();
+            drafting.state = FulfillState::Drafting;
+            drafting.owner_pid = Some(me);
+            drafting.owner_start_time = Some(my_start);
+            drafting.driver_pgid = Some(4242);
+            store
+                .fulfill_state_cas(
+                    "revenue_daily",
+                    Some(&observed),
+                    &drafting,
+                    &FulfillJournalRow {
+                        seq: 0,
+                        at: None,
+                        event: "drafting".to_string(),
+                        from_state: None,
+                        to_state: "drafting".to_string(),
+                        spec_digest: None,
+                        plan_id: None,
+                        idempotency_key: None,
+                    },
+                )
+                .expect("cas");
+        }
+
+        let output = product_compile_in(&root, &config, Some(&state_path), "revenue_daily")
+            .expect("the owning process's own compile proceeds");
+        assert_eq!(output.phase, "lowered_contract");
+    }
+
+    /// R2-1: the PUBLIC façade must not hand out the loop's exemption.
+    ///
+    /// An earlier fix passed a "who is asking" argument and
+    /// `fulfill_api::product_compile` hard-coded the loop's variant, so
+    /// every caller of that public entry inherited the loop's identity
+    /// and walked past the guard. There is no such argument now — the
+    /// guard reads this process's real identity — so the façade and the
+    /// CLI verb are guarded identically. This calls the façade against a
+    /// record owned by ANOTHER process and requires a refusal.
+    #[test]
+    fn the_public_facade_does_not_grant_the_loops_exemption() {
+        use rocky_core::fulfill::{FulfillJournalRow, FulfillState};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+        {
+            let store = StateStore::open(&state_path).expect("opens");
+            let observed = store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            let mut drafting = observed.clone();
+            drafting.state = FulfillState::Drafting;
+            drafting.owner_pid = Some(31337);
+            drafting.owner_start_time = Some(1);
+            store
+                .fulfill_state_cas(
+                    "revenue_daily",
+                    Some(&observed),
+                    &drafting,
+                    &FulfillJournalRow {
+                        seq: 0,
+                        at: None,
+                        event: "drafting".to_string(),
+                        from_state: None,
+                        to_state: "drafting".to_string(),
+                        spec_digest: None,
+                        plan_id: None,
+                        idempotency_key: None,
+                    },
+                )
+                .expect("cas");
+        }
+
+        // The façade — the entry the fulfillment loop consumes, and the
+        // one that previously exempted whoever called it.
+        let err = crate::commands::fulfill_api::product_compile(
+            &root,
+            &config,
+            Some(&state_path),
+            "revenue_daily",
+        )
+        .expect_err("the façade must be guarded exactly like the CLI verb");
+        assert!(
+            format!("{err:#}").contains("[compile-refused-in-flight]"),
+            "{err:#}"
+        );
+        assert!(
+            committed_manifest(&root, "revenue_daily")
+                .expect("reads")
+                .is_none(),
+            "a refusal must not commit a generation"
+        );
+    }
+
+    /// The PID-reuse hole the start-time pairing closes (#1493, red-team
+    /// finding 2). A crashed loop leaves its pid on the record. An
+    /// unrelated `rocky product compile` that later recycles that exact
+    /// pid must STILL be refused — ownership is not pid equality.
+    ///
+    /// The stamp is this test process's own pid, which is precisely the
+    /// collision a pid-comparing guard would read as "this is mine".
+    #[test]
+    fn a_recycled_pid_does_not_buy_ownership_of_a_compile() {
+        use rocky_core::fulfill::{FulfillJournalRow, FulfillState};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, config) = project_with_config(dir.path(), &passing_config());
+        let state_path = temp_state_path(dir.path());
+        product_approve_in(&root, &state_path, "revenue_daily").expect("approves");
+
+        {
+            let store = StateStore::open(&state_path).expect("opens");
+            let observed = store
+                .fulfill_state_get("revenue_daily")
+                .expect("reads")
+                .expect("recorded");
+            let mut drafting = observed.clone();
+            drafting.state = FulfillState::Drafting;
+            drafting.owner_pid = Some(std::process::id());
+            // A DIFFERENT start time: the stamp is a dead process that
+            // happened to hold this pid, not us.
+            drafting.owner_start_time = Some(1);
+            store
+                .fulfill_state_cas(
+                    "revenue_daily",
+                    Some(&observed),
+                    &drafting,
+                    &FulfillJournalRow {
+                        seq: 0,
+                        at: None,
+                        event: "drafting".to_string(),
+                        from_state: None,
+                        to_state: "drafting".to_string(),
+                        spec_digest: None,
+                        plan_id: None,
+                        idempotency_key: None,
+                    },
+                )
+                .expect("cas");
+        }
+
+        let err = product_compile_in(&root, &config, Some(&state_path), "revenue_daily")
+            .expect_err("a matching pid must not be read as ownership");
+        assert!(
+            format!("{err:#}").contains("[compile-refused-in-flight]"),
+            "{err:#}"
+        );
+        assert!(
+            committed_manifest(&root, "revenue_daily")
+                .expect("reads")
+                .is_none(),
+            "a refusal must not commit a generation"
         );
     }
 

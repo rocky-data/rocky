@@ -54,11 +54,21 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          # Pinned: an unpinned `stable` let the 1.98.0 release land mid-day
+          # (2026-08-20) and turn required checks red with no code change,
+          # while cache-busting every Rust job at once. Bump deliberately.
+          toolchain: 1.98.0
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: engine
+          # Restore only. This workflow runs on a TAG ref, and GitHub scopes
+          # caches so an entry created for one tag is never visible to the
+          # next one — saving here spends multi-GB of the repo's 10 GB budget
+          # on an entry only a re-run of this same tag could ever read, while
+          # evicting the main-branch caches that every PR restores from.
+          save-if: false
           key: wasm
 
       # Set up Node with the npm registry so `npm publish` picks up

@@ -207,6 +207,34 @@ fn load_all_models(models_dir: &Path) -> Result<Vec<rocky_core::models::Model>> 
     Ok(all)
 }
 
+/// How many declarative tests [`run_declarative_tests`] would execute for
+/// `model` — the number a caller may report as deferred when the target is
+/// not materialised yet.
+///
+/// Counts the model loader's EXPANDED `ModelConfig.tests` vector, which is
+/// the exact vector the runner iterates. That matters: the loader appends
+/// every `[[use_test]]` reference to `tests` after resolving it against
+/// `test_definitions.toml`, and the runner cannot tell an expanded
+/// reference from an inline test. Counting the sidecar's raw `[[tests]]`
+/// array instead would undercount by exactly the `[[use_test]]`
+/// references — and the sidecar merge preserves those, because the product
+/// lowering owns only `tests`.
+///
+/// Goes through [`load_all_models`], the same loader the runner uses, so
+/// the counted set is the executed set by construction rather than by a
+/// re-derivation that has to be kept in step by hand.
+///
+/// An unknown model is an error, never a zero: a caller must be able to
+/// tell "no checks" from "no answer".
+pub fn declarative_test_count(models_dir: &Path, model: &str) -> Result<usize> {
+    let all_models = load_all_models(models_dir)?;
+    let found = all_models
+        .iter()
+        .find(|loaded| loaded.config.name == model)
+        .ok_or_else(|| anyhow::Error::new(ModelNotFound(model.to_string())))?;
+    Ok(found.config.tests.len())
+}
+
 /// Model names, for [`reject_unknown_model`] — which takes `&[String]` so it
 /// can serve both the declarative path (loaded `Model`s) and the compiled
 /// path (`TestResult::all_models`).
@@ -556,7 +584,63 @@ fn test_type_label(tt: &TestType) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::load_all_models;
+    use super::{declarative_test_count, load_all_models};
+
+    /// Write a one-model project whose sidecar carries `sidecar_extra`,
+    /// plus a named-test registry. Returns the models dir.
+    fn project(sidecar_extra: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let models = tmp.path().join("models");
+        std::fs::create_dir(&models).expect("create models dir");
+        std::fs::write(
+            models.join("test_definitions.toml"),
+            "[positive]\ntype = \"expression\"\nexpression = \"amount > 0\"\n",
+        )
+        .expect("write test definitions");
+        std::fs::write(models.join("orders.sql"), "SELECT 1 AS id").expect("write model sql");
+        std::fs::write(
+            models.join("orders.toml"),
+            format!(
+                "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+                 [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"orders\"\n\n\
+                 [[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n{sidecar_extra}"
+            ),
+        )
+        .expect("write model sidecar");
+        (tmp, models)
+    }
+
+    #[test]
+    fn declarative_test_count_includes_expanded_use_test_references() {
+        // #1495: the model loader resolves every `[[use_test]]` against
+        // `test_definitions.toml` and APPENDS it to `ModelConfig.tests`,
+        // which is the vector `run_declarative_tests` iterates. Counting
+        // the sidecar's raw `[[tests]]` array would report 1 here and
+        // silently drop the reference — an undercount, and the third
+        // one found in this area. Counting through the runner's own
+        // loader makes the counted set the executed set.
+        let (_tmp, models) = project("\n[[use_test]]\nname = \"positive\"\n");
+        assert_eq!(
+            declarative_test_count(&models, "orders").expect("count"),
+            2,
+            "the expanded [[use_test]] reference must be counted alongside the inline test"
+        );
+        // The loader agrees with the counter, by construction.
+        let loaded = load_all_models(&models).expect("load models");
+        assert_eq!(loaded[0].config.tests.len(), 2);
+    }
+
+    #[test]
+    fn declarative_test_count_refuses_an_unknown_model_rather_than_returning_zero() {
+        // A caller must be able to tell "no checks" from "no answer".
+        let (_tmp, models) = project("");
+        assert_eq!(declarative_test_count(&models, "orders").expect("count"), 1);
+        let err = declarative_test_count(&models, "nope").expect_err("unknown model");
+        assert!(
+            err.to_string().contains("nope"),
+            "the refusal must name the model: {err}"
+        );
+    }
 
     #[test]
     fn declarative_loader_includes_tests_from_rocky_models() {

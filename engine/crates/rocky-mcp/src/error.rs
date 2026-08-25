@@ -66,6 +66,15 @@ pub enum ToolErrorCode {
     /// (`rocky review <plan_id> --approve`) before `rocky apply`. `policy_rule`
     /// names the deciding rule when one matched.
     PolicyReviewRequired,
+    /// The `review_queue` approve action is not served on this server's
+    /// profile. Distinct from [`Self::PolicyReviewRequired`]: no policy rule
+    /// decided this and no plan was recorded — the operator simply did not
+    /// start the server with `rocky mcp --profile approver`, so this session
+    /// cannot write a human sign-off marker at all. Retrying with
+    /// `confirm: true` can never satisfy it; the recovery is the human's
+    /// terminal (`rocky review <plan_id> --approve`) or an operator restart
+    /// on the approver profile.
+    ApproveNotEnabled,
     /// An unexpected internal failure. `message` carries the detail.
     Internal,
 }
@@ -276,6 +285,30 @@ impl ToolError {
             spec_digest,
         }));
         wrapped
+    }
+
+    /// The `review_queue` approve action is not served on this profile (#1517).
+    ///
+    /// The message and hint are built HERE, in one place, so every refusal
+    /// names the same opt-in and the flag spelling cannot drift per call site.
+    /// The hint gives both recoveries in the order an operator should prefer
+    /// them: the human's own terminal first, the server restart second.
+    pub fn approve_not_enabled(plan_id: &str) -> Json<Self> {
+        Self::wrap(
+            ToolErrorCode::ApproveNotEnabled,
+            format!(
+                "approving '{plan_id}' writes a human sign-off marker that unblocks `rocky \
+                 apply`, and this MCP server does not serve the approve action: it was started \
+                 without `--profile approver`."
+            ),
+            format!(
+                "Ask the human to approve in their own terminal with `rocky review {plan_id} \
+                 --approve`. If approving from this server is genuinely wanted, the OPERATOR \
+                 must restart it as `rocky mcp --profile approver` — an agent cannot turn this \
+                 on mid-session. Listing the queue needs no opt-in: call review_queue with no \
+                 approve_plan_id."
+            ),
+        )
     }
 
     /// An unexpected internal failure.

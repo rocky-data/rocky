@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Fulfillment walking skeleton — the loop's happy path end to end, one binary.
-# (Repair recovery is a known engine gap, #1493 — see README; not exercised here.)
+# Fulfillment walking skeleton — the loop end to end, one binary, INCLUDING
+# repair recovery: the recorded first draft is red (E010), the verify bundle
+# catches it, and the recorded repair round fixes it (#1493, fixed).
 #
 # `set -uo pipefail` (NOT -e): this POC asserts FAILURE paths, so expected
 # non-zero exits are captured explicitly (`; echo EXIT=$?`) and checked. Every
@@ -155,11 +156,19 @@ cp "$S4/paste_block.txt" expected/04_paste_block.txt
 rm -rf "$S4"
 
 # ------------------------------------------------------------------ Assert 2
-# APPROVE + MANIFEST TOTALITY. Approve the spec, then one fulfill drives the
-# loop through snapshot verify -> posture -> Phase A -> drafting -> Phase B ->
-# verify -> propose, stopping for plan review. The committed lowering manifest
-# must be TOTAL: phase "merged", every spec field mapped, zero rejects.
-echo; echo "[2] approve spec + drive the loop; manifest is total (merged, 0 rejects)"
+# APPROVE + REPAIR + MANIFEST TOTALITY. Approve the spec, then ONE fulfill
+# drives the loop through snapshot verify -> posture -> Phase A -> drafting
+# (the recorded draft FORGETS revenue_eur) -> Phase B -> verify RED (E010) ->
+# repair round (#1493: the dispatch reopens the drafting window through the
+# staged commit, so the repair's sidecar rewrite is authorized, not "tamper")
+# -> re-merge -> verify green -> propose, stopping for plan review. The
+# committed lowering manifest must be TOTAL: phase "merged", every spec field
+# mapped, zero rejects.
+echo; echo "[2] approve + drive: red draft -> repair round -> converged; manifest total"
+# MUTATION 2r: record a GREEN first draft (the repair SQL) -> the verify never
+# goes red, no repair round runs, and the repair-evidence assertions below
+# (exactly 3 worker transcripts) must catch the difference.
+mut 2r && { jq '.tasks.drafting.calls[-1].arguments.sql = .tasks.repair.calls[0].arguments.sql' replay/session.json > .mut && mv .mut replay/session.json; }
 code=$(rj expected/02_approve.json fulfill approve-spec "$PRODUCT")
 [ "$code" = "0" ] || fail "2 (approve-spec exit $code; $(cat expected/02_approve.err))"
 [ "$(jq -r .state expected/02_approve.json)" = "spec_approved" ] || fail "2 (state after approve $(jq -r .state expected/02_approve.json), want spec_approved)"
@@ -181,7 +190,27 @@ UNMAPPED=$(jq -r '[.fields[] | select(.disposition == "pending")] | length' "$MA
 [ "$NFIELDS" -ge 8 ] || fail "2 (manifest maps only $NFIELDS fields)"
 [ "$REJECTS" = "0" ] || fail "2 (manifest has $REJECTS rejected field(s))"
 [ "$UNMAPPED" = "0" ] || fail "2 (manifest has $UNMAPPED still-pending field(s) in the merged phase)"
-echo "    OK  manifest merged, $NFIELDS fields mapped, 0 rejects, digest bound to the approval"
+# REPAIR EVIDENCE (#1493). Convergence alone could hide a repair that never
+# ran, so pin the round itself:
+#  (a) the worker transcripts are exactly elicitation + drafting + repair, BY
+#      KIND. The driver names each transcript `<stamp>-<kind>.log`, so this
+#      reads which round actually reached a worker. Counting alone is weaker:
+#      three transcripts of kinds elicitation+drafting+drafting would pass a
+#      count check while meaning the repair round was dispatched as a plain
+#      draft (the F2 defect: the round the machine decided must survive into
+#      the dispatch). A green first draft (mutation 2r) leaves two.
+#  (b) the surviving model SQL carries revenue_eur — the REPAIR's draft, which
+#      the red first draft did not have. The loop classified its own repair
+#      write as authorized (window reopened through the staged commit), not as
+#      tamper — reaching needs_input at all proves no blocked(tampered) stop.
+TRANSCRIPTS_DIR=".rocky/fulfillment/${PRODUCT}/transcripts"
+NTRANSCRIPTS=$(find "$TRANSCRIPTS_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')
+[ "$NTRANSCRIPTS" = "3" ] || fail "2 (want 3 worker transcripts — elicitation + red draft + repair — got ${NTRANSCRIPTS:-0}: the repair round did not run)"
+KINDS=$(find "$TRANSCRIPTS_DIR" -type f -name '*.log' 2>/dev/null \
+  | sed -e 's|.*/||' -e 's|\.log$||' -e 's|.*-||' | sort | tr '\n' ' ')
+[ "$KINDS" = "drafting elicitation repair " ] || fail "2 (worker rounds by kind were [${KINDS}], want [drafting elicitation repair ] — a second 'drafting' means the repair round was dispatched as a plain draft)"
+grep -q "revenue_eur" "models/${PRODUCT}.sql" || fail "2 (the surviving model SQL lacks revenue_eur — the repair's draft did not land)"
+echo "    OK  red draft repaired (rounds by kind: ${KINDS}; repaired SQL survived); manifest merged, $NFIELDS fields, 0 rejects, digest bound"
 
 # ------------------------------------------------------------------ Assert 5
 # The proposed plan on disk carries the product binding: product_id + spec_digest.
@@ -365,7 +394,8 @@ echo "    OK  fresh lag ${FRESH_LAG}s < ${FRESH_BUD}s; stale lag ${STALE_LAG}s >
 
 echo
 echo "=================================================================="
-echo "POC complete: spec -> lowering -> propose -> human gate -> digest-gated apply,"
-echo "with 6 refusal paths exercised (negatives, policy, supersession, backstop, staleness)."
+echo "POC complete: spec -> lowering -> red draft -> REPAIR -> propose -> human"
+echo "gate -> digest-gated apply, with 6 refusal paths exercised (negatives,"
+echo "policy, supersession, backstop, staleness)."
 echo "This is the MACHINERY proof (replay driver). run-live.sh is the capability proof."
 echo "=================================================================="

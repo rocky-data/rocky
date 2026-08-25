@@ -3389,8 +3389,13 @@ fn run_verify_after(
 /// `rocky review <plan-id> --approve`:
 ///
 /// - marker ABSENT → `bail!` instructing the operator to review first.
-/// - marker PRESENT → the human has signed off; dispatch the identical
+/// - marker INVALID (unreadable, unparseable, or naming a DIFFERENT plan) →
+///   `bail!` with its own distinct error; it never counts as an approval.
+/// - marker APPROVED (parses AND names this plan) → dispatch the identical
 ///   execution path as [`run_apply_run_plan`] via [`execute_run_plan`].
+///
+/// The check runs unconditionally, after the policy gate (#1459), so policy
+/// can only tighten it. It verifies the marker, not the approver.
 async fn run_apply_ai_authored_plan(
     root: &Path,
     config_path: &Path,

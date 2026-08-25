@@ -31,10 +31,20 @@ jobs:
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # Pinned: an unpinned `stable` let the 1.98.0 release land mid-day
+          # (2026-08-20) and turn required checks red with no code change,
+          # while cache-busting every Rust job at once. Bump deliberately.
+          toolchain: 1.98.0
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: engine
+          # Restore only. This workflow runs on pull_request refs, whose caches
+          # are visible to that PR alone and are deleted when it closes. Saving
+          # here only consumes the shared 10 GB budget and evicts main's
+          # entries; restoring from main still gives the warm dependency tree.
+          save-if: false
           key: evals-pr
 
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1

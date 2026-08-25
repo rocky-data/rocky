@@ -19,7 +19,7 @@ It ships two transformation models over the same source:
 - **"It compiled" is not "it's correct."** Both models pass `rocky compile`. Schema-only verification cannot tell them apart. Only the data can.
 - **The trap is realistic.** A `WHERE status = 'completed'` that silently matches zero rows, and an `amount_cents` summed as dollars (100x too large), are two of the most common reconcile bugs in real pipelines. They are exactly what an agent that reads column names but never samples rows gets wrong.
 - **The fix is a tool, not a prompt trick.** The Rocky MCP server hands an agent `sample_rows` and `profile_column`, so it sees `'COMPLETE'` and the cents scale before it writes a filter. The correctness it learns becomes a `[[tests]]` assertion, not a comment.
-- **Materialization stays human-gated.** The agent can `propose` a plan, but a human runs `rocky review <plan-id> --approve` before `rocky apply`. The agent never ships unreviewed SQL.
+- **Materialization stays gated on a review marker.** The agent can `propose` a plan. `rocky apply` then refuses it until `rocky review <plan-id> --approve` has written a marker naming that exact plan. The check is on the marker, not on who wrote it.
 
 ## The engineered scenario
 
