@@ -5826,18 +5826,29 @@ fn breaking_finding_lite(f: &rocky_core::breaking_change::BreakingFinding) -> Br
 ///
 /// This said "the DuckDB warehouse", but the only caller hands it whatever
 /// its `warehouse_adapter` resolved — any of DuckDB, Snowflake, BigQuery,
-/// Databricks or Trino. The `FROM information_schema.columns` below carries no
-/// catalog, and every one of Rocky's own adapters qualifies that view:
-/// `rocky-snowflake/src/batch.rs` scopes it to `<database>.`,
-/// `rocky-databricks/src/batch.rs` to `<catalog>.`, and
+/// Databricks or Trino. The `FROM information_schema.columns` below carries
+/// no catalog, and THREE of those five qualify that view when they build the
+/// equivalent query themselves: `rocky-snowflake/src/batch.rs` scopes it to
+/// `<database>.`, `rocky-databricks/src/batch.rs` to `<catalog>.`, and
 /// `rocky-bigquery/src/dialect.rs` states outright that a bare
-/// `INFORMATION_SCHEMA.COLUMNS` does not resolve there.
+/// `INFORMATION_SCHEMA.COLUMNS` does not resolve there. The other two do not,
+/// for their own reasons: DuckDB's catalog is flat and un-prefixed on purpose
+/// (`rocky-duckdb/src/dialect.rs` pushes the catalog into a `WHERE` filter),
+/// and Trino never reads `information_schema` at all — it describes columns
+/// with `DESCRIBE` (`rocky-trino/src/adapter.rs`).
 ///
-/// So on a non-DuckDB target this returns empty for the ordinary reason that
-/// the query cannot run — and the caller reports success with no physical
-/// tables either way. Named here rather than fixed: widening the query is a
-/// product change, and it belongs with the silent-degradation defect the
-/// caller's note points at.
+/// So the honest reading is NON-PORTABLE AND MAY FAIL off DuckDB — not
+/// "returns empty on every non-DuckDB target", which is a step too strong.
+/// Snowflake submits the adapter's configured `database` and `schema` with
+/// every statement (`rocky-snowflake/src/connector.rs`, `SubmitRequest`), so
+/// where those are set a bare `information_schema.columns` can resolve there.
+/// Only the DuckDB path is verified; what the other four do with THIS exact
+/// statement is untested, and the resolved-vs-failed distinction is the part
+/// that varies. What does NOT vary is the caller: empty rows and a failed
+/// query both leave it reporting success with no physical tables.
+///
+/// Named here rather than fixed: widening the query is a product change, and
+/// it belongs with the silent-degradation defect the caller's note points at.
 async fn discover_source_tables(
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
 ) -> Vec<SchemaEntry> {
