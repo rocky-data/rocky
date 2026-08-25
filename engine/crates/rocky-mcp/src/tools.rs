@@ -2176,9 +2176,25 @@ impl RockyMcpServer {
         Ok(Json(project_compile_result(&output)))
     }
 
+    // FOURTEENTH ROUND, finding 1 — this said "the exact SQL Rocky would
+    // execute", and the preview is offline: it passes no warehouse to
+    // `sql_gen::generate_transformation_sql_with_warehouse`, and
+    // `commands::plan_preview_output` logs and SKIPS any model whose SQL
+    // that call cannot render. `PlanPreviewResult` carries `statements` and
+    // nothing else, so a skipped model leaves no trace in the result at
+    // all. Three strategies are skipped by construction — a Snowflake
+    // `DynamicTable` needs a compute warehouse, a `TimeInterval` model
+    // needs a runtime window that static planning leaves `None`, and
+    // `ContentAddressed` never reaches SQL generation — and any other
+    // render failure is swallowed the same way.
     #[tool(
-        description = "Preview the exact SQL Rocky would execute for the project's \
-         transformation models (offline, no warehouse connection). Read it to confirm the \
+        description = "Render the SQL Rocky generates for the project's transformation models, \
+         offline and with no warehouse connection. It is not the whole plan: a model whose SQL \
+         cannot be rendered offline is SKIPPED, and the result does not name it, so a short or \
+         empty statement list is not proof the project has nothing else to do. Skipped by \
+         construction: a Snowflake dynamic table (it needs a live compute warehouse), a \
+         time-interval model (it needs a runtime window), and a content-addressed model (it \
+         never goes through SQL generation). Read the statements it does return to confirm the \
          generated SQL matches intent before proposing a materialization."
     )]
     async fn plan_preview(
@@ -5166,8 +5182,11 @@ impl RockyMcpServer {
                          the sidecar's spec-owned metadata.\n\
                          5. compile — read the diagnostics (each carries a code, a span, and \
                          often a suggestion), fix against them, and loop until clean.\n\
-                         6. plan_preview — read the exact SQL Rocky would execute and confirm \
-                         it matches the intent.\n\
+                         6. plan_preview — read the SQL Rocky generates offline and confirm \
+                         it matches the intent. It is not the whole plan: any model it \
+                         cannot render offline is skipped, and the result does not name it. \
+                         A model missing from the statements means 'not renderable offline', \
+                         never 'nothing to do'.\n\
                          7. test — run the project's LOCAL tests (the compiled model tests \
                          and unit tests). That is the only suite you can run here. The \
                          checks the product spec declares — its grain, its not-null columns, \
@@ -5225,8 +5244,11 @@ impl RockyMcpServer {
                      span, and often a suggestion. Fix against the diagnostic and recompile; \
                      loop until clean. The compiler is your fast feedback loop — lean on it \
                      instead of reasoning about correctness in your head.\n\
-                     6. plan_preview — read the exact SQL Rocky would execute and confirm it \
-                     matches the intent before proposing.\n\
+                     6. plan_preview — read the SQL Rocky generates offline and confirm it \
+                     matches the intent before proposing. It is not the whole plan: any model \
+                     it cannot render offline is skipped, and the result does not name it. A \
+                     model missing from the statements means 'not renderable offline', never \
+                     'nothing to do'.\n\
                      7. Encode what you learned while sampling as a contract (required/protected \
                      columns) or a check (assertion), not just a WHERE clause — that moves the \
                      invariant into the typed substrate so the compiler enforces it on every \
@@ -7628,6 +7650,32 @@ mod tests {
                 "{profile:?}: `profile_column`'s description offers `top_values` without \
                  saying the query behind it can fail into an empty list on a successful \
                  call: {profile_column}"
+            );
+            // FOURTEENTH ROUND, finding 1 — the same defect on a tool that
+            // RENDERS rather than reads, which is why it sat outside this
+            // test's original family. `plan_preview` called its output "the
+            // exact SQL Rocky would execute" while
+            // `commands::plan_preview_output` passes no warehouse and skips
+            // every model `sql_gen` cannot render offline, and
+            // `PlanPreviewResult` has no field that names a skipped model.
+            //
+            // Pinned in BOTH directions and on BOTH profiles: the removed
+            // exactness claim must stay gone, and the disclosure that
+            // replaced it must stay present. Only the trailing sentence
+            // differs per profile ([`WORKER_TOOL_DESCRIPTIONS`]), so the
+            // disclosure is shared text and a one-sided edit fails here.
+            let plan_preview = description("plan_preview");
+            assert!(
+                !plan_preview.contains("exact SQL Rocky would execute"),
+                "{profile:?}: `plan_preview`'s description promises the EXACT execution SQL; \
+                 the preview is offline and silently drops what it cannot render: \
+                 {plan_preview}"
+            );
+            assert!(
+                plan_preview.contains("SKIPPED, and the result does not name it"),
+                "{profile:?}: `plan_preview`'s description must say that a model it cannot \
+                 render offline is dropped WITHOUT being named, or an empty preview reads as \
+                 an empty project: {plan_preview}"
             );
         }
     }

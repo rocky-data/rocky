@@ -2865,6 +2865,55 @@ async fn prompt_get_build_model_returns_authoring_loop() {
     client.cancel().await.unwrap();
 }
 
+/// FOURTEENTH ROUND, finding 1 — `build_model` step 6 told the agent
+/// `plan_preview` returns "the exact SQL Rocky would execute", on BOTH
+/// profiles.
+///
+/// It does not. `commands::plan_preview_output` renders offline: it passes
+/// no warehouse to `sql_gen::generate_transformation_sql_with_warehouse`,
+/// and any model that call cannot render is logged at debug and DROPPED
+/// from the result. `PlanPreviewResult` has a `statements` field and
+/// nothing else, so there is no `skipped_models` for a caller to read. An
+/// agent that believes the exactness claim reads a short preview as a
+/// short plan.
+///
+/// Pinned in both directions, on both profiles, because a one-sided edit to
+/// these two nearly-identical bodies is exactly how the round-thirteen
+/// `build_model` variants slipped.
+#[tokio::test]
+async fn build_model_does_not_promise_plan_preview_is_exact() {
+    for profile in [
+        rocky_mcp::McpProfile::Default,
+        rocky_mcp::McpProfile::Worker,
+    ] {
+        let dir = TempDir::new().unwrap();
+        write_project(dir.path(), &dir.path().join("test.duckdb"));
+        let server = RockyMcpServer::new_with_profile(dir.path().join("rocky.toml"), profile);
+        let client = connect(server).await;
+        let args = serde_json::json!({ "intent": "daily revenue" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let result = client
+            .get_prompt(GetPromptRequestParams::new("build_model").with_arguments(args))
+            .await
+            .expect("get_prompt build_model");
+        let body = prompt_text(&result);
+        assert!(
+            !body.contains("exact SQL Rocky would execute"),
+            "{profile:?}: `build_model` promises `plan_preview` returns the EXACT execution \
+             SQL; the preview is offline and drops what it cannot render: {body}"
+        );
+        assert!(
+            body.contains("not renderable offline"),
+            "{profile:?}: `build_model` must tell the agent that a model missing from the \
+             preview is unrenderable rather than absent, or an empty preview reads as a \
+             finished plan: {body}"
+        );
+        client.cancel().await.unwrap();
+    }
+}
+
 /// Flatten a prompt result's text messages into one searchable haystack.
 fn prompt_text(result: &rmcp::model::GetPromptResult) -> String {
     use rmcp::model::ContentBlock;
