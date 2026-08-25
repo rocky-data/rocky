@@ -87,6 +87,15 @@ fn compile_inner(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<(CompileOutput, CompileTextData)> {
+    let project_config = match config_path {
+        Some(path) => match rocky_config::load_rocky_config(path) {
+            Ok(config) => Some(config),
+            Err(rocky_config::ConfigError::FileNotFound { .. }) => None,
+            Err(error) => return Err(error.into()),
+        },
+        None => None,
+    };
+
     // `source_schemas` precedence:
     //   1. `--with-seed` wins -> seed loader (explicit user intent,
     //      used for tests/playgrounds where the cache is irrelevant).
@@ -99,17 +108,16 @@ fn compile_inner(
         // from `RockyType::Unknown` into concrete types for any project
         // that ships a runnable seed (the entire playground).
         load_source_schemas_from_seed(models_dir)?
-    } else if let Some(path) = config_path {
+    } else if let Some(config) = &project_config {
         // TTL-filtered load from `state.redb`'s `SCHEMA_CACHE` table.
         // Honours `[cache.schemas] enabled` + `ttl_seconds` (after
         // applying the optional CLI `--cache-ttl` override).
-        match rocky_config::load_rocky_config(path) {
-            Ok(cfg) => {
-                let schema_cfg = cfg.cache.schemas.with_ttl_override(cache_ttl_override);
-                crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
-            }
-            Err(_) => HashMap::new(),
-        }
+        let schema_cfg = config
+            .cache
+            .schemas
+            .clone()
+            .with_ttl_override(cache_ttl_override);
+        crate::source_schemas::load_cached_source_schemas(&schema_cfg, state_path)
     } else {
         HashMap::new()
     };
@@ -122,15 +130,12 @@ fn compile_inner(
     // suppression bit — when the top-level `[freshness]` block declares
     // an `expected_lag_seconds`, every model inherits the default and
     // W005 stays silent.
-    let (mask, allow_unmasked, project_freshness_default) = match config_path {
-        Some(path) => match rocky_config::load_rocky_config(path) {
-            Ok(cfg) => (
-                cfg.mask.clone(),
-                cfg.classifications.allow_unmasked.clone(),
-                cfg.freshness.has_default(),
-            ),
-            Err(_) => (std::collections::BTreeMap::new(), Vec::new(), false),
-        },
+    let (mask, allow_unmasked, project_freshness_default) = match &project_config {
+        Some(config) => (
+            config.mask.clone(),
+            config.classifications.allow_unmasked.clone(),
+            config.freshness.has_default(),
+        ),
         None => (std::collections::BTreeMap::new(), Vec::new(), false),
     };
 
@@ -157,14 +162,9 @@ fn compile_inner(
     // Portability lint. Effective target_dialect = CLI flag > [portability]
     // config > unset. Project-wide allow list and per-model `-- rocky-allow:`
     // pragmas suppress matching constructs before they become diagnostics.
-    let portability_cfg = match config_path {
-        Some(path) => rocky_config::load_rocky_config(path)
-            .ok()
-            .map(|c| c.portability),
-        None => None,
-    };
+    let portability_cfg = project_config.as_ref().map(|config| &config.portability);
     let effective_dialect =
-        target_dialect.or_else(|| portability_cfg.as_ref().and_then(|p| p.target_dialect));
+        target_dialect.or_else(|| portability_cfg.and_then(|p| p.target_dialect));
     let project_allow: std::collections::HashSet<String> = portability_cfg
         .as_ref()
         .map(|p| {
@@ -255,12 +255,12 @@ fn compile_inner(
     // recipe-hash pin mismatch surfaces as E033. Projects with no `[imports]`
     // block incur no work — `imports_diagnostics` returns empty immediately.
     if let Some(path) = config_path
-        && let Ok(cfg) = rocky_config::load_rocky_config(path)
-        && !cfg.imports.is_empty()
+        && let Some(config) = &project_config
+        && !config.imports.is_empty()
     {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let import_diags = crate::commands::imports_check::imports_diagnostics(
-            &cfg,
+            config,
             config_dir,
             &result.project.models,
         );
@@ -934,6 +934,33 @@ schema_template = "s"
             &rocky_core::run_vars::RunVars::new(),
         )
         .expect("missing config should fall through, not error");
+    }
+
+    #[test]
+    fn malformed_config_file_fails_compile() {
+        let dir = TempDir::new().unwrap();
+        let models_dir = dir.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        write_model(&models_dir, "m1", "SELECT 1 AS id");
+        let config = dir.path().join("rocky.toml");
+        fs::write(&config, "[portability\n").unwrap();
+
+        let err = run_compile(
+            Some(&config),
+            Path::new(".rocky-state.redb"),
+            &models_dir,
+            None,
+            None,
+            true,
+            false,
+            None,
+            false,
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("failed to parse TOML"));
     }
 
     // ---- --with-seed source-schema loading ----
