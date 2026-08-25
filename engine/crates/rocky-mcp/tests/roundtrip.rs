@@ -5296,6 +5296,61 @@ const SERVED_TEXT_GOLDEN: &str = concat!(
 /// needs no `unsafe` env mutation and CI (where it is unset) can only compare.
 const BLESS_VAR: &str = "ROCKY_BLESS_MCP_SERVED_TEXT";
 
+/// Does this value of [`BLESS_VAR`] ask for a re-bless?
+///
+/// FIFTEENTH ROUND, finding 3 — **only `1`**, after trimming. The previous
+/// rule was "nonempty and not `0`", which blesses on `false`, on `no`, and
+/// on every other value a person could write meaning *don't*. A stray
+/// `ROCKY_BLESS_MCP_SERVED_TEXT=false` in a shell profile or a CI `env:`
+/// block would then rewrite the golden on every run and this guard would
+/// pass forever without anyone reading a word of the text it protects.
+///
+/// The earlier fix stopped an EMPTY value from blessing, for the same
+/// reason one step short: an unset-looking value must not mean yes. An
+/// UNRECOGNISED value must not mean yes either — the two are the same
+/// mistake, and only the allowlist form is closed against the next value
+/// nobody thought of.
+///
+/// Fails CLOSED: anything this does not recognise compares instead of
+/// writing, so the worst case of a typo is a test failure telling you how
+/// to bless, never a silent rubber stamp.
+///
+/// A free function over `Option<&str>` rather than a predicate inline in
+/// the test body, so the rule is testable without mutating the process
+/// environment — see `bless_requires_an_explicit_one`.
+fn should_bless(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// FIFTEENTH ROUND, finding 3 — the bless switch is an ALLOWLIST.
+///
+/// Driven over the values a person or a CI file actually writes. `false`
+/// and `no` are the ones that matter: under the previous "nonempty and not
+/// `0`" rule both blessed, which is the inverse of what either word means.
+#[test]
+fn bless_requires_an_explicit_one() {
+    for asks in ["1", " 1 ", "\t1\n"] {
+        assert!(
+            should_bless(Some(asks)),
+            "`{asks}` asks for a re-bless and must be honoured, or the documented \
+             instruction in the failure message does not work"
+        );
+    }
+    for refuses in [
+        "", " ", "0", "false", "no", "off", "FALSE", "true", "yes", "y", "2",
+    ] {
+        assert!(
+            !should_bless(Some(refuses)),
+            "`{refuses}` is not an explicit `1`; blessing on it turns the golden into a \
+             rubber stamp that nobody asked for"
+        );
+    }
+    assert!(
+        !should_bless(None),
+        "an unset variable is how CI runs; it must compare, never write"
+    );
+}
+
 /// Digest every worded surface one profile serves, keyed by surface.
 ///
 /// Keys carry no profile prefix — the caller adds one — so the approver
@@ -5523,14 +5578,11 @@ async fn served_text_golden_pins_every_worded_surface() {
     }
     let rendered = render_golden(&live);
 
-    // A blank or `0` value does NOT bless. `.is_ok()` alone would accept
-    // `ROCKY_BLESS_MCP_SERVED_TEXT=` — an exported-but-empty variable, which
-    // is how a shell profile or a CI `env:` block silently turns a guard into
-    // a rubber stamp. Blessing has to be asked for.
-    let blessing = std::env::var(BLESS_VAR)
-        .map(|v| !v.trim().is_empty() && v.trim() != "0")
-        .unwrap_or(false);
-    if blessing {
+    // Blessing has to be ASKED FOR, with an explicit `1` — see
+    // [`should_bless`], which is where the rule and its evidence live. Every
+    // other value, recognised or not, compares.
+    let value = std::env::var(BLESS_VAR).ok();
+    if should_bless(value.as_deref()) {
         std::fs::write(SERVED_TEXT_GOLDEN, &rendered)
             .unwrap_or_else(|e| panic!("write {SERVED_TEXT_GOLDEN}: {e}"));
         return;
