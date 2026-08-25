@@ -273,9 +273,35 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
         "Run `rocky compile --output json` and read `diagnostics`",
         "Call the `compile` tool and read its `diagnostics`",
     ),
+    // FIFTEENTH ROUND, finding 1 — the round-fourteen sweep narrowed
+    // `plan_preview`'s exactness claim on the tool description, both
+    // `build_model` bodies and the published tool table, and MISSED this
+    // one. The rewrite carried "exactly what would execute" straight from
+    // the CLI sentence onto the tool, which is the surface the claim is
+    // least true of: `commands::plan_preview_output` renders offline and
+    // DROPS any model `sql_gen` cannot render, and `PlanPreviewResult` has
+    // no field that names one.
+    //
+    // The needle is now the whole step, because the default sentence it
+    // replaces carries two CLI routes (`rocky plan` and `rocky apply`) and
+    // a partial rewrite would leave one standing for the verb scan in
+    // `worker_instructions_are_projected_and_default_stays_verbatim`.
     (
-        "Run `rocky plan` to see exactly what would execute.",
-        "Call the `plan_preview` tool to see exactly what would execute.",
+        "Run `rocky plan` and read the SQL it prints. It is a preview, not a transcript. \
+         The plan is generated offline, with no live source schema and no compute \
+         warehouse: a transformation whose SQL cannot be rendered that way is skipped and \
+         is not named, an incremental table previews the 1970 sentinel watermark rather \
+         than the real one, and a replication `MERGE` on any dialect but Databricks \
+         previews a canonical shape rather than the column list the runner resolves at \
+         execute time. `rocky apply` recompiles the project rather than replaying the \
+         file. Confirm the SQL it does print matches your intent.",
+        "Call the `plan_preview` tool and read the SQL it returns. It renders offline, and \
+         it is not the whole plan: a model whose SQL cannot be rendered offline is SKIPPED, \
+         and the result does not name it, so a model missing from the statements means 'not \
+         renderable offline', never 'nothing to do'. Skipped by construction: a Snowflake \
+         dynamic table (it needs a live compute warehouse), a time-interval model (it needs \
+         a runtime window), and a content-addressed model (it never goes through SQL \
+         generation). Confirm the SQL it does return matches your intent.",
     ),
     // TENTH ROUND, findings 1B and 1D together — the fourth imperative,
     // whose replacement also has to be exact about WHICH suite it runs.
@@ -6196,11 +6222,23 @@ fn render_cell(v: serde_json::Value) -> String {
 /// the agent never mistakes a written draft for a materialized change.
 /// Default profile only; the worker profile serves
 /// [`WORKER_DRAFT_NEXT_STEPS`].
+///
+/// FIFTEENTH ROUND, finding 1 — this said `plan_preview` reads "the SQL
+/// Rocky would run", on BOTH variants, and the round-fourteen sweep did not
+/// reach either. The harm is concrete and this is the surface that delivers
+/// it: a dynamic-table draft SUCCEEDS, receives this guidance, and is then
+/// absent from the preview it was just told to read, because
+/// `commands::plan_preview_output` skips what it cannot render offline and
+/// `PlanPreviewResult` carries no field naming a skipped model. The agent
+/// is holding a successful draft and an empty preview with nothing to tell
+/// it the two are about the same model.
 const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched the \
      warehouse. Continue the authoring loop: fix any error diagnostics above and re-draft (or \
-     `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, then `propose` \
-     to record an AI-authored plan for a human to `rocky review <plan_id> --approve` and \
-     `rocky apply`. Never apply a draft directly.";
+     `compile`) until it is clean, `plan_preview` to read the SQL that renders offline, then \
+     `propose` to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
+     and `rocky apply`. The preview is not the whole plan: a model it cannot render offline is \
+     skipped and is not named, so a draft that succeeded here and is missing from the preview \
+     is unrenderable offline, not absent from the project. Never apply a draft directly.";
 
 /// The worker-profile variant of [`DRAFT_NEXT_STEPS`] (FF-WP1 fix round 2,
 /// item 5c): the default reminder instructs `propose`, a tool this profile
@@ -6220,7 +6258,10 @@ const DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or 
 /// class as naming a tool the profile does not serve.
 const WORKER_DRAFT_NEXT_STEPS: &str = "This is a draft — Rocky has NOT applied it or touched \
      the warehouse. Continue the drafting loop: fix any error diagnostics above and re-draft \
-     (or `compile`) until it is clean, `plan_preview` to read the SQL Rocky would run, and the \
+     (or `compile`) until it is clean, `plan_preview` to read the SQL that renders offline \
+     (the preview is not the whole plan — a model it cannot render offline is skipped and is \
+     not named, so a draft that succeeded here and is missing from the preview is \
+     unrenderable offline, not absent from the project), and the \
      `test` tool to run the project's LOCAL tests. Those local tests are the only suite you \
      can run here. The checks the product spec declares — its grain, its not-null columns, its \
      `checks` list — are lowered into the sidecar for you and need the applied table to run \
@@ -7166,6 +7207,31 @@ mod tests {
             );
         }
 
+        // FIFTEENTH ROUND, finding 1, and the half the finding did not name.
+        // The worker rewrite carried "exactly what would execute" onto
+        // `plan_preview`; the sentence it was rewriting made the SAME claim
+        // about `rocky plan`, and the DEFAULT and APPROVER profiles serve
+        // that sentence verbatim. `INSTRUCTIONS` is an `include_str!` of the
+        // authoring skill, so the skill file IS a served surface.
+        //
+        // The claim is false for the CLI too, on the same grounding the
+        // reviewer used against `docs/reference/glossary.md`: `rocky plan`
+        // renders offline (`plan.rs::replication_copy_sql` degrades a
+        // non-Databricks `MERGE` to a canonical shape via
+        // `preview_merge_shape`, and an incremental table previews the 1970
+        // sentinel watermark), `rocky plan --model` routes through
+        // `plan_preview_output` and skips what it cannot render, and
+        // `rocky apply` RECOMPILES the project rather than replaying the
+        // persisted plan (`plan.rs`'s run-plan blueprint doc).
+        //
+        // Pinned on the served text rather than on the file, because the
+        // file is only a defect while the server serves it.
+        assert!(
+            !INSTRUCTIONS.contains("exactly what would execute"),
+            "the served instructions promise `rocky plan` shows EXACTLY what would execute; \
+             the plan renders offline and `rocky apply` recompiles rather than replaying it"
+        );
+
         let excluded = worker_excluded_tool_mentions();
         let banner = worker_instructions_banner(&excluded);
         let worker_info = server_with(McpProfile::Worker).get_info();
@@ -7411,6 +7477,23 @@ mod tests {
                  (`{served}`): {body}"
             );
         }
+        // FIFTEENTH ROUND, finding 1 — and the served action is not enough
+        // on its own. The rewrite that named `plan_preview` also carried
+        // the CLI sentence's exactness claim onto it, which is the surface
+        // it is least true of: the preview renders with no warehouse and
+        // DROPS what it cannot render, unnamed. Pinned in both directions
+        // so neither the removal nor the disclosure can be undone alone.
+        assert!(
+            !body_lower.contains("exactly what would execute"),
+            "the projected body promises `plan_preview` shows EXACTLY what would execute; \
+             it renders offline and silently drops what it cannot render: {body}"
+        );
+        assert!(
+            body.contains("SKIPPED, and the result does not name it"),
+            "the projected body must say a model the preview cannot render offline is \
+             dropped WITHOUT being named, or an empty preview reads as an empty project: \
+             {body}"
+        );
         // FINDING 1C — the retry steer. It presumed materializing a pipeline
         // through a route this profile does not serve; no worker tool runs
         // one, so no run error can occur to retry.
@@ -8350,10 +8433,13 @@ mod tests {
             default_server.draft_model_next_steps(),
             "This is a draft — Rocky has NOT applied it or touched the warehouse. Continue the \
              authoring loop: fix any error diagnostics above and re-draft (or `compile`) until \
-             it is clean, `plan_preview` to read the SQL Rocky would run, then `propose` to \
-             record an AI-authored plan for a human to `rocky review <plan_id> --approve` and \
-             `rocky apply`. Never apply a draft directly.",
-            "default draft_model next_steps are byte-unchanged"
+             it is clean, `plan_preview` to read the SQL that renders offline, then `propose` \
+             to record an AI-authored plan for a human to `rocky review <plan_id> --approve` \
+             and `rocky apply`. The preview is not the whole plan: a model it cannot render \
+             offline is skipped and is not named, so a draft that succeeded here and is \
+             missing from the preview is unrenderable offline, not absent from the project. \
+             Never apply a draft directly.",
+            "default draft_model next_steps are pinned byte-for-byte"
         );
         assert_eq!(
             default_server.draft_check_next_steps(),
@@ -8378,6 +8464,42 @@ mod tests {
             assert!(
                 next_steps.contains("hand-off to the trusted runner"),
                 "worker next_steps end at the runner hand-off: {next_steps}"
+            );
+        }
+
+        // FIFTEENTH ROUND, finding 1 — the `plan_preview` exactness claim
+        // on BOTH `draft_model` variants, which the round-fourteen sweep of
+        // the description, the two prompt bodies and the docs table did not
+        // reach.
+        //
+        // Pinned in BOTH directions and on BOTH profiles, for the reason
+        // this whole test exists: the two bodies are near-identical, and a
+        // one-sided edit is how round thirteen's `build_model` variants
+        // nearly slipped. The default variant's byte-pin above already
+        // catches its half; this catches the worker's, and it states WHICH
+        // property is being held rather than leaving it to a diff.
+        //
+        // The harm is specific to this surface. A dynamic-table draft
+        // SUCCEEDS, carries this text, and is then absent from the preview
+        // it names — `commands::plan_preview_output` passes no warehouse and
+        // skips what `sql_gen` cannot render, and `PlanPreviewResult` has no
+        // field that names a skipped model.
+        for (profile, next_steps) in [
+            (McpProfile::Default, default_server.draft_model_next_steps()),
+            (McpProfile::Worker, worker_server.draft_model_next_steps()),
+        ] {
+            assert!(
+                !next_steps.contains("SQL Rocky would run"),
+                "{profile:?}: `draft_model`'s next_steps call the preview the SQL Rocky WOULD \
+                 RUN; it renders offline and silently drops what it cannot render: \
+                 {next_steps}"
+            );
+            assert!(
+                next_steps.contains("skipped and is not named"),
+                "{profile:?}: `draft_model`'s next_steps must say a model the preview cannot \
+                 render offline is dropped WITHOUT being named — a draft can succeed here \
+                 and then be missing from the preview this text sends the agent to read: \
+                 {next_steps}"
             );
         }
     }

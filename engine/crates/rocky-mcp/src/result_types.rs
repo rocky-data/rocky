@@ -59,10 +59,22 @@ pub struct PlannedStatementLite {
     pub sql: String,
 }
 
-/// `plan_preview` result — the SQL the runner would emit for the model(s).
+/// `plan_preview` result — the SQL that renders offline for the model(s).
+///
+/// NOT the whole plan, and the distinction is the whole reason this doc
+/// comment is worded carefully. `commands::plan_preview_output` renders with
+/// no warehouse and SKIPS any model `sql_gen` cannot render that way; there
+/// is no field here that names one, so a skipped model leaves no trace and a
+/// short `statements` list is not a short plan.
+///
+/// This is not served text today — rmcp emits no `output_schema`, and
+/// `worker_result_text_names_no_excluded_tool` pins that absence — but it is
+/// kept true for the same reason `draft_check_next_steps` is: it is what
+/// would be wrong first if the schema were ever opted in.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct PlanPreviewResult {
-    /// Generated statements, in execution order.
+    /// Statements Rocky could render offline, in execution order. A model
+    /// whose SQL needs a live warehouse is absent and unnamed.
     pub statements: Vec<PlannedStatementLite>,
 }
 
