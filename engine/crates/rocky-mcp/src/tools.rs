@@ -430,8 +430,11 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // reached for a stronger claim than the contradiction needed, which is
     // this branch's signature defect.
     //
-    // DERIVED FROM THE ALLOWLIST, entry by entry, not from the sentence it
-    // replaces. Nine of the twelve reach no adapter at all —
+    // HAND-REVIEWED FROM THE ALLOWLIST, entry by entry, not read off the
+    // sentence it replaces — and NOT derived, which the word "derived" here
+    // used to imply. The same review now lives as a checked table,
+    // [`WORKER_TOOL_EFFECTS`], so this prose has something to drift AGAINST
+    // rather than being the only copy. Nine of the twelve reach no adapter —
     // `breaking_change` (git + an in-process compile), `catalog`,
     // `compile`, `dependents`, `draft_model`, `lineage`, `list`,
     // `plan_preview` (offline; it reads the config only to pick a dialect)
@@ -451,12 +454,24 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // "Some tools DO read the warehouse" and then names the ones a worker
     // actually reaches for, which is everything the number bought.
     //
+    // THIRTEENTH ROUND, finding 2 — and deleting that length check left the
+    // bullet's LEADING sentence, "No tool this profile serves runs or
+    // materializes a pipeline", with no tripwire at all. The check held
+    // nothing, but it did fail when the surface grew. [`WORKER_TOOL_EFFECTS`]
+    // replaces it with a reviewed effect per served tool, cross-checked
+    // against the router: a thirteenth tool fails the test until someone
+    // reads its body and classifies it. Hand-reviewed, and labelled as such
+    // — the opposite mistake to the three lists on this branch that looked
+    // derived and were not.
+    //
     // TWELFTH ROUND, finding 1 — and the round-eleven replacement then said
     // something ELSE that is not true, one sentence later. It promised that
     // a failed read "comes back as that tool's own error", which is a
     // universal over the three readers it had just named. Two of them keep
     // it: `sample_rows` and `profile_column` both propagate a failed read as
-    // `ToolError::warehouse_error`. `inspect_schema` does not. It swallows
+    // `ToolError::warehouse_error` — though only for their PRIMARY query;
+    // see the thirteenth-round note below, which narrows this sentence.
+    // `inspect_schema` does not. It swallows
     // BOTH failure modes — the call site discards the `Err` arm
     // (`if let Ok(Some(adapter))`, so an adapter that will not resolve skips
     // discovery entirely) and `discover_source_tables` returns `Vec::new()`
@@ -735,6 +750,104 @@ const WORKER_PROFILE_TOOLS: &[&str] = &[
     "sample_rows",
     "test",
 ];
+
+/// What a worker-served tool does to the CONFIGURED TARGET warehouse.
+///
+/// The axis is the warehouse only. `Offline` does not mean "no side effects":
+/// `draft_model` writes files under the models directory, and `test` runs a
+/// DuckDB of its own. It means the tool never opens the adapter the project's
+/// `rocky.toml` points at.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerToolEffect {
+    /// Never opens the target adapter — compile, file, local-state or
+    /// in-memory work only.
+    Offline,
+    /// Opens the target adapter and runs a READ query. No writes, no DDL.
+    ReadsWarehouse,
+    /// Executes or materializes a pipeline node against the target.
+    RunsPipeline,
+}
+
+/// The reviewed effect of every tool the worker profile serves.
+///
+/// THIRTEENTH ROUND, finding 2. The worker instructions open with a
+/// universal — "No tool this profile serves runs or materializes a pipeline"
+/// — over twelve hand-chosen names. Round twelve guarded it with
+/// `WORKER_PROFILE_TOOLS.len() == 12`, which held nothing (a swap or a
+/// behaviour change keeps the length), and deleting that guard left the
+/// universal with no tripwire at all. This is the replacement: a classified
+/// entry per served tool, cross-checked against the ROUTER by
+/// `every_worker_served_tool_is_classified_and_none_runs_a_pipeline`. A
+/// thirteenth tool reaching the worker surface fails that test until someone
+/// classifies it.
+///
+/// HAND-REVIEWED, AND SAYING SO IS THE POINT. Nothing derives this. Each
+/// entry was read against its tool body: the three `ReadsWarehouse` ones
+/// reach `warehouse_adapter()` / `prepare_table_query()`; the nine `Offline`
+/// ones call a sync `commands::*_output` helper over the models directory,
+/// the config, or the local state store. The sync signature is NOT the
+/// argument — the `duckdb` crate is synchronous, so sync does not imply
+/// offline. The bodies are.
+///
+/// WHAT THIS GUARD DOES NOT HOLD, stated rather than left to be found: that
+/// each classification is TRUE. It holds that nothing served is
+/// unclassified. If `commands::test_output` ever executes against the
+/// configured target instead of its own in-memory DuckDB, this table is
+/// silently wrong and the test stays green. Deriving the answer would take a
+/// call graph over this file, which is a fourth thing that would look
+/// derived and go wrong at the first indirection.
+#[cfg(test)]
+const WORKER_TOOL_EFFECTS: &[(&str, WorkerToolEffect)] = &[
+    // Compile + `breaking_change` classifier over the models directory.
+    ("breaking_change", WorkerToolEffect::Offline),
+    // `compute_catalog_output` — models directory plus the local state store.
+    ("catalog", WorkerToolEffect::Offline),
+    ("compile", WorkerToolEffect::Offline),
+    ("dependents", WorkerToolEffect::Offline),
+    // Writes `models/<name>.sql` and its sidecar. A file effect, not a
+    // warehouse one.
+    ("draft_model", WorkerToolEffect::Offline),
+    // `warehouse_adapter()` then `discover_source_tables` — both best-effort,
+    // which is the defect the worker text discloses rather than fixes.
+    ("inspect_schema", WorkerToolEffect::ReadsWarehouse),
+    ("lineage", WorkerToolEffect::Offline),
+    // `list_{models,pipelines,adapters,sources}_output` — config and files.
+    ("list", WorkerToolEffect::Offline),
+    // Reads the config only to pick a dialect; generates SQL, submits none.
+    ("plan_preview", WorkerToolEffect::Offline),
+    // `prepare_table_query` plus TWO reads: the aggregate, then `top_values`.
+    ("profile_column", WorkerToolEffect::ReadsWarehouse),
+    // `prepare_table_query` plus one `SELECT ... LIMIT` read.
+    ("sample_rows", WorkerToolEffect::ReadsWarehouse),
+    // `commands::test_output` — the compiled model tests and the fixture
+    // tests, in a DuckDB of its own, not the configured target.
+    ("test", WorkerToolEffect::Offline),
+];
+
+/// The entries in `table` that execute or materialize a pipeline.
+///
+/// Split out so the test can show the check BITES — running it over a
+/// deliberately bad table is the difference between a guard and another
+/// assertion that only looks like one.
+#[cfg(test)]
+fn worker_tools_that_run_a_pipeline<'a>(table: &[(&'a str, WorkerToolEffect)]) -> Vec<&'a str> {
+    table
+        .iter()
+        .filter(|(_, effect)| *effect == WorkerToolEffect::RunsPipeline)
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// The entries in `table` that read the target warehouse.
+#[cfg(test)]
+fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)]) -> Vec<&'a str> {
+    table
+        .iter()
+        .filter(|(_, effect)| *effect == WorkerToolEffect::ReadsWarehouse)
+        .map(|(name, _)| *name)
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Worker-profile guidance surfaces — the enumeration, the rewrite table,
@@ -7200,7 +7313,19 @@ mod tests {
             "the projected body must not claim no served tool reaches the warehouse — \
              `sample_rows`, `profile_column` and `inspect_schema` all do: {body}"
         );
-        for reader in ["sample_rows", "profile_column", "inspect_schema"] {
+        //
+        // THIRTEENTH ROUND, finding 2 — the three names were a literal here.
+        // They come from [`WORKER_TOOL_EFFECTS`] now, so a thirteenth tool
+        // classified as a reader has to be NAMED in this bullet before this
+        // test goes green. That is the half of the reader claim that can be
+        // held mechanically; which tools read is hand-reviewed, over there.
+        let readers = worker_tools_that_read_the_warehouse(WORKER_TOOL_EFFECTS);
+        assert!(
+            !readers.is_empty(),
+            "the classification must name at least one reader or the sweep below proves \
+             nothing: {WORKER_TOOL_EFFECTS:?}"
+        );
+        for reader in readers {
             assert!(
                 WORKER_PROFILE_TOOLS.contains(&reader),
                 "`{reader}` must still be on the allowlist, or the sentence naming it as a \
@@ -7300,17 +7425,31 @@ mod tests {
         // holdable — each named reader is on the allowlist AND named in the
         // body — and it never claimed exhaustivity.
         //
-        // WHAT THIS LEAVES UNGUARDED, stated rather than left to be found:
-        // the bullet's leading sentence, "No tool this profile serves runs
-        // or materializes a pipeline", is a universal over twelve
-        // hand-chosen names. PROPERTY 4 below derives the EXCLUDED set — the
-        // complement of the allowlist — so it cannot see the interior. A
-        // thirteenth allowlisted tool that ran a pipeline would falsify that
-        // sentence with every assertion in this test still green. Deriving
-        // it would take a call graph over this file seeded at the adapter
-        // constructors: a fourth thing that looks derived, one level up, and
-        // wrong the first time someone adds an indirection. Whoever extends
-        // `WORKER_PROFILE_TOOLS` owns re-reading that sentence.
+        // WHAT ROUND TWELVE LEFT UNGUARDED — and what now holds it. The
+        // bullet's leading sentence, "No tool this profile serves runs or
+        // materializes a pipeline", is a universal over twelve hand-chosen
+        // names. PROPERTY 4 below derives the EXCLUDED set — the complement
+        // of the allowlist — so it cannot see the interior, and a thirteenth
+        // allowlisted tool that ran a pipeline would falsify the sentence
+        // with every assertion in this test green.
+        //
+        // Round twelve deleted the length check and volunteered that gap
+        // rather than replacing it. The reviewer ruled the universal is not
+        // acceptable uninstrumented, and it was right: the length check held
+        // nothing, but it WAS an extension tripwire, and dropping it left
+        // the sentence with none.
+        //
+        // [`WORKER_TOOL_EFFECTS`] is the replacement — a reviewed effect per
+        // served tool, cross-checked against the router by
+        // `every_worker_served_tool_is_classified_and_none_runs_a_pipeline`.
+        // It is hand-reviewed and says so, which is the distinction this
+        // branch keeps getting wrong in the other direction: it does not
+        // pretend to derive what a call graph would have to answer.
+        assert!(
+            worker_tools_that_run_a_pipeline(WORKER_TOOL_EFFECTS).is_empty(),
+            "the bullet opens by denying any served tool runs or materializes a pipeline, \
+             and the reviewed classification now contradicts it: {WORKER_TOOL_EFFECTS:?}"
+        );
 
         // PROPERTY 4 — the banner names EVERY excluded tool, derived. The
         // banner is the one worker surface that names them deliberately:
@@ -7341,6 +7480,72 @@ mod tests {
         assert!(
             banner_lower.contains("hand-off") && banner_lower.contains("trusted runner"),
             "the banner redirects every ending to the trusted-runner hand-off: {banner}"
+        );
+    }
+
+    /// THIRTEENTH ROUND, finding 2 — the extension tripwire under the worker
+    /// bullet's leading universal, "No tool this profile serves runs or
+    /// materializes a pipeline".
+    ///
+    /// Cross-checks [`WORKER_TOOL_EFFECTS`] against the ROUTER, not against
+    /// [`WORKER_PROFILE_TOOLS`]. The allowlist is a list of strings and a
+    /// name that matches no route is silently inert; the router is what a
+    /// worker session can actually call. Both directions, so a thirteenth
+    /// served tool fails here until someone classifies it, and a stale entry
+    /// for a tool that left the surface fails too.
+    ///
+    /// What it does NOT prove is that a classification is correct — see the
+    /// note on the table. It proves nothing served is unclassified, and that
+    /// no reviewed entry contradicts the sentence.
+    #[test]
+    fn every_worker_served_tool_is_classified_and_none_runs_a_pipeline() {
+        use std::collections::BTreeSet;
+
+        let server = server_with(McpProfile::Worker);
+        let served: BTreeSet<String> = server
+            .tool_router
+            .list_all()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let classified: BTreeSet<String> = WORKER_TOOL_EFFECTS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        assert_eq!(
+            WORKER_TOOL_EFFECTS.len(),
+            classified.len(),
+            "a tool is classified twice, and the duplicate could disagree with itself: \
+             {WORKER_TOOL_EFFECTS:?}"
+        );
+        assert_eq!(
+            served, classified,
+            "every tool the worker router SERVES carries a reviewed effect, and nothing else \
+             does. Add the new tool to WORKER_TOOL_EFFECTS — after reading its body — or \
+             drop the stale entry"
+        );
+
+        // THE CLAIM the worker instructions make about this surface.
+        assert!(
+            worker_tools_that_run_a_pipeline(WORKER_TOOL_EFFECTS).is_empty(),
+            "the worker bullet denies that any served tool runs or materializes a pipeline: \
+             {WORKER_TOOL_EFFECTS:?}"
+        );
+
+        // AND THE CHECK HAS TO BITE. Round twelve's guard read as semantic
+        // assurance and passed through the thing it claimed to hold, so this
+        // one is run over a table that DOES violate the sentence. Without
+        // this, `is_empty()` above is green on a filter that never matches —
+        // indistinguishable from a guard that works.
+        assert_eq!(
+            worker_tools_that_run_a_pipeline(&[
+                ("compile", WorkerToolEffect::Offline),
+                ("run_pipeline", WorkerToolEffect::RunsPipeline),
+                ("sample_rows", WorkerToolEffect::ReadsWarehouse),
+            ]),
+            vec!["run_pipeline"],
+            "the classification check must catch a tool that runs a pipeline, or the \
+             assertion above proves only that the filter never matches"
         );
     }
 
