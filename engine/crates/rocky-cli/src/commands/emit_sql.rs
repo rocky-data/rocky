@@ -479,6 +479,61 @@ mod tests {
         // `preview_dialect(...).name() == "snowflake"`.
     }
 
+    /// SEVENTEENTH ROUND, finding 2 — the parity pin, placed HERE because
+    /// this is the one test module that can reach both renderers.
+    ///
+    /// `plan_preview_output` used to skip `apply_surrogate_keys` while this
+    /// command and `rocky run` both applied it. A reviewer reading the
+    /// preview — over MCP, an agent about to approve a model — saw SQL
+    /// missing a column the run would materialize.
+    ///
+    /// Asserted as EQUALITY, not as "the preview also mentions the column".
+    /// A containment check would go green again the moment the two renderers
+    /// diverged in some other way, which is the failure this pin is for. The
+    /// only normalization is the statement terminator: `emit-sql` joins a
+    /// model's statements into a runnable script and terminates each with
+    /// `;`, while the preview returns them unterminated.
+    #[test]
+    fn plan_preview_and_emit_sql_render_the_same_keyed_sql() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model(
+            dir.path(),
+            "keyed",
+            "SELECT order_id FROM upstream",
+            "\n[[surrogate_key]]\nname = \"order_key\"\ncolumns = [\"order_id\"]\n",
+        );
+
+        let emitted = emit_models(
+            None,
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap()
+        .models;
+        assert_eq!(emitted.len(), 1);
+
+        let preview = crate::commands::plan_preview_output(None, dir.path(), None, None).unwrap();
+        assert_eq!(
+            preview.statements.len(),
+            1,
+            "the preview must render the same one model"
+        );
+
+        assert_eq!(
+            format!("{};", preview.statements[0].sql.trim_end_matches(';')),
+            emitted[0].sql,
+            "the offline preview and `emit-sql` must render the same SQL"
+        );
+        // Named explicitly so a future reader sees WHICH column the equality
+        // is protecting; equality alone would pass if both dropped it.
+        assert!(
+            preview.statements[0].sql.contains("AS order_key"),
+            "the preview must carry the declared surrogate key:\n{}",
+            preview.statements[0].sql
+        );
+    }
+
     #[test]
     fn applies_declared_surrogate_key_in_emitted_sql() {
         let dir = tempfile::tempdir().unwrap();

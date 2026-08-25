@@ -969,6 +969,29 @@ pub fn plan_preview_output(
     // Project the compile result to typed IR, reusing the shared
     // `project_ir_from_compile` helper so we don't re-derive IR by hand.
     let project_ir = super::ci_diff::project_ir_from_compile(&result);
+
+    // SEVENTEENTH ROUND, finding 2 — declared surrogate-key specs, applied
+    // below exactly as `emit_sql::emit_models` and the run path apply them.
+    //
+    // Until now this core was the ONLY consumer of a compiled model that did
+    // not. `rocky run` wraps the SELECT at materialization
+    // (`commands::run`), `rocky emit-sql` wraps it at render
+    // (`commands::emit_sql`), and this preview did neither — so it showed a
+    // reviewer SQL that was missing a column the run WILL materialize. On the
+    // MCP surface that reviewer is an agent approving a model, which is the
+    // shape of gap this branch exists to close.
+    //
+    // The alternative was to keep the divergence and carry a warning on every
+    // surface that serves the preview. Rejected: round seventeen's finding 2
+    // IS that alternative failing — the worker-profile projection dropped the
+    // warning the moment there were two surfaces to keep in step. Parity has
+    // no copies to keep in step.
+    //
+    // A malformed spec is fatal here, as it already is on both other paths: a
+    // preview of SQL that `rocky run` would refuse to generate is worse than
+    // a refusal.
+    let surrogate_keys = rocky_core::models::load_surrogate_keys_from_tree(models_dir)
+        .context("invalid surrogate_key configuration")?;
     if let Some(model) = filter
         && !project_ir
             .models
@@ -988,6 +1011,21 @@ pub fn plan_preview_output(
         {
             continue;
         }
+
+        // Borrowed unless this model actually declares a key. `ModelIr::clone`
+        // is a deep copy of the SQL string plus several owned `Vec`s, and most
+        // models declare none, so the clone is paid only where it buys
+        // something.
+        let model_ir: std::borrow::Cow<'_, rocky_ir::ModelIr> = match surrogate_keys.get(model_name)
+        {
+            Some(specs) => {
+                let mut keyed = model_ir.clone();
+                rocky_core::models::apply_surrogate_keys(&mut keyed, specs, dialect.as_ref());
+                std::borrow::Cow::Owned(keyed)
+            }
+            None => std::borrow::Cow::Borrowed(model_ir),
+        };
+        let model_ir = model_ir.as_ref();
 
         let target_label = if model_ir.target.catalog.is_empty() {
             format!("{}.{}", model_ir.target.schema, model_ir.target.table)

@@ -319,27 +319,35 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // the sentence naming the MCP equivalent sits directly beside it.
     //
     // AND THE FIRST DRAFT OF THAT SENTENCE CALLED THEM EQUIVALENT, which
-    // was a fresh over-claim inside the commit removing one. They do NOT
-    // render the same SQL. `emit_sql::emit_models` calls
-    // `rocky_core::models::apply_surrogate_keys` per model;
-    // `plan_preview_output` never does. Observed on one model with
+    // was a fresh over-claim inside the commit removing one. They did NOT
+    // render the same SQL: `emit_sql::emit_models` called
+    // `rocky_core::models::apply_surrogate_keys` per model and
+    // `plan_preview_output` never did, so on a model with
     // `[[surrogate_key]] name = "order_key"`:
     //
     //   emit-sql      SELECT *, CAST(md5(...) AS VARCHAR) AS order_key
     //                 FROM ( SELECT ... ) AS __rocky_keyed
     //   plan_preview  SELECT ...                     (no order_key)
     //
-    // `rocky plan --model` shares the gap, because it shares the core. So
-    // the preview omits a column the run WILL materialize, and the served
-    // text now says so rather than implying the two paths agree. The
-    // divergence itself is pre-existing behaviour and is NOT changed here.
+    // SEVENTEENTH ROUND, finding 2 — that divergence is now FIXED at the
+    // source rather than described here. `plan_preview_output` applies the
+    // declared keys, like `emit-sql` and like the run, and
+    // `emit_sql::tests::plan_preview_and_emit_sql_render_the_same_keyed_sql`
+    // asserts the two renderings are EQUAL. The warning sentence this
+    // comment justified is gone from the served text.
+    //
+    // Why parity rather than a warning: the warning lasted one round. It
+    // sat inside the block this table replaces for workers, and the
+    // replacement did not carry it — so a worker approved preview SQL with
+    // no caveat at all. Any true statement about a divergence has to be
+    // repeated on every surface that serves the preview; removing the
+    // divergence has nothing to repeat.
     (
         "Read your model's generated SQL before you ship it. `rocky emit-sql` renders it \
          offline: no live source schema, no compute warehouse. It prints the models in \
          dependency order and reports on stderr any it could not render. Over MCP the nearest \
          tool is `plan_preview`. It renders offline too, but it drops what it cannot render \
-         without naming it. It also omits declared surrogate-key columns, which `rocky \
-         emit-sql` and the run both add. `rocky plan` is a different command, not this step. It \
+         without naming it. `rocky plan` is a different command, not this step. It \
          needs a replication pipeline, connects to the source to discover tables, and prints \
          replication SQL. It refuses a transformation-only project. Bare `rocky plan` never \
          prints a transformation model's SQL; `rocky plan --model <name>` does, through that \
