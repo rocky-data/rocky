@@ -4811,11 +4811,21 @@ async fn compile_rejects_unknown_target_dialect() {
 /// `ProtocolVersion::LATEST` (`2025-11-25`). The stripping was being credited
 /// to a mechanism no test drove.
 ///
-/// BOTH DIRECTIONS, in one test, deliberately. A present-only assertion would
-/// still pass if serde stopped emitting the field for everyone, and an
-/// absent-only assertion would still pass if the server narrowed
-/// `supported_protocol_versions` and stopped speaking `2026-07-28` at all.
-/// Neither alone distinguishes "negotiated per peer" from "off everywhere".
+/// BOTH DIRECTIONS, in one test, deliberately — and note WHICH direction
+/// catches which failure, because an earlier draft of this paragraph had the
+/// two the wrong way round.
+///
+/// A present-only assertion (the modern peer keeps the field) survives the
+/// field being ON EVERYWHERE: if `strip_result_type_for_legacy_peer` stopped
+/// being called, every peer would keep `resultType` and this half would still
+/// pass.
+///
+/// An absent-only assertion (the default peer does not get it) survives the
+/// field being OFF EVERYWHERE: it still passes if serde stopped emitting the
+/// field at all, and it still passes if the server narrowed
+/// `supported_protocol_versions` so no peer can negotiate `2026-07-28`.
+///
+/// Only the pair distinguishes "negotiated per peer" from either extreme.
 ///
 /// The negotiated version is asserted first on each connection, because
 /// `result_type` says nothing if the handshake did not land where the test

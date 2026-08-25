@@ -1077,11 +1077,14 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// version on each before reading `result_type`, so "stripped for the
 /// default client, served to a modern one" is a checked claim.
 ///
-/// It asserts BOTH directions on purpose. Present-only would still pass if
-/// serde stopped emitting the field for everyone; absent-only would still
-/// pass if this server narrowed `supported_protocol_versions` and stopped
-/// speaking `2026-07-28`. Only the pair distinguishes "negotiated per peer"
-/// from "off everywhere".
+/// It asserts BOTH directions on purpose, and each one covers the extreme
+/// the other cannot see. Present-only survives the field being ON
+/// EVERYWHERE — drop the strip call and every peer keeps `resultType`, and
+/// that half still passes. Absent-only survives the field being OFF
+/// EVERYWHERE — serde emitting nothing, or this server narrowing
+/// `supported_protocol_versions` so no peer can negotiate `2026-07-28`, and
+/// that half still passes. Only the pair distinguishes "negotiated per peer"
+/// from either extreme.
 ///
 /// The value is the fixed string `complete`, so a modern client learns
 /// nothing from it — this is about the CLAIM, as everything on this list is.
