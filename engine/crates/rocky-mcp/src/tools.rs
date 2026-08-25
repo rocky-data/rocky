@@ -436,8 +436,20 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // `compile`, `dependents`, `draft_model`, `lineage`, `list`,
     // `plan_preview` (offline; it reads the config only to pick a dialect)
     // and `test` (its own in-memory DuckDB). The other three read. None of
-    // the twelve runs or materializes anything, and that — not "no
+    // the twelve runs or materializes a PIPELINE, and that — not "no
     // warehouse access" — is what makes a run error unreachable here.
+    // (`sample_rows` and `profile_column` do run QUERIES; an earlier draft of
+    // this note said "runs or materializes anything", which the served
+    // sentence below had already been corrected away from.)
+    //
+    // TWELFTH ROUND, finding 2 — this enumeration stays; the COUNT that used
+    // to open the served sentence does not. "Three tools do READ the
+    // warehouse" asserts exhaustivity over the allowlist, and whether a tool
+    // opens an adapter is a fact about its body, not about this list. It was
+    // guarded with `WORKER_PROFILE_TOOLS.len() == 12`, which passes through
+    // any behaviour change and any one-for-one swap. The sentence now says
+    // "Some tools DO read the warehouse" and then names the ones a worker
+    // actually reaches for, which is everything the number bought.
     //
     // TWELFTH ROUND, finding 1 — and the round-eleven replacement then said
     // something ELSE that is not true, one sentence later. It promised that
@@ -463,7 +475,7 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
          failed: retry a `Transient`, stop and surface an `AuthFailed`.",
         "Run **errors** are not something you will see. No tool this profile serves runs or \
          materializes a pipeline, so there is no run to retry and no `failure_kind` to branch \
-         on. Three tools do READ the warehouse: `sample_rows` and `profile_column` query it \
+         on. Some tools DO read the warehouse. `sample_rows` and `profile_column` query it \
          directly, and `inspect_schema` lists its tables when it can. `sample_rows` and \
          `profile_column` surface a failed read as that tool's own error, not as a run \
          outcome. `inspect_schema` does not. The physical tables it adds to `sources` are \
@@ -7120,19 +7132,30 @@ mod tests {
              `inspect_schema`'s `sources` is inconclusive, not absent. Dropping the caveat \
              re-promises what the tool does not do: {body}"
         );
-        // The sentence says THREE, which is a count over the allowlist and
-        // cannot be derived: whether a tool opens an adapter is a fact
-        // about its body, not about this list. So the list's SIZE is
-        // pinned instead. A thirteenth tool fails here, and whoever adds it
-        // has to answer whether it reads the warehouse before the count
-        // above can go back to being true.
-        assert_eq!(
-            WORKER_PROFILE_TOOLS.len(),
-            12,
-            "the projected body says three of the worker tools read the warehouse. That is \
-             a count, not a derivation — re-check the new tool against it before changing \
-             this number: {WORKER_PROFILE_TOOLS:?}"
-        );
+        // TWELFTH ROUND, finding 2 — NO COUNT IS PINNED HERE, DELIBERATELY.
+        //
+        // The bullet used to open "Three tools do READ the warehouse", and
+        // that number was guarded with `WORKER_PROFILE_TOOLS.len() == 12`.
+        // The assertion READS as semantic assurance and is not: changing an
+        // existing tool's body to open an adapter, or swapping one
+        // allowlisted tool for another, preserves the length and passes. A
+        // guard that looks derived and proves nothing is the exact defect
+        // this branch has produced three times, so the CLAIM went instead of
+        // the guard being propped up. The loop above still holds what is
+        // holdable — each named reader is on the allowlist AND named in the
+        // body — and it never claimed exhaustivity.
+        //
+        // WHAT THIS LEAVES UNGUARDED, stated rather than left to be found:
+        // the bullet's leading sentence, "No tool this profile serves runs
+        // or materializes a pipeline", is a universal over twelve
+        // hand-chosen names. PROPERTY 4 below derives the EXCLUDED set — the
+        // complement of the allowlist — so it cannot see the interior. A
+        // thirteenth allowlisted tool that ran a pipeline would falsify that
+        // sentence with every assertion in this test still green. Deriving
+        // it would take a call graph over this file seeded at the adapter
+        // constructors: a fourth thing that looks derived, one level up, and
+        // wrong the first time someone adds an indirection. Whoever extends
+        // `WORKER_PROFILE_TOOLS` owns re-reading that sentence.
 
         // PROPERTY 4 — the banner names EVERY excluded tool, derived. The
         // banner is the one worker surface that names them deliberately:
