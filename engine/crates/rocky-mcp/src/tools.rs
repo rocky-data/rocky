@@ -288,20 +288,20 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // `worker_instructions_are_projected_and_default_stays_verbatim`.
     (
         "Run `rocky plan` and read the SQL it prints. It is a preview, not a transcript. \
-         The plan is generated offline, with no live source schema and no compute \
-         warehouse: a transformation whose SQL cannot be rendered that way is skipped and \
-         is not named, an incremental table previews the 1970 sentinel watermark rather \
-         than the real one, and a replication `MERGE` on any dialect but Databricks \
-         previews a canonical shape rather than the column list the runner resolves at \
-         execute time. `rocky apply` recompiles the project rather than replaying the \
-         file. Confirm the SQL it does print matches your intent.",
-        "Call the `plan_preview` tool and read the SQL it returns. It renders offline, and \
-         it is not the whole plan: a model whose SQL cannot be rendered offline is SKIPPED, \
-         and the result does not name it, so a model missing from the statements means 'not \
-         renderable offline', never 'nothing to do'. Skipped by construction: a Snowflake \
-         dynamic table (it needs a live compute warehouse), a time-interval model (it needs \
-         a runtime window), and a content-addressed model (it never goes through SQL \
-         generation). Confirm the SQL it does return matches your intent.",
+         The plan is generated offline. There is no live source schema and no compute \
+         warehouse. So a transformation that cannot be rendered that way is skipped, and \
+         it is not named. An incremental table previews the 1970 sentinel watermark, not \
+         the real one. A replication `MERGE` on any dialect but Databricks previews a \
+         canonical shape, not the column list the runner resolves at execute time. And \
+         `rocky apply` recompiles the project rather than replaying the file. Confirm the \
+         SQL it does print matches your intent.",
+        "Call the `plan_preview` tool and read the SQL it returns. It renders offline. It \
+         is not the whole plan: a model whose SQL cannot be rendered offline is SKIPPED, \
+         and the result does not name it. So a model missing from the statements means \
+         'not renderable offline', never 'nothing to do'. Three are skipped by \
+         construction: a Snowflake dynamic table needs a live compute warehouse, a \
+         time-interval model needs a runtime window, and a content-addressed model never \
+         goes through SQL generation. Confirm the SQL it does return matches your intent.",
     ),
     // TENTH ROUND, findings 1B and 1D together — the fourth imperative,
     // whose replacement also has to be exact about WHICH suite it runs.
