@@ -974,14 +974,15 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// is swept without anyone editing a test. `Prompt::name` and
 /// `GetPromptResult::messages` are the two that are always present.
 ///
-/// `resultType` IS NOT ON THE WIRE FOR ANY CLIENT TODAY, and the first
-/// attempt at this correction wrote the opposite — caught by pinning it
-/// rather than by reading the type. rmcp's constructors do set
-/// `Some(ResultType::COMPLETE)`, and then the server handler calls
-/// `strip_result_type_for_legacy_peer()` for any peer whose NEGOTIATED
-/// protocol version is older than `2026-07-28`. It applies to row 8's
-/// `result_type` as well, for the same reason and by the same call.
+/// `resultType` IS STRIPPED PER PEER, not absent from this server. rmcp's
+/// constructors set `Some(ResultType::COMPLETE)`, and the server handler
+/// then calls `strip_result_type_for_legacy_peer()` for any peer whose
+/// NEGOTIATED protocol version is older than `2026-07-28`. It applies to
+/// row 8's `result_type` as well, for the same reason and by the same call.
 /// Reading a field off the struct is not evidence it reaches a worker.
+///
+/// The first attempt at this correction wrote the opposite of the strip —
+/// caught by pinning the value rather than by reading the type.
 ///
 /// "FOR ANY CLIENT TODAY", NOT "BY CONSTRUCTION", and the fifteenth round
 /// is why the qualifier is here. This used to argue that
@@ -997,14 +998,32 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// `2026-07-28` is given it, `sep_2322_supported` is then true, the strip
 /// call is skipped, and `resultType` DOES reach that client.
 ///
-/// The stripping therefore holds because no client asks for `2026-07-28`
-/// yet, not because this server refuses to speak it. The negotiated version
-/// is `2025-11-25` against rmcp 3.1.2's own client — which is now BLESSED,
-/// as part of row 1's `initialize` payload in
+/// The stripping therefore holds because no PRODUCTION client asks for
+/// `2026-07-28` yet, not because this server refuses to speak it. The
+/// negotiated version is `2025-11-25` against rmcp 3.1.2's own client —
+/// which is now BLESSED, as part of row 1's `initialize` payload in
 /// `served_text_golden_pins_every_worded_surface`, so the day it moves the
 /// golden moves with it and this paragraph gets re-read. Closing the gap by
 /// construction would mean narrowing `supported_protocol_versions`, which is
 /// a behaviour change to what this server speaks and is not made here.
+///
+/// SIXTEENTH ROUND, finding 3 — THAT IS NOW GUARDED, NOT MERELY OBSERVED.
+/// The two paragraphs above were correct and completely unexercised: every
+/// roundtrip connected with rmcp's default `()` handler, so the branch they
+/// describe — a peer that DOES negotiate `2026-07-28` — was reached by no
+/// test. `result_type_reaches_a_2026_07_28_client_and_no_other` (in
+/// `tests/roundtrip.rs`) now drives both peers and asserts the negotiated
+/// version on each before reading `result_type`, so "stripped for the
+/// default client, served to a modern one" is a checked claim.
+///
+/// It asserts BOTH directions on purpose. Present-only would still pass if
+/// serde stopped emitting the field for everyone; absent-only would still
+/// pass if this server narrowed `supported_protocol_versions` and stopped
+/// speaking `2026-07-28`. Only the pair distinguishes "negotiated per peer"
+/// from "off everywhere".
+///
+/// The value is the fixed string `complete`, so a modern client learns
+/// nothing from it — this is about the CLAIM, as everything on this list is.
 ///
 /// The value of `resultType` is the fixed string `complete`, so nothing
 /// about this is a guidance LEAK. The defect was the CLAIM — a justification

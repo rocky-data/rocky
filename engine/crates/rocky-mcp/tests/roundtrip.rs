@@ -54,6 +54,12 @@ schema_template = "out"
 }
 
 /// Spawn `server` on one end of a duplex pipe and return a connected client.
+///
+/// The `()` handler requests `ClientInfo::default()`, whose `protocol_version`
+/// is rmcp 3.1.2's `ProtocolVersion::LATEST` — `2025-11-25` today. Every test
+/// in this file that uses `connect` is therefore describing THAT negotiated
+/// version, which matters for `resultType`: see
+/// [`result_type_reaches_a_2026_07_28_client_and_no_other`].
 async fn connect(server: RockyMcpServer) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
@@ -62,6 +68,28 @@ async fn connect(server: RockyMcpServer) -> rmcp::service::RunningService<rmcp::
         }
     });
     ().serve(client_io).await.expect("client connects")
+}
+
+/// [`connect`], but the client asks for a SPECIFIC protocol version instead of
+/// taking rmcp's default.
+///
+/// `impl ClientHandler for ClientInfo` returns the value itself from
+/// `get_info`, so handing `serve` a `ClientInfo` is the whole mechanism — no
+/// custom handler type is needed.
+async fn connect_at_version(
+    server: RockyMcpServer,
+    protocol_version: rmcp::model::ProtocolVersion,
+) -> rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientInfo> {
+    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_io).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    // `ClientInfo::default()` is exactly what the `()` handler in [`connect`]
+    // sends, so the ONLY difference between the two clients is the version.
+    let info = rmcp::model::ClientInfo::default().with_protocol_version(protocol_version);
+    info.serve(client_io).await.expect("client connects")
 }
 
 #[tokio::test]
@@ -4765,6 +4793,121 @@ async fn compile_rejects_unknown_target_dialect() {
     );
 
     client.cancel().await.unwrap();
+}
+
+/// SIXTEENTH ROUND, finding 3 — `resultType` coverage was OBSERVED, never
+/// GUARDED.
+///
+/// The fifteenth round corrected a false justification in `tools.rs`: the
+/// server does NOT pin `2024-11-05`, it advertises rmcp's whole
+/// `KNOWN_VERSIONS` list, and `negotiate_protocol_version` hands a client back
+/// whatever it asked for when the server supports it. So a client that
+/// requests `2026-07-28` gets it, `sep_2322_supported` is true,
+/// `strip_result_type_for_legacy_peer()` is skipped, and `resultType` reaches
+/// that client.
+///
+/// That correction was right and completely unexercised: every roundtrip in
+/// this file connects with rmcp's default `()` handler, which asks for
+/// `ProtocolVersion::LATEST` (`2025-11-25`). The stripping was being credited
+/// to a mechanism no test drove.
+///
+/// BOTH DIRECTIONS, in one test, deliberately. A present-only assertion would
+/// still pass if serde stopped emitting the field for everyone, and an
+/// absent-only assertion would still pass if the server narrowed
+/// `supported_protocol_versions` and stopped speaking `2026-07-28` at all.
+/// Neither alone distinguishes "negotiated per peer" from "off everywhere".
+///
+/// The negotiated version is asserted first on each connection, because
+/// `result_type` says nothing if the handshake did not land where the test
+/// thinks it did.
+///
+/// This does not change what the server SPEAKS. Closing the gap by
+/// construction would mean narrowing `supported_protocol_versions`, which is a
+/// behaviour change and is still not made here.
+#[tokio::test]
+async fn result_type_reaches_a_2026_07_28_client_and_no_other() {
+    use rmcp::model::{ProtocolVersion, ResultType};
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let config_path = dir.path().join("rocky.toml");
+
+    // 1. A client that ASKS for 2026-07-28 is given it, and keeps `resultType`.
+    let modern = connect_at_version(
+        RockyMcpServer::new(config_path.clone()),
+        ProtocolVersion::V_2026_07_28,
+    )
+    .await;
+    let negotiated = modern
+        .peer_info()
+        .expect("the server returned an initialize result")
+        .protocol_version
+        .clone();
+    assert_eq!(
+        negotiated,
+        ProtocolVersion::V_2026_07_28,
+        "the server advertises rmcp's whole KNOWN_VERSIONS list and does not \
+         override supported_protocol_versions, so a client asking for \
+         2026-07-28 must be given it; if this fails the rest of the test is \
+         measuring the wrong session"
+    );
+    let modern_result = modern
+        .call_tool(CallToolRequestParams::new("compile"))
+        .await
+        .expect("compile call returns a result");
+    assert_eq!(
+        modern_result.result_type,
+        Some(ResultType::COMPLETE),
+        "a peer that negotiated 2026-07-28 skips \
+         strip_result_type_for_legacy_peer, so resultType is on the wire for \
+         it: {modern_result:?}"
+    );
+    modern.cancel().await.unwrap();
+
+    // 2. The default `()` client every other test in this file uses asks for
+    //    `LATEST` (2025-11-25), which is older, so the field is stripped.
+    let legacy = connect(RockyMcpServer::new(config_path)).await;
+    let legacy_negotiated = legacy
+        .peer_info()
+        .expect("the server returned an initialize result")
+        .protocol_version
+        .clone();
+    assert_eq!(
+        legacy_negotiated,
+        ProtocolVersion::LATEST,
+        "the default handler asks for rmcp's LATEST; if that constant moves \
+         past 2026-07-28 this whole test inverts and the tools.rs note about \
+         'no client asks for it yet' has to be re-read"
+    );
+    assert!(
+        legacy_negotiated.as_str() < ProtocolVersion::V_2026_07_28.as_str(),
+        "the default client's version must be OLDER than 2026-07-28 for the \
+         strip to apply at all: {legacy_negotiated:?}"
+    );
+    let legacy_result = legacy
+        .call_tool(CallToolRequestParams::new("compile"))
+        .await
+        .expect("compile call returns a result");
+    assert_eq!(
+        legacy_result.result_type, None,
+        "a peer on an older negotiated version has resultType stripped: \
+         {legacy_result:?}"
+    );
+
+    // Non-vacuity: the two calls differ ONLY in `resultType`. Without this a
+    // failure to produce any result at all would satisfy both assertions.
+    assert_eq!(
+        legacy_result.structured_content, modern_result.structured_content,
+        "the two peers must receive the SAME tool result; only the protocol \
+         discriminator may differ"
+    );
+    assert!(
+        legacy_result.structured_content.is_some(),
+        "the compile call must actually return content, or both assertions \
+         above are about an empty result"
+    );
+
+    legacy.cancel().await.unwrap();
 }
 
 /// SIXTEENTH ROUND, finding 1 — the two tools that read `self.config_path`
