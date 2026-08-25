@@ -521,10 +521,18 @@ rocky test-adapter [flags]
 
 ```bash
 $ rocky test-adapter --adapter duckdb
-Running conformance tests for duckdb...
-  19/19 core tests passed
-  3/7 optional tests passed (4 skipped: not supported)
+Adapter Conformance: duckdb (SDK 1.x)
+==================================================
+...
+Result: 1 passed, 0 failed, 25 skipped
 ```
+
+Most specs report `skipped` today. The suite declares 26 specs and
+implements the check for one of them (`format_table_ref`); the rest are
+declared surface with no check written yet, and they say so rather than
+counting as passes. A run where **nothing** was verified prints an explicit
+warning — it is not a passing conformance run, even though the exit status
+is zero (the status keys on failures).
 
 ### Related Commands
 

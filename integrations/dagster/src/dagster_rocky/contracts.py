@@ -65,6 +65,11 @@ _CONTRACT_CODE_TO_CHECK: dict[str, str] = {
     "E013": CONTRACT_PROTECTED_COLUMNS_CHECK,
     "E011": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
     "E012": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    # `no_new_nullable` violations. `has_column_constraints` below already
+    # turns this check ON when that rule is set, and an unmapped code is
+    # dropped silently at the dispatch — so without this entry the check
+    # would report PASSING while the contract was being violated.
+    "E014": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
     "W010": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
 }
 
