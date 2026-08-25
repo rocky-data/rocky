@@ -3278,6 +3278,116 @@ async fn worker_profile_prompts_end_at_the_runner_handoff() {
     client.cancel().await.unwrap();
 }
 
+/// THIRTEENTH ROUND — the surface this branch predicted round fourteen
+/// would find, swept before it did.
+///
+/// Every earlier sweep over `prompts/get` bodies asks the same question:
+/// does this text name a tool the profile does not serve? None of them ever
+/// asked whether it makes a claim the served tool does not keep. That is a
+/// different defect class, and it was here: `build_model` step 1 said
+/// "inspect_schema — read EVERY existing model and source table", then
+/// "select only what's actually there" — an assertion of completeness over
+/// the tool with TWO silent failure paths, telling the caller to treat
+/// absence as absence. It is the same over-claim removed from that tool's
+/// own description this round, one surface over.
+///
+/// BOTH PROFILES, because the two variants are separate string literals
+/// branched on `self.profile` with no construction-time link between them
+/// (unlike `WORKER_TOOL_DESCRIPTIONS`, whose rewrite refuses when its
+/// needle stops matching). A one-sided fix is otherwise silent, which is
+/// what this sweep is for — see the mutation that proves it.
+///
+/// WHAT THIS DOES NOT CATCH, stated rather than left to be found: a
+/// substring pin catches THIS phrasing. "all source tables", "the complete
+/// set of", or a fresh universal in a future prompt walk straight past it.
+/// It is a regression pin on a defect that has now recurred four times on
+/// four surfaces, not a semantic rule — deriving one would need to read the
+/// claim, not the words.
+#[tokio::test]
+async fn no_prompt_body_tells_the_caller_inspect_schema_is_complete() {
+    for profile in [
+        rocky_mcp::McpProfile::Default,
+        rocky_mcp::McpProfile::Worker,
+    ] {
+        let dir = TempDir::new().unwrap();
+        write_project(dir.path(), &dir.path().join("test.duckdb"));
+        let server = RockyMcpServer::new_with_profile(dir.path().join("rocky.toml"), profile);
+        let client = connect(server).await;
+
+        // ENUMERATED from the served router, like the sweep above, so a
+        // sixth prompt is covered without an edit here.
+        let prompts = client.list_all_prompts().await.expect("list prompts");
+        assert_eq!(
+            prompts.len(),
+            5,
+            "{profile:?} serves all 5 prompts; a new one must be swept, not excused"
+        );
+
+        let mut saw_build_model = false;
+        for prompt in &prompts {
+            let name = prompt.name.clone();
+            // Synthesised from the prompt's OWN declared arguments — the
+            // same rule as the worker sweep, for the same reason.
+            let mut args = serde_json::Map::new();
+            for declared in prompt.arguments.iter().flatten() {
+                let value = if declared.name == "model" {
+                    "orders"
+                } else {
+                    "daily revenue"
+                };
+                args.insert(declared.name.clone(), serde_json::json!(value));
+            }
+            let mut params = GetPromptRequestParams::new(name.clone());
+            if !args.is_empty() {
+                params = params.with_arguments(args);
+            }
+            let result = client
+                .get_prompt(params)
+                .await
+                .unwrap_or_else(|e| panic!("get_prompt {name}: {e}"));
+            let haystack = prompt_text(&result).to_lowercase();
+
+            assert!(
+                !haystack.contains("every existing model and source table"),
+                "{profile:?} `{name}` tells the caller inspect_schema returns every model \
+                 and source table. Its physical-table discovery reports none of them and \
+                 still succeeds, so that instructs the caller to read a silent failure as \
+                 proof of absence"
+            );
+
+            // AND THE REPLACEMENT MUST CARRY THE CAVEAT, not merely drop
+            // the universal. Dropping it is the cheap edit and it leaves
+            // the caller with no reason to distrust an empty `sources` —
+            // the same both-directions rule the served instructions use.
+            //
+            // Pinned on `build_model` only: it is the prompt that opens by
+            // instructing inspect_schema over the WHOLE project.
+            // `add_tests_to_pks` also calls it, for the typed columns of
+            // one named model, and claims no completeness.
+            if name == "build_model" {
+                saw_build_model = true;
+                assert!(
+                    haystack.contains("inconclusive, not absent"),
+                    "{profile:?} `build_model` instructs inspect_schema first and must say \
+                     a table missing from `sources` is inconclusive: {haystack}"
+                );
+                assert!(
+                    haystack.contains("ask sample_rows for that table"),
+                    "{profile:?} `build_model` must name the reader that fails loudly for \
+                     the same table, or the caveat leaves the caller stuck: {haystack}"
+                );
+            }
+        }
+        assert!(
+            saw_build_model,
+            "{profile:?} serves `build_model` — if it was renamed, the pins above moved \
+             with it or silently stopped running"
+        );
+
+        client.cancel().await.unwrap();
+    }
+}
+
 /// FF-WP1 fix round 2 (item 5), extended by the F3 red team (finding 3) —
 /// the worker-profile guidance surfaces ON THE WIRE.
 ///

@@ -5150,9 +5150,11 @@ impl RockyMcpServer {
                     format!(
                         "Build a Rocky model for this intent:\n\n  {intent}\n\n\
                          Follow Rocky's authoring loop, using the MCP tools at each step:\n\n\
-                         1. inspect_schema — read every existing model and source table with \
-                         its typed columns. Never guess column names; select only what's \
-                         actually there.\n\
+                         1. inspect_schema — read the project's models and source tables with \
+                         their typed columns. Never guess column names; select only what it \
+                         shows. Its physical warehouse tables are best-effort: a table missing \
+                         from `sources` is inconclusive, not absent. Ask sample_rows for that \
+                         table before you conclude it does not exist.\n\
                          2. sample_rows — look at real rows before writing any filter or cast. \
                          The schema tells you a column exists; it does not tell you its literal \
                          values, its units, or its null rate.\n\
@@ -5206,8 +5208,11 @@ impl RockyMcpServer {
                 format!(
                     "Build a Rocky model for this intent:\n\n  {intent}\n\n\
                      Follow Rocky's authoring loop, using the MCP tools at each step:\n\n\
-                     1. inspect_schema — read every existing model and source table with its \
-                     typed columns. Never guess column names; select only what's actually there.\n\
+                     1. inspect_schema — read the project's models and source tables with their \
+                     typed columns. Never guess column names; select only what it shows. Its \
+                     physical warehouse tables are best-effort: a table missing from `sources` is \
+                     inconclusive, not absent. Ask sample_rows for that table before you conclude \
+                     it does not exist.\n\
                      2. sample_rows — look at real rows before writing any filter or cast. The \
                      schema tells you a column exists; it does not tell you its literal values, \
                      its units, or its null rate.\n\
