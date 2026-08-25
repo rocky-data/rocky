@@ -5881,12 +5881,24 @@ fn render_golden(table: &std::collections::BTreeMap<String, String>) -> String {
 /// plan-producing tools the exclusion was really about, so driving it here
 /// would import the drift that is genuinely absent from the worker surface.
 ///
-/// WHAT IT STILL DOES NOT COVER: surface 6 is not served (pinned absent by
-/// `worker_result_text_names_no_excluded_tool`), row 9 stays PARTIAL for
-/// the reason the enumeration gives — policy denials, warehouse failures
-/// and internal errors are not reachable from an offline harness — and the
-/// default profile's call results are unpinned. This is not "every MCP
-/// surface".
+/// WHAT IT STILL DOES NOT COVER, listed rather than left to be discovered:
+///
+///  - surface 6 is not served (pinned absent by
+///    `worker_result_text_names_no_excluded_tool`);
+///  - row 9 stays PARTIAL for the reason the enumeration gives — policy
+///    denials, warehouse failures and internal errors are not reachable
+///    from an offline harness;
+///  - the DEFAULT profile's call results are unpinned, deliberately (it
+///    serves the plan-producing tools);
+///  - the APPROVER profile's call results are unpinned too, and this one is
+///    a genuine hole rather than a choice. The approver serves an action
+///    neither other profile does — `review_queue` approve, #1517 — and its
+///    result envelope is read by no sweep and pinned by no golden. Rows 1–5
+///    cover the approver only because they are compared for EQUALITY
+///    against the default surface, and that equality says nothing about
+///    what a call returns.
+///
+/// This is not "every MCP surface".
 ///
 /// The `Approver` profile is compared against `Default` rather than
 /// blessed: `try_new_with_profile` branches on `Worker` alone, so the two
@@ -5967,6 +5979,12 @@ async fn served_text_golden_pins_every_worded_surface() {
         "the call sweep produced no rows; it would pin nothing"
     );
 
+    // `record` refuses a duplicate key WITHIN one table. Two tables now merge
+    // under the same `worker` label, and a plain `insert` would drop the
+    // older row silently — the guard losing its own precondition one layer
+    // up. The `tools/call/*` keys cannot collide with `instructions` /
+    // `prompts/*` / `tools/list/*` today; "cannot" is exactly the kind of
+    // unenforced claim this file exists to stop taking on trust.
     let mut live = std::collections::BTreeMap::new();
     for (label, table) in [
         ("default", default),
@@ -5974,7 +5992,12 @@ async fn served_text_golden_pins_every_worded_surface() {
         ("worker", worker_calls),
     ] {
         for (key, hash) in table {
-            live.insert(format!("{label}/{key}"), hash);
+            let full = format!("{label}/{key}");
+            assert!(
+                live.insert(full.clone(), hash).is_none(),
+                "two digest tables both produced '{full}'; one row would silently replace \
+                 the other and the golden would pin only the survivor"
+            );
         }
     }
     let rendered = render_golden(&live);
