@@ -919,13 +919,14 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 ///                                                   worker_result_text_names_no_
 ///                                                   excluded_tool
 ///   7  tools/call   -> ok: result next_steps       swept: draft_next_steps_are_
-///        (a FIELD of row 8's channel)               profile_selected
+///        (a FIELD of row 8's channel)               profile_selected; also GOLDEN
+///                                                   (worker) under its own key
 ///   8  tools/call   -> ok: THE WHOLE CallToolResult PARTIAL — two DIFFERENT
-///        (structured_content AND content AND        reasons, split below
-///         is_error AND result_type AND _meta)
+///        (structured_content AND content AND        reasons, split below;
+///         is_error AND result_type AND _meta)       all 12 worker tools GOLDEN
 ///   9  tools/call   -> err: THE WHOLE CallToolResult PARTIAL — argument arms
-///        (the ToolError body — message,             swept, the rest OPEN
-///         remediation_hint, policy_rule, the
+///        (the ToolError body — message,             swept AND GOLDEN (worker),
+///         remediation_hint, policy_rule, the        the rest OPEN
 ///         plan fields — AND the envelope)
 /// ```
 ///
@@ -1204,14 +1205,37 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// (see [`RockyMcpServer::draft_check_next_steps`]) because it is what
 /// would be wrong first if the tool were re-admitted.
 ///
-/// A GOLDEN NOW SITS UNDER ROWS 1–5, and it is a new CHECK over existing
-/// rows — NOT a tenth row. The count below stays 9.
+/// A GOLDEN NOW SITS UNDER ROWS 1–5, 7, 8 AND 9, and it is a new CHECK over
+/// existing rows — NOT a tenth row. The count below stays 9.
 ///
 /// `served_text_golden_pins_every_worded_surface` (in `tests/roundtrip.rs`)
 /// digests the whole serialized payload of rows 1, 2, 3, 4 and 5, for the
-/// DEFAULT and WORKER profiles, into
-/// `tests/fixtures/served_text.golden`. Any edit to any of that text fails
-/// the test until someone re-blesses the file.
+/// DEFAULT and WORKER profiles, plus rows 7, 8 and 9 for the WORKER
+/// profile, into `tests/fixtures/served_text.golden`. Any edit to any of
+/// that text fails the test until someone re-blesses the file.
+///
+/// ROWS 7–9 WERE EXCLUDED FROM IT, and the fifteenth round is why they are
+/// not. The exclusion read: "their payloads embed run-dependent values, so a
+/// digest over them would drift every run and get blessed reflexively." That
+/// is true of `tools/call` in general. It is not true of the WORKER set, and
+/// checking that was the step the exclusion skipped — the plan- and
+/// timestamp-producing tools are `propose`, `optimize` and the rest of the
+/// withheld list, and this profile serves none of them.
+///
+/// Grounded rather than argued: all 21 worker call payloads (12 successes,
+/// 9 argument failures) were dumped and read. Not one carries an absolute
+/// path, a timestamp, a duration or an id. `draft_model` reports a bare
+/// model NAME, `test` reports counts with no timings, and
+/// `breaking_change`'s `skipped_reason` names no path. The temp-root
+/// normalizer in the harness is defence for a field not yet added, not
+/// something that fires today.
+///
+/// WORKER ONLY for those three, and the asymmetry is deliberate: the
+/// DEFAULT profile serves the plan-producing tools the exclusion was really
+/// about, so pinning its call results would import the drift that is
+/// genuinely absent here. Row 9 also stays PARTIAL in the golden for the
+/// same reason it is partial in the sweep — only the argument-validation
+/// arm is reachable offline.
 ///
 /// "WHOLE SERIALIZED PAYLOAD" WAS NOT TRUE OF ROW 1 WHEN IT WAS FIRST
 /// WRITTEN, and the fifteenth round is why it is called out rather than
@@ -1235,9 +1259,9 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// sentence from a false one, and a wrong claim blessed once stays
 /// blessed. It converts "is every served sentence true?" — unbounded —
 /// into "is this one changed sentence true?" — bounded, and still a
-/// person's job. Rows 7, 8 and 9 are deliberately outside it: their
-/// payloads embed run-dependent values, so a digest over them would drift
-/// every run and get blessed reflexively.
+/// person's job. What remains outside it is stated above: the default
+/// profile's call results, and every error arm of row 9 that an offline
+/// harness cannot reach.
 ///
 /// Test-gated because nothing in the server reads the number — the value
 /// is the enumeration above it and the anchor it gives the capability

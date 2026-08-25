@@ -5322,6 +5322,54 @@ fn should_bless(value: Option<&str>) -> bool {
     value.is_some_and(|v| v.trim() == "1")
 }
 
+/// FIFTEENTH ROUND — the path normalizer, driven directly.
+///
+/// It has NO live call site that changes anything: no worker call payload
+/// carries a path today (see [`normalize_run_paths`]). A helper whose only
+/// caller never exercises it is a helper nobody has checked, so it is
+/// checked here rather than trusted.
+///
+/// The longest-first ordering is the case worth pinning. On macOS the raw
+/// root is a PREFIX of nothing, but the canonical root
+/// (`/private/var/…`) CONTAINS the raw one (`/var/…`) as a substring — so
+/// replacing the shorter first would leave `/private<TMP>` behind, which
+/// still embeds nothing per-run but is not the sentinel either.
+#[test]
+fn normalize_run_paths_replaces_every_root_longest_first() {
+    let roots = vec![
+        "/private/var/folders/ab/T/.tmpXYZ".to_string(),
+        "/var/folders/ab/T/.tmpXYZ".to_string(),
+    ];
+    assert_eq!(
+        normalize_run_paths("wrote /var/folders/ab/T/.tmpXYZ/models/a.sql", &roots),
+        "wrote <TMP>/models/a.sql",
+        "the raw root is replaced"
+    );
+    assert_eq!(
+        normalize_run_paths(
+            "wrote /private/var/folders/ab/T/.tmpXYZ/models/a.sql",
+            &roots
+        ),
+        "wrote <TMP>/models/a.sql",
+        "the canonical root is replaced WHOLE — a shorter root must not eat its own prefix"
+    );
+    assert_eq!(
+        normalize_run_paths("no path here", &roots),
+        "no path here",
+        "text without a root is passed through untouched"
+    );
+
+    // And the ordering the helper itself produces, not just the one this
+    // test hand-wrote: `temp_roots` must sort longest-first or the case
+    // above regresses without this test noticing.
+    let dir = TempDir::new().unwrap();
+    let ordered = temp_roots(dir.path());
+    assert!(
+        ordered.windows(2).all(|w| w[0].len() >= w[1].len()),
+        "temp_roots must return longest-first: {ordered:?}"
+    );
+}
+
 /// FIFTEENTH ROUND, finding 3 — the bless switch is an ALLOWLIST.
 ///
 /// Driven over the values a person or a CI file actually writes. `false`
@@ -5351,40 +5399,88 @@ fn bless_requires_an_explicit_one() {
     );
 }
 
+/// Digest one payload under `key`, refusing anything that would make the
+/// golden per-run garbage rather than a pin.
+///
+/// `nonce` is the temp directory's unique final component. It is checked
+/// AFTER any normalization the caller applies, so a path the caller thought
+/// it had replaced fails here instead of being blessed as a fresh hash every
+/// run. That ordering is the whole value of the check: it turns "I believe I
+/// normalized every run-dependent value" into something the test decides.
+fn record(
+    out: &mut std::collections::BTreeMap<String, String>,
+    key: &str,
+    payload: &str,
+    nonce: &str,
+) {
+    assert!(
+        !payload.is_empty(),
+        "'{key}' serialized to nothing; a golden over an empty payload pins nothing"
+    );
+    assert!(
+        !payload.contains(nonce),
+        "'{key}' embeds the per-run temp path; the golden would drift every run: {payload}"
+    );
+    let previous = out.insert(
+        key.to_string(),
+        blake3::hash(payload.as_bytes()).to_hex().to_string(),
+    );
+    assert!(previous.is_none(), "duplicate golden key '{key}'");
+}
+
+/// Replace this run's temporary roots with a fixed sentinel.
+///
+/// EXACT REPLACEMENT, not a pattern. A regex over "things that look like a
+/// path" would quietly absorb a genuine change to served text; replacing the
+/// literal root this run was given cannot, because any other value survives
+/// and is caught either by [`record`]'s nonce check or by the golden itself.
+///
+/// Both the raw and the canonicalized root are replaced. On macOS `TempDir`
+/// hands out `/var/folders/…` while a canonicalized path comes back as
+/// `/private/var/folders/…`, and a payload can carry either.
+///
+/// IT DOES NOT FIRE TODAY, and saying so is the point rather than an
+/// apology. Every one of the 21 worker call payloads was dumped and read
+/// while this was written: not one contains an absolute path, a timestamp,
+/// a duration or an id. `draft_model` reports a bare model NAME, `test`
+/// reports counts with no timings, and `breaking_change`'s `skipped_reason`
+/// names no path. That is the grounding for pinning these rows at all — the
+/// exclusion assumed run-dependent payloads that this profile does not
+/// produce.
+///
+/// So this is here for the field that has not been added yet, and the
+/// trade is deliberate: it ABSORBS a temp root silently rather than failing
+/// on it. [`record`]'s nonce check is the half that cannot be absorbed, and
+/// a value this misses fails there instead of blessing.
+fn normalize_run_paths(payload: &str, roots: &[String]) -> String {
+    let mut out = payload.to_string();
+    for root in roots {
+        out = out.replace(root, "<TMP>");
+    }
+    out
+}
+
+/// The temp roots [`normalize_run_paths`] should replace, longest first so a
+/// prefix cannot shadow the longer form it is a prefix of.
+fn temp_roots(dir: &Path) -> Vec<String> {
+    let mut roots = vec![dir.to_string_lossy().to_string()];
+    if let Ok(canonical) = dir.canonicalize() {
+        roots.push(canonical.to_string_lossy().to_string());
+    }
+    roots.sort_by_key(|r| std::cmp::Reverse(r.len()));
+    roots.dedup();
+    roots
+}
+
 /// Digest every worded surface one profile serves, keyed by surface.
 ///
 /// Keys carry no profile prefix — the caller adds one — so the approver
 /// surface can be compared against the default surface key-for-key.
-///
-/// `nonce` is the temp directory's unique final component. No served text
-/// should contain it; if one does, the golden would be per-run garbage
-/// rather than a pin, and this is where that is caught.
 async fn served_text_digests(
     config_path: &Path,
     profile: rocky_mcp::McpProfile,
     nonce: &str,
 ) -> std::collections::BTreeMap<String, String> {
-    fn record(
-        out: &mut std::collections::BTreeMap<String, String>,
-        key: &str,
-        payload: &str,
-        nonce: &str,
-    ) {
-        assert!(
-            !payload.is_empty(),
-            "'{key}' serialized to nothing; a golden over an empty payload pins nothing"
-        );
-        assert!(
-            !payload.contains(nonce),
-            "'{key}' embeds the per-run temp path; the golden would drift every run: {payload}"
-        );
-        let previous = out.insert(
-            key.to_string(),
-            blake3::hash(payload.as_bytes()).to_hex().to_string(),
-        );
-        assert!(previous.is_none(), "duplicate golden key '{key}'");
-    }
-
     let server = RockyMcpServer::new_with_profile(config_path.to_path_buf(), profile);
     let client = connect(server).await;
     let mut out = std::collections::BTreeMap::new();
@@ -5488,6 +5584,233 @@ async fn served_text_digests(
     out
 }
 
+/// Digest the whole serialized `CallToolResult` of every `tools/call` a
+/// worker can reach — surfaces 7, 8 and 9.
+///
+/// FIFTEENTH ROUND — these were excluded from the golden on the argument
+/// that their payloads embed run-dependent values (paths, plan ids,
+/// timestamps), so a digest over them would drift every run and get blessed
+/// reflexively. The argument is sound in general and does not hold on THIS
+/// set, which is the check the exclusion skipped: the plan- and
+/// timestamp-producing tools are `propose`, `optimize` and the rest of the
+/// withheld set, and the worker profile does not serve any of them. What is
+/// left run-dependent is the temp root, and replacing it exactly is cheap.
+///
+/// WORKER ONLY, deliberately. The default profile serves the tools the
+/// exclusion was really about, so driving it here would import exactly the
+/// drift the reviewer established is absent from the worker surface. Rows
+/// 1–5 stay on both profiles; these three are worker-scoped, and the golden
+/// keys say so.
+///
+/// The fixture MIRRORS `worker_result_text_names_no_excluded_tool`: the same
+/// budget-breached sidecar so `compile` and `draft_model` are RED with an
+/// E027 suggestion, and the same non-git tree so `breaking_change` sets
+/// `skipped_reason`. A golden over a green fixture would pin text that was
+/// never emitted, which is the failure that sweep already had to correct.
+///
+/// ROW 7 GETS ITS OWN KEY even though its text sits inside row 8's envelope.
+/// The row exists because `next_steps` is profile-selected and has its own
+/// failure mode; a separate key makes a change to it legible in the drift
+/// report instead of hiding inside a whole-envelope hash.
+async fn worker_call_digests(
+    dir: &Path,
+    nonce: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let roots = temp_roots(dir);
+    let db_path = dir.join("warehouse.duckdb");
+    write_project(dir, &db_path);
+    write_target_defaults(dir);
+    std::fs::write(
+        dir.join("models").join("orders.toml"),
+        "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \
+         \"warehouse\"\nschema = \"out\"\ntable = \"orders\"\n\n[budget]\nmax_usd = \
+         0.0000001\nmax_bytes_scanned = 1\n",
+    )
+    .unwrap();
+    materialize_orders(&db_path, "out", "(1,'COMPLETE')").await;
+
+    let config_path = dir.join("rocky.toml");
+    let server = RockyMcpServer::new_with_profile(config_path, rocky_mcp::McpProfile::Worker);
+    let client = connect(server).await;
+    let mut out = std::collections::BTreeMap::new();
+
+    let digest = |out: &mut std::collections::BTreeMap<String, String>,
+                  key: String,
+                  value: &serde_json::Value| {
+        let whole = serde_json::to_string(value).expect("result serializes");
+        record(out, &key, &normalize_run_paths(&whole, &roots), nonce);
+    };
+
+    // Surface 8, the diagnostic route. RED on purpose — see the fixture note
+    // above.
+    let compile = client
+        .call_tool(CallToolRequestParams::new("compile"))
+        .await
+        .expect("compile call");
+    assert_eq!(
+        compile.structured_content.as_ref().expect("structured")["has_errors"],
+        serde_json::json!(true),
+        "the fixture must compile RED or this pins text that was never emitted"
+    );
+
+    // Surfaces 7 and 8 together — `draft_model` is the one worker-served
+    // producer of `next_steps`.
+    let draft = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 1 AS id, 'COMPLETE' AS status",
+                "re-draft, to pin draft_model's own served text",
+            )),
+        )
+        .await
+        .expect("draft_model call");
+    let drafted = draft.structured_content.as_ref().expect("structured");
+    assert_eq!(
+        drafted["has_errors"],
+        serde_json::json!(true),
+        "the re-draft must compile RED or draft_model's diagnostics are empty"
+    );
+    let next_steps = drafted["next_steps"]
+        .as_str()
+        .expect("draft_model carries next_steps — surface 7 has no other producer");
+    record(
+        &mut out,
+        "tools/call/ok/draft_model.next_steps",
+        &normalize_run_paths(next_steps, &roots),
+        nonce,
+    );
+
+    let breaking = client
+        .call_tool(CallToolRequestParams::new("breaking_change"))
+        .await
+        .expect("breaking_change call");
+    assert!(
+        breaking
+            .structured_content
+            .as_ref()
+            .expect("structured")
+            .get("skipped_reason")
+            .is_some(),
+        "the non-git fixture must set skipped_reason or that free text goes unpinned"
+    );
+
+    digest(
+        &mut out,
+        "tools/call/ok/compile".to_string(),
+        &serde_json::to_value(&compile).expect("serializes"),
+    );
+    digest(
+        &mut out,
+        "tools/call/ok/draft_model".to_string(),
+        &serde_json::to_value(&draft).expect("serializes"),
+    );
+    digest(
+        &mut out,
+        "tools/call/ok/breaking_change".to_string(),
+        &serde_json::to_value(&breaking).expect("serializes"),
+    );
+
+    let model_arg = serde_json::json!({ "model": "orders" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let obj = |v: serde_json::Value| v.as_object().unwrap().clone();
+    let mut ok_count = 3;
+    for (tool, args) in [
+        ("plan_preview", None),
+        ("catalog", None),
+        ("inspect_schema", None),
+        ("test", None),
+        ("list", Some(obj(serde_json::json!({ "kind": "models" })))),
+        ("lineage", Some(model_arg.clone())),
+        ("dependents", Some(model_arg.clone())),
+        ("sample_rows", Some(model_arg.clone())),
+        (
+            "profile_column",
+            Some(obj(
+                serde_json::json!({ "model": "orders", "column": "status" }),
+            )),
+        ),
+    ] {
+        let mut request = CallToolRequestParams::new(tool);
+        if let Some(args) = args {
+            request = request.with_arguments(args);
+        }
+        let called = client
+            .call_tool(request)
+            .await
+            .unwrap_or_else(|e| panic!("`{tool}` call: {e}"));
+        assert!(
+            called.structured_content.is_some() && !called.content.is_empty(),
+            "`{tool}` returns both renderings, or this pins half an envelope"
+        );
+        digest(
+            &mut out,
+            format!("tools/call/ok/{tool}"),
+            &serde_json::to_value(&called).expect("serializes"),
+        );
+        ok_count += 1;
+    }
+    assert_eq!(
+        ok_count, 12,
+        "all 12 worker-served tools are driven, or the golden has the same hole the \
+         name-based sweep closed"
+    );
+
+    // Surface 9 — the argument-validation arm of the nine worker-served
+    // tools that have one. Still PARTIAL for the reason the enumeration
+    // states: policy denials, warehouse failures and internal errors are not
+    // reachable from this harness.
+    let mut err_count = 0;
+    for (tool, args) in [
+        ("compile", serde_json::json!({ "model": "no_such_model" })),
+        (
+            "plan_preview",
+            serde_json::json!({ "model": "no_such_model" }),
+        ),
+        ("lineage", serde_json::json!({ "model": "no_such_model" })),
+        (
+            "dependents",
+            serde_json::json!({ "model": "no_such_model" }),
+        ),
+        ("test", serde_json::json!({ "model": "no_such_model" })),
+        (
+            "sample_rows",
+            serde_json::json!({ "model": "no_such_model" }),
+        ),
+        (
+            "profile_column",
+            serde_json::json!({ "model": "orders", "column": "no_such_column" }),
+        ),
+        ("list", serde_json::json!({ "kind": "not_a_kind" })),
+        (
+            "draft_model",
+            serde_json::json!({ "name": "../escape", "sql": "SELECT 1", "intent": "x" }),
+        ),
+    ] {
+        let called = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(obj(args)))
+            .await
+            .unwrap_or_else(|e| panic!("`{tool}` error-path call: {e}"));
+        assert_eq!(
+            called.is_error,
+            Some(true),
+            "`{tool}` must FAIL here or this pins a success envelope: {called:?}"
+        );
+        digest(
+            &mut out,
+            format!("tools/call/err/{tool}"),
+            &serde_json::to_value(&called).expect("serializes"),
+        );
+        err_count += 1;
+    }
+    assert_eq!(err_count, 9, "nine reachable error paths are pinned");
+
+    client.cancel().await.unwrap();
+    out
+}
+
 /// Render a digest table as the golden's on-disk form: `key<TAB>hash`, one
 /// per line, sorted (a `BTreeMap` iterates in key order).
 fn render_golden(table: &std::collections::BTreeMap<String, String>) -> String {
@@ -5534,14 +5857,36 @@ fn render_golden(table: &std::collections::BTreeMap<String, String>) -> String {
 /// sweeps, and this golden reproduced it while being the guard against it.
 /// A new row must hash a serialized value, never a field read off one.
 ///
-/// WHAT IT DOES NOT COVER, said plainly rather than left to be discovered:
-/// surfaces 7, 8 and 9 — the text a `tools/call` carries when it succeeds
-/// or fails. Those payloads embed run-dependent values (paths, plan ids,
-/// timestamps, warehouse errors), so a digest over them would drift every
-/// run and get blessed reflexively, which is worse than no golden. They
-/// keep the name-based sweeps in
-/// `worker_result_text_names_no_excluded_tool`. Surface 6 is not served.
-/// This is not "every MCP surface".
+/// IT ALSO COVERS surfaces 7, 8 and 9 on the WORKER profile — the text a
+/// `tools/call` carries when it succeeds or fails: all 12 worker-served
+/// tools, and the nine reachable argument-validation failures, each as a
+/// whole serialized `CallToolResult`. See [`worker_call_digests`].
+///
+/// THOSE THREE WERE EXCLUDED, and the fifteenth round is why they are not.
+/// The exclusion said their payloads embed run-dependent values — paths,
+/// plan ids, timestamps — so a digest over them would drift every run and
+/// get blessed reflexively. That is true of the surface in general and NOT
+/// of this set, which is the step the exclusion skipped: the plan- and
+/// timestamp-producing tools are `propose`, `optimize` and the rest of the
+/// withheld set, and the worker profile serves none of them. What remains
+/// run-dependent is the temp root, replaced exactly by
+/// `normalize_run_paths` and then re-checked by [`record`]'s nonce
+/// assertion, so a path that was missed fails rather than blessing.
+///
+/// The general principle was right; whether it applied to the specific set
+/// was never checked. That gap is the finding, not the principle.
+///
+/// WORKER ONLY for those three, and the asymmetry with rows 1–5 is
+/// deliberate rather than an oversight: the DEFAULT profile serves the
+/// plan-producing tools the exclusion was really about, so driving it here
+/// would import the drift that is genuinely absent from the worker surface.
+///
+/// WHAT IT STILL DOES NOT COVER: surface 6 is not served (pinned absent by
+/// `worker_result_text_names_no_excluded_tool`), row 9 stays PARTIAL for
+/// the reason the enumeration gives — policy denials, warehouse failures
+/// and internal errors are not reachable from an offline harness — and the
+/// default profile's call results are unpinned. This is not "every MCP
+/// surface".
 ///
 /// The `Approver` profile is compared against `Default` rather than
 /// blessed: `try_new_with_profile` branches on `Worker` alone, so the two
@@ -5606,8 +5951,28 @@ async fn served_text_golden_pins_every_worded_surface() {
         }
     }
 
+    // Surfaces 7, 8 and 9, worker only. Its OWN temp directory, because this
+    // pass calls `draft_model` and therefore WRITES into the project — and
+    // the three passes above share one fixture that must stay untouched.
+    let call_dir = TempDir::new().unwrap();
+    let call_nonce = call_dir
+        .path()
+        .file_name()
+        .expect("temp dir has a final component")
+        .to_string_lossy()
+        .to_string();
+    let worker_calls = worker_call_digests(call_dir.path(), &call_nonce).await;
+    assert!(
+        !worker_calls.is_empty(),
+        "the call sweep produced no rows; it would pin nothing"
+    );
+
     let mut live = std::collections::BTreeMap::new();
-    for (label, table) in [("default", default), ("worker", worker)] {
+    for (label, table) in [
+        ("default", default),
+        ("worker", worker),
+        ("worker", worker_calls),
+    ] {
         for (key, hash) in table {
             live.insert(format!("{label}/{key}"), hash);
         }
