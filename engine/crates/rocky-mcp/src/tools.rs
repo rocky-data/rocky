@@ -163,6 +163,26 @@ fn worker_instructions_banner(excluded: &[String]) -> String {
 /// until a server is built. An edit to the skill compiles and then refuses
 /// at `rocky mcp --profile worker` startup. A TEST is what keeps the frozen
 /// constants lined up; see [`RockyMcpServer::try_new_with_profile`].
+///
+/// # The rule a replacement has to satisfy
+///
+/// A needle usually spans a WHOLE passage, so a replacement inherits every
+/// sentence in it — including the ones that WARN. Round seventeen, finding 2
+/// is what this rule is made of: the step-5 passage carried "the preview
+/// omits declared surrogate-key columns", the worker replacement did not,
+/// and a table built to remove FALSE claims had silently removed a TRUE
+/// warning. A worker then approved preview SQL with no caveat at all.
+///
+/// So, per pair: a caveat in the needle that still applies to the worker
+/// must appear in the replacement. Only a caveat about something the worker
+/// cannot reach may be dropped, and dropping it is then not a loss.
+///
+/// The whole table was swept against that rule when the rule was written.
+/// Every remaining drop is a caveat about a surface this profile does not
+/// serve — `rocky review`'s approval marker, `rocky product verify`,
+/// `draft_metadata`'s parse guard, `rocky plan`'s replication-only preview
+/// artefacts. The one real loss was step 5's, and it was fixed by removing
+/// the divergence rather than by copying the sentence.
 const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // The frontmatter `description` — the first thing in the served text.
     (
