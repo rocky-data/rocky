@@ -5523,7 +5523,14 @@ async fn served_text_golden_pins_every_worded_surface() {
     }
     let rendered = render_golden(&live);
 
-    if std::env::var(BLESS_VAR).is_ok() {
+    // A blank or `0` value does NOT bless. `.is_ok()` alone would accept
+    // `ROCKY_BLESS_MCP_SERVED_TEXT=` — an exported-but-empty variable, which
+    // is how a shell profile or a CI `env:` block silently turns a guard into
+    // a rubber stamp. Blessing has to be asked for.
+    let blessing = std::env::var(BLESS_VAR)
+        .map(|v| !v.trim().is_empty() && v.trim() != "0")
+        .unwrap_or(false);
+    if blessing {
         std::fs::write(SERVED_TEXT_GOLDEN, &rendered)
             .unwrap_or_else(|e| panic!("write {SERVED_TEXT_GOLDEN}: {e}"));
         return;
