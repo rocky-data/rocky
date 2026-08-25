@@ -87,6 +87,24 @@ fn compile_inner(
     cache_ttl_override: Option<u64>,
     run_vars: &rocky_core::run_vars::RunVars,
 ) -> Result<(CompileOutput, CompileTextData)> {
+    // Load the project config ONCE, and let a failure fail the command.
+    //
+    // This used to be four independent loads — schema cache, `[mask]` /
+    // `[classifications]`, the portability lint, `[imports]` — each
+    // swallowing its error with `.ok()` or `Err(_) =>`. One malformed file
+    // therefore produced an empty mask, no portability lint, no imports
+    // check and a cold schema cache, with nothing said (#1521).
+    //
+    // `FileNotFound` is the ONLY tolerated error, and deliberately so: it is
+    // the standalone case, `rocky compile --models …` against a directory
+    // with no project file. Every other failure — a parse error, a
+    // permission denial, a directory sitting where the file should be —
+    // refuses, because we cannot tell what that config would have changed
+    // and compiling without it would silently answer a different question.
+    // Do not relax this back to a tolerant match.
+    //
+    // Note `--config` defaults to `rocky.toml`, so this path runs even when
+    // the user passed no flag.
     let project_config = match config_path {
         Some(path) => match rocky_config::load_rocky_config(path) {
             Ok(config) => Some(config),
@@ -166,7 +184,6 @@ fn compile_inner(
     let effective_dialect =
         target_dialect.or_else(|| portability_cfg.and_then(|p| p.target_dialect));
     let project_allow: std::collections::HashSet<String> = portability_cfg
-        .as_ref()
         .map(|p| {
             p.allow
                 .iter()
