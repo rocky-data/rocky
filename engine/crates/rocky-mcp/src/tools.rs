@@ -313,24 +313,41 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // preview core the step never actually invoked.
     //
     // `rocky emit-sql` is the verb that does what the step asks: offline,
-    // every model in dependency order, works on a transformation-only
+    // the models in dependency order, works on a transformation-only
     // project, and reports what it could not render on stderr instead of
     // dropping it silently. The default profile has no `emit_sql` TOOL, so
     // the sentence naming the MCP equivalent sits directly beside it.
+    //
+    // AND THE FIRST DRAFT OF THAT SENTENCE CALLED THEM EQUIVALENT, which
+    // was a fresh over-claim inside the commit removing one. They do NOT
+    // render the same SQL. `emit_sql::emit_models` calls
+    // `rocky_core::models::apply_surrogate_keys` per model;
+    // `plan_preview_output` never does. Observed on one model with
+    // `[[surrogate_key]] name = "order_key"`:
+    //
+    //   emit-sql      SELECT *, CAST(md5(...) AS VARCHAR) AS order_key
+    //                 FROM ( SELECT ... ) AS __rocky_keyed
+    //   plan_preview  SELECT ...                     (no order_key)
+    //
+    // `rocky plan --model` shares the gap, because it shares the core. So
+    // the preview omits a column the run WILL materialize, and the served
+    // text now says so rather than implying the two paths agree. The
+    // divergence itself is pre-existing behaviour and is NOT changed here.
     (
         "Read your model's generated SQL before you ship it. `rocky emit-sql` renders it \
          offline: no live source schema, no compute warehouse. It prints the models in \
-         dependency order and reports on stderr any it could not render. Over MCP the \
-         equivalent is the `plan_preview` tool, which renders the same way but drops what \
-         it cannot render without naming it. `rocky plan` is a different command, not this \
-         step. It needs a replication pipeline, connects to the source to discover tables, \
-         and prints replication SQL. It refuses a transformation-only project. Bare \
-         `rocky plan` never prints a transformation model's SQL; `rocky plan --model \
-         <name>` does, rendered offline. In replication SQL an incremental table previews \
-         the 1970 sentinel watermark, not the real one. A `MERGE` on any dialect but \
-         Databricks previews a canonical shape, not the column list the runner resolves at \
-         execute time. And `rocky apply` recompiles the project rather than replaying the \
-         file. Confirm the SQL you read matches your intent.",
+         dependency order and reports on stderr any it could not render. Over MCP the nearest \
+         tool is `plan_preview`. It renders offline too, but it drops what it cannot render \
+         without naming it. It also omits declared surrogate-key columns, which `rocky \
+         emit-sql` and the run both add. `rocky plan` is a different command, not this step. It \
+         needs a replication pipeline, connects to the source to discover tables, and prints \
+         replication SQL. It refuses a transformation-only project. Bare `rocky plan` never \
+         prints a transformation model's SQL; `rocky plan --model <name>` does, through that \
+         same preview core. In replication SQL an incremental table previews the 1970 sentinel \
+         watermark, not the real one. A `MERGE` on any dialect but Databricks previews a \
+         canonical shape, not the column list the runner resolves at execute time. And `rocky \
+         apply` recompiles the project rather than replaying the file. Confirm the SQL you read \
+         matches your intent.",
         "Call the `plan_preview` tool and read the SQL it returns. It renders offline. It \
          is not the whole plan: a model whose SQL cannot be rendered offline is SKIPPED, \
          and the result does not name it. So a model missing from the statements means \

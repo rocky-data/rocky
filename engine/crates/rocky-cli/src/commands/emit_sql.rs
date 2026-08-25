@@ -379,6 +379,43 @@ mod tests {
         );
     }
 
+    /// SIXTEENTH ROUND, finding 1 — `emit-sql` shares
+    /// [`super::plan::preview_dialect`] with `plan_preview`, so it inherited
+    /// the refusal. Pinned HERE as well as on the plan side, because sharing a
+    /// helper is only half the guarantee: a future caller could re-inline a
+    /// tolerant copy and the plan-side test would stay green.
+    ///
+    /// Both arms in one test, because the tolerated case is the load-bearing
+    /// half — `--config` defaults to `rocky.toml`, so the standalone
+    /// `--models <dir>` invocation reaches this with a path that does not
+    /// exist, and it must still emit.
+    #[test]
+    fn emit_refuses_a_malformed_config_but_tolerates_an_absent_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model(dir.path(), "m", "SELECT 1 AS id", "");
+        let vars = rocky_core::run_vars::RunVars::new();
+
+        // ABSENT — the standalone case. Emits in the default dialect.
+        let absent = dir.path().join("rocky.toml");
+        assert!(!absent.exists());
+        let emitted = emit_models(Some(&absent), dir.path(), None, &vars)
+            .expect("an ABSENT config is the standalone case, not a malformed one")
+            .models;
+        assert_eq!(emitted.len(), 1, "the absent-config arm must still emit");
+
+        // MALFORMED — unterminated table header, so TOML parsing fails.
+        std::fs::write(&absent, "[adapter.default\ntype = \"snowflake\"\n").unwrap();
+        // `EmitResult` is not `Debug`, so match rather than `expect_err`.
+        let Err(err) = emit_models(Some(&absent), dir.path(), None, &vars) else {
+            panic!("a malformed rocky.toml must refuse, not emit DuckDB SQL");
+        };
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config"),
+            "the refusal must name the config as the cause: {rendered}"
+        );
+    }
+
     #[test]
     fn applies_declared_surrogate_key_in_emitted_sql() {
         let dir = tempfile::tempdir().unwrap();
