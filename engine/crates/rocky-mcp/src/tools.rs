@@ -5042,6 +5042,13 @@ impl RockyMcpServer {
     /// `if let Ok(Some(..))` discarding the `Err` arm is, and it degrades to
     /// a SUCCESS that names no physical tables. `prepare_table_query` — the
     /// path `sample_rows` and `profile_column` take — propagates instead.
+    ///
+    /// Read that as a claim about `prepare_table_query`, not about those two
+    /// tools end to end. `profile_column` runs a SECOND query after it, and
+    /// that one takes `Err(_) => Vec::new()` before the tool returns success
+    /// (see the note at its `top_values` block). Spelled out because this
+    /// sentence sits one clause from the swallow it contrasts with, and the
+    /// same over-reading is what round thirteen came back for.
     fn warehouse_adapter(
         &self,
     ) -> anyhow::Result<Option<std::sync::Arc<dyn rocky_core::traits::WarehouseAdapter>>> {
