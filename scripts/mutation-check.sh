@@ -136,7 +136,17 @@ echo "---"
 # when a mutation deletes a condition and leaves an unused binding. Reporting
 # that as "fix-sensitive" would be the same false green this script exists to
 # prevent, inside the script.
-if grep -qE '^error(\[E[0-9]+\])?:|error: could not compile' "$mutated_log"; then
+#
+# Cargo's OWN summary line for a failing test is `error: test failed, to
+# rerun pass ...`, on stderr. It starts with `error:` and therefore matched
+# the scan below, so EVERY Rust test that failed under mutation — the exact
+# outcome this script exists to certify — was reported INCONCLUSIVE. Strip
+# that line (and its bench/doctest siblings) before scanning: it is proof the
+# harness RAN, which is the opposite of the condition being detected. Nothing
+# else is exempted, so a real `error[E0433]` or `could not compile` still
+# stops the check.
+if grep -vE '^error: (test|doctest|bench) failed' "$mutated_log" \
+    | grep -qE '^error(\[E[0-9]+\])?:|error: could not compile'; then
     echo "mutation-check: INCONCLUSIVE — the mutation broke the build, so the test" >&2
     echo "never ran. Choose a mutation that still compiles (flip a condition to" >&2
     echo "\`false &&\`, change a constant) rather than one that deletes code." >&2
