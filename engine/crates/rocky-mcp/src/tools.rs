@@ -469,6 +469,17 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // the lane has avoided throughout. So the text describes the tool
     // honestly — inconclusive, not authoritative, on a failed read — and
     // points at the reader that DOES fail loudly for the same table.
+    //
+    // THE REMEDY SENTENCE RESTS ON A BEHAVIOUR, so name where that behaviour
+    // is proven. "Ask `sample_rows` for that table" only works because
+    // `prepare_table_query` routes a DOTTED target down the qualified-raw-ref
+    // branch with no compile — a bare name would be looked up as a model and
+    // refused. That is covered live over the wire by
+    // `sample_rows_reaches_raw_source_by_qualified_ref` (tests/roundtrip.rs),
+    // which samples `seeds.orders` when no model declares it. If that test
+    // goes, or `sample_rows` starts requiring a compiled model name, this
+    // sentence becomes wrong advice at the exact moment a worker needs it —
+    // worse than the promise it replaced, because it is the fallback.
     (
         "Run **errors** carry a `failure_kind` (`Transient`, `AuthFailed`, `QueryRejected`, \
          `QuotaExceeded`, …) and sometimes a `cooldown_seconds`. Branch on *why* something \
@@ -7171,6 +7182,24 @@ mod tests {
             "and it must say what that costs the worker: a table missing from \
              `inspect_schema`'s `sources` is inconclusive, not absent. Dropping the caveat \
              re-promises what the tool does not do: {body}"
+        );
+        // AND IT MUST HAND THE WORKER A WAY OUT. A caveat with no remedy
+        // leaves a worker stuck at the exact point it needs to act, so the
+        // discriminator is pinned as its own assertion rather than left to
+        // the reader loop above — that loop is satisfied by the earlier
+        // mention of `sample_rows` and cannot see this sentence.
+        //
+        // The behaviour under it is proven elsewhere, not here:
+        // `prepare_table_query` routes a DOTTED target down the
+        // qualified-raw-ref branch with no compile, covered live over the
+        // wire by `sample_rows_reaches_raw_source_by_qualified_ref`
+        // (tests/roundtrip.rs). This assertion pins the ADVICE; that test
+        // pins the behaviour the advice depends on.
+        assert!(
+            body_lower.contains("ask `sample_rows` for that table"),
+            "the body must name the reader that DOES fail loudly for the same table, or the \
+             caveat above leaves the worker with no way to tell inconclusive from absent: \
+             {body}"
         );
         // TWELFTH ROUND, finding 2 — NO COUNT IS PINNED HERE, DELIBERATELY.
         //

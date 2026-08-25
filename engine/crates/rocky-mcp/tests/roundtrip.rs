@@ -4376,6 +4376,15 @@ async fn profile_column_lists_top_values_for_low_cardinality() {
 async fn sample_rows_reaches_raw_source_by_qualified_ref() {
     // Source-reach: a qualified `schema.table` that is NOT a model is sampled
     // directly, with no compile required.
+    //
+    // A SERVED INSTRUCTION DEPENDS ON THIS, so do not delete it without
+    // reading that instruction. The worker-profile guidance
+    // (`WORKER_INSTRUCTIONS_REWRITES` in src/tools.rs) tells a worker that a
+    // table missing from `inspect_schema`'s `sources` is inconclusive rather
+    // than absent — `inspect_schema` degrades to a silent empty list — and
+    // sends it here: "Ask `sample_rows` for that table before you conclude it
+    // is absent." That only holds while a dotted target reaches the raw
+    // source without a compile, which is exactly what this test proves.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("src.duckdb");
     write_project(dir.path(), &db_path);
