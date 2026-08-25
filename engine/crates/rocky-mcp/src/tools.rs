@@ -947,16 +947,42 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// is swept without anyone editing a test. `Prompt::name` and
 /// `GetPromptResult::messages` are the two that are always present.
 ///
-/// `resultType` IS NOT ON THE WIRE AT ALL, and the first attempt at this
-/// correction wrote the opposite — caught by pinning it rather than by
-/// reading the type. rmcp's constructors do set
+/// `resultType` IS NOT ON THE WIRE FOR ANY CLIENT TODAY, and the first
+/// attempt at this correction wrote the opposite — caught by pinning it
+/// rather than by reading the type. rmcp's constructors do set
 /// `Some(ResultType::COMPLETE)`, and then the server handler calls
-/// `strip_result_type_for_legacy_peer()` for any peer older than
-/// `2026-07-28`. [`RockyMcpServer::get_info`] pins
-/// `ProtocolVersion::V_2024_11_05`, so every result this server sends is
-/// stripped. It applies to row 8's `result_type` as well, for the same
-/// reason and by the same call. Reading a field off the struct is not
-/// evidence it reaches a worker.
+/// `strip_result_type_for_legacy_peer()` for any peer whose NEGOTIATED
+/// protocol version is older than `2026-07-28`. It applies to row 8's
+/// `result_type` as well, for the same reason and by the same call.
+/// Reading a field off the struct is not evidence it reaches a worker.
+///
+/// "FOR ANY CLIENT TODAY", NOT "BY CONSTRUCTION", and the fifteenth round
+/// is why the qualifier is here. This used to argue that
+/// [`RockyMcpServer::get_info`] "pins `ProtocolVersion::V_2024_11_05`, so
+/// every result this server sends is stripped". `get_info` does not pin the
+/// wire version. It supplies the server's FALLBACK, and rmcp's
+/// `serve_server` then overwrites `init_response.protocol_version` with
+/// `negotiate_protocol_version(client_requested, server_fallback,
+/// supported)` — which returns the CLIENT's request whenever the server
+/// supports it. `RockyMcpServer` does not override
+/// `Service::supported_protocol_versions`, so it advertises rmcp's whole
+/// `KNOWN_VERSIONS` list, `V_2026_07_28` included. A client that asks for
+/// `2026-07-28` is given it, `sep_2322_supported` is then true, the strip
+/// call is skipped, and `resultType` DOES reach that client.
+///
+/// The stripping therefore holds because no client asks for `2026-07-28`
+/// yet, not because this server refuses to speak it. The negotiated version
+/// is `2025-11-25` against rmcp 3.1.2's own client — which is now BLESSED,
+/// as part of row 1's `initialize` payload in
+/// `served_text_golden_pins_every_worded_surface`, so the day it moves the
+/// golden moves with it and this paragraph gets re-read. Closing the gap by
+/// construction would mean narrowing `supported_protocol_versions`, which is
+/// a behaviour change to what this server speaks and is not made here.
+///
+/// The value of `resultType` is the fixed string `complete`, so nothing
+/// about this is a guidance LEAK. The defect was the CLAIM — a justification
+/// that named a mechanism the code does not have — which is the same class
+/// every round of this branch has found in served text.
 ///
 /// THAT SENTENCE WAS TRUE OF ROW 3 AND OF NO OTHER ROW, and the tenth round
 /// is why it is worth writing down twice. Row 3 did serialise the whole
