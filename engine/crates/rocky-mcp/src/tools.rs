@@ -443,7 +443,7 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
          `QuotaExceeded`, …) and sometimes a `cooldown_seconds`. Branch on *why* something \
          failed: retry a `Transient`, stop and surface an `AuthFailed`.",
         "Run **errors** are not something you will see. No tool this profile serves runs or \
-         materializes anything, so there is no run to retry and no `failure_kind` to branch \
+         materializes a pipeline, so there is no run to retry and no `failure_kind` to branch \
          on. Three tools do READ the warehouse: `sample_rows` and `profile_column` query it \
          directly, and `inspect_schema` lists its tables when it can. A read that fails comes \
          back as that tool's own error, not as a run outcome. A tool result that reports a \
@@ -7071,6 +7071,19 @@ mod tests {
                  than denying that any tool does: {body}"
             );
         }
+        // The sentence says THREE, which is a count over the allowlist and
+        // cannot be derived: whether a tool opens an adapter is a fact
+        // about its body, not about this list. So the list's SIZE is
+        // pinned instead. A thirteenth tool fails here, and whoever adds it
+        // has to answer whether it reads the warehouse before the count
+        // above can go back to being true.
+        assert_eq!(
+            WORKER_PROFILE_TOOLS.len(),
+            12,
+            "the projected body says three of the worker tools read the warehouse. That is \
+             a count, not a derivation — re-check the new tool against it before changing \
+             this number: {WORKER_PROFILE_TOOLS:?}"
+        );
 
         // PROPERTY 4 — the banner names EVERY excluded tool, derived. The
         // banner is the one worker surface that names them deliberately:
