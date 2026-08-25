@@ -37,6 +37,8 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_cli::commands::fulfill_api::ProposeOutcome",
     "rocky_cli::commands::fulfill_api::ProposeRequest",
     "rocky_cli::commands::fulfill_api::ReceiptLookup",
+    // #1493 — the drafting-window reopen (typed outcome + the call).
+    "rocky_cli::commands::fulfill_api::ReopenOutcome",
     "rocky_cli::commands::fulfill_api::TypedApplyOutcome",
     "rocky_cli::commands::fulfill_api::VerifyStatus",
     "rocky_cli::commands::fulfill_api::apply_plan",
@@ -52,6 +54,7 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_cli::commands::fulfill_api::print_json",
     "rocky_cli::commands::fulfill_api::product_approve",
     "rocky_cli::commands::fulfill_api::product_compile",
+    "rocky_cli::commands::fulfill_api::product_reopen_drafting",
     "rocky_cli::commands::fulfill_api::product_status",
     "rocky_cli::commands::fulfill_api::product_verify",
     "rocky_cli::commands::fulfill_api::propose_governed_run_plan",
@@ -62,6 +65,9 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_core::config::RockyConfig",
     "rocky_core::config::load_rocky_config",
     // The state vocabulary + the CAS store (WP-E1's tables).
+    // `DraftingRound` is the PERSISTED drafting-round identity (#1493):
+    // a resume dispatches the round the machine decided, not a default.
+    "rocky_core::fulfill::DraftingRound",
     "rocky_core::fulfill::FulfillCas",
     "rocky_core::fulfill::FulfillJournalRow",
     "rocky_core::fulfill::FulfillState",
@@ -69,6 +75,13 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_core::fulfill::FulfillStateRecord::new",
     "rocky_core::fulfill::ProductApprovalRecord",
     "rocky_core::state::StateStore",
+    // The process start-time probe (#1493). DELIBERATE addition: it used
+    // to live in this crate, and moved DOWN to rocky-core because
+    // `rocky-cli` needs the same answer to tell whether a product
+    // record's owner stamp is its own process — and rocky-cli cannot
+    // depend on this crate, which sits above it. This crate re-exports
+    // it, so the ownership probe and every caller are unchanged.
+    "rocky_core::process::process_liveness",
     // Spec identity + the confined write target (the runner's candidate
     // write and the snapshot re-verification).
     "rocky_core::product::commit::contained_write_target",

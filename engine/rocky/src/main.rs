@@ -2304,16 +2304,22 @@ enum Command {
     /// any MCP-capable agent harness can drive Rocky. Long-running: serves
     /// until the client disconnects. Materialization stays human-gated — the
     /// `propose` tool only writes an AI-authored plan; a human runs
-    /// `rocky review --approve` + `rocky apply`. Use `--profile worker` to
-    /// serve only the minimal drafting allowlist to an untrusted worker.
+    /// `rocky review --approve` + `rocky apply`. No profile writes a sign-off
+    /// marker unless you ask for one: `review_queue` lists the pending queue
+    /// everywhere, but its approve action is served ONLY on
+    /// `--profile approver`. Use `--profile worker` to serve only the minimal
+    /// drafting allowlist to an untrusted worker.
     Mcp {
         /// Pipeline config file the server resolves the project from.
         #[arg(long, default_value = "rocky.toml")]
         config: PathBuf,
-        /// Tool surface to serve. `default` exposes every tool; `worker` is
-        /// the minimal drafting allowlist for untrusted workers: the
-        /// read/inspect grounding tools, compile / test / breaking_change /
-        /// dependents, draft_model + draft_check, and the prompts — no
+        /// Tool surface to serve. `default` exposes every tool but REFUSES the
+        /// `review_queue` approve action (listing the queue still works);
+        /// `approver` is `default` plus that one action, for a server the
+        /// operator intends to be able to write human sign-off markers;
+        /// `worker` is the minimal drafting allowlist for untrusted workers:
+        /// the read/inspect grounding tools, compile / test / breaking_change
+        /// / dependents, draft_model + draft_check, and the prompts — no
         /// contract, metadata, propose, review, or schedule surface.
         #[arg(long, value_enum, default_value_t = McpProfileArg::Default)]
         profile: McpProfileArg,
@@ -2324,8 +2330,10 @@ enum Command {
 /// rocky-mcp crate stays clap-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum McpProfileArg {
-    /// Full tool surface (unchanged behavior).
+    /// Every tool, but `review_queue` cannot approve (it still lists).
     Default,
+    /// Every tool, and `review_queue` MAY approve — write a sign-off marker.
+    Approver,
     /// Minimal drafting-worker allowlist.
     Worker,
 }
@@ -2334,6 +2342,7 @@ impl From<McpProfileArg> for rocky_mcp::McpProfile {
     fn from(value: McpProfileArg) -> Self {
         match value {
             McpProfileArg::Default => rocky_mcp::McpProfile::Default,
+            McpProfileArg::Approver => rocky_mcp::McpProfile::Approver,
             McpProfileArg::Worker => rocky_mcp::McpProfile::Worker,
         }
     }
@@ -4835,6 +4844,61 @@ mod tests {
     // resolve_output — `--output` default resolution
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // `rocky mcp --profile` — the #1517 approve opt-in
+    // -----------------------------------------------------------------------
+
+    /// The refusal message in `rocky-mcp` tells the operator to run `rocky mcp
+    /// --profile approver`. This proves clap actually PARSES that exact
+    /// spelling: `ValueEnum` derives the value name from the variant, so a
+    /// rename would leave the message pointing at a flag that errors out —
+    /// precisely the 3am failure the opt-in exists to prevent.
+    #[test]
+    fn mcp_profile_arg_accepts_approver() {
+        // `try_parse_with_big_stack`, not a bare `try_parse_from`: clap's
+        // generated parse code for this `Cli` overflows the 2 MB test-thread
+        // stack in a debug build. See that helper's comment — production
+        // `main()` parses on the OS-default 8 MB stack and is unaffected.
+        let cli = try_parse_with_big_stack(&["rocky", "mcp", "--profile", "approver"]);
+        let Command::Mcp { profile, .. } = cli.command else {
+            panic!("expected the mcp command");
+        };
+        assert_eq!(profile, McpProfileArg::Approver);
+        assert_eq!(
+            rocky_mcp::McpProfile::from(profile),
+            rocky_mcp::McpProfile::Approver,
+            "the CLI mirror maps to the profile that serves approving"
+        );
+    }
+
+    /// `rocky mcp` with NO flag is the shape the issue was about: it must land
+    /// on the profile that refuses to approve.
+    #[test]
+    fn mcp_with_no_profile_flag_cannot_approve() {
+        let cli = try_parse_with_big_stack(&["rocky", "mcp"]);
+        let Command::Mcp { profile, .. } = cli.command else {
+            panic!("expected the mcp command");
+        };
+        assert_eq!(profile, McpProfileArg::Default);
+        assert_eq!(
+            rocky_mcp::McpProfile::from(profile),
+            rocky_mcp::McpProfile::Default,
+        );
+    }
+
+    /// The worker profile is untouched by #1517 — same spelling, same mapping.
+    #[test]
+    fn mcp_profile_arg_worker_is_unchanged() {
+        let cli = try_parse_with_big_stack(&["rocky", "mcp", "--profile", "worker"]);
+        let Command::Mcp { profile, .. } = cli.command else {
+            panic!("expected the mcp command");
+        };
+        assert_eq!(
+            rocky_mcp::McpProfile::from(profile),
+            rocky_mcp::McpProfile::Worker,
+        );
+    }
+
     #[test]
     fn resolve_output_explicit_json_wins_over_tty() {
         assert_eq!(
@@ -4909,6 +4973,10 @@ mod tests {
     /// (macOS gets larger defaults; CI is where the overflow shows up).
     /// A scoped thread keeps the workaround local to test code; production
     /// `main()` uses the OS-default 8 MB thread stack and is unaffected.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "this IS the sanctioned wrapper the disallowed-methods entry points callers at"
+    )]
     fn try_parse_with_big_stack(args: &[&str]) -> Cli {
         std::thread::scope(|s| {
             std::thread::Builder::new()
@@ -4969,6 +5037,11 @@ mod tests {
     /// FF-WP1: `rocky review --status` parses by its literal flag name, and
     /// clap rejects combining it with `--approve` / `--queue`.
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
     fn review_status_flag_parses_and_conflicts() {
         let cli = try_parse_with_big_stack(&["rocky", "review", "abc123", "--status"]);
         match cli.command {
@@ -5073,6 +5146,11 @@ mod tests {
     /// Parse on the 8 MiB stack and return whether parsing *succeeded* — used
     /// by the conflict / requires tests (the recursive clap derive overflows
     /// the default test-thread stack).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
     fn parse_run_ok(args: &[&str]) -> bool {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         std::thread::scope(|s| {
@@ -5277,6 +5355,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
     fn plan_rejects_branch_with_shadow() {
         // clap should reject this combination at parse time via the
         // `conflicts_with_all = ["shadow", "shadow_schema"]` modifier.

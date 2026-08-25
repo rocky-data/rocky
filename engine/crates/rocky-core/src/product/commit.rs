@@ -46,14 +46,17 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fulfill::FulfillState;
 use crate::product::lowering::{
     Lowering, contract_rel, lower_phase_a, lower_phase_b, manifest_rel, sidecar_rel, sql_rel,
     state_dir_rel,
 };
 use crate::product::manifest::{
-    MANIFEST_FILENAME, Manifest, contained_artifact_path, content_digest, verify_artifact_hashes,
+    MANIFEST_FILENAME, Manifest, ManifestPhase, contained_artifact_path, content_digest,
+    verify_artifact_hashes,
 };
 use crate::product::spec::{ParsedSpec, SpecRejected, SpecResult};
+use crate::state::StateStore;
 
 /// Suffix of a staged (not yet renamed) file, written next to its final.
 pub const STAGED_SUFFIX: &str = ".ff-staged";
@@ -72,6 +75,23 @@ pub enum RecoveryAction {
     RolledBack,
     /// A committed generation's leftovers were swept.
     RolledForward,
+}
+
+/// What [`reopen_for_drafting`] found and did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReopenOutcome {
+    /// No committed manifest exists, or it is already at Phase A: the
+    /// drafting window is open (or there is nothing to demote) and
+    /// nothing was written.
+    NotNeeded,
+    /// Every artifact byte-verified against the committed merged
+    /// manifest, and the manifest was then demoted to Phase A through
+    /// the staged commit — the drafting window is open again.
+    Reopened,
+    /// Artifact bytes drifted from the committed merged manifest while
+    /// no write was authorized. Nothing was mutated; each entry is a
+    /// [`verify_artifact_hashes`] problem rendering.
+    Tampered(Vec<String>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,11 +1197,239 @@ fn run_phase_b_with_ops(
     Ok(lowering)
 }
 
+/// (Re)open the drafting window over a committed MERGED generation, on
+/// the evidence that the fulfillment loop DECIDED this drafting round
+/// (#1493).
+///
+/// # Why this needs evidence
+///
+/// The demotion below is an authority transition: it takes a generation
+/// whose sidecar bytes are pinned by a committed manifest and returns
+/// that sidecar to the writable drafting namespace. Reached without the
+/// loop, it would open the Phase-A window on a legitimate merged
+/// generation with no round to fill it — so the raw transition is
+/// [`demote_merged_manifest_to_phase_a`], which is `pub(crate)` and
+/// unreachable from any other crate (pinned by the out-of-crate
+/// compile-fail proof in `rocky-core-compiletest`). This is the only
+/// public way in, and it reads the decision out of `store` rather than
+/// taking it as an argument. Every condition below is checked against
+/// that stored record:
+///
+/// - the record is THIS product's (`product_id` matches the spec), so a
+///   record fetched for another product grants nothing here;
+/// - the machine is at [`FulfillState::Drafting`] — the one state in
+///   which a drafting or repair worker is dispatched. Every other state
+///   (`Merged`, `Verifying`, `Applied`, …) has no round to open a window
+///   for;
+/// - the owner stamp names THIS process. Stamping it means winning the
+///   record's CAS, which is what "the loop decided" reduces to on disk.
+///
+/// # Exactly what this gate is worth
+///
+/// It prevents a demotion the loop did not decide: an accidental one, or
+/// one from another code path in this binary that reaches for the
+/// transition without a round behind it. That is the failure it exists
+/// for, and it holds — the conditions are answered by persisted state,
+/// not by anything the caller says about itself.
+///
+/// It is NOT a defense against a deliberate in-process caller. `store`
+/// is a caller-chosen [`StateStore`], and opening one at an arbitrary
+/// path and writing a record into it are both public operations, so code
+/// running inside this process can construct a store that satisfies
+/// every condition. Nothing in-process can prevent that: such a caller
+/// already holds every capability the process holds, including simply
+/// rewriting the files this function would have written. It is outside
+/// the boundary, not a hole in it.
+///
+/// The owner check pairs the pid with the process start time
+/// ([`crate::process::stamp_is_this_process`]), so a dead owner's
+/// recycled pid is not mistaken for ours, and an unconfirmable stamp
+/// fails closed.
+///
+/// # Errors
+///
+/// Returns `reopen-undecided` when the record does not carry the loop's
+/// decision, plus everything
+/// [`demote_merged_manifest_to_phase_a`] refuses.
+pub fn reopen_for_drafting(
+    project_root: &Path,
+    spec_path: &str,
+    parsed: &ParsedSpec,
+    store: &StateStore,
+) -> SpecResult<ReopenOutcome> {
+    let product_id = parsed.product_id();
+    let undecided = |why: String| {
+        SpecRejected::new(
+            "reopen-undecided",
+            format!(
+                "refusing to reopen the drafting window for {product_id}: {why}. The drafting \
+                 window is opened by the fulfillment loop's own decided round — run \
+                 `rocky fulfill {}` instead of demoting a committed generation by hand",
+                parsed.product().name
+            ),
+        )
+    };
+    // The evidence is READ HERE, from the state store, and never
+    // accepted as an argument. A `FulfillStateRecord` is publicly
+    // constructible, so taking one from the caller would let any caller
+    // mint its own permission slip; taking the store makes the caller
+    // prove the claim against the record that actually won the CAS.
+    let decided = store
+        .fulfill_state_get(&parsed.product().name)
+        .map_err(|err| {
+            SpecRejected::new(
+                "reopen-state-unreadable",
+                format!("could not read the fulfillment record for {product_id}: {err}"),
+            )
+        })?;
+    let Some(decided) = decided else {
+        return Err(undecided(
+            "no fulfillment record exists, so nothing decided a drafting round".to_string(),
+        ));
+    };
+    if decided.product_id != product_id {
+        return Err(undecided(format!(
+            "the stored fulfillment record belongs to {} ",
+            decided.product_id
+        )));
+    }
+    if decided.state != FulfillState::Drafting {
+        return Err(undecided(format!(
+            "the loop is at '{}', not 'drafting' — no drafting round is open",
+            decided.state.tag()
+        )));
+    }
+    if !crate::process::stamp_is_this_process(decided.owner_pid, decided.owner_start_time) {
+        let me = std::process::id();
+        // Say which of the two cases this is. "owned by pid 43917, not
+        // this process (pid 43917)" reads as a contradiction and tells
+        // an operator nothing.
+        let why = match decided.owner_pid {
+            None => "no process owns the record — nothing decided a drafting round".to_string(),
+            Some(pid) if pid == me => format!(
+                "the record's owner stamp carries this pid ({pid}) but a different process \
+                 start time, so it was left by an earlier process that has since died and \
+                 whose pid the system reused — not by this one. Re-run `rocky fulfill` to \
+                 take the stale record over"
+            ),
+            Some(pid) => format!(
+                "the record is owned by another process (pid {pid}), not this one (pid {me})"
+            ),
+        };
+        return Err(undecided(why));
+    }
+    demote_merged_manifest_to_phase_a(project_root, spec_path, parsed)
+}
+
+/// The raw demotion of a committed MERGED generation back to Phase A —
+/// the loop's authorized transition before it dispatches a repair (or a
+/// resumed drafting) worker (#1493).
+///
+/// `pub(crate)`: reaching this without the loop's decided round would
+/// open the Phase-A window on a legitimate merged generation. The one
+/// public route in is [`reopen_for_drafting`], which demands the
+/// compare-and-swapped record first.
+///
+/// A merged manifest pins the sidecar's exact bytes, which is right for
+/// every window where no write is authorized — but a repair round the
+/// loop itself dispatched rewrites the sidecar legitimately, and
+/// verifying it against the previous round's hash would mis-classify
+/// the loop's own work as tamper. This is the E12 authority transition
+/// that resolves it, with the prepare / commit / recovery protocol
+/// stated:
+///
+/// - **prepare** — byte-verify EVERY artifact hash in the committed
+///   merged manifest first. Any drift happened while no write was
+///   authorized and is reported as [`ReopenOutcome::Tampered`], nothing
+///   mutated — the reopen never blesses dirty state into a fresh
+///   window.
+/// - **commit** — re-lower Phase A from the caller's spec (byte-stable:
+///   the contract render is deterministic and the verified on-disk
+///   contract already matches it) and commit it through
+///   [`commit_generation`], manifest-renamed-last. The sidecar leaves
+///   the manifest's artifact set, returning it to the drafting
+///   namespace exactly as in round 1; the very next Phase B re-records
+///   its hash transactionally from what it merges.
+/// - **recovery** — [`recover_generation`] (run first here and by the
+///   commit) rolls a crashed reopen back to the merged manifest, and
+///   the next drafting dispatch simply reopens again.
+///
+/// Only the staged commit protocol ever updates hashes; out-of-band
+/// edits between gates stay detected because every other verification
+/// surface is unchanged.
+///
+/// # Errors
+///
+/// Returns `spec-superseded` when the merged manifest was generated
+/// from a different spec digest (the supersession fence should have
+/// re-entered the loop before any reopen), and
+/// `reopen-foreign-generation` when its identity fields name another
+/// product, model, or spec path — a foreign generation is never
+/// demoted. Plus anything [`recover_generation`], [`lower_phase_a`], or
+/// [`commit_generation`] refuses.
+pub(crate) fn demote_merged_manifest_to_phase_a(
+    project_root: &Path,
+    spec_path: &str,
+    parsed: &ParsedSpec,
+) -> SpecResult<ReopenOutcome> {
+    recover_generation(project_root, parsed)?;
+    let Some(committed) = committed_manifest(project_root, &parsed.product().name)? else {
+        return Ok(ReopenOutcome::NotNeeded);
+    };
+    if committed.phase == ManifestPhase::LoweredContract {
+        return Ok(ReopenOutcome::NotNeeded);
+    }
+    let output_model = parsed.output_model().to_string();
+    let product_id = parsed.product_id();
+    let mismatches: Vec<String> = [
+        ("product_id", &committed.product_id, &product_id),
+        ("output_model", &committed.output_model, &output_model),
+        ("spec_path", &committed.spec_path, &spec_path.to_string()),
+    ]
+    .into_iter()
+    .filter(|(_, recorded, current)| recorded != current)
+    .map(|(name, recorded, current)| {
+        format!("{name}: manifest {recorded:?} vs current {current:?}")
+    })
+    .collect();
+    if !mismatches.is_empty() {
+        return Err(SpecRejected::new(
+            "reopen-foreign-generation",
+            format!(
+                "the committed merged manifest belongs to a different generation identity \
+                 and is never demoted: {}",
+                mismatches.join("; ")
+            ),
+        ));
+    }
+    if committed.spec_digest != parsed.digest {
+        return Err(SpecRejected::new(
+            "spec-superseded",
+            format!(
+                "the committed merged manifest was generated from spec {}, but the current \
+                 spec digests to {} — re-approve to restart the generation instead of \
+                 reopening a superseded one",
+                committed.spec_digest, parsed.digest
+            ),
+        ));
+    }
+    let problems = verify_artifact_hashes(project_root, &committed);
+    if !problems.is_empty() {
+        return Ok(ReopenOutcome::Tampered(problems));
+    }
+    let lowering = lower_phase_a(parsed, spec_path)?;
+    commit_generation(project_root, parsed, &lowering)?;
+    Ok(ReopenOutcome::Reopened)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    // Only the reopen's evidence tests build a record; production code
+    // reads one out of the store and never names the type.
+    use crate::fulfill::FulfillStateRecord;
     use crate::product::manifest::{ManifestPhase, assert_total};
     use crate::product::spec::parse_spec_bytes;
 
@@ -1436,6 +1684,339 @@ mod tests {
             assert_eq!(&content_digest(&bytes), expected, "{rel_path}");
         }
         assert_eq!(leftovers(&project), Vec::<String>::new());
+    }
+
+    // ------------------- the drafting-window reopen (#1493) -----------------
+
+    #[test]
+    fn reopen_demotes_a_verified_merged_generation_to_phase_a() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        full_flow(&project, &parsed);
+        let before = snapshot(&project);
+
+        let outcome =
+            demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("reopens");
+        assert_eq!(outcome, ReopenOutcome::Reopened);
+
+        // The manifest is Phase A again: contract-only artifact set, so
+        // the sidecar is back in the drafting namespace.
+        let manifest = committed(&project);
+        assert_eq!(manifest.phase, ManifestPhase::LoweredContract);
+        assert_eq!(
+            manifest.artifacts.keys().collect::<Vec<_>>(),
+            vec!["models/revenue_daily.contract.toml"]
+        );
+
+        // ONLY the manifest changed: every model file kept its exact
+        // bytes, nothing appeared, nothing vanished.
+        let after = snapshot(&project);
+        assert_eq!(
+            before.keys().collect::<Vec<_>>(),
+            after.keys().collect::<Vec<_>>(),
+            "no files created or removed"
+        );
+        let changed: Vec<&String> = before
+            .iter()
+            .filter(|(name, bytes)| after.get(*name) != Some(bytes))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            changed,
+            vec![".rocky/fulfillment/revenue_daily/lowering-manifest.json"],
+            "the reopen writes the manifest and nothing else"
+        );
+
+        // Round-trip: the next Phase B re-merges and re-records the
+        // sidecar hash transactionally.
+        run_phase_b(&project, SPEC_PATH, &parsed).expect("phase B re-commits");
+        assert_eq!(committed(&project).phase, ManifestPhase::Merged);
+        assert_eq!(leftovers(&project), Vec::<String>::new());
+    }
+
+    #[test]
+    fn reopen_refuses_a_drifted_artifact_without_mutating() {
+        // Drift in EITHER committed artifact between the merge and the
+        // reopen had no authorized writer: tamper, refused, untouched.
+        for tampered_rel in [
+            "models/revenue_daily.toml",
+            "models/revenue_daily.contract.toml",
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let project = seeded_project(dir.path());
+            let parsed = parsed_d3();
+            full_flow(&project, &parsed);
+            let path = project.join(tampered_rel);
+            let mut text = std::fs::read_to_string(&path).expect("read");
+            text.push_str("\n# out-of-band edit\n");
+            write_file(&path, text.as_bytes());
+            let before = snapshot(&project);
+
+            let outcome =
+                demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("runs");
+            let ReopenOutcome::Tampered(problems) = outcome else {
+                panic!("expected Tampered for {tampered_rel}, got {outcome:?}");
+            };
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.contains(tampered_rel) && p.contains("content drift")),
+                "{tampered_rel}: {problems:?}"
+            );
+            assert_eq!(snapshot(&project), before, "a refusal mutates nothing");
+            assert_eq!(
+                committed(&project).phase,
+                ManifestPhase::Merged,
+                "the merged manifest is never demoted over drifted bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn reopen_is_not_needed_before_the_merge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+
+        // No committed manifest at all: nothing to demote.
+        assert_eq!(
+            demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("runs"),
+            ReopenOutcome::NotNeeded
+        );
+
+        // A committed Phase-A manifest: the window is already open.
+        run_phase_a(&project, SPEC_PATH, &parsed).expect("phase A");
+        let before = snapshot(&project);
+        assert_eq!(
+            demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &parsed).expect("runs"),
+            ReopenOutcome::NotNeeded
+        );
+        assert_eq!(snapshot(&project), before, "not-needed writes nothing");
+    }
+
+    #[test]
+    fn reopen_refuses_a_superseded_or_foreign_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        full_flow(&project, &parsed);
+        let before = snapshot(&project);
+
+        // The spec moved after the merge: refuse, never demote spec A's
+        // generation under spec B.
+        let edited_text = String::from_utf8(SPEC_FIXTURE.to_vec())
+            .expect("utf-8")
+            .replace(
+                r#"checks = ["revenue_eur >= 0"]"#,
+                r#"checks = ["revenue_eur > 0"]"#,
+            );
+        let edited = parse_spec_bytes(edited_text.as_bytes(), SPEC_PATH).expect("valid");
+        assert_ne!(edited.digest, parsed.digest);
+        let error = demote_merged_manifest_to_phase_a(&project, SPEC_PATH, &edited)
+            .expect_err("superseded");
+        assert_eq!(error.code, "spec-superseded");
+        assert!(error.message.contains(&parsed.digest), "{error}");
+        assert!(error.message.contains(&edited.digest), "{error}");
+
+        // A manifest recorded under another spec path is a foreign
+        // generation identity.
+        let error = demote_merged_manifest_to_phase_a(&project, "products/elsewhere.toml", &parsed)
+            .expect_err("foreign");
+        assert_eq!(error.code, "reopen-foreign-generation");
+        assert!(error.message.contains("spec_path"), "{error}");
+
+        assert_eq!(snapshot(&project), before, "refusals mutate nothing");
+        assert_eq!(committed(&project).phase, ManifestPhase::Merged);
+    }
+
+    // ---------------- the reopen's evidence gate (F1, #1493) ----------------
+
+    /// The record a loop that DECIDED a drafting round leaves on disk:
+    /// this product, at `drafting`, owner stamp = this process.
+    ///
+    /// The stamp carries this process's REAL start time, because the
+    /// gate pairs the pid with it — a pid alone no longer passes.
+    fn decided_record(parsed: &ParsedSpec) -> FulfillStateRecord {
+        let mut record = FulfillStateRecord::new(
+            FulfillState::Drafting,
+            parsed.product_id(),
+            Some(parsed.digest.clone()),
+            None,
+        );
+        let pid = std::process::id();
+        record.owner_pid = Some(pid);
+        record.owner_start_time = Some(
+            crate::process::process_liveness(pid)
+                .expect("probe this process")
+                .expect("this process is alive"),
+        );
+        record
+    }
+
+    /// A state store at `dir/state.redb` holding exactly `record` for
+    /// `revenue_daily` — the reopen reads the store, so a test that
+    /// wants a record observed has to actually persist it.
+    fn store_holding(dir: &Path, record: Option<&FulfillStateRecord>) -> StateStore {
+        let store = StateStore::open(&dir.join("state.redb")).expect("state store");
+        if let Some(record) = record {
+            let row = crate::fulfill::FulfillJournalRow {
+                seq: 0,
+                at: None,
+                event: "seeded".to_string(),
+                from_state: None,
+                to_state: record.state.tag().to_string(),
+                spec_digest: None,
+                plan_id: None,
+                idempotency_key: None,
+            };
+            let outcome = store
+                .fulfill_state_cas("revenue_daily", None, record, &row)
+                .expect("seed the record");
+            assert_eq!(outcome, crate::fulfill::FulfillCas::Won);
+        }
+        store
+    }
+
+    #[test]
+    fn the_reopen_demotes_only_on_the_loops_decided_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        full_flow(&project, &parsed);
+        let store = store_holding(dir.path(), Some(&decided_record(&parsed)));
+
+        let outcome = reopen_for_drafting(&project, SPEC_PATH, &parsed, &store)
+            .expect("the decided record opens the window");
+        assert_eq!(outcome, ReopenOutcome::Reopened);
+        assert_eq!(committed(&project).phase, ManifestPhase::LoweredContract);
+    }
+
+    #[test]
+    fn the_reopen_refuses_when_the_store_holds_no_record_at_all() {
+        // The forgery case the evidence gate exists for: a caller that
+        // never won a CAS has nothing in the store to point at, and
+        // cannot supply a record of its own because the entry does not
+        // take one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        full_flow(&project, &parsed);
+        let before = snapshot(&project);
+        let store = store_holding(dir.path(), None);
+
+        let error =
+            reopen_for_drafting(&project, SPEC_PATH, &parsed, &store).expect_err("no record");
+        assert_eq!(error.code, "reopen-undecided");
+        assert!(
+            error.message.contains("no fulfillment record exists"),
+            "{error}"
+        );
+        assert_eq!(snapshot(&project), before, "a refusal mutates nothing");
+        assert_eq!(committed(&project).phase, ManifestPhase::Merged);
+    }
+
+    /// One refusal case: why it must refuse, how to build the record
+    /// that triggers it, and the fragment the message must name.
+    type UndecidedCase = (
+        &'static str,
+        fn(&ParsedSpec) -> FulfillStateRecord,
+        &'static str,
+    );
+
+    #[test]
+    fn the_reopen_refuses_every_record_that_is_not_the_loops_decision() {
+        // Each case removes exactly ONE element of the decision, so a
+        // passing case cannot be carried by the others.
+        let cases: [UndecidedCase; 6] = [
+            (
+                "no owner stamp at all — nobody won the record's CAS",
+                |parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.owner_pid = None;
+                    record
+                },
+                "nothing decided a drafting round",
+            ),
+            (
+                "owned by a DIFFERENT process — a concurrent caller",
+                |parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.owner_pid = Some(std::process::id().wrapping_add(1));
+                    record
+                },
+                "owned by another process",
+            ),
+            (
+                "OUR pid, but a dead owner's start time — a recycled pid",
+                |parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.owner_start_time = Some(1);
+                    record
+                },
+                "pid the system reused",
+            ),
+            (
+                "our pid with NO recorded start time — unconfirmable, so not ours",
+                |parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.owner_start_time = None;
+                    record
+                },
+                "pid the system reused",
+            ),
+            (
+                "the loop is not in a drafting round",
+                |parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.state = FulfillState::Merged;
+                    record
+                },
+                "not 'drafting'",
+            ),
+            (
+                "a record fetched for ANOTHER product",
+                |parsed: &ParsedSpec| {
+                    let mut record = decided_record(parsed);
+                    record.product_id = "product:elsewhere".to_string();
+                    record
+                },
+                "belongs to product:elsewhere",
+            ),
+        ];
+
+        for (why, build, expected_fragment) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let project = seeded_project(dir.path());
+            let parsed = parsed_d3();
+            full_flow(&project, &parsed);
+            let before = snapshot(&project);
+            // The record has to be PERSISTED to be observed — that is
+            // the point of reading the store rather than an argument.
+            let store = store_holding(dir.path(), Some(&build(&parsed)));
+
+            let error = reopen_for_drafting(&project, SPEC_PATH, &parsed, &store).expect_err(why);
+            assert_eq!(error.code, "reopen-undecided", "{why}: {error}");
+            assert!(
+                error.message.contains(expected_fragment),
+                "{why}: the refusal must name the missing evidence \
+                 ({expected_fragment:?}), got: {error}"
+            );
+            assert!(
+                error.message.contains("rocky fulfill revenue_daily"),
+                "{why}: the refusal must name the decided route: {error}"
+            );
+            assert_eq!(
+                snapshot(&project),
+                before,
+                "{why}: a refusal mutates nothing"
+            );
+            assert_eq!(
+                committed(&project).phase,
+                ManifestPhase::Merged,
+                "{why}: the merged manifest is never demoted without the decision"
+            );
+        }
     }
 
     // ------------------------- crash and recovery ---------------------------

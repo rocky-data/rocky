@@ -93,16 +93,49 @@ project, not across project boundaries.
 `rocky branch create` and `rocky run --branch <name>` give you isolated branches
 for development and review. A branch today is a schema prefix: models for branch
 `feature_x` materialize under a `branch__feature_x` namespace, so a branch never
-touches a production table. Approval writes a signed artifact under
-`.rocky/approvals/<branch>/`, and promotion verifies that signature before it
-merges the branch forward.
+touches a production table. `rocky branch approve` writes an artifact under
+`.rocky/approvals/<branch>/` by default. `--out` sends it somewhere else, and
+the gate only reads the default directory, so an artifact written elsewhere
+does not count.
+
+The gate that reads those artifacts is off by default. Set
+`[branch.approval] required = true` to turn it on. With it off, the promote
+path does not read the directory at all.
+
+With it on, the gate runs when the promote plan is built. That is `rocky plan
+promote`, and bare `rocky branch promote <name>`, which builds a plan first.
+Applying a promote plan that already exists does not repeat the check, so the
+approvals are the ones that were valid at plan time. The gate loads every
+artifact in that directory and counts the valid ones against `min_approvers`.
+
+An artifact is valid when its blake3 digest still matches its own contents, its
+recorded branch state hash matches the branch now, it is not dated in the
+future, and it is not older than `max_age_seconds`. When `allowed_signers` is
+not empty, the approver's email must also be on that list.
+
+`min_approvers` counts artifact FILES, not distinct people. Nothing
+de-duplicates by identity, so one approver can satisfy a threshold of two by
+writing two artifacts. It defaults to 1, and setting it to 0 makes the count
+pass with no approvals at all.
+
+Two things bypass the gate even when it is on. `rocky branch promote
+--skip-approval` skips it, and so does the `ROCKY_BRANCH_APPROVAL_SKIP`
+environment variable. Both record the reason as an audit event rather than
+failing.
+
+That digest is not a cryptographic signature, and it is not a tamper boundary.
+It is unkeyed, so anything that can write the file can change the artifact and
+recompute the digest together. What it catches is a modification that was not
+re-hashed. It authenticates nobody: the approver's email is a self-asserted git
+identity hashed with the rest of the artifact, and a writer can set it to
+anything.
 
 What you get today is schema-prefix isolation, not a warehouse-native zero-copy
 clone. Delta `SHALLOW CLONE` and Snowflake zero-copy `CLONE` would make branch
 creation near-instant and free of storage cost. That integration is a follow-up,
 not what runs now.
 
-**Partial.** Schema-prefix branches with signed approval and promotion ship today. Warehouse-native clones do not.
+**Partial.** Schema-prefix branches and promotion ship today. The approval gate ships too, but it is off until you set `[branch.approval] required = true`, and its check is a digest, not a signature. Warehouse-native clones and signed approvals do not ship.
 
 ### Per-model cost
 
@@ -264,7 +297,7 @@ surprised.
 | Schema drift handling (ignore / safe widen / drop-and-recreate) | Shipped | Explicit graded response with a grace period. |
 | Dialect-divergence lint (`P001`) | Shipped | Opt-in via `--target-dialect`; error severity. |
 | VS Code trust overlays | Shipped | Exactly four: Drift, Breaking, Replay, Governance. |
-| Branches | Partial | Schema-prefix isolation with signed approval/promotion; no warehouse-native zero-copy clones yet. |
+| Branches | Partial | Schema-prefix isolation with promotion. The approval gate is opt-in (`[branch.approval] required = true`) and checks an unkeyed digest: an integrity checksum, not a tamper boundary, and it authenticates nobody. No warehouse-native zero-copy clones yet. |
 | Replay | Partial | Deterministic recording + ledger verification, plus re-execution (`rocky replay --execute --verify`, local or `--warehouse`) for deterministic content-addressed models; mutable-source models are `non_replayable`, non-deterministic recipes flagged. |
 | Content-addressed writes | Partial | Single-writer Delta/UniForm; no multi-writer, broad schema evolution, or deletion vectors yet. |
 | Per-model cost | Partial | Billing-exact on BigQuery; a duration × DBU-rate estimate on Databricks and Snowflake; zero on DuckDB. Databricks surfaces scanned bytes for observability; Snowflake's warehouse-reported-bytes plumbing is the follow-up. |

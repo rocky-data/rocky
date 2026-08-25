@@ -52,6 +52,9 @@ you catch before a row is written. See
   <Card title="Declarative tests, not templated SQL" icon="list-format">
     Tests are declarative TOML. Rocky generates the assertion SQL for your target dialect, and `rocky test` runs fixture-driven tests locally on DuckDB.
   </Card>
+  <Card title="Data products declared in a spec file" icon="document">
+    `products/<name>.toml` states a product's grain, columns, checks, and freshness. `rocky product compile` renders the model's contract and merges spec-owned sidecar metadata, turning the grain and checks into declarative `[[tests]]`. `rocky fulfill` then drives an agent through drafting and verification, and stops at each gate for you (experimental).
+  </Card>
   <Card title="A tested exit door, not a one-way door" icon="cloud-download">
     `rocky emit-sql` renders the compiled SQL for your transformation models with no warehouse connection. The output is plain runnable SQL, so adopting Rocky never locks you in.
   </Card>
@@ -115,4 +118,5 @@ by default. Those adapters are Beta today. See the
 <CardGrid>
   <LinkCard title="Import an existing project" href="/guides/migrate-from-dbt/" description="Run rocky import-dbt against a dbt Core project. You get a Rocky repo on disk, and you can move over one piece at a time." />
   <LinkCard title="Using Dagster?" href="/dagster/introduction/" description="dagster-rocky wraps the CLI as a ConfigurableResource: auto-discovery, asset checks, and Pipes through one subprocess hop." />
+  <LinkCard title="Declare a data product" href="/reference/commands/products/" description="Write the spec, lower it onto the model's contract and sidecar, and approve a revision. rocky fulfill drives the agent loop between those steps." />
 </CardGrid>

@@ -75,8 +75,15 @@ Two limits have their own tracking issues. A descendant that puts itself in a ne
 
 The full boundary, and how it applies to any agent rather than just this loop, is set out in [Operating Rocky with agents](/concepts/operating-rocky-with-agents/), "What the three gates do not defend against".
 
-## Known issue: a repair round is reported as tampering
+## Repair rounds
 
-A red first verification sends the loop into a repair round. That repair rewrites the merged sidecar file, which is exactly what it is meant to do. The integrity check that follows compares the file against the hash recorded **before** the repair, so the loop reports its own authorized write as tampering and moves the product to `blocked`.
+A red verification sends the loop back to the agent for a repair round. The repair rewrites the merged sidecar file, which is exactly what it is meant to do. If the next verification is green the loop carries on to propose. A repair is not guaranteed to work: one that leaves the verification red is retried up to the repair budget, and a product that exhausts that budget stops at `blocked` with the last failure printed. What no longer happens is the loop reporting its own repair as tampering.
 
-This fails closed. The product stops at `blocked` and the apply never runs, so nothing reaches your warehouse. It does mean that a product whose first verification is red cannot finish today, which is the case repair exists for. Tracked in [#1493](https://github.com/rocky-data/rocky/issues/1493).
+The loop authorizes that write rather than assuming it. Before it dispatches a repair worker it re-checks **every** hash the committed manifest records. Drift there had no authorized writer, so it is tamper: the product moves to `blocked` and nothing is rewritten. Only when every file verifies does the loop demote the manifest to its contract-only phase, which returns the sidecar to the writable set. The next merge re-records the hashes from what it merged. Hashes are only ever written by the commit protocol.
+
+Two consequences worth knowing:
+
+- **The window is real.** Between the repair dispatch and the merge that closes it, the sidecar is not covered by any hash, and the merge preserves keys and `[[tests]]` entries the lowering does not own. Content added to that file during the window survives into the committed artifact. Using it needs a process that can write your models directory — the same access that can forge an approval marker. Trusted handling of the repair agent's output bytes is tracked in [#1515](https://github.com/rocky-data/rocky/issues/1515).
+- **Do not run `rocky product compile` against a product a loop is driving.** Compiling mid-window would re-merge the previous round's sidecar, so the command refuses whenever the fulfillment record still carries an owner or worker-group stamp. Stop the loop, or let it reach its next stop, and the stamp is cleared. A loop that was killed outright leaves its stamp behind; `rocky fulfill <product>` takes that record over by checking the owner's start time, and the refusal says so.
+
+Taking an already-**merged** generation back to its contract-only phase is a different act from lowering a fresh one, and only the loop can do it. `rocky product compile` lowers a first contract for a product that has no committed manifest yet, which is ordinary. Nothing but `rocky fulfill <product>` demotes a merged generation: there is no verb for it, and the engine refuses any caller that does not hold the loop's own compare-and-swapped record.

@@ -9,8 +9,14 @@
 //! `draft_metadata`). Materialization stays human-gated: the agent can only
 //! *propose* an AI-authored plan; a human runs `rocky review --approve` +
 //! `rocky apply` (a product-bound plan additionally requires
-//! `--expect-spec-digest`). `rocky mcp --profile worker` serves a minimal
-//! drafting allowlist for untrusted workers ([`McpProfile`]).
+//! `--expect-spec-digest`).
+//!
+//! Three profiles ([`McpProfile`]), chosen once at launch by the operator:
+//! `rocky mcp` serves every tool but REFUSES `review_queue`'s approve action,
+//! so the no-flag command cannot write a sign-off marker (#1517);
+//! `--profile approver` adds that one action back for a server meant to have
+//! it; `--profile worker` serves a minimal drafting allowlist to untrusted
+//! workers.
 //!
 //! ## Statelessness
 //!
@@ -43,7 +49,9 @@ pub use tools::{McpProfile, RockyMcpServer};
 /// `config_path` is the project's `rocky.toml`; the models directory is
 /// resolved as `<config-dir>/models`, matching the CLI's top-level
 /// convention. `profile` selects the tool surface: [`McpProfile::Default`]
-/// serves everything, [`McpProfile::Worker`] the minimal drafting allowlist.
+/// serves every tool with the `review_queue` approve action refused,
+/// [`McpProfile::Approver`] the same tools with that action served, and
+/// [`McpProfile::Worker`] the minimal drafting allowlist.
 /// Logging goes to stderr (stdout is reserved for the MCP wire protocol).
 pub async fn serve_stdio(
     config_path: std::path::PathBuf,

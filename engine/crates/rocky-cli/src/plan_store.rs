@@ -83,10 +83,12 @@ use serde::{Deserialize, Serialize};
 /// > structurally cannot observe an invalid shape.
 ///
 /// Persisting a value is not the same as replaying the check that validated it.
-/// `ReplicationPlan.config_snapshot` is the counterexample: it is written at
-/// plan time and no production apply-side code reads it, so a plan whose
-/// adapter or destination changed between plan and apply is not detected by it.
-/// Guards over *derived* state — discovery output, compiled models, live
+/// `ReplicationPlan.config_snapshot` WAS the counterexample: it was written at
+/// plan time and no production apply-side code read it, so a plan whose adapter
+/// or destination changed between plan and apply went undetected. #1460 closed
+/// that specific hole — apply now compares the snapshot whole — but the SHAPE
+/// is the lesson here, not the instance, and it recurred often enough to be
+/// worth stating. Guards over *derived* state — discovery output, compiled models, live
 /// warehouse shape — are likewise only re-established where that derivation
 /// repeats at apply.
 ///
@@ -97,8 +99,17 @@ use serde::{Deserialize, Serialize};
 /// paths never call (#1310). Such checks belong at the seam every entrypoint
 /// crosses.
 ///
-/// Audited across all nine kinds. Two entries below record a gap rather than a
-/// guarantee; do not read this table as a certification.
+/// Audited across all nine kinds. One entry below records a gap rather than a
+/// guarantee: the point-in-time limit on `Restore`. Do not read this table as
+/// a certification, and re-check a row against its code before relying on it —
+/// two rows here described gaps that had already been closed (#1459, #1460).
+///
+/// The `AiAuthored` row states what the marker check ENFORCES, which is that a
+/// well-formed marker names this plan. It does not establish that a person
+/// approved: the marker is unsigned, its `approver` field is a best-effort git
+/// identity the gate never reads, and anything that can write the plans
+/// directory can produce one. Treat it as a floor against an unreviewed
+/// machine-authored apply, not as proof of human intent.
 ///
 /// | Kind | Load-bearing plan-time invariant | Re-established at apply? |
 /// |---|---|---|
@@ -107,8 +118,8 @@ use serde::{Deserialize, Serialize};
 /// | `Gc` | candidate is provably derivable | Yes — re-derives against the live store and takes derivability from the fresh candidate, never the payload; fail-closed on hash mismatch |
 /// | `Restore` | rebuilt bytes are hash-exact | Point-in-time only — the hash is verified *before* the ledger row is reinstated, and nothing fences the object between the two |
 /// | `Compact` / `Archive` | policy gate | Yes — the gate runs at apply; a denied apply never reaches `execute_statement` |
-/// | `Replication` | source state matches what was reviewed | **Partly — see #1460.** Apply discovers once for comparison, then `run` discovers again and builds work from the second result; `config_snapshot` has no production apply-side reader |
-/// | `AiAuthored` | human review before a machine-authored change executes | **No — see #1459.** The marker is only checked when policy is `NotConfigured`; a configured policy resolving to `Allow` reaches `apply_policy_gate`, which returns `Ok(())` without consulting it |
+/// | `Replication` | source state + config match what was reviewed | Yes, since #1460. Apply compares the persisted `config_snapshot` WHOLE against a freshly fingerprinted load, and `run` re-applies the source-state check against the discovery the work is actually built from. Two stated limits remain: credentials are redacted in the snapshot, so a changed secret is not detected, and the state identity is credential-free by construction |
+/// | `AiAuthored` | a review marker naming the plan before a machine-authored change executes | Yes — unconditionally, since #1459. `apply_policy_gate` runs FIRST (so `Deny` / `RequireReview` keep their wording and precedence), then [`crate::commands::review::review_marker_state`] must return `Approved` for THIS plan id. `Allow` and `NotConfigured` return `Ok(())` without consulting the marker, so the check runs after them and policy can only TIGHTEN the gate, never waive it. It is parse-and-match, not file-exists, and it authenticates nobody — see the caveat below |
 /// | `Backfill` | reviewed closure + run-plan diagnostics | Yes for the closure — see the structural note on `run_apply_backfill_plan` |
 ///
 /// `Backfill` is the one entry whose safety is **structural rather than
@@ -145,9 +156,11 @@ pub enum PlanKind {
     /// An AI-authored run plan. The payload is a `RunPlan` struct — the same
     /// shape as [`PlanKind::Run`] — but the kind discriminator marks it as
     /// machine-authored, so a bare `rocky apply` refuses to execute it until a
-    /// human signs off via `rocky review <plan-id> --approve`. The review step
-    /// writes a marker file alongside the plan; `apply` requires that marker
-    /// before dispatching the same execution path as a `Run` plan.
+    /// review marker names it. `rocky review <plan-id> --approve` writes that
+    /// marker alongside the plan; `apply` requires a marker that PARSES and
+    /// names this exact plan id before dispatching the same execution path as
+    /// a `Run` plan. The check authenticates no one — see the caveat on
+    /// [`PlanKind`].
     #[serde(rename = "ai_authored")]
     AiAuthored,
     /// A supervised-backfill plan composed by `rocky backfill`. The payload is

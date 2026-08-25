@@ -15,6 +15,13 @@
 //! Phase B → the runner's own verify bundle → governed propose →
 //! marker poll → pre-apply digest recompute from the snapshot → the
 //! typed apply with `expect_spec_digest` → observation.
+//!
+//! A red verify bundle re-enters drafting as a repair round. The
+//! dispatch first REOPENS the window (#1493): the committed merged
+//! generation is byte-verified in full (drift there is tamper —
+//! blocked), then its manifest is demoted to Phase A through the
+//! staged commit, so the worker's sidecar rewrite is authorized
+//! exactly like round 1's and Phase B re-records what it merges.
 
 use std::path::{Path, PathBuf};
 
@@ -113,6 +120,13 @@ pub async fn run_fulfill(
             return Ok(());
         }
     };
+
+    // Crash seam for the self-lockout drill (#1493): ownership is
+    // stamped on disk, no state transition has happened yet. The next
+    // invocation must be able to take that stamp over and still open its
+    // own drafting window — a gate that read the dead owner's stamp as
+    // "mine" would lock the product out permanently.
+    fault_point("post-acquire");
 
     let outcome = runner.step_loop(*record, retry).await;
     let (final_record, stop) = match outcome {
@@ -1015,6 +1029,30 @@ impl Runner {
             }
         };
         let spec = self.approved_spec()?;
+
+        // #1493 — the loop's own authorized (re)opening of the drafting
+        // window: a committed MERGED manifest belongs to the previous
+        // round. The reopen byte-verifies EVERY recorded hash first
+        // (drift in the window between Phase B and this dispatch had no
+        // authorized writer — tamper, blocked), then demotes the
+        // manifest to Phase A through the staged commit, so the
+        // worker's sidecar rewrite is authorized exactly like round 1's
+        // and the next Phase B re-records the hashes it merges. Keyed
+        // on the ON-DISK manifest phase, never the task kind, so a
+        // resume that crashed between the repair CAS and the reopen
+        // still reopens (or still blocks).
+        if kind == TaskBriefKind::Repair {
+            // Crash seam for the reopen drill: the repair transition is
+            // journaled, the window not yet reopened.
+            fault_point("pre-repair-reopen");
+        }
+        match fulfill_api::product_reopen_drafting(&self.root, &self.state_path, &self.product)? {
+            fulfill_api::ReopenOutcome::Tampered(problems) => {
+                return Ok(Event::ArtifactCheck { problems });
+            }
+            fulfill_api::ReopenOutcome::NotNeeded | fulfill_api::ReopenOutcome::Reopened => {}
+        }
+
         let sources: Vec<String> = spec.parsed.product().source.tables.clone();
         let dir = self.fulfillment_dir();
         let verify_detail = match &record.state {
@@ -1048,6 +1086,11 @@ impl Runner {
                 // Crash seam for the Phase-A tamper drill: the worker is
                 // gone (group killed), the byte-verify has not run yet.
                 fault_point("post-drafting");
+                if kind == TaskBriefKind::Repair {
+                    // The same seam scoped to a REPAIR round, for the
+                    // out-of-band-tamper-during-repair drill.
+                    fault_point("post-repair-drafting");
+                }
                 Event::DraftingFinished { error: None }
             }
             Err(err) => Event::DraftingFinished { error: Some(err) },

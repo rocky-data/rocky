@@ -129,7 +129,7 @@ How a model's output lands in the warehouse: `view`, `table`, `incremental`, `me
 
 ### MCP (Model Context Protocol)
 
-An open protocol that lets an AI agent call tools. `rocky mcp` serves Rocky's tools over it. The read-only ones let an agent check its work against the real project: compile, plan preview, lineage, test, schema inspection, row sampling. Others write into `models/`: `draft_model`, `draft_contract`, and `draft_check` go through the compiler and your `[policy]` rules. Applying an AI-authored plan still needs human approval. See [MCP authoring](/concepts/mcp-authoring/).
+An open protocol that lets an AI agent call tools. `rocky mcp` serves Rocky's tools over it. The read-only ones let an agent check its work against the real project: compile, plan preview, lineage, test, schema inspection, row sampling. Others write into `models/`: `draft_model`, `draft_contract`, and `draft_check` go through the compiler and your `[policy]` rules. Applying an AI-authored plan still needs an approval marker that names that plan. See [MCP authoring](/concepts/mcp-authoring/).
 
 ### MERGE
 

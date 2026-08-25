@@ -132,8 +132,11 @@ authored by agents rather than people. The question that matters shifts from
 
 Rocky's long arc is the governed estate. Humans declare the invariants:
 contracts, policies, budgets. Agents do the operating: author, run, diagnose,
-remediate. The engine enforces and records every step, so any consumer, human or
-machine, can check a table's custody before relying on it.
+remediate. The engine checks each mutating step and records what it decided, so
+any consumer, human or machine, can read a table's recorded custody before
+relying on it. Read that record as best-effort: a failed ledger write warns and
+lets the operation continue, and a refusal issued before the rules are
+evaluated writes no row at all.
 
 The pieces above are that arc's foundation, shipped in their first form: the
 policy plane, the custody ledger, bit-exact replay, and the engine-free manifest

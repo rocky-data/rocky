@@ -52,9 +52,9 @@ does. The tools are named so the loop reads in sequence.
         └───────┬────────┘
                 ▼
         ┌────────────────┐   rocky review <plan_id> --approve
-        │ 6. a human     │   rocky apply  <plan_id>
-        │    approves    │   No MCP tool writes that approval.
-        └────────────────┘
+        │ 6. an approval │   rocky apply  <plan_id>
+        │    marker      │   The worker profile serves no tool
+        └────────────────┘   that writes that marker.
 ```
 
 Steps 1 and 2 are the reason the rest works. A column name does not tell you its
@@ -92,8 +92,8 @@ See [MCP Authoring](/concepts/mcp-authoring/) for every tool in both families.
 
 ## The three gates
 
-Nothing an agent produces reaches your warehouse without clearing three
-independent checks. The engine performs all three in code.
+Nothing an agent produces reaches your warehouse without clearing three checks.
+The engine performs all three in code.
 [What the three gates do not defend against](#what-the-three-gates-do-not-defend-against)
 states what each check actually verifies, and where that stops.
 
@@ -147,8 +147,30 @@ recorded, the ledger does not give you that today.
 
 **Gate 3, the approval marker.** `propose` writes a plan marked as AI-authored.
 `rocky apply` refuses to run one unless an approval marker is present that parses
-and names that exact plan. `rocky review <plan-id> --approve` is the command that
-writes that marker, and no MCP tool writes it.
+and names that exact plan. `rocky review <plan-id> --approve` writes that marker.
+
+One MCP tool can write it too, but only if you ask for that when you start the
+server. `review_queue` writes the marker when it is called with
+`approve_plan_id` and `confirm: true` — and that call is served on one profile
+only:
+
+```
+rocky mcp                      lists the queue, REFUSES to approve
+rocky mcp --profile approver   lists the queue, and may approve
+rocky mcp --profile worker     no review_queue at all
+```
+
+On any other profile the approve call is refused with the error code
+`approve_not_enabled`, nothing is written, and the message names the flag. The
+refusal comes before Rocky looks at the queue, so it does not depend on the
+plan, on `confirm`, or on the state store being readable.
+
+Be exact about what the opt-in buys you. It decides **whether this server can
+approve at all**, and only the operator who starts the server chooses it. It
+does not authenticate the approval: on `--profile approver`, `confirm` is still
+set by the caller, and Rocky still does not check that a person set it. So
+`--profile approver` gives you a server where an agent's `confirm` is
+sufficient. Start one only where that is what you want.
 
 Be exact about what this check verifies. It reads a file, parses it, and compares
 the plan id. It does not authenticate who approved, or that a person approved at
@@ -202,6 +224,32 @@ it survives the kill. A test exhibits the escape, so the limit cannot quietly
 turn into a false guarantee. Sandboxing at the operating-system level is the
 planned fix. Tracked in
 [#1491](https://github.com/rocky-data/rocky/issues/1491).
+
+**A repair round opens a window where the sidecar is not hash-pinned.** When the
+fulfillment loop's verification comes back red, it sends the model back to the
+agent for a repair. The agent has to rewrite the model's sidecar file, so the
+loop first returns that file to the writable set: it checks every recorded hash,
+then demotes the lowering manifest to its contract-only phase. While that window
+is open, the sidecar is not covered by any hash. The merge that closes the window
+keeps every key the lowering does not own, and every `[[tests]]` entry it did not
+generate. So content added to the sidecar during the window is carried into the
+committed file and hashed there, exactly as if the agent had written it.
+
+The window is open only between the loop's own repair dispatch and its next
+merge, and only a process that can write your models directory can use it. That
+same process can write an approval marker, which is a larger capability than
+this one. Trusted handling of the repair agent's output bytes is planned work.
+Tracked in [#1515](https://github.com/rocky-data/rocky/issues/1515).
+
+**The committed manifest is data, not a credential.** The lowering manifest
+records which files belong to a product generation, which phase it is in, and
+each file's hash. The loop reads it to decide what to verify. It is an ordinary
+file in your project, so a process that can edit it can change what gets checked
+— setting the phase back to contract-only and deleting the sidecar's entry makes
+the loop skip that file rather than report drift. The engine already treats
+manifests this way: matching identity fields in a manifest authenticate nothing.
+The verification is a check on files, not a proof about them. This needs the same
+write access as the point above, and is covered by the same planned work.
 
 **A directory swapped mid-write is still a race.** The fulfillment loop commits
 its files with `O_NOFOLLOW` and creates them with `O_EXCL`, so a symbolic link

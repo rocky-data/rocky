@@ -27,7 +27,7 @@ Write for a person who is busy. These rules apply to chat replies, PR descriptio
 
 | Path | Language | What it is |
 |---|---|---|
-| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. Multi-crate Cargo workspace. |
+| `engine/` | Rust | Core CLI + engine — SQL transformation, schema drift, incremental loads, adapters. Also carries spec-driven data products: `rocky product` (parse, verify, lower, approve) and the `rocky fulfill` loop (experimental), in the `rocky-fulfill` crate. Multi-crate Cargo workspace. |
 | `sdk/python/` | Python | `rocky-sdk` — standalone typed Python client (`RockyClient`) over the `rocky` CLI. Owns the generated Pydantic models. For notebooks, scripts, and orchestrators. |
 | `integrations/dagster/` | Python | Dagster integration — a thin `ConfigurableResource` adapter over `rocky-sdk`'s `RockyClient`; maps results to assets/checks. Depends on `rocky-sdk`. |
 | `editors/vscode/` | TypeScript | VS Code extension — LSP client (stdio to `rocky lsp`), syntax highlighting, commands for AI features. |

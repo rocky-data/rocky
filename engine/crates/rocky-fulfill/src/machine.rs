@@ -23,7 +23,7 @@
 //!   the next task.
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use rocky_core::fulfill::{FulfillState, FulfillStateRecord};
+use rocky_core::fulfill::{DraftingRound, FulfillState, FulfillStateRecord};
 
 /// Driver dispatches allowed per task cycle (elicitation or drafting)
 /// before the product blocks. FF-DESIGN D6 rules, frozen.
@@ -930,7 +930,9 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
         //   driver drafting task → drafting
         // ------------------------------------------------------------------
         FulfillState::LoweredContract => match event {
-            Event::Reentry => dispatch_drafting(observed, &product, TaskKind::Draft, now),
+            // The first pass over a freshly lowered contract is always a
+            // draft — there is no verification to repair yet.
+            Event::Reentry => dispatch_drafting(observed, &product, DraftingRound::Draft, now),
             other => internal_mismatch(observed, &other),
         },
 
@@ -955,7 +957,11 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                         &error,
                     )
                 } else {
-                    dispatch_drafting(observed, &product, TaskKind::Draft, now)
+                    // A retry stays in the round the machine is already
+                    // in: retrying a failed REPAIR driver with the
+                    // drafting brief would hand the worker the wrong
+                    // task (#1493).
+                    dispatch_drafting(observed, &product, observed.drafting_round, now)
                 }
             }
             // merged | all Phase-A artifact bytes re-verified against
@@ -1005,7 +1011,12 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                         "drafting attempts exhausted",
                     )
                 } else {
-                    dispatch_drafting(observed, &product, TaskKind::Draft, now)
+                    // The crash-resume arm. The round comes off the
+                    // RECORD, so a repair that crashed between its own
+                    // CAS and its worker dispatch resumes as a repair —
+                    // same brief, same budget — instead of silently
+                    // downgrading to a draft (#1493).
+                    dispatch_drafting(observed, &product, observed.drafting_round, now)
                 }
             }
             other => internal_mismatch(observed, &other),
@@ -1028,7 +1039,10 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
         // ------------------------------------------------------------------
         // verifying | own compile+test green; policy check agrees;
         //   manifest total | → controlled propose → proposed;
-        //   red ≤ repair rounds → drafting; else blocked
+        //   red ≤ repair rounds → drafting (the repair dispatch reopens
+        //   the window: merged generation byte-verified in full, then
+        //   the manifest demoted to Phase A through the staged commit —
+        //   #1493); else blocked
         // ------------------------------------------------------------------
         FulfillState::Verifying => match event {
             Event::Reentry => Decision::Act(TaskKind::VerifyBundle),
@@ -1069,10 +1083,15 @@ pub fn decide(observed: &FulfillStateRecord, event: Event, now: DateTime<Utc>) -
                     let mut next = to_state(observed, FulfillState::Drafting, now);
                     next.repair_rounds = observed.repair_rounds + 1;
                     next.drafting_attempts = 1;
+                    // Persist the round WITH the transition that decides
+                    // it: this CAS and the worker dispatch are separate
+                    // steps, and a crash between them must resume as a
+                    // repair (#1493).
+                    next.drafting_round = DraftingRound::Repair;
                     Decision::AdvanceAndAct {
                         record: next,
                         event: format!("repair round {} ({detail})", observed.repair_rounds + 1),
-                        task: TaskKind::Repair,
+                        task: round_task(DraftingRound::Repair),
                     }
                 }
             }
@@ -1625,12 +1644,17 @@ fn dispatch_elicitation(
 }
 
 /// The drafting dispatch: count the attempt BEFORE dispatch, then act.
+///
+/// The round is PERSISTED on the record it advances to, so a crash
+/// between this transition and the worker's dispatch resumes as the same
+/// round rather than silently downgrading a repair to a draft (#1493).
 fn dispatch_drafting(
     observed: &FulfillStateRecord,
     product: &str,
-    task: TaskKind,
+    round: DraftingRound,
     now: DateTime<Utc>,
 ) -> Decision {
+    let task = round_task(round);
     if observed.drafting_attempts >= MAX_COMPILE_ITERS {
         let record = blocked(
             observed,
@@ -1646,10 +1670,21 @@ fn dispatch_drafting(
     }
     let mut next = to_state(observed, FulfillState::Drafting, now);
     next.drafting_attempts = observed.drafting_attempts + 1;
+    next.drafting_round = round;
     Decision::AdvanceAndAct {
         record: next,
-        event: format!("drafting attempt {}", observed.drafting_attempts + 1),
+        event: format!("{} attempt {}", round.tag(), observed.drafting_attempts + 1),
         task,
+    }
+}
+
+/// The task that performs `round`. The one mapping from the persisted
+/// round to the dispatched task, so a resume and a fresh decision can
+/// never disagree.
+fn round_task(round: DraftingRound) -> TaskKind {
+    match round {
+        DraftingRound::Draft => TaskKind::Draft,
+        DraftingRound::Repair => TaskKind::Repair,
     }
 }
 
@@ -2736,6 +2771,124 @@ mod tests {
         assert_eq!(record.drafting_attempts, 1, "fresh drafting cycle");
         assert_eq!(task, TaskKind::Repair);
         assert!(event.contains("E012 on revenue_eur"));
+        assert_eq!(
+            record.drafting_round,
+            DraftingRound::Repair,
+            "the decided round is persisted WITH the transition, not left \
+             for the dispatch to remember"
+        );
+    }
+
+    // ------------- the round survives a crash and a retry (#1493) -----------
+
+    /// The record the repair transition above leaves on disk, as a
+    /// resume would read it back.
+    fn crashed_mid_repair() -> FulfillStateRecord {
+        let mut prior = rec(FulfillState::Verifying);
+        prior.repair_rounds = 1;
+        prior.drafting_attempts = 5;
+        let d = decide(
+            &prior,
+            Event::VerifyBundle {
+                compile_green: false,
+                test_green: true,
+                posture_green: true,
+                manifest_total: true,
+                tests_deferred: None,
+                detail: "E012 on revenue_eur".into(),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndAct { record, .. } = d else {
+            panic!("expected the repair transition, got {d:?}");
+        };
+        record
+    }
+
+    #[test]
+    fn a_crash_between_the_repair_cas_and_its_worker_resumes_as_a_repair() {
+        // The #1493 F2 defect: the repair transition CASes `drafting`
+        // and then dispatches. A crash in between leaves the record at
+        // `drafting`, and the cold resume re-enters with `Reentry`.
+        // Before the fix that arm hard-coded `TaskKind::Draft`, so the
+        // resumed round got the DRAFTING brief and the drafting budget
+        // for a round the machine had decided was a repair.
+        let resumed = crashed_mid_repair();
+        assert_eq!(resumed.state, FulfillState::Drafting);
+
+        let d = decide(&resumed, Event::Reentry, now());
+        let Decision::AdvanceAndAct {
+            record,
+            task,
+            event,
+        } = d
+        else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(
+            task,
+            TaskKind::Repair,
+            "a resumed repair must dispatch the REPAIR task — the brief and \
+             the budget both key off it"
+        );
+        assert_eq!(
+            record.drafting_round,
+            DraftingRound::Repair,
+            "and the round stays persisted across the resume"
+        );
+        assert!(
+            event.starts_with("repair attempt"),
+            "the journal names the round it actually dispatched: {event}"
+        );
+    }
+
+    #[test]
+    fn a_failed_repair_driver_retries_as_a_repair_not_a_draft() {
+        // Same defect, second arm: the driver-failure retry also
+        // hard-coded `TaskKind::Draft`, so a repair whose worker failed
+        // once came back as a plain draft.
+        let resumed = crashed_mid_repair();
+        let d = decide(
+            &resumed,
+            Event::DraftingFinished {
+                error: Some("driver exit 1".into()),
+            },
+            now(),
+        );
+        let Decision::AdvanceAndAct { task, record, .. } = d else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(task, TaskKind::Repair, "a retried repair is still a repair");
+        assert_eq!(record.drafting_round, DraftingRound::Repair);
+    }
+
+    #[test]
+    fn a_first_draft_carrying_repair_rounds_is_still_a_draft() {
+        // Why the round is PERSISTED and not derived from
+        // `repair_rounds`: that counter survives into a re-approved
+        // generation's first pass, so `repair_rounds > 0` does not mean
+        // "this round is a repair". A derivation would mis-dispatch
+        // exactly here.
+        let mut lowered = rec(FulfillState::LoweredContract);
+        lowered.repair_rounds = 2;
+        let d = decide(&lowered, Event::Reentry, now());
+        let Decision::AdvanceAndAct { task, record, .. } = d else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(
+            task,
+            TaskKind::Draft,
+            "the first pass over a fresh contract is a draft whatever the \
+             repair counter says"
+        );
+        assert_eq!(record.drafting_round, DraftingRound::Draft);
+
+        // And the resume of THAT record stays a draft too.
+        let d = decide(&record, Event::Reentry, now());
+        let Decision::AdvanceAndAct { task, .. } = d else {
+            panic!("expected AdvanceAndAct, got {d:?}");
+        };
+        assert_eq!(task, TaskKind::Draft);
     }
 
     #[test]
