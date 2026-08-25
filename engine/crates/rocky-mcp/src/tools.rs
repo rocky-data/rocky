@@ -5572,13 +5572,24 @@ impl RockyMcpServer {
             .with_description("Read-only structured summary of the Rocky project"))
     }
 
-    /// Diagnose and fix failing declarative tests: run the tests, ground each
+    /// Diagnose and fix failing LOCAL tests: run the tests, ground each
     /// failure with profile_column, propose a fix. Stops at *propose*.
+    ///
+    /// FOURTEENTH ROUND — "declarative" was wrong here, and round ten fixed
+    /// it on the worker surface ONLY. The `test` tool calls
+    /// `commands::test_output` on EVERY profile, which runs
+    /// `test_runner::run_tests` (model execution) plus
+    /// `test_runner::run_unit_tests` (sidecar fixture `[[test]]` blocks). It
+    /// never calls `run_declarative_tests` — the `rocky test --declarative`
+    /// path that evaluates sidecar `[[tests]]` against the WAREHOUSE. No
+    /// profile reaches it, so this was never a profile-shaped defect and
+    /// round ten's profile-shaped fix left the default half standing.
     #[prompt(
         name = "fix_failing_test",
-        description = "Diagnose and fix failing declarative tests: run `test` -> for each failure \
-         profile_column the implicated columns to ground the cause -> propose a fix. Stops at the \
-         human approval gate."
+        description = "Diagnose and fix failing LOCAL tests: run `test` — the project's model \
+         and unit tests, not the warehouse-run `--declarative` set — then for each failure \
+         profile_column the implicated columns to ground the cause -> propose a fix. Stops at \
+         the human approval gate."
     )]
     async fn fix_failing_test(
         &self,
@@ -7824,10 +7835,28 @@ mod tests {
                  draft_contract -> propose. Stops at the human approval gate.",
             ),
             (
+                // FOURTEENTH ROUND — the one entry on this list that is NOT
+                // byte-unchanged from the pre-worker-profile string, and the
+                // reason is written down so it is not read as a leak.
+                //
+                // The old text said "declarative tests: run `test`". The
+                // `test` tool runs `commands::test_output` — model execution
+                // plus sidecar fixture `[[test]]` blocks — on every profile,
+                // and never `run_declarative_tests`. Round ten found that and
+                // fixed the WORKER copy, pinning its absence in
+                // `worker_prompt_descriptions_name_no_excluded_tool`; the
+                // defect was never profile-shaped, so the default copy stayed
+                // false for four rounds.
+                //
+                // This test's job is to stop the worker rewrite LEAKING into
+                // the default surface, not to freeze a false sentence. A
+                // deliberate correctness fix updates the literal here, in the
+                // same commit, on purpose.
                 "fix_failing_test",
-                "Diagnose and fix failing declarative tests: run `test` -> for each failure \
-                 profile_column the implicated columns to ground the cause -> propose a fix. \
-                 Stops at the human approval gate.",
+                "Diagnose and fix failing LOCAL tests: run `test` — the project's model and \
+                 unit tests, not the warehouse-run `--declarative` set — then for each \
+                 failure profile_column the implicated columns to ground the cause -> \
+                 propose a fix. Stops at the human approval gate.",
             ),
             (
                 "summarize_project",
@@ -7849,6 +7878,26 @@ mod tests {
                 listed.get(*name).and_then(|d| d.as_deref()),
                 Some(*description),
                 "default-profile description of '{name}' is byte-unchanged"
+            );
+        }
+        // FOURTEENTH ROUND — the byte pin above already covers this, and it
+        // is asserted separately anyway because a byte pin records WHAT, not
+        // WHY. Someone re-blessing the literal to make a build pass would
+        // put the false sentence back and this line is what stops them.
+        //
+        // The claim: no default-profile description may say the `test` tool
+        // runs the declarative set. It does not, on any profile —
+        // `commands::test_output` runs model execution plus sidecar fixture
+        // `[[test]]` blocks, never `run_declarative_tests`. The mirror of
+        // this assertion has guarded the worker surface since round ten;
+        // the defect was never profile-shaped, so the guard should not be
+        // either.
+        for (name, description) in &listed {
+            let lower = description.as_deref().unwrap_or_default().to_lowercase();
+            assert!(
+                !lower.contains("declarative tests: run `test`"),
+                "default-profile description of '{name}' claims the `test` tool runs the \
+                 declarative check set; it runs the LOCAL model + unit tests: {description:?}"
             );
         }
     }
