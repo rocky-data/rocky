@@ -4767,6 +4767,93 @@ async fn compile_rejects_unknown_target_dialect() {
     client.cancel().await.unwrap();
 }
 
+/// SIXTEENTH ROUND, finding 1 — the two tools that read `self.config_path`
+/// disagreed about a `rocky.toml` that exists but does not load.
+///
+/// `main`'s #1521/#1522 made `compile_inner` refuse it (`FileNotFound` is the
+/// only tolerated `ConfigError`), and `compile` uses that path. Its sibling
+/// `plan_preview` discarded EVERY config error with `.ok()` and fell through to
+/// the DuckDB default. So one malformed Snowflake config failed `compile` while
+/// `plan_preview` returned confident DuckDB-rendered SQL for a project whose
+/// config cannot be read.
+///
+/// No test failure could ever have caught that: both paths passed. It is a
+/// semantic gap between two siblings, which is why the assertion here is that
+/// they AGREE — not merely that each one does something.
+///
+/// The config is Snowflake and the models are valid, so the dialect is the
+/// only thing the swallowed error changed. A `plan_preview` that still
+/// swallowed it would return `is_error: None` and a `CREATE OR REPLACE TABLE`
+/// in the wrong dialect, and every other assertion in this file would stay
+/// green.
+#[tokio::test]
+async fn a_malformed_config_refuses_on_plan_preview_the_way_it_does_on_compile() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let config_path = dir.path().join("rocky.toml");
+
+    // Baseline FIRST, on the well-formed project this harness writes: both
+    // tools succeed. Without it, "both error" could be true of a fixture that
+    // never worked, and the guard would prove nothing about the config.
+    let server = RockyMcpServer::new(config_path.clone());
+    let client = connect(server).await;
+    for tool in ["compile", "plan_preview"] {
+        let ok = client
+            .call_tool(CallToolRequestParams::new(tool))
+            .await
+            .unwrap_or_else(|e| panic!("{tool} baseline call returns a result: {e}"));
+        assert_ne!(
+            ok.is_error,
+            Some(true),
+            "{tool} must succeed on the well-formed fixture, or this test's \
+             failure assertions prove nothing: {ok:?}"
+        );
+    }
+    client.cancel().await.unwrap();
+
+    // A Snowflake target, then broken: an unterminated table header, so TOML
+    // parsing fails rather than the file going missing.
+    std::fs::write(
+        &config_path,
+        "[adapter.default\ntype = \"snowflake\"\naccount = \"acct\"\n",
+    )
+    .unwrap();
+
+    let server = RockyMcpServer::new(config_path);
+    let client = connect(server).await;
+    for tool in ["compile", "plan_preview"] {
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool))
+            .await
+            .unwrap_or_else(|e| panic!("{tool} call returns a result: {e}"));
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "{tool} must refuse a rocky.toml that does not load; returning SQL \
+             in the DEFAULT dialect for a project whose config cannot be read \
+             answers a different question than the caller asked: {result:?}"
+        );
+        let err = result
+            .structured_content
+            .unwrap_or_else(|| panic!("{tool} error carries structured_content"));
+        // The message has to NAME the config, not merely be non-empty — an
+        // agent that cannot tell "your rocky.toml is broken" from "your SQL is
+        // broken" will go and edit the model.
+        let message = err["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("config") || message.contains("rocky.toml"),
+            "{tool}'s refusal must name the config as the cause so the caller \
+             fixes the right file, got: {message:?}"
+        );
+        assert!(
+            !message.trim().is_empty() && err["code"].as_str().is_some_and(|c| !c.is_empty()),
+            "{tool} keeps the structured envelope on a config failure: {err:?}"
+        );
+    }
+
+    client.cancel().await.unwrap();
+}
+
 /// The structured-error contract, end-to-end over the wire: every failing tool
 /// call comes back as `is_error: true` with a `{code, message,
 /// remediation_hint}` envelope in `structured_content`. Drives one

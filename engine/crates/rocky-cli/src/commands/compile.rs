@@ -105,11 +105,21 @@ fn compile_inner(
     //
     // Note `--config` defaults to `rocky.toml`, so this path runs even when
     // the user passed no flag.
+    // SIXTEENTH ROUND — the refusal now NAMES the file. `ConfigError`'s own
+    // `Display` is "failed to parse TOML: …", and model sidecars are TOML
+    // too, so an agent reading the bare message cannot tell whether to fix
+    // `rocky.toml` or a `<model>.toml` and will go and edit the wrong one.
+    // `plan_preview`'s sibling refusal (`plan::preview_dialect`) carries the
+    // same context, so the two paths now say the same thing about the same
+    // file.
     let project_config = match config_path {
         Some(path) => match rocky_config::load_rocky_config(path) {
             Ok(config) => Some(config),
             Err(rocky_config::ConfigError::FileNotFound { .. }) => None,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(anyhow::Error::from(error)
+                    .context(format!("failed to load config from {}", path.display())));
+            }
         },
         None => None,
     };
@@ -977,7 +987,21 @@ schema_template = "s"
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("failed to parse TOML"));
+        // `{err:#}` renders the WHOLE anyhow chain. `to_string()` would show
+        // only the outermost context, and this assertion is about the parse
+        // error surviving all the way out.
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to parse TOML"),
+            "the underlying parse error must survive to the surface: {rendered}"
+        );
+        // SIXTEENTH ROUND — and it must name the FILE. Model sidecars are TOML
+        // too; "failed to parse TOML" alone sends the reader at the wrong one.
+        assert!(
+            rendered.contains("failed to load config from")
+                && rendered.contains(config.to_string_lossy().as_ref()),
+            "the refusal must name rocky.toml as the file to fix: {rendered}"
+        );
     }
 
     // ---- --with-seed source-schema loading ----

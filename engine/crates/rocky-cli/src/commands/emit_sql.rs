@@ -20,8 +20,9 @@
 //! files carry a leading note to that effect.
 //!
 //! The dialect is the project's configured target adapter type (resolved from
-//! `rocky.toml` without credentials); with no resolvable config it defaults to
-//! DuckDB. All models render in this one resolved dialect, so for a project
+//! `rocky.toml` without credentials); with no project file at all it defaults
+//! to DuckDB. A `rocky.toml` that exists but does not load is an error, not a
+//! fallback. All models render in this one resolved dialect, so for a project
 //! whose models target more than one adapter, the emitted SQL matches
 //! `rocky run` only for the models whose target uses that dialect. Output is
 //! one `<model>.sql` file per model when `--out-dir` is given,
@@ -39,26 +40,7 @@ use rocky_core::models::SurrogateKeySpec;
 use rocky_core::sql_gen;
 use tracing::{debug, info};
 
-use super::plan::dialect_for_adapter_type;
-use crate::registry;
-
-/// Resolve the project's target dialect from `rocky.toml` (no credentials),
-/// falling back to DuckDB when no config resolves. Mirrors the resolution in
-/// [`super::plan::plan_preview_output`] so emitted SQL matches the plan preview.
-fn resolve_dialect(config_path: Option<&Path>) -> Box<dyn rocky_core::traits::SqlDialect> {
-    let adapter_type = config_path
-        .and_then(|p| rocky_core::config::load_rocky_config(p).ok())
-        .and_then(|cfg| {
-            let target_adapter_name = registry::resolve_replication_pipeline(&cfg, None)
-                .ok()
-                .map(|(_, pipeline)| pipeline.target.adapter.clone());
-            target_adapter_name
-                .and_then(|name| cfg.adapters.get(&name).map(|a| a.adapter_type.clone()))
-                .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
-        })
-        .unwrap_or_else(|| "duckdb".to_string());
-    dialect_for_adapter_type(&adapter_type)
-}
+use super::plan::preview_dialect;
 
 /// One model's emitted SQL: its name and the joined runnable statement(s).
 struct EmittedModel {
@@ -102,7 +84,11 @@ fn emit_models(
 ) -> Result<EmitResult> {
     use rocky_compiler::compile::{self, CompilerConfig};
 
-    let dialect = resolve_dialect(config_path);
+    // The SAME resolution `plan_preview_output` uses — literally the same
+    // function, so "emitted SQL matches the plan preview" is true by
+    // construction. A `rocky.toml` that exists but does not load refuses here
+    // too, rather than emitting DuckDB SQL for a broken Snowflake project.
+    let dialect = preview_dialect(config_path)?;
 
     let config = CompilerConfig {
         models_dir: models_dir.to_path_buf(),

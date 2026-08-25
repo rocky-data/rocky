@@ -603,6 +603,73 @@ pub(crate) fn dialect_for_adapter_type(
     }
 }
 
+/// Resolve the dialect an OFFLINE renderer previews SQL in, refusing a
+/// malformed `rocky.toml` instead of silently defaulting to DuckDB.
+///
+/// # Why this is one function and not two
+///
+/// SIXTEENTH ROUND, finding 1. `plan_preview_output` and
+/// `emit_sql::resolve_dialect` each carried their own copy of this resolution,
+/// and `emit_sql`'s doc comment asserted the two "mirror" each other. Both
+/// swallowed EVERY config error with `.ok()` and fell through to DuckDB.
+/// `main`'s #1521/#1522 had already made `rocky compile` refuse a malformed
+/// config on the sibling path, so a broken Snowflake `rocky.toml` failed
+/// `compile` while `plan_preview` cheerfully returned DUCKDB-rendered SQL for
+/// a project whose config cannot even load. Two aligned reads, one of them
+/// fixed, is how that gap opened; sharing the body is what keeps "mirrors"
+/// true by construction rather than by assertion.
+///
+/// # What is tolerated, and what is not
+///
+/// Two tolerant paths are deliberate and must stay:
+///
+/// - `config_path == None` — the standalone `--models <dir>` case, no project
+///   file was named at all. Resolves DuckDB.
+/// - [`ConfigError::FileNotFound`](rocky_core::config::ConfigError::FileNotFound)
+///   — `--config` defaults to `rocky.toml`, so this path runs even when the
+///   user passed no flag and no project file exists. Resolves DuckDB.
+///
+/// Every OTHER `ConfigError` propagates: a parse error, a missing `${VAR}`, a
+/// permission denial, a directory where the file should be. The same rule
+/// `compile_inner` applies, and for the same reason — we cannot tell what that
+/// config would have selected, and rendering in the default dialect answers a
+/// different question than the one asked.
+///
+/// An unresolvable *pipeline* stays tolerant, which is a different thing from
+/// an unloadable *config*: the preview falls back to the first declared
+/// adapter, then to DuckDB. A transformation-only project has no replication
+/// pipeline to resolve and must still preview.
+pub(crate) fn preview_dialect(
+    config_path: Option<&Path>,
+) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
+    let config = match config_path {
+        Some(path) => match rocky_core::config::load_rocky_config(path) {
+            Ok(config) => Some(config),
+            Err(rocky_core::config::ConfigError::FileNotFound { .. }) => None,
+            Err(error) => {
+                return Err(anyhow::Error::from(error).context(format!(
+                    "failed to load config from {} for the offline SQL preview",
+                    path.display()
+                )));
+            }
+        },
+        None => None,
+    };
+    let adapter_type = config
+        .and_then(|cfg| {
+            // Prefer the default replication pipeline's target adapter; fall
+            // back to the first adapter declared in the config.
+            let target_adapter_name = registry::resolve_replication_pipeline(&cfg, None)
+                .ok()
+                .map(|(_, pipeline)| pipeline.target.adapter.clone());
+            target_adapter_name
+                .and_then(|name| cfg.adapters.get(&name).map(|a| a.adapter_type.clone()))
+                .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
+        })
+        .unwrap_or_else(|| "duckdb".to_string());
+    Ok(dialect_for_adapter_type(&adapter_type))
+}
+
 /// Resolve the configured target adapter's standalone [`SqlDialect`] from a
 /// `rocky.toml` path, without building a live adapter (no credentials needed).
 ///
@@ -611,6 +678,11 @@ pub(crate) fn dialect_for_adapter_type(
 /// [`dialect_for_adapter_type`]. Used by `compact` / `archive` so their
 /// maintenance generators see the real dialect and can fail fast off
 /// Databricks at plan time.
+///
+/// Stricter than [`preview_dialect`] on purpose: this one also refuses an
+/// unresolvable pipeline or an undeclared target adapter, because a
+/// maintenance generator that guessed the dialect would template Delta-only
+/// SQL at a warehouse that cannot run it.
 pub(crate) fn resolve_configured_dialect(
     config_path: &Path,
 ) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
@@ -805,7 +877,11 @@ fn preview_merge_shape(model_ir: &ModelIr, dialect: &dyn SqlDialect) -> Result<S
 /// The dialect is sourced from the project's configured target adapter type
 /// (via `config_path`) when available; otherwise it defaults to DuckDB (or the
 /// Databricks fallback when the `duckdb` feature is off). See
-/// [`dialect_for_adapter_type`].
+/// [`preview_dialect`] and [`dialect_for_adapter_type`].
+///
+/// A `rocky.toml` that exists but does NOT LOAD is an error, not a fallback:
+/// previewing a broken Snowflake project in DuckDB would answer a question
+/// nobody asked. Only a missing file resolves the default dialect.
 ///
 /// ## Replication-only projects
 ///
@@ -827,22 +903,10 @@ pub fn plan_preview_output(
     output.env = env.map(str::to_string);
 
     // Resolve the preview dialect from the configured target adapter type.
-    // No config / unresolvable target → DuckDB (or the Databricks fallback
-    // when the `duckdb` feature is off).
-    let adapter_type = config_path
-        .and_then(|p| rocky_core::config::load_rocky_config(p).ok())
-        .and_then(|cfg| {
-            // Prefer the default replication pipeline's target adapter; fall
-            // back to the first adapter declared in the config.
-            let target_adapter_name = registry::resolve_replication_pipeline(&cfg, None)
-                .ok()
-                .map(|(_, pipeline)| pipeline.target.adapter.clone());
-            target_adapter_name
-                .and_then(|name| cfg.adapters.get(&name).map(|a| a.adapter_type.clone()))
-                .or_else(|| cfg.adapters.values().next().map(|a| a.adapter_type.clone()))
-        })
-        .unwrap_or_else(|| "duckdb".to_string());
-    let dialect = dialect_for_adapter_type(&adapter_type);
+    // No config file / unresolvable target → DuckDB (or the Databricks
+    // fallback when the `duckdb` feature is off). A config that EXISTS but
+    // does not load refuses — see [`preview_dialect`].
+    let dialect = preview_dialect(config_path)?;
 
     // Compile the project in-process (offline — no source schemas, no cache).
     let config = CompilerConfig {
@@ -3060,6 +3124,102 @@ table = "m"
         .unwrap();
 
         let out = plan_preview_output(None, &models_dir, None, None).unwrap();
+        assert_eq!(out.statements.len(), 1);
+        assert_eq!(out.statements[0].target, "c.s.m");
+    }
+
+    /// SIXTEENTH ROUND, finding 1 — a `rocky.toml` that EXISTS but does not
+    /// LOAD used to be swallowed by `.ok()`, and the preview fell through to
+    /// the DuckDB default.
+    ///
+    /// The concrete gap that made this a defect rather than a tidy-up: `main`'s
+    /// #1522 made `rocky compile` refuse the same file (`compile_inner` tolerates
+    /// `FileNotFound` and nothing else), and the MCP server exposes BOTH tools
+    /// off the same `config_path`. So one malformed Snowflake config failed
+    /// `compile` while `plan_preview` returned confident DUCKDB-rendered SQL for
+    /// a project whose config cannot be read — the strictness landed on one path
+    /// and not its sibling.
+    ///
+    /// The models here are VALID and the target dialect is Snowflake, so the
+    /// only thing that can make this fail is the config. A preview that
+    /// swallowed the error would return exactly one statement and pass every
+    /// other assertion in this module.
+    #[test]
+    fn plan_preview_refuses_a_malformed_config_instead_of_defaulting_to_duckdb() {
+        let tmp = TempDir::new().unwrap();
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "snowflake"
+account = "acct"
+"#,
+            &[(
+                "users",
+                r#"name = "users"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "users"
+"#,
+            )],
+        );
+
+        // Baseline: the SAME project previews fine while the config parses.
+        // Without this the test could pass on a project that never rendered.
+        let ok = plan_preview_output(Some(&cfg_path), &models_dir, None, None)
+            .expect("a well-formed config previews");
+        assert_eq!(ok.statements.len(), 1, "baseline must render one statement");
+
+        // Now break the file — unterminated string, so TOML parsing fails.
+        fs::write(&cfg_path, "[adapter.default\ntype = \"snowflake\"\n").unwrap();
+
+        let err = plan_preview_output(Some(&cfg_path), &models_dir, None, None)
+            .expect_err("a malformed rocky.toml must refuse, not default to DuckDB");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("failed to load config"),
+            "the refusal must name the config as the cause so a caller can act \
+             on it, got: {rendered}"
+        );
+    }
+
+    /// The tolerated half of the rule above, pinned so a later tightening
+    /// cannot quietly remove it: `--config` DEFAULTS to `rocky.toml`, so the
+    /// standalone `--models <dir>` case reaches `preview_dialect` with a path
+    /// that does not exist. That is `FileNotFound`, and it must still resolve
+    /// the default dialect rather than refuse.
+    #[test]
+    fn plan_preview_tolerates_an_absent_config_file() {
+        let tmp = TempDir::new().unwrap();
+        let models_dir = tmp.path().join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(models_dir.join("m.sql"), "-- model: m\nSELECT 1 AS id").unwrap();
+        fs::write(
+            models_dir.join("m.toml"),
+            r#"name = "m"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "m"
+"#,
+        )
+        .unwrap();
+
+        // A path that was never written — the `--config` default against a
+        // directory with no project file.
+        let absent = tmp.path().join("rocky.toml");
+        assert!(!absent.exists());
+        let out = plan_preview_output(Some(&absent), &models_dir, None, None)
+            .expect("an ABSENT config is the standalone case, not a malformed one");
         assert_eq!(out.statements.len(), 1);
         assert_eq!(out.statements[0].target, "c.s.m");
     }
