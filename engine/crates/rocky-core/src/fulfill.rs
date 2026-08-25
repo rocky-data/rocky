@@ -113,6 +113,34 @@ impl FulfillState {
     }
 }
 
+/// Which drafting round a dispatch is: the first pass at the model, or a
+/// repair of a red verification (#1493).
+///
+/// The two rounds hand the worker a different brief and a different
+/// budget, so a resume must dispatch the one the machine decided. The
+/// `Default` is [`Self::Draft`], which is what a record written before
+/// this field existed deserializes to — the pre-existing behaviour, so
+/// an upgrade never changes a running product's round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftingRound {
+    /// The first drafting pass for this generation.
+    #[default]
+    Draft,
+    /// A repair pass after the verify bundle came back red.
+    Repair,
+}
+
+impl DraftingRound {
+    /// The stable tag (journal text, refusal messages).
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Repair => "repair",
+        }
+    }
+}
+
 /// The current fulfillment record of one product (key `product:<name>`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FulfillStateRecord {
@@ -150,6 +178,23 @@ pub struct FulfillStateRecord {
     /// Verify-red → repair-drafting cycles consumed.
     #[serde(default)]
     pub repair_rounds: u32,
+    /// Which drafting round the machine dispatched into the CURRENT
+    /// drafting window (#1493).
+    ///
+    /// Persisted because a resume reads the record, not the decision
+    /// that produced it: a crash after the repair transition commits but
+    /// before the worker is dispatched would otherwise re-enter as a
+    /// plain draft, handing the worker the drafting brief and the
+    /// drafting budget for a round the machine decided was a repair.
+    ///
+    /// It is NOT derivable from [`Self::repair_rounds`]: that counter
+    /// survives the supersession and re-approval paths, so a fresh
+    /// generation's FIRST draft can legitimately carry a non-zero count.
+    ///
+    /// Meaningful only while the state is
+    /// [`FulfillState::Drafting`]; every dispatch rewrites it.
+    #[serde(default)]
+    pub drafting_round: DraftingRound,
     /// The loop process currently driving this product. `None` = the
     /// record is released (every clean stop clears it); a stamp that
     /// outlives its process is what the takeover probe detects.
@@ -192,6 +237,7 @@ impl FulfillStateRecord {
             idempotency_key: None,
             drafting_attempts: 0,
             repair_rounds: 0,
+            drafting_round: DraftingRound::Draft,
             owner_pid: None,
             owner_start_time: None,
             driver_pgid: None,
@@ -294,6 +340,61 @@ pub enum FulfillCas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `drafting_round` (#1493) must be readable in BOTH directions
+    /// across the version that added it, because the record is persisted
+    /// state a user's binary may straddle:
+    ///
+    /// - a record written BEFORE the field existed must still parse, and
+    ///   default to `Draft` — the behaviour that shipped before, so an
+    ///   upgrade never changes a running product's round;
+    /// - a record written AFTER must still parse on a binary that does
+    ///   not know the field, i.e. the struct must not deny unknown
+    ///   fields.
+    ///
+    /// The whole-record CAS compares equality, so a field that silently
+    /// changed representation between reads would make every CAS lose.
+    #[test]
+    fn the_drafting_round_reads_across_the_version_that_added_it() {
+        // A record as an OLDER binary wrote it: no `drafting_round` key.
+        let old = serde_json::json!({
+            "state": "drafting",
+            "product_id": "product:revenue_daily",
+            "journal_seq": 3,
+            "drafting_attempts": 1,
+            "repair_rounds": 2,
+        });
+        let parsed: FulfillStateRecord =
+            serde_json::from_value(old).expect("a pre-field record still parses");
+        assert_eq!(
+            parsed.drafting_round,
+            DraftingRound::Draft,
+            "an absent round defaults to the behaviour that shipped before"
+        );
+
+        // Re-serializing and re-reading is stable, so an expected/current
+        // pair read either side of a write still compares equal.
+        let round_tripped: FulfillStateRecord =
+            serde_json::from_str(&serde_json::to_string(&parsed).expect("serialize"))
+                .expect("deserialize");
+        assert_eq!(round_tripped, parsed, "the CAS compares whole records");
+
+        // A record an OLDER binary reads back: the unknown key is
+        // ignored, not a hard error.
+        let mut newer = parsed.clone();
+        newer.drafting_round = DraftingRound::Repair;
+        let text = serde_json::to_string(&newer).expect("serialize");
+        assert!(text.contains("\"drafting_round\":\"repair\""), "{text}");
+        #[derive(serde::Deserialize)]
+        struct WithoutTheField {
+            product_id: String,
+            repair_rounds: u32,
+        }
+        let older: WithoutTheField =
+            serde_json::from_str(&text).expect("a reader without the field must not fail");
+        assert_eq!(older.product_id, "product:revenue_daily");
+        assert_eq!(older.repair_rounds, 2);
+    }
 
     #[test]
     fn state_tags_round_trip_through_serde() {

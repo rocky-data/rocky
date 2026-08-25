@@ -6,7 +6,7 @@ default:
 # --- Build ---
 
 # Build all subprojects (release mode)
-build: build-engine build-sdk build-dagster build-framework build-vscode
+build: build-engine build-sdk build-dagster build-vscode
 
 build-engine:
     cd engine && cargo build --release
@@ -18,17 +18,13 @@ build-sdk:
 build-dagster:
     cd integrations/dagster && uv build --wheel
 
-# rocky-fulfillment also depends on rocky-sdk — keep it after build-sdk.
-build-framework:
-    cd framework && uv build --wheel
-
 build-vscode:
     cd editors/vscode && npm install && npm run compile
 
 # --- Test ---
 
 # Run all test suites
-test: test-engine test-sdk test-dagster test-framework test-vscode
+test: test-engine test-sdk test-dagster test-vscode
 
 test-engine:
     cd engine && cargo test
@@ -38,9 +34,6 @@ test-sdk:
 
 test-dagster:
     cd integrations/dagster && uv run pytest
-
-test-framework:
-    cd framework && uv run pytest
 
 # Note: `npm test` runs the VS Code integration tests which download a full
 # Electron under .vscode-test/ (~344 MB). Use vitest unit tests by default
@@ -64,7 +57,7 @@ evals-selftest:
 
 # --- Lint ---
 
-lint: lint-engine lint-sdk lint-dagster lint-framework lint-vscode
+lint: lint-engine lint-sdk lint-dagster lint-vscode
 
 lint-engine:
     cd engine && cargo clippy --all-targets -- -D warnings && cargo fmt --check
@@ -74,9 +67,6 @@ lint-sdk:
 
 lint-dagster:
     cd integrations/dagster && uv run ruff check && uv run ruff format --check
-
-lint-framework:
-    cd framework && uv run ruff check && uv run ruff format --check
 
 lint-vscode:
     cd editors/vscode && npm run lint
@@ -111,17 +101,22 @@ codegen-all: codegen regen-fixtures
 
 # Export JSON schemas from the engine's typed CLI output structs.
 #
-# Builds the rocky binary in release mode and reuses it. The release
-# build is shared with `regen-fixtures` (which expects
-# engine/target/release/rocky), so a single `just codegen && just
-# regen-fixtures` invocation only compiles the engine once.
+# Builds the rocky binary with the DEV profile deliberately. Codegen output is
+# serialized `schemars` JSON — no optimization pass can change it — and a
+# two-profile byte-diff (schemas + openapi + dagster fixtures) confirmed the
+# release and debug binaries produce identical bytes. The release build cost
+# ~7 minutes against ~40 seconds for debug over the same warm dependencies,
+# and it was the single largest step in the codegen-drift CI job.
+#
+# The binary is shared with `regen-fixtures` (which resolves it the same way),
+# so `just codegen && just regen-fixtures` compiles the engine once.
 codegen-rust:
-    cd engine && cargo run --quiet --release --bin rocky -- export-schemas ../schemas
+    cd engine && cargo run --quiet --bin rocky -- export-schemas ../schemas
 
 # Generate the OpenAPI 3.1 document for the `rocky serve` HTTP API from the
 # same typed schema registry as `codegen-rust` plus the `/api/v1` route table.
 #
-# Reuses the release binary built by `codegen-rust` (it runs after it in the
+# Reuses the binary built by `codegen-rust` (it runs after it in the
 # `codegen` aggregate), so a `just codegen` run compiles the engine only once.
 # The document is validated against the OpenAPI 3.1 meta-schema offline before
 # it is written; a structurally invalid or dangling-ref document fails here.
@@ -129,7 +124,7 @@ codegen-rust:
 # `schemas/` (avoiding the export-schemas count-guard). codegen-drift CI fails
 # if the committed document is stale.
 codegen-openapi:
-    cd engine && cargo run --quiet --release --bin rocky -- export-openapi ../docs/public/openapi.json
+    cd engine && cargo run --quiet --bin rocky -- export-openapi ../docs/public/openapi.json
 
 # Regenerate Pydantic v2 models in the rocky-sdk package from schemas/
 # (writes to sdk/python/src/rocky_sdk/types_generated/). dagster-rocky
@@ -233,11 +228,6 @@ release-dagster version *args:
 # Release VS Code extension (pass --publish to also push to Marketplace)
 release-vscode version *args:
     ./scripts/release.sh vscode {{version}} {{args}}
-
-# Release the fulfillment framework: framework-v* tag + GitHub Release only.
-# Nothing publishes to a registry yet (the script refuses --publish).
-release-framework version *args:
-    ./scripts/release.sh framework {{version}} {{args}}
 
 # --- Demo recording ---
 

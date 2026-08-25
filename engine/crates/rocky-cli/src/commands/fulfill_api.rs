@@ -34,6 +34,12 @@ pub use crate::commands::review::{compute_review_status, run_review_status};
 pub use crate::commands::run::RunTermination;
 #[cfg(feature = "duckdb")]
 pub use crate::commands::test::test_output;
+// How many declarative tests the runner WOULD execute for a model. The
+// loop reports these as deferred at `verifying`, where the target is not
+// materialised yet and none of them can run. Shares the declarative
+// runner's own loader so the counted set is the executed set.
+#[cfg(feature = "duckdb")]
+pub use crate::commands::test::declarative_test_count;
 // The loop's stop report (registered in export-schemas as `fulfill`),
 // and the one JSON printer, so the loop's whole rocky-cli surface stays
 // this module.
@@ -793,6 +799,34 @@ pub fn product_status(
     product_name: &str,
 ) -> Result<ProductStatusOutput> {
     super::product::product_status_in(root, state_path, product_name)
+}
+
+/// The typed outcome of [`product_reopen_drafting`], re-exported so the
+/// loop's whole engine surface stays behind this façade.
+pub use rocky_core::product::commit::ReopenOutcome;
+
+/// (Re)open the drafting window before dispatching a drafting or repair
+/// worker (#1493). Invariant guarded: a committed MERGED manifest
+/// belongs to the previous round — every recorded hash is byte-verified
+/// FIRST (drift while no write was authorized is reported as
+/// [`ReopenOutcome::Tampered`], never blessed), and only then is the
+/// manifest demoted to Phase A through the staged commit, so the
+/// worker's sidecar rewrite is authorized exactly like round 1's and
+/// the next Phase B re-records the hashes it merges. Only the commit
+/// protocol ever updates hashes.
+///
+/// Gated on the loop's decision, not on a product name: the fulfillment
+/// record is read from `state_path` and must be this product's, at
+/// `drafting`, owner-stamped by THIS process. A caller that never won
+/// the record's compare-and-swap gets `reopen-undecided` and nothing is
+/// mutated. The raw demotion is `pub(crate)` inside `rocky-core` and
+/// cannot be named from here at all.
+pub fn product_reopen_drafting(
+    root: &Path,
+    state_path: &Path,
+    product_name: &str,
+) -> Result<ReopenOutcome> {
+    super::product::product_reopen_in(root, state_path, product_name)
 }
 
 /// Approve the current spec revision — the authority transition:

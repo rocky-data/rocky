@@ -213,14 +213,25 @@ connector-level `--filter id=<conn_id>` keys remain unchanged.
 
 ```toml
 [pipeline.silver]
-type        = "transformation"
-models_dir  = "models/silver"
-contracts_dir = "contracts/silver"
-depends_on  = ["raw"]
+type       = "transformation"
+models     = "models/silver/**"   # glob, relative to rocky.toml; default "models/**"
+depends_on = ["raw"]
 
+# There is no contracts key: a model's contract is auto-discovered as the
+# sibling `<model>.contract.toml`, or passed at the CLI via `--contracts <dir>`.
+
+# A transformation target takes an adapter ref (plus optional governance)
+# and nothing else — `catalog`/`schema` here are parse errors
+# (`deny_unknown_fields`). Each model names its own destination in its
+# sidecar `[target]`:
+#
+#   # models/silver/dim_customers.toml
+#   [target]
+#   catalog = "analytics"
+#   schema  = "marts"
+#   table   = "dim_customers"
 [pipeline.silver.target]
-catalog = "analytics"
-schema  = "marts"
+adapter = "warehouse"
 ```
 
 ### Quality pipeline
@@ -230,14 +241,19 @@ schema  = "marts"
 type       = "quality"
 depends_on = ["silver"]
 
+# A quality target is an adapter ref only. The tables to check are listed
+# in `[[pipeline.qa.tables]]` (omit `table` to check the whole schema).
 [pipeline.qa.target]
+adapter = "warehouse"
+
+[[pipeline.qa.tables]]
 catalog = "analytics"
 schema  = "marts"
 
+# Quality runs execute `row_count`, `custom`, and `assertions` only. Other
+# check kinds are inert here — `rocky validate` warns (V034).
 [pipeline.qa.checks]
-row_count    = true
-column_match = true
-freshness    = { threshold_seconds = 86400 }
+row_count = true
 ```
 
 ### Snapshot pipeline
@@ -245,6 +261,8 @@ freshness    = { threshold_seconds = 86400 }
 ```toml
 [pipeline.dim_history]
 type       = "snapshot"
+unique_key = ["customer_id"]     # required: row identity in the source table
+updated_at = "updated_at"        # required: change-detection column
 depends_on = ["silver"]
 
 [pipeline.dim_history.source]
@@ -255,6 +273,7 @@ table   = "dim_customers"
 [pipeline.dim_history.target]
 catalog = "analytics_history"
 schema  = "snapshots"
+table   = "dim_customers_history"   # required: explicit history table
 ```
 
 ## Minimal-config defaults (omit these)
@@ -272,7 +291,14 @@ The parser applies sane defaults — keep configs lean by omitting anything that
 | Model `target.table` | `name` | Renaming on write |
 | Directory-level `target` | `models/_defaults.toml` inherited | Overriding per-model |
 
-## Checks (all four pipeline types)
+## Checks
+
+Every pipeline type accepts a `[checks]` block, but execution differs:
+replication runs the full set; quality runs `row_count`, `custom`, and
+`assertions` only; transformation, snapshot, and load run no pipeline-level
+checks today (`executed_check_kinds` in `config.rs` is the source of
+truth). `rocky validate` warns (V034) on a check the pipeline type never
+executes.
 
 ```toml
 [pipeline.<name>.checks]

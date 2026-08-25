@@ -69,6 +69,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: engine
+          # Save only from main. The cache is immutable per key, so a PR that
+          # matches main's key never re-saves anyway; a PR that MISSES it (a
+          # lockfile or toolchain change) used to mint its own multi-GB copy
+          # under refs/pull/N/merge. Those duplicates pushed the repo past
+          # GitHub's 10 GB cache budget and triggered LRU eviction of main's
+          # entries — which is what turns a warm 11-minute run into a cold
+          # 35-minute one. PRs still RESTORE from main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Free disk space and add swap
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
@@ -101,6 +109,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: engine
+          # Save only from main. The cache is immutable per key, so a PR that
+          # matches main's key never re-saves anyway; a PR that MISSES it (a
+          # lockfile or toolchain change) used to mint its own multi-GB copy
+          # under refs/pull/N/merge. Those duplicates pushed the repo past
+          # GitHub's 10 GB cache budget and triggered LRU eviction of main's
+          # entries — which is what turns a warm 11-minute run into a cold
+          # 35-minute one. PRs still RESTORE from main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Free disk space and add swap
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
@@ -158,6 +174,14 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: engine
+          # Save only from main. The cache is immutable per key, so a PR that
+          # matches main's key never re-saves anyway; a PR that MISSES it (a
+          # lockfile or toolchain change) used to mint its own multi-GB copy
+          # under refs/pull/N/merge. Those duplicates pushed the repo past
+          # GitHub's 10 GB cache budget and triggered LRU eviction of main's
+          # entries — which is what turns a warm 11-minute run into a cold
+          # 35-minute one. PRs still RESTORE from main's cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Free disk space and add swap
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc

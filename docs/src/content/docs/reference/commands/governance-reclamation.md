@@ -7,7 +7,7 @@ sidebar:
 
 These commands govern what an agent, or a person, may change. They also record what was decided and reclaim storage.
 
-One rule runs through all of them: the review gate. Every mutating plan on this page needs an explicit human sign-off before `rocky apply` will execute it. The read-only commands write nothing at all.
+One rule runs through all of them: the review gate. Every mutating plan on this page needs an approval marker before `rocky apply` will execute it. `rocky review <plan-id> --approve` writes that marker. The read-only commands write nothing at all.
 
 For the concepts behind the policy plane and the agent authoring loop, see [Operating Rocky with agents](/concepts/operating-rocky-with-agents/).
 

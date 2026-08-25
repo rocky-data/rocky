@@ -8,21 +8,22 @@
 ## What it shows
 
 One product goes from nothing to a live table, driven by one binary. You write no
-SQL and pre-create no spec. `rocky fulfill revenue_daily` drives the loop's happy
-path end to end:
+SQL and pre-create no spec. `rocky fulfill revenue_daily` drives the loop end to
+end — including one repair round, because the recorded first draft is wrong:
 
 ```
 elicit spec ─▶ human approves spec ─▶ lower to contract ─▶ agent drafts SQL
-   ─▶ verify ─▶ propose plan ─▶ human approves plan ─▶ digest-gated apply ─▶ observe
+   ─▶ verify ──red (E010)──▶ repair round (agent redrafts) ─▶ re-verify green
+   ─▶ propose plan ─▶ human approves plan ─▶ digest-gated apply ─▶ observe
 ```
 
 Every step that could let an agent change the warehouse without a human is a real
 engine gate, and this POC drives each one and checks it holds. The default
 `./run.sh` uses a **recorded** worker session (no network, no key), so it runs in
 CI. `./run-live.sh` swaps in a **real** worker (`claude -p`) that writes the SQL
-itself. Scope: this POC covers the happy path and every gate above — it does NOT
-exercise repair recovery (a red verify → retry), which is a known engine gap
-(#1493, see below).
+itself. The recorded drafting round forgets the required `revenue_eur` column, so
+the runner's own verify bundle comes back red and the loop recovers through a
+recorded repair round (#1493, fixed — see below).
 
 ## Why it's distinctive
 
@@ -49,13 +50,31 @@ exercise repair recovery (a red verify → retry), which is a known engine gap
   completion gate. Its precise scope — what is genuine authorship and what is
   brief-provided grounding — is in "What the live lane proves" below; do not read
   it as an agent designing the whole product spec unaided.
-- **Repair recovery is NOT exercised — a known engine gap (#1493).** When the
+- **Repair recovery IS exercised (replay lane) — #1493 is fixed.** When the
   runner's verify goes red it dispatches a *repair* round, whose `draft_model`
-  legitimately rewrites the merged sidecar; the artifact byte-check then compares
-  that rewrite against Phase B's pre-repair hash and mis-classifies it as
-  `tampered`. So both lanes use an empty `repair.calls` / rely on the first draft
-  being green, and the POC's claim is bounded to the happy path plus every gate.
-  Repair recovery lands when #1493 is fixed in the engine (not fixed here).
+  legitimately rewrites the merged sidecar. The engine used to compare that
+  rewrite against Phase B's pre-repair hash and mis-classify the loop's own
+  work as `tampered`; it now **reopens the drafting window through the staged
+  commit** before dispatching repair (verify every recorded hash first — drift
+  there is still tamper — then demote the manifest to Phase A), so the repair
+  write is authorized exactly like the first draft's and out-of-band edits
+  between gates stay detected. The replay lane's recorded first draft is red
+  (E010: `revenue_eur` missing) and the recorded repair fixes it; assert 2
+  pins the round by KIND — the worker transcripts must be exactly
+  `elicitation`, `drafting`, `repair`, and the repaired SQL must survive. By
+  kind, not by count: three transcripts reading `elicitation, drafting,
+  drafting` would pass a count check while meaning the repair round was
+  dispatched as a plain draft. The **banked live evidence predates the fix** —
+  its first draft was green, so it exercised no repair round; the live lane
+  simply gains this recovery path now.
+- **The repair window is a real residual.** Between the repair dispatch and the
+  merge that closes it, the sidecar is not covered by any hash, and the merge
+  preserves keys and `[[tests]]` entries the lowering does not own — so content
+  added to that file during the window is carried into the committed artifact.
+  Using it needs a process that can write the models directory while the loop
+  runs, which is the same access that can forge an approval marker. This POC
+  makes no claim to defend against that. Tracked in
+  [#1515](https://github.com/rocky-data/rocky/issues/1515).
 - **Freshness is observed, not enforced.** Assert 10 shows the loop *reporting*
   staleness (lag vs budget) after the data is aged. Staleness is a finding in the
   loop's journal; it never blocks an apply. This POC makes no claim that Rocky
@@ -159,11 +178,15 @@ ANTHROPIC_API_KEY=... ./run-live.sh   # live lane: a real worker drafts the SQL
 [1] cold start: elicitation writes the candidate, loop stops for approval
     OK  state=needs_input, products/revenue_daily.toml written by the runner
 ...
+[2] approve + drive: red draft -> repair round -> converged; manifest total
+    OK  red draft repaired (3 transcripts; repaired SQL survived); manifest merged, ...
+...
 [10] staleness: fresh observe (lag<budget), then stale after backdating (lag>budget)
-    OK  fresh lag 5s < 86400s; stale lag 209383917s > 86400s; journal=39 rows
+    OK  fresh lag 5s < 86400s; stale lag 209383917s > 86400s; journal=44 rows
 
-POC complete: spec -> lowering -> propose -> human gate -> digest-gated apply,
-with 6 refusal paths exercised (negatives, policy, supersession, backstop, staleness).
+POC complete: spec -> lowering -> red draft -> REPAIR -> propose -> human
+gate -> digest-gated apply, with 6 refusal paths exercised (negatives,
+policy, supersession, backstop, staleness).
 ```
 
 ## The 10 asserts, each mapped to the engine gate it exercises
@@ -171,7 +194,7 @@ with 6 refusal paths exercised (negatives, policy, supersession, backstop, stale
 | # | Assert | Engine gate |
 |---|---|---|
 | 1 | Cold start writes the candidate | `Init` → elicit → confined candidate write → `needs_input(spec_approval)`; hand-off digest re-verified |
-| 2 | Manifest is total (merged, 0 rejects) | `product compile` staged lowering + manifest totality |
+| 2 | Red draft → repair round → converged; manifest total (merged, 0 rejects) | the verify bundle goes red (E010) → repair dispatch reopens the drafting window through the staged commit (#1493) → re-merge → green; `product compile` staged lowering + manifest totality |
 | 3 | 6 broken specs each refused by code | spec-schema gates (`unknown-key`, `type-not-rocky`, `freshness-missing-time-column`, `source-not-exact-triple`, `classification-unresolved`, `trust-not-propose-only`) |
 | 4 | Stripped `[policy]` → paste-ready block | posture verification (`product verify`), compared verbatim to the loop's stop |
 | 5 | Plan carries product_id + spec_digest | governed propose writes `.rocky/plans/<id>.json` with the product binding |

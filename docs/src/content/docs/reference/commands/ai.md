@@ -364,6 +364,7 @@ rocky mcp [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--config <PATH>` | `PathBuf` | `rocky.toml` | Pipeline config file the server resolves the project from. The models directory is resolved as `<config-dir>/models`. |
+| `--profile <PROFILE>` | `default` \| `approver` \| `worker` | `default` | Which tool surface to serve. `default` serves all 31 tools but refuses `review_queue`'s approve action (listing the queue still works). `approver` serves the same 31 tools and allows that action, so the server can write approval markers. `worker` serves the minimal drafting allowlist for an untrusted worker. |
 
 The server is **stateless**: every tool call resolves the project from the config + models dir and compiles fresh, so it always reflects the current on-disk files. Logging goes to stderr (stdout is reserved for the MCP wire protocol).
 
@@ -376,33 +377,38 @@ The server is **stateless**: every tool call resolves the project from the confi
 
 What leaves your machine is bounded: warehouse queries go to your warehouse; the generators send your model's SQL and schema to **your own** Anthropic key, and for `ai_contract` only aggregate column counts (row / null / distinct), **never raw cell values**.
 
-### Safety model: read-only and propose-only
+### Safety model: the server does not materialize
 
-The server **never materializes anything**. An agent can write files and record a plan. It stops there.
+The server **never materializes anything**. No tool runs SQL that changes your warehouse. An agent can write project files and record a plan. One tool, `review_queue`, can also write the approval marker for a plan that is already in the pending review queue — but only on `rocky mcp --profile approver`. The default server refuses that call.
 
 ```
-   agent, through rocky mcp                human
-   ────────────────────────                ──────────────────────────
+   through rocky mcp                       through the CLI
+   ─────────────────                       ───────────────
    draft_model     ──writes──► models/<name>.sql + sidecar
    draft_contract  ──writes──► models/<model>.contract.toml
    draft_check     ──writes──► [[tests]] in the sidecar
         │
-        │ this is as far as the agent goes
         ▼
    propose         ──writes──► .rocky/plans/<plan-id>.json
                                         │
                                         ▼
                               rocky review <plan-id> --approve
+                              writes the approval marker. The
+                              review_queue MCP tool writes it
+                              too, with confirm: true — but ONLY
+                              on --profile approver. The default
+                              server refuses (approve_not_enabled).
                                         │
                                         ▼
                               rocky apply <plan-id> ──► warehouse
+                              no MCP tool runs this step
 ```
 
 Three rules keep that boundary in place:
 
 - The generators (`ai_contract`, `ai_test`, `explain_model`) return **drafts** and mutate nothing. Hand a draft to the `draft_contract` or `draft_check` write tool, or save it to disk and run `compile` and `test` yourself.
 - `governance_preview` and `drift_preview` are **read-only** previews.
-- The server never approves on your behalf. Approval is the one step it cannot take.
+- The server does not apply. `rocky apply` is the only step that WRITES to the warehouse, and no MCP tool runs it. Some tools do read the warehouse: `sample_rows`, `profile_column`, `inspect_schema`, and `drift_preview` issue queries against it. `review_queue` can write a plan's approval marker, but only on `rocky mcp --profile approver` — the default server refuses the call with `approve_not_enabled` and writes nothing. Where it is served it still needs `confirm: true` from the caller, and it still refuses a plan that is not already in the pending review queue. `rocky mcp --profile worker` does not serve `review_queue` at all. So treat approval as a step the server can take **only on a server you started for that purpose**; the profile is chosen at launch and an agent cannot change it mid-session.
 
 ### Tools
 
@@ -451,11 +457,11 @@ A `draft_*` call made without its content `spec` returns an actionable error poi
 
 | Tool | What it does |
 |---|---|
-| `propose` | Record an **AI-authored plan** for materializing a model. Writes a plan only — it compiles the project and records the plan offline (no LLM call, no warehouse write). A human must run `rocky review <plan_id> --approve` then `rocky apply <plan_id>`. |
+| `propose` | Record an **AI-authored plan** for materializing a model. Writes a plan only — it compiles the project and records the plan offline (no LLM call, no warehouse write). `rocky apply <plan_id>` then runs it only once `rocky review <plan_id> --approve` has written the approval marker. |
 
 ### Prompts (guided trajectories)
 
-The server also exposes MCP prompts that orchestrate the tools above into a guided workflow. Every trajectory **stops at the propose / human-gate step**; it never applies.
+The server also exposes MCP prompts that orchestrate the tools above into a guided workflow. Every trajectory **stops at the propose step**; it never applies.
 
 | Prompt | What it guides |
 |---|---|
@@ -488,4 +494,4 @@ claude mcp add rocky -- rocky mcp --config rocky.toml
 ### Related Commands
 
 - [`rocky ai`](#rocky-ai) -- one-shot model generation from the CLI (no MCP client needed)
-- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- execute an approved AI-authored plan (a human runs `rocky review <plan_id> --approve` first)
+- [`rocky apply`](/reference/commands/core-pipeline/#rocky-apply) -- execute an AI-authored plan (`rocky review <plan_id> --approve` writes the marker it requires first)

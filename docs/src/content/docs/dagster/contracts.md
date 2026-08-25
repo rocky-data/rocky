@@ -36,7 +36,6 @@ project/
 [rules]
 required = ["id", "amount"]
 protected = ["customer_id"]
-no_new_nullable = true
 
 # Per-column type and nullability constraints
 [[columns]]

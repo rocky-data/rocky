@@ -4,9 +4,10 @@
 # For each assert n, run.sh carries a guarded `MUTATE=n` hook that breaks THAT
 # assert's engine gate (a lying digest, a dropped contract column, an un-stripped
 # policy, a corrupted plan binding, a skipped review, a right-instead-of-wrong
-# digest, a deleted grain test, un-aged data, ...). A correct assert must then
-# print exactly `FAIL: n`. This script runs all ten in a throwaway COPY of the
-# POC (the mutations never touch the committed tree) and prints the ledger.
+# digest, a deleted grain test, un-aged data, a green-first-draft that skips
+# the repair round, ...). A correct assert must then print exactly `FAIL: n`.
+# This script runs every mutation in a throwaway COPY of the POC (the
+# mutations never touch the committed tree) and prints the ledger.
 #
 # Run AFTER `./run.sh` is green. Requires `rocky` on PATH (same as run.sh).
 set -uo pipefail
@@ -25,6 +26,7 @@ rm -rf "$WORK/poc/products" "$WORK/poc/.rocky" "$WORK/poc/expected" "$WORK/poc/w
 declare -a WHAT=(
   "1:lie about the candidate hand-off digest (runner refuses the write)"
   "2:inject a rejected field into the committed manifest (breaks zero-rejects totality)"
+  "2r:record a GREEN first draft so no repair round runs (repair evidence must be real, #1493)"
   "3:swap a broken spec for the valid one (a valid spec exits 0 -> no refusal)"
   "4:keep [policy] instead of stripping it (posture passes, no paste-block)"
   "5:strip product_id from the persisted plan payload"
@@ -72,6 +74,6 @@ echo
 echo "Ledger (assert | broken gate | observed | verdict):"
 printf '%s' "$LEDGER"
 echo
-echo "Mutation pass: $pass / $total gate mutations caught (10 asserts; assert 9 has three — failed + errored + warned)."
+echo "Mutation pass: $pass / $total gate mutations caught (10 asserts; assert 2 has two — totality + repair evidence; assert 9 has three — failed + errored + warned)."
 [ "$pass" = "$total" ] || { echo "MUTATION PASS INCOMPLETE — $((total - pass)) mutation(s) not caught."; exit 1; }
 echo "Every broken gate is caught. The replay lane is a real gate exerciser."

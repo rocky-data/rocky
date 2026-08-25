@@ -40,6 +40,7 @@ pub mod physical_edges;
 pub mod plan_partition;
 pub mod policy;
 pub mod preview;
+pub mod process;
 pub mod product;
 pub mod quarantine;
 pub mod recipe_identity;

@@ -15,6 +15,13 @@
 //! Phase B → the runner's own verify bundle → governed propose →
 //! marker poll → pre-apply digest recompute from the snapshot → the
 //! typed apply with `expect_spec_digest` → observation.
+//!
+//! A red verify bundle re-enters drafting as a repair round. The
+//! dispatch first REOPENS the window (#1493): the committed merged
+//! generation is byte-verified in full (drift there is tamper —
+//! blocked), then its manifest is demoted to Phase A through the
+//! staged commit, so the worker's sidecar rewrite is authorized
+//! exactly like round 1's and Phase B re-records what it merges.
 
 use std::path::{Path, PathBuf};
 
@@ -113,6 +120,13 @@ pub async fn run_fulfill(
             return Ok(());
         }
     };
+
+    // Crash seam for the self-lockout drill (#1493): ownership is
+    // stamped on disk, no state transition has happened yet. The next
+    // invocation must be able to take that stamp over and still open its
+    // own drafting window — a gate that read the dead owner's stamp as
+    // "mine" would lock the product out permanently.
+    fault_point("post-acquire");
 
     let outcome = runner.step_loop(*record, retry).await;
     let (final_record, stop) = match outcome {
@@ -479,6 +493,22 @@ impl Runner {
 
         let test_green = self.scoped_tests_green(&model, &mut detail);
 
+        // The product's declared data checks live in the model sidecar
+        // as `[[tests]]`. They execute only via `rocky test
+        // --declarative`, against the MATERIALISED table — and this gate
+        // runs before apply, so the table does not exist yet.
+        // `test_green` above therefore covers model execution and unit
+        // tests ONLY. Counting the rest here is what keeps the bundle's
+        // claim honest: they are reported deferred, never as passed.
+        //
+        // Computed in the bundle rather than inside `scoped_tests_green`
+        // so the count survives the `#[cfg(not(feature = "duckdb"))]`
+        // build, which has no local test surface at all.
+        let (tests_deferred, deferred_note) = self.deferred_declared_checks(&spec);
+        if let Some(note) = deferred_note {
+            detail.push(note);
+        }
+
         let posture_green = match self.verify_posture()? {
             PostureStatus::Pass => true,
             PostureStatus::NeedsInput { reason, .. } | PostureStatus::Fail { reason } => {
@@ -517,8 +547,48 @@ impl Runner {
             test_green,
             posture_green,
             manifest_total,
+            tests_deferred,
             detail: detail.join(" | "),
         })
+    }
+
+    /// The deferred-checks report: the typed count, and the
+    /// plain-language note for `detail`.
+    fn deferred_declared_checks(&self, spec: &ApprovedSpec) -> (Option<usize>, Option<String>) {
+        deferred_report(self.count_declared_checks(spec))
+    }
+
+    /// Count every declared data check that `rocky test --declarative`
+    /// would run for this product's model.
+    ///
+    /// ASKS THE RUNNER'S OWN LOADER rather than re-deriving the set.
+    /// Two earlier re-derivations both undercounted: the spec's
+    /// `generated_tests` misses the worker's appended `[[tests]]` (the
+    /// merge preserves them), and the sidecar's raw `[[tests]]` array
+    /// misses every `[[use_test]]` reference (the model loader resolves
+    /// those against `test_definitions.toml` and appends them to
+    /// `ModelConfig.tests`, which is the vector the runner iterates).
+    ///
+    /// Counting through `declarative_test_count` makes the counted set
+    /// the executed set by construction, so a future layer of expansion
+    /// cannot silently reopen the same hole.
+    #[cfg(feature = "duckdb")]
+    fn count_declared_checks(&self, spec: &ApprovedSpec) -> Result<usize, String> {
+        fulfill_api::declarative_test_count(&self.models_dir, spec.parsed.output_model())
+            .map_err(|err| format!("{err:#}"))
+    }
+
+    /// Without the duckdb feature there is no declarative test surface
+    /// to ask, so the count is unavailable rather than invented. This
+    /// build already fails the verify gate closed (see
+    /// `scoped_tests_green`), so nothing is lost by declining here.
+    #[cfg(not(feature = "duckdb"))]
+    fn count_declared_checks(&self, _spec: &ApprovedSpec) -> Result<usize, String> {
+        Err(
+            "this build has no duckdb feature, so the declarative test loader \
+             cannot be asked what it would run"
+                .to_string(),
+        )
     }
 
     #[cfg(feature = "duckdb")]
@@ -582,11 +652,21 @@ impl Runner {
                 // A pre-gate failure (compile, ledger, plan write) is a
                 // red verify bundle in spirit: surface it as a verify
                 // failure so the repair budget applies.
+                //
+                // No deferred count of its own. `TaskKind::Propose` is
+                // dispatched from exactly one place — the all-green
+                // bundle arm — so a `verify green: N declared data
+                // checks deferred` row is ALREADY in the journal for
+                // this same pass. Re-reading the sidecar here would be
+                // a second, independent reading that could state a
+                // different number and make the journal tell two
+                // stories about one pass.
                 return Ok(Event::VerifyBundle {
                     compile_green: false,
                     test_green: true,
                     posture_green: true,
                     manifest_total: true,
+                    tests_deferred: None,
                     detail: format!("propose failed before the policy gate: {err}"),
                 });
             }
@@ -949,6 +1029,30 @@ impl Runner {
             }
         };
         let spec = self.approved_spec()?;
+
+        // #1493 — the loop's own authorized (re)opening of the drafting
+        // window: a committed MERGED manifest belongs to the previous
+        // round. The reopen byte-verifies EVERY recorded hash first
+        // (drift in the window between Phase B and this dispatch had no
+        // authorized writer — tamper, blocked), then demotes the
+        // manifest to Phase A through the staged commit, so the
+        // worker's sidecar rewrite is authorized exactly like round 1's
+        // and the next Phase B re-records the hashes it merges. Keyed
+        // on the ON-DISK manifest phase, never the task kind, so a
+        // resume that crashed between the repair CAS and the reopen
+        // still reopens (or still blocks).
+        if kind == TaskBriefKind::Repair {
+            // Crash seam for the reopen drill: the repair transition is
+            // journaled, the window not yet reopened.
+            fault_point("pre-repair-reopen");
+        }
+        match fulfill_api::product_reopen_drafting(&self.root, &self.state_path, &self.product)? {
+            fulfill_api::ReopenOutcome::Tampered(problems) => {
+                return Ok(Event::ArtifactCheck { problems });
+            }
+            fulfill_api::ReopenOutcome::NotNeeded | fulfill_api::ReopenOutcome::Reopened => {}
+        }
+
         let sources: Vec<String> = spec.parsed.product().source.tables.clone();
         let dir = self.fulfillment_dir();
         let verify_detail = match &record.state {
@@ -982,6 +1086,11 @@ impl Runner {
                 // Crash seam for the Phase-A tamper drill: the worker is
                 // gone (group killed), the byte-verify has not run yet.
                 fault_point("post-drafting");
+                if kind == TaskBriefKind::Repair {
+                    // The same seam scoped to a REPAIR round, for the
+                    // out-of-band-tamper-during-repair drill.
+                    fault_point("post-repair-drafting");
+                }
                 Event::DraftingFinished { error: None }
             }
             Err(err) => Event::DraftingFinished { error: Some(err) },
@@ -1066,6 +1175,18 @@ struct ApprovedSpec {
     parsed: rocky_core::product::spec::ParsedSpec,
 }
 
+/// Turn a count attempt into the typed field plus its `detail` note.
+///
+/// Pure, so the rule that a FAILED count never becomes `Some(0)` is
+/// pinned by a test rather than by reading the code. "0 deferred" and
+/// "could not tell" are different claims and only one can be true.
+fn deferred_report(counted: Result<usize, String>) -> (Option<usize>, Option<String>) {
+    match counted {
+        Ok(count) => (Some(count), machine::deferred_note(count)),
+        Err(why) => (None, Some(machine::uncounted_deferred_note(&why))),
+    }
+}
+
 fn render_refusal(refusal: &fulfill_api::PolicyRefusal) -> String {
     format!(
         "model '{}', rule {}, {}",
@@ -1092,3 +1213,30 @@ fn fault_point(name: &str) {
 
 #[cfg(not(debug_assertions))]
 fn fault_point(_name: &str) {}
+
+#[cfg(test)]
+mod deferred_check_counting {
+    use super::deferred_report;
+
+    #[test]
+    fn a_failed_count_reports_unknown_rather_than_zero() {
+        // The step-side half of the same rule the machine pins: a count
+        // that could not be read must NOT collapse into `Some(0)`,
+        // which would read as "nothing is deferred".
+        let (count, note) = deferred_report(Err("model 'x' not found".to_string()));
+        assert_eq!(count, None, "an unread count is not a zero count");
+        let note = note.expect("an unknown count still says checks are deferred");
+        assert!(note.contains("deferred"));
+        assert!(note.contains("count unavailable: model 'x' not found"));
+
+        let (count, note) = deferred_report(Ok(4));
+        assert_eq!(count, Some(4));
+        assert!(
+            note.expect("four deferred")
+                .starts_with("4 declared data checks deferred")
+        );
+
+        // A genuine zero is a real answer, and renders no clause.
+        assert_eq!(deferred_report(Ok(0)), (Some(0), None));
+    }
+}

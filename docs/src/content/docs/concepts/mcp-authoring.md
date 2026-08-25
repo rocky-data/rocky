@@ -126,7 +126,7 @@ returns an empty result rather than failing.
 
 ### Write path (draft tools)
 
-These are the safe way for an agent to change the project. Each one writes into
+These are the governed way for an agent to change the project. Each one writes into
 the project's `models/` directory and **compiles in the same call**, so you get
 the type-check with the write. Each one is also checked against your policy
 rules. A `draft_*` tool never applies a change to the warehouse.
@@ -151,7 +151,7 @@ one ends at a proposed plan or an enumerated gap, never at an applied change.
 
 | Prompt | What it walks |
 |---|---|
-| `build_model` | inspect_schema → sample_rows → profile_column → compile → plan preview → propose. Stops at the human approval gate. |
+| `build_model` | inspect_schema → sample_rows → profile_column → compile → plan preview → propose. Stops at the approval gate. |
 | `find_untested_models` | compile → identify untested models → `ai_test` / `ai_contract` → `draft_check` / `draft_contract` → propose. Stops at the gate. |
 | `add_tests_to_pks` | inspect_schema → identify key columns → `draft_check` (uniqueness + not-null) → propose. |
 | `summarize_project` | A read-only project tour; proposes nothing — points at `find_untested_models` / `build_model` for next steps. |
@@ -160,10 +160,19 @@ one ends at a proposed plan or an enumerated gap, never at an applied change.
 A prompt is a recommended sequence, not a privileged path. It calls exactly the
 tools listed above and it stops at the same gate.
 
-## Two profiles
+## Three profiles
 
-`rocky mcp` serves the full 31-tool surface by default. `rocky mcp --profile
-worker` serves a smaller, fixed list meant for an untrusted drafting worker: the
+`rocky mcp` serves all 31 tools by default, with one action held back:
+`review_queue` lists the pending review queue, but its approve action —
+`approve_plan_id` + `confirm: true`, which writes the approval marker that
+unblocks `rocky apply` — is refused with `approve_not_enabled`.
+
+`rocky mcp --profile approver` serves the same 31 tools and allows that one
+action. Use it only for a server you intend to be able to sign off plans.
+Approving is still attributed to the operator's git identity, not to a verified
+person.
+
+`rocky mcp --profile worker` serves a smaller, fixed list meant for an untrusted drafting worker: the
 read and inspect tools (`plan_preview`, `lineage`, `list`, `inspect_schema`,
 `catalog`, `sample_rows`, `profile_column`), the verification loop (`compile`,
 `test`, `breaking_change`, `dependents`), `draft_model` + `draft_check`, and the
@@ -182,13 +191,13 @@ tools on the allowlist and end at a hand-off to the trusted runner — never at
 
 The write path has three gates. No single call passes all three. A `draft_*`
 call passes two: the compiler type-checks what it wrote, then Rocky evaluates
-your `[policy]` rules before the call returns. The third gate is a human, and it
-sits at apply time. `propose` records an AI-authored plan and returns a
+your `[policy]` rules before the call returns. The third gate is the approval
+marker, and it sits at apply time. `propose` records an AI-authored plan and returns a
 `plan_id`; it executes nothing:
 
 ```bash
-rocky review <plan_id> --approve    # human sign-off, required
-rocky apply  <plan_id>              # only runs after approval
+rocky review <plan_id> --approve    # writes the approval marker
+rocky apply  <plan_id>              # refused until that marker names it
 ```
 
 A bare `rocky apply <plan_id>` on an unapproved AI-authored plan is rejected by

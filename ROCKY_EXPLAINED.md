@@ -588,7 +588,7 @@ The gate is a best-effort optimization. It is not a promise that a rebuild would
 
 ## 15. The Plan / Review / Apply Safety Gate
 
-Rocky has a safety gate for AI-generated changes. An AI can propose a plan, but it can't apply it without a human signing off.
+Rocky has a gate for AI-generated changes. An AI can propose a plan. `rocky apply` refuses to run it until an approval marker names that exact plan. The gate checks the marker, not who wrote it.
 
 ```
 1. AI proposes change
@@ -606,19 +606,19 @@ Rocky has a safety gate for AI-generated changes. An AI can propose a plan, but 
        ✓ ADDITIVE: new column 'region' added
        ~ RETYPED: column 'amount' widened Int32 → Int64 (safe)
 
-3. Human approves
-   ───────────────
+3. Approve
+   ────────
    rocky review plan_abc123 --approve
-   → writes approval marker (who, when)
+   → writes approval marker (best-effort git identity, when)
 
-4. Apply (only possible after approval)
-   ─────────────────────────────────────
+4. Apply (refused without a matching marker)
+   ──────────────────────────────────────────
    rocky apply plan_abc123
-   → checks approval marker exists
+   → checks the marker parses and names this plan
    → executes the plan
 ```
 
-**Rocky refuses `rocky apply` on AI-authored plans without an approval marker.** This is enforced in the engine — not a convention.
+**Rocky refuses `rocky apply` on AI-authored plans without an approval marker.** The engine performs that check, and it runs whatever your `[policy]` rules say. The marker is unsigned, so it records that an approval was made on this machine, not who made it.
 
 The breaking-change classifier lives in `rocky-core` (consumed by `rocky review` and `rocky plan`, not the compiler) and knows 16 kinds of change:
 - Model added or removed; column dropped, added, retyped (narrowing flagged), nullability flipped, or reordered
@@ -1188,7 +1188,7 @@ Everything Rocky does, in one ASCII map:
 
  SAFETY GATES:
  ─────────────
- AI plans:   propose → review (breaking-change classifier) → human approve → apply
+ AI plans:   propose → review (breaking-change classifier) → approval marker → apply
  Contracts:  staging → validate types/columns → promote to prod
  SQL safety: every identifier is regex-validated before interpolation
              (no SQL injection)

@@ -1,5 +1,5 @@
 {
-  "_comment": "Recorded worker session, replayed verbatim against `rocky mcp --profile worker`. Elicitation hands off the candidate spec (digest re-checked by the runner). Drafting first PROVES the privilege boundary (propose/review/etc are tool-not-found on the worker profile), then authors the model via draft_model. repair.calls is EMPTY because repair recovery is a KNOWN engine gap (issue #1493): a red verify triggers a Repair round whose draft_model rewrites the merged sidecar, which the artifact byte-check then mis-classifies as TAMPER. So this POC exercises the happy path and every gate, but NOT repair recovery. With repair.calls empty, a genuine red verify surfaces honestly as `verification red after N repair rounds` instead of the misleading tamper block.",
+  "_comment": "Recorded worker session, replayed verbatim against `rocky mcp --profile worker`. Elicitation hands off the candidate spec (digest re-checked by the runner). Drafting first PROVES the privilege boundary (propose/review/etc are tool-not-found on the worker profile), then authors a draft that FORGETS the required revenue_eur column — so the runner's own verify bundle comes back red (E010) and the machine enters a repair round. The recorded repair authors the full model. Repair recovery is exercised on every replay run (it was a known engine gap, #1493: the repair round's sidecar rewrite was mis-classified as tamper; the engine now reopens the drafting window through the staged commit before dispatching repair, so the loop converges — and out-of-band edits between gates are still caught).",
   "tasks": {
     "elicitation": {
       "calls": [],
@@ -42,7 +42,7 @@
           "tool": "draft_model",
           "arguments": {
             "name": "revenue_daily",
-            "sql": "SELECT client_id, CAST(charged_at AS DATE) AS day, MAX(charged_at) AS loaded_at, SUM(CASE WHEN is_refund THEN 0 ELSE amount_eur END)::DOUBLE AS revenue_eur FROM wh.raw.stripe_charges GROUP BY client_id, CAST(charged_at AS DATE)",
+            "sql": "SELECT client_id, CAST(charged_at AS DATE) AS day, MAX(charged_at) AS loaded_at FROM wh.raw.stripe_charges GROUP BY client_id, CAST(charged_at AS DATE)",
             "intent": "Daily gross revenue per client in EUR, refunds excluded"
           },
           "expect": "ok"
@@ -50,7 +50,17 @@
       ]
     },
     "repair": {
-      "calls": []
+      "calls": [
+        {
+          "tool": "draft_model",
+          "arguments": {
+            "name": "revenue_daily",
+            "sql": "SELECT client_id, CAST(charged_at AS DATE) AS day, MAX(charged_at) AS loaded_at, SUM(CASE WHEN is_refund THEN 0 ELSE amount_eur END)::DOUBLE AS revenue_eur FROM wh.raw.stripe_charges GROUP BY client_id, CAST(charged_at AS DATE)",
+            "intent": "Daily gross revenue per client in EUR, refunds excluded"
+          },
+          "expect": "ok"
+        }
+      ]
     }
   }
 }

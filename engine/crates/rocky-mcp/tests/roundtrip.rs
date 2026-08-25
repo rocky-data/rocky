@@ -492,7 +492,14 @@ scope = { any = true }
 effect = "require_review"
 "#,
     );
-    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    // The APPROVER profile (#1517): the last assertion here is that combining
+    // `product_id` with an approve is an ARGUMENT error. On the default
+    // profile the availability gate fires first and that call never reaches
+    // the argument check, so testing it needs a server that serves approving.
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Approver,
+    );
     let client = connect(server).await;
 
     // Two pending escalations: one product-bound, one bare.
@@ -879,6 +886,12 @@ effect = "require_review"
 /// citations, the scorecard matches hand-computed truth, and the `review_queue`
 /// approve action is gated on an explicit confirmation before it writes the
 /// sign-off marker that unblocks `rocky apply`.
+///
+/// Runs on the APPROVER profile (#1517) — the only profile that serves the
+/// approve action at all. The confirm gate tested here is the SECOND gate: it
+/// still holds even once the operator has opted in. The default profile's
+/// refusal is
+/// [`default_profile_lists_the_queue_but_refuses_to_approve`].
 #[tokio::test]
 async fn governor_tools_surface_escalation_and_gate_the_approve() {
     let dir = TempDir::new().unwrap();
@@ -896,7 +909,10 @@ scope = { any = true }
 effect = "require_review"
 "#,
     );
-    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let server = RockyMcpServer::new_with_profile(
+        dir.path().join("rocky.toml"),
+        rocky_mcp::McpProfile::Approver,
+    );
     let client = connect(server).await;
 
     // An agent proposes → recorded as a require_review escalation in the ledger,
@@ -1080,6 +1096,137 @@ effect = "require_review"
     assert!(
         marker.exists(),
         "the confirmed approve wrote the sign-off marker"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// #1517 — the split, on the profile `rocky mcp` serves with NO flag: reading
+/// the queue works, approving does not.
+///
+/// This is the whole point of the issue. The stock command used to hand one
+/// agent both halves — propose a plan, then sign it off — with `confirm` as
+/// the only thing standing in the way, and `confirm` is set by the caller.
+/// Here the same call, with `confirm: true` and a genuinely pending plan_id,
+/// leaves no marker on disk and comes back naming the opt-in.
+#[tokio::test]
+async fn default_profile_lists_the_queue_but_refuses_to_approve() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "apply"
+scope = { any = true }
+effect = "require_review"
+"#,
+    );
+    // The DEFAULT profile — exactly what `rocky mcp` serves with no flag.
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let _ = client
+        .call_tool(CallToolRequestParams::new("propose"))
+        .await
+        .expect("propose returns a result");
+    let plans = plan_files(dir.path());
+    assert_eq!(plans.len(), 1, "the propose persisted one plan for review");
+    let plan_id = plans[0].file_stem().unwrap().to_str().unwrap().to_string();
+
+    // Half one: LISTING is untouched. The queue is useful and harmless to
+    // read, so the gate must not have removed it along with approving.
+    let queue = client
+        .call_tool(CallToolRequestParams::new("review_queue"))
+        .await
+        .expect("review_queue list call");
+    assert_ne!(
+        queue.is_error,
+        Some(true),
+        "listing the queue still works on the default profile: {queue:?}"
+    );
+    let sc = queue.structured_content.expect("queue structured content");
+    assert_eq!(sc["total"], serde_json::json!(1));
+    let pending = sc["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "the escalation is listed");
+    assert_eq!(pending[0]["plan_id"], serde_json::json!(plan_id));
+
+    // Half two: APPROVING is refused — with confirm=true, on a real pending
+    // plan. Nothing about this call is malformed; the profile is the refusal.
+    let approve = serde_json::json!({ "approve_plan_id": plan_id, "confirm": true })
+        .as_object()
+        .unwrap()
+        .clone();
+    let refused = client
+        .call_tool(CallToolRequestParams::new("review_queue").with_arguments(approve))
+        .await
+        .expect("review_queue approve returns a result");
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "the default profile refuses to approve: {refused:?}"
+    );
+    let err = refused
+        .structured_content
+        .expect("structured error envelope");
+
+    // A DISTINCT code. Not `policy_review_required`: no rule decided this and
+    // no plan was recorded by it, and no retry with confirm can satisfy it.
+    assert_eq!(
+        err["code"],
+        serde_json::json!("approve_not_enabled"),
+        "the refusal has its own machine-matchable code: {err:?}"
+    );
+
+    // The refusal NAMES the opt-in. An operator hitting this at 3am must not
+    // have to read source to find out what to do. The flag spelling is pinned
+    // as a literal here on purpose — `mcp_profile_arg_accepts_approver` proves
+    // the same literal is what clap actually parses.
+    let message = err["message"].as_str().expect("a message");
+    let hint = err["remediation_hint"].as_str().expect("a hint");
+    let both = format!("{message}\n{hint}");
+    assert!(
+        both.contains("--profile approver"),
+        "the refusal names the opt-in flag verbatim: {both}"
+    );
+    assert!(
+        both.contains(&plan_id),
+        "the refusal names the plan it refused: {both}"
+    );
+    assert!(
+        hint.contains("rocky review") && hint.contains("--approve"),
+        "the hint offers the human's own terminal as the normal path: {hint}"
+    );
+    assert!(
+        hint.contains("OPERATOR") || hint.contains("operator"),
+        "the hint says WHO can turn it on: {hint}"
+    );
+
+    // The only assertion that really matters: nothing was written.
+    let marker = dir
+        .path()
+        .join(".rocky")
+        .join("plans")
+        .join(format!("{plan_id}.reviewed.json"));
+    assert!(
+        !marker.exists(),
+        "no sign-off marker exists after a refused approve"
+    );
+
+    // And the plan is still pending — the refusal changed no state at all.
+    let after = client
+        .call_tool(CallToolRequestParams::new("review_queue"))
+        .await
+        .expect("review_queue re-list");
+    let after_sc = after.structured_content.expect("queue content");
+    assert_eq!(
+        after_sc["total"],
+        serde_json::json!(1),
+        "the escalation is still awaiting review"
     );
 
     client.cancel().await.unwrap();

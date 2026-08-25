@@ -181,14 +181,13 @@ Rocky type-checks every change an agent writes. The agent produces a plan. A pla
               │
      ┌────────┴────────┬──────────────────┐
      │ require review  │ allow            │ deny
-     ▼                 │                  ▼
-  ┌──────────────┐     │        ┌───────────────────┐
-  │ a human      │     │        │ refused. No SQL   │
-  │ approves,    │     │        │ runs, so there is │
-  │ then applies │     │        │ nothing to undo.  │
-  └──────┬───────┘     │        └─────────┬─────────┘
-         │             │                  │
-         └──────┬──────┘                  │
+     ▼                 ▼                  ▼
+  ┌───────────────────────────┐ ┌───────────────────┐
+  │ an AI-authored plan needs │ │ refused. No SQL   │
+  │ an approval marker naming │ │ runs, so there is │
+  │ it. BOTH branches cross   │ │ nothing to undo.  │
+  │ this check.               │ └─────────┬─────────┘
+  └─────────────┬─────────────┘           │
                 ▼                         │
      ┌────────────────────┐               │
      │ the warehouse runs │               │
@@ -213,10 +212,10 @@ The diagram shows the gate at `rocky apply`. The MCP `draft` and `propose` tools
 A rule can also name checks that must pass in that run. If one fails, or never ran, Rocky stops and records the failure. It cannot undo the write: the change stays until a human reverts it.
 
 - **You write the rules.** A `[policy]` rule in `rocky.toml` says what each principal may do, and where. The answer is allow, require review, or deny. Set `max_downstreams` to cap how far one change may reach.
-- **A plan written by AI waits for a human.** The engine enforces this. It is not a convention you can forget.
+- **An AI-written plan needs an approval marker.** `rocky apply` refuses an AI-authored plan unless a marker file is present that parses and names that exact plan. That check runs whatever your rules say, so an `allow` rule cannot waive it — since engine v1.71.0; on earlier versions a rule could waive it. The marker is not signed, so it records that an approval was made on this machine, not who made it.
 - **You can test the rules.** `[[policy.tests]]` scenarios run through the real evaluator, so `rocky policy test` catches an edit that opens a hole.
 - **You can ask what happened.** `rocky audit --for <table>` says who changed what, and under whose authority. `rocky review --queue` ranks what waits on you.
-- **Agents connect over MCP.** `rocky mcp` exposes 31 tools. Seven of them write, and those seven pass the same rules.
+- **Agents connect over MCP.** `rocky mcp` exposes 31 tools. Six can write: five pass the same rules, and `pause_schedule` carries its own guard. Writing the approval marker is not on that list — `review_queue` lists the queue but cannot sign anything off unless you start the server as `rocky mcp --profile approver`.
 
 <p align="center">
   <img src="docs/public/demo-policy-enforce.gif" alt="an agent's change to a contracted model is planned, rocky apply run as the agent principal is denied by the policy plane with the rule named, and rocky audit shows the recorded decision" width="900" />
@@ -238,6 +237,40 @@ policy check: agent / apply / dim_customer
 An agent earns freedom one step at a time. You grant each step. `rocky policy freeze` is the kill switch.
 
 Full detail: [Operating Rocky with agents](https://rocky-data.dev/concepts/operating-rocky-with-agents/).
+
+## Declare a data product
+
+You write one spec file. `products/<name>.toml` states what the product must be: its grain, its columns, its checks, and how fresh it has to be. The spec adds no new runtime machinery. A field either lowers onto something the engine already has, such as a contract or the model's sidecar, or it is refused when the spec is parsed. Not every field ends up as an engine check: freshness is observed by the loop after the apply, not enforced at compile time.
+
+```
+   products/<name>.toml
+          │
+          ├── rocky product approve  freezes the revision as a snapshot
+          │                          addressed by its digest
+          ├── rocky product verify   checks the trust posture, the masking
+          │                          tags, and identity collisions
+          ├── rocky product compile  one phase per call: renders the
+          │                          contract, or merges the sidecar
+          │                          (grain, non-null columns and checks
+          │                          become declarative [[tests]])
+          │
+          └── rocky fulfill <name>   drives these verbs, and the drafting
+                                     agent between them. Stops at each gate
+                                     with the exact next command to run
+
+   The loop stops for spec approval FIRST, then verifies, then lowers.
+   Each verb also runs on its own, in any order you need.
+```
+
+`rocky fulfill` runs the drafting agent through the driver you set in `[fulfill.driver]`. There are two. The subprocess driver runs a command you choose: the worker sees only the environment variables you allowlist, and the whole task runs in one process group the loop kills when the task ends. The replay driver runs a recorded session against the worker-profile MCP server instead, which is what CI uses.
+
+Rocky ships a narrowed MCP surface for that worker. `rocky mcp --profile worker` serves the read and inspect tools, the compile and test loop, and two draft tools. It serves no other tools, and a tool added later stays out until someone adds it deliberately. The MCP prompts stay available in every profile. Point your driver command at it. The engine does not force the command you configure to use it.
+
+The runner then re-reads what the agent wrote from disk, re-verifies it, and hands it to the same governed `propose` as any other agent change.
+
+The plan records the digest of the approved spec. A bare `rocky apply` refuses a product-bound plan. You run `rocky apply <plan-id> --expect-spec-digest <digest>`, and it refuses when the digest you pass does not match the one on the plan. `rocky fulfill` is experimental.
+
+Full detail: [Product commands](https://rocky-data.dev/reference/commands/products/) and [Fulfill commands](https://rocky-data.dev/reference/commands/fulfill/).
 
 ## Where Rocky is today
 

@@ -108,9 +108,20 @@ pub struct RockyMcpServer {
 /// Which tool surface `rocky mcp` serves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum McpProfile {
-    /// The full tool surface — unchanged behavior for every existing agent.
+    /// Every tool, with ONE action withheld: `review_queue` lists the pending
+    /// queue but REFUSES to approve (#1517). Approving writes the human
+    /// sign-off marker `rocky apply` requires, so it is not a capability the
+    /// no-flag command should hand an agent; [`Self::Approver`] is the
+    /// explicit opt-in. Every other tool behaves exactly as before.
     #[default]
     Default,
+    /// [`Self::Default`]'s tools, plus the `review_queue` APPROVE action
+    /// (`rocky mcp --profile approver`). Serves the same tool NAMES as the
+    /// default profile — the opt-in enables an action, it does not add a
+    /// tool. Choose it only when the operator intends this server to be able
+    /// to write sign-off markers; approval is still attributed to the
+    /// operator's git identity, never to a verified human.
+    Approver,
     /// The minimal drafting-worker allowlist (`--profile worker`): read /
     /// inspect grounding tools, the compile/test/breaking-change/dependents
     /// verification loop, `draft_model` + `draft_check`, and the prompts.
@@ -490,15 +501,20 @@ pub struct ScorecardArgs {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ReviewQueueArgs {
-    /// When set, APPROVE this pending plan_id instead of listing the queue. The
-    /// plan must be one currently awaiting review — call with this unset first
-    /// to see the pending plan_ids.
+    /// When set, APPROVE this pending plan_id instead of listing the queue.
+    /// Served only when the operator started the server as `rocky mcp
+    /// --profile approver`; on any other profile this field is refused with
+    /// `approve_not_enabled` and nothing is written. The plan must also be one
+    /// currently awaiting review — call with this unset first to see the
+    /// pending plan_ids.
     #[serde(default)]
     pub approve_plan_id: Option<String>,
     /// Explicit confirmation for the approve action. Approving writes a human
     /// sign-off marker that unblocks `rocky apply`, so it is refused unless this
     /// is `true`. Set it ONLY when the human has explicitly authorized approving
-    /// this exact plan — it stands in for that human intent.
+    /// this exact plan — it stands in for that human intent. It cannot unlock
+    /// the approve action itself: a server without `--profile approver` refuses
+    /// regardless of this flag.
     #[serde(default)]
     pub confirm: bool,
     /// List mode only: keep only pending plans whose payload carries this
@@ -553,7 +569,8 @@ const PROFILE_TOP_VALUES_MAX: usize = 25;
 impl RockyMcpServer {
     /// Build a server rooted at `config_path`'s directory; the models
     /// directory is `<config-dir>/models` (the CLI's top-level convention).
-    /// Serves the full default tool surface.
+    /// Serves the [`McpProfile::Default`] surface: every tool, with the
+    /// `review_queue` approve action refused (#1517).
     pub fn new(config_path: PathBuf) -> Self {
         Self::new_with_profile(config_path, McpProfile::Default)
     }
@@ -635,12 +652,28 @@ impl RockyMcpServer {
         rocky_core::state::resolve_state_path(None, &self.models_dir).path
     }
 
+    /// Whether this server serves the `review_queue` APPROVE action — writing
+    /// the human sign-off marker that unblocks `rocky apply` (#1517).
+    ///
+    /// ONLY [`McpProfile::Approver`] does. Written as an exhaustive match, not
+    /// `!= Default`, so a future profile has to state its answer here instead
+    /// of inheriting one: a new variant fails to compile until someone
+    /// decides, and the decision defaults to nothing.
+    fn approve_action_served(&self) -> bool {
+        match self.profile {
+            McpProfile::Default | McpProfile::Worker => false,
+            McpProfile::Approver => true,
+        }
+    }
+
     /// The `next_steps` reminder a successful `draft_model` result carries.
     /// The worker profile's variant ends at the trusted-runner hand-off and
-    /// never instructs `propose` (FF-WP1 fix round 2, item 5c).
+    /// never instructs `propose` (FF-WP1 fix round 2, item 5c). The approver
+    /// profile is the default surface plus one action, so it shares the
+    /// default text — which already ends at the human's `rocky review`.
     fn draft_model_next_steps(&self) -> &'static str {
         match self.profile {
-            McpProfile::Default => DRAFT_NEXT_STEPS,
+            McpProfile::Default | McpProfile::Approver => DRAFT_NEXT_STEPS,
             McpProfile::Worker => WORKER_DRAFT_NEXT_STEPS,
         }
     }
@@ -649,7 +682,7 @@ impl RockyMcpServer {
     /// profile-selected like [`Self::draft_model_next_steps`].
     fn draft_check_next_steps(&self) -> &'static str {
         match self.profile {
-            McpProfile::Default => DRAFT_CHECK_NEXT_STEPS,
+            McpProfile::Default | McpProfile::Approver => DRAFT_CHECK_NEXT_STEPS,
             McpProfile::Worker => WORKER_DRAFT_CHECK_NEXT_STEPS,
         }
     }
@@ -3126,8 +3159,9 @@ impl RockyMcpServer {
     // projections of the same decision/run ledger the worker-agent tools write
     // to, so "what did agents do this week, and why was that apply allowed?" is
     // a cited, conversational query. `estate_brief` / `audit_query` /
-    // `scorecard` are read-only; `review_queue` reads the pending queue and,
-    // behind an explicit `confirm`, writes the human sign-off marker. Every
+    // `scorecard` are read-only; `review_queue` reads the pending queue on
+    // every profile and — ONLY on `--profile approver`, and then only behind an
+    // explicit `confirm` — writes the human sign-off marker (#1517). Every
     // projection reuses the shipped `brief` / `audit` / `review` cores, so a
     // section whose underlying query fails renders `unavailable` rather than a
     // smoothed-over narrative — the ledger grounds, no LLM narrates here.
@@ -3390,15 +3424,19 @@ impl RockyMcpServer {
     }
 
     #[tool(
-        description = "The ranked pending-review queue, and a GATED approve action. With no \
+        description = "The ranked pending-review queue, and an OPT-IN approve action. With no \
          `approve_plan_id`, lists every `require_review` escalation not yet signed off, ranked by \
          blast_radius × classification × staleness, each carrying its decision_ref, plan_id, and \
-         `approve_command`. With `approve_plan_id` + `confirm=true`, writes the human sign-off \
-         marker that unblocks `rocky apply` for that plan — refused unless the plan is actually in \
-         the pending queue AND `confirm` is set (the require-review-grade confirmation stands in \
-         for explicit human intent). Policy applies to the governor's agent too: the approval is \
-         attributed to the operator's git identity, not a cryptographically bound principal (a \
-         signed human confirmation is a later step). Never approve on the user's behalf."
+         `approve_command`. Listing works on every profile. APPROVING is different: it writes the \
+         human sign-off marker that unblocks `rocky apply`, and MOST SERVERS DO NOT SERVE IT — it \
+         is refused with `approve_not_enabled` unless the operator started this server as `rocky \
+         mcp --profile approver`. Where it is served, `approve_plan_id` + `confirm=true` is still \
+         refused unless the plan is actually in the pending queue AND `confirm` is set (the \
+         require-review-grade confirmation stands in for explicit human intent). Policy applies to \
+         the governor's agent too: the approval is attributed to the operator's git identity, not \
+         a cryptographically bound principal (a signed human confirmation is a later step). Never \
+         approve on the user's behalf; the normal path is the human running `rocky review \
+         <plan_id> --approve` in their own terminal."
     )]
     async fn review_queue(
         &self,
@@ -3406,6 +3444,20 @@ impl RockyMcpServer {
     ) -> ToolResult<ReviewQueueResult> {
         let args = params.0;
         let state_path = self.state_path();
+
+        // #1517 — the availability gate, deliberately the FIRST thing an
+        // approve meets. Ahead of the queue read so the refusal never depends
+        // on the state store being healthy or on what the queue happens to
+        // hold: on a profile that does not serve approving, the answer is the
+        // same one every time, and it names the opt-in.
+        if args.approve_plan_id.is_some() && !self.approve_action_served() {
+            // Echo the caller's plan id, not a validated one — validating it
+            // first would leak queue contents to a session that may not
+            // approve, and the recovery text is identical either way.
+            return Err(ToolError::approve_not_enabled(
+                args.approve_plan_id.as_deref().unwrap_or_default(),
+            ));
+        }
 
         // Always compute the current queue first — it is both the read result
         // and the guard that an approve targets a genuinely pending escalation.
@@ -4126,8 +4178,13 @@ impl ServerHandler for RockyMcpServer {
         // forks from the canonical file — but under the worker profile it is
         // prefixed with the banner naming the tools this session does not
         // serve and redirecting every ending to the trusted-runner hand-off.
+        // The approver profile serves the same text as the default one: the
+        // skill already ends every workflow at the human's `rocky review`, and
+        // announcing "you may approve here" to the agent would push the wrong
+        // way (#1517). The capability is discoverable where it is used — in
+        // `review_queue`'s own description.
         let instructions = match self.profile {
-            McpProfile::Default => INSTRUCTIONS.to_string(),
+            McpProfile::Default | McpProfile::Approver => INSTRUCTIONS.to_string(),
             McpProfile::Worker => format!("{WORKER_INSTRUCTIONS_BANNER}{INSTRUCTIONS}"),
         };
         ServerInfo::new(
@@ -5551,5 +5608,68 @@ mod tests {
                 "worker next_steps end at the runner hand-off: {next_steps}"
             );
         }
+    }
+
+    /// #1517 — the decision table for "may this server write a sign-off
+    /// marker?", enumerated over EVERY profile rather than sampled. Approving
+    /// is off unless the operator asked for it, and the `#[default]` variant
+    /// is one of the profiles that cannot.
+    ///
+    /// The `McpProfile::default()` assertion is the load-bearing one: the
+    /// whole issue was that the no-flag command pointed the wrong way, and
+    /// `#[derive(Default)]` + `#[default]` means moving that attribute one
+    /// variant down would silently arm approving for every existing agent.
+    #[test]
+    fn only_the_approver_profile_serves_the_approve_action() {
+        assert_eq!(
+            McpProfile::default(),
+            McpProfile::Default,
+            "the profile served with no flag is the one that cannot approve"
+        );
+        assert!(
+            !server_with(McpProfile::Default).approve_action_served(),
+            "default profile: approving is refused"
+        );
+        assert!(
+            !server_with(McpProfile::Worker).approve_action_served(),
+            "worker profile: approving is refused"
+        );
+        assert!(
+            server_with(McpProfile::Approver).approve_action_served(),
+            "approver profile: approving is served — the opt-in does something"
+        );
+    }
+
+    /// #1517 — the opt-in enables an ACTION, it does not add a TOOL.
+    ///
+    /// Two things ride on this. The `briefs.rs` excluded-tool golden derives
+    /// its list as default-minus-worker, so a refactor that tried to express
+    /// the approve opt-in by adding or removing a ROUTE would silently move
+    /// that golden. And the split itself: `review_queue` must still be served
+    /// on the default profile, because listing the queue stays available.
+    #[test]
+    fn approver_profile_adds_an_action_not_a_tool() {
+        let default_tools = server_with(McpProfile::Default).tool_names();
+        let approver_tools = server_with(McpProfile::Approver).tool_names();
+        assert_eq!(
+            default_tools, approver_tools,
+            "the approver profile serves exactly the default profile's tools"
+        );
+        assert!(
+            default_tools.iter().any(|t| t == "review_queue"),
+            "`review_queue` is still served on the default profile — listing is not gated"
+        );
+
+        // The worker profile is untouched by #1517: still the smaller
+        // allowlist, still with no `review_queue` at all.
+        let worker_tools = server_with(McpProfile::Worker).tool_names();
+        assert!(
+            worker_tools.len() < default_tools.len(),
+            "the worker profile is still a strict subset"
+        );
+        assert!(
+            !worker_tools.iter().any(|t| t == "review_queue"),
+            "the worker profile still serves no `review_queue` at all"
+        );
     }
 }
