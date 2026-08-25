@@ -438,6 +438,25 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // and `test` (its own in-memory DuckDB). The other three read. None of
     // the twelve runs or materializes anything, and that — not "no
     // warehouse access" — is what makes a run error unreachable here.
+    //
+    // TWELFTH ROUND, finding 1 — and the round-eleven replacement then said
+    // something ELSE that is not true, one sentence later. It promised that
+    // a failed read "comes back as that tool's own error", which is a
+    // universal over the three readers it had just named. Two of them keep
+    // it: `sample_rows` and `profile_column` both propagate a failed read as
+    // `ToolError::warehouse_error`. `inspect_schema` does not. It swallows
+    // BOTH failure modes — the call site discards the `Err` arm
+    // (`if let Ok(Some(adapter))`, so an adapter that will not resolve skips
+    // discovery entirely) and `discover_source_tables` returns `Vec::new()`
+    // on a failed query — and then returns SUCCESS. A worker holding the old
+    // promise reads an empty `sources` as "no such table".
+    //
+    // THE CLAIM IS WHAT MOVES HERE, NOT THE TOOL. The silent degradation is
+    // a product defect on every profile, filed separately; widening this
+    // branch into `inspect_schema`'s result shape would be the scope creep
+    // the lane has avoided throughout. So the text describes the tool
+    // honestly — inconclusive, not authoritative, on a failed read — and
+    // points at the reader that DOES fail loudly for the same table.
     (
         "Run **errors** carry a `failure_kind` (`Transient`, `AuthFailed`, `QueryRejected`, \
          `QuotaExceeded`, …) and sometimes a `cooldown_seconds`. Branch on *why* something \
@@ -445,9 +464,15 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
         "Run **errors** are not something you will see. No tool this profile serves runs or \
          materializes a pipeline, so there is no run to retry and no `failure_kind` to branch \
          on. Three tools do READ the warehouse: `sample_rows` and `profile_column` query it \
-         directly, and `inspect_schema` lists its tables when it can. A read that fails comes \
-         back as that tool's own error, not as a run outcome. A tool result that reports a \
-         failure is a finding for your report — read it, name it, and do not work around it.",
+         directly, and `inspect_schema` lists its tables when it can. `sample_rows` and \
+         `profile_column` surface a failed read as that tool's own error, not as a run \
+         outcome. `inspect_schema` does not. The physical tables it adds to `sources` are \
+         best-effort: when the warehouse cannot be read it reports none of them and still \
+         returns success. A table missing from `sources` is therefore inconclusive, not proof \
+         the table is absent. Ask `sample_rows` for that table before you conclude it is \
+         absent — it either reads the table or fails with a readable error. A tool result \
+         that reports a failure is a finding for your report — read it, name it, and do not \
+         work around it.",
     ),
     // The third check-authorship steer.
     (
@@ -7071,6 +7096,30 @@ mod tests {
                  than denying that any tool does: {body}"
             );
         }
+        // TWELFTH ROUND, finding 1 — and the REASON the bullet gives has to
+        // hold for every reader it names. It did not. `sample_rows` and
+        // `profile_column` propagate a failed read as
+        // `ToolError::warehouse_error`; `inspect_schema` discards the `Err`
+        // arm at its call site, takes `Vec::new()` from a failed discovery
+        // query, and returns SUCCESS with no physical tables. A worker
+        // holding the old universal reads an empty `sources` as "no such
+        // table".
+        //
+        // Pinned in BOTH directions, for the reason the pair above is:
+        // dropping the caveat is the cheap edit, and it re-promises
+        // silently.
+        assert!(
+            !body_lower.contains("a read that fails comes back as that tool's own error"),
+            "the projected body must not promise EVERY named reader surfaces a failed read \
+             as its own error — `inspect_schema` reports no physical tables and still \
+             returns success: {body}"
+        );
+        assert!(
+            body_lower.contains("not proof the table is absent"),
+            "and it must say what that costs the worker: a table missing from \
+             `inspect_schema`'s `sources` is inconclusive, not absent. Dropping the caveat \
+             re-promises what the tool does not do: {body}"
+        );
         // The sentence says THREE, which is a count over the allowlist and
         // cannot be derived: whether a tool opens an adapter is a fact
         // about its body, not about this list. So the list's SIZE is
