@@ -51,6 +51,10 @@ rocky-snowflake = { path = "../rocky-snowflake" }
 rocky-ai = { path = "../rocky-ai" }
 tempfile = "3"
 serde_json = { workspace = true }
+# The served-text golden (`roundtrip.rs`) digests every worded MCP surface so
+# a wording change cannot land without a re-bless. Any stable hash would do;
+# blake3 is already a workspace dependency.
+blake3 = { workspace = true }
 # The scripted round-trip test drives the stdio server in-process with an rmcp
 # client over a duplex pipe, so it needs the client side of rmcp too.
 rmcp = { version = "3.0", features = ["server", "macros", "transport-io", "client"] }

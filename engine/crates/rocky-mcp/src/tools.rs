@@ -1152,6 +1152,31 @@ fn worker_tools_that_read_the_warehouse<'a>(table: &[(&'a str, WorkerToolEffect)
 /// (see [`RockyMcpServer::draft_check_next_steps`]) because it is what
 /// would be wrong first if the tool were re-admitted.
 ///
+/// A GOLDEN NOW SITS UNDER ROWS 1–5, and it is a new CHECK over existing
+/// rows — NOT a tenth row. The count below stays 9.
+///
+/// `served_text_golden_pins_every_worded_surface` (in `tests/roundtrip.rs`)
+/// digests the whole serialized payload of rows 1, 2, 3, 4 and 5, for the
+/// DEFAULT and WORKER profiles, into
+/// `tests/fixtures/served_text.golden`. Any edit to any of that text fails
+/// the test until someone re-blesses the file.
+///
+/// The reason it exists is the limit of every other rule on this list. All
+/// of them are LEXICAL — they look for a word. An arbitrary paraphrase
+/// defeats a negative-substring pin, and no lexical rule can catch a
+/// reworded semantic overclaim without pretending to understand meaning.
+/// The golden does not read the text at all, so a paraphrase cannot dodge
+/// it.
+///
+/// AND ITS OWN LIMIT, stated here so it is not read as more: it catches
+/// UNREVIEWED wording changes, not FALSE ones. It cannot tell a true
+/// sentence from a false one, and a wrong claim blessed once stays
+/// blessed. It converts "is every served sentence true?" — unbounded —
+/// into "is this one changed sentence true?" — bounded, and still a
+/// person's job. Rows 7, 8 and 9 are deliberately outside it: their
+/// payloads embed run-dependent values, so a digest over them would drift
+/// every run and get blessed reflexively.
+///
 /// Test-gated because nothing in the server reads the number — the value
 /// is the enumeration above it and the anchor it gives the capability
 /// test. It is a constant rather than a comment so that grepping

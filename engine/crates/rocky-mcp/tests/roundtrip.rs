@@ -5279,3 +5279,306 @@ async fn suggest_freshness_block_returns_null_without_api_key() {
 
     client.cancel().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// The served-text golden.
+// ---------------------------------------------------------------------------
+
+/// Where the golden lives. Read and re-blessed through the SAME constant, so
+/// a bless cannot land in a different file from the one the test compares
+/// against.
+const SERVED_TEXT_GOLDEN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/served_text.golden"
+);
+
+/// Set this to re-bless the golden. It is read, never written, so the test
+/// needs no `unsafe` env mutation and CI (where it is unset) can only compare.
+const BLESS_VAR: &str = "ROCKY_BLESS_MCP_SERVED_TEXT";
+
+/// Digest every worded surface one profile serves, keyed by surface.
+///
+/// Keys carry no profile prefix — the caller adds one — so the approver
+/// surface can be compared against the default surface key-for-key.
+///
+/// `nonce` is the temp directory's unique final component. No served text
+/// should contain it; if one does, the golden would be per-run garbage
+/// rather than a pin, and this is where that is caught.
+async fn served_text_digests(
+    config_path: &Path,
+    profile: rocky_mcp::McpProfile,
+    nonce: &str,
+) -> std::collections::BTreeMap<String, String> {
+    fn record(
+        out: &mut std::collections::BTreeMap<String, String>,
+        key: &str,
+        payload: &str,
+        nonce: &str,
+    ) {
+        assert!(
+            !payload.is_empty(),
+            "'{key}' serialized to nothing; a golden over an empty payload pins nothing"
+        );
+        assert!(
+            !payload.contains(nonce),
+            "'{key}' embeds the per-run temp path; the golden would drift every run: {payload}"
+        );
+        let previous = out.insert(
+            key.to_string(),
+            blake3::hash(payload.as_bytes()).to_hex().to_string(),
+        );
+        assert!(previous.is_none(), "duplicate golden key '{key}'");
+    }
+
+    let server = RockyMcpServer::new_with_profile(config_path.to_path_buf(), profile);
+    let client = connect(server).await;
+    let mut out = std::collections::BTreeMap::new();
+
+    // Surface 1 — the served `instructions`, whole. The banner is NOT
+    // spliced out here: this golden is about drift, and a banner that
+    // changes because the allowlist changed is exactly the kind of change
+    // that should need a re-bless.
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .expect("every profile serves instructions");
+    record(&mut out, "instructions", &instructions, nonce);
+
+    // Surfaces 2 and 3 — the whole listed `Prompt`, and the whole
+    // `prompts/get` result for it. Arguments are synthesised from each
+    // prompt's own declared list, the same way the sweeps above do it, so a
+    // new prompt is covered with nothing to remember.
+    let prompts = client.list_all_prompts().await.expect("list prompts");
+    assert!(
+        !prompts.is_empty(),
+        "a profile that serves no prompt pins nothing"
+    );
+    for prompt in &prompts {
+        record(
+            &mut out,
+            &format!("prompts/list/{}", prompt.name),
+            &serde_json::to_string(prompt).expect("prompt serializes"),
+            nonce,
+        );
+        let mut args = serde_json::Map::new();
+        for declared in prompt.arguments.iter().flatten() {
+            let value = if declared.name == "model" {
+                "orders"
+            } else {
+                "daily revenue"
+            };
+            args.insert(declared.name.clone(), serde_json::json!(value));
+        }
+        let mut params = GetPromptRequestParams::new(prompt.name.clone());
+        if !args.is_empty() {
+            params = params.with_arguments(args);
+        }
+        let result = client
+            .get_prompt(params)
+            .await
+            .unwrap_or_else(|e| panic!("get_prompt {}: {e}", prompt.name));
+        record(
+            &mut out,
+            &format!("prompts/get/{}", prompt.name),
+            &serde_json::to_string(&result).expect("prompt result serializes"),
+            nonce,
+        );
+    }
+
+    // Surfaces 4 and 5 — the whole listed `Tool`: description AND input
+    // schema, plus every other field serde emits.
+    let tools = client.list_all_tools().await.expect("list tools");
+    assert!(
+        !tools.is_empty(),
+        "a profile that serves no tool pins nothing"
+    );
+    for tool in &tools {
+        record(
+            &mut out,
+            &format!("tools/list/{}", tool.name),
+            &serde_json::to_string(tool).expect("tool serializes"),
+            nonce,
+        );
+    }
+
+    client.cancel().await.unwrap();
+    out
+}
+
+/// Render a digest table as the golden's on-disk form: `key<TAB>hash`, one
+/// per line, sorted (a `BTreeMap` iterates in key order).
+fn render_golden(table: &std::collections::BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for (key, hash) in table {
+        out.push_str(key);
+        out.push('\t');
+        out.push_str(hash);
+        out.push('\n');
+    }
+    out
+}
+
+/// FOURTEENTH ROUND, finding 3 — the GOLDEN over every worded MCP surface,
+/// both profiles.
+///
+/// WHAT THIS BUYS, precisely: no change to text this server serves can land
+/// without someone re-blessing the golden in the same diff. The previous
+/// thirteen rounds all found the same defect class — a served sentence that
+/// claimed more than the code delivers — and every guard built against it
+/// was a negative substring pin, which an arbitrary paraphrase walks past.
+/// This does not read the text, so a paraphrase cannot dodge it.
+///
+/// WHAT IT DOES NOT BUY, and this must not be read otherwise: it is NOT
+/// semantic enforcement. It cannot tell a true sentence from a false one.
+/// A wrong claim that is blessed once stays blessed forever, and a re-bless
+/// that nobody reads converts this guard into a rubber stamp. It turns an
+/// unbounded problem (is every served sentence true?) into a bounded one
+/// (is this specific changed sentence true?). Answering the bounded
+/// question is still a person's job, which is why the failure message asks
+/// for it by name.
+///
+/// WHAT IT COVERS: surfaces 1–5 of `WORKER_GUIDANCE_SURFACES` — the served
+/// `instructions`, the whole listed `Prompt`, the whole `prompts/get`
+/// result, and the whole listed `Tool` — for the DEFAULT and WORKER
+/// profiles. Both, because a one-sided edit to the two near-identical
+/// `build_model` bodies is how round thirteen's defect nearly shipped.
+///
+/// WHAT IT DOES NOT COVER, said plainly rather than left to be discovered:
+/// surfaces 7, 8 and 9 — the text a `tools/call` carries when it succeeds
+/// or fails. Those payloads embed run-dependent values (paths, plan ids,
+/// timestamps, warehouse errors), so a digest over them would drift every
+/// run and get blessed reflexively, which is worse than no golden. They
+/// keep the name-based sweeps in
+/// `worker_result_text_names_no_excluded_tool`. Surface 6 is not served.
+/// This is not "every MCP surface".
+///
+/// The `Approver` profile is compared against `Default` rather than
+/// blessed: `try_new_with_profile` branches on `Worker` alone, so the two
+/// serve identical text today, and pinning the EQUALITY catches a future
+/// divergence that a third blessed column would silently absorb.
+#[tokio::test]
+async fn served_text_golden_pins_every_worded_surface() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let config_path = dir.path().join("rocky.toml");
+    let nonce = dir
+        .path()
+        .file_name()
+        .expect("temp dir has a final component")
+        .to_string_lossy()
+        .to_string();
+
+    let default = served_text_digests(&config_path, rocky_mcp::McpProfile::Default, &nonce).await;
+    let worker = served_text_digests(&config_path, rocky_mcp::McpProfile::Worker, &nonce).await;
+
+    // The approver profile serves the same TEXT as the default profile — it
+    // enables one `review_queue` action, it does not reword anything. Pinned
+    // as an equality so a future divergence has to be noticed here.
+    let approver = served_text_digests(&config_path, rocky_mcp::McpProfile::Approver, &nonce).await;
+    assert_eq!(
+        approver, default,
+        "the approver profile now serves different text from the default profile; it is \
+         blessed as the default surface, so either revert the divergence or give it its own \
+         golden rows"
+    );
+
+    // Non-vacuity, before any comparison. A digest table that went empty, or
+    // a worker surface that stopped being a subset of the default one, would
+    // otherwise compare clean against a golden blessed from the same bug.
+    let tool_keys = |table: &std::collections::BTreeMap<String, String>| {
+        table
+            .keys()
+            .filter(|k| k.starts_with("tools/list/"))
+            .cloned()
+            .collect::<std::collections::BTreeSet<String>>()
+    };
+    let default_tools = tool_keys(&default);
+    let worker_tools = tool_keys(&worker);
+    assert!(
+        worker_tools.len() < default_tools.len(),
+        "the worker profile must serve strictly fewer tools than the default profile, or \
+         this golden is pinning one surface twice"
+    );
+    assert!(
+        worker_tools.is_subset(&default_tools),
+        "the worker profile serves a tool the default profile does not: {:?}",
+        worker_tools.difference(&default_tools).collect::<Vec<_>>()
+    );
+    for table in [&default, &worker] {
+        for key in table.keys() {
+            if let Some(name) = key.strip_prefix("prompts/list/") {
+                assert!(
+                    table.contains_key(&format!("prompts/get/{name}")),
+                    "prompt '{name}' is listed but its body is not digested"
+                );
+            }
+        }
+    }
+
+    let mut live = std::collections::BTreeMap::new();
+    for (label, table) in [("default", default), ("worker", worker)] {
+        for (key, hash) in table {
+            live.insert(format!("{label}/{key}"), hash);
+        }
+    }
+    let rendered = render_golden(&live);
+
+    if std::env::var(BLESS_VAR).is_ok() {
+        std::fs::write(SERVED_TEXT_GOLDEN, &rendered)
+            .unwrap_or_else(|e| panic!("write {SERVED_TEXT_GOLDEN}: {e}"));
+        return;
+    }
+
+    let on_disk = std::fs::read_to_string(SERVED_TEXT_GOLDEN).unwrap_or_default();
+    if on_disk == rendered {
+        return;
+    }
+
+    // BIDIRECTIONAL, not "every golden row still matches". A tool or prompt
+    // added later is ABSENT from the golden, and a one-directional check
+    // reads that as clean — which is the same shape as every hand-picked
+    // list this crate has already been bitten by.
+    let expected: std::collections::BTreeMap<&str, &str> = on_disk
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .collect();
+    let mut changed = Vec::new();
+    let mut added = Vec::new();
+    for (key, hash) in &live {
+        match expected.get(key.as_str()) {
+            Some(blessed) if *blessed == hash.as_str() => {}
+            Some(blessed) => changed.push(format!(
+                "  CHANGED  {key}\n    was {blessed}\n    now {hash}"
+            )),
+            None => added.push(format!("  NEW      {key}")),
+        }
+    }
+    let removed: Vec<String> = expected
+        .keys()
+        .filter(|key| !live.contains_key(**key))
+        .map(|key| format!("  GONE     {key}"))
+        .collect();
+
+    let mut report = String::new();
+    for line in changed.iter().chain(added.iter()).chain(removed.iter()) {
+        report.push_str(line);
+        report.push('\n');
+    }
+    if report.is_empty() {
+        report.push_str("  (no keyed drift — the file's formatting differs from the renderer)\n");
+    }
+
+    panic!(
+        "The text this MCP server serves has changed:\n\n{report}\n\
+         This guard does NOT check that the new wording is TRUE — it only stops a wording \
+         change from landing unreviewed. So, in this order:\n\n\
+         1. Read each changed surface above and check the new sentence against the code it \
+            describes. Every round of this branch has found a served claim that out-ran its \
+            implementation; that is the failure this exists to make visible.\n\
+         2. Only then re-bless:\n\
+            \x20  {BLESS_VAR}=1 cargo test -p rocky-mcp --test roundtrip \
+         served_text_golden_pins_every_worded_surface\n\
+         3. Commit the golden with the change that caused it, so a reviewer sees both.\n\n\
+         Re-blessing without step 1 makes this file a rubber stamp and buys nothing.\n"
+    );
+}
