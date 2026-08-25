@@ -2410,9 +2410,11 @@ impl RockyMcpServer {
     }
 
     #[tool(
-        description = "Return the typed columns of every model and source table in the project. \
-         Use this to learn what's available to select from and the upstream types — never guess \
-         column names."
+        description = "Return the typed columns of every model and source table in the project, \
+         plus the physical warehouse tables the project never declared. Use this to learn what's \
+         available to select from and the upstream types — never guess column names. The physical \
+         tables are best-effort: when the warehouse cannot be read this returns none of them and \
+         still succeeds, so a table missing from `sources` is inconclusive, not absent."
     )]
     async fn inspect_schema(
         &self,
@@ -3386,7 +3388,9 @@ impl RockyMcpServer {
          source: row count, nulls, null rate, distinct count, min, max — and, for a \
          low-cardinality column (≤25 distinct), the distinct values with their counts \
          (`top_values`), which surfaces exact literals (e.g. a status string) that min/max hide. \
-         Requires live warehouse credentials in the target adapter (rocky.toml)."
+         `top_values` comes from a second query and is best-effort: when that query fails the \
+         list is empty and this still succeeds. Requires live warehouse credentials in the \
+         target adapter (rocky.toml)."
     )]
     async fn profile_column(
         &self,
@@ -7539,6 +7543,22 @@ mod tests {
              {WORKER_TOOL_EFFECTS:?}"
         );
 
+        // AND THE READER SET IS PINNED to the three that were audited.
+        // Feeding the body sweep from this table removed a stale literal and
+        // added a RELAXATION in its place: reclassify `inspect_schema` to
+        // `Offline` and the bullet no longer has to name it, with every
+        // assertion green. Narrowing the set now takes a deliberate two-line
+        // edit — the table AND this line — which is the "someone has to
+        // look" property the guard exists for. Not circular: this pins the
+        // SHAPE of the reviewed answer, the table holds the answer.
+        assert_eq!(
+            worker_tools_that_read_the_warehouse(WORKER_TOOL_EFFECTS),
+            vec!["inspect_schema", "profile_column", "sample_rows"],
+            "the three audited warehouse readers. Re-read the tool body before changing this \
+             — the worker bullet has to NAME every reader, and dropping one here drops it \
+             from that sweep too"
+        );
+
         // AND THE CHECK HAS TO BITE. Round twelve's guard read as semantic
         // assurance and passed through the thing it claimed to hold, so this
         // one is run over a table that DOES violate the sentence. Without
@@ -7554,6 +7574,57 @@ mod tests {
             "the classification check must catch a tool that runs a pipeline, or the \
              assertion above proves only that the filter never matches"
         );
+    }
+
+    /// THIRTEENTH ROUND — the SIBLING SURFACE to finding 1. The served
+    /// instructions now describe both best-effort reads honestly, and the
+    /// `tools/list` descriptions of the same two tools did not.
+    ///
+    /// `inspect_schema` was the worse of the pair: "the typed columns of
+    /// every model and source table in the project" is an unqualified
+    /// universal, and "never guess column names" tells the worker to treat
+    /// the answer as complete — over a tool with TWO silent failure paths.
+    ///
+    /// Swept on BOTH profiles because neither description is rewritten for
+    /// the worker (`WORKER_TOOL_DESCRIPTIONS` covers `breaking_change`,
+    /// `plan_preview` and `draft_model` only), so one string serves both and
+    /// a default-profile caller reads the same promise.
+    #[test]
+    fn the_reader_tool_descriptions_disclose_their_best_effort_reads() {
+        for profile in [McpProfile::Default, McpProfile::Worker] {
+            let server = server_with(profile);
+            let description = |name: &str| -> String {
+                server
+                    .tool_router
+                    .map
+                    .get(name)
+                    .unwrap_or_else(|| panic!("{profile:?} serves '{name}'"))
+                    .attr
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let inspect = description("inspect_schema");
+            assert!(
+                inspect.contains("best-effort"),
+                "{profile:?}: `inspect_schema` promises the project's tables without saying \
+                 its physical-table discovery can report none of them and still succeed: \
+                 {inspect}"
+            );
+            assert!(
+                inspect.contains("inconclusive, not absent"),
+                "{profile:?}: and it must say what that costs the caller, or 'best-effort' \
+                 reads as 'sometimes slow': {inspect}"
+            );
+            let profile_column = description("profile_column");
+            assert!(
+                profile_column.contains("second query and is best-effort"),
+                "{profile:?}: `profile_column`'s description offers `top_values` without \
+                 saying the query behind it can fail into an empty list on a successful \
+                 call: {profile_column}"
+            );
+        }
     }
 
     /// Item 5b — the worker `prompts/list` surface: EVERY listed prompt
