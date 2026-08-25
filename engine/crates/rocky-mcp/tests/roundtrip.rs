@@ -2914,6 +2914,71 @@ async fn build_model_does_not_promise_plan_preview_is_exact() {
     }
 }
 
+/// FOURTEENTH ROUND, finding 2 — `fix_failing_test` promised failure-local
+/// evidence that its own tools do not supply.
+///
+/// Two claims, and they are ASYMMETRIC across the profiles, so this test is
+/// asymmetric too rather than tidy:
+///
+/// - "sample_rows to look at offending rows" was in BOTH bodies.
+///   `sample_rows` takes `model` and `percent` and nothing else — it issues
+///   `SELECT * FROM <ref> [tablesample] LIMIT n`, with no predicate. A
+///   sparse bad row can simply be absent from the sample, and an agent told
+///   the rows are "offending" reads that absence as evidence.
+/// - "and the failing-row count" was WORKER-ONLY. `TestFailureLite` carries
+///   `name`, `error` and `suite`; there is no count field, and the compile,
+///   seed and model-execution failure paths in `rocky-engine`'s
+///   `test_runner` put no row numbers in the error text either. The default
+///   body never made that claim, so only the worker body gained the
+///   disclosure — pinning the default for it would pin a sentence that has
+///   no defect behind it.
+///
+/// No predicate sampling was added. The fix is the wording.
+#[tokio::test]
+async fn fix_failing_test_does_not_promise_failure_local_evidence() {
+    for profile in [
+        rocky_mcp::McpProfile::Default,
+        rocky_mcp::McpProfile::Worker,
+    ] {
+        let dir = TempDir::new().unwrap();
+        write_project(dir.path(), &dir.path().join("test.duckdb"));
+        let server = RockyMcpServer::new_with_profile(dir.path().join("rocky.toml"), profile);
+        let client = connect(server).await;
+        let args = serde_json::json!({ "model": "orders" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let result = client
+            .get_prompt(GetPromptRequestParams::new("fix_failing_test").with_arguments(args))
+            .await
+            .expect("get_prompt fix_failing_test");
+        let body = prompt_text(&result);
+        assert!(
+            !body.contains("offending rows"),
+            "{profile:?}: `fix_failing_test` calls the `sample_rows` output the OFFENDING \
+             rows; the tool takes no predicate and samples the whole table: {body}"
+        );
+        assert!(
+            body.contains("takes no predicate"),
+            "{profile:?}: `fix_failing_test` must say `sample_rows` is unfiltered, or a \
+             sample with no bad row in it reads as proof there is none: {body}"
+        );
+        assert!(
+            !body.contains("and the failing-row count"),
+            "{profile:?}: `fix_failing_test` promises a failing-row count; `TestFailureLite` \
+             carries only `name`, `error` and `suite`: {body}"
+        );
+        if profile == rocky_mcp::McpProfile::Worker {
+            assert!(
+                body.contains("no failing-row count field"),
+                "the worker body is the one that promised the count, so it is the one that \
+                 must say the field does not exist: {body}"
+            );
+        }
+        client.cancel().await.unwrap();
+    }
+}
+
 /// Flatten a prompt result's text messages into one searchable haystack.
 fn prompt_text(result: &rmcp::model::GetPromptResult) -> String {
     use rmcp::model::ContentBlock;

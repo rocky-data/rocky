@@ -5582,14 +5582,23 @@ impl RockyMcpServer {
                         "Diagnose and fix the failing tests in {scope}, using the MCP tools at \
                          each step:\n\n\
                          1. test — run the project's LOCAL model and unit tests, and read \
-                         which assertions fail, on which model, and the failing-row count. \
+                         `failures`: each entry gives the failing test's `name`, its `error` \
+                         text, and the `suite` it came from. That is everything it carries. \
+                         There is no failing-row count field, and several failure paths — a \
+                         compile error, a seed that will not load, a model that will not \
+                         execute — report no row numbers in the error text either. \
                          That local suite is the only one you can run here: the checks the \
                          product spec declares are evaluated by the trusted runner after an \
                          apply, not by this tool.\n\
                          2. For each failure, ground the cause before deciding the fix: \
                          profile_column the implicated columns to see their actual null rate, \
-                         distinct count, and value domain, and sample_rows to look at offending \
-                         rows. The failure tells you WHAT broke; the data tells you WHY.\n\
+                         distinct count, and value domain, and sample_rows to look at \
+                         representative rows. sample_rows takes no predicate — it returns an \
+                         unfiltered sample, so it is NOT failure-local evidence and a sparse \
+                         bad row can be missing from it. Rows it does not show are not rows \
+                         that do not exist; profile_column's whole-column counts are the \
+                         stronger signal. The failure tells you WHAT broke; the data tells \
+                         you WHY.\n\
                          3. Decide which side is wrong. If the model SQL is wrong (it produces \
                          duplicates / nulls / out-of-domain values it shouldn't), redraft it \
                          with draft_model — on an existing model it replaces the SQL and \
@@ -5642,8 +5651,11 @@ impl RockyMcpServer {
                      2. For each failure, ground the cause before deciding the fix: profile_column \
                      the implicated columns (the ones the assertion references) to see their \
                      actual null rate, distinct count, and value domain, and sample_rows to look \
-                     at offending rows. The failure tells you WHAT broke; the data tells you \
-                     WHY.\n\
+                     at representative rows. sample_rows takes no predicate — it returns an \
+                     unfiltered sample, so it is NOT failure-local evidence and a sparse bad row \
+                     can be missing from it. Rows it does not show are not rows that do not \
+                     exist; profile_column's whole-column counts are the stronger signal. The \
+                     failure tells you WHAT broke; the data tells you WHY.\n\
                      3. Decide which side is wrong. Either the model SQL is wrong (it produces \
                      duplicates / nulls / out-of-domain values it shouldn't) — fix the SQL — or \
                      the test encodes an invariant the data was never meant to hold — fix the \
