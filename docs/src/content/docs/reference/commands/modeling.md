@@ -509,7 +509,17 @@ rocky emit-sql [flags]
 
 ### Dialect and the runnable guarantee
 
-The dialect is the project's configured target adapter type, resolved from `rocky.toml` without credentials. With no resolvable config it defaults to DuckDB. All models render in this one resolved dialect, so for a project whose models target more than one adapter, the emitted SQL matches `rocky run` only for the models whose target uses that dialect.
+The dialect is the project's configured target adapter type, read from `rocky.toml`. No credentials are needed and no connection is opened. All models render in this one resolved dialect, so for a project whose models target more than one adapter, the emitted SQL matches `rocky run` only for the models whose target uses that dialect.
+
+Three outcomes, and the middle one is the point of the no-credentials promise:
+
+| `rocky.toml` | What happens |
+|---|---|
+| No file at the given path | Renders in DuckDB, the default dialect. |
+| Present, with `${VAR}` placeholders you have not exported | Renders in the configured dialect. The placeholder is never sent anywhere, so it does not have to resolve. |
+| Present but malformed, or it breaks a config rule | Refuses, and names the file. Rendering a broken Snowflake project in DuckDB would answer a question you did not ask. |
+
+One exception sits under row two: a placeholder written as a bare value, such as `port = ${PORT}`, is not valid TOML whether or not the variable is set. That is row three, and the error names `PORT`.
 
 Full-refresh models emit a complete `CREATE OR REPLACE TABLE … AS …` that runs as-is against a fresh warehouse and matches what a run executes in the resolved dialect. Incremental and merge models emit their steady-state statement instead: a bare `INSERT` or `MERGE` that operates on an existing target. `rocky run` bootstraps the target table on first build and threads the incremental watermark from state, neither of which a static emit can reproduce, so those files carry a leading note to that effect:
 

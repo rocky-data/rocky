@@ -621,19 +621,32 @@ pub(crate) fn dialect_for_adapter_type(
 ///
 /// # What is tolerated, and what is not
 ///
-/// Two tolerant paths are deliberate and must stay:
+/// Three tolerant paths are deliberate and must stay:
 ///
 /// - `config_path == None` — the standalone `--models <dir>` case, no project
 ///   file was named at all. Resolves DuckDB.
 /// - [`ConfigError::FileNotFound`](rocky_core::config::ConfigError::FileNotFound)
 ///   — `--config` defaults to `rocky.toml`, so this path runs even when the
 ///   user passed no flag and no project file exists. Resolves DuckDB.
+/// - An unset `${CREDENTIAL}`. Both callers are OFFLINE renderers whose
+///   published contract is "without a warehouse connection" and "resolved
+///   from `rocky.toml` without credentials", so the load runs under
+///   [`load_rocky_config_env_tolerant`](rocky_core::config::load_rocky_config_env_tolerant)
+///   and the placeholder survives as literal text.
 ///
-/// Every OTHER `ConfigError` propagates: a parse error, a missing `${VAR}`, a
-/// permission denial, a directory where the file should be. The same rule
-/// `compile_inner` applies, and for the same reason — we cannot tell what that
-/// config would have selected, and rendering in the default dialect answers a
-/// different question than the one asked.
+/// SEVENTEENTH ROUND, finding 1: the round-sixteen version of this function
+/// used the full `load_rocky_config`, which expands env vars. An initialized
+/// Databricks project with `${DATABRICKS_HOST}` unset therefore failed BOTH
+/// `rocky emit-sql` and MCP `plan_preview` before either touched a warehouse
+/// — a user-facing regression against the documented no-credentials contract.
+/// Refusing a MALFORMED config is the fix that round wanted; refusing an
+/// UNRESOLVED credential was a separate behaviour change riding along with it.
+///
+/// Every OTHER `ConfigError` still propagates: a parse error, a validator
+/// rejection, a permission denial, a directory where the file should be. The
+/// same rule `compile_inner` applies, and for the same reason — we cannot tell
+/// what that config would have selected, and rendering in the default dialect
+/// answers a different question than the one asked.
 ///
 /// An unresolvable *pipeline* stays tolerant, which is a different thing from
 /// an unloadable *config*: the preview falls back to the first declared
@@ -643,7 +656,7 @@ pub(crate) fn preview_dialect(
     config_path: Option<&Path>,
 ) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
     let config = match config_path {
-        Some(path) => match rocky_core::config::load_rocky_config(path) {
+        Some(path) => match rocky_core::config::load_rocky_config_env_tolerant(path) {
             Ok(config) => Some(config),
             Err(rocky_core::config::ConfigError::FileNotFound { .. }) => None,
             Err(error) => {
@@ -882,6 +895,10 @@ fn preview_merge_shape(model_ir: &ModelIr, dialect: &dyn SqlDialect) -> Result<S
 /// A `rocky.toml` that exists but does NOT LOAD is an error, not a fallback:
 /// previewing a broken Snowflake project in DuckDB would answer a question
 /// nobody asked. Only a missing file resolves the default dialect.
+///
+/// An unset `${CREDENTIAL}` is NOT "does not load" here. This core opens no
+/// connection, so a value it will never send is not a precondition for
+/// picking a dialect — see [`preview_dialect`].
 ///
 /// ## Replication-only projects
 ///
@@ -3186,6 +3203,69 @@ table = "users"
             "the refusal must name the config as the cause so a caller can act \
              on it, got: {rendered}"
         );
+    }
+
+    /// SEVENTEENTH ROUND, finding 1 — the regression pin.
+    ///
+    /// Round sixteen routed `preview_dialect` through the FULL config load,
+    /// which expands `${VAR}`. That made an unset credential fatal for two
+    /// commands documented as needing none: `rocky emit-sql` and MCP
+    /// `plan_preview`. An operator who had run `rocky init` for Databricks and
+    /// not yet exported `DATABRICKS_HOST` could no longer read their own
+    /// generated SQL.
+    ///
+    /// Two-sided on purpose. Succeeding is half the claim; the other half is
+    /// that the preview still picks the CONFIGURED dialect. A tolerant load
+    /// that silently fell back to DuckDB would pass a "it did not fail" test
+    /// while answering in the wrong dialect — the exact defect round sixteen
+    /// was fixing. So this asserts `snowflake`, which DuckDB-fallback and
+    /// Databricks-fallback both fail.
+    #[test]
+    fn plan_preview_tolerates_an_unset_credential_placeholder() {
+        let tmp = TempDir::new().unwrap();
+        // Never set, by construction — no `set_var` here. Mutating the
+        // process environment is global and racy under `cargo test`'s
+        // parallel threads, and a flaky pin is worse than no pin.
+        assert!(
+            std::env::var("ROCKY_DEFINITELY_NOT_SET_PREVIEW_ACCOUNT").is_err(),
+            "this test's premise is that the var is unset"
+        );
+        let (cfg_path, models_dir) = write_project(
+            &tmp,
+            r#"
+[adapter.default]
+type = "snowflake"
+account = "${ROCKY_DEFINITELY_NOT_SET_PREVIEW_ACCOUNT}"
+"#,
+            &[(
+                "users",
+                r#"name = "users"
+
+[strategy]
+type = "full_refresh"
+
+[target]
+catalog = "c"
+schema = "s"
+table = "users"
+"#,
+            )],
+        );
+
+        // The dialect is the CONFIGURED one, not the default.
+        let dialect = preview_dialect(Some(&cfg_path))
+            .expect("an unset credential must not fail an offline preview");
+        assert_eq!(
+            dialect.name(),
+            "snowflake",
+            "the preview must still resolve the configured adapter's dialect"
+        );
+
+        // And the whole offline preview runs end to end.
+        let out = plan_preview_output(Some(&cfg_path), &models_dir, None, None)
+            .expect("the offline preview opens no connection, so it needs no credential");
+        assert_eq!(out.statements.len(), 1);
+        assert_eq!(out.statements[0].target, "c.s.users");
     }
 
     /// The tolerated half of the rule above, pinned so a later tightening

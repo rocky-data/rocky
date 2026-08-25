@@ -2289,17 +2289,74 @@ pub fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
     substitute_env_vars_with_report(input).map(|(text, _)| text)
 }
 
+/// What [`parse_rocky_config_str_with_policy`] does with a `${VAR}` that has
+/// no value and no `:-default`.
+///
+/// SEVENTEENTH ROUND, finding 1. Two different questions were being answered
+/// by one loader. "Is this config well formed?" must be fatal everywhere.
+/// "Are this project's credentials available?" is only a question for a
+/// command that is about to connect. `rocky emit-sql` and MCP `plan_preview`
+/// connect to nothing, and their documented contract says so
+/// (`docs/.../reference/commands/modeling.md`, "without a warehouse
+/// connection"). Requiring `${DATABRICKS_HOST}` to be exported before an
+/// offline renderer will pick a dialect answers the second question on a
+/// path that only ever asked the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvPolicy {
+    /// Refuse with [`ConfigError::MissingEnvVar`]. Every path that executes,
+    /// connects, or persists — i.e. everything except the offline previews.
+    Require,
+    /// Leave the `${VAR}` text in place and carry on. OFFLINE readers only.
+    ///
+    /// This is NOT a tolerance for broken configs: the TOML still has to
+    /// parse and the whole [`CONFIG_VALIDATORS`] chain still has to pass.
+    /// The placeholder survives as literal text, which is valid inside the
+    /// quoted string every credential field uses. A placeholder written as a
+    /// BARE value (`port = ${PORT}`) was never valid TOML and still fails —
+    /// as a parse error naming the unresolved variable, see
+    /// [`format_env_var_hint`].
+    KeepPlaceholder,
+}
+
 /// Like [`substitute_env_vars`], but also returns a report of every
 /// substitution performed. Used by the config loader to attach env-var
 /// origin context to post-substitution parse errors (§P2.9).
 pub fn substitute_env_vars_with_report(
     input: &str,
 ) -> Result<(String, Vec<EnvVarSubstitution>), ConfigError> {
+    let (text, substitutions, unresolved) = substitute_env_vars_keeping_placeholders(input);
+    match unresolved.into_iter().next() {
+        Some((name, span)) => Err(ConfigError::MissingEnvVar {
+            name,
+            span: Some(span),
+        }),
+        None => Ok((text, substitutions)),
+    }
+}
+
+/// What [`substitute_env_vars_keeping_placeholders`] hands back: the
+/// substituted text, every substitution performed, and every `${VAR}` that had
+/// no value — each with the byte span of its placeholder in the raw input.
+type EnvSubstitutionOutcome = (
+    String,
+    Vec<EnvVarSubstitution>,
+    Vec<(String, std::ops::Range<usize>)>,
+);
+
+/// The substitution body, with no opinion about a missing variable: the
+/// `${VAR}` text is copied through verbatim and reported back to the caller,
+/// which decides whether that is fatal.
+///
+/// Returns `(substituted text, substitutions performed, unresolved vars)`.
+/// The unresolved list is in source order and carries each placeholder's byte
+/// span, so [`substitute_env_vars_with_report`] can raise exactly the
+/// [`ConfigError::MissingEnvVar`] it always did — same name, same span.
+fn substitute_env_vars_keeping_placeholders(input: &str) -> EnvSubstitutionOutcome {
     let re = &*ENV_VAR_RE;
     let mut result = String::with_capacity(input.len());
     let mut last_end = 0;
-    // Track the first missing env var and its byte span for diagnostics.
-    let mut first_missing: Option<(String, std::ops::Range<usize>)> = None;
+    // Every missing env var and its byte span, in source order, for diagnostics.
+    let mut unresolved: Vec<(String, std::ops::Range<usize>)> = Vec::new();
     let mut substitutions: Vec<EnvVarSubstitution> = Vec::new();
 
     for cap in re.captures_iter(input) {
@@ -2343,9 +2400,7 @@ pub fn substitute_env_vars_with_report(
                     });
                 }
                 Err(_) => {
-                    if first_missing.is_none() {
-                        first_missing = Some((expr.to_string(), match_start..match_end));
-                    }
+                    unresolved.push((expr.to_string(), match_start..match_end));
                     // Keep the placeholder verbatim so the rest of the string
                     // stays intact for context.
                     result.push_str(&input[match_start..match_end]);
@@ -2355,24 +2410,25 @@ pub fn substitute_env_vars_with_report(
         last_end = match_end;
     }
 
-    if let Some((name, span)) = first_missing {
-        return Err(ConfigError::MissingEnvVar {
-            name,
-            span: Some(span),
-        });
-    }
-
     // Copy the tail of the input after the last match.
     result.push_str(&input[last_end..]);
-    Ok((result, substitutions))
+    (result, substitutions, unresolved)
 }
 
-/// Formats a list of env-var substitutions into a one-line human-readable
-/// hint appended to post-substitution parse errors. Values are truncated to
-/// avoid dumping secrets / multi-KB strings into a log line; the operator
-/// just needs enough context to find the misbehaving env var.
-fn format_env_var_hint(substitutions: &[EnvVarSubstitution]) -> String {
-    if substitutions.is_empty() {
+/// Formats the env-var context into a one-line human-readable hint appended
+/// to post-substitution parse errors. Values are truncated to avoid dumping
+/// secrets / multi-KB strings into a log line; the operator just needs enough
+/// context to find the misbehaving env var.
+///
+/// `unresolved` matters only under [`EnvPolicy::KeepPlaceholder`], and it is
+/// the whole reason that policy does not degrade diagnostics. Under
+/// [`EnvPolicy::Require`] an unset `${PORT}` is a `MissingEnvVar` naming
+/// `PORT`. Under `KeepPlaceholder` the text `${PORT}` survives into the TOML,
+/// and a BARE `port = ${PORT}` then fails to parse — for a reason the parse
+/// error itself cannot express. Listing the unresolved names here keeps that
+/// error pointing at `PORT` instead of at a stray `$`.
+fn format_env_var_hint(substitutions: &[EnvVarSubstitution], unresolved: &[String]) -> String {
+    if substitutions.is_empty() && unresolved.is_empty() {
         return String::new();
     }
     const MAX_VALUE_LEN: usize = 40;
@@ -2396,10 +2452,27 @@ fn format_env_var_hint(substitutions: &[EnvVarSubstitution]) -> String {
             format!("{}={:?}", sub.name, truncated)
         })
         .collect();
-    format!(
-        "\n  hint: config had these env var substitutions — check one is the culprit: {}",
-        parts.join(", ")
-    )
+    let mut hint = String::new();
+    if !parts.is_empty() {
+        hint.push_str(&format!(
+            "\n  hint: config had these env var substitutions — check one is the culprit: {}",
+            parts.join(", ")
+        ));
+    }
+    if !unresolved.is_empty() {
+        let mut seen_unresolved = std::collections::HashSet::new();
+        let names: Vec<&str> = unresolved
+            .iter()
+            .filter(|name| seen_unresolved.insert(*name))
+            .map(String::as_str)
+            .collect();
+        hint.push_str(&format!(
+            "\n  hint: these env vars are not set, so their ${{...}} placeholders were left \
+             in the config text: {}",
+            names.join(", ")
+        ));
+    }
+    hint
 }
 
 // ===========================================================================
@@ -5888,8 +5961,32 @@ fn read_config_file(path: &Path) -> Result<String, ConfigError> {
 /// deprecation remapping, and shorthand normalization included; `kind`
 /// validation excluded (see [`parse_rocky_config`]).
 fn parse_rocky_config_str(raw: &str) -> Result<RockyConfig, ConfigError> {
-    let (substituted, substitutions) = substitute_env_vars_with_report(raw)?;
-    let env_var_hint = format_env_var_hint(&substitutions);
+    parse_rocky_config_str_with_policy(raw, EnvPolicy::Require)
+}
+
+/// [`parse_rocky_config_str`] with an explicit [`EnvPolicy`].
+///
+/// ONE body, deliberately. The offline previews and every executing path
+/// differ in exactly one decision — what an unset `${VAR}` means — and share
+/// the parse, the deprecation remap, the shorthand normalization and (via
+/// their callers) the whole validator chain. A second parse body is how the
+/// two aligned reads in `plan::preview_dialect` drifted apart in the first
+/// place; this is the same mistake one layer down, so it is not made.
+fn parse_rocky_config_str_with_policy(
+    raw: &str,
+    env_policy: EnvPolicy,
+) -> Result<RockyConfig, ConfigError> {
+    let (substituted, substitutions, unresolved) = substitute_env_vars_keeping_placeholders(raw);
+    let unresolved_names: Vec<String> = unresolved.iter().map(|(name, _)| name.clone()).collect();
+    if env_policy == EnvPolicy::Require
+        && let Some((name, span)) = unresolved.into_iter().next()
+    {
+        return Err(ConfigError::MissingEnvVar {
+            name,
+            span: Some(span),
+        });
+    }
+    let env_var_hint = format_env_var_hint(&substitutions, &unresolved_names);
     let to_parse_err = |source: toml::de::Error| -> ConfigError {
         if env_var_hint.is_empty() {
             ConfigError::ParseToml(source)
@@ -5970,6 +6067,48 @@ fn apply_single_adapter_discovery_default(config: &mut RockyConfig) {
 /// chain so it can emit every issue as its own diagnostic.
 pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     let config = parse_rocky_config(path)?;
+    validate_loaded_config(&config)?;
+    Ok(config)
+}
+
+/// [`load_rocky_config`] for a reader that will never connect: an unset
+/// `${VAR}` leaves its placeholder in place instead of failing the load.
+///
+/// # What this is for
+///
+/// The offline SQL renderers — `rocky emit-sql` and MCP `plan_preview` — read
+/// `rocky.toml` for ONE fact: which adapter type the project targets, so the
+/// preview renders in the right dialect. They open no connection, so a
+/// credential they will never send is not a precondition for answering that.
+/// The published contract says as much: "without a warehouse connection",
+/// "resolved from `rocky.toml` without credentials".
+///
+/// # What is still fatal
+///
+/// Everything that is actually wrong with the file:
+///
+/// ```text
+///   rocky.toml state                     load_rocky_config   ..._env_tolerant
+///   ------------------------------------ ------------------- ----------------
+///   malformed TOML                       refuse              refuse
+///   fails a CONFIG_VALIDATORS rule       refuse              refuse
+///   unreadable / permission denied       refuse              refuse
+///   unset ${CREDENTIAL} in a string      refuse              LOADS
+///   unset ${VAR} as a bare TOML value    refuse              refuse (parse)
+/// ```
+///
+/// The last row is not a gap: `port = ${PORT}` is not valid TOML with or
+/// without substitution. It fails as a parse error whose hint names `PORT`
+/// (see [`format_env_var_hint`]).
+///
+/// # What it must NOT be used for
+///
+/// Anything that connects, executes, or persists. A placeholder that reached
+/// an adapter would be sent as a literal `${DATABRICKS_HOST}`. Every such
+/// path calls [`load_rocky_config`] and keeps `MissingEnvVar` fatal.
+pub fn load_rocky_config_env_tolerant(path: &Path) -> Result<RockyConfig, ConfigError> {
+    let raw = read_config_file(path)?;
+    let config = parse_rocky_config_str_with_policy(&raw, EnvPolicy::KeepPlaceholder)?;
     validate_loaded_config(&config)?;
     Ok(config)
 }
@@ -6255,7 +6394,7 @@ mod tests {
             name: "SECRET".to_string(),
             value,
         }];
-        let hint = format_env_var_hint(&subs); // must not panic
+        let hint = format_env_var_hint(&subs, &[]); // must not panic
         assert!(hint.contains("SECRET"));
         assert!(hint.contains('…'));
     }
@@ -6443,6 +6582,116 @@ snapshot = "snap.json"
     fn test_no_env_vars() {
         let result = substitute_env_vars("no variables here").unwrap();
         assert_eq!(result, "no variables here");
+    }
+
+    // -----------------------------------------------------------------
+    // SEVENTEENTH ROUND, finding 1 — `load_rocky_config_env_tolerant`.
+    //
+    // These use a variable that is never set by construction rather than
+    // `set_var`/`remove_var`: the process environment is global, `cargo
+    // test` runs these threads in parallel, and a pin that flakes is worse
+    // than no pin at all.
+    // -----------------------------------------------------------------
+
+    /// An unset credential placeholder loads, and the placeholder survives as
+    /// literal text — so the caller sees exactly what it would have to
+    /// resolve before connecting.
+    #[test]
+    fn env_tolerant_load_keeps_an_unset_credential_placeholder() {
+        assert!(
+            std::env::var("ROCKY_DEFINITELY_NOT_SET_TOLERANT_HOST").is_err(),
+            "premise: the variable is unset"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            r#"
+[adapter.default]
+type = "databricks"
+host = "${ROCKY_DEFINITELY_NOT_SET_TOLERANT_HOST}"
+http_path = "/sql/1.0/warehouses/abc"
+token = "pat"
+"#,
+        )
+        .unwrap();
+
+        // The strict loader refuses — that behaviour is unchanged and is the
+        // baseline this test is a delta against.
+        assert!(matches!(
+            load_rocky_config(&path),
+            Err(ConfigError::MissingEnvVar { .. })
+        ));
+
+        let config = load_rocky_config_env_tolerant(&path)
+            .expect("an offline reader needs no credential to learn the adapter type");
+        let adapter = config.adapters.get("default").expect("adapter parsed");
+        assert_eq!(adapter.adapter_type, "databricks");
+        assert_eq!(
+            adapter.host.as_deref(),
+            Some("${ROCKY_DEFINITELY_NOT_SET_TOLERANT_HOST}"),
+            "the placeholder must survive verbatim, never silently blank"
+        );
+    }
+
+    /// Tolerating an unset variable must not tolerate a BROKEN file. Both
+    /// halves, because "it loaded" is only good news if the things that
+    /// should still fail still fail.
+    #[test]
+    fn env_tolerant_load_still_refuses_malformed_and_invalid_configs() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Malformed: unterminated table header.
+        let malformed = tmp.path().join("malformed.toml");
+        std::fs::write(&malformed, "[adapter.default\ntype = \"snowflake\"\n").unwrap();
+        assert!(
+            load_rocky_config_env_tolerant(&malformed).is_err(),
+            "malformed TOML stays fatal"
+        );
+
+        // Semantically invalid: parses, then fails the validator chain —
+        // snowflake has no discovery role, so `kind = "discovery"` is
+        // rejected by `validate_adapter_kinds`.
+        let invalid = tmp.path().join("invalid.toml");
+        std::fs::write(
+            &invalid,
+            "[adapter.default]\ntype = \"snowflake\"\nkind = \"discovery\"\naccount = \"a\"\n",
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                load_rocky_config_env_tolerant(&invalid),
+                Err(ConfigError::AdapterKindUnsupported { .. })
+            ),
+            "the whole CONFIG_VALIDATORS chain still runs"
+        );
+    }
+
+    /// The one shape the tolerant policy cannot save, pinned so the
+    /// diagnostic stays useful: a placeholder written as a BARE TOML value
+    /// was never valid TOML, so it fails to parse — and the error must still
+    /// name the variable, which the parser alone cannot know.
+    #[test]
+    fn env_tolerant_load_names_an_unresolved_var_in_a_parse_error() {
+        assert!(
+            std::env::var("ROCKY_DEFINITELY_NOT_SET_BARE_PORT").is_err(),
+            "premise: the variable is unset"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapter.default]\ntype = \"duckdb\"\nport = ${ROCKY_DEFINITELY_NOT_SET_BARE_PORT}\n",
+        )
+        .unwrap();
+
+        let err = load_rocky_config_env_tolerant(&path)
+            .expect_err("a bare ${VAR} is not valid TOML with or without substitution");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("ROCKY_DEFINITELY_NOT_SET_BARE_PORT"),
+            "the parse error must name the unresolved variable, got: {rendered}"
+        );
     }
 
     #[test]

@@ -87,7 +87,10 @@ fn emit_models(
     // The SAME resolution `plan_preview_output` uses — literally the same
     // function, so "emitted SQL matches the plan preview" is true by
     // construction. A `rocky.toml` that exists but does not load refuses here
-    // too, rather than emitting DuckDB SQL for a broken Snowflake project.
+    // too, rather than emitting DuckDB SQL for a broken Snowflake project. An
+    // unset `${CREDENTIAL}` is not that case: this command connects to
+    // nothing and is documented as needing none, so the placeholder is
+    // tolerated (`preview_dialect`).
     let dialect = preview_dialect(config_path)?;
 
     let config = CompilerConfig {
@@ -414,6 +417,66 @@ mod tests {
             rendered.contains("failed to load config"),
             "the refusal must name the config as the cause: {rendered}"
         );
+    }
+
+    /// SEVENTEENTH ROUND, finding 1 — `emit-sql`'s own pin.
+    ///
+    /// The published contract for this command is "without a warehouse
+    /// connection" and "resolved from `rocky.toml` without credentials"
+    /// (`docs/.../reference/commands/modeling.md`). Round sixteen's shared
+    /// `preview_dialect` briefly expanded env vars, so an initialized
+    /// Databricks project with `${DATABRICKS_HOST}` unset exited 1 here.
+    ///
+    /// Pinned on this side as well as the plan side for the reason the
+    /// neighbouring test gives: sharing a helper is only half the guarantee.
+    #[test]
+    fn emit_tolerates_an_unset_credential_placeholder() {
+        assert!(
+            std::env::var("ROCKY_DEFINITELY_NOT_SET_EMIT_HOST").is_err(),
+            "premise: the variable is unset"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        // Written by hand rather than via `write_model`: that helper pins
+        // `catalog = ""`, and the Databricks dialect refuses a two-part
+        // reference, so the model would be SKIPPED and the test would pass
+        // on an empty result set for the wrong reason.
+        std::fs::write(dir.path().join("m.sql"), "SELECT 1 AS id\n").unwrap();
+        std::fs::write(
+            dir.path().join("m.toml"),
+            "[strategy]\ntype = \"full_refresh\"\n\n\
+             [target]\ncatalog = \"c\"\nschema = \"main\"\ntable = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = dir.path().join("rocky.toml");
+        std::fs::write(
+            &cfg,
+            "[adapter.default]\ntype = \"databricks\"\n\
+             host = \"${ROCKY_DEFINITELY_NOT_SET_EMIT_HOST}\"\n\
+             http_path = \"/sql/1.0/warehouses/abc\"\ntoken = \"pat\"\n",
+        )
+        .unwrap();
+
+        let emitted = emit_models(
+            Some(&cfg),
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .expect("emit-sql opens no connection, so an unset credential must not stop it")
+        .models;
+        assert_eq!(emitted.len(), 1, "the model must still render");
+        assert!(
+            emitted[0].sql.contains("CREATE OR REPLACE TABLE"),
+            "unexpected SQL: {}",
+            emitted[0].sql
+        );
+        // This arm does NOT prove the dialect: a trivial CTAS renders
+        // identically in Databricks and DuckDB, so asserting on this SQL
+        // could not tell a correct resolution from a silent fallback. The
+        // two-sided dialect claim is pinned where it is observable, on the
+        // shared resolver — `plan::tests::
+        // plan_preview_tolerates_an_unset_credential_placeholder` asserts
+        // `preview_dialect(...).name() == "snowflake"`.
     }
 
     #[test]
