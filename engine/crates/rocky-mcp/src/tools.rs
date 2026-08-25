@@ -2313,8 +2313,25 @@ impl RockyMcpServer {
         // Surface the physical warehouse tables so an agent can ground a raw
         // source the project never declared — and at cold start, before any
         // model exists. Skip a table that is a model's target or is already
-        // reported as a compile-derived source. Best-effort across warehouses:
-        // the discovery query degrades to an empty list on any error.
+        // reported as a compile-derived source.
+        //
+        // TWO SILENT FAILURE MODES, and the old note here described only the
+        // second. `if let Ok(Some(..))` discards the `Err` arm, so an adapter
+        // that will not resolve skips discovery entirely — and
+        // `warehouse_adapter` returns `Ok(Some(..))` or `Err`, never
+        // `Ok(None)`, so `Err` is the only way this can miss.
+        // `discover_source_tables` then returns an empty `Vec` on a failed
+        // query. Either way this returns SUCCESS with no physical tables, and
+        // `InspectSchemaResult` carries no field saying which happened — so a
+        // caller cannot tell "no undeclared tables" from "discovery did not
+        // run". The `models` list and the compile-derived `sources` are NOT
+        // affected: a compile failure other than "no models found" already
+        // returned `ToolError::compile_failed` above.
+        //
+        // Filed as its own defect (it affects every profile, not just the
+        // worker). The worker guidance in `WORKER_INSTRUCTIONS_REWRITES`
+        // describes the tool as inconclusive here rather than promising an
+        // error it does not raise.
         if let Ok(Some(adapter)) = self.warehouse_adapter() {
             let seen: std::collections::HashSet<String> =
                 sources.iter().map(|s| s.name.clone()).collect();
@@ -4850,9 +4867,15 @@ impl RockyMcpServer {
     /// Returns the configured target adapter for the resolved pipeline — any
     /// warehouse (DuckDB, Snowflake, BigQuery, Databricks, Trino). The data
     /// grounding tools (`sample_rows`, `profile_column`, and `inspect_schema`'s
-    /// source discovery) reach the live warehouse through it. Kept as
-    /// `Result<Option<...>>` so `inspect_schema`'s `if let Ok(Some(_))`
-    /// graceful-degradation path survives a resolution failure.
+    /// source discovery) reach the live warehouse through it.
+    ///
+    /// Every return is `Ok(Some(..))` or `Err` — the `None` arm is dead. The
+    /// note here used to justify the `Result<Option<..>>` shape as what lets
+    /// `inspect_schema` degrade gracefully, and that had it backwards: the
+    /// `Option` is not what swallows a resolution failure. `inspect_schema`'s
+    /// `if let Ok(Some(..))` discarding the `Err` arm is, and it degrades to
+    /// a SUCCESS that names no physical tables. `prepare_table_query` — the
+    /// path `sample_rows` and `profile_column` take — propagates instead.
     fn warehouse_adapter(
         &self,
     ) -> anyhow::Result<Option<std::sync::Arc<dyn rocky_core::traits::WarehouseAdapter>>> {
@@ -5783,10 +5806,27 @@ fn breaking_finding_lite(f: &rocky_core::breaking_change::BreakingFinding) -> Br
     }
 }
 
-/// Discover the physical tables in the DuckDB warehouse as schema-qualified
+/// Discover the physical tables in the target warehouse as schema-qualified
 /// source entries (best-effort — returns empty on any query error). Excludes
 /// the system schemas. Lets `inspect_schema` show an agent the raw sources the
 /// project never declared, including at cold start.
+///
+/// # The query is unqualified, and that is not portable
+///
+/// This said "the DuckDB warehouse", but the only caller hands it whatever
+/// its `warehouse_adapter` resolved — any of DuckDB, Snowflake, BigQuery,
+/// Databricks or Trino. The `FROM information_schema.columns` below carries no
+/// catalog, and every one of Rocky's own adapters qualifies that view:
+/// `rocky-snowflake/src/batch.rs` scopes it to `<database>.`,
+/// `rocky-databricks/src/batch.rs` to `<catalog>.`, and
+/// `rocky-bigquery/src/dialect.rs` states outright that a bare
+/// `INFORMATION_SCHEMA.COLUMNS` does not resolve there.
+///
+/// So on a non-DuckDB target this returns empty for the ordinary reason that
+/// the query cannot run — and the caller reports success with no physical
+/// tables either way. Named here rather than fixed: widening the query is a
+/// product change, and it belongs with the silent-degradation defect the
+/// caller's note points at.
 async fn discover_source_tables(
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
 ) -> Vec<SchemaEntry> {
