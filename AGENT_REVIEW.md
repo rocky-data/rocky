@@ -65,7 +65,10 @@ Key files:
    soundness, content-addressed commit atomicity, no half-committed state on the failure path.
 5. **Rust correctness hazards** — panics on user-reachable paths, `unsafe` without `// SAFETY:`.
 6. **Test evidence** — is the change proven by a coded-diagnostic rejection test and an assertion on the
-   emitted type / SQL?
+   emitted type / SQL? A test only counts when it FAILS with the fix reverted; run
+   `scripts/mutation-check.sh` to show that. It refuses on a dirty worktree, so commit the fix and its
+   test first — the committed state is what the evidence is about. Two failure shapes it catches: a test
+   that reimplements the logic instead of calling it, and a mutation that silently did not apply.
 
 Do **not** spend budget on formatting, import ordering, naming, or doc typos. Collapse those into at most
 a single trailing `nits:` line.
