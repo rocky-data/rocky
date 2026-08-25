@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::diagnostic::{Diagnostic, E010, E011, E012, E013, W010};
+use crate::diagnostic::{Diagnostic, E010, E011, E012, E013, E014, W010};
 use crate::types::{RockyType, TypedColumn};
 
 /// A compile-time contract for a model's output schema.
@@ -215,6 +215,62 @@ pub fn validate_contract(
         }
     }
 
+    // `[rules] no_new_nullable` — parsed since it was introduced, enforced
+    // nowhere until now. The product lowering layer knew: it refuses to emit
+    // this key precisely because "the engine parses that rule and enforces it
+    // nowhere, so emitting it would promise a guard that does not run"
+    // (`rocky-core/src/product/lowering.rs`). A declared control that never
+    // runs is worse than no control, because the operator believes it is on
+    // (#1467).
+    //
+    // The reading: the contract's `[[columns]]` are the declared baseline, so
+    // a NEW nullable column is a nullable output column the contract does not
+    // declare. Enforcement is opt-in (`no_new_nullable` defaults to false), so
+    // this can only fail a project that explicitly asked for the guard.
+    if contract.rules.no_new_nullable {
+        if contract.columns.is_empty() {
+            // No baseline, so "new" has no meaning. Refusing beats the two
+            // silent readings: treating every nullable column as new (a
+            // surprise mass-failure) or treating none as new (inert again).
+            diagnostics.push(
+                Diagnostic::error(
+                    E014,
+                    model_name,
+                    "`[rules] no_new_nullable` is set but the contract declares no `[[columns]]`, \
+                     so there is no baseline for what counts as new"
+                        .to_string(),
+                )
+                .with_suggestion(
+                    "declare the expected columns in `[[columns]]`, or remove `no_new_nullable`"
+                        .to_string(),
+                ),
+            );
+        } else {
+            let declared: std::collections::HashSet<&str> =
+                contract.columns.iter().map(|c| c.name.as_str()).collect();
+            for col in inferred_schema {
+                if col.nullable && !declared.contains(col.name.as_str()) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            E014,
+                            model_name,
+                            format!(
+                                "nullable column '{}' is not declared in the contract, and \
+                                 `[rules] no_new_nullable` forbids adding one",
+                                col.name
+                            ),
+                        )
+                        .with_suggestion(format!(
+                            "declare `{}` in `[[columns]]`, make it NOT NULL in the SELECT, or \
+                             remove `no_new_nullable`",
+                            col.name
+                        )),
+                    );
+                }
+            }
+        }
+    }
+
     diagnostics
 }
 
@@ -331,6 +387,102 @@ mod tests {
 
         let diags = validate_contract("test_model", &schema, &contract);
         assert!(diags.is_empty(), "expected no diagnostics: {diags:?}");
+    }
+
+    /// Helper: a contract declaring `id`, with the rules the test wants.
+    fn contract_declaring_id(rules: ContractRules) -> CompilerContract {
+        CompilerContract {
+            columns: vec![ContractColumn {
+                name: "id".to_string(),
+                type_name: None,
+                nullable: None,
+                description: None,
+            }],
+            rules,
+        }
+    }
+
+    /// The rule was parsed and enforced nowhere (#1467). An undeclared
+    /// nullable column is exactly what it forbids.
+    #[test]
+    fn no_new_nullable_rejects_an_undeclared_nullable_column() {
+        let schema = vec![
+            typed_col("id", RockyType::Int64, false),
+            typed_col("surprise", RockyType::String, true),
+        ];
+        let contract = contract_declaring_id(ContractRules {
+            no_new_nullable: true,
+            ..Default::default()
+        });
+
+        let diags = validate_contract("m", &schema, &contract);
+        let e014: Vec<_> = diags.iter().filter(|d| &*d.code == "E014").collect();
+        assert_eq!(e014.len(), 1, "expected one E014, got: {diags:?}");
+        assert!(
+            e014[0].message.contains("surprise"),
+            "the diagnostic must name the column: {:?}",
+            e014[0].message
+        );
+    }
+
+    /// A NON-nullable undeclared column is not what this rule is about.
+    #[test]
+    fn no_new_nullable_allows_an_undeclared_non_nullable_column() {
+        let schema = vec![
+            typed_col("id", RockyType::Int64, false),
+            typed_col("added", RockyType::String, false),
+        ];
+        let contract = contract_declaring_id(ContractRules {
+            no_new_nullable: true,
+            ..Default::default()
+        });
+
+        let diags = validate_contract("m", &schema, &contract);
+        assert!(
+            diags.iter().all(|d| &*d.code != "E014"),
+            "a non-nullable column must not trip no_new_nullable: {diags:?}"
+        );
+    }
+
+    /// The rule is OPT-IN. Enforcing it must not change any project that
+    /// never set it — the same schema with the flag off is clean.
+    #[test]
+    fn no_new_nullable_is_opt_in() {
+        let schema = vec![
+            typed_col("id", RockyType::Int64, false),
+            typed_col("surprise", RockyType::String, true),
+        ];
+        let contract = contract_declaring_id(ContractRules::default());
+
+        let diags = validate_contract("m", &schema, &contract);
+        assert!(
+            diags.iter().all(|d| &*d.code != "E014"),
+            "no_new_nullable defaults to false and must stay inert then: {diags:?}"
+        );
+    }
+
+    /// With no `[[columns]]` the rule has no baseline, so "new" is undefined.
+    /// Refusing beats guessing: treating every nullable column as new is a
+    /// surprise mass-failure, treating none as new is inert again.
+    #[test]
+    fn no_new_nullable_without_a_baseline_is_refused() {
+        let schema = vec![typed_col("anything", RockyType::String, true)];
+        let contract = CompilerContract {
+            columns: vec![],
+            rules: ContractRules {
+                no_new_nullable: true,
+                ..Default::default()
+            },
+        };
+
+        let diags = validate_contract("m", &schema, &contract);
+        let e014: Vec<_> = diags.iter().filter(|d| &*d.code == "E014").collect();
+        assert_eq!(e014.len(), 1, "expected exactly one E014: {diags:?}");
+        assert!(
+            e014[0].message.contains("no baseline"),
+            "the refusal must explain why: {:?}",
+            e014[0].message
+        );
     }
 
     #[test]

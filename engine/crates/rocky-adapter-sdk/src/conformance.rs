@@ -94,6 +94,18 @@ impl ConformanceResult {
             self.tests_passed, self.tests_failed, self.tests_skipped
         ));
 
+        // Nothing ran. The exit status is still zero — it keys on failures,
+        // and changing that would break pipelines — so the report has to be
+        // the thing that says so. A conformance suite reporting no failures
+        // while verifying nothing is the same silent-success shape the
+        // `_ => Pass` catch-all had, one level up.
+        if self.tests_passed == 0 && self.tests_failed == 0 {
+            out.push_str(
+                "\nWARNING: no conformance check actually ran. This is NOT a passing \
+                 conformance run — every spec was skipped.\n",
+            );
+        }
+
         out
     }
 }
@@ -409,7 +421,16 @@ fn run_test_spec(spec: &TestSpec, dialect: Option<&dyn SqlDialect>) -> TestOutco
                 Err(e) => TestOutcome::Fail(e.to_string()),
             }
         }
-        _ => TestOutcome::Pass,
+        // Every spec without an arm above. Reporting `Pass` here meant
+        // `rocky test-adapter` printed green for work it never did: only
+        // `format_table_ref` is actually exercised, so connect, statement
+        // execution, schema/table lifecycle, grants, batch checks and
+        // discovery all counted as passing conformance (#475).
+        //
+        // `Skipped` is the honest answer — the spec is declared, the check
+        // is not written. It also keeps `tests_run` (passed + failed) from
+        // counting unimplemented specs as verified work.
+        _ => TestOutcome::Skip("no conformance check is implemented for this spec yet".into()),
     }
 }
 
@@ -560,16 +581,86 @@ mod tests {
             .unwrap_or_else(|| panic!("missing {name} result"))
     }
 
+    /// A run that verified nothing must SAY so.
+    ///
+    /// The exit status keys on failures, so an all-skipped run exits zero —
+    /// changing that would break pipelines. The report is therefore the only
+    /// thing standing between "no failures" and "nothing was checked", which
+    /// is the same silent-success shape the `_ => Pass` catch-all had.
+    #[test]
+    fn a_run_that_verified_nothing_says_so() {
+        // No dialect: even `format_table_ref` — the one implemented spec —
+        // skips, so nothing at all is verified. That is the real shape of a
+        // run against an adapter that could not be reached.
+        let manifest = test_manifest(AdapterCapabilities::full());
+        let result = run_conformance(&manifest, None);
+
+        assert_eq!(result.tests_passed, 0, "fixture precondition");
+        assert_eq!(result.tests_failed, 0, "fixture precondition");
+        let report = result.report();
+        assert!(
+            report.contains("NOT a passing conformance run"),
+            "an all-skipped report must not read as success:\n{report}"
+        );
+    }
+
+    /// The converse: a run that DID verify something must not carry the
+    /// warning, or it becomes noise everyone learns to ignore.
+    #[test]
+    fn a_run_that_verified_something_carries_no_warning() {
+        let manifest = test_manifest(AdapterCapabilities::warehouse_only());
+        let result = run_conformance(&manifest, Some(&TestDialect::default()));
+
+        assert!(result.tests_passed > 0, "fixture precondition");
+        assert!(
+            !result.report().contains("NOT a passing conformance run"),
+            "the warning must not fire when checks actually ran"
+        );
+    }
+
+    /// A spec only counts as RUN when a check actually executed.
+    ///
+    /// This test used to assert `tests_skipped == 0` and `tests_run == 26`,
+    /// which encoded the bug: `run_test_spec` implements exactly one arm
+    /// (`format_table_ref`) and every other spec fell through to `Pass`. A
+    /// full-capability adapter therefore reported 26 passing conformance
+    /// tests having executed one (#475).
+    ///
+    /// The honest counts are asserted instead, and the invariant that
+    /// matters is asserted directly: nothing reports Passed unless its
+    /// check ran.
     #[test]
     fn test_conformance_full_capabilities() {
         let manifest = test_manifest(AdapterCapabilities::full());
         let result = run_test_conformance(&manifest);
 
         assert_eq!(result.adapter, "test-adapter");
-        assert_eq!(result.tests_skipped, 0);
         assert_eq!(result.tests_failed, 0);
-        // All 26 tests should run
-        assert_eq!(result.tests_run, 26);
+
+        // 26 specs are declared; only `format_table_ref` has an
+        // implementation, and this run mode supplies no dialect — so it
+        // skips too. `tests_run` counts passed + failed, i.e. real work.
+        assert_eq!(
+            result.tests_run + result.tests_skipped,
+            26,
+            "every declared spec must be accounted for"
+        );
+        assert!(
+            result.tests_skipped >= 25,
+            "specs with no implemented check must report Skipped, not Passed \
+             (got {} skipped)",
+            result.tests_skipped
+        );
+
+        // The property, stated without counting: a Passed result means a
+        // check ran. Only `format_table_ref` can produce one today.
+        for r in &result.results {
+            assert!(
+                r.status != TestStatus::Passed || r.name == "format_table_ref",
+                "spec '{}' reported Passed but has no implemented check",
+                r.name
+            );
+        }
     }
 
     #[test]

@@ -247,6 +247,35 @@ def test_results_fail_when_e013_present():
     assert results[0].passed is False
 
 
+def test_results_e014_maps_to_column_constraints():
+    """E014 (no_new_nullable violated) → contract_column_constraints fails.
+
+    The dispatch drops any code missing from ``_CONTRACT_CODE_TO_CHECK``
+    silently. Since ``has_column_constraints`` is turned on by the presence
+    of ``no_new_nullable``, an unmapped E014 would leave the check REPORTING
+    PASSING while the contract was being violated — a false green in the
+    orchestrator.
+    """
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=False, has_protected=False, has_column_constraints=True)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[
+                _diag("E014", "orders", "nullable column 'extra' is not declared in the contract"),
+            ],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.check_name == CONTRACT_COLUMN_CONSTRAINTS_CHECK
+    assert r.passed is False, "an E014 violation must fail the check, not pass silently"
+
+
 def test_results_e011_e012_map_to_column_constraints():
     """E011 (type mismatch) and E012 (nullability) → contract_column_constraints fails."""
     asset_key = dg.AssetKey(["orders"])

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`rocky compile` refuses a `rocky.toml` it cannot read.** The config was loaded four separate times — for the schema cache, `[mask]` / `[classifications]`, the portability lint and `[imports]` — and every one of them swallowed the error. A malformed file therefore produced an empty mask, no portability lint, no imports check and a cold schema cache: four silent degradations from one broken file, none reported. It is now loaded once and a load failure fails the command; a genuinely absent file still compiles standalone, so flag-only use is unchanged.
+
+  Worth knowing on upgrade: `--config` defaults to `rocky.toml`, so this reaches projects that never passed the flag. `rocky compile --models models/` in a directory holding a broken `rocky.toml` now fails where it previously compiled — the file was always broken, it just said nothing. Only `FileNotFound` is tolerated: a permission error, or a directory where the file should be, refuses rather than guessing. (#1521, contributed in #1522)
+- **`[rules] no_new_nullable` is now enforced.** The rule parsed since it was introduced and ran nowhere — the product lowering layer knew, and refused to emit the key precisely because "the engine parses that rule and enforces it nowhere, so emitting it would promise a guard that does not run." A nullable output column the contract does not declare in `[[columns]]` is now an error (**E014**). Setting the rule with no `[[columns]]` is also E014: without a declared baseline, "new" has no meaning, and refusing beats the two silent readings (every nullable column is new, or none is). **Enforcement is opt-in** — `no_new_nullable` defaults to false, so this can only fail a project that explicitly asked for the guard. (#1467)
+
+### Fixed
+
+- **`rocky test-adapter` no longer reports a pass for conformance specs it never ran.** The conformance runner implements exactly one check (`format_table_ref`); every other spec — connect, statement execution, schema and table lifecycle, grants, batch checks, discovery — fell through a `_ => Pass` catch-all. A full-capability adapter therefore printed **26 passing conformance tests having executed one**. Those specs now report `Skipped` with the reason, and `tests_run` counts only real work. Exit status is unchanged (it keys on failures), so no pipeline breaks — but a run that used to print 26 passed now prints 1 accounted-for and 25 skipped, which is the honest number. (#475)
+
+
 ### Fixed
 
 - **`rocky run --watch` and `rocky watch` now honour SIGINT reliably, and honour SIGTERM at all.** Both loops built a fresh `tokio::signal::ctrl_c()` future on every iteration. When the file-change arm won, that future was dropped — and tokio discards a signal that arrives while no listener is registered. Between the debounce window and the inner run registering its own handler, a Ctrl-C was therefore both ignored *and* non-fatal, because tokio had already replaced the default disposition; the watcher kept running and a second Ctrl-C was needed. The registration is now built once, before the first iteration, and never dropped. Separately, neither loop had a SIGTERM arm at all, so after the first run the watcher could not be stopped by `timeout`, a CI job cancellation, or a container eviction — only by SIGKILL. Both now stop cleanly on either signal. (#1405)

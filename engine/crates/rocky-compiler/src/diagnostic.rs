@@ -31,6 +31,9 @@ pub const E011: &str = "E011";
 pub const E012: &str = "E012";
 /// Protected column has been removed.
 pub const E013: &str = "E013";
+/// A nullable column appeared that the contract does not declare, under
+/// `[rules] no_new_nullable`.
+pub const E014: &str = "E014";
 
 // Errors — time_interval validation
 //

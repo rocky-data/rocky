@@ -68,13 +68,7 @@ pub async fn run_test_adapter(
             // checks and override `connect` as failed below.
             let mut result = conformance::run_conformance(&manifest, None);
             // Override the first test (connect) as failed.
-            if let Some(connect_test) = result.results.first_mut() {
-                connect_test.status = conformance::TestStatus::Failed;
-                connect_test.message = Some(format!("failed to initialize: {e}"));
-                result.tests_passed -= 1;
-                result.tests_failed += 1;
-                result.tests_run = result.tests_passed + result.tests_failed;
-            }
+            mark_connect_failed(&mut result, &format!("failed to initialize: {e}"));
 
             result
         }
@@ -197,4 +191,148 @@ fn output_result(result: &ConformanceResult, json_output: bool) -> Result<()> {
         print!("{}", result.report());
     }
     Ok(())
+}
+
+/// Rewrite a conformance result's first spec (`connect`) as a failure.
+///
+/// Extracted so it can be tested against the REAL path. The bug it carried
+/// was invisible inline: it did `tests_passed -= 1`, assuming `connect` had
+/// passed. Every unimplemented spec passed unconditionally, so that held by
+/// accident — and once unimplemented specs report `Skipped`, `tests_passed`
+/// is 0 here. The subtraction then panics in debug and wraps in release,
+/// corrupting the result before the `tests_failed > 0` contract fires.
+///
+/// It moves the counter the test ACTUALLY contributed to, and saturates.
+fn mark_connect_failed(result: &mut conformance::ConformanceResult, reason: &str) {
+    let Some(connect_test) = result.results.first_mut() else {
+        return;
+    };
+    connect_test.status = conformance::TestStatus::Failed;
+    connect_test.message = Some(reason.to_string());
+
+    // RECOUNT from the results, rather than patching deltas.
+    //
+    // Delta-patching is what produced the underflow this function was
+    // extracted to fix, and it had a second bug of the same family: the
+    // `Failed` arm carried a comment saying "already counted, do not
+    // double-count" while `tests_failed += 1` ran unconditionally below it,
+    // so overriding an already-failed spec counted it twice. Recounting
+    // makes every prior status correct by construction and removes the class
+    // rather than the instance.
+    result.tests_passed = result
+        .results
+        .iter()
+        .filter(|r| r.status == conformance::TestStatus::Passed)
+        .count();
+    result.tests_failed = result
+        .results
+        .iter()
+        .filter(|r| r.status == conformance::TestStatus::Failed)
+        .count();
+    result.tests_skipped = result
+        .results
+        .iter()
+        .filter(|r| r.status == conformance::TestStatus::Skipped)
+        .count();
+    result.tests_run = result.tests_passed + result.tests_failed;
+}
+
+#[cfg(test)]
+mod tests {
+    use rocky_adapter_sdk::conformance::{self, TestStatus};
+    use rocky_adapter_sdk::{AdapterCapabilities, AdapterManifest};
+
+    /// Overriding a spec that ALREADY failed must not count it twice.
+    ///
+    /// The delta-patching version had a `Failed` arm commented "already
+    /// counted, do not double-count" — while `tests_failed += 1` ran
+    /// unconditionally below it. Unreachable today (the first spec always
+    /// skips), so it was a latent defect whose comment claimed the opposite
+    /// of the code. Recounting from `results` makes it correct by
+    /// construction; this pins that.
+    #[test]
+    fn overriding_an_already_failed_connect_counts_it_once() {
+        let manifest = AdapterManifest {
+            name: "probe".into(),
+            version: "0".into(),
+            sdk_version: rocky_adapter_sdk::SDK_VERSION.into(),
+            dialect: "unknown".into(),
+            capabilities: AdapterCapabilities::warehouse_only(),
+            auth_methods: vec![],
+            config_schema: serde_json::Value::Null,
+        };
+        let mut result = conformance::run_conformance(&manifest, None);
+
+        // Force the state the dead arm was written for.
+        result.results[0].status = TestStatus::Failed;
+        super::mark_connect_failed(&mut result, "failed to initialize: probe");
+
+        assert_eq!(
+            result.tests_failed, 1,
+            "an already-failed spec must count once, not twice"
+        );
+        assert_eq!(
+            result.tests_passed + result.tests_failed + result.tests_skipped,
+            result.results.len(),
+            "every result counted exactly once"
+        );
+    }
+
+    /// The init-failure path must not underflow its counters.
+    ///
+    /// It used to do `tests_passed -= 1` on the assumption that `connect`
+    /// had passed. Every unimplemented spec passed unconditionally, so that
+    /// held by accident. Once an unimplemented spec reports Skipped,
+    /// `tests_passed` is 0 there — and the subtraction panics in debug and
+    /// wraps to `u64::MAX` in release, corrupting the result before the
+    /// failure contract fires (#475 review).
+    ///
+    /// This reproduces the exact shape: take a real conformance result whose
+    /// `connect` is NOT Passed, and apply the same override.
+    #[test]
+    fn overriding_connect_as_failed_never_underflows() {
+        let manifest = AdapterManifest {
+            name: "probe".into(),
+            version: "0".into(),
+            sdk_version: rocky_adapter_sdk::SDK_VERSION.into(),
+            dialect: "unknown".into(),
+            capabilities: AdapterCapabilities::warehouse_only(),
+            auth_methods: vec![],
+            config_schema: serde_json::Value::Null,
+        };
+        let mut result = conformance::run_conformance(&manifest, None);
+
+        assert_ne!(
+            result.results[0].status,
+            TestStatus::Passed,
+            "fixture precondition: connect must not be Passed, or this test \
+             cannot exhibit the underflow"
+        );
+        let skipped_before = result.tests_skipped;
+
+        // The PRODUCTION path, not a copy of it. An earlier version of this
+        // test reimplemented the override inline, and therefore passed even
+        // with the real code reverted to the underflowing form.
+        super::mark_connect_failed(&mut result, "failed to initialize: probe");
+
+        assert_eq!(result.tests_failed, 1);
+        assert_eq!(
+            result.tests_skipped,
+            skipped_before - 1,
+            "the skipped count must lose the test that became a failure"
+        );
+        // The accounting IDENTITY, not a bound. `tests_run <= results.len()`
+        // was satisfied in release by a wrapped `usize::MAX + 1 == 0`, so it
+        // could not see the underflow it was written for.
+        assert_eq!(
+            result.tests_passed + result.tests_failed + result.tests_skipped,
+            result.results.len(),
+            "every result must be counted exactly once"
+        );
+        assert_eq!(
+            result.tests_run,
+            result.tests_passed + result.tests_failed,
+            "tests_run counts real work: passed + failed"
+        );
+    }
 }

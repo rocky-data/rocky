@@ -35,6 +35,10 @@ You can also build one subproject directly. The sections below give the commands
 
 Optional: run `just install-hooks` to point `core.hooksPath` at `.git-hooks/`. Every hook check is conditional. A check runs only when the change touches the subproject it covers.
 
+`post-checkout` is a warning, not a check: `git checkout <branch>` does not stop for a dirty worktree — it carries non-conflicting changes across, and they end up committed on whichever branch you landed on. git has no pre-checkout hook, so the switch cannot be refused; the hook makes the carry loud instead of silent.
+
+To start a branch, `scripts/new-branch.sh <name> [base]` refuses on a dirty tree and defaults the base to a freshly-fetched `origin/main`. Branching from whatever happened to be checked out is the other half of the same problem: the new branch inherits the current one's commits, so it conflicts when that branch merges — and a squash-merge of the child can land the parent's work, including its `Closes #NNN` trailers, under the child's number.
+
 - **pre-commit:** `cargo fmt --check` for `engine/`, `ruff format --check` for `integrations/dagster/`, eslint for `editors/vscode/`.
 - **pre-commit, codegen drift:** runs only when you stage `output.rs`, `commands/doctor.rs`, or `commands/export_schemas.rs` under `engine/crates/rocky-cli/src/`.
 - **pre-push:** `cargo clippy` for `engine/`, `ruff check` for `integrations/dagster/`.
