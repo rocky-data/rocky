@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.39.0] — 2026-08-26
+
+### Added
+
+- **Generated TypeScript types for `rocky product` and `rocky fulfill`.** Six new files under `src/types/generated/`: `product_compile`, `product_verify`, `product_approve`, `product_status`, the `rocky_product` spec-file types (#1483), and `fulfill` (#1492). They describe the JSON those commands already emit, so extension code and any TypeScript consumer can type it. Nothing in the extension reads them yet — this release adds no command, view, menu item, or setting. The LSP client and every existing command are unchanged.
+
+- **The bundled `rocky.toml` schema describes the `[fulfill]` block.** `[fulfill.driver]` takes one of two shapes: `type = "subprocess"` with `command`, `env_allow`, `timeout_seconds` and `kill_grace_seconds`, or `type = "replay"` with `session`. `[fulfill] briefs_dir` names a directory of brief overrides. The extension ships this schema and points it at `rocky.toml`; whether you see completion for the new keys depends on the TOML extension that reads it. `src/types/generated/rocky_project.ts` was regenerated alongside it and now exports `FulfillConfig` and `FulfillDriverConfig`, plus an optional `fulfill` field on `RockyConfig`. (#1492)
+
+### Changed
+
+- **Agent mode can no longer sign off a plan.** The extension starts its Model Context Protocol server as `rocky mcp --config <workspace>/rocky.toml`. It passes no `--profile approver`. On the engine released alongside this version, the `review_queue` tool serves its approve action only to a server started with that flag. So an agent that calls `review_queue` with `approve_plan_id` and `confirm: true` now gets the error `approve_not_enabled`, and no approval marker is written. Listing the pending queue is unchanged.
+
+  A Model Context Protocol server lets an agent call Rocky's tools directly. The approval marker is a file — `.rocky/plans/<plan-id>.reviewed.json` — that `rocky apply` requires before it will run an AI-authored plan. Before this, the extension's own server handed an agent both halves — propose a plan and approve it.
+
+  Worth knowing on upgrade: an agent workflow that approved its own plan through the extension now fails at that step. Approve it yourself instead. The Review panel's **Approve** button is unaffected — it runs `rocky review <plan-id> --approve` through the CLI, not through the server — and so is typing that command in a terminal.
+
+  The README is corrected to match. It said `review_queue` "can sign off a pending plan" and counted seven writing tools; it now counts six and states the refusal. (#1517, fixed in #1523)
+
 ## [1.38.0] — 2026-08-18
 
 ### Fixed

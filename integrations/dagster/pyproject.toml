@@ -1,6 +1,6 @@
 [project]
 name = "dagster-rocky"
-version = "1.63.0"
+version = "1.64.0"
 description = "Dagster integration for the Rocky SQL transformation engine"
 readme = "README.md"
 license = "Apache-2.0"
@@ -27,14 +27,20 @@ dependencies = [
     # freeze-marker and schedule/tick output types; an older SDK would be missing
     # them (and also the 0.8.3 `--models` forwarding + retention `env` guard fixes
     # the model-aware resource methods depend on).
-    # 0.12.0 is the first release with `dag(models_dir=...)` and
-    # `run_model(pipeline=...)`. This resource passes both keywords
-    # unconditionally, so an older SDK — legal under the previous `>=0.9.1` —
-    # raises TypeError during DAG discovery and per-model execution. The
-    # monorepo path source masks that in dev and CI, so this floor is the only
-    # thing protecting the published wheel. Release rocky-sdk 0.12.0 BEFORE any
-    # dagster-rocky release carrying this floor. (#1348)
-    "rocky-sdk>=0.12.0",
+    # 0.13.0 is the first release carrying the `rocky product` types. This
+    # resource imports ProductVerifyOutput, ProductCompileOutput,
+    # ProductApproveOutput and ProductStatusOutput from `.types`, which
+    # re-exports `rocky_sdk.types`, which pulls them from the
+    # `rocky_sdk.types_generated` barrel at module import. Those names do not
+    # exist in 0.12.0, so `import dagster_rocky` raises ImportError against an
+    # older SDK — not a TypeError at call time, but a hard failure at import.
+    # The 0.12.0 reason still holds underneath it: `dag(models_dir=...)` and
+    # `run_model(pipeline=...)` are passed
+    # unconditionally. The monorepo path source masks both in dev and CI, so
+    # this floor is the only thing protecting the published wheel. Release
+    # rocky-sdk 0.13.0 BEFORE any dagster-rocky release carrying this floor.
+    # (#1348)
+    "rocky-sdk>=0.13.0",
     # Floor matches the version CI actually resolves and tests (uv.lock). The
     # RockyComponent path uses dagster.components.* APIs from preview namespaces,
     # so we advertise a tested floor rather than an older, never-exercised one.

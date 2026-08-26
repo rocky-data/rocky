@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-08-26
+
+### Added
+
+- **Four typed client methods for `rocky product`.** `product_verify()`, `product_compile()`, `product_approve()` and `product_status()` each shell `rocky product <verb> <name>` and return a typed report. They need a `rocky` binary that carries the `rocky product` verbs; an older binary refuses with `unrecognized subcommand 'product'`. (#1483)
+
+  `product_verify()` is the one with a trap. `rocky product verify` exits **1** on `needs_input` and **2** on `fail`, but prints the full JSON report either way. The method therefore passes `allow_partial=True` and returns that report instead of raising — the same pattern `doctor()` uses. **Triage the `status` field, not the exit code.** `status` is `pass` / `needs_input` / `fail`; on `needs_input` the `paste_block` field carries the corrected `[policy]` block to paste into `rocky.toml`.
+
+- **Seven new result models, all additive.** `ProductVerifyOutput`, `ProductCompileOutput`, `ProductApproveOutput` and `ProductStatusOutput` for the four verbs; `ProductApprovalOutput` and `ProductArtifactOutput`, nested inside the compile and status reports; and `FulfillOutput` for `rocky fulfill`. All seven import from `rocky_sdk`, from `rocky_sdk.types` and from `rocky_sdk.types_generated`. **No existing result model gained or lost a field** in this release. (#1483, #1492)
+
+- **`parse_rocky_output()` routes five new commands.** `product_verify`, `product_compile`, `product_approve`, `product_status` and `fulfill`. In 0.12.0 each of those payloads raised `ValueError: Unknown Rocky command type: 'product_verify'`. (#1483, #1492)
+
+  **`fulfill` routes, but no client method produces it.** `RockyClient` has no `fulfill()` — the four `product_*` methods above are the whole client surface added here. To get a `FulfillOutput`, run `rocky fulfill <product> --output json` yourself and hand the string to `parse_rocky_output()`.
+
+- **`rocky_sdk.types_generated.rocky_product_schema`** — models for the product spec file `products/<name>.toml`: `SpecFile`, `ProductSpec`, `OutputSpec`, `SourceSpec`, `TrustSpec`, `ColumnSpec` and `FreshnessSpec`. Like every other config-shaped model in this SDK, they live only in their own submodule. `from rocky_sdk.types_generated import ProductSpec` fails with `ImportError`; import from the full submodule path instead. (#1483)
+
+### Changed
+
+- **A `rocky.toml` carrying a `[fulfill]` block now validates. In 0.12.0 it did not.** `RockyConfig` sets `extra="forbid"`, and it had no `fulfill` field — so `RockyConfig.model_validate()` on a config with `[fulfill]` failed with a Pydantic `ValidationError`: `Extra inputs are not permitted`. The field now exists and parses into a `FulfillConfig`, with `briefs_dir` (a relative path of brief overrides) and `driver` (either the `subprocess` variant or the `replay` variant).
+
+  A config with no `[fulfill]` block parses exactly as before — `fulfill` defaults to an empty block with both fields `None`. This reaches only code that validates `rocky.toml` through `RockyConfig`; the engine reads its own config and never goes through this model. (#1492)
+
+- **Generated enum class names shifted inside `rocky_sdk.types_generated.rocky_project_schema`, and 18 of them shift silently.** Two new `[fulfill]` driver variants sort earlier in the schema, so datamodel-codegen renumbered everything after them by two.
+
+  **The silent ones — 18 names that still import and now mean something else:**
+
+  | Name | Was | Is now |
+  |---|---|---|
+  | `Type` | `replication` pipeline tag | `subprocess` driver tag |
+  | `Type23` … `Type39` | 17 tags, one meaning each | each carries what `Type25` … `Type41` carries |
+
+  Every one of `Type`, `Type23` … `Type39` still resolves. None kept its members — the comparison is 18 changed, 0 unchanged. So `Type27.not_null`, valid in 0.12.0, now raises `AttributeError` at **use**, because `Type27` is the `snapshot` tag. Nothing fails at import, and nothing warns.
+
+  **The loud ones — 3 names that no longer exist here:** `PolicyEffect21` / `22` / `23`. Importing one from `rocky_project_schema` now raises `ImportError`. Their members moved to `PolicyEffect24` / `25` / `26`. The old three names still exist, but in the **new** `product_verify_schema` module, describing the same three effects for a different output — so an import that silently resolves from there is describing something else.
+
+  These are datamodel-codegen's positional names. They renumber whenever a schema gains a definition that sorts earlier — here the two new `[fulfill]` driver variants. **None of them is exported from `rocky_sdk.types` or from the `rocky_sdk.types_generated` barrel**, so only a direct `from rocky_sdk.types_generated.rocky_project_schema import ...` can reach one. The models meant to be used — `RockyConfig`, `PolicyConfig`, the pipeline classes and the quality-assertion classes — keep their names, their fields, and the exact strings they accept. (#1492)
+
 ## [0.12.0] — 2026-08-18
 
 ### Added

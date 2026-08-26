@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.64.0] — 2026-08-26
+
+### Added
+
+- **`RockyResource` gains four `product_*` methods.** `product_verify()`, `product_compile()`, `product_approve()` and `product_status()` each take a product name and run the matching `rocky product <verb>`. They return the typed results `ProductVerifyOutput`, `ProductCompileOutput`, `ProductApproveOutput` and `ProductStatusOutput`, all re-exported from `dagster_rocky.types`.
+
+  **`product_verify()` does not raise on a bad posture — read `status`, not the exit code.** The CLI exits 1 or 2 on `needs_input` and `fail`, but still prints the full JSON report, so the SDK reads it anyway. `result.status` is `pass` / `needs_input` / `fail`; on `needs_input`, `result.paste_block` carries the corrected `[policy]` block to put in `rocky.toml`. The other three methods behave like every sibling: a non-zero exit becomes a `dagster.Failure`.
+
+  `rocky product` is a new engine subcommand — engine-v1.71.0 does not have it. The SDK's minimum-binary check is `MIN_ROCKY_VERSION = "1.34.0"`, far below any engine that has these verbs, so it does not catch this. Against an older binary the call fails at the CLI, not at the version check. (#1483)
+
+### Changed
+
+- **The `rocky-sdk` floor rises from `>=0.12.0` to `>=0.13.0`. An older SDK stops `dagster_rocky` importing at all.** The four product result types are generated in the SDK, and `dagster_rocky.types` re-exports the SDK's surface. `resource.py` imports the four names at module level, and `dagster_rocky/__init__.py` imports `resource.py` — so with `rocky-sdk` 0.12.0 installed, plain `import dagster_rocky` raises `ImportError: cannot import name 'ProductApproveOutput'`. This is not confined to the new methods; nothing in the package loads. Upgrade `rocky-sdk` in the same step. (#1483)
+
+### Fixed
+
+- **A `no_new_nullable` contract violation now fails its asset check. On 1.63.0 it reported a pass.** Up to engine-v1.71.0 the engine parsed `[rules] no_new_nullable` and enforced nothing, so no diagnostic ever reached the check and the check was green by default. The engine now raises **E014** for a nullable output column that the contract does not declare in `[[columns]]`.
+
+  `dagster-rocky` maps each contract diagnostic to a check by its code, and **drops any code it does not know, silently**. E014 was not in that map. Meanwhile `contract_column_constraints` is switched on as soon as `no_new_nullable` is set. So `dagster-rocky` 1.63.0 paired with the new engine emits that check, reports it **passing**, and the contract is being violated the whole time. Upgrade the engine and this package together, or that pairing gives you a false green. E014 is now mapped to `contract_column_constraints`.
+
+  On upgrade: a project that sets `no_new_nullable = true` and outputs an undeclared nullable column now sees that asset check **fail** where it used to pass. That is the fix working. `no_new_nullable` defaults to false, so a project that never set it is unaffected. (#1467)
+
 ## [1.63.0] — 2026-08-18
 
 ### Added
