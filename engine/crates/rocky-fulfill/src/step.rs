@@ -428,7 +428,22 @@ impl Runner {
                 // The digest this generation pinned at verify — read from
                 // the RECORD, so a resume compares against what was
                 // verified rather than against whatever is on disk now.
-                self.observe_checks(prior_detail, record.checks_digest.clone())
+                // The routing identity the APPLIED plan authorised, read
+                // from the record's `plan_id` for the same reason the
+                // digest is: a resume must compare against what applied,
+                // not against whatever the config says now.
+                //
+                // `plan_id` is the applied plan here by construction.
+                // Observation runs only from `applied` / `observing` /
+                // `observed_failing`; every transition into those uses
+                // `to_state`, which preserves `plan_id`; and the one site
+                // that REPLACES it lands on `proposed`, which is not an
+                // observation state.
+                let applied_routing = record
+                    .plan_id
+                    .as_deref()
+                    .and_then(|plan_id| fulfill_api::plan_routing_identity(&self.root, plan_id));
+                self.observe_checks(prior_detail, record.checks_digest.clone(), applied_routing)
                     .await
             }
         }
@@ -900,6 +915,7 @@ impl Runner {
         &self,
         prior_detail: String,
         verified_digest: Option<String>,
+        applied_routing: Option<String>,
     ) -> Result<Event> {
         // Crash seam for the mid-observation drill: the staleness/test
         // reading is journaled, the declared checks are not read yet.
@@ -1140,6 +1156,62 @@ impl Runner {
             });
         };
 
+        // ROUTING GATE — the checks about to run must read the
+        // warehouse the APPLY wrote to.
+        //
+        // Ordered AFTER the check-set custody comparison, deliberately.
+        // When a sidecar AND the routing both changed, both are true and
+        // the restore is still the instruction that matters; custody
+        // outranks routing for the same reason it outranks a warehouse
+        // that will not resolve.
+        //
+        // Compared against `verified_set.routing_identity()`, which came
+        // from the SAME config load that produced the bound adapter.
+        // Loading `rocky.toml` again here to identify it would compare
+        // snapshot A while executing against snapshot B — the two-reads
+        // defect this handle exists to close, reintroduced at the one
+        // seam it had not yet covered.
+        //
+        // A MISSING identity is a hold, not a pass. `if let Some(..)`
+        // here would wave through exactly the plans this gate cannot
+        // check. Apply refuses a `fingerprint_version >= 1` plan that
+        // carries no identity, so a plan that applied has one; absence
+        // means the evidence is gone, which is a reason to stop rather
+        // than a reason to proceed.
+        match applied_routing.as_deref() {
+            Some(applied) if applied == verified_set.routing_identity() => {}
+            Some(_) => {
+                return Ok(Event::ObservationChecks {
+                    failed: 0,
+                    errored: 0,
+                    warned: 0,
+                    // NOT `Some(0)`. Nothing ran, and a zero here would
+                    // read as "no unevaluated checks" — health.
+                    deferred: None,
+                    detail: "the warehouse `rocky.toml` routes to now is not the one this \
+                             generation applied to, so the declared checks were NOT run — \
+                             running them would report on a table this generation never wrote"
+                        .to_string(),
+                    prior_detail,
+                    cause: Some(UnevaluableCause::RoutingDiverged),
+                });
+            }
+            None => {
+                return Ok(Event::ObservationChecks {
+                    failed: 0,
+                    errored: 0,
+                    warned: 0,
+                    deferred: None,
+                    detail: "this generation recorded no routing identity for the plan it \
+                             applied, so there is nothing to compare the current warehouse \
+                             against, and the declared checks were NOT run"
+                        .to_string(),
+                    prior_detail,
+                    cause: Some(UnevaluableCause::RoutingDiverged),
+                });
+            }
+        }
+
         let observed = match fulfill_api::observe_declarative_checks(verified_set).await {
             Ok(observed) => observed,
             Err(err) => {
@@ -1175,6 +1247,7 @@ impl Runner {
         &self,
         prior_detail: String,
         _verified_digest: Option<String>,
+        _applied_routing: Option<String>,
     ) -> Result<Event> {
         fault_point("mid-observation");
         Ok(Event::ObservationChecks {

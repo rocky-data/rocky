@@ -482,6 +482,14 @@ pub struct LoadedCheckSet {
     /// Held as the live adapter, not as a name: nothing later re-reads
     /// `rocky.toml` to decide where the query goes.
     warehouse: Arc<dyn WarehouseAdapter>,
+    /// The routing identity of the config load that produced
+    /// `warehouse` — the SAME load, never a second one.
+    ///
+    /// This is what makes the observation comparable to the apply. The
+    /// apply refused unless the config's routing identity equalled the
+    /// one its plan authorised; holding the value here lets the caller
+    /// ask the same question of the config that chose THIS adapter.
+    routing_identity: String,
 }
 
 #[cfg(feature = "duckdb")]
@@ -509,7 +517,7 @@ impl LoadedCheckSet {
     ) -> std::result::Result<Self, BindFailure> {
         let models = load_all_models(models_dir).map_err(BindFailure::CheckSet)?;
         let digest = check_set_digest(&models, model).map_err(BindFailure::CheckSet)?;
-        let warehouse = resolve_warehouse_adapter(config_path, pipeline_name)
+        let (warehouse, routing_identity) = resolve_warehouse_adapter(config_path, pipeline_name)
             .map_err(BindFailure::Warehouse)?;
         Ok(Self {
             model: model.to_string(),
@@ -517,12 +525,25 @@ impl LoadedCheckSet {
             models,
             models_dir: models_dir.to_path_buf(),
             warehouse,
+            routing_identity,
         })
     }
 
     /// The digest of the snapshot this handle owns.
     pub fn digest(&self) -> &str {
         &self.digest
+    }
+
+    /// The routing identity of the config that chose this handle's
+    /// warehouse.
+    ///
+    /// Compare it against the `config_identity` the applied plan
+    /// carries. Equal means the checks are about to read the warehouse
+    /// the apply wrote. Unequal means they are not, and nothing else in
+    /// this handle can tell you that — the check-set digest covers the
+    /// checks and the target table NAME, never the connection.
+    pub fn routing_identity(&self) -> &str {
+        &self.routing_identity
     }
 
     /// Execute the checks of the snapshot this handle owns.
@@ -621,7 +642,10 @@ pub(crate) async fn declarative_run(
     model_filter: Option<&str>,
 ) -> Result<DeclarativeRun> {
     // 1. Load config + adapter registry.
-    let warehouse_adapter = resolve_warehouse_adapter(config_path, pipeline_name)?;
+    // The identity is for the custody comparison at observation; a plain
+    // `rocky test --declarative` pins nothing and has nothing to compare.
+    let (warehouse_adapter, _routing_identity) =
+        resolve_warehouse_adapter(config_path, pipeline_name)?;
 
     // 2. Load all models.
     let all_models = load_all_models(models_dir)?;
@@ -635,17 +659,36 @@ pub(crate) async fn declarative_run(
 /// it identically. Config resolution stays FIRST in `declarative_run`,
 /// so an unloadable config still reports itself before an empty models
 /// directory does.
+/// Resolve the warehouse, and the routing identity of the config that
+/// chose it, from ONE load.
+///
+/// The identity is derived here rather than by a caller re-loading
+/// `rocky.toml`, and that is the whole point of returning it. A second
+/// load would identify snapshot A while the adapter came from snapshot
+/// B, so a routing swap landing between the two reads would compare
+/// equal and then execute against the other warehouse — the same
+/// two-reads defect [`LoadedCheckSet`] exists to close for the check
+/// set, in the one place it would still have been open.
+///
+/// It is [`super::apply::config_policy_identity`], not a narrower
+/// derivation of its own: the apply gate refuses on exactly this value,
+/// so re-deriving it here would let the two gates disagree about what
+/// counts as a reroute, silently. Credentials are excluded by
+/// construction — every one serialises as `"***"` — so a rotation does
+/// not move it.
 fn resolve_warehouse_adapter(
     config_path: &Path,
     pipeline_name: Option<&str>,
-) -> Result<Arc<dyn WarehouseAdapter>> {
+) -> Result<(Arc<dyn WarehouseAdapter>, String)> {
     let rocky_cfg = rocky_core::config::load_rocky_config(config_path).context(format!(
         "failed to load config from {}",
         config_path.display()
     ))?;
+    let routing_identity = super::apply::config_policy_identity(&rocky_cfg);
     let (_, pipeline) = registry::resolve_pipeline(&rocky_cfg, pipeline_name)?;
     let adapter_registry = AdapterRegistry::from_config(&rocky_cfg)?;
-    adapter_registry.warehouse_adapter(pipeline.target_adapter())
+    let warehouse = adapter_registry.warehouse_adapter(pipeline.target_adapter())?;
+    Ok((warehouse, routing_identity))
 }
 
 /// Select and execute the declarative checks of an ALREADY-LOADED

@@ -376,6 +376,42 @@ pub enum UnevaluableCause {
     /// `spec_checks_lower_only_to_error_severity_expression_tests` and
     /// the composite-grain arm in rocky-core, so teaching `checks` a
     /// new shape fails a test that names this message.
+    /// The checks are the verified ones, but the warehouse they would
+    /// read is not the one the apply WROTE.
+    ///
+    /// Apply refuses unless the config's routing identity equals the
+    /// `config_identity` its plan authorised. Observation had no such
+    /// gate: it bound whatever `rocky.toml` named at that moment, so a
+    /// single re-route between the apply and the observation made the
+    /// checks certify a different warehouse — reporting health, or a
+    /// data-red, about a table the loop never wrote. A repair round
+    /// spent on that evidence is the loop's most expensive action taken
+    /// on its least trustworthy input.
+    ///
+    /// The comparison reuses `config_policy_identity`, the value the
+    /// apply gate already refuses on, rather than a narrower derivation
+    /// of its own. Two derivations would let the two gates disagree
+    /// about what a re-route is, and disagree silently.
+    ///
+    /// TWO CAUSES, ONE STRING, AND THE MESSAGE MUST NAME BOTH. The
+    /// identity is env-resolved: `substitute_env_vars` expands `${VAR}`
+    /// in the raw TOML text before it is parsed, so ANY routing field
+    /// can carry one. So an unequal identity means either the file was
+    /// edited or a variable resolved differently in this process, and
+    /// the two opaque JSON strings cannot be told apart. Printing only
+    /// "restore the file you changed" would send an operator who
+    /// changed no file looking for an edit that does not exist — the
+    /// same wrong-remedy defect that kept `rocky.toml` out of the
+    /// custody digest for credentials.
+    ///
+    /// ABSENCE IS A HOLD, not a pass. A plan with no `config_identity`
+    /// is one this gate cannot check, and `if let Some(..)` around the
+    /// comparison would pass exactly those. Apply already refuses a
+    /// `fingerprint_version >= 1` plan that carries none, so a plan that
+    /// applied necessarily has one — which makes absence a broken
+    /// invariant rather than a normal case, and holding the right
+    /// answer.
+    RoutingDiverged,
     CheckCustody,
     /// The pinned digest and the recomputed one were taken under
     /// DIFFERENT preimage schemes, so they were never comparable.
@@ -1949,6 +1985,32 @@ fn decide_observation_checks(
                 // unreachable because it returned above; writing it out
                 // means a variant added later has to come to this match
                 // and choose.
+                // Named, not folded in with the bare re-run. Re-running
+                // binds the SAME diverged config and reports the same
+                // thing forever, so "rocky fulfill" alone is the remedy
+                // that cannot resolve what it is printed for.
+                //
+                // Both causes, because the compared value is
+                // env-resolved and the two are indistinguishable in it.
+                // Telling an operator who changed no file to restore one
+                // is the wrong-remedy defect this branch already
+                // rejected once, for credentials.
+                Some(UnevaluableCause::RoutingDiverged) => (
+                    format!("rocky fulfill {product}"),
+                    " — the checks are the verified ones, but `rocky.toml` now routes to a \
+                     different warehouse than the apply wrote to, so running them would \
+                     report on a table this generation never wrote. Two things cause this \
+                     and the recorded value cannot tell them apart: the routing in \
+                     `rocky.toml` was edited, or a `${VAR}` in a routing field resolved to \
+                     a different value in this process. Check the environment first if you \
+                     changed no file. Point the config back at the warehouse the apply \
+                     wrote and re-run. To move the product to a different warehouse \
+                     instead, that is a new generation: restore the routing, re-run until \
+                     the loop leaves `applied`, then change the config and approve the spec \
+                     again. Credentials are not part of this value, so a rotation never \
+                     causes it"
+                        .to_string(),
+                ),
                 Some(UnevaluableCause::CheckSchemeChanged)
                 | Some(UnevaluableCause::Unreadable)
                 | None => (format!("rocky fulfill {product}"), String::new()),

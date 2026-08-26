@@ -1013,6 +1013,22 @@ pub fn product_approve(
 
 /// Re-exported so the loop's capability classification and gate share
 /// the exact types the plan store persists.
+/// The routing identity the plan `plan_id` authorised at propose time,
+/// if it recorded one.
+///
+/// `None` has two shapes and the caller must treat BOTH as a hold, not
+/// a pass: the plan file could not be read, or it carries no
+/// `config_identity`. Apply refuses a `fingerprint_version >= 1` plan
+/// with no identity, so a plan that actually applied has one — `None`
+/// here therefore means the evidence is missing, never that the routing
+/// is fine.
+pub fn plan_routing_identity(root: &std::path::Path, plan_id: &str) -> Option<String> {
+    crate::plan_store::read_plan(root, plan_id)
+        .ok()?
+        .embedded_capabilities()
+        .config_identity
+}
+
 pub use crate::plan_store::EmbeddedCapabilities as ProposeCapabilities;
 
 #[cfg(test)]
