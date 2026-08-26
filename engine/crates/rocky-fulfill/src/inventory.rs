@@ -90,6 +90,15 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_cli::commands::fulfill_api::lookup_apply_receipt",
     "rocky_cli::commands::fulfill_api::observe_declarative_checks",
     "rocky_cli::commands::fulfill_api::observe_max_time_column",
+    // F3 — the routing identity the APPLIED plan authorised. DELIBERATE
+    // addition: observation bound whatever `rocky.toml` named at that
+    // moment, so one re-route between apply and observation made the
+    // declared checks certify a warehouse this generation never wrote
+    // to. Reads the value the apply gate already refuses on
+    // (`config_policy_identity`) rather than deriving a second one, so
+    // the two gates cannot disagree about what a re-route is. `None`
+    // is a hold, never a pass.
+    "rocky_cli::commands::fulfill_api::plan_routing_identity",
     "rocky_cli::commands::fulfill_api::print_json",
     "rocky_cli::commands::fulfill_api::product_approve",
     "rocky_cli::commands::fulfill_api::product_compile",
