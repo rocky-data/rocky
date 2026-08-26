@@ -1082,6 +1082,99 @@ mod tests {
         (tmp, models)
     }
 
+    /// Write a `rocky.toml` whose duckdb pipeline routes at `db_path`,
+    /// carrying `secret` as the adapter's token.
+    fn config_at(dir: &std::path::Path, db_path: &str, secret: &str) -> std::path::PathBuf {
+        let cfg = dir.join("rocky.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "[adapters.wh]\ntype = \"duckdb\"\npath = \"{db_path}\"\ntoken = \"{secret}\"\n\n\
+                 [pipeline.main]\ntype = \"transformation\"\n\n\
+                 [pipeline.main.target]\nadapter = \"wh\"\n"
+            ),
+        )
+        .expect("write rocky.toml");
+        cfg
+    }
+
+    /// The identity `bind` carries MUST be the one the apply gate
+    /// refuses on — not a narrower derivation of its own.
+    ///
+    /// This is the whole reason observation can be compared to an apply
+    /// at all. Two derivations would let the two gates disagree about
+    /// what a re-route is, and disagree silently: apply would refuse a
+    /// change observation waved through, or the reverse.
+    ///
+    /// Asserted as EQUALITY against `config_policy_identity` over the
+    /// same config, rather than "the strings differ when routing
+    /// changes". A private derivation that happened to move on the same
+    /// inputs would pass the weaker test and still be a second
+    /// derivation.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn bind_carries_the_identity_the_apply_gate_refuses_on() {
+        let (tmp, models) = project("");
+        let cfg_path = config_at(tmp.path(), "a.duckdb", "SECRET_A");
+
+        let set = super::LoadedCheckSet::bind(&models, "orders", &cfg_path, None)
+            .expect("bind should succeed on a well-formed project");
+        let loaded = rocky_core::config::load_rocky_config(&cfg_path).expect("load config");
+        assert_eq!(
+            set.routing_identity(),
+            crate::commands::apply::config_policy_identity(&loaded),
+            "the observation gate must compare the SAME value the apply gate refuses on"
+        );
+    }
+
+    /// A ROTATION IS NOT A RE-ROUTE, and a re-route IS one.
+    ///
+    /// Both halves matter and they fail in opposite directions. If a
+    /// rotated credential moved the identity, every rotation would
+    /// strand an applied product in a hold whose printed remedy —
+    /// restore the routing — could not clear it. If a changed route did
+    /// NOT move it, the gate would be inert and observation would go on
+    /// certifying the wrong warehouse, which is the defect this exists
+    /// to close.
+    #[test]
+    #[cfg(feature = "duckdb")]
+    fn routing_identity_moves_on_a_re_route_and_not_on_a_rotation() {
+        let (tmp, models) = project("");
+
+        let cfg_a = config_at(tmp.path(), "a.duckdb", "SECRET_A");
+        let base = super::LoadedCheckSet::bind(&models, "orders", &cfg_a, None)
+            .expect("bind a")
+            .routing_identity()
+            .to_string();
+
+        // Same route, different credential.
+        let rotated_dir = tempfile::tempdir().expect("tempdir");
+        let cfg_rotated = config_at(rotated_dir.path(), "a.duckdb", "SECRET_B");
+        let rotated = super::LoadedCheckSet::bind(&models, "orders", &cfg_rotated, None)
+            .expect("bind rotated")
+            .routing_identity()
+            .to_string();
+        assert_eq!(
+            base, rotated,
+            "a rotated credential must NOT read as a re-route — every credential \
+             serialises as \"***\", and a hold here could not be cleared by the remedy \
+             the operator is given"
+        );
+
+        // Different route, same credential.
+        let moved_dir = tempfile::tempdir().expect("tempdir");
+        let cfg_moved = config_at(moved_dir.path(), "b.duckdb", "SECRET_A");
+        let moved = super::LoadedCheckSet::bind(&models, "orders", &cfg_moved, None)
+            .expect("bind moved")
+            .routing_identity()
+            .to_string();
+        assert_ne!(
+            base, moved,
+            "a changed route MUST move the identity, or the gate is inert and observation \
+             keeps certifying whatever the config names now"
+        );
+    }
+
     /// The digest must be reproducible across loads, or the custody gate
     /// it backs reports divergence on every run and the loop never
     /// observes anything.
