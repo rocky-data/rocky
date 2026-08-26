@@ -1978,13 +1978,6 @@ fn decide_observation_checks(
                      restore is the whole remedy"
                         .to_string(),
                 ),
-                // Enumerated, not defaulted. A `_ =>` here is how a
-                // fourth cause would silently acquire "re-run the loop"
-                // — the remedy that is right only when re-running can
-                // change the answer. `CheckSchemeChanged` is listed and
-                // unreachable because it returned above; writing it out
-                // means a variant added later has to come to this match
-                // and choose.
                 // Named, not folded in with the bare re-run. Re-running
                 // binds the SAME diverged config and reports the same
                 // thing forever, so "rocky fulfill" alone is the remedy
@@ -2011,6 +2004,13 @@ fn decide_observation_checks(
                      causes it"
                         .to_string(),
                 ),
+                // Enumerated, not defaulted. A `_ =>` here is how a
+                // fourth cause would silently acquire "re-run the loop"
+                // — the remedy that is right only when re-running can
+                // change the answer. `CheckSchemeChanged` is listed and
+                // unreachable because it returned above; writing it out
+                // means a variant added later has to come to this match
+                // and choose.
                 Some(UnevaluableCause::CheckSchemeChanged)
                 | Some(UnevaluableCause::Unreadable)
                 | None => (format!("rocky fulfill {product}"), String::new()),
@@ -4852,6 +4852,74 @@ mod tests {
         );
 
         // A transient read failure: re-running genuinely can resolve it.
+        // ROUTING DIVERGENCE — a different hold with a different
+        // remedy, and the failure mode here is naming only ONE of its
+        // two causes.
+        //
+        // The compared value is env-resolved: `substitute_env_vars`
+        // expands `${VAR}` in the raw TOML text before it is parsed, so
+        // any routing field can carry one. An operator who edited
+        // nothing and had a variable resolve differently gets the same
+        // opaque inequality as one who edited the file. Printing only
+        // "restore the file you changed" sends the first of them hunting
+        // an edit that does not exist — the wrong-remedy defect this
+        // branch already rejected once, which is why `rocky.toml` is not
+        // in the custody digest for credentials.
+        let d = decide(
+            &rec(FulfillState::Applied),
+            reading(Some(UnevaluableCause::RoutingDiverged)),
+            now(),
+        );
+        let Decision::AdvanceAndStop { stop, .. } = d else {
+            panic!("expected AdvanceAndStop, got {d:?}");
+        };
+        let routing = &stop.message;
+        assert!(
+            routing.contains("routes to a different warehouse than the apply wrote to"),
+            "the hold says what diverged, in warehouse terms: {routing}"
+        );
+        assert!(
+            routing.contains("report on a table this generation never wrote"),
+            "and WHY running anyway would be wrong, not merely disallowed: {routing}"
+        );
+
+        // BOTH CAUSES. Each half asserted separately, because a message
+        // naming only the edit passes any test that just looks for
+        // "rocky.toml".
+        assert!(
+            routing.contains("was edited"),
+            "cause one — the file changed — is named: {routing}"
+        );
+        assert!(
+            routing.contains("`${VAR}` in a routing field resolved to a different value"),
+            "cause two — the environment resolved a routing field differently — is named, \
+             because the recorded value cannot tell it from an edit: {routing}"
+        );
+        assert!(
+            routing.contains("Check the environment first if you changed no file"),
+            "and the operator who changed nothing is told where to look, rather than being \
+             sent after an edit that does not exist: {routing}"
+        );
+
+        // A ROTATION IS NOT A DIVERGENCE, said out loud. Credentials
+        // serialise as `"***"` in `config_policy_identity`, so rotating
+        // one cannot move the value — and an operator staring at an
+        // opaque mismatch will suspect their credentials first.
+        assert!(
+            routing.contains("Credentials are not part of this value"),
+            "a credential rotation is explicitly ruled out as a cause: {routing}"
+        );
+
+        // AND IT IS NOT THE CUSTODY REMEDY. These two holds are
+        // adjacent and their instructions are different; borrowing the
+        // custody wording here would tell an operator to restore a
+        // sidecar nobody touched.
+        assert!(
+            !routing.contains("restore the file you changed"),
+            "the routing remedy must not borrow the custody wording — nothing about the \
+             check set is in doubt here: {routing}"
+        );
+
         for cause in [Some(UnevaluableCause::Unreadable), None] {
             let d = decide(&rec(FulfillState::Applied), reading(cause.clone()), now());
             let Decision::AdvanceAndStop { stop, .. } = d else {
