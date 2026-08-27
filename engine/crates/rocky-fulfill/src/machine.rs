@@ -4934,11 +4934,13 @@ mod tests {
         // naming only the edit passes any test that just looks for
         // "rocky.toml".
         assert!(
-            routing.contains("the config was \nedited") || routing.contains("the config was edited"),
+            routing.contains("the config was \nedited")
+                || routing.contains("the config was edited"),
             "cause one — the file changed — is named: {routing}"
         );
         assert!(
-            routing.contains("resolved to a \ndifferent value") || routing.contains("resolved to a different value"),
+            routing.contains("resolved to a \ndifferent value")
+                || routing.contains("resolved to a different value"),
             "cause two — the environment resolved a field differently — is named, because \
              the recorded value cannot tell it from an edit: {routing}"
         );

@@ -2082,24 +2082,29 @@ fn emptying_the_sidecar_cannot_turn_a_known_red_into_observing() {
 
 /// A BROKEN CONFIG IS NOT A CUSTODY DIVERGENCE.
 ///
-/// The check set and the warehouse are now bound together — one call
-/// reads the models directory and `rocky.toml` and hands back a handle
-/// that owns both — so a config failure and a check-set failure arrive
-/// at the same place. They must not leave through the same exit.
+/// Editing the TARGET ADAPTER is a routing change, and the hold must
+/// say so — not "the warehouse could not be resolved".
 ///
-/// The custody hold's remedy is "restore the file you changed … then
-/// put the change in the product spec". That is the right instruction
-/// for an edited sidecar and a useless one for a mistyped adapter name:
-/// there is nothing to restore into the verified set, and no spec field
-/// carries a warehouse. Re-running after fixing the config genuinely
-/// resolves it, which is the `Unreadable` remedy.
+/// This test predates the round-18 ordering fix and used to assert the
+/// resolution error. That expectation was the weaker truth: the config
+/// this generation applied under names `default`; the edited one names
+/// `no_such_warehouse`; the identities differ, and the routing gate now
+/// runs BEFORE adapter resolution (it has to — resolution failure used
+/// to mask divergence, and the freshness query used to run before
+/// either). So the operator is told the config diverged from the one
+/// the apply saw, which subsumes "and the adapter it now names does not
+/// resolve".
 ///
-/// So the assertion that earns this test is the NEGATIVE one — the stop
-/// must not say "restore the file you changed". Collapsing the two
-/// failures into one error passes an assertion that only checks the
-/// product held.
+/// What this test still earns is its NEGATIVE: the stop must not say
+/// "restore the file you changed" — that is the check-set custody
+/// remedy, and nothing under `models/` moved. And its positive tail:
+/// the printed remedy (put the configuration back) must actually work.
+///
+/// The bare resolution error still exists for the one case that can
+/// reach it: a legacy plan (no identity, routing-exempt) over a config
+/// whose adapter fails to construct.
 #[test]
-fn an_unresolvable_warehouse_holds_without_the_custody_remedy() {
+fn a_reroute_to_an_unresolvable_adapter_reports_routing_not_custody() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     write_project(dir, &session_json(&[]));
@@ -2135,8 +2140,13 @@ fn an_unresolvable_warehouse_holds_without_the_custody_remedy() {
     );
     let message = json["message"].as_str().expect("message");
     assert!(
-        message.contains("the warehouse the declared checks run against could not be resolved"),
-        "the stop names what actually failed: {message}"
+        message.contains("is not the one this generation applied under")
+            || message.contains("is not the configuration now on disk"),
+        "the stop names the routing divergence, the stronger truth: {message}"
+    );
+    assert!(
+        message.contains("Put the configuration back as the apply saw it"),
+        "and the remedy that works is stated: {message}"
     );
     assert!(
         !message.contains("restore the file you changed"),

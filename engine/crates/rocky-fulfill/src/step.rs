@@ -1290,11 +1290,14 @@ impl Runner {
         let current = fulfill_api::current_routing_identity(&self.config_path);
         match current {
             Ok(current) if current == applied => None,
-            Ok(_) => Some(self.routing_stop(
-                UnevaluableCause::RoutingDiverged,
-                "the routing configuration is not the one this generation applied under".to_string(),
-                prior_detail,
-            )),
+            Ok(_) => Some(
+                self.routing_stop(
+                    UnevaluableCause::RoutingDiverged,
+                    "the routing configuration is not the one this generation applied under"
+                        .to_string(),
+                    prior_detail,
+                ),
+            ),
             // A config that will not load is NOT a routing divergence —
             // nothing about the routing is in doubt, the file is broken.
             // It leaves through the same `Unreadable` exit the bind
@@ -1317,12 +1320,7 @@ impl Runner {
 
     /// One shape for every routing hold, so the cause cannot be set
     /// without the detail that explains it.
-    fn routing_stop(
-        &self,
-        cause: UnevaluableCause,
-        detail: String,
-        prior_detail: String,
-    ) -> Event {
+    fn routing_stop(&self, cause: UnevaluableCause, detail: String, prior_detail: String) -> Event {
         Event::ObservationChecks {
             failed: 0,
             errored: 0,
