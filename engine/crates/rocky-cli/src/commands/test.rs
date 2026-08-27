@@ -1082,10 +1082,24 @@ mod tests {
         (tmp, models)
     }
 
-    /// Write a `rocky.toml` whose duckdb pipeline routes at `db_path`,
+    /// Write a `rocky.toml` whose duckdb pipeline routes at `db_name`,
     /// carrying `secret` as the adapter's token.
-    fn config_at(dir: &std::path::Path, db_path: &str, secret: &str) -> std::path::PathBuf {
-        let cfg = dir.join("rocky.toml");
+    ///
+    /// The path is made ABSOLUTE under `dir`. A relative one is resolved
+    /// against the test process's cwd, so binding would create or open a
+    /// database in the worktree and two tests running in parallel would
+    /// share it. The identity is over the string in the config either
+    /// way, so absolute costs the assertions nothing.
+    fn config_at(
+        dir: &std::path::Path,
+        cfg_name: &str,
+        db_name: &str,
+        secret: &str,
+    ) -> std::path::PathBuf {
+        let db_path = dir.join(db_name);
+        let db_path = db_path.to_string_lossy().into_owned();
+        let db_path = db_path.as_str();
+        let cfg = dir.join(cfg_name);
         std::fs::write(
             &cfg,
             format!(
@@ -1115,7 +1129,7 @@ mod tests {
     #[cfg(feature = "duckdb")]
     fn bind_carries_the_identity_the_apply_gate_refuses_on() {
         let (tmp, models) = project("");
-        let cfg_path = config_at(tmp.path(), "a.duckdb", "SECRET_A");
+        let cfg_path = config_at(tmp.path(), "rocky.toml", "a.duckdb", "SECRET_A");
 
         let set = super::LoadedCheckSet::bind(&models, "orders", &cfg_path, None)
             .expect("bind should succeed on a well-formed project");
@@ -1141,15 +1155,16 @@ mod tests {
     fn routing_identity_moves_on_a_re_route_and_not_on_a_rotation() {
         let (tmp, models) = project("");
 
-        let cfg_a = config_at(tmp.path(), "a.duckdb", "SECRET_A");
+        let cfg_a = config_at(tmp.path(), "a.toml", "a.duckdb", "SECRET_A");
         let base = super::LoadedCheckSet::bind(&models, "orders", &cfg_a, None)
             .expect("bind a")
             .routing_identity()
             .to_string();
 
-        // Same route, different credential.
-        let rotated_dir = tempfile::tempdir().expect("tempdir");
-        let cfg_rotated = config_at(rotated_dir.path(), "a.duckdb", "SECRET_B");
+        // Same route, different credential. SAME directory, so the
+        // resolved database path is byte-identical and the credential is
+        // genuinely the only thing that moved.
+        let cfg_rotated = config_at(tmp.path(), "rotated.toml", "a.duckdb", "SECRET_B");
         let rotated = super::LoadedCheckSet::bind(&models, "orders", &cfg_rotated, None)
             .expect("bind rotated")
             .routing_identity()
@@ -1161,9 +1176,9 @@ mod tests {
              the operator is given"
         );
 
-        // Different route, same credential.
-        let moved_dir = tempfile::tempdir().expect("tempdir");
-        let cfg_moved = config_at(moved_dir.path(), "b.duckdb", "SECRET_A");
+        // Different route, same credential — again same directory, so
+        // the database NAME is the only difference.
+        let cfg_moved = config_at(tmp.path(), "moved.toml", "b.duckdb", "SECRET_A");
         let moved = super::LoadedCheckSet::bind(&models, "orders", &cfg_moved, None)
             .expect("bind moved")
             .routing_identity()

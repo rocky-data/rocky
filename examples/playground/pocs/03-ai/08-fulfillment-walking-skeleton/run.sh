@@ -478,15 +478,15 @@ code=$(rj expected/12_routing.json fulfill "$PRODUCT")
 STATE12="$(jq -r .state expected/12_routing.json)"
 [ "$STATE12" != "observing" ] \
   || fail "12 (the loop reported observing after a re-route — it certified a warehouse this generation never wrote to)"
-jq -e '.message | test("routes to a different warehouse than the apply wrote to")' expected/12_routing.json >/dev/null \
+jq -e '.message | test("is not the (configuration|one this generation applied under)")' expected/12_routing.json >/dev/null \
   || fail "12 (the stop does not name the routing divergence; got: $(jq -r .message expected/12_routing.json | head -c 200))"
 # BOTH causes, because the compared value is env-resolved and the two are
 # indistinguishable in it. Naming only the edit strands an operator who
 # changed no file.
-jq -e '.message | test("was edited")' expected/12_routing.json >/dev/null \
+jq -e '.message | test("the config was edited")' expected/12_routing.json >/dev/null \
   || fail "12 (the remedy does not name an edit as a cause)"
-jq -e '.message | contains("in a routing field resolved to a different value")' expected/12_routing.json >/dev/null \
-  || fail "12 (the remedy does not name an environment-resolved routing field as the other cause)"
+jq -e '.message | test("resolved to a different value")' expected/12_routing.json >/dev/null \
+  || fail "12 (the remedy does not name an environment-resolved field as the other cause)"
 # And it must NOT borrow the custody wording — no sidecar changed here.
 jq -e '.message | contains("restore the file you changed") | not' expected/12_routing.json >/dev/null \
   || fail "12 (the routing hold borrowed the check-set custody remedy — it would send the operator after a sidecar nobody touched)"

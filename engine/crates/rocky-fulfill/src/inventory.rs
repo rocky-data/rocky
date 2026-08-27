@@ -90,15 +90,23 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     "rocky_cli::commands::fulfill_api::lookup_apply_receipt",
     "rocky_cli::commands::fulfill_api::observe_declarative_checks",
     "rocky_cli::commands::fulfill_api::observe_max_time_column",
-    // F3 — the routing identity the APPLIED plan authorised. DELIBERATE
-    // addition: observation bound whatever `rocky.toml` named at that
-    // moment, so one re-route between apply and observation made the
-    // declared checks certify a warehouse this generation never wrote
-    // to. Reads the value the apply gate already refuses on
-    // (`config_policy_identity`) rather than deriving a second one, so
-    // the two gates cannot disagree about what a re-route is. `None`
-    // is a hold, never a pass.
-    "rocky_cli::commands::fulfill_api::plan_routing_identity",
+    // F3 — the routing custody surface, three routes. DELIBERATE:
+    // observation bound whatever `rocky.toml` named at that moment, so
+    // one re-route between apply and observation made the declared
+    // checks certify a warehouse this generation never wrote to.
+    //
+    // `plan_routing` reads what the applied plan authorised, TYPED —
+    // identity / legacy-exempt / missing-but-required / unreadable —
+    // because collapsing those to an Option printed a restore remedy
+    // for evidence a restore cannot recreate. The legacy exemption is
+    // apply's own (`fingerprint_version >= 1`), reused not re-derived.
+    // `current_routing_identity` is the EARLY read that lets `observe`
+    // refuse before the staleness query touches the wrong warehouse;
+    // the authoritative comparison stays on the executing handle's own
+    // load (`LoadedCheckSet::routing_identity`).
+    "rocky_cli::commands::fulfill_api::PlanRouting",
+    "rocky_cli::commands::fulfill_api::current_routing_identity",
+    "rocky_cli::commands::fulfill_api::plan_routing",
     "rocky_cli::commands::fulfill_api::print_json",
     "rocky_cli::commands::fulfill_api::product_approve",
     "rocky_cli::commands::fulfill_api::product_compile",

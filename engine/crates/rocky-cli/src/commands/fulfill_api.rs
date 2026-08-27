@@ -1013,20 +1013,66 @@ pub fn product_approve(
 
 /// Re-exported so the loop's capability classification and gate share
 /// the exact types the plan store persists.
-/// The routing identity the plan `plan_id` authorised at propose time,
-/// if it recorded one.
+/// What a plan says about the warehouse it was authorised to write.
 ///
-/// `None` has two shapes and the caller must treat BOTH as a hold, not
-/// a pass: the plan file could not be read, or it carries no
-/// `config_identity`. Apply refuses a `fingerprint_version >= 1` plan
-/// with no identity, so a plan that actually applied has one — `None`
-/// here therefore means the evidence is missing, never that the routing
-/// is fine.
-pub fn plan_routing_identity(root: &std::path::Path, plan_id: &str) -> Option<String> {
-    crate::plan_store::read_plan(root, plan_id)
-        .ok()?
-        .embedded_capabilities()
-        .config_identity
+/// Four outcomes, because collapsing them to `Option<String>` makes two
+/// different facts look identical and prints a remedy that cannot work
+/// for one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanRouting {
+    /// The plan authorised this routing identity.
+    Identity(String),
+    /// A genuinely-legacy plan: `fingerprint_version == 0`, written
+    /// before routing identities existed.
+    ///
+    /// APPLY EXEMPTS THESE — `verify_routing_identity`'s `None =>
+    /// Ok(())` arm, reached when `require_fingerprint` is false. So
+    /// observation exempts them too. Holding here would strand a
+    /// product behind a gate the apply it is observing did not apply,
+    /// with a remedy (restore the routing) that cannot create evidence
+    /// the plan never carried.
+    LegacyExempt,
+    /// The plan requires an identity and carries none. Apply refuses
+    /// this; so does observation.
+    MissingButRequired,
+    /// The plan could not be read at all. Distinct from "carries no
+    /// identity", because the remedy is different and the message must
+    /// not claim to know what the plan recorded.
+    Unreadable(String),
+}
+
+/// Read what plan `plan_id` authorised.
+///
+/// Mirrors apply's own rule rather than inventing a second one: the
+/// legacy exemption here is the same `fingerprint_version >= 1` test
+/// apply uses to decide whether a missing identity is tolerable.
+pub fn plan_routing(root: &std::path::Path, plan_id: &str) -> PlanRouting {
+    let plan = match crate::plan_store::read_plan(root, plan_id) {
+        Ok(plan) => plan,
+        Err(err) => return PlanRouting::Unreadable(format!("{err:#}")),
+    };
+    let embedded = plan.embedded_capabilities();
+    match embedded.config_identity {
+        Some(identity) => PlanRouting::Identity(identity),
+        // The SAME threshold apply uses (`require_fingerprint =
+        // fingerprint_version >= 1`). Deliberately `>= 1`, not
+        // `>= CURRENT`: gating on CURRENT would silently re-exempt v1
+        // plans as the version advances.
+        None if embedded.fingerprint_version >= 1 => PlanRouting::MissingButRequired,
+        None => PlanRouting::LegacyExempt,
+    }
+}
+
+/// The routing identity of the config at `config_path`, right now.
+///
+/// For the EARLY refusal only — the one that keeps a wrong-warehouse
+/// query from happening. The authoritative comparison is against
+/// `LoadedCheckSet::routing_identity()`, which comes from the same load
+/// that produced the adapter that will execute.
+pub fn current_routing_identity(config_path: &std::path::Path) -> anyhow::Result<String> {
+    let cfg = rocky_core::config::load_rocky_config(config_path)
+        .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+    Ok(super::apply::config_policy_identity(&cfg))
 }
 
 pub use crate::plan_store::EmbeddedCapabilities as ProposeCapabilities;

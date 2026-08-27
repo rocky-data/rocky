@@ -412,6 +412,18 @@ pub enum UnevaluableCause {
     /// invariant rather than a normal case, and holding the right
     /// answer.
     RoutingDiverged,
+    /// The evidence needed to CHECK the routing is gone: the applied
+    /// plan is unreadable, or it required an identity and carries none.
+    ///
+    /// A separate variant because the remedy is opposite to
+    /// `RoutingDiverged`'s. "Put the configuration back" cannot create
+    /// evidence a plan never carried or a file that will not read, and a
+    /// re-run re-reads the same absence forever — so this routes to
+    /// `blocked`, whose `--retry` starts a fresh generation that pins
+    /// its own evidence at its own verify. The same exit
+    /// `CheckSchemeChanged` uses, for the same reason: the hold cannot
+    /// be cleared from inside the generation it holds.
+    RoutingEvidenceMissing,
     CheckCustody,
     /// The pinned digest and the recomputed one were taken under
     /// DIFFERENT preimage schemes, so they were never comparable.
@@ -1834,6 +1846,21 @@ fn decide_observation_checks(
             //     replaces the fulfillment record with `spec_approved`.
             //     The exit is therefore "edit the spec, then approve",
             //     never "approve again".
+            if matches!(cause, Some(UnevaluableCause::RoutingEvidenceMissing)) {
+                let reason = format!(
+                    "{detail} — re-running cannot recreate this evidence, and the \
+                     configuration is not the problem, so no restore clears it. `--retry` \
+                     starts a fresh generation that records its own routing identity at its \
+                     own propose"
+                );
+                let record = blocked(observed, reason, now);
+                return blocked_stop(
+                    record,
+                    "routing evidence missing under an applied generation".to_string(),
+                    &product,
+                    &detail,
+                );
+            }
             if matches!(cause, Some(UnevaluableCause::CheckSchemeChanged)) {
                 // WHAT THIS ARM MAY AND MAY NOT SAY ABOUT DISK.
                 //
@@ -1990,18 +2017,22 @@ fn decide_observation_checks(
                 // rejected once, for credentials.
                 Some(UnevaluableCause::RoutingDiverged) => (
                     format!("rocky fulfill {product}"),
-                    " — the checks are the verified ones, but `rocky.toml` now routes to a \
-                     different warehouse than the apply wrote to, so running them would \
-                     report on a table this generation never wrote. Two things cause this \
-                     and the recorded value cannot tell them apart: the routing in \
-                     `rocky.toml` was edited, or a `${VAR}` in a routing field resolved to \
-                     a different value in this process. Check the environment first if you \
-                     changed no file. Point the config back at the warehouse the apply \
-                     wrote and re-run. To move the product to a different warehouse \
-                     instead, that is a new generation: restore the routing, re-run until \
-                     the loop leaves `applied`, then change the config and approve the spec \
-                     again. Credentials are not part of this value, so a rotation never \
-                     causes it"
+                    " — the checks are the verified ones, but the configuration this \
+                     generation applied under is not the configuration now on disk, so the \
+                     checks were not run: they could read a table this generation never \
+                     wrote. WHAT IS COMPARED is the same value `rocky apply` refuses on — \
+                     every adapter and every pipeline, serialised. That is broader than the \
+                     warehouse: editing an unrelated pipeline's `execution`, `schedule` or \
+                     `models` moves it too, and this hold cannot tell that apart from a \
+                     genuine re-route. Causes, in the order worth checking: the config was \
+                     edited; a `${VAR}` in an adapter or pipeline field resolved to a \
+                     different value in this process (check the environment first if you \
+                     changed no file); or this binary serialises that value differently \
+                     from the one that wrote the plan. Put the configuration back as the \
+                     apply saw it and re-run. To move the product somewhere else instead, \
+                     that is a new generation: restore, re-run until the loop leaves \
+                     `applied`, then change the config and approve the spec again. \
+                     Credentials are not part of this value, so a rotation never causes it"
                         .to_string(),
                 ),
                 // Enumerated, not defaulted. A `_ =>` here is how a
@@ -2012,6 +2043,7 @@ fn decide_observation_checks(
                 // means a variant added later has to come to this match
                 // and choose.
                 Some(UnevaluableCause::CheckSchemeChanged)
+                | Some(UnevaluableCause::RoutingEvidenceMissing)
                 | Some(UnevaluableCause::Unreadable)
                 | None => (format!("rocky fulfill {product}"), String::new()),
             };
@@ -4875,28 +4907,44 @@ mod tests {
         };
         let routing = &stop.message;
         assert!(
-            routing.contains("routes to a different warehouse than the apply wrote to"),
-            "the hold says what diverged, in warehouse terms: {routing}"
+            routing.contains("is not the configuration now on disk"),
+            "the hold says what diverged: {routing}"
         );
         assert!(
-            routing.contains("report on a table this generation never wrote"),
+            routing.contains("read a table this generation never wrote"),
             "and WHY running anyway would be wrong, not merely disallowed: {routing}"
+        );
+        // THE SCOPE IS STATED, not implied. The compared value is every
+        // adapter and every pipeline, so an edit to an unrelated
+        // pipeline's `execution` or `schedule` lands here too. A message
+        // that said "a different warehouse" flat out would be false for
+        // exactly that operator, and they would go looking at routing
+        // that never changed.
+        assert!(
+            routing.contains("broader than the \nwarehouse")
+                || routing.contains("broader than the warehouse"),
+            "the message must admit the compared value is broader than routing: {routing}"
+        );
+        assert!(
+            routing.contains("execution") && routing.contains("schedule"),
+            "and name the non-routing fields that also move it: {routing}"
         );
 
         // BOTH CAUSES. Each half asserted separately, because a message
         // naming only the edit passes any test that just looks for
         // "rocky.toml".
         assert!(
-            routing.contains("was edited"),
+            routing.contains("the config was \nedited") || routing.contains("the config was edited"),
             "cause one — the file changed — is named: {routing}"
         );
         assert!(
-            routing.contains("`${VAR}` in a routing field resolved to a different value"),
-            "cause two — the environment resolved a routing field differently — is named, \
-             because the recorded value cannot tell it from an edit: {routing}"
+            routing.contains("resolved to a \ndifferent value") || routing.contains("resolved to a different value"),
+            "cause two — the environment resolved a field differently — is named, because \
+             the recorded value cannot tell it from an edit: {routing}"
         );
         assert!(
-            routing.contains("Check the environment first if you changed no file"),
+            routing.contains("check the environment first if you \nchanged no file")
+                || routing.contains("check the environment first if you changed no file"),
             "and the operator who changed nothing is told where to look, rather than being \
              sent after an edit that does not exist: {routing}"
         );

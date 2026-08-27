@@ -423,7 +423,7 @@ impl Runner {
             TaskKind::PreApplyCheck => self.pre_apply_check(record),
             TaskKind::Apply => self.apply(record).await,
             TaskKind::LookupReceipt => self.lookup_receipt(record),
-            TaskKind::Observe => self.observe().await,
+            TaskKind::Observe => self.observe(record).await,
             TaskKind::ObserveChecks { prior_detail } => {
                 // The digest this generation pinned at verify — read from
                 // the RECORD, so a resume compares against what was
@@ -439,11 +439,7 @@ impl Runner {
                 // `to_state`, which preserves `plan_id`; and the one site
                 // that REPLACES it lands on `proposed`, which is not an
                 // observation state.
-                let applied_routing = record
-                    .plan_id
-                    .as_deref()
-                    .and_then(|plan_id| fulfill_api::plan_routing_identity(&self.root, plan_id));
-                self.observe_checks(prior_detail, record.checks_digest.clone(), applied_routing)
+                self.observe_checks(prior_detail, record.checks_digest.clone(), record)
                     .await
             }
         }
@@ -915,7 +911,7 @@ impl Runner {
         &self,
         prior_detail: String,
         verified_digest: Option<String>,
-        applied_routing: Option<String>,
+        record: &FulfillStateRecord,
     ) -> Result<Event> {
         // Crash seam for the mid-observation drill: the staleness/test
         // reading is journaled, the declared checks are not read yet.
@@ -1156,59 +1152,38 @@ impl Runner {
             });
         };
 
-        // ROUTING GATE — the checks about to run must read the
-        // warehouse the APPLY wrote to.
+        // ROUTING GATE — AUTHORITATIVE COMPARISON.
         //
-        // Ordered AFTER the check-set custody comparison, deliberately.
-        // When a sidecar AND the routing both changed, both are true and
-        // the restore is still the instruction that matters; custody
-        // outranks routing for the same reason it outranks a warehouse
-        // that will not resolve.
+        // `observe` already refused an obviously-diverged config before
+        // any warehouse read. This one is the comparison that counts:
+        // it asks the handle that is ABOUT TO EXECUTE what config chose
+        // its adapter, from that handle's own single load. The early
+        // refusal reads the file separately, so only this one rules out
+        // a re-route that landed between the two.
         //
-        // Compared against `verified_set.routing_identity()`, which came
-        // from the SAME config load that produced the bound adapter.
-        // Loading `rocky.toml` again here to identify it would compare
-        // snapshot A while executing against snapshot B — the two-reads
-        // defect this handle exists to close, reintroduced at the one
-        // seam it had not yet covered.
-        //
-        // A MISSING identity is a hold, not a pass. `if let Some(..)`
-        // here would wave through exactly the plans this gate cannot
-        // check. Apply refuses a `fingerprint_version >= 1` plan that
-        // carries no identity, so a plan that applied has one; absence
-        // means the evidence is gone, which is a reason to stop rather
-        // than a reason to proceed.
-        match applied_routing.as_deref() {
-            Some(applied) if applied == verified_set.routing_identity() => {}
-            Some(_) => {
-                return Ok(Event::ObservationChecks {
-                    failed: 0,
-                    errored: 0,
-                    warned: 0,
-                    // NOT `Some(0)`. Nothing ran, and a zero here would
-                    // read as "no unevaluated checks" — health.
-                    deferred: None,
-                    detail: "the warehouse `rocky.toml` routes to now is not the one this \
-                             generation applied to, so the declared checks were NOT run — \
-                             running them would report on a table this generation never wrote"
-                        .to_string(),
-                    prior_detail,
-                    cause: Some(UnevaluableCause::RoutingDiverged),
-                });
-            }
+        // Ordered AFTER the check-set custody comparison. When a sidecar
+        // AND the routing both changed, both are true and the restore is
+        // still the instruction that matters.
+        match self.routing_hold(record, prior_detail.clone()) {
+            Some(hold) => return Ok(hold),
             None => {
-                return Ok(Event::ObservationChecks {
-                    failed: 0,
-                    errored: 0,
-                    warned: 0,
-                    deferred: None,
-                    detail: "this generation recorded no routing identity for the plan it \
-                             applied, so there is nothing to compare the current warehouse \
-                             against, and the declared checks were NOT run"
-                        .to_string(),
-                    prior_detail,
-                    cause: Some(UnevaluableCause::RoutingDiverged),
-                });
+                // The early refusal passed. Now the authoritative one:
+                // the identity the executing handle actually carries.
+                if let fulfill_api::PlanRouting::Identity(applied) = record
+                    .plan_id
+                    .as_deref()
+                    .map(|id| fulfill_api::plan_routing(&self.root, id))
+                    .unwrap_or(fulfill_api::PlanRouting::LegacyExempt)
+                    && applied != verified_set.routing_identity()
+                {
+                    return Ok(self.routing_stop(
+                        UnevaluableCause::RoutingDiverged,
+                        "the configuration that chose the warehouse these checks would run \
+                         against is not the one this generation applied under"
+                            .to_string(),
+                        prior_detail,
+                    ));
+                }
             }
         }
 
@@ -1247,7 +1222,7 @@ impl Runner {
         &self,
         prior_detail: String,
         _verified_digest: Option<String>,
-        _applied_routing: Option<String>,
+        _record: &FulfillStateRecord,
     ) -> Result<Event> {
         fault_point("mid-observation");
         Ok(Event::ObservationChecks {
@@ -1263,11 +1238,129 @@ impl Runner {
         })
     }
 
+    /// The routing hold, if this observation must not touch the
+    /// warehouse.
+    ///
+    /// `None` means proceed. `Some(event)` is a hold that names why.
+    ///
+    /// Mirrors apply's rule rather than inventing a stricter one: a
+    /// genuinely-legacy plan carries no identity and apply executes it
+    /// anyway, so observation reads it too. Holding there would strand a
+    /// product behind a gate its own apply did not apply, and the
+    /// printed remedy could not create evidence the plan never had.
+    fn routing_hold(&self, record: &FulfillStateRecord, prior_detail: String) -> Option<Event> {
+        let Some(plan_id) = record.plan_id.as_deref() else {
+            // No plan to compare against. Not reachable from an
+            // observation state (every path into one preserves the pin),
+            // so this is a broken invariant rather than a normal case —
+            // and a hold is the right answer to a broken invariant.
+            return Some(self.routing_stop(
+                UnevaluableCause::RoutingEvidenceMissing,
+                "this generation's record carries no plan id, so there is nothing to say which \
+                 warehouse the apply wrote to"
+                    .to_string(),
+                prior_detail,
+            ));
+        };
+        let applied = match fulfill_api::plan_routing(&self.root, plan_id) {
+            // Apply exempts these; so do we. See `PlanRouting::LegacyExempt`.
+            fulfill_api::PlanRouting::LegacyExempt => return None,
+            fulfill_api::PlanRouting::Identity(identity) => identity,
+            fulfill_api::PlanRouting::MissingButRequired => {
+                return Some(self.routing_stop(
+                    UnevaluableCause::RoutingEvidenceMissing,
+                    format!(
+                        "plan {plan_id} required a routing identity and carries none, so there \
+                         is nothing to compare the current configuration against"
+                    ),
+                    prior_detail,
+                ));
+            }
+            fulfill_api::PlanRouting::Unreadable(why) => {
+                return Some(self.routing_stop(
+                    UnevaluableCause::RoutingEvidenceMissing,
+                    format!(
+                        "plan {plan_id} could not be read, so what warehouse this generation \
+                         applied to is unknown: {why}"
+                    ),
+                    prior_detail,
+                ));
+            }
+        };
+        let current = fulfill_api::current_routing_identity(&self.config_path);
+        match current {
+            Ok(current) if current == applied => None,
+            Ok(_) => Some(self.routing_stop(
+                UnevaluableCause::RoutingDiverged,
+                "the routing configuration is not the one this generation applied under".to_string(),
+                prior_detail,
+            )),
+            // A config that will not load is NOT a routing divergence —
+            // nothing about the routing is in doubt, the file is broken.
+            // It leaves through the same `Unreadable` exit the bind
+            // failure uses, whose remedy (fix the config and re-run)
+            // genuinely works.
+            Err(why) => Some(Event::ObservationChecks {
+                failed: 0,
+                errored: 0,
+                warned: 0,
+                deferred: None,
+                detail: format!(
+                    "the configuration could not be read, so the declared checks were NOT run: \
+                     {why:#}"
+                ),
+                prior_detail,
+                cause: Some(UnevaluableCause::Unreadable),
+            }),
+        }
+    }
+
+    /// One shape for every routing hold, so the cause cannot be set
+    /// without the detail that explains it.
+    fn routing_stop(
+        &self,
+        cause: UnevaluableCause,
+        detail: String,
+        prior_detail: String,
+    ) -> Event {
+        Event::ObservationChecks {
+            failed: 0,
+            errored: 0,
+            warned: 0,
+            // NOT `Some(0)`: nothing ran, and a zero reads as health.
+            deferred: None,
+            detail,
+            prior_detail,
+            cause: Some(cause),
+        }
+    }
+
     /// Post-apply observation: scoped tests + the typed staleness read.
-    async fn observe(&self) -> Result<Event> {
+    async fn observe(&self, record: &FulfillStateRecord) -> Result<Event> {
         // Crash seam for the post-apply pre-observation drill: the apply
         // is journaled and terminal, nothing has been observed yet.
         fault_point("pre-observation");
+
+        // ROUTING GATE, BEFORE ANY WAREHOUSE READ.
+        //
+        // This is deliberately the FIRST thing in the observation, ahead
+        // of the staleness read. `observe_max_time_column` does its own
+        // `load_rocky_config` and runs `SELECT MAX(...)`, so a re-route
+        // between the apply and here means that query lands on the wrong
+        // warehouse and its answer is journaled as this generation's
+        // freshness. Gating only the declared checks left that read
+        // outside the gate: the loop avoided the healthy transition and
+        // still performed, and recorded, a wrong-warehouse observation.
+        //
+        // The check repeats inside `observe_checks` rather than being
+        // hoisted out of it. That one compares the identity carried by
+        // the handle that will EXECUTE, from its own single load, so it
+        // is the authoritative comparison; this one is an early refusal
+        // that keeps the queries from happening at all.
+        if let Some(hold) = self.routing_hold(record, String::new()) {
+            return Ok(hold);
+        }
+
         let spec = self.approved_spec()?;
         let model = spec.parsed.output_model().to_string();
         let mut detail: Vec<String> = Vec::new();
