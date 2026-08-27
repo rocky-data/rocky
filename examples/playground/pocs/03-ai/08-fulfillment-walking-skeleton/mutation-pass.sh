@@ -39,6 +39,7 @@ declare -a WHAT=(
   "10:skip backdating so the data never goes stale"
   "11:skip injecting the duplicate so no declared check fails post-apply (the data-red branch never runs)"
   "11h:skip the FRESH review of the repaired plan (a data-red must not inherit the failing plan's approval)"
+  "12:skip the post-apply re-route so the config still names the applied warehouse (the routing gate has nothing to catch, and the loop reads clean)"
 )
 
 echo "=================================================================="

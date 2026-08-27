@@ -458,6 +458,51 @@ DUPES="$(duckdb -csv -noheader wh.duckdb "SELECT COUNT(*) FROM (SELECT client_id
 echo "    OK  red -> observed_failing (exit 4) -> repair round -> NEW plan $PLAN3 (!= $PLAN2), bare apply refused, fresh review -> observing"
 
 
+# ----------------------------------------------------------------- Assert 12
+# ROUTING CUSTODY. The product is applied and healthy. Re-point `rocky.toml`
+# at a DIFFERENT warehouse and the declared checks must NOT run.
+#
+# The warehouse we re-point to is a COPY of the real one, so every declared
+# check would PASS there. That is the whole point: without the gate the loop
+# reports health, and the health is about a table this generation never wrote.
+# A green reading is the failure mode, not a red one.
+echo; echo "[12] routing custody: a post-apply re-route holds instead of certifying another warehouse"
+cp wh.duckdb wh_elsewhere.duckdb || fail "12 (could not copy the warehouse)"
+cp rocky.toml rocky.toml.orig || fail "12 (could not save the config)"
+# MUTATION 12: skip the re-route -> the config still names the applied
+# warehouse, the gate has nothing to catch, and the loop reads clean.
+mut 12 || sed -i.bak 's|^path = "wh.duckdb"$|path = "wh_elsewhere.duckdb"|' rocky.toml \
+  || fail "12 (could not re-route the config)"
+
+code=$(rj expected/12_routing.json fulfill "$PRODUCT")
+STATE12="$(jq -r .state expected/12_routing.json)"
+[ "$STATE12" != "observing" ] \
+  || fail "12 (the loop reported observing after a re-route — it certified a warehouse this generation never wrote to)"
+jq -e '.message | test("routes to a different warehouse than the apply wrote to")' expected/12_routing.json >/dev/null \
+  || fail "12 (the stop does not name the routing divergence; got: $(jq -r .message expected/12_routing.json | head -c 200))"
+# BOTH causes, because the compared value is env-resolved and the two are
+# indistinguishable in it. Naming only the edit strands an operator who
+# changed no file.
+jq -e '.message | test("was edited")' expected/12_routing.json >/dev/null \
+  || fail "12 (the remedy does not name an edit as a cause)"
+jq -e '.message | contains("in a routing field resolved to a different value")' expected/12_routing.json >/dev/null \
+  || fail "12 (the remedy does not name an environment-resolved routing field as the other cause)"
+# And it must NOT borrow the custody wording — no sidecar changed here.
+jq -e '.message | contains("restore the file you changed") | not' expected/12_routing.json >/dev/null \
+  || fail "12 (the routing hold borrowed the check-set custody remedy — it would send the operator after a sidecar nobody touched)"
+
+# The hold CLEARS by restoring the routing. A gate whose remedy does not work
+# is a product stranded by its own guard.
+mv rocky.toml.orig rocky.toml || fail "12 (could not restore the config)"
+rm -f rocky.toml.bak wh_elsewhere.duckdb
+code=$(rj expected/12_cleared.json fulfill "$PRODUCT")
+STATE12B="$(jq -r .state expected/12_cleared.json)"
+[ "$STATE12B" = "observing" ] \
+  || fail "12 (restoring the routing did not clear the hold — state $STATE12B, want observing)"
+echo "    OK  re-route -> hold (state $STATE12, both causes named) -> restore -> observing"
+
+
+
 echo
 echo "=================================================================="
 echo "POC complete: spec -> lowering -> red draft -> REPAIR -> propose -> human"
