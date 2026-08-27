@@ -1857,8 +1857,8 @@ fn decide_observation_checks(
                 return blocked_stop(
                     record,
                     "routing evidence missing under an applied generation".to_string(),
-                    &product,
-                    &detail,
+                    product,
+                    detail,
                 );
             }
             if matches!(cause, Some(UnevaluableCause::CheckSchemeChanged)) {
