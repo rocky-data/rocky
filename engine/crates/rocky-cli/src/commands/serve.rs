@@ -20,8 +20,14 @@
 //!
 //! `read-only` authenticates exactly like `full` but is refused `403` on any
 //! request whose HTTP method is not safe (`GET`, `HEAD`, `OPTIONS`). That is
-//! the token a browser UI should hold: one leaked token, or one XSS, then
-//! cannot reach `POST /api/v1/jobs/run` and through it the warehouse.
+//! the token a browser UI should hold: a leak of it cannot reach
+//! `POST /api/v1/jobs/run` and through it the warehouse.
+//!
+//! It does not gate the webhook ingress, which is Bearer-exempt. Under
+//! `--scheduler` on a loopback bind with no `ROCKY_WEBHOOK_SECRET` that route
+//! accepts unsigned `POST`s by dev convenience, so same-origin script can
+//! spool work with no token at all. Set `ROCKY_WEBHOOK_SECRET` when a browser
+//! can reach this server.
 //!
 //! A scope with no token is an **error**, not a silent no-op: the operator
 //! asked to restrict something that would otherwise stay fully mutable.

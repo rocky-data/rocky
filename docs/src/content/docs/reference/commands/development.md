@@ -236,6 +236,8 @@ read-only token
 
 The check reads the HTTP method, not a list of paths, so any route Rocky adds later is refused too. Two things it does not touch: `GET /api/v1/health` stays open, and the webhook route `POST /api/v1/hooks/trigger/{pipeline}` keeps its own HMAC check.
 
+The second one has an edge. With `--scheduler`, on a loopback bind, and no `ROCKY_WEBHOOK_SECRET`, the webhook route accepts an unsigned `POST` and queues work for the scheduler. No token is involved, so a read-only token does not stop it. Set `ROCKY_WEBHOOK_SECRET` whenever a browser or an untrusted process can reach the server.
+
 CORS is empty-by-default. Browser apps must declare every allowed origin via `--allowed-origin <ORIGIN>`. Permitted methods: `GET`, `POST`, `OPTIONS`. Permitted headers: `Authorization`, `Content-Type`.
 
 ### Flags

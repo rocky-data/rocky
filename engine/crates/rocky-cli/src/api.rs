@@ -4042,6 +4042,17 @@ adapter = "db"
         loopback: bool,
         rps: f64,
     ) -> (Arc<ServerState>, tempfile::TempDir) {
+        webhook_state_with_token(secret, loopback, rps, None)
+    }
+
+    /// [`webhook_state`] with a configured Bearer token, so a test can show
+    /// what the token's scope does — and does not — reach.
+    fn webhook_state_with_token(
+        secret: Option<&str>,
+        loopback: bool,
+        rps: f64,
+        token: Option<ServeToken>,
+    ) -> (Arc<ServerState>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("rocky.toml");
         std::fs::write(&config_path, WEBHOOK_TEST_CONFIG).unwrap();
@@ -4056,7 +4067,7 @@ adapter = "db"
             false, // models_dir_is_explicit — irrelevant to webhook ingress
             None,
             Some(config_path),
-            None,
+            token,
             Vec::new(),
             None,
             Some(ingress),
@@ -4118,6 +4129,59 @@ adapter = "db"
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["demand"], "accepted");
         assert_eq!(spool_file_count(&dir), 1);
+    }
+
+    /// **The limit of the read-scoped token, pinned rather than described.**
+    ///
+    /// The webhook route is Bearer-exempt, so the token's scope has no say over
+    /// it — and on `serve --scheduler` bound to loopback with no
+    /// `ROCKY_WEBHOOK_SECRET`, the handler accepts an UNSIGNED `POST` (the
+    /// documented dev convenience at `webhook_trigger`) and durably spools a
+    /// demand the resident reconciler will run.
+    ///
+    /// So in that one configuration a read-scoped token is not, on its own, a
+    /// browser-safety guarantee: same-origin script can spool work without any
+    /// token at all. That is pre-existing behaviour, not something the scope
+    /// changed — the same request succeeds identically with no token
+    /// configured, which the assertion below shows. It is pinned here because
+    /// the surrounding prose claims a read-scoped token keeps a browser off the
+    /// warehouse, and this is the configuration where that claim needs its
+    /// caveat. Setting `ROCKY_WEBHOOK_SECRET` closes it.
+    #[tokio::test]
+    async fn read_scope_does_not_reach_the_unsigned_loopback_webhook() {
+        let (state, dir) =
+            webhook_state_with_token(None, true, 100.0, Some(ServeToken::read_only("s3cret")));
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+
+        // No Authorization header at all: the route is Bearer-exempt, so the
+        // scope check never runs and the unsigned POST is accepted.
+        let resp = client
+            .post(format!("{base}/api/v1/hooks/trigger/raw"))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            202,
+            "unsigned loopback webhook stays accepted — the scope does not gate it"
+        );
+        assert_eq!(spool_file_count(&dir), 1, "and it durably spooled work");
+
+        // Identical with the read-scoped token presented, confirming the token
+        // is simply not consulted here — this is not a scope refusal turning
+        // into an acceptance.
+        let resp = client
+            .post(format!("{base}/api/v1/hooks/trigger/raw"))
+            .bearer_auth("s3cret")
+            .header("X-Rocky-Delivery", "second")
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+        assert_eq!(spool_file_count(&dir), 2);
     }
 
     #[tokio::test]

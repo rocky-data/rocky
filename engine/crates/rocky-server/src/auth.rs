@@ -15,7 +15,18 @@
 //!   historical all-or-nothing token. `ReadOnly` authenticates exactly the
 //!   same way but is refused `403` on any request whose HTTP method is not
 //!   safe — see [`is_safe_method`]. A browser UI can hold a `ReadOnly`
-//!   token without one leak or one XSS reaching a warehouse mutation.
+//!   token without one leak of that token reaching a warehouse mutation
+//!   *through the token*.
+//!
+//! One limit worth stating, because the scope does not cover it: the webhook
+//! ingress is Bearer-exempt, so a `ReadOnly` token has no say over it. On
+//! `serve --scheduler` bound to loopback with no `ROCKY_WEBHOOK_SECRET`, that
+//! route accepts an unsigned `POST` and spools work for the resident
+//! reconciler — reachable by same-origin script with no token at all. That is
+//! pre-existing behaviour the scope neither adds nor removes, but it means a
+//! read-scoped token is not by itself a browser-safety guarantee in that one
+//! configuration. Setting `ROCKY_WEBHOOK_SECRET` closes it. Pinned by
+//! `rocky_cli::api::tests::read_scope_does_not_reach_the_unsigned_loopback_webhook`.
 //!
 //! CORS defaults mirror the auth posture: an empty allowlist means
 //! same-origin only (no `Access-Control-Allow-Origin` header). Origins

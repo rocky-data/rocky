@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Set it with `--token-scope <full|read-only>`, or `ROCKY_SERVE_TOKEN_SCOPE` — the same flag-then-env shape `--token` already uses. **The default is `full`, so existing deployments are unchanged.** Setting a scope without a token is an error rather than a silent no-op, and an unparseable scope is an error rather than a fall back to `full`, so a typo in the env var cannot quietly hand out full access.
 
-  Two things a read-scoped token does **not** change: `GET /api/v1/health` stays auth-exempt, and the HMAC-authenticated webhook ingress (`POST /api/v1/hooks/trigger/{pipeline}`) is unaffected — it never consults the bearer token.
+  Two things a read-scoped token does **not** change: `GET /api/v1/health` stays auth-exempt, and the webhook ingress (`POST /api/v1/hooks/trigger/{pipeline}`) is unaffected — it never consults the bearer token, because it authenticates with its own HMAC.
+
+  **Know this before you hand a read-only token to a browser.** The scope restricts that token; it is not a whole-server browser perimeter. `rocky serve --scheduler` bound to loopback with no `ROCKY_WEBHOOK_SECRET` accepts an *unsigned* webhook `POST` — a documented dev convenience, unchanged here — and spools work for the resident scheduler. Same-origin script can reach that with no token at all. Set `ROCKY_WEBHOOK_SECRET` whenever a browser can reach the sidecar.
 
 ### Fixed
 
