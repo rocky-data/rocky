@@ -384,6 +384,50 @@ mod tests {
         );
     }
 
+    /// **The producer-to-consumer wire.** Everything else here tests one half:
+    /// the router tests build a `ServeToken::read_only` by hand, and the
+    /// pairing tests call the private helper with an already-parsed
+    /// `TokenScope`. Neither would notice if `run_serve` ignored its
+    /// `token_scope` argument, or always built a full-scope token — the field
+    /// would be written by tests and never by the CLI.
+    ///
+    /// So this walks the real path: the raw flag string `--token-scope
+    /// read-only` goes through `resolve_serve_token`, and the resulting token
+    /// is installed on a `ServerState` exactly as `run_serve` installs it. The
+    /// assertion is on `state.auth`, the field the middleware actually reads.
+    ///
+    /// The one link still not covered in-process is clap itself (`Cli` lives
+    /// in the `rocky` binary crate, which this crate cannot import). That link
+    /// is covered by running the built binary: `rocky serve --token-scope
+    /// read-only` with a token answers `403` on `POST /api/v1/jobs/run` and
+    /// `200` on `GET /api/v1/meta`.
+    #[tokio::test]
+    async fn the_raw_flag_value_reaches_the_state_the_middleware_reads() {
+        use rocky_server::state::ServerState;
+
+        let models = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../rocky-compiler/tests/fixtures/simple_project/models");
+
+        for (raw, expected) in [
+            (Some("read-only".to_string()), TokenScope::ReadOnly),
+            (Some("full".to_string()), TokenScope::Full),
+            // No scope named at all → the historical full-scope token.
+            (None, TokenScope::Full),
+        ] {
+            let token = resolve_serve_token(Some("s3cret".to_string()), raw.clone())
+                .unwrap()
+                .expect("a secret always yields a token");
+            let state =
+                ServerState::with_auth(models.clone(), None, None, Some(token), Vec::new(), None);
+            let installed = state.auth.as_ref().expect("the token reached the state");
+            assert_eq!(
+                installed.scope, expected,
+                "--token-scope {raw:?} must install {expected:?}"
+            );
+            assert_eq!(installed.secret, "s3cret");
+        }
+    }
+
     /// An unparseable scope is an error rather than a fall back to `Full`.
     /// This is the case that matters on the env path: clap validates the flag,
     /// nothing validates `ROCKY_SERVE_TOKEN_SCOPE`.

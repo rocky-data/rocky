@@ -148,6 +148,20 @@ impl std::fmt::Debug for ServeToken {
 /// is refused for a read-scoped token the moment it exists, because the
 /// middleware runs before the router and never consults the path.
 ///
+/// State that precisely, because it has two real limits and neither is
+/// covered by the method check:
+///
+/// 1. It holds only for routes **inside** the wrapped router. A route
+///    registered after `Router::layer` in `rocky_cli::api::router` is outside
+///    this middleware entirely — that is why the router's own doc makes
+///    registration order rule 1, and why
+///    `every_declared_route_is_auth_wrapped_except_health` probes it.
+/// 2. It classifies the **method**, not the handler. A `GET` handler with a
+///    mutating effect would pass. Audited at the time of writing: no `GET`
+///    handler in `rocky_cli::api` performs a durable or warehouse write — the
+///    only write on a `GET` path is `get_job`'s in-memory job-cache upsert.
+///    Adding a mutating `GET` would break this guarantee silently, so don't.
+///
 /// `TRACE` is deliberately absent even though RFC 9110 classifies it as safe:
 /// nothing routes it, and refusing it keeps the cross-site-tracing shape off
 /// the list entirely.
@@ -168,8 +182,17 @@ pub fn is_safe_method(method: &Method) -> bool {
 /// refusal therefore does not cover these paths. Keep this set to routes that
 /// serve safe methods only — a mutating route added here would be reachable by
 /// a read-scoped token (and by no token at all). The webhook prefix is the
-/// deliberate exception: it is a `POST`, and it authenticates itself with an
-/// `X-Rocky-Signature` HMAC over the raw body instead of the Bearer token.
+/// deliberate exception: it is a `POST`, and it is expected to authenticate
+/// itself with an `X-Rocky-Signature` HMAC over the raw body instead of the
+/// Bearer token.
+///
+/// "Expected to" is exact. The handler verifies an HMAC **only when a secret
+/// is configured** (`ROCKY_WEBHOOK_SECRET`). On a loopback bind with no
+/// secret it accepts unsigned `POST`s as a documented dev convenience, and
+/// this exemption means the Bearer token and its scope have no say over that
+/// — so in that one configuration the webhook is a mutating route reachable
+/// with no credential. Pre-existing, unchanged here, and pinned by
+/// `rocky_cli::api::tests::read_scope_does_not_reach_the_unsigned_loopback_webhook`.
 const AUTH_EXEMPT_PATHS: &[&str] = &["/api/v1/health"];
 
 /// The single-segment prefix under which webhook ingress routes live. A request
@@ -179,6 +202,9 @@ const WEBHOOK_TRIGGER_PREFIX: &str = "/api/v1/hooks/trigger/";
 
 /// Whether `path` is a webhook-ingress route eligible for the HMAC-auth
 /// exemption from the Bearer middleware.
+///
+/// Path shape only — this says nothing about whether the handler will
+/// actually check an HMAC. See [`AUTH_EXEMPT_PATHS`] for when it does not.
 ///
 /// The exemption is deliberately the **tightest** possible: the path must be a
 /// single non-empty segment directly under [`WEBHOOK_TRIGGER_PREFIX`] — the
@@ -342,6 +368,16 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// Origins must be valid `Origin`-header values (e.g.
 /// `http://localhost:5173`). Invalid entries are dropped with a
 /// `tracing::warn`.
+///
+/// The advertised method list is deliberately **not** scope-aware. It says
+/// `GET, POST, OPTIONS` whatever [`TokenScope`] the token carries, and omits
+/// `HEAD`. That is a capability mismatch, not a bypass: this layer sits
+/// outside [`require_bearer_token`], so it answers the preflight `OPTIONS`
+/// itself and never reaches a handler, and the browser's subsequent real
+/// `POST` still passes through the scope check and earns its `403`. Narrowing
+/// the advertisement per scope would only move the refusal earlier, at the
+/// cost of a second place where the safe-method list is written down — and a
+/// second place is how the two drift.
 pub fn build_cors_layer(allowed_origins: &[String]) -> CorsLayer {
     if allowed_origins.is_empty() {
         return CorsLayer::new();

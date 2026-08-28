@@ -125,7 +125,10 @@ impl Default for ServeConfig {
 /// so it cannot land without appearing in [`api_v1_routes`] — which is what
 /// the read-scope test enumerates. The read-scope *guarantee* does not depend
 /// on either table: `rocky_server::auth` refuses on the HTTP method before
-/// routing, so a new mutating route is covered with no edit there.
+/// routing, so a new mutating route is covered with no edit there — provided
+/// it is registered above the layer (rule 1) and its method is genuinely not
+/// safe. A mutating `GET` would pass; see `rocky_server::auth::is_safe_method`
+/// for the two stated limits.
 pub fn router(state: Arc<ServerState>) -> Router {
     let cors = build_cors_layer(&state.allowed_origins);
 
@@ -3598,8 +3601,8 @@ mod tests {
     /// - table → router: `every_declared_route_is_registered_on_the_router`
     ///   proves each declared entry is really served.
     /// - router → table: `router_registers_no_undeclared_mutating_route`
-    ///   (below) proves no mutating registration exists that this table
-    ///   does not list.
+    ///   (below) narrows the other direction with a source-text count. It is
+    ///   a heuristic, not a proof — its own doc lists what it cannot see.
     ///
     /// And the guarantee itself does not rest on any of the three: the
     /// middleware refuses on the HTTP **method**, before routing, without
@@ -3674,6 +3677,19 @@ mod tests {
     /// break literal extraction, but not the count. The guard is kept honest
     /// from the other side by refusing the router-builder forms that could
     /// register a mutating method without one of those four words appearing.
+    ///
+    /// What it does NOT prove, stated so nobody leans on it further than it
+    /// reaches. It counts text, so it can be defeated by a helper function
+    /// that returns a `post(...)` router from outside `router()`, and it can
+    /// miscount if an identifier such as `post_process(` appears in the body.
+    /// It classifies methods, not effects, so a mutating `GET` reads as safe.
+    /// Two named holes ARE closed: comment lines are stripped before counting,
+    /// and the declaration table is asserted duplicate-free below — without
+    /// that, a repeated declared entry could balance an undeclared
+    /// registration and the counts would agree while a route went unprobed.
+    ///
+    /// The real enforcement is `rocky_server::auth`, which never reads this
+    /// table or this file.
     #[test]
     fn router_registers_no_undeclared_mutating_route() {
         let source = include_str!("api.rs");
@@ -3715,6 +3731,18 @@ mod tests {
             .iter()
             .map(|verb| body.matches(verb).count())
             .sum();
+
+        // Counting only works against a table with no repeats: a duplicated
+        // declared entry would inflate `declared` and let an undeclared
+        // registration balance it out unnoticed.
+        let all = api_v1_routes();
+        let unique: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "api_v1_routes() must not repeat an entry — a duplicate would let \
+             an undeclared mutating route hide inside the count"
+        );
 
         // `declared_mutating_routes()` drops the webhook route, which IS a
         // registered `post(`, so add it back for the comparison.
