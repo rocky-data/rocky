@@ -224,6 +224,18 @@ rocky serve [flags]
 - **Loopback only (default)** — bind stays on `127.0.0.1`. Authentication is still on, so external processes (LSP, dashboards) need the token, but a misconfigured network won't expose model SQL to the LAN.
 - **Non-loopback bind** — `--host 0.0.0.0` (or any non-loopback address) **requires `--token <secret>`** (or the `ROCKY_SERVE_TOKEN` env var); `rocky serve` refuses to start otherwise.
 
+A token is full-scope by default: it reaches every route. `--token-scope read-only` narrows it. A read-only token authenticates the same way, then gets `403` on any request that is not `GET`, `HEAD`, or `OPTIONS`. Give that token to a browser UI, so a leaked token cannot start a run:
+
+```text
+read-only token
+  ├─ GET  /api/v1/dag        → 200
+  ├─ GET  /api/v1/compile    → 200
+  ├─ POST /api/v1/jobs/run   → 403 forbidden_read_only_token
+  └─ POST /api/v1/compile    → 403 forbidden_read_only_token
+```
+
+The check reads the HTTP method, not a list of paths, so any route Rocky adds later is refused too. Two things it does not touch: `GET /api/v1/health` stays open, and the webhook route `POST /api/v1/hooks/trigger/{pipeline}` keeps its own HMAC check.
+
 CORS is empty-by-default. Browser apps must declare every allowed origin via `--allowed-origin <ORIGIN>`. Permitted methods: `GET`, `POST`, `OPTIONS`. Permitted headers: `Authorization`, `Content-Type`.
 
 ### Flags
@@ -235,6 +247,7 @@ CORS is empty-by-default. Browser apps must declare every allowed origin via `--
 | `--host <HOST>` | `String` | `127.0.0.1` | Bind host. Non-loopback (`0.0.0.0`, etc.) requires `--token`. |
 | `--port <PORT>` | `u16` | `8080` | Port to listen on. |
 | `--token <SECRET>` | `String` | | Bearer token required by every API request except `/api/v1/health`. Falls back to `ROCKY_SERVE_TOKEN` env var when omitted. **Required when `--host` is non-loopback.** |
+| `--token-scope <SCOPE>` | `full` \| `read-only` | `full` | What `--token` may do. `read-only` allows `GET`, `HEAD`, and `OPTIONS` only; anything else gets `403 forbidden_read_only_token`. Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a token is an error. |
 | `--allowed-origin <ORIGIN>` | `String` (repeatable) | `[]` | Add an origin to the CORS allowlist. Repeat for multiple origins (e.g. `--allowed-origin http://localhost:5173 --allowed-origin https://dashboard.example.com`). |
 | `--watch` | `bool` | `false` | Watch for file changes and auto-recompile. |
 | `--scheduler` | `bool` | `false` | Also run the resident scheduler: a timer loop that evaluates every pipeline's `[schedule]` and runs what is due, in-process. On SIGTERM or Ctrl-C the server drains a running scheduled child before it exits. Run one instance per project directory. Experimental. |
