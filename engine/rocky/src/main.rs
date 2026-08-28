@@ -1689,6 +1689,14 @@ enum Command {
         /// var when omitted. Required when `--host` is non-loopback.
         #[arg(long)]
         token: Option<String>,
+        /// What `--token` may do. `full` (the default) reaches every route.
+        /// `read-only` authenticates the same way but is refused `403` on any
+        /// request whose method is not `GET`, `HEAD`, or `OPTIONS` — the token
+        /// to hand a browser UI, so one leak can't reach a warehouse mutation.
+        /// Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a
+        /// token is an error.
+        #[arg(long = "token-scope", value_name = "SCOPE", value_parser = ["full", "read-only"])]
+        token_scope: Option<String>,
         /// CORS allowlist. Repeat for each origin (e.g.
         /// `--allowed-origin http://localhost:5173`). The default
         /// allowlist is empty (same-origin only).
@@ -4131,6 +4139,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             port,
             watch,
             token,
+            token_scope,
             allowed_origins,
             scheduler,
             poll_interval_seconds,
@@ -4156,6 +4165,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 port,
                 watch,
                 token,
+                token_scope,
                 allowed_origins,
                 scheduler,
                 poll_interval_seconds,

@@ -3,14 +3,19 @@
 //! `rocky serve` ships behind a Bearer-token auth middleware and a
 //! configurable CORS allowlist. The defaults are deliberately tight:
 //!
-//! - When `auth_token` is `Some`, every request to `/api/v1/*`, `/`, or
+//! - When `auth` is `Some`, every request to `/api/v1/*`, `/`, or
 //!   `/dashboard` must carry an `Authorization: Bearer <token>` header
 //!   that matches via constant-time comparison. `/api/v1/health` is
 //!   always auth-exempt so liveness probes work.
-//! - When `auth_token` is `None`, the server refuses to start unless the
+//! - When `auth` is `None`, the server refuses to start unless the
 //!   bind host is `127.0.0.1` / `localhost` (loopback only). This keeps
 //!   the LAN-leak class of bug from regressing on a forgotten `--host`
 //!   override.
+//! - A configured token also carries a [`TokenScope`]. `Full` is the
+//!   historical all-or-nothing token. `ReadOnly` authenticates exactly the
+//!   same way but is refused `403` on any request whose HTTP method is not
+//!   safe — see [`is_safe_method`]. A browser UI can hold a `ReadOnly`
+//!   token without one leak or one XSS reaching a warehouse mutation.
 //!
 //! CORS defaults mirror the auth posture: an empty allowlist means
 //! same-origin only (no `Access-Control-Allow-Origin` header). Origins
@@ -29,6 +34,116 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::state::ServerState;
 
+/// What a configured `rocky serve` Bearer token is allowed to do.
+///
+/// Deliberately an enum rather than an `is_readonly: bool`: a new privilege
+/// tier has to come to the `match` in [`require_bearer_token`], which has no
+/// `_ =>` arm, so it cannot be added without deciding what it may mutate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TokenScope {
+    /// Every route the router serves, mutating included. The historical
+    /// (and default) behaviour of a configured token.
+    #[default]
+    Full,
+    /// Safe HTTP methods only. Authenticates normally; any other method is
+    /// refused `403` before it reaches the router.
+    ReadOnly,
+}
+
+impl TokenScope {
+    /// The spellings accepted on `--token-scope` and in
+    /// `ROCKY_SERVE_TOKEN_SCOPE`, in CLI-flag order.
+    pub const VALUE_NAMES: &'static [&'static str] = &["full", "read-only"];
+}
+
+impl std::str::FromStr for TokenScope {
+    type Err = UnknownTokenScope;
+
+    /// Exact, lowercase, hyphenated — one spelling per scope. Anything else
+    /// is an error rather than a silent fall back to [`TokenScope::Full`]:
+    /// the flag is validated by clap, but `ROCKY_SERVE_TOKEN_SCOPE` is not,
+    /// and a typo there must not quietly hand out a full-scope token.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "full" => Ok(Self::Full),
+            "read-only" => Ok(Self::ReadOnly),
+            other => Err(UnknownTokenScope(other.to_string())),
+        }
+    }
+}
+
+/// A `--token-scope` / `ROCKY_SERVE_TOKEN_SCOPE` value that names no scope.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "unknown token scope `{0}` (expected one of: {expected})",
+    expected = TokenScope::VALUE_NAMES.join(", ")
+)]
+pub struct UnknownTokenScope(pub String);
+
+/// The Bearer token `rocky serve` was configured with, and the scope it grants.
+///
+/// The secret and its scope are one value, not two fields on [`ServerState`],
+/// so a scope can never be configured without a token to attach it to. That
+/// shape is what makes "the operator asked for read-only but no token was set,
+/// so everything stayed mutable" unrepresentable rather than a silent
+/// fail-open.
+#[derive(Clone)]
+pub struct ServeToken {
+    /// The expected Bearer secret. Compared in constant time.
+    pub secret: String,
+    /// What this token may do.
+    pub scope: TokenScope,
+}
+
+impl ServeToken {
+    /// A full-scope token — the historical all-or-nothing behaviour.
+    pub fn full(secret: impl Into<String>) -> Self {
+        Self {
+            secret: secret.into(),
+            scope: TokenScope::Full,
+        }
+    }
+
+    /// A read-scoped token: authenticates, but only safe methods pass.
+    pub fn read_only(secret: impl Into<String>) -> Self {
+        Self {
+            secret: secret.into(),
+            scope: TokenScope::ReadOnly,
+        }
+    }
+}
+
+/// Hand-written so the secret never reaches a log line, a panic message, or a
+/// `#[derive(Debug)]` on any struct that comes to hold a `ServeToken`.
+impl std::fmt::Debug for ServeToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeToken")
+            .field("secret", &"<redacted>")
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+/// Whether `method` is an HTTP *safe* method — one defined to be read-only.
+///
+/// This is the whole derivation behind [`TokenScope::ReadOnly`]. It is an
+/// explicit allowlist of three methods, so it is fail-closed by construction:
+/// a method nobody anticipated — `PROPFIND`, a future verb, an arbitrary
+/// extension token hyper hands through — is refused because it is not on the
+/// list, not permitted because it is not on a list of known-mutating verbs.
+///
+/// Deriving the refusal from the method rather than from the path is what
+/// makes a route added tomorrow safe with no edit here: `POST /api/v1/<new>`
+/// is refused for a read-scoped token the moment it exists, because the
+/// middleware runs before the router and never consults the path.
+///
+/// `TRACE` is deliberately absent even though RFC 9110 classifies it as safe:
+/// nothing routes it, and refusing it keeps the cross-site-tracing shape off
+/// the list entirely.
+pub fn is_safe_method(method: &Method) -> bool {
+    *method == Method::GET || *method == Method::HEAD || *method == Method::OPTIONS
+}
+
 /// Exact paths that bypass the Bearer-token middleware. `/api/v1/health` is
 /// the canonical liveness probe — orchestrators and load balancers need
 /// to hit it without a token.
@@ -36,6 +151,14 @@ use crate::state::ServerState;
 /// This is an exact-match set. The one *class* of prefix exemption is the
 /// webhook ingress (see [`is_webhook_trigger_path`]), which carries its own
 /// HMAC authentication instead of the Bearer token.
+///
+/// **An entry here bypasses the [`TokenScope`] check as well as the token**,
+/// because the exemption returns before either runs. The method-derived
+/// refusal therefore does not cover these paths. Keep this set to routes that
+/// serve safe methods only — a mutating route added here would be reachable by
+/// a read-scoped token (and by no token at all). The webhook prefix is the
+/// deliberate exception: it is a `POST`, and it authenticates itself with an
+/// `X-Rocky-Signature` HMAC over the raw body instead of the Bearer token.
 const AUTH_EXEMPT_PATHS: &[&str] = &["/api/v1/health"];
 
 /// The single-segment prefix under which webhook ingress routes live. A request
@@ -79,9 +202,25 @@ fn is_webhook_trigger_path(path: &str) -> bool {
 /// is a no-op — but `rocky serve` refuses to bind a non-loopback host
 /// without one, so the no-op path is safe.
 ///
+/// An authenticated request is then checked against the token's
+/// [`TokenScope`]. A [`TokenScope::ReadOnly`] token is refused `403` unless
+/// its method is safe ([`is_safe_method`]). The order matters: authenticate
+/// first, so a wrong token is always `401` and the `403` never becomes an
+/// oracle for which routes exist or mutate.
+///
+/// ```text
+/// request
+///   ├─ exempt path? ────────────────► handler   (health, HMAC webhook)
+///   ├─ no token configured? ────────► handler   (loopback-only mode)
+///   ├─ token missing / wrong? ──────► 401 unauthorized
+///   ├─ scope Full ──────────────────► handler
+///   └─ scope ReadOnly
+///        ├─ GET / HEAD / OPTIONS ───► handler
+///        └─ anything else ──────────► 403 forbidden_read_only_token
+/// ```
+///
 /// A rejected request carries the same `{code, message, remediation_hint}`
-/// error envelope shape the `/api/v1` handlers use, with `code:"unauthorized"`
-/// — never an empty body.
+/// error envelope shape the `/api/v1` handlers use — never an empty body.
 pub async fn require_bearer_token(
     State(state): State<Arc<ServerState>>,
     request: Request,
@@ -89,12 +228,13 @@ pub async fn require_bearer_token(
 ) -> Response {
     let path = request.uri().path();
     // Health is exact-exempt; webhook ingress is prefix-exempt because it
-    // carries its own HMAC auth. Both bypass the Bearer token here.
+    // carries its own HMAC auth. Both bypass the Bearer token here — and, by
+    // returning first, the scope check below too. See `AUTH_EXEMPT_PATHS`.
     if AUTH_EXEMPT_PATHS.contains(&path) || is_webhook_trigger_path(path) {
         return next.run(request).await;
     }
 
-    let Some(expected) = state.auth_token.as_deref() else {
+    let Some(token) = state.auth.as_ref() else {
         // No token configured → loopback-only mode.
         return next.run(request).await;
     };
@@ -109,8 +249,20 @@ pub async fn require_bearer_token(
         return unauthorized_response();
     };
 
-    if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+    if !constant_time_eq(provided.as_bytes(), token.secret.as_bytes()) {
         return unauthorized_response();
+    }
+
+    // Authenticated. Now: is this token allowed to do what it is asking?
+    // Exhaustive on purpose — no `_ =>` arm, so a future scope variant fails
+    // to compile here until someone decides what it may mutate.
+    match token.scope {
+        TokenScope::Full => {}
+        TokenScope::ReadOnly => {
+            if !is_safe_method(request.method()) {
+                return forbidden_read_only_response();
+            }
+        }
     }
 
     next.run(request).await
@@ -135,6 +287,22 @@ fn unauthorized_response() -> Response {
         Json(body),
     )
         .into_response()
+}
+
+/// Build a `403` response for a read-scoped token that tried to mutate.
+///
+/// `403`, not `401`: the credential was accepted, so re-authenticating with
+/// the same token will never help, and no `WWW-Authenticate` challenge is
+/// sent. Body shape mirrors [`unauthorized_response`] (and, through it,
+/// `rocky_cli::output::ErrorEnvelope`) so every error on this API carries the
+/// same `{code, message, remediation_hint}` envelope.
+fn forbidden_read_only_response() -> Response {
+    let body = serde_json::json!({
+        "code": "forbidden_read_only_token",
+        "message": "this bearer token is read-only; only GET, HEAD, and OPTIONS are permitted",
+        "remediation_hint": "use a full-scope token (`rocky serve --token-scope full`, the default) for mutating routes",
+    });
+    (StatusCode::FORBIDDEN, Json(body)).into_response()
 }
 
 /// Constant-time byte comparison. Returns `true` only if both slices have

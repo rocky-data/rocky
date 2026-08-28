@@ -10,6 +10,28 @@
 //! 1. `--token <secret>` flag
 //! 2. `ROCKY_SERVE_TOKEN` env var
 //!
+//! The token's **scope** comes from the same shape, so an operator configures
+//! it the way they already configure the secret:
+//!
+//! 1. `--token-scope <full|read-only>` flag
+//! 2. `ROCKY_SERVE_TOKEN_SCOPE` env var
+//! 3. `full` when neither is set — the historical all-or-nothing token, so
+//!    existing deployments are unchanged.
+//!
+//! `read-only` authenticates exactly like `full` but is refused `403` on any
+//! request whose HTTP method is not safe (`GET`, `HEAD`, `OPTIONS`). That is
+//! the token a browser UI should hold: one leaked token, or one XSS, then
+//! cannot reach `POST /api/v1/jobs/run` and through it the warehouse.
+//!
+//! A scope with no token is an **error**, not a silent no-op: the operator
+//! asked to restrict something that would otherwise stay fully mutable.
+//!
+//! There is no `[serve]` section in `rocky.toml` — `rocky-core/src/config.rs`
+//! defines none — so flag-plus-env is the idiom `serve` already uses for every
+//! one of its knobs (`--token`, `--allowed-origin`, `--host`). A new config
+//! shape for one field would be net-new surface, and would split where an
+//! operator looks for the secret and where they look for its scope.
+//!
 //! Cross-origin clients must be enumerated via `--allowed-origin`. The
 //! default allowlist is empty (same-origin only); the dashboard at `/`
 //! is server-rendered HTML and doesn't need cross-origin XHR.
@@ -17,6 +39,8 @@
 use std::path::Path;
 
 use anyhow::Result;
+
+use rocky_server::auth::{ServeToken, TokenScope};
 
 /// The fixed webhook-ingress request rate (requests/second), with an equal
 /// burst. A flood guard shared across all callers, not a per-sender quota.
@@ -41,6 +65,9 @@ pub async fn run_serve(
     port: u16,
     watch: bool,
     auth_token: Option<String>,
+    // The raw `--token-scope` value, unparsed. `None` falls back to
+    // `ROCKY_SERVE_TOKEN_SCOPE`, then to `TokenScope::Full`.
+    token_scope: Option<String>,
     allowed_origins: Vec<String>,
     scheduler: bool,
     poll_interval_seconds: Option<u64>,
@@ -49,7 +76,8 @@ pub async fn run_serve(
 ) -> Result<()> {
     // Token resolution: --token takes precedence over the env var so
     // CI / scripts can override an inherited environment.
-    let token = auth_token.or_else(|| std::env::var("ROCKY_SERVE_TOKEN").ok());
+    let secret = auth_token.or_else(|| std::env::var("ROCKY_SERVE_TOKEN").ok());
+    let token = resolve_serve_token(secret, token_scope)?;
 
     // The config file the scheduler reads (falls back to the conventional
     // `rocky.toml`); the webhook spool is anchored under its `.rocky` directory,
@@ -170,6 +198,44 @@ pub async fn run_serve(
         tracing::warn!(error = %e, "scheduler task did not shut down cleanly");
     }
     result
+}
+
+/// Pair the resolved Bearer secret with its [`TokenScope`].
+///
+/// Mirrors the secret's own resolution order — flag, then env var, then a
+/// default — so there is one idiom to learn. Two things fail closed here:
+///
+/// - An unparseable scope is an error, never a fall back to `Full`. clap
+///   validates `--token-scope`, but nothing validates the env var, and a typo
+///   there ("readonly", "read_only") must not silently hand out full access.
+/// - A scope with no secret is an error. The operator asked to restrict a
+///   token that does not exist; accepting it would leave the server fully
+///   mutable while looking configured. This fires for the env var too: a
+///   globally exported `ROCKY_SERVE_TOKEN_SCOPE` with no token is exactly the
+///   confusion worth refusing rather than ignoring, and the message names the
+///   two ways out.
+fn resolve_serve_token(
+    secret: Option<String>,
+    token_scope: Option<String>,
+) -> Result<Option<ServeToken>> {
+    let scope = match token_scope.or_else(|| std::env::var("ROCKY_SERVE_TOKEN_SCOPE").ok()) {
+        Some(raw) => Some(raw.parse::<TokenScope>()?),
+        None => None,
+    };
+
+    match (secret, scope) {
+        (Some(secret), scope) => Ok(Some(ServeToken {
+            secret,
+            // No scope named → `Full`, the historical all-or-nothing token.
+            scope: scope.unwrap_or_default(),
+        })),
+        (None, Some(_)) => anyhow::bail!(
+            "--token-scope (or ROCKY_SERVE_TOKEN_SCOPE) was set but no token was. \
+             A scope only restricts a configured token. Pass --token <secret> \
+             (or set ROCKY_SERVE_TOKEN), or drop the scope."
+        ),
+        (None, None) => Ok(None),
+    }
 }
 
 /// Resolve when the process should begin draining: a SIGTERM (unix) or a ctrl-c

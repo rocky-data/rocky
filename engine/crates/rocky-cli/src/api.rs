@@ -86,7 +86,7 @@ use crate::output::{
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
     /// Bind host. Defaults to `127.0.0.1`. A non-loopback host (e.g.
-    /// `0.0.0.0`) requires `auth_token` to be `Some`.
+    /// `0.0.0.0`) requires `ServerState::auth` to be `Some`.
     pub host: String,
     /// Listen port.
     pub port: u16,
@@ -181,7 +181,7 @@ pub async fn serve(
     shutdown: rocky_core::schedule::Drain,
     ready: rocky_core::schedule::Drain,
 ) -> anyhow::Result<()> {
-    if !is_loopback(&config.host) && state.auth_token.is_none() {
+    if !is_loopback(&config.host) && state.auth.is_none() {
         anyhow::bail!(
             "rocky serve refuses to bind {host} without a Bearer token. \
              Pass --token <secret> (or set ROCKY_SERVE_TOKEN), or bind to \
@@ -2646,11 +2646,17 @@ mod tests {
     }
 
     fn test_state_with_token(token: &str) -> Arc<ServerState> {
+        test_state_with_scoped_token(ServeToken::full(token))
+    }
+
+    /// A server whose configured token carries an explicit
+    /// [`rocky_server::auth::TokenScope`].
+    fn test_state_with_scoped_token(token: ServeToken) -> Arc<ServerState> {
         ServerState::with_auth(
             simple_project_models(),
             None,
             None,
-            Some(token.to_string()),
+            Some(token),
             Vec::new(),
             None,
         )
