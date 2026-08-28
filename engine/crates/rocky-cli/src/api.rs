@@ -41,12 +41,17 @@
 //! `dag/status` are server-lifecycle, also out of contract.
 //!
 //! All routes except `/api/v1/health` require a Bearer token when one is
-//! configured on [`ServerState`]; see [`rocky_server::auth`]. Error
+//! configured on [`ServerState`]; see [`rocky_server::auth`]. A token
+//! configured with `--token-scope read-only` authenticates the same way but
+//! is refused `403 forbidden_read_only_token` on every request whose HTTP
+//! method is not safe (`GET`, `HEAD`, `OPTIONS`) — so every route below that
+//! serves `POST` (or any method added later) is unreachable with one. Error
 //! responses carry the [`ErrorEnvelope`] body (`{code, message,
 //! remediation_hint}`), never an empty body — including the router-level
 //! fallbacks (`404 route_not_found` for an unmatched path,
-//! `405 method_not_allowed` for a known path hit with the wrong method) and
-//! malformed path parameters (`400 bad_request`). The one exception: a
+//! `405 method_not_allowed` for a known path hit with the wrong method), the
+//! scope refusal above, and malformed path parameters (`400 bad_request`).
+//! The one exception: a
 //! request the HTTP stack rejects before it reaches the router (e.g.
 //! malformed HTTP or an aborted body read) is answered below this layer and
 //! carries no envelope.
@@ -114,6 +119,13 @@ impl Default for ServeConfig {
 ///    the generated OpenAPI paths; the probe test
 ///    `every_declared_route_is_registered_on_the_router` fails when the two
 ///    drift.
+///
+/// A route registered with a non-safe method (`post`/`put`/`patch`/`delete`)
+/// is additionally counted by `router_registers_no_undeclared_mutating_route`,
+/// so it cannot land without appearing in [`api_v1_routes`] — which is what
+/// the read-scope test enumerates. The read-scope *guarantee* does not depend
+/// on either table: `rocky_server::auth` refuses on the HTTP method before
+/// routing, so a new mutating route is covered with no edit there.
 pub fn router(state: Arc<ServerState>) -> Router {
     let cors = build_cors_layer(&state.allowed_origins);
 
@@ -1555,6 +1567,8 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
+
+    use rocky_server::auth::{ServeToken, is_safe_method};
 
     fn simple_project_models() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3530,6 +3544,428 @@ mod tests {
             resp.status(),
             401,
             "a traversal under the webhook prefix must stay behind Bearer auth"
+        );
+    }
+
+    // --- Read-scoped token: refused on every mutating route ---
+
+    /// A `ServerState` with a scoped token AND a pinned state path, so a test
+    /// can inspect the durable `jobs` table afterwards.
+    fn pinned_scoped_server(
+        token: ServeToken,
+        models_dir: PathBuf,
+        state_path: &std::path::Path,
+    ) -> Arc<ServerState> {
+        ServerState::with_auth(
+            models_dir,
+            None,
+            None,
+            Some(token),
+            Vec::new(),
+            Some(state_path.to_path_buf()),
+        )
+    }
+
+    /// The declared routes a read-scoped token must be refused on: every
+    /// `api_v1_routes()` entry whose method is not safe, minus the webhook
+    /// ingress, which is Bearer-exempt (it carries its own HMAC) and has its
+    /// own test below.
+    ///
+    /// The safe/unsafe split calls [`is_safe_method`] — the production
+    /// predicate — rather than restating the method list, so a test can never
+    /// pass by agreeing with a copy of the rule instead of the rule.
+    fn declared_mutating_routes() -> Vec<String> {
+        api_v1_routes()
+            .into_iter()
+            .filter(|entry| {
+                let (method, _) = entry.split_once(' ').expect("entries are 'METHOD /path'");
+                let method = Method::from_bytes(method.as_bytes()).expect("declared method");
+                !is_safe_method(&method)
+            })
+            .filter(|entry| entry != "POST /api/v1/hooks/trigger/{pipeline}")
+            .collect()
+    }
+
+    /// **Bar item 1.** A read-scoped token is refused `403` on every mutating
+    /// route the router serves, and is refused *before* any side effect: no
+    /// job record is persisted and the mutation permit is never taken.
+    ///
+    /// Honest scope of the enumeration: axum's `Router` exposes no route
+    /// iterator, so this walks the hand-maintained `api_v1_routes()` table,
+    /// not the router itself. Two other tests close the two directions that
+    /// leaves open:
+    ///
+    /// - table → router: `every_declared_route_is_registered_on_the_router`
+    ///   proves each declared entry is really served.
+    /// - router → table: `router_registers_no_undeclared_mutating_route`
+    ///   (below) proves no mutating registration exists that this table
+    ///   does not list.
+    ///
+    /// And the guarantee itself does not rest on any of the three: the
+    /// middleware refuses on the HTTP **method**, before routing, without
+    /// consulting the path. These tests are evidence, not the mechanism.
+    #[tokio::test]
+    async fn read_scoped_token_is_forbidden_on_every_declared_mutating_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = pinned_state_path(&models_dir);
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        let state = pinned_scoped_server(ServeToken::read_only("s3cret"), models_dir, &state_path);
+        let base = spawn_router(state.clone()).await;
+        let client = reqwest::Client::new();
+
+        let mutating = declared_mutating_routes();
+        assert!(
+            mutating.len() >= 4,
+            "the mutating surface should not have silently emptied; got {mutating:?}"
+        );
+
+        for entry in &mutating {
+            let (method, path) = entry.split_once(' ').expect("entries are 'METHOD /path'");
+            let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+            let resp = client
+                .request(method, probe_url(&base, path))
+                .bearer_auth("s3cret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                403,
+                "{entry}: a read-scoped token must never reach a mutating route"
+            );
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(
+                body.code, "forbidden_read_only_token",
+                "{entry}: refusal must carry the scope envelope, not some other error"
+            );
+            assert!(body.remediation_hint.is_some(), "{entry}");
+        }
+
+        // Refused at a seam upstream of the handler, not merely answered 403:
+        // no permit was taken and nothing was persisted. Without this the test
+        // would still pass if a job were submitted and *then* rejected.
+        assert_eq!(
+            state.mutation_permit.running_job(),
+            None,
+            "a refused request must not have taken the mutation permit"
+        );
+        let store = rocky_core::state::StateStore::open(&state_path).unwrap();
+        assert!(
+            store.list_jobs().unwrap().is_empty(),
+            "a refused request must not have persisted a job record"
+        );
+    }
+
+    /// **Bar item 1, router→table direction.** No mutating route may be
+    /// registered on `router()` without appearing in `api_v1_routes()` — the
+    /// table the test above enumerates.
+    ///
+    /// This is a **source-text guard, not a programmatic enumeration**: axum's
+    /// `Router` has no public route iterator, so the honest thing to say is
+    /// that this reads `router()`'s own source and counts. It fails when a new
+    /// `post`/`put`/`patch`/`delete` registration lands without a matching
+    /// declared entry, which is exactly "a new non-safe-method route appeared
+    /// without being considered".
+    ///
+    /// It is deliberately count-based rather than a path parser: rustfmt is
+    /// free to reflow `.route("...", post(handler))` across lines, which would
+    /// break literal extraction, but not the count. The guard is kept honest
+    /// from the other side by refusing the router-builder forms that could
+    /// register a mutating method without one of those four words appearing.
+    #[test]
+    fn router_registers_no_undeclared_mutating_route() {
+        let source = include_str!("api.rs");
+        let start = source
+            .find("pub fn router(state: Arc<ServerState>) -> Router {")
+            .expect("router() must be findable by its exact signature");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("router() must end at column 0");
+        // Comment lines are stripped so prose mentioning a verb can't inflate
+        // the count — the count must reflect code.
+        let body: String = body[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Forms this counter cannot classify. Each could mount a mutating
+        // method invisibly, so their presence fails the test rather than
+        // silently weakening it — someone must come here and decide.
+        for form in [
+            ".nest(",
+            ".nest_service(",
+            ".merge(",
+            ".route_service(",
+            ".fallback_service(",
+            ".any(",
+            ".on(",
+            "MethodFilter",
+        ] {
+            assert!(
+                !body.contains(form),
+                "router() uses `{form}`, which this guard cannot classify. \
+                 Either express the route with a plain method combinator, or \
+                 teach this test (and re-check the read-scope enumeration)."
+            );
+        }
+
+        let registered: usize = ["post(", "put(", "patch(", "delete("]
+            .iter()
+            .map(|verb| body.matches(verb).count())
+            .sum();
+
+        // `declared_mutating_routes()` drops the webhook route, which IS a
+        // registered `post(`, so add it back for the comparison.
+        let declared = declared_mutating_routes().len() + 1;
+        assert_eq!(
+            registered, declared,
+            "router() registers {registered} non-safe-method route(s) but \
+             api_v1_routes() declares {declared}. A mutating route that is not \
+             declared is one the read-scope test never probes — add it to \
+             api_v1_routes()."
+        );
+    }
+
+    /// **Bar item 2.** A read-scoped token is *not* a broken token: every
+    /// declared read route still answers normally. The discriminator is the
+    /// same one the auth-wrapping probe uses — a `401` would mean the token
+    /// stopped authenticating, a `403` would mean the scope check over-fired.
+    /// Any other status proves the request reached its handler.
+    #[tokio::test]
+    async fn read_scoped_token_still_serves_every_declared_read_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let state_path = pinned_state_path(&models_dir);
+        drop(rocky_core::state::StateStore::open(&state_path).unwrap());
+        let state = pinned_scoped_server(ServeToken::read_only("s3cret"), models_dir, &state_path);
+        state.recompile().await;
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+
+        for entry in api_v1_routes() {
+            let (method, path) = entry.split_once(' ').expect("entries are 'METHOD /path'");
+            let probe_method = Method::from_bytes(method.as_bytes()).unwrap();
+            if !is_safe_method(&probe_method) {
+                continue;
+            }
+            let resp = client
+                .request(
+                    reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                    probe_url(&base, path),
+                )
+                .bearer_auth("s3cret")
+                .send()
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                401,
+                "{entry}: read scope must still authenticate"
+            );
+            assert_ne!(
+                resp.status(),
+                403,
+                "{entry}: the scope check must not fire on a safe method"
+            );
+        }
+
+        // A concrete 200 with the real body, so "not 401/403" can't be
+        // satisfied by some unrelated failure on every route.
+        let resp = client
+            .get(format!("{base}/api/v1/meta"))
+            .bearer_auth("s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: MetaOutput = resp.json().await.unwrap();
+        assert!(!body.routes.is_empty());
+    }
+
+    /// **Bar item 3.** A full-scope token still reaches the mutating routes —
+    /// the change is opt-in and breaks no existing deployment.
+    ///
+    /// The malformed `X-Rocky-Principal` short-circuits `POST /jobs/*` with a
+    /// `400` *before* the permit, the persist, and the subprocess spawn, so
+    /// this asserts reachability without actually launching Rocky.
+    #[tokio::test]
+    async fn full_scope_token_still_reaches_every_mutating_route() {
+        let state = test_state_with_scoped_token(ServeToken::full("s3cret"));
+        state.recompile().await;
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+
+        for entry in declared_mutating_routes() {
+            let (method, path) = entry.split_once(' ').expect("entries are 'METHOD /path'");
+            let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+            let resp = client
+                .request(method, probe_url(&base, path))
+                .bearer_auth("s3cret")
+                .header("X-Rocky-Principal", "bad/slash")
+                .send()
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                403,
+                "{entry}: a full-scope token must keep reaching mutating routes"
+            );
+            assert_ne!(resp.status(), 401, "{entry}: the token must authenticate");
+        }
+    }
+
+    /// **Bar item 4.** No token configured (the loopback-only default) is
+    /// untouched: a mutating request still succeeds with no `Authorization`
+    /// header at all. A scope only ever restricts a *configured* token.
+    #[tokio::test]
+    async fn no_token_configured_leaves_mutating_routes_open() {
+        let state = test_state();
+        state.recompile().await;
+        let base = spawn_router(state).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(format!("{base}/api/v1/compile"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "loopback-only mode must keep serving mutating routes without a token"
+        );
+    }
+
+    /// **Bar item 5.** The webhook ingress is unaffected by scope. It is
+    /// Bearer-exempt because it authenticates with its own `X-Rocky-Signature`
+    /// HMAC, and the scope check sits *after* that exemption — so a
+    /// read-scoped token must not turn a webhook `POST` into a `403`.
+    ///
+    /// On this webhook-disabled state the handler answers `404
+    /// webhook_disabled`, which is the proof it was reached.
+    #[tokio::test]
+    async fn webhook_ingress_is_unaffected_by_token_scope() {
+        let base = spawn_router(test_state_with_scoped_token(ServeToken::read_only(
+            "s3cret",
+        )))
+        .await;
+        let client = reqwest::Client::new();
+
+        // With the token…
+        let resp = client
+            .post(format!("{base}/api/v1/hooks/trigger/orders"))
+            .bearer_auth("s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "the HMAC-exempt route must reach its handler"
+        );
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "webhook_disabled");
+
+        // …and without it, exactly as before this change.
+        let resp = client
+            .post(format!("{base}/api/v1/hooks/trigger/orders"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: ErrorEnvelope = resp.json().await.unwrap();
+        assert_eq!(body.code, "webhook_disabled");
+    }
+
+    /// **Bar item 6.** Fail-closed on methods nobody enumerated. The refusal
+    /// is an allowlist of three safe methods, so a verb the router does not
+    /// serve, a WebDAV verb, and a bare extension token are all refused —
+    /// refused for being absent from the allowlist, not for being present on
+    /// some list of known-mutating verbs.
+    ///
+    /// `PUT`/`PATCH`/`DELETE` here are the important ones: they match no route,
+    /// so without the scope check they would answer `405`/`404`. Getting `403`
+    /// proves the middleware refused them ahead of the router.
+    #[tokio::test]
+    async fn odd_and_unknown_methods_are_refused_for_a_read_scoped_token() {
+        let base = spawn_router(test_state_with_scoped_token(ServeToken::read_only(
+            "s3cret",
+        )))
+        .await;
+        let client = reqwest::Client::new();
+
+        for verb in ["PUT", "PATCH", "DELETE", "TRACE", "PROPFIND", "FROB", "get"] {
+            let method = reqwest::Method::from_bytes(verb.as_bytes()).unwrap();
+            let resp = client
+                .request(method, format!("{base}/api/v1/meta"))
+                .bearer_auth("s3cret")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                403,
+                "{verb}: an un-enumerated method must be refused, not routed"
+            );
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "forbidden_read_only_token", "{verb}");
+        }
+    }
+
+    /// A wrong token is `401`, never `403`, whatever the configured scope: the
+    /// scope check runs only after authentication succeeds, so the `403` can
+    /// never become an oracle telling an unauthenticated caller which routes
+    /// mutate.
+    #[tokio::test]
+    async fn scope_check_never_precedes_authentication() {
+        let base = spawn_router(test_state_with_scoped_token(ServeToken::read_only(
+            "s3cret",
+        )))
+        .await;
+        let client = reqwest::Client::new();
+
+        for (label, req) in [
+            ("no token", client.post(format!("{base}/api/v1/jobs/run"))),
+            (
+                "wrong token",
+                client
+                    .post(format!("{base}/api/v1/jobs/run"))
+                    .bearer_auth("wrong"),
+            ),
+        ] {
+            let resp = req.send().await.unwrap();
+            assert_eq!(resp.status(), 401, "{label}: must be 401, not 403");
+            let body: ErrorEnvelope = resp.json().await.unwrap();
+            assert_eq!(body.code, "unauthorized", "{label}");
+        }
+    }
+
+    /// The exempt path set bypasses the scope check as well as the token (it
+    /// returns first), so it must stay safe-method-only. `/api/v1/health`
+    /// serves `GET` alone, so a `POST` to it reaches the router's `405` — it
+    /// never reaches a handler that could mutate. This pins that: a mutating
+    /// handler mounted on an exempt path would answer 2xx here.
+    #[tokio::test]
+    async fn exempt_paths_expose_no_mutating_handler() {
+        let base = spawn_router(test_state_with_scoped_token(ServeToken::read_only(
+            "s3cret",
+        )))
+        .await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/api/v1/health"))
+            .bearer_auth("s3cret")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            405,
+            "an auth-exempt path must serve no mutating method — it bypasses \
+             the scope check too"
         );
     }
 

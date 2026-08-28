@@ -399,6 +399,102 @@ mod tests {
         ));
     }
 
+    /// The safe-method allowlist, stated as an allowlist: three methods pass,
+    /// and everything else — mutating verbs, RFC-safe-but-unrouted `TRACE`,
+    /// a WebDAV verb, a bare extension token, and a lowercase `get` (HTTP
+    /// methods are case-sensitive) — does not. The failures matter more than
+    /// the passes: they are what "fail-closed on an unknown method" means.
+    #[test]
+    fn safe_methods_are_an_allowlist_not_a_denylist() {
+        for m in [Method::GET, Method::HEAD, Method::OPTIONS] {
+            assert!(is_safe_method(&m), "{m} is a safe method");
+        }
+        for m in [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::TRACE,
+            Method::CONNECT,
+        ] {
+            assert!(!is_safe_method(&m), "{m} must not pass a read-only scope");
+        }
+        for raw in [b"PROPFIND".as_slice(), b"FROB", b"get", b"Get", b"MKCOL"] {
+            let m = Method::from_bytes(raw).unwrap();
+            assert!(
+                !is_safe_method(&m),
+                "{m}: a method nobody enumerated must be refused, not permitted"
+            );
+        }
+    }
+
+    /// Scope parsing is exact and fails closed. `--token-scope` is validated by
+    /// clap, but `ROCKY_SERVE_TOKEN_SCOPE` is not — a typo there must be an
+    /// error, never a quiet fall back to `Full`.
+    #[test]
+    fn token_scope_parses_exactly_two_spellings() {
+        assert_eq!("full".parse::<TokenScope>().unwrap(), TokenScope::Full);
+        assert_eq!(
+            "read-only".parse::<TokenScope>().unwrap(),
+            TokenScope::ReadOnly
+        );
+        for bad in ["readonly", "read_only", "Read-Only", "FULL", "", "ro"] {
+            assert!(
+                bad.parse::<TokenScope>().is_err(),
+                "`{bad}` must not resolve to a scope"
+            );
+        }
+        // Every spelling the CLI advertises must actually parse.
+        for name in TokenScope::VALUE_NAMES {
+            assert!(name.parse::<TokenScope>().is_ok(), "{name}");
+        }
+    }
+
+    /// The historical behaviour is the default: a token with no scope named is
+    /// a full-scope token, so existing deployments are unchanged.
+    #[test]
+    fn default_scope_is_full() {
+        assert_eq!(TokenScope::default(), TokenScope::Full);
+        assert_eq!(ServeToken::full("s").scope, TokenScope::Full);
+        assert_eq!(ServeToken::read_only("s").scope, TokenScope::ReadOnly);
+    }
+
+    /// `ServeToken`'s hand-written `Debug` must never print the secret — it is
+    /// one `tracing::debug!` away from a log file otherwise.
+    #[test]
+    fn serve_token_debug_redacts_the_secret() {
+        let rendered = format!("{:?}", ServeToken::read_only("hunter2"));
+        assert!(!rendered.contains("hunter2"), "secret leaked: {rendered}");
+        assert!(rendered.contains("ReadOnly"), "scope should be visible");
+    }
+
+    /// The `403` body carries the same `{code, message, remediation_hint}`
+    /// envelope every other error on this API uses.
+    #[tokio::test]
+    async fn forbidden_response_carries_the_error_envelope() {
+        let resp = forbidden_read_only_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // A rejected credential earns a challenge; an accepted-but-insufficient
+        // one does not — re-sending the same token cannot help.
+        assert!(resp.headers().get(header::WWW_AUTHENTICATE).is_none());
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "forbidden_read_only_token");
+        assert!(body["message"].is_string());
+        assert!(body["remediation_hint"].is_string());
+    }
+
+    /// The auth-exempt set bypasses the scope check as well as the token,
+    /// because the exemption returns before either runs. Nothing enforces that
+    /// its entries are read-only — so pin the set itself: it must stay at the
+    /// liveness probe, and the one prefix exemption must stay the HMAC-authed
+    /// webhook. A new entry here is a decision, not a detail.
+    #[test]
+    fn auth_exempt_set_is_pinned() {
+        assert_eq!(AUTH_EXEMPT_PATHS, &["/api/v1/health"]);
+        assert_eq!(WEBHOOK_TRIGGER_PREFIX, "/api/v1/hooks/trigger/");
+    }
+
     #[test]
     fn constant_time_eq_matches_strings() {
         assert!(constant_time_eq(b"hello", b"hello"));

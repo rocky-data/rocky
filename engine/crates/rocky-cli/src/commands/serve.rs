@@ -222,7 +222,16 @@ fn resolve_serve_token(
         Some(raw) => Some(raw.parse::<TokenScope>()?),
         None => None,
     };
+    pair_token_with_scope(secret, scope)
+}
 
+/// The decision half of [`resolve_serve_token`], with the environment read
+/// already done. Split out so its four cases are testable without mutating
+/// process-global env vars from a parallel test binary.
+fn pair_token_with_scope(
+    secret: Option<String>,
+    scope: Option<TokenScope>,
+) -> Result<Option<ServeToken>> {
     match (secret, scope) {
         (Some(secret), scope) => Ok(Some(ServeToken {
             secret,
@@ -232,7 +241,7 @@ fn resolve_serve_token(
         (None, Some(_)) => anyhow::bail!(
             "--token-scope (or ROCKY_SERVE_TOKEN_SCOPE) was set but no token was. \
              A scope only restricts a configured token. Pass --token <secret> \
-             (or set ROCKY_SERVE_TOKEN), or drop the scope."
+             (or set ROCKY_SERVE_TOKEN), or bind to 127.0.0.1 and drop the scope."
         ),
         (None, None) => Ok(None),
     }
@@ -260,5 +269,56 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A token with no scope named keeps the historical behaviour.
+    #[test]
+    fn a_token_without_a_scope_is_full() {
+        let token = pair_token_with_scope(Some("s3cret".into()), None)
+            .unwrap()
+            .expect("a secret yields a token");
+        assert_eq!(token.secret, "s3cret");
+        assert_eq!(token.scope, TokenScope::Full);
+    }
+
+    #[test]
+    fn a_named_scope_is_carried_onto_the_token() {
+        let token = pair_token_with_scope(Some("s3cret".into()), Some(TokenScope::ReadOnly))
+            .unwrap()
+            .expect("a secret yields a token");
+        assert_eq!(token.scope, TokenScope::ReadOnly);
+    }
+
+    /// A scope with no token is refused, not ignored. Accepting it would leave
+    /// the server fully mutable while looking configured — the operator asked
+    /// to restrict something and would get no restriction and no warning.
+    #[test]
+    fn a_scope_without_a_token_is_an_error() {
+        let err = pair_token_with_scope(None, Some(TokenScope::ReadOnly))
+            .expect_err("a scope with no token must not be silently dropped");
+        let msg = err.to_string();
+        assert!(msg.contains("--token-scope"), "{msg}");
+        assert!(msg.contains("ROCKY_SERVE_TOKEN_SCOPE"), "{msg}");
+    }
+
+    /// Neither set → loopback-only mode, exactly as before.
+    #[test]
+    fn neither_token_nor_scope_is_no_auth() {
+        assert!(pair_token_with_scope(None, None).unwrap().is_none());
+    }
+
+    /// An unparseable scope is an error rather than a fall back to `Full`.
+    /// This is the case that matters on the env path: clap validates the flag,
+    /// nothing validates `ROCKY_SERVE_TOKEN_SCOPE`.
+    #[test]
+    fn an_unparseable_scope_is_an_error() {
+        let err = resolve_serve_token(Some("s3cret".into()), Some("readonly".into()))
+            .expect_err("a typo must not resolve to a full-scope token");
+        assert!(err.to_string().contains("unknown token scope"), "{err}");
     }
 }
