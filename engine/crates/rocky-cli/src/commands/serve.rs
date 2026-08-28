@@ -82,7 +82,10 @@ pub async fn run_serve(
 ) -> Result<()> {
     // Token resolution: --token takes precedence over the env var so
     // CI / scripts can override an inherited environment.
-    let secret = auth_token.or_else(|| std::env::var("ROCKY_SERVE_TOKEN").ok());
+    let secret = match auth_token {
+        Some(t) => Some(t),
+        None => env_var_fail_closed("ROCKY_SERVE_TOKEN")?,
+    };
     let token = resolve_serve_token(secret, token_scope)?;
 
     // The config file the scheduler reads (falls back to the conventional
@@ -206,6 +209,30 @@ pub async fn run_serve(
     result
 }
 
+/// Read `name` from the environment, treating a value that is *set but not
+/// valid Unicode* as an error rather than as absent.
+///
+/// The obvious spelling — `std::env::var(name).ok()` — collapses
+/// `NotPresent` and `NotUnicode` into `None`, and both of this command's
+/// security-relevant env vars fail **open** on that collapse: a mangled
+/// `ROCKY_SERVE_TOKEN` would serve with no auth at all on a loopback bind,
+/// and a mangled `ROCKY_SERVE_TOKEN_SCOPE` would silently grant `Full`. In
+/// both cases the operator set the variable and gets less protection than
+/// they asked for, with no diagnostic. Refusing to start is the only honest
+/// answer: the variable is set, and Rocky cannot tell what it says.
+fn env_var_fail_closed(name: &str) -> Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(v) => Ok(Some(v)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!(
+            "{name} is set but is not valid Unicode, so Rocky cannot read it. \
+             Refusing to start rather than silently ignoring it — an ignored \
+             {name} is less protection than you configured. Fix the value or \
+             unset it."
+        ),
+    }
+}
+
 /// Pair the resolved Bearer secret with its [`TokenScope`].
 ///
 /// Mirrors the secret's own resolution order — flag, then env var, then a
@@ -224,7 +251,11 @@ fn resolve_serve_token(
     secret: Option<String>,
     token_scope: Option<String>,
 ) -> Result<Option<ServeToken>> {
-    let scope = match token_scope.or_else(|| std::env::var("ROCKY_SERVE_TOKEN_SCOPE").ok()) {
+    let raw = match token_scope {
+        Some(v) => Some(v),
+        None => env_var_fail_closed("ROCKY_SERVE_TOKEN_SCOPE")?,
+    };
+    let scope = match raw {
         Some(raw) => Some(raw.parse::<TokenScope>()?),
         None => None,
     };
@@ -316,6 +347,41 @@ mod tests {
     #[test]
     fn neither_token_nor_scope_is_no_auth() {
         assert!(pair_token_with_scope(None, None).unwrap().is_none());
+    }
+
+    /// A set-but-unreadable env var must be an error, not silence. This is the
+    /// difference between `std::env::var(..).ok()` (fail open — the operator's
+    /// token or scope is discarded without a word) and refusing to start.
+    ///
+    /// The env var is set and restored inside one test, and the assertions do
+    /// not depend on any other variable, so a parallel test binary is unharmed.
+    #[test]
+    fn a_set_but_unreadable_env_var_refuses_to_start() {
+        use std::ffi::OsString;
+        #[cfg(unix)]
+        use std::os::unix::ffi::OsStringExt;
+
+        // A lone 0x80 byte is not valid UTF-8, so `env::var` reports
+        // `NotUnicode` rather than `NotPresent`.
+        #[cfg(unix)]
+        {
+            let name = "ROCKY_TEST_NOT_UNICODE_PROBE";
+            // SAFETY: single-threaded test body; the variable is unique to this
+            // test and removed before it returns.
+            unsafe { std::env::set_var(name, OsString::from_vec(vec![0x80])) };
+            let result = env_var_fail_closed(name);
+            unsafe { std::env::remove_var(name) };
+
+            let err = result.expect_err("an unreadable value must not read as unset");
+            assert!(err.to_string().contains("not valid Unicode"), "{err}");
+        }
+
+        // An absent variable is still simply absent.
+        assert!(
+            env_var_fail_closed("ROCKY_TEST_DEFINITELY_UNSET_PROBE")
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// An unparseable scope is an error rather than a fall back to `Full`.
