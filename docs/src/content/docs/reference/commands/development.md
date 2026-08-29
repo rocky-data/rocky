@@ -234,7 +234,7 @@ read-only token
   └─ POST /api/v1/compile    → 403 forbidden_read_only_token
 ```
 
-The check reads the HTTP method, not a list of paths, so any route Rocky adds later is refused too. Two things it does not touch: `GET /api/v1/health` stays open, and the webhook route `POST /api/v1/hooks/trigger/{pipeline}` keeps its own HMAC check.
+The check reads the HTTP method, not a list of paths, so a route added later with a mutating method is refused the moment it exists. Two limits are worth knowing: the check classifies the METHOD, not the handler, so a `GET` that mutates would pass; and it only covers routes registered inside the authenticated router, not one added after that layer. Two things it does not touch: `GET /api/v1/health` stays open, and the webhook route `POST /api/v1/hooks/trigger/{pipeline}` keeps its own HMAC check.
 
 The second one has an edge. With `--scheduler`, on a loopback bind, and no `ROCKY_WEBHOOK_SECRET`, the webhook route accepts an unsigned `POST` and queues work for the scheduler. No token is involved, so a read-only token does not stop it. Set `ROCKY_WEBHOOK_SECRET` whenever a browser or an untrusted process can reach the server.
 

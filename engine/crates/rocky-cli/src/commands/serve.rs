@@ -80,50 +80,32 @@ pub async fn run_serve(
     drain_timeout_seconds: Option<u64>,
     state_path: Option<&Path>,
 ) -> Result<()> {
-    // Token resolution: --token takes precedence over the env var so
-    // CI / scripts can override an inherited environment.
-    let secret = match auth_token {
-        Some(t) => Some(t),
-        None => env_var_fail_closed("ROCKY_SERVE_TOKEN")?,
-    };
-    let token = resolve_serve_token(secret, token_scope)?;
-
-    // The config file the scheduler reads (falls back to the conventional
-    // `rocky.toml`); the webhook spool is anchored under its `.rocky` directory,
-    // so the accept path and the reconciler agree on one spool.
+    // The whole flags -> token -> ServerState segment lives in
+    // `build_serve_state` so a test can cross the SAME code production runs.
+    // Previously the wire test called `resolve_serve_token` and then built its
+    // own `ServerState`, which left this handoff unobserved: replacing the
+    // token with `ServeToken::full(t.secret)` right here survived the entire
+    // suite (the helper tests still saw `ReadOnly`, the router tests still
+    // built read-only tokens by hand, and production always installed `Full`).
+    // Also needed below by the scheduler; `build_serve_state` derives its own
+    // copy for the webhook spool. Same expression, deliberately — see the
+    // note on `rocky_dir_for_config`.
     let resolved_config = config_path
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("rocky.toml"));
 
-    // Webhook ingress is live only alongside a resident reconciler (`--scheduler`)
-    // — nothing else would consume a spooled demand. The secret comes from
-    // `ROCKY_WEBHOOK_SECRET`; without one the route stays dark unless the bind is
-    // loopback (dev convenience).
-    let webhook = if scheduler {
-        Some(rocky_server::webhook_ingress::WebhookIngress {
-            secret: std::env::var("ROCKY_WEBHOOK_SECRET")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            bind_is_loopback: crate::api::is_loopback(&host),
-            rocky_dir: crate::commands::scheduler::rocky_dir_for_config(&resolved_config),
-            rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(
-                WEBHOOK_RATE_LIMIT_RPS,
-            ),
-        })
-    } else {
-        None
-    };
-
-    let state = rocky_server::state::ServerState::with_auth_and_webhook(
-        models_dir.to_path_buf(),
+    let state = build_serve_state(
+        models_dir,
         models_dir_is_explicit,
-        contracts_dir.map(std::path::Path::to_path_buf),
-        config_path.map(std::path::Path::to_path_buf),
-        token,
+        contracts_dir,
+        config_path,
+        &host,
+        auth_token,
+        token_scope,
         allowed_origins,
-        state_path.map(std::path::Path::to_path_buf),
-        webhook,
-    );
+        scheduler,
+        state_path,
+    )?;
 
     // Start filesystem watcher if requested
     let _watcher = if watch {
@@ -216,10 +198,43 @@ pub async fn run_serve(
 /// `NotPresent` and `NotUnicode` into `None`, and both of this command's
 /// security-relevant env vars fail **open** on that collapse: a mangled
 /// `ROCKY_SERVE_TOKEN` would serve with no auth at all on a loopback bind,
-/// and a mangled `ROCKY_SERVE_TOKEN_SCOPE` would silently grant `Full`. In
+/// a mangled `ROCKY_SERVE_TOKEN_SCOPE` would silently grant `Full`, and a
+/// mangled `ROCKY_WEBHOOK_SECRET` would re-open the unsigned-webhook path. In
 /// both cases the operator set the variable and gets less protection than
 /// they asked for, with no diagnostic. Refusing to start is the only honest
 /// answer: the variable is set, and Rocky cannot tell what it says.
+/// `ROCKY_WEBHOOK_SECRET`, refusing every value that cannot authenticate.
+///
+/// Separate from [`env_var_fail_closed`] only because an empty secret is a
+/// distinct error worth its own message: unlike a bearer token, an empty HMAC
+/// key silently re-opens the unsigned-webhook path on a loopback bind.
+fn webhook_secret_fail_closed() -> Result<Option<String>> {
+    match env_var_fail_closed("ROCKY_WEBHOOK_SECRET")? {
+        Some(s) if s.trim().is_empty() => anyhow::bail!(
+            "ROCKY_WEBHOOK_SECRET is set but empty, so it cannot sign or verify \
+             anything. Refusing to start: on a loopback bind an absent secret \
+             makes the webhook accept UNSIGNED requests, which is not what \
+             setting the variable asked for. Give it a value or unset it."
+        ),
+        other => Ok(other),
+    }
+}
+
+/// A bearer secret that is present but blank cannot authenticate anyone, and
+/// the non-loopback startup gate only asks whether auth is `None` — so an
+/// empty token would start a public-bound server holding a zero-length
+/// full-scope credential. Refused here instead.
+fn reject_blank_secret(name: &str, secret: Option<String>) -> Result<Option<String>> {
+    match secret {
+        Some(s) if s.trim().is_empty() => anyhow::bail!(
+            "{name} is set but empty, so it cannot authenticate a request. \
+             Refusing to start rather than serving with a zero-length \
+             credential. Give it a value or unset it."
+        ),
+        other => Ok(other),
+    }
+}
+
 fn env_var_fail_closed(name: &str) -> Result<Option<String>> {
     match std::env::var(name) {
         Ok(v) => Ok(Some(v)),
@@ -307,6 +322,86 @@ async fn wait_for_shutdown() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// Everything between the raw CLI flags and the live [`ServerState`]: token
+/// resolution, scope pairing, webhook wiring, state construction.
+///
+/// Extracted so the producer-to-consumer test can call the SAME function
+/// `run_serve` calls. A test that resolves a token and then constructs its own
+/// state proves only that the helper works — it cannot see a regression in the
+/// handoff between them, which is exactly where a `ServeToken::full(..)` slip
+/// would live.
+#[allow(clippy::too_many_arguments)]
+fn build_serve_state(
+    models_dir: &Path,
+    models_dir_is_explicit: bool,
+    contracts_dir: Option<&Path>,
+    config_path: Option<&Path>,
+    host: &str,
+    auth_token: Option<String>,
+    token_scope: Option<String>,
+    allowed_origins: Vec<String>,
+    scheduler: bool,
+    state_path: Option<&Path>,
+) -> Result<std::sync::Arc<rocky_server::state::ServerState>> {
+    // Token resolution: --token takes precedence over the env var so
+    // CI / scripts can override an inherited environment.
+    let secret = match auth_token {
+        Some(t) => Some(t),
+        None => env_var_fail_closed("ROCKY_SERVE_TOKEN")?,
+    };
+    // Blank from either source — the flag or the env var — is refused.
+    let secret = reject_blank_secret("ROCKY_SERVE_TOKEN", secret)?;
+    let token = resolve_serve_token(secret, token_scope)?;
+
+    // The config file the scheduler reads (falls back to the conventional
+    // `rocky.toml`); the webhook spool is anchored under its `.rocky` directory,
+    // so the accept path and the reconciler agree on one spool.
+    let resolved_config = config_path
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("rocky.toml"));
+
+    // Webhook ingress is live only alongside a resident reconciler (`--scheduler`)
+    // — nothing else would consume a spooled demand. The secret comes from
+    // `ROCKY_WEBHOOK_SECRET`; without one the route stays dark unless the bind is
+    // loopback (dev convenience).
+    let webhook = if scheduler {
+        Some(rocky_server::webhook_ingress::WebhookIngress {
+            // THE THIRD ALIGNED READ. `ROCKY_SERVE_TOKEN` and
+            // `ROCKY_SERVE_TOKEN_SCOPE` were made fail-closed and this one was
+            // left on `.ok()` — the read with the WORST consequence of the
+            // three. A mangled secret collapsed to `None` means "no secret
+            // configured", and on a loopback bind that is the documented
+            // dev-convenience path: the webhook accepts an UNSIGNED POST,
+            // spools a demand, and the resident scheduler runs it. The
+            // operator set the variable and got no HMAC at all.
+            //
+            // An EMPTY value is refused for the same reason rather than
+            // filtered to `None`: "" is a configured secret that cannot
+            // authenticate anything, so treating it as absent silently opens
+            // the same path.
+            secret: webhook_secret_fail_closed()?,
+            bind_is_loopback: crate::api::is_loopback(&host),
+            rocky_dir: crate::commands::scheduler::rocky_dir_for_config(&resolved_config),
+            rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(
+                WEBHOOK_RATE_LIMIT_RPS,
+            ),
+        })
+    } else {
+        None
+    };
+
+    Ok(rocky_server::state::ServerState::with_auth_and_webhook(
+        models_dir.to_path_buf(),
+        models_dir_is_explicit,
+        contracts_dir.map(std::path::Path::to_path_buf),
+        config_path.map(std::path::Path::to_path_buf),
+        token,
+        allowed_origins,
+        state_path.map(std::path::Path::to_path_buf),
+        webhook,
+    ))
 }
 
 #[cfg(test)]
@@ -403,8 +498,6 @@ mod tests {
     /// `200` on `GET /api/v1/meta`.
     #[tokio::test]
     async fn the_raw_flag_value_reaches_the_state_the_middleware_reads() {
-        use rocky_server::state::ServerState;
-
         let models = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../rocky-compiler/tests/fixtures/simple_project/models");
 
@@ -414,11 +507,25 @@ mod tests {
             // No scope named at all → the historical full-scope token.
             (None, TokenScope::Full),
         ] {
-            let token = resolve_serve_token(Some("s3cret".to_string()), raw.clone())
-                .unwrap()
-                .expect("a secret always yields a token");
-            let state =
-                ServerState::with_auth(models.clone(), None, None, Some(token), Vec::new(), None);
+            // Crosses `build_serve_state` — the SAME function `run_serve`
+            // calls — rather than resolving a token and hand-building a
+            // state. That is the difference between proving the helper works
+            // and proving the handoff does: replacing the token with
+            // `ServeToken::full(..)` between resolution and state
+            // construction survived the old shape of this test.
+            let state = build_serve_state(
+                &models,
+                false,
+                None,
+                None,
+                "127.0.0.1",
+                Some("s3cret".to_string()),
+                raw.clone(),
+                Vec::new(),
+                false,
+                None,
+            )
+            .expect("a well-formed scope builds a state");
             let installed = state.auth.as_ref().expect("the token reached the state");
             assert_eq!(
                 installed.scope, expected,

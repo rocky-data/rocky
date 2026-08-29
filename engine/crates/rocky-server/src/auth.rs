@@ -169,9 +169,15 @@ impl std::fmt::Debug for ServeToken {
 ///    whether one is opened. So `open_read_only` commits a write transaction
 ///    too, and every `GET` that reads the state store does likewise.
 ///
-///    What that does and does not mean:
-///    - It is NOT a warehouse mutation and NOT a semantic state change. The
-///      committed bytes are the epoch-0 table/version baseline.
+///    What that does and does not mean — stated more carefully than the
+///    first correction, which was itself too categorical:
+///    - It is NOT a warehouse mutation and NOT a logical-record change. No
+///      run, plan, product or history row is created or altered.
+///    - It CAN change the database layout. Read-only mode skips the version
+///      stamp, but it still opens every table eagerly, so against an older
+///      store missing a newer table a `GET` durably creates that table while
+///      leaving the version stamp untouched. Calling that "no semantic state
+///      change" was an over-claim in the other direction.
 ///    - It IS a write transaction, so a read-scoped `GET` serializes against
 ///      real writers. Polled by a browser, that is a contention surface.
 ///    - It is PRE-EXISTING `serve` behaviour, not introduced by the token

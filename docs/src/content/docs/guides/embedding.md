@@ -128,7 +128,7 @@ Run `rocky serve` next to your application as a single-tenant sidecar. It is not
 
 **Binding.** The server binds to `127.0.0.1:8080` by default, loopback only. It refuses to bind a non-loopback host such as `0.0.0.0` unless you also configure a bearer token. An unauthenticated API therefore cannot leak model SQL and run history onto the network by accident.
 
-**Authentication.** Auth is one optional shared-secret bearer token, passed with `--token` or the `ROCKY_SERVE_TOKEN` environment variable. When you set a token, every route except `GET /api/v1/health` requires it. This is a single secret, not a user system.
+**Authentication.** Auth is one optional shared-secret bearer token, passed with `--token` or the `ROCKY_SERVE_TOKEN` environment variable. When you set a token, every route requires it except two: `GET /api/v1/health`, and the webhook `POST /api/v1/hooks/trigger/{pipeline}` — the webhook is bearer-exempt because it authenticates with its own HMAC over the raw body. This is a single secret, not a user system.
 
 **Token scope.** A token reaches every route by default. `--token-scope read-only` (or `ROCKY_SERVE_TOKEN_SCOPE`) narrows it to `GET`, `HEAD`, and `OPTIONS`; every other method gets `403 forbidden_read_only_token`. Hand that token to anything you do not fully trust with a warehouse write — a browser UI above all, where a leaked token would otherwise reach `POST /api/v1/jobs/run`. The rule is the HTTP method, not a list of paths, so routes added in future are covered as well.
 
