@@ -382,7 +382,7 @@ fn build_serve_state(
             // authenticate anything, so treating it as absent silently opens
             // the same path.
             secret: webhook_secret_fail_closed()?,
-            bind_is_loopback: crate::api::is_loopback(&host),
+            bind_is_loopback: crate::api::is_loopback(host),
             rocky_dir: crate::commands::scheduler::rocky_dir_for_config(&resolved_config),
             rate_limiter: rocky_server::webhook_ingress::WebhookRateLimiter::new(
                 WEBHOOK_RATE_LIMIT_RPS,
