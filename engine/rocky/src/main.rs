@@ -857,8 +857,13 @@ enum Command {
         /// Run all pipelines as a unified DAG, in dependency order.
         /// Each pipeline is a node; cross-pipeline `depends_on` edges define
         /// execution order. Layers run in parallel.
+        ///
+        /// Incompatible with `--resume` / `--resume-latest`, rejected at parse
+        /// time: a persisted `RunPlan` carrying both never replays the resume
+        /// into its DAG sub-runs (see the `run_plan.dag` arm in `apply.rs`), so
+        /// the plan would apply as a fresh run of every pipeline.
         /// Applies to the default plan subcommand only.
-        #[arg(long, global = false)]
+        #[arg(long, conflicts_with_all = ["resume", "resume_latest"], global = false)]
         dag: bool,
 
         /// Caller-supplied opaque key used to dedup this run against prior
@@ -1020,7 +1025,14 @@ enum Command {
         /// Run all pipelines as a unified DAG, in dependency order.
         /// Each pipeline is a node; cross-pipeline `depends_on` edges define
         /// execution order. Layers run in parallel.
-        #[arg(long)]
+        ///
+        /// Incompatible with `--resume` / `--resume-latest`, rejected at parse
+        /// time. `run_with_dag` takes no resume arguments and its sub-runner
+        /// passes `None` for both, so the combination used to run every
+        /// pipeline FRESH while reporting success — the #1543 fail-open shape,
+        /// on the widest-blast-radius path. Same reasoning as the `--var` and
+        /// `--models` bails below; `--watch` already names both flags.
+        #[arg(long, conflicts_with_all = ["resume", "resume_latest"])]
         dag: bool,
 
         /// Caller-supplied opaque key used to dedup this run against prior
@@ -4988,6 +5000,61 @@ mod tests {
                 .join()
                 .expect("parser thread panicked")
         })
+    }
+
+    /// `--dag` drops the resume flags on the floor: `run_with_dag` takes no
+    /// resume arguments and `default_sub_runner` passes `None` / `false` for
+    /// both, so `rocky run --dag --resume-latest` used to exit 0 having rebuilt
+    /// every pipeline from scratch — #1543's fail-open shape on the widest
+    /// path. Both spellings, on both `run` and `plan`, must now fail at parse
+    /// time; `--dag` on its own still parses.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
+    fn dag_conflicts_with_the_resume_flags() {
+        for conflicting in [
+            vec!["rocky", "run", "--dag", "--resume-latest"],
+            vec!["rocky", "run", "--dag", "--resume", "run-1"],
+            vec!["rocky", "plan", "--dag", "--resume-latest"],
+            vec!["rocky", "plan", "--dag", "--resume", "run-1"],
+        ] {
+            let parsed = std::thread::scope(|s| {
+                let owned: Vec<String> = conflicting.iter().map(ToString::to_string).collect();
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn_scoped(s, move || Cli::try_parse_from(&owned).is_ok())
+                    .expect("spawn parser thread")
+                    .join()
+                    .expect("parser thread panicked")
+            });
+            assert!(!parsed, "{conflicting:?} must be a clap conflict");
+        }
+
+        // Positive control: the conflict must not have made `--dag` itself
+        // unusable, and a resume without `--dag` still parses.
+        let cli = try_parse_with_big_stack(&["rocky", "run", "--dag"]);
+        let Command::Run {
+            dag,
+            resume,
+            resume_latest,
+            ..
+        } = cli.command
+        else {
+            panic!("expected the run command");
+        };
+        assert!(dag && resume.is_none() && !resume_latest);
+
+        let cli = try_parse_with_big_stack(&["rocky", "run", "--resume-latest"]);
+        let Command::Run {
+            dag, resume_latest, ..
+        } = cli.command
+        else {
+            panic!("expected the run command");
+        };
+        assert!(resume_latest && !dag);
     }
 
     fn parse_run_idempotency_key(args: &[&str]) -> Option<String> {

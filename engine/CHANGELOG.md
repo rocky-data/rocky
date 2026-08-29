@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A resume that cannot resume now stops instead of running everything from scratch.** `rocky run --resume <run-id>` and `rocky run --resume-latest` used to fall back to an ordinary run when the checkpoint was missing or the state store could not be read. A typo, an empty state directory or an expired checkpoint therefore launched a full production run and reported success. Both flags now exit non-zero before anything is discovered or written, and a state-store read error is reported with its cause rather than swallowed. A valid checkpoint that recorded zero completed tables is still a valid resume, and now records its `resumed_from` identity.
+
+  Paths that record no per-table checkpoint used to accept the flags and ignore them. They now refuse: other pipeline types, mixed replication and model runs (`--all` or `--models`), `--model`, and `--dag`. `--dag` and the resume flags are rejected when the command is parsed, on both `rocky run` and `rocky plan`; a plan written by an older binary that carries both is refused at apply time, before the config is loaded.
+
+  With a remote `[state]` backend, a resume now requires an authoritative restore. If the download fails and the run elects past it, the local file may be stale, so recovery refuses rather than skipping tables on state it could not confirm.
+
+  **On upgrade:** this is a behavior change for automation that passes a resume flag unconditionally. A command that used to exit 0 having rebuilt everything now exits non-zero. Starting fresh is still an explicit run with no resume flag. To recover a run that used `--all` or `--dag`, resume the replication pipeline on its own and then rebuild the models. (#1543, contributed in #1544; `--dag` and the plan/apply paths in #1546)
+
 ## [1.72.0] — 2026-08-26
 
 ### Added

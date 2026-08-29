@@ -321,8 +321,8 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Plan both replication and compiled models. |
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with the defaults. Resolved at plan time and stored in the plan. |
-| `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint. Mints a new `run_id` and records the prior one as `resumed_from`. |
-| `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint. Which run that is gets resolved at apply time, not plan time. |
+| `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint. Mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
+| `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint. Which run that is gets resolved at apply time, not plan time. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--shadow` | `bool` | `false` | Write to shadow targets instead of production. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
 | `--shadow-schema <NAME>` | `string` | | Override the schema for shadow tables. Mutually exclusive with `--shadow-suffix`. |
@@ -334,7 +334,7 @@ Rocky records the execution flags in the plan file, so `rocky apply` replays the
 | `--missing` | `bool` | `false` | Plan the partitions missing from the state store, computed from the model's `first_partition` up to now. Errors if `first_partition` is unset. Resolved against the state store at apply time. |
 | `--lookback <N>` | `integer` | | Also recompute the previous N partitions. The flag overrides the model's TOML `lookback`. This is the standard handling for late-arriving data. |
 | `--parallel <N>` | `integer` | `1` | Run N partitions at a time. Warehouse-query parallelism only: state writes serialize through the state store. |
-| `--dag` | `bool` | `false` | Plan all pipelines as one DAG in dependency order. Each pipeline is a node, cross-pipeline `depends_on` edges set the order, and layers run in parallel. |
+| `--dag` | `bool` | `false` | Plan all pipelines as one DAG in dependency order. Each pipeline is a node, cross-pipeline `depends_on` edges set the order, and layers run in parallel. Mutually exclusive with `--resume` / `--resume-latest`: the DAG runner does not consume them, so a plan carrying both would apply as a fresh run of every pipeline. |
 | `--idempotency-key <KEY>` | `string` | `$ROCKY_IDEMPOTENCY_KEY` | Opaque caller-supplied key that dedups this run against prior runs with the same key. Supported on the `local`, `valkey`, and `tiered` state backends; an `s3`-only or `gcs`-only backend errors when the flag is parsed. Keys are stored verbatim, so never put a secret in one. |
 | `--env <NAME>` | `string` | | Scope the governance preview (`mask_actions`) to one environment, so `[mask.<env>]` overrides overlay the workspace `[mask]` defaults. Classification tagging and retention policies are the same in every environment and are previewed regardless. |
 | `--semantic` | `bool` | `false` | Also run the breaking-change classifier against `--base` and attach the change-impact verdict under `breaking_verdict`. Decision-support only — never gates the plan and never changes the exit code. |
@@ -549,8 +549,8 @@ rocky run [flags]
 | `--governance-override <JSON>` | `string` | | Additional governance config as inline JSON or `@file.json`, merged with defaults. |
 | `--models <PATH>` | `PathBuf` | | Models directory for transformation execution. |
 | `--all` | `bool` | `false` | Execute both replication and compiled models. |
-| `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. |
-| `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. |
+| `--resume <RUN_ID>` | `string` | | Resume a specific previous replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
+| `--resume-latest` | `bool` | `false` | Resume the most recent failed replication run from its last checkpoint; mints a new `run_id` and records the prior one as `resumed_from`. Rejected with `--dag`, which does not replay the resume into its sub-runs (rejected at parse time). |
 | `--shadow` | `bool` | `false` | Run in shadow mode: write to shadow targets instead of production. |
 | `--shadow-suffix <SUFFIX>` | `string` | `_rocky_shadow` | Suffix appended to table names in shadow mode. |
 | `--shadow-schema <NAME>` | `string` | | Override schema for shadow tables (mutually exclusive with `--shadow-suffix`). |
