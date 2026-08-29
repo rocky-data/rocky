@@ -157,10 +157,29 @@ impl std::fmt::Debug for ServeToken {
 ///    registration order rule 1, and why
 ///    `every_declared_route_is_auth_wrapped_except_health` probes it.
 /// 2. It classifies the **method**, not the handler. A `GET` handler with a
-///    mutating effect would pass. Audited at the time of writing: no `GET`
-///    handler in `rocky_cli::api` performs a durable or warehouse write — the
-///    only write on a `GET` path is `get_job`'s in-memory job-cache upsert.
-///    Adding a mutating `GET` would break this guarantee silently, so don't.
+///    mutating effect would pass, and one class of write already does.
+///
+///    **Corrected 2026-08-29** — the earlier note here claimed "no `GET`
+///    handler performs a durable write, only `get_job`'s in-memory cache
+///    upsert". That was false, and it was false because the audit read
+///    handler bodies and stopped there. The write is one call deeper:
+///    `StateStore::open_inner` (`rocky-core/src/state.rs`) begins a redb
+///    write transaction and commits it on EVERY open — the `OpenMode`
+///    argument gates the migration/stamp logic *inside* the transaction, not
+///    whether one is opened. So `open_read_only` commits a write transaction
+///    too, and every `GET` that reads the state store does likewise.
+///
+///    What that does and does not mean:
+///    - It is NOT a warehouse mutation and NOT a semantic state change. The
+///      committed bytes are the epoch-0 table/version baseline.
+///    - It IS a write transaction, so a read-scoped `GET` serializes against
+///      real writers. Polled by a browser, that is a contention surface.
+///    - It is PRE-EXISTING `serve` behaviour, not introduced by the token
+///      scope. The scope does not make it worse; the earlier claim simply
+///      described it wrongly.
+///
+///    Tracked as #1545; do not restate the old claim. Adding a genuinely
+///    mutating `GET` would still break this silently, so don't.
 ///
 /// `TRACE` is deliberately absent even though RFC 9110 classifies it as safe:
 /// nothing routes it, and refusing it keeps the cross-site-tracing shape off
