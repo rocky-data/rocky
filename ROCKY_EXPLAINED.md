@@ -363,7 +363,7 @@ A **watermark** is the timestamp of the newest row Rocky has already loaded. It 
 
 Computing the new value from the target, rather than the source, prevents a race. New rows can land in the source while a run is in flight. The target holds only what Rocky actually wrote, so the watermark never moves past unprocessed data.
 
-**run_progress_entries + idempotency_keys** make runs resumable. If a run is interrupted, Rocky can skip the models that already completed. `rocky run --resume-latest` uses this.
+**run_progress_entries + idempotency_keys** make replication runs resumable. If a run is interrupted, Rocky can skip the *tables* that already copied. `rocky run --resume-latest` uses this. Transformation models record no per-table checkpoint, so a run that would execute models — another pipeline type, `--all`, `--models`, `--model`, or `--dag` — refuses the resume flags instead of ignoring them.
 
 ---
 
@@ -1309,7 +1309,7 @@ Resolved tags land on `rocky compile --output json` as `models_detail[].tags`, a
 | See what SQL will run | `rocky plan -c rocky.toml` |
 | Run the pipeline | `rocky run -c rocky.toml` |
 | Run only the sources matching one `key=value` | `rocky run -c rocky.toml --filter source=shopify` |
-| Resume a failed run | `rocky run -c rocky.toml --resume-latest` |
+| Resume a failed replication run | `rocky run -c rocky.toml --resume-latest` |
 | Run a single partition | `rocky run -c rocky.toml --partition 2024-01-15` |
 | Check watermark state | `rocky state -c rocky.toml` |
 | See run history | `rocky history` |

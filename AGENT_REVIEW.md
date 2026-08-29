@@ -132,8 +132,11 @@ it. That is the property to **preserve**, and it means the finding to look for i
 ### Executor (`rocky-core/src/{dag_executor.rs, unified_dag.rs, state.rs}`, `rocky-cli/src/commands/{run.rs, run_content_addressed.rs}`)
 - Execution respects the dependency DAG **topologically**; no node runs before its inputs
   (`rocky-ir/src/dag.rs::topological_sort` / `execution_layers`).
-- **Resume/retry is idempotent.** `rocky run --resume`/`--resume-latest` re-runs from a checkpoint; a
-  retried node must not double-apply an `INSERT`/`MERGE` or corrupt redb state.
+- **Resume/retry is idempotent, and replication-only.** `rocky run --resume`/`--resume-latest` re-runs
+  from a per-table replication checkpoint; a retried node must not double-apply an `INSERT`/`MERGE` or
+  corrupt redb state. Every path that records no such checkpoint refuses the flags rather than running
+  fresh — other pipeline types, `--all`/`--models`, `--model`, `--dag`, and non-authoritative remote
+  state. A resume that silently becomes a fresh run is the #1543 defect, not a convenience.
 - **Incremental-watermark soundness.** The runner reads the prior `MAX(ts)` from the redb state store,
   filters `WHERE ts > <watermark>`, then re-queries source to record the next watermark. For this
   SQL-executed path the **warehouse owns the data-write transaction**; Rocky owns only redb. Scrutinize the
