@@ -105,6 +105,8 @@ async fn drive_run(
     config_path: &Path,
     state_path: &Path,
     assume_fresh_state: bool,
+    resume_run_id: Option<&str>,
+    resume_latest: bool,
 ) -> anyhow::Result<()> {
     // PR-B: `run` executes from the caller's owned fingerprinted snapshot;
     // this driver loads it the way every production entry point does.
@@ -121,9 +123,9 @@ async fn drive_run(
         false, // output_json
         None,  // models_dir
         false, // run_all
-        None,  // resume_run_id
-        false, // resume_latest
-        None,  // shadow_config
+        resume_run_id,
+        resume_latest,
+        None, // shadow_config
         &rocky_cli::commands::PartitionRunOptions::default(),
         None, // model_name_filter
         None, // cache_ttl_override
@@ -157,9 +159,15 @@ async fn ungoverned_download_failure_suppresses_all_uploads() {
 
     harness.faults.arm(FaultOp::Head, FaultMode::FailAll);
 
-    drive_run(&project.config_path, &project.state_path, false)
-        .await
-        .expect("an ungoverned run continues past a failed download (degraded mode)");
+    drive_run(
+        &project.config_path,
+        &project.state_path,
+        false,
+        None,
+        false,
+    )
+    .await
+    .expect("an ungoverned run continues past a failed download (degraded mode)");
 
     harness.faults.clear();
     assert_eq!(
@@ -179,9 +187,15 @@ async fn fresh_start_bootstrap_still_uploads() {
     let harness = CrossPodHarness::new_s3_like();
     let project = TestProject::new().await;
 
-    drive_run(&project.config_path, &project.state_path, false)
-        .await
-        .expect("a fresh-start replication run must succeed");
+    drive_run(
+        &project.config_path,
+        &project.state_path,
+        false,
+        None,
+        false,
+    )
+    .await
+    .expect("a fresh-start replication run must succeed");
 
     assert!(
         harness.faults.count(FaultOp::Put) >= 1,
@@ -201,7 +215,7 @@ async fn assume_fresh_state_proceeds_and_uploads() {
 
     harness.faults.arm(FaultOp::Head, FaultMode::FailAll);
 
-    drive_run(&project.config_path, &project.state_path, true)
+    drive_run(&project.config_path, &project.state_path, true, None, false)
         .await
         .expect("--assume-fresh-state elects past the failed download");
 
@@ -210,6 +224,67 @@ async fn assume_fresh_state_proceeds_and_uploads() {
         harness.faults.count(FaultOp::Put) >= 1,
         "an asserted fresh start is trusted: the end-of-run upload must fire"
     );
+}
+
+/// A resume must never use a stale local checkpoint when the configured
+/// remote source of truth cannot be read. The ordinary ungoverned path may
+/// continue in degraded mode, but recovery has to fail closed before touching
+/// the warehouse.
+#[tokio::test]
+async fn resume_refuses_indeterminate_remote_state() {
+    let _serial = remote_testing::serial_guard();
+    let harness = CrossPodHarness::new_s3_like();
+    let project = TestProject::new().await;
+
+    let store = rocky_core::state::StateStore::open(&project.state_path).unwrap();
+    store.init_run_progress("stale-run", 1).unwrap();
+    drop(store);
+
+    harness.faults.arm(FaultOp::Head, FaultMode::FailAll);
+
+    let err = drive_run(
+        &project.config_path,
+        &project.state_path,
+        false,
+        Some("stale-run"),
+        false,
+    )
+    .await
+    .expect_err("resume must refuse indeterminate remote state");
+
+    harness.faults.clear();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("non-authoritative state (Indeterminate)"),
+        "unexpected error: {message}"
+    );
+    assert_eq!(
+        harness.faults.count(FaultOp::Put),
+        0,
+        "a refused resume must not upload local state"
+    );
+
+    let warehouse = DuckDbWarehouseAdapter::open(
+        &project
+            .config_path
+            .parent()
+            .expect("config has a parent")
+            .join("wh.duckdb"),
+    )
+    .unwrap();
+    let result = warehouse
+        .execute_query(
+            "SELECT COUNT(*) AS count FROM information_schema.tables \
+             WHERE table_schema = 'staging__acme' AND table_name = 'orders'",
+        )
+        .await
+        .unwrap();
+    let count = result.rows[0][0].as_u64().or_else(|| {
+        result.rows[0][0]
+            .as_str()
+            .and_then(|value| value.parse().ok())
+    });
+    assert_eq!(count, Some(0));
 }
 
 /// (d) Seam regression: the pre-gate download seams keep their fail-closed

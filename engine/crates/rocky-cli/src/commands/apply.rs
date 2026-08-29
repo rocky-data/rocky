@@ -586,6 +586,31 @@ fn validate_run_plan_execution_shape(plan_id: &str, run_plan: &RunPlan) -> Resul
              the model selector. Re-plan without --dag."
         );
     }
+    // Same shape for resume (#1543 follow-up): the `run_plan.dag` arm below
+    // does not replay `resume` / `resume_latest` into its sub-runs, so a plan
+    // carrying both applied as a FRESH run of every pipeline and reported
+    // success. `rocky plan` now rejects the combination at parse time; this
+    // check is what covers a plan written by an older binary, which is on-disk
+    // JSON the gc apply path already treats as possibly hand-authored.
+    // Both resume selectors at once. `resolve_resume_progress` in `run.rs`
+    // checks `resume_latest` FIRST, so a plan carrying both silently discards
+    // the run id the operator named and recovers a different run. `rocky run`
+    // and `rocky plan` now reject the pair at parse time; this covers the
+    // persisted shape, same as the `--dag` pair below.
+    if run_plan.resume.is_some() && run_plan.resume_latest {
+        bail!(
+            "plan '{plan_id}' sets both --resume and --resume-latest; only one run can be \
+             resumed and --resume-latest would win, discarding the named run id. Re-plan with \
+             exactly one of them."
+        );
+    }
+    if run_plan.dag && (run_plan.resume.is_some() || run_plan.resume_latest) {
+        bail!(
+            "plan '{plan_id}' sets both a resume flag and --dag; the DAG runner ignores \
+             the resume flag and would rebuild every pipeline from scratch. Re-plan without \
+             --dag to resume a replication run."
+        );
+    }
     Ok(())
 }
 
@@ -3587,13 +3612,16 @@ async fn run_apply_ai_authored_plan(
 /// **Why this arm does not call [`validate_run_plan_execution_shape`]** (#1325).
 /// It is the third kind carrying a `RunPlan` payload, and the other two —
 /// `Run` and `AiAuthored` — do call it. The reason this one is safe is NOT
-/// that a backfill plan cannot carry the rejected `dag && model` shape:
-/// `build_run_plan` hardcodes `dag: false` / `model: None` today, but that is
+/// that a backfill plan cannot carry a rejected shape (`dag && model`, or
+/// `dag && resume`):
+/// `build_run_plan` hardcodes `dag: false` / `model: None` / no resume today,
+/// but that is
 /// the argument #1173 already rejected, since the check exists precisely for
 /// plans written by an OLDER binary, and a plan payload is on-disk JSON that
 /// the gc apply path already treats as possibly hand-authored.
 ///
-/// It is safe because this arm never READS `dag` or `model`. It consumes
+/// It is safe because this arm never READS `dag`, `model`, or either resume
+/// field. It consumes
 /// `models_dir`, `models`, `partition_from`, `partition_to`, `parallel`, and
 /// `env` — the last feeding the governance fingerprint gate, not model
 /// selection — so the DAG runner is never reached and DAG-precedence cannot
@@ -8046,6 +8074,93 @@ autonomy_budget = { failures = 3, window = "7d" }
             format!(
                 "plan '{plan_id}' sets both a model selector and --dag; the DAG runner ignores \
                  the model selector. Re-plan without --dag."
+            )
+        );
+        assert!(
+            !state.exists(),
+            "the invalid plan must be rejected before state is opened or mutated"
+        );
+        Ok(())
+    }
+
+    /// #1543 follow-up, same shape as the `--model` case above: `rocky plan`
+    /// now rejects `--dag` with a resume flag at parse time, but a plan written
+    /// by an older binary is on-disk JSON. The DAG arm never replays the resume
+    /// into its sub-runs, so applying one rebuilt every pipeline from scratch
+    /// and reported success. Both spellings must refuse before config loading.
+    #[tokio::test]
+    async fn persisted_resume_and_dag_plan_is_refused_before_config_load() -> anyhow::Result<()> {
+        for label in ["--resume", "--resume-latest"] {
+            let dir = tempfile::tempdir()?;
+            let mut rp = minimal_run_plan();
+            rp.dag = true;
+            if label == "--resume" {
+                rp.resume = Some("run-20260101-000000-000".to_string());
+            } else {
+                rp.resume_latest = true;
+            }
+            let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+            let state = dir.path().join("state.redb");
+
+            // No rocky.toml, exactly as above: the guard must fire ahead of the
+            // config load, not somewhere inside the DAG dispatch.
+            let err = super::run_apply_run_plan(
+                dir.path(),
+                &dir.path().join("rocky.toml"),
+                &plan_id,
+                &state,
+                PolicyPrincipal::Human,
+                true,
+            )
+            .await
+            .expect_err("a persisted resume + --dag plan must be refused");
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "plan '{plan_id}' sets both a resume flag and --dag; the DAG runner ignores \
+                     the resume flag and would rebuild every pipeline from scratch. Re-plan \
+                     without --dag to resume a replication run."
+                ),
+                "{label} must name the contradictory persisted flags"
+            );
+            assert!(
+                !state.exists(),
+                "{label}: the invalid plan must be rejected before state is opened or mutated"
+            );
+        }
+        Ok(())
+    }
+
+    /// The persisted half of the dual-selector rejection. `--resume` and
+    /// `--resume-latest` together never name one run: the resolver takes
+    /// `resume_latest` and drops the id. Parse time covers new invocations;
+    /// this covers a plan an older binary wrote.
+    #[tokio::test]
+    async fn persisted_dual_resume_selectors_are_refused_before_config_load() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let mut rp = minimal_run_plan();
+        rp.resume = Some("run-20260101-000000-000".to_string());
+        rp.resume_latest = true;
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+        let state = dir.path().join("state.redb");
+
+        let err = super::run_apply_run_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .expect_err("a persisted dual-selector plan must be refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "plan '{plan_id}' sets both --resume and --resume-latest; only one run can be \
+                 resumed and --resume-latest would win, discarding the named run id. Re-plan \
+                 with exactly one of them."
             )
         );
         assert!(

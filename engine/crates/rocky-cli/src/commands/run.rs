@@ -19,7 +19,7 @@ use rocky_core::config::{
 use rocky_core::drift;
 use rocky_core::hooks::{HookContext, HookRegistry};
 use rocky_core::sql_gen;
-use rocky_core::state::StateStore;
+use rocky_core::state::{RunProgress, StateError, StateStore};
 use rocky_core::traits::{
     BatchCheckAdapter, FreshnessResult as BatchFreshnessResult, GovernanceAdapter, MaskingPolicy,
     RowCountResult as BatchRowCountResult, TagTarget, WarehouseAdapter,
@@ -1368,6 +1368,53 @@ pub enum RunTermination {
     },
 }
 
+fn ensure_resume_supported(requested: bool, supported: bool, execution_kind: &str) -> Result<()> {
+    anyhow::ensure!(
+        !requested || supported,
+        "resume is supported only for replication-only execution; {execution_kind} does not support checkpoints"
+    );
+    Ok(())
+}
+
+fn ensure_resume_authority(
+    requested: bool,
+    authority: rocky_core::state_sync::StateAuthority,
+) -> Result<()> {
+    anyhow::ensure!(
+        !requested || authority == rocky_core::state_sync::StateAuthority::Authoritative,
+        "cannot resume from non-authoritative state ({authority:?}); restore the configured remote state backend or start a fresh run without a resume flag"
+    );
+    Ok(())
+}
+
+fn require_resume_progress(
+    progress: std::result::Result<Option<RunProgress>, StateError>,
+    requested: &str,
+) -> Result<RunProgress> {
+    progress
+        .with_context(|| format!("failed to load progress for {requested}"))?
+        .with_context(|| format!("cannot resume {requested}: no progress found"))
+}
+
+fn resolve_resume_progress(
+    state_store: &StateStore,
+    resume_run_id: Option<&str>,
+    resume_latest: bool,
+) -> Result<Option<RunProgress>> {
+    if resume_latest {
+        return require_resume_progress(state_store.get_latest_run_progress(), "the latest run")
+            .map(Some);
+    }
+    if let Some(run_id) = resume_run_id {
+        return require_resume_progress(
+            state_store.get_run_progress(run_id),
+            &format!("run '{run_id}'"),
+        )
+        .map(Some);
+    }
+    Ok(None)
+}
+
 /// Execute `rocky run` — full pipeline.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip_all, name = "run", fields(run_id))]
@@ -1608,10 +1655,23 @@ pub async fn run(
     let skip_gate =
         SkipGateConfig::resolve(skip_opts, &rocky_cfg.run, shadow_config.is_some());
 
+    let resume_requested = resume_run_id.is_some() || resume_latest;
+
+    // `--all` and `--models` append an uncheckpointed model phase to a
+    // replication run. Resuming only the replication half would silently run
+    // transformations fresh, so reject the mixed execution before opening an
+    // adapter or mutating state.
+    ensure_resume_supported(
+        resume_requested,
+        !run_all && models_dir.is_none(),
+        "mixed replication and transformation execution",
+    )?;
+
     // Model-only execution: skip the entire replication path and execute
     // just the named model. Dagster uses this for per-asset materialization
     // when it controls the DAG scheduling.
     if let Some(target_model) = model_name_filter {
+        ensure_resume_supported(resume_requested, false, "model-only")?;
         let adapter_registry = AdapterRegistry::from_config(rocky_cfg)?;
         // An explicit `--pipeline` alongside `--model` (also how the unified-DAG
         // sub-runner drives each transformation node) resolves the model against
@@ -1963,6 +2023,15 @@ pub async fn run(
 
     let (pipeline_name, pipeline_config) =
         registry::resolve_pipeline(rocky_cfg, pipeline_name_arg)?;
+
+    ensure_resume_supported(
+        resume_requested,
+        matches!(
+            &pipeline_config,
+            rocky_core::config::PipelineConfig::Replication(_)
+        ),
+        pipeline_config.pipeline_type_str(),
+    )?;
 
     info!(
         pipeline = pipeline_name,
@@ -2533,6 +2602,12 @@ pub async fn run(
         }
     };
 
+    // A recovery request must read the durable source of truth. `FreshStart`
+    // proves that no remote checkpoint exists; `Indeterminate` means the
+    // download failed and any local file may be stale. Neither may authorize
+    // table skipping.
+    ensure_resume_authority(resume_requested, authority)?;
+
     // Freeze fence (ADR-CONCURRENCY.md D3 fence granularity): fresh
     // durable-tier marker LISTs at this run's boundaries — before the
     // replication fan-out, at each execution-layer boundary inside
@@ -2581,6 +2656,12 @@ pub async fn run(
             "failed to open state store at {}",
             state_path.display()
         ))?;
+
+    // Resolve an explicit recovery request before discovery or warehouse
+    // setup. A missing or unreadable checkpoint must never degrade into a
+    // fresh run.
+    let resume_progress =
+        resolve_resume_progress(&state_store, resume_run_id, resume_latest)?;
 
     // Suppress both the periodic and the end-of-run upload when either:
     // - the on-disk state was forward-incompatible (newer schema than this
@@ -3521,42 +3602,20 @@ pub async fn run(
     // see the `governed_ctx` gate ahead of `governance_setup` — so no warehouse
     // statement executes for a denied / unreviewed agent replication.)
 
-    let completed_keys: std::collections::HashSet<String> = if resume_latest {
-        if let Ok(Some(prev)) = state_store.get_latest_run_progress() {
-            let keys: std::collections::HashSet<String> = prev
-                .tables
-                .iter()
-                .filter(|t| t.status == rocky_core::state::TableStatus::Success)
-                .map(|t| t.table_key.clone())
-                .collect();
-            if !keys.is_empty() {
-                info!(
-                    resumed_from = prev.run_id,
-                    tables_skipped = keys.len(),
-                    "resuming from previous run"
-                );
-                output.resumed_from = Some(prev.run_id.clone());
-            }
-            keys
-        } else {
-            std::collections::HashSet::new()
-        }
-    } else if let Some(rid) = resume_run_id {
-        if let Ok(Some(prev)) = state_store.get_run_progress(rid) {
-            let keys: std::collections::HashSet<String> = prev
-                .tables
-                .iter()
-                .filter(|t| t.status == rocky_core::state::TableStatus::Success)
-                .map(|t| t.table_key.clone())
-                .collect();
-            if !keys.is_empty() {
-                output.resumed_from = Some(rid.to_string());
-            }
-            keys
-        } else {
-            warn!(run_id = rid, "no progress found for run, starting fresh");
-            std::collections::HashSet::new()
-        }
+    let completed_keys: std::collections::HashSet<String> = if let Some(prev) = resume_progress {
+        let keys: std::collections::HashSet<String> = prev
+            .tables
+            .iter()
+            .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+            .map(|t| t.table_key.clone())
+            .collect();
+        info!(
+            resumed_from = prev.run_id,
+            tables_skipped = keys.len(),
+            "resuming from previous run"
+        );
+        output.resumed_from = Some(prev.run_id);
+        keys
     } else {
         std::collections::HashSet::new()
     };
@@ -11936,6 +11995,270 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
 mod tests {
     use super::*;
     use rocky_core::plan_partition::PartitionSelection;
+
+    #[test]
+    fn resume_rejects_unsupported_execution_paths() {
+        let err = ensure_resume_supported(true, false, "transformation")
+            .expect_err("an unsupported pipeline must not ignore resume");
+        assert!(
+            err.to_string()
+                .contains("only for replication-only execution"),
+            "unexpected error: {err:#}"
+        );
+        ensure_resume_supported(
+            true,
+            false,
+            "mixed replication and transformation execution",
+        )
+        .expect_err("a mixed --all/--models run must not partially resume");
+        ensure_resume_supported(false, false, "transformation")
+            .expect("an ordinary transformation run remains valid");
+    }
+
+    #[test]
+    fn resume_requires_authoritative_state() {
+        use rocky_core::state_sync::StateAuthority;
+
+        ensure_resume_authority(true, StateAuthority::Authoritative)
+            .expect("local or restored state is authoritative");
+        for authority in [StateAuthority::FreshStart, StateAuthority::Indeterminate] {
+            let err = ensure_resume_authority(true, authority)
+                .expect_err("resume must not consult missing or stale local state");
+            assert!(
+                err.to_string().contains("non-authoritative state"),
+                "unexpected error: {err:#}"
+            );
+        }
+        ensure_resume_authority(false, StateAuthority::Indeterminate)
+            .expect("ordinary ungoverned runs retain their degraded-mode behavior");
+    }
+
+    #[test]
+    fn resume_specific_run_requires_an_existing_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let err = resolve_resume_progress(&store, Some("never-recorded"), false)
+            .expect_err("an unknown run must not start fresh");
+        assert!(
+            err.to_string().contains("run 'never-recorded'"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn resume_latest_requires_an_existing_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let err = resolve_resume_progress(&store, None, true)
+            .expect_err("an empty state store must not start fresh");
+        assert!(
+            err.to_string().contains("the latest run"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn resume_accepts_a_valid_zero_progress_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store.init_run_progress("run-empty", 0).unwrap();
+
+        let explicit = resolve_resume_progress(&store, Some("run-empty"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(explicit.run_id, "run-empty");
+        assert!(explicit.tables.is_empty());
+
+        let latest = resolve_resume_progress(&store, None, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.run_id, "run-empty");
+    }
+
+    #[test]
+    fn resume_preserves_state_lookup_errors() {
+        let err = require_resume_progress(
+            Err(StateError::VersionParse("garbled".to_string())),
+            "run 'broken'",
+        )
+        .expect_err("state errors must not start a fresh run");
+        let message = format!("{err:#}");
+        assert!(message.contains("failed to load progress for run 'broken'"));
+        assert!(message.contains("state schema version is corrupt"));
+    }
+
+    async fn drive_resume_test_run(
+        config_path: &std::path::Path,
+        state_path: &std::path::Path,
+        pipeline: &str,
+        resume_run_id: Option<&str>,
+        resume_latest: bool,
+    ) -> anyhow::Result<()> {
+        super::run(
+            config_path,
+            std::sync::Arc::new(
+                rocky_core::config::load_rocky_config_fingerprinted(config_path).unwrap(),
+            ),
+            None,
+            Some(pipeline),
+            state_path,
+            None,
+            true,
+            None,
+            false,
+            resume_run_id,
+            resume_latest,
+            None,
+            &PartitionRunOptions::default(),
+            None,
+            None,
+            None,
+            None,
+            &DeferOptions::default(),
+            &SkipRunOptions::default(),
+            &rocky_core::run_vars::RunVars::new(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn transformation_resume_refuses_before_opening_the_warehouse() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warehouse.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[state]
+backend = "local"
+
+[pipeline.transform]
+type = "transformation"
+models = "models/**"
+
+[pipeline.transform.target]
+adapter = "default"
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let err = drive_resume_test_run(&config_path, &state_path, "transform", None, true)
+            .await
+            .expect_err("a transformation run must not ignore --resume-latest");
+
+        assert!(
+            err.to_string()
+                .contains("only for replication-only execution"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            !db_path.exists(),
+            "the unsupported resume must fail before opening the warehouse"
+        );
+        assert!(
+            !state_path.exists(),
+            "the unsupported resume must fail before opening the state store"
+        );
+    }
+
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn missing_replication_checkpoint_refuses_before_warehouse_mutation() {
+        use rocky_core::traits::WarehouseAdapter;
+        use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("warehouse.duckdb");
+        let config_path = dir.path().join("rocky.toml");
+        let state_path = dir.path().join("state.redb");
+        {
+            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+            warehouse
+                .execute_statement("CREATE SCHEMA raw__orders")
+                .await
+                .unwrap();
+            warehouse
+                .execute_statement("CREATE TABLE raw__orders.one AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[adapter]
+type = "duckdb"
+path = "{}"
+
+[state]
+backend = "local"
+
+[pipeline.replicate]
+type = "replication"
+strategy = "full_refresh"
+
+[pipeline.replicate.source.discovery]
+adapter = "default"
+
+[pipeline.replicate.source.schema_pattern]
+prefix = "raw__"
+separator = "__"
+components = ["source"]
+
+[pipeline.replicate.target]
+adapter = "default"
+catalog_template = "warehouse"
+schema_template = "staging__{{source}}"
+
+[pipeline.replicate.target.governance]
+auto_create_schemas = true
+"#,
+                db_path.display()
+            ),
+        )
+        .unwrap();
+
+        let err = drive_resume_test_run(
+            &config_path,
+            &state_path,
+            "replicate",
+            Some("never-recorded"),
+            false,
+        )
+        .await
+        .expect_err("an unknown checkpoint must not start a fresh run");
+
+        assert!(
+            err.to_string().contains("no progress found"),
+            "unexpected error: {err:#}"
+        );
+        let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
+        let result = warehouse
+            .execute_query(
+                "SELECT COUNT(*) FROM information_schema.tables \
+                 WHERE table_schema = 'staging__orders' AND table_name = 'one'",
+            )
+            .await
+            .unwrap();
+        let count = result.rows[0][0]
+            .as_u64()
+            .or_else(|| result.rows[0][0].as_str().and_then(|v| v.parse().ok()));
+        assert_eq!(count, Some(0), "the target table must not be created");
+    }
 
     // Serializes the process-global env-var mutations in this module's tests —
     // the trigger-threading ones below and the `TRACEPARENT` adoption ones

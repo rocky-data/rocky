@@ -247,7 +247,18 @@ Exit code:
 
 ## Checkpoint and resume
 
-A run can be interrupted mid-layer by a killed process or a network failure. Rocky can resume it from the last successful checkpoint, but only when you ask for it. Pass `--resume-latest` or `--resume <run-id>`. Without one of those flags the next run starts fresh and rebuilds every selected table.
+A replication run can be interrupted mid-layer by a killed process or a network failure. Rocky can resume it from the last successful checkpoint, but only when you ask for it. Pass `--resume-latest` or `--resume <run-id>`. Without one of those flags the next run starts fresh and rebuilds every selected table.
+
+Resume flags fail if the checkpoint is missing or unreadable. Every path that does not record per-table checkpoints refuses them instead of ignoring them: other pipeline types, mixed replication/model runs (`--all` or `--models`), and `--dag`. With a remote state backend, resume also requires an authoritative restore; an absent or unreachable remote state refuses recovery even if a stale local state file exists.
+
+There is no way to resume half of a combined run. `--all` and `--models` re-run the replication phase before the model phase, so a second command cannot pick up where a resumed replication left off — it copies the same tables again. If a `--all` or `--dag` run fails, either re-run it whole, or split the work: resume the replication pipeline on its own with `--resume-latest`, then build the models by naming their transformation pipeline, which runs no replication of its own.
+
+```bash
+rocky run -c rocky.toml --pipeline <replication-pipeline> --resume-latest
+rocky run -c rocky.toml --pipeline <transformation-pipeline>
+```
+
+That split needs the models to live in their own transformation pipeline. In a single pipeline driven by `--all`, they do not, and the whole run repeats.
 
 The state store records which tables completed in the `run_progress_entries` table, one entry per `run_id` plus table, with a `run_progress` header row per `run_id`. `rocky run --resume-latest` looks up the most recent `run_id`, reads which tables already completed, and skips them.
 
