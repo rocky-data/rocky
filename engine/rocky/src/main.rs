@@ -788,8 +788,11 @@ enum Command {
         #[arg(long, global = false)]
         all: bool,
         /// Resume a failed replication run; mints a new `run_id` and records the prior one as `resumed_from`.
+        /// Mutually exclusive with `--resume-latest`, for the same reason as on
+        /// `rocky run`: a plan carrying both would discard the named run id at
+        /// apply time.
         /// Applies to the default plan subcommand only.
-        #[arg(long, global = false)]
+        #[arg(long, conflicts_with = "resume_latest", global = false)]
         resume: Option<String>,
         /// Resume the most recent failed replication run; mints a new `run_id` and records the prior one as `resumed_from`.
         /// Resolved against the state store at apply time.
@@ -950,8 +953,11 @@ enum Command {
         /// Execute both replication and compiled models
         #[arg(long)]
         all: bool,
-        /// Resume a failed replication run; mints a new `run_id` and records the prior one as `resumed_from`
-        #[arg(long)]
+        /// Resume a failed replication run; mints a new `run_id` and records the prior one as `resumed_from`.
+        /// Mutually exclusive with `--resume-latest`: the resolver gives
+        /// `--resume-latest` precedence, so accepting both silently discarded
+        /// the run id the operator actually named.
+        #[arg(long, conflicts_with = "resume_latest")]
         resume: Option<String>,
         /// Resume the most recent failed replication run; mints a new `run_id` and records the prior one as `resumed_from`
         #[arg(long)]
@@ -5008,6 +5014,11 @@ mod tests {
     /// every pipeline from scratch — #1543's fail-open shape on the widest
     /// path. Both spellings, on both `run` and `plan`, must now fail at parse
     /// time; `--dag` on its own still parses.
+    ///
+    /// The same loop pins the dual-selector pair. `--resume <id>
+    /// --resume-latest` also parsed, and `resolve_resume_progress` checks
+    /// `resume_latest` first, so the run id the operator named was discarded
+    /// without a word.
     #[test]
     #[allow(
         clippy::disallowed_methods,
@@ -5020,6 +5031,11 @@ mod tests {
             vec!["rocky", "run", "--dag", "--resume", "run-1"],
             vec!["rocky", "plan", "--dag", "--resume-latest"],
             vec!["rocky", "plan", "--dag", "--resume", "run-1"],
+            // Both selectors at once: `resolve_resume_progress` checks
+            // `resume_latest` first, so this used to parse and silently
+            // discard `run-1`.
+            vec!["rocky", "run", "--resume", "run-1", "--resume-latest"],
+            vec!["rocky", "plan", "--resume", "run-1", "--resume-latest"],
         ] {
             let parsed = std::thread::scope(|s| {
                 let owned: Vec<String> = conflicting.iter().map(ToString::to_string).collect();

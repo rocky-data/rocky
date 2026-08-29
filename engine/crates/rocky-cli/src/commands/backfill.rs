@@ -976,5 +976,11 @@ mod tests {
              backfill apply arm does not validate — add validate_run_plan_execution_shape \
              to run_apply_backfill_plan"
         );
+        assert!(
+            !(plan.resume.is_some() && plan.resume_latest),
+            "a composed backfill carries both resume selectors, the shape that the backfill \
+             apply arm does not validate — add validate_run_plan_execution_shape to \
+             run_apply_backfill_plan"
+        );
     }
 }

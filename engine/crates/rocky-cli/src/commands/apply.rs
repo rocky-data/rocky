@@ -592,6 +592,18 @@ fn validate_run_plan_execution_shape(plan_id: &str, run_plan: &RunPlan) -> Resul
     // success. `rocky plan` now rejects the combination at parse time; this
     // check is what covers a plan written by an older binary, which is on-disk
     // JSON the gc apply path already treats as possibly hand-authored.
+    // Both resume selectors at once. `resolve_resume_progress` in `run.rs`
+    // checks `resume_latest` FIRST, so a plan carrying both silently discards
+    // the run id the operator named and recovers a different run. `rocky run`
+    // and `rocky plan` now reject the pair at parse time; this covers the
+    // persisted shape, same as the `--dag` pair below.
+    if run_plan.resume.is_some() && run_plan.resume_latest {
+        bail!(
+            "plan '{plan_id}' sets both --resume and --resume-latest; only one run can be \
+             resumed and --resume-latest would win, discarding the named run id. Re-plan with \
+             exactly one of them."
+        );
+    }
     if run_plan.dag && (run_plan.resume.is_some() || run_plan.resume_latest) {
         bail!(
             "plan '{plan_id}' sets both a resume flag and --dag; the DAG runner ignores \
@@ -8116,6 +8128,45 @@ autonomy_budget = { failures = 3, window = "7d" }
                 "{label}: the invalid plan must be rejected before state is opened or mutated"
             );
         }
+        Ok(())
+    }
+
+    /// The persisted half of the dual-selector rejection. `--resume` and
+    /// `--resume-latest` together never name one run: the resolver takes
+    /// `resume_latest` and drops the id. Parse time covers new invocations;
+    /// this covers a plan an older binary wrote.
+    #[tokio::test]
+    async fn persisted_dual_resume_selectors_are_refused_before_config_load() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let mut rp = minimal_run_plan();
+        rp.resume = Some("run-20260101-000000-000".to_string());
+        rp.resume_latest = true;
+        let plan_id = write_plan(dir.path(), PlanKind::Run, &rp)?;
+        let state = dir.path().join("state.redb");
+
+        let err = super::run_apply_run_plan(
+            dir.path(),
+            &dir.path().join("rocky.toml"),
+            &plan_id,
+            &state,
+            PolicyPrincipal::Human,
+            true,
+        )
+        .await
+        .expect_err("a persisted dual-selector plan must be refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "plan '{plan_id}' sets both --resume and --resume-latest; only one run can be \
+                 resumed and --resume-latest would win, discarding the named run id. Re-plan \
+                 with exactly one of them."
+            )
+        );
+        assert!(
+            !state.exists(),
+            "the invalid plan must be rejected before state is opened or mutated"
+        );
         Ok(())
     }
 
