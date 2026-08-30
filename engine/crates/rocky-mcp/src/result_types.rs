@@ -183,10 +183,24 @@ pub struct SchemaEntry {
 }
 
 /// `inspect_schema` result — the typed columns of every model + source.
+///
+/// `models` and the compile-derived half of `sources` are exact. The physical
+/// warehouse tables APPENDED to `sources` are best-effort, so
+/// `discovery_incomplete` says whether that append actually ran. Without it, an
+/// empty `sources` at cold start reads identically as "the warehouse has no
+/// other tables" and "I could not look" (#1533).
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct InspectSchemaResult {
     pub models: Vec<SchemaEntry>,
     pub sources: Vec<SchemaEntry>,
+    /// `true` when physical-table discovery did not run, so `sources` may be
+    /// missing warehouse tables the project never declared. The
+    /// compile-derived entries are unaffected either way.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub discovery_incomplete: bool,
+    /// Why discovery did not run, when `discovery_incomplete` is `true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery_error: Option<String>,
 }
 
 /// `sample_rows` result — a capped sample of real rows.

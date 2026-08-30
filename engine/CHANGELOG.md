@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`rocky serve --token-scope read-only` — a bearer token that authenticates but is refused every mutating HTTP method.** The `serve` token was all-or-nothing: any valid token reached every route, including `POST /api/v1/compile` and `POST /api/v1/jobs/{run,plan,apply}`, which spawn the Rocky executable and can reach configured `sh -c` hooks. A browser UI holding that token meant one leaked token, or one XSS, reached a warehouse mutation.
+
+  A read-scoped token authenticates exactly like a full one, then is refused `403 forbidden_read_only_token` — in the usual `{code, message, remediation_hint}` envelope — on every request whose HTTP method is not `GET`, `HEAD` or `OPTIONS`. The refusal is derived from the **method**, not from a list of mutating paths, and the middleware runs before the router: a mutating route added later is refused the moment it exists, with no edit to the auth layer — provided it is registered inside the authenticated router and its effect matches its method. The check classifies the method, not the handler, and safe-method handlers that read the state store do commit a redb write transaction (#1545). The allowlist is the three safe methods and nothing else, so an unfamiliar or extension method is refused for being absent rather than permitted for being unrecognised.
+
+  Set it with `--token-scope <full|read-only>`, or `ROCKY_SERVE_TOKEN_SCOPE` — the same flag-then-env shape `--token` already uses. **The default is `full`, so existing deployments are unchanged.** Setting a scope without a token is an error rather than a silent no-op, and an unparseable scope is an error rather than a fall back to `full`, so a typo in the env var cannot quietly hand out full access.
+
+  Two things a read-scoped token does **not** change: `GET /api/v1/health` stays auth-exempt, and the webhook ingress (`POST /api/v1/hooks/trigger/{pipeline}`) is unaffected — it never consults the bearer token, because it authenticates with its own HMAC.
+
+  **Know this before you hand a read-only token to a browser.** The scope restricts that token; it is not a whole-server browser perimeter. `rocky serve --scheduler` bound to loopback with no `ROCKY_WEBHOOK_SECRET` accepts an *unsigned* webhook `POST` — a documented dev convenience, unchanged here — and spools work for the resident scheduler. Same-origin script can reach that with no token at all. Set `ROCKY_WEBHOOK_SECRET` whenever a browser can reach the sidecar.
+
 ### Fixed
 
 - **A resume that cannot resume now stops instead of running everything from scratch.** `rocky run --resume <run-id>` and `rocky run --resume-latest` used to fall back to an ordinary run when the checkpoint was missing or the state store could not be read. A typo, an empty state directory or an expired checkpoint therefore launched a full production run and reported success. Both flags now exit non-zero before anything is discovered or written, and a state-store read error is reported with its cause rather than swallowed. A valid checkpoint that recorded zero completed tables is still a valid resume, and now records its `resumed_from` identity.
