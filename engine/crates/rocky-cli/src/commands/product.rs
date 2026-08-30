@@ -3041,7 +3041,6 @@ effect = "require_review"
                 models_dir: root.join("models"),
                 contracts_dir: None,
                 source_schemas,
-                source_column_info: std::collections::HashMap::new(),
                 mask: cfg.mask.clone(),
                 allow_unmasked: cfg.classifications.allow_unmasked.clone(),
                 project_freshness_default: cfg.freshness.has_default(),

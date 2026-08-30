@@ -108,7 +108,6 @@ fn emit_models(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
-        source_column_info: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,

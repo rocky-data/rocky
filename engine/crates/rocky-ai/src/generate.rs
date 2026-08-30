@@ -5,7 +5,6 @@ use std::collections::{HashMap, HashSet};
 
 use rocky_compiler::types::TypedColumn;
 use rocky_core::models::Model;
-use rocky_ir::ColumnInfo;
 
 use crate::client::{AiError, LlmClient, LlmResponse};
 use crate::prompt;
@@ -39,7 +38,6 @@ pub struct GeneratedModel {
 pub struct ValidationContext<'a> {
     pub project_models: &'a [Model],
     pub source_schemas: &'a HashMap<String, Vec<TypedColumn>>,
-    pub source_column_info: &'a HashMap<String, Vec<ColumnInfo>>,
 }
 
 /// What a generated model is verified against.
@@ -219,7 +217,6 @@ fn baseline_error_keys(ctx: &ValidationContext<'_>) -> Result<HashSet<String>, S
         .map_err(|e| format!("project loading failed: {e}"))?;
     let config = rocky_compiler::compile::CompilerConfig {
         source_schemas: ctx.source_schemas.clone(),
-        source_column_info: ctx.source_column_info.clone(),
         ..Default::default()
     };
     let compiled = rocky_compiler::compile::compile_project(project, &config, Vec::new())
@@ -291,17 +288,13 @@ fn validate_generated_code(
     );
     let generated = build_generated_model(&name, sql, source, format, &resolved_target, strategy);
 
-    let (models, source_schemas, source_column_info) = match context {
+    let (models, source_schemas) = match context {
         Some(ctx) => {
             let mut models: Vec<Model> = ctx.project_models.to_vec();
             models.push(generated);
-            (
-                models,
-                ctx.source_schemas.clone(),
-                ctx.source_column_info.clone(),
-            )
+            (models, ctx.source_schemas.clone())
         }
-        None => (vec![generated], HashMap::new(), HashMap::new()),
+        None => (vec![generated], HashMap::new()),
     };
 
     let project = rocky_compiler::project::Project::from_models(models)
@@ -319,7 +312,6 @@ fn validate_generated_code(
     // gone missing here too, silently (#1302).
     let config = rocky_compiler::compile::CompilerConfig {
         source_schemas,
-        source_column_info,
         ..Default::default()
     };
     let compiled = rocky_compiler::compile::compile_project(project, &config, Vec::new())
@@ -562,11 +554,9 @@ mod tests {
             "SELECT CAST(1 AS BIGINT) AS id, CAST('x' AS VARCHAR) AS name",
         )];
         let empty_schemas = HashMap::new();
-        let empty_cols = HashMap::new();
         let ctx = ValidationContext {
             project_models: &upstream_models,
             source_schemas: &empty_schemas,
-            source_column_info: &empty_cols,
         };
 
         // `upstream_model` puts `orders` at test.test.orders.
@@ -595,11 +585,9 @@ mod tests {
             "SELECT CAST(1 AS BIGINT) AS id, CAST('x' AS VARCHAR) AS name",
         )];
         let empty_schemas = HashMap::new();
-        let empty_cols = HashMap::new();
         let ctx = ValidationContext {
             project_models: &upstream_models,
             source_schemas: &empty_schemas,
-            source_column_info: &empty_cols,
         };
 
         let distinct = crate::sidecar::SidecarTarget::parse("test.test.gen_orders").unwrap();
@@ -633,11 +621,9 @@ mod tests {
             "SELECT CAST(1 AS BIGINT) AS id, CAST('x' AS VARCHAR) AS name",
         )];
         let empty_schemas = HashMap::new();
-        let empty_cols = HashMap::new();
         let ctx = ValidationContext {
             project_models: &upstream_models,
             source_schemas: &empty_schemas,
-            source_column_info: &empty_cols,
         };
         let collides = crate::sidecar::SidecarTarget::parse("test.test.orders").unwrap();
 
@@ -673,11 +659,9 @@ mod tests {
         b.config.target.table = "shared".to_string();
         let upstream_models = vec![a, b];
         let empty_schemas = HashMap::new();
-        let empty_cols = HashMap::new();
         let ctx = ValidationContext {
             project_models: &upstream_models,
             source_schemas: &empty_schemas,
-            source_column_info: &empty_cols,
         };
 
         let free = crate::sidecar::SidecarTarget::parse("test.test.gen_thing").unwrap();
@@ -762,11 +746,9 @@ mod tests {
         );
         let upstream_models = vec![upstream];
         let empty_schemas = HashMap::new();
-        let empty_cols = HashMap::new();
         let ctx = ValidationContext {
             project_models: &upstream_models,
             source_schemas: &empty_schemas,
-            source_column_info: &empty_cols,
         };
 
         let valid = "from orders\nselect { id, name }";

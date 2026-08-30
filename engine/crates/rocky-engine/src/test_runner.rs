@@ -82,7 +82,6 @@ pub fn run_tests(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(std::path::Path::to_path_buf),
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         run_vars: run_vars.clone(),
         ..Default::default()
     };

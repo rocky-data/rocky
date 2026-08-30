@@ -711,7 +711,6 @@ impl RockyMcpServer {
             models_dir: self.models_dir.clone(),
             contracts_dir: None,
             source_schemas,
-            source_column_info: std::collections::HashMap::new(),
             ..Default::default()
         };
         compile::compile(&config).map_err(|e| anyhow::anyhow!("compile failed: {e}"))
@@ -756,7 +755,6 @@ impl RockyMcpServer {
             models_dir: self.models_dir.clone(),
             contracts_dir: None,
             source_schemas: source_schemas.clone(),
-            source_column_info: std::collections::HashMap::new(),
             ..Default::default()
         };
         let head_compile = match compile::compile(&config) {
