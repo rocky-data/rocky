@@ -179,7 +179,6 @@ fn bench_cold_compile(c: &mut Criterion) {
             models_dir: dir.path().join("models"),
             contracts_dir: None,
             source_schemas: HashMap::new(),
-            source_column_info: HashMap::new(),
             ..Default::default()
         };
 
@@ -230,7 +229,6 @@ fn bench_phase_breakdown(c: &mut Criterion) {
             models_dir: dir.path().join("models"),
             contracts_dir: None,
             source_schemas: HashMap::new(),
-            source_column_info: HashMap::new(),
             ..Default::default()
         };
 
@@ -567,7 +565,6 @@ fn bench_sub_second_compile(c: &mut Criterion) {
         models_dir: dir.path().join("models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
@@ -620,7 +617,6 @@ fn bench_single_file_change(c: &mut Criterion) {
         models_dir: dir.path().join("models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 

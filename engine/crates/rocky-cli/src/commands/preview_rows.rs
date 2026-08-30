@@ -126,7 +126,6 @@ pub async fn run_preview_rows(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
-        source_column_info: std::collections::HashMap::new(),
         mask: rocky_cfg.mask.clone(),
         allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
         project_freshness_default: rocky_cfg.freshness.has_default(),

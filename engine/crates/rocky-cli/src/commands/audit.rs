@@ -654,7 +654,6 @@ pub(crate) fn compile_project(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas,
-        source_column_info: std::collections::HashMap::new(),
         ..Default::default()
     };
     compile::compile(&config).context("failed to compile models for blast-radius analysis")
