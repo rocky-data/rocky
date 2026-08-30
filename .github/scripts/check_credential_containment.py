@@ -61,7 +61,7 @@ GH_RELEASE_SOURCE = (
     "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
 )
 TAIKI_INSTALL_SOURCE = (
-    "taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1"
+    "taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7"
 )
 # Actions a job may run when it is not reachable from a pull request. Release,
 # publish and deployment workflows never execute candidate code, so the
