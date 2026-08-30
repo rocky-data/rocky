@@ -182,9 +182,31 @@ fn emit_models(
 
     // Declared surrogate-key specs, applied per model so the emitted SELECT is
     // wrapped identically to the materialization path (see `apply_surrogate_keys`).
+    //
+    // Loaded ONLY for the models this invocation will emit. The whole-tree load
+    // meant a malformed `[[surrogate_key]]` on ANY model failed an emit narrowed
+    // to a different one (#1537) — `validate_surrogate_key_spec` returns a
+    // `ModelError` for the tree, not for the model asked about. An unnarrowed
+    // emit still covers every model, so a bad spec is still reported; it is now
+    // reported by the invocations that would actually apply it.
+    //
+    // Selection is by the compiled models' own `file_path`, the same derivation
+    // `run` uses (`commands/run.rs`, the `selected_model_paths` set). Filtering
+    // on the filename stem instead would silently drop the key of a model whose
+    // sidecar renames it with `name = "..."` — a wrong-SQL failure, strictly
+    // worse than the noisy one being fixed.
+    let selected_model_paths: std::collections::HashSet<std::path::PathBuf> = result
+        .project
+        .models
+        .iter()
+        .filter(|m| model_filter.is_none_or(|f| m.config.name == f))
+        .map(|m| std::path::PathBuf::from(&m.file_path))
+        .collect();
     let surrogate_keys: HashMap<String, Vec<SurrogateKeySpec>> =
-        rocky_core::models::load_surrogate_keys_from_tree(models_dir)
-            .context("invalid surrogate_key configuration")?;
+        rocky_core::models::load_surrogate_keys_from_tree_filtered(models_dir, |path| {
+            selected_model_paths.contains(path)
+        })
+        .context("invalid surrogate_key configuration")?;
 
     let mut emitted = Vec::new();
     let mut skipped = Vec::new();
@@ -420,6 +442,105 @@ mod tests {
             emitted[0].sql
         );
         assert!(emitted[0].sql.contains("__rocky_keyed"));
+    }
+
+    /// A malformed `[[surrogate_key]]` on one model must not fail an emit
+    /// narrowed to a different one (#1537). `run` already behaves this way; the
+    /// preview inherited an unfiltered load rather than choosing one.
+    #[test]
+    fn narrowed_emit_ignores_a_malformed_key_on_another_model() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model(dir.path(), "orders", "SELECT 1 AS id", "");
+        // `columns = []` fails `validate_surrogate_key_spec`: a key must list at
+        // least one input column.
+        write_model(
+            dir.path(),
+            "customers",
+            "SELECT 2 AS id",
+            "\n[[surrogate_key]]\nname = \"customer_key\"\ncolumns = []\n",
+        );
+
+        let emitted = emit_models(
+            None,
+            dir.path(),
+            Some("orders"),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .expect("a malformed key on `customers` must not fail an emit of `orders`")
+        .models;
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].name, "orders");
+    }
+
+    /// The other half of the same rule: narrowing must not become a way to
+    /// smuggle a bad spec past validation. An emit that covers the offending
+    /// model still refuses.
+    #[test]
+    fn unnarrowed_emit_still_reports_a_malformed_key() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model(dir.path(), "orders", "SELECT 1 AS id", "");
+        write_model(
+            dir.path(),
+            "customers",
+            "SELECT 2 AS id",
+            "\n[[surrogate_key]]\nname = \"customer_key\"\ncolumns = []\n",
+        );
+
+        let err = emit_models(
+            None,
+            dir.path(),
+            None,
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        // `EmitResult` is not `Debug` (production type, no test-only derive);
+        // discard the Ok value so `expect_err` can report.
+        .map(|_| ())
+        .expect_err("an unnarrowed emit covers `customers`, so it must still refuse");
+        assert!(
+            format!("{err:#}").contains("surrogate_key"),
+            "the refusal must name the surrogate_key configuration:\n{err:#}"
+        );
+
+        // And narrowing TO the offending model refuses too — the spec is only
+        // skipped for invocations that would not apply it.
+        emit_models(
+            None,
+            dir.path(),
+            Some("customers"),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .map(|_| ())
+        .expect_err("narrowing to `customers` must still refuse its own bad key");
+    }
+
+    /// Guards the over-filtering direction: the narrowed model must still get
+    /// its OWN key. Selection is by the compiled model's `file_path`, so a
+    /// sidecar that renames the model still resolves.
+    #[test]
+    fn narrowed_emit_still_applies_its_own_key() {
+        let dir = tempfile::tempdir().unwrap();
+        write_model(dir.path(), "other", "SELECT 1 AS id", "");
+        write_model(
+            dir.path(),
+            "keyed",
+            "SELECT order_id FROM upstream",
+            "\n[[surrogate_key]]\nname = \"order_key\"\ncolumns = [\"order_id\"]\n",
+        );
+
+        let emitted = emit_models(
+            None,
+            dir.path(),
+            Some("keyed"),
+            &rocky_core::run_vars::RunVars::new(),
+        )
+        .unwrap()
+        .models;
+        assert_eq!(emitted.len(), 1);
+        assert!(
+            emitted[0].sql.contains("AS order_key"),
+            "narrowing must not drop the selected model's own key:\n{}",
+            emitted[0].sql
+        );
     }
 
     #[test]

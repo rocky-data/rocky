@@ -176,12 +176,23 @@ impl SqlDialect for TrinoDialect {
         select_sql: &str,
     ) -> AdapterResult<Vec<String>> {
         // Trino's REST API runs each statement in its own transaction
-        // (the `START TRANSACTION` / `COMMIT` flow requires sticky
-        // sessions and connector support). The portable form is a
-        // 2-statement DELETE + INSERT — the runtime executes them in
-        // order and rolls back via `DROP TABLE` on failure for v0.
-        // Iceberg-backed catalogs support true `INSERT OVERWRITE`;
-        // wiring that up is a follow-up.
+        // (the `START TRANSACTION` / `COMMIT` flow requires sticky sessions and
+        // connector support). The portable form is a 2-statement
+        // DELETE + INSERT, which the runtime executes in order.
+        //
+        // THIS OVERWRITE IS NOT ATOMIC, and Trino is the only adapter where
+        // that is true. If the INSERT fails, the DELETE is already committed
+        // and the partition is left empty — the `ROLLBACK` the runtime issues
+        // on failure cannot undo it. (An older version of this comment claimed
+        // the rollback was a `DROP TABLE`; it is a `ROLLBACK`, and either way
+        // it does not recover the deleted rows.)
+        //
+        // The runner compensates by marking EVERY key of a failed batch
+        // `Failed`, so `--missing` re-plans the whole undefined window rather
+        // than the leading key alone (#1496).
+        //
+        // Iceberg-backed catalogs support true `INSERT OVERWRITE`; wiring that
+        // up is the real fix and a follow-up.
         Ok(vec![
             format!("DELETE FROM {target} WHERE {partition_filter}"),
             format!("INSERT INTO {target}\n{select_sql}"),
