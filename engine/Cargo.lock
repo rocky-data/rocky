@@ -4319,6 +4319,7 @@ version = "1.72.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "async-trait",
  "chrono",
  "rmcp",
  "rocky-ai",
