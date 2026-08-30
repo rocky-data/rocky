@@ -112,6 +112,82 @@ run_case "uncoded compiler error is inconclusive" \
 # A test that still passes under mutation proves nothing: verdict 1.
 run_case "surviving mutant fails the check" "" 0 1
 
+# A failed `mktemp` must REFUSE, not sail on with an empty path. Found by
+# independent review (Codex): `set -u` does not catch it, because the variable
+# is set-and-empty rather than unset. `> ""` is an ambiguous redirect that
+# writes nothing, the search below then finds no build errors in a file that was
+# never written, and a broken build reports as a killed mutant — verdict 0 for a
+# test that never ran. This is the exact trace, with the third call failing.
+run_mktemp_exhaustion_case() {
+    local repo
+    repo="$(mktemp -d)"
+
+    (
+        cd "$repo" || exit 2
+        git init -q .
+        git config user.email t@example.invalid
+        git config user.name  t
+        git config commit.gpgsign false
+
+        echo "CLEAN" > probe.txt
+
+        # The mutation compiles nothing — the stub reports a REAL build break,
+        # so the only correct verdicts are 3 (inconclusive) or a refusal. Never 0.
+        cat > stub.sh <<'STUB'
+#!/usr/bin/env bash
+if grep -q MUTATED "$1"; then
+    echo "error[E0308]: mismatched types"
+    echo "error: could not compile \`probe\` (lib test) due to 1 previous error"
+    exit 1
+fi
+echo "test result: ok. 1 passed; 0 failed"
+exit 0
+STUB
+        chmod +x stub.sh
+
+        cat > mut.py <<'MUT'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+open(p, "w").write(s.replace("CLEAN", "MUTATED"))
+MUT
+
+        # Succeeds twice, fails on the third call — the baseline and mutated
+        # logs are created, the filtered log is not.
+        mkdir -p fakebin
+        cat > fakebin/mktemp <<'FAKE'
+#!/usr/bin/env bash
+count_file="${MKTEMP_COUNT_FILE:?}"
+n=$(( $(cat "$count_file" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$count_file"
+# -d (the scratch dir) always delegates; only the plain file calls are counted.
+if [ "$1" = "-d" ]; then exec /usr/bin/mktemp "$@"; fi
+if [ "$n" -ge 3 ]; then exit 1; fi
+exec /usr/bin/mktemp "$@"
+FAKE
+        chmod +x fakebin/mktemp
+
+        git add -A && git commit -qm init
+        MKTEMP_COUNT_FILE="$repo/.mktemp-count" \
+        PATH="$repo/fakebin:$PATH" \
+            "$SCRIPT" probe.txt mut.py ./stub.sh probe.txt > /dev/null 2>&1
+        exit $?
+    )
+    local got=$?
+
+    # 2 = refused to run. 3 would also be acceptable. 0 is the bug.
+    if [ "$got" = "2" ] || [ "$got" = "3" ]; then
+        echo "  ok    a failed mktemp refuses rather than reporting success (exit $got)"
+        pass=$((pass + 1))
+    else
+        echo "  FAIL  a failed mktemp — wanted exit 2 or 3, got $got"
+        fail=$((fail + 1))
+    fi
+    rm -rf "$repo"
+}
+
+run_mktemp_exhaustion_case
+
 echo
 if [ "$fail" -gt 0 ]; then
     echo "$pass passed, $fail FAILED"

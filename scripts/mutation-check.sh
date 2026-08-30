@@ -77,9 +77,16 @@ if [ -n "$dirty" ]; then
     exit 2
 fi
 
-baseline_log="$(mktemp)"
-mutated_log="$(mktemp)"
-filtered_log="$(mktemp)"
+# `set -u` does not catch these: a failed `mktemp` leaves the variable SET and
+# empty, so `> "$var"` becomes `> ""` — an ambiguous redirect that writes
+# nothing. Downstream that reads as "no build errors found", which is the
+# fail-open direction. Refuse instead.
+baseline_log="$(mktemp)" || die "cannot create a temp file for the baseline log"
+[ -n "$baseline_log" ] || die "mktemp returned an empty path for the baseline log"
+mutated_log="$(mktemp)" || die "cannot create a temp file for the mutated log"
+[ -n "$mutated_log" ] || die "mktemp returned an empty path for the mutated log"
+filtered_log="$(mktemp)" || die "cannot create a temp file for the filtered log"
+[ -n "$filtered_log" ] || die "mktemp returned an empty path for the filtered log"
 before="$(git rev-parse HEAD)" || die "cannot read HEAD"
 
 # BASELINE. Run the test command against the clean tree first and require it
@@ -148,7 +155,20 @@ echo "---"
 # `grep -v` that filters out every line exits 1, so a piped conditional would
 # turn "the log was nothing but the summary" into a status that reads the
 # wrong way.
-grep -vE '^error: (test|bench|doctest) (failed|run failed)' "$mutated_log" > "$filtered_log" || true
+grep -vE '^error: (test|bench|doctest) (failed|run failed)' "$mutated_log" > "$filtered_log"
+filter_rc=$?
+# grep: 0 = lines kept, 1 = every line was filtered out (a log that was nothing
+# but the summary — fine), 2+ = a real failure. A bare `|| true` here would
+# swallow that third case and leave an EMPTY filtered log, which the search
+# below reads as "no build errors" — reporting a killed mutant for a build that
+# may well have broken. Fail closed instead: if the log cannot be filtered, we
+# do not know what happened, and INCONCLUSIVE is the honest verdict.
+if [ "$filter_rc" -gt 1 ]; then
+    echo "mutation-check: INCONCLUSIVE — could not filter the mutated log" >&2
+    echo "(grep exited $filter_rc). Refusing to report a verdict from a log" >&2
+    echo "that was not searched." >&2
+    exit 3
+fi
 if grep -qE '^error(\[E[0-9]+\])?:|error: could not compile' "$filtered_log"; then
     echo "mutation-check: INCONCLUSIVE — the mutation broke the build, so the test" >&2
     echo "never ran. Choose a mutation that still compiles (flip a condition to" >&2
