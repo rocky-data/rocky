@@ -5736,10 +5736,12 @@ mod tests {
     /// that file is part of the engine build: editing it changes what `rocky
     /// mcp` serves, and renaming or deleting it fails compilation.
     ///
-    /// `engine-ci.yml` must watch every such path. A check that never runs is
-    /// never satisfied — and because `Test`, `Clippy`, `Format`, `Adapter
-    /// boundary` and the codegen check are REQUIRED contexts, a path the filter
-    /// misses does not merely skip CI, it blocks the merge outright (#1557).
+    /// `engine-ci.yml` must watch every such path, in BOTH places that route
+    /// it since #1563: the `push` trigger still carries a `paths:` filter,
+    /// while `pull_request` runs unfiltered and the `changes` job's
+    /// `ENGINE_PATHS_RE` decides whether the required jobs do real work. A
+    /// path the regex misses skips engine CI for exactly the change that
+    /// needs it — #1557's failure mode, moved one level down (#1557, #1563).
     #[test]
     fn every_out_of_tree_include_is_watched_by_engine_ci() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -5750,6 +5752,18 @@ mod tests {
         let src = std::fs::read_to_string(manifest.join("src/tools.rs")).expect("read tools.rs");
         let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/engine-ci.yml"))
             .expect("read engine-ci.yml");
+
+        // The change-detection regex the `changes` job matches PR diffs
+        // against. One line, `ENGINE_PATHS_RE: <regex>`.
+        let engine_paths_re = workflow
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("ENGINE_PATHS_RE:"))
+            .expect(
+                "engine-ci.yml no longer defines ENGINE_PATHS_RE — the \
+                 change-detection mechanism moved, and this guard needs to \
+                 move with it",
+            )
+            .trim();
 
         // Paths that climb above `engine/` — `src/` is three levels below the
         // repo root, so four or more `../` escapes the engine tree.
@@ -5765,30 +5779,36 @@ mod tests {
                 repo_root.join(repo_relative).exists(),
                 "include_str! names a file that does not exist: {repo_relative}"
             );
-            // EVERY `paths:` list, not merely one of them. `engine-ci.yml`
-            // carries two — `push` and `pull_request` — and a path present in
-            // only one still misses half the trigger. `contains` over the whole
-            // file would pass on a single occurrence; mutation-checking this
-            // test by deleting one of the two proved exactly that.
+            // The `push` trigger's `paths:` list is the only one left since
+            // #1563 removed the pull_request filter. Pin that count so a
+            // reintroduced or dropped list changes this guard deliberately.
             let lists = workflow_path_lists(&workflow);
             assert_eq!(
                 lists.len(),
-                2,
-                "expected engine-ci.yml to carry a `paths:` list for both `push` \
-                 and `pull_request`; found {}. If the triggers changed, this \
-                 guard needs to change with them.",
+                1,
+                "expected engine-ci.yml to carry exactly one `paths:` list \
+                 (push — pull_request is deliberately unfiltered since #1563); \
+                 found {}. If the triggers changed, this guard needs to change \
+                 with them.",
                 lists.len()
             );
-            for (n, list) in lists.iter().enumerate() {
-                assert!(
-                    list.iter().any(|entry| entry == repo_relative),
-                    "`{repo_relative}` is compiled into the engine but is missing \
-                     from engine-ci.yml `paths:` list {n}. The required checks \
-                     would never run for a change to it, so the change gets no \
-                     engine CI AND cannot merge (#1557). It must be in BOTH the \
-                     push and pull_request lists."
-                );
-            }
+            assert!(
+                lists[0].iter().any(|entry| entry == repo_relative),
+                "`{repo_relative}` is compiled into the engine but is missing \
+                 from engine-ci.yml's push `paths:` list. A push touching it \
+                 would run no engine CI (#1557)."
+            );
+            // The PR side: the detection regex must name the file as an
+            // exact-file alternative — the path with its dots escaped, then
+            // `$`. Prefix alternatives like `engine/` do not cover it.
+            let exact_alternative = format!("{}$", repo_relative.replace('.', "\\."));
+            assert!(
+                engine_paths_re.contains(&exact_alternative),
+                "`{repo_relative}` is compiled into the engine but \
+                 ENGINE_PATHS_RE in engine-ci.yml does not carry \
+                 `{exact_alternative}`. A PR touching it would skip the \
+                 required engine jobs (#1557, #1563)."
+            );
             checked += 1;
         }
 
