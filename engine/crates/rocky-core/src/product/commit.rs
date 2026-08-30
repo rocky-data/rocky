@@ -342,7 +342,11 @@ pub fn contained_write_target(project_root: &Path, rel: &str) -> Result<PathBuf,
 /// own stale scratch from a prior crash (the restage-over-orphans case):
 /// it is removed via `remove_file`, which never follows a link either, and
 /// the O_EXCL create retried once.
-fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+///
+/// Exported for the fulfillment loop's staged candidate write, which derives a
+/// temporary path from an already-validated target and so needs the same
+/// leaf protection this module gives its own scratch files (#1500).
+pub fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     // `None` keeps the process default (0666 & umask) these staged
     // artifacts have always been created with — they are renamed into place
