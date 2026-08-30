@@ -142,6 +142,13 @@ pub enum ProposeError {
     /// reason).
     #[error("failed to list durable freeze markers before the policy gate: {0}")]
     MarkerList(String),
+    /// The project config exists but could not be read, so any configured
+    /// `[policy]` rules cannot be evaluated (fail-closed).
+    #[error(
+        "the project config failed to load, so any configured [policy] rules cannot be \
+         enforced (fail-closed). Fix the config and re-run. Cause: {0}"
+    )]
+    PolicyUnreadable(String),
     /// Persisting the gated plan failed.
     #[error("failed to write AI-authored plan: {0}")]
     PlanWrite(String),
@@ -378,7 +385,16 @@ pub async fn propose_governed_run_plan(
     // freeze-gate sync decision and the policy gate, so a `rocky.toml`
     // swap between the two can't let the guard skip the sync while the
     // gate then reads stale local decisions.
-    let cfg = rocky_core::config::load_rocky_config(config_path).ok();
+    //
+    // Fail-closed on a load ERROR. `.ok()` here discarded it, so an unreadable
+    // config produced `None`, the gate below saw no `[policy]`, and a plan a
+    // configured `deny` forbids was persisted anyway. The gate's own
+    // `Unloadable` arm does NOT catch this: `evaluate_apply_policy_with_policy`
+    // is handed the policy directly and never loads a config, so it can never
+    // report `Unloadable` itself. The refusal has to happen HERE, at the read.
+    // A genuinely absent config still yields `None` and the pre-policy posture.
+    let cfg =
+        super::apply::load_config_for_gate(config_path).map_err(ProposeError::PolicyUnreadable)?;
     // Pull the authoritative remote freeze/budget ledger BEFORE the
     // policy gate reads it, so an active cross-pod freeze denies the
     // propose instead of persisting a plan a later apply would refuse.
@@ -426,6 +442,13 @@ pub async fn propose_governed_run_plan(
     };
 
     match gate {
+        // Separate from the permissive arm: an unreadable config leaves any
+        // configured `[policy]` unenforceable, and a propose that writes a plan
+        // under an unknown policy is exactly the fail-open #1559 describes.
+        super::PolicyGate::Unloadable { reason } => Err(ProposeError::PlanWrite(format!(
+            "the project config failed to load, so any configured [policy] rules cannot be \
+             enforced (fail-closed). Fix the config and re-run. Cause: {reason}"
+        ))),
         super::PolicyGate::NotConfigured | super::PolicyGate::Allow => {
             let plan_id = write_plan()?;
             Ok(ProposeOutcome::Written {
@@ -847,6 +870,57 @@ pub use crate::plan_store::EmbeddedCapabilities as ProposeCapabilities;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A propose must refuse when the config exists but cannot be read: any
+    /// `[policy]` block in it is then unenforceable, and writing an
+    /// AI-authored plan under an unknown policy is the fail-open #1559 is
+    /// about.
+    ///
+    /// This does NOT go through the gate's `Unloadable` arm.
+    /// `evaluate_apply_policy_with_policy` is handed the policy directly and
+    /// never loads a config, so it can never report `Unloadable` itself — the
+    /// refusal has to happen at the read. That is exactly why the first
+    /// version of this fix was inert: it added the arm and left the `.ok()`.
+    #[tokio::test]
+    async fn propose_refuses_when_the_config_cannot_be_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let models_dir = root.join("models");
+        write_file(&models_dir.join("orders.sql"), b"SELECT 1 AS id\n");
+        write_file(
+            &models_dir.join("orders.toml"),
+            b"[strategy]\ntype = \"full_refresh\"\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
+        );
+        // Parses as TOML, fails to LOAD: the variable is not set.
+        let config_path = root.join("rocky.toml");
+        write_file(
+            &config_path,
+            b"[adapter]\ntype = \"duckdb\"\npath = \"${ROCKY_T_UNSET_1559_PROPOSE}\"\n\
+              \n[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n",
+        );
+
+        let outcome = propose_governed_run_plan(ProposeRequest {
+            root,
+            config_path: &config_path,
+            models_dir: &models_dir,
+            state_path: &root.join("state.redb"),
+            model: Some("orders".to_string()),
+            product: None,
+            idempotency_key: None,
+        })
+        .await;
+
+        assert!(
+            matches!(outcome, Err(ProposeError::PolicyUnreadable(_))),
+            "an unreadable config must refuse the propose, got: {outcome:?}"
+        );
+        // And nothing may be persisted.
+        let plans = root.join(".rocky").join("plans");
+        let written = std::fs::read_dir(&plans)
+            .map(|d| d.filter_map(std::result::Result::ok).count())
+            .unwrap_or(0);
+        assert_eq!(written, 0, "a refused propose must not persist a plan");
+    }
 
     fn write_file(path: &Path, bytes: &[u8]) {
         if let Some(parent) = path.parent() {
