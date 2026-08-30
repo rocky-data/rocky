@@ -79,6 +79,7 @@ fi
 
 baseline_log="$(mktemp)"
 mutated_log="$(mktemp)"
+filtered_log="$(mktemp)"
 before="$(git rev-parse HEAD)" || die "cannot read HEAD"
 
 # BASELINE. Run the test command against the clean tree first and require it
@@ -101,7 +102,7 @@ echo "mutation-check: baseline passes"
 # ONE exit trap: setting a second `trap ... EXIT` later would silently replace
 # the first, and the one that must never be lost is the restore.
 restore() {
-    rm -f "$baseline_log" "$mutated_log"
+    rm -f "$baseline_log" "$mutated_log" "$filtered_log"
     git checkout HEAD -- "$target" 2>/dev/null
     local left
     left="$(git status --porcelain)"
@@ -136,7 +137,19 @@ echo "---"
 # when a mutation deletes a condition and leaves an unused binding. Reporting
 # that as "fix-sensitive" would be the same false green this script exists to
 # prevent, inside the script.
-if grep -qE '^error(\[E[0-9]+\])?:|error: could not compile' "$mutated_log"; then
+# The runner prints its own failure summary at the start of a line, and it
+# begins with `error:` — `cargo test` says "error: test failed, to rerun pass
+# ...", nextest says "error: test run failed". Those are what a KILLED mutant
+# looks like, which is the verdict this script exists to report. Matching them
+# as a broken build inverts the signal (#1535, #1547), so strip them first and
+# look for compiler diagnostics in what is left.
+#
+# Filtered into a file rather than piped: `set -o pipefail` is on, and a
+# `grep -v` that filters out every line exits 1, so a piped conditional would
+# turn "the log was nothing but the summary" into a status that reads the
+# wrong way.
+grep -vE '^error: (test|bench|doctest) (failed|run failed)' "$mutated_log" > "$filtered_log" || true
+if grep -qE '^error(\[E[0-9]+\])?:|error: could not compile' "$filtered_log"; then
     echo "mutation-check: INCONCLUSIVE — the mutation broke the build, so the test" >&2
     echo "never ran. Choose a mutation that still compiles (flip a condition to" >&2
     echo "\`false &&\`, change a constant) rather than one that deletes code." >&2

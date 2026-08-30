@@ -31,6 +31,18 @@ jobs:
       - name: Run the verdict self-test
         run: python3 scripts/soak_verdict.py --self-test
 
+  mutation-check-verdicts:
+    name: Mutation-check verdicts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pin the killed / survived / inconclusive verdicts
+        # Uses stub commands in scratch repos, so no Rust toolchain is needed.
+        run: bash scripts/tests/mutation-check.test.sh
+
   shellcheck:
     name: Shellcheck scripts
     runs-on: ubuntu-latest
