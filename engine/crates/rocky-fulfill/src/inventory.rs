@@ -85,6 +85,13 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // Spec identity + the confined write target (the runner's candidate
     // write and the snapshot re-verification).
     "rocky_core::product::commit::contained_write_target",
+    // The staged candidate's tmp is DERIVED from that validated target, so no
+    // check has seen it. Written through the same O_EXCL no-follow create the
+    // commit module uses for its own scratch, rather than a plain
+    // `std::fs::write` that follows a planted link (#1500). Added deliberately:
+    // one more function from a module this crate already consumes, and the
+    // alternative was a second copy of a guard that is easy to get subtly wrong.
+    "rocky_core::product::commit::write_new_no_follow",
     "rocky_core::product::spec::ParsedSpec",
     "rocky_core::product::spec::parse_spec_bytes",
     "rocky_core::product::spec::spec_digest",

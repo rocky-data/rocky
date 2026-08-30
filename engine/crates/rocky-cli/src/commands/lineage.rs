@@ -61,7 +61,6 @@ pub fn run_lineage(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas,
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
@@ -376,7 +375,6 @@ mod tests {
             models_dir: models_dir.to_path_buf(),
             contracts_dir: None,
             source_schemas: HashMap::new(),
-            source_column_info: HashMap::new(),
             ..Default::default()
         };
         compile::compile(&config).expect("chain compiles")

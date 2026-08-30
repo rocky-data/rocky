@@ -191,7 +191,6 @@ fn compile_for_propose(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas,
-        source_column_info: std::collections::HashMap::new(),
         ..Default::default()
     };
     compile::compile(&config).map_err(|e| anyhow::anyhow!("compile failed: {e}"))
@@ -705,7 +704,6 @@ pub async fn observe_max_time_column(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
-        source_column_info: std::collections::HashMap::new(),
         ..Default::default()
     };
     let result = compile::compile(&compiler_cfg).context("compile failed")?;

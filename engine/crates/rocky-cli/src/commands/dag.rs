@@ -478,7 +478,6 @@ fn build_column_lineage_from_models(
             schema_cache_cfg,
             state_path,
         ),
-        source_column_info: std::collections::HashMap::new(),
         ..Default::default()
     };
 

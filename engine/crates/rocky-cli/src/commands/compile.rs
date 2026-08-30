@@ -161,7 +161,6 @@ fn compile_inner(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(std::path::Path::to_path_buf),
         source_schemas,
-        source_column_info: HashMap::new(),
         mask,
         allow_unmasked,
         project_freshness_default,
