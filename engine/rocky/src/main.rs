@@ -756,6 +756,13 @@ enum Command {
     /// <plan-id>` replays the same intent. Flags whose semantics depend on
     /// state observed at apply time — `--resume-latest`, `--missing` — are
     /// evaluated at apply time, not plan time.
+    ///
+    /// Those default-plan flags are refused when a subcommand follows — the
+    /// guard sits at the head of the dispatch. NOT clap's
+    /// `args_conflicts_with_subcommands`: that also conflicts INHERITED GLOBALS
+    /// placed before the subcommand, so `rocky plan --output json promote b`
+    /// and `rocky plan --principal agent promote b` — both legitimate, both
+    /// consumed by the promote path — would be refused (#1550).
     Plan {
         /// Optional subcommand (e.g. `promote`). When absent, runs the default
         /// replication dry-run plan.
@@ -1689,6 +1696,14 @@ enum Command {
         /// var when omitted. Required when `--host` is non-loopback.
         #[arg(long)]
         token: Option<String>,
+        /// What `--token` may do. `full` (the default) reaches every route.
+        /// `read-only` authenticates the same way but is refused `403` on any
+        /// request whose method is not `GET`, `HEAD`, or `OPTIONS` — the token
+        /// to hand a browser UI, so one leak can't reach a warehouse mutation.
+        /// Falls back to `ROCKY_SERVE_TOKEN_SCOPE`. Setting a scope without a
+        /// token is an error.
+        #[arg(long = "token-scope", value_name = "SCOPE", value_parser = ["full", "read-only"])]
+        token_scope: Option<String>,
         /// CORS allowlist. Repeat for each origin (e.g.
         /// `--allowed-origin http://localhost:5173`). The default
         /// allowlist is empty (same-origin only).
@@ -2969,6 +2984,30 @@ fn reset_sigpipe() {
 /// global subscriber. Splitting it drops that to ~5 ms for the
 /// fast-exit flags, which matters for shell prompt integrations and
 /// editor-extension startup checks.
+/// The first supplied default-plan flag, if any.
+///
+/// `rocky plan`'s own flags are declared `global = false` and documented
+/// "Applies to the default plan subcommand only". The `Some(PlanSubcommand)`
+/// dispatch reads none of them, so supplying one used to be accepted and
+/// silently discarded (#1550).
+///
+/// Deliberately NOT clap's `args_conflicts_with_subcommands`. That conflicts
+/// inherited GLOBALS as well when they appear before the subcommand, which
+/// would refuse `rocky plan --output json promote b` — legitimate, and consumed
+/// by the promote path. This sees only the flags `plan` itself declares.
+///
+/// Detection is by VALUE, not by clap's `ValueSource`. The three flags carrying
+/// a `default_value` (`--shadow-suffix`, `--parallel`, `--base`) are compared
+/// against that default, so passing one explicitly AT its default is not
+/// reported — an invocation indistinguishable from omitting it, and identical
+/// in effect.
+fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'static str> {
+    flags
+        .iter()
+        .find(|(_, supplied)| *supplied)
+        .map(|(name, _)| *name)
+}
+
 fn main() -> Result<()> {
     // Must run before `Cli::parse()`: clap emits `--help` / `--version`
     // through `println!`, which panics on EPIPE if SIGPIPE is ignored.
@@ -3406,92 +3445,135 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             env,
             semantic,
             base,
-        } => match subcommand {
-            None => {
-                // Mirror the `rocky run` guard: --idempotency-key is mutually
-                // exclusive with --resume / --resume-latest. Enforced at plan
-                // time so a malformed plan never lands on disk.
-                if idempotency_key.is_some() && (resume.is_some() || resume_latest) {
-                    anyhow::bail!(
-                        "--idempotency-key cannot be combined with --resume / --resume-latest \
+        } => {
+            // #1550: a default-plan flag alongside a plan subcommand used to be
+            // ACCEPTED and then silently discarded — the dispatch below reads
+            // none of them, so `rocky plan --resume-latest promote <b>` ran the
+            // promote and threw the flag away. Checked here, before any work,
+            // and only over the flags `plan` itself declares: inherited globals
+            // (`--output`, `--principal`) are consumed by the promote path and
+            // must keep working before the subcommand.
+            if subcommand.is_some()
+                && let Some(flag) = offending_default_plan_flag(&[
+                    ("--filter", filter.is_some()),
+                    ("--pipeline", pipeline.is_some()),
+                    ("--model", model.is_some()),
+                    ("--governance-override", governance_override.is_some()),
+                    ("--models", models_dir.is_some()),
+                    ("--all", all),
+                    ("--resume", resume.is_some()),
+                    ("--resume-latest", resume_latest),
+                    ("--shadow", shadow),
+                    ("--shadow-suffix", shadow_suffix != "_rocky_shadow"),
+                    ("--shadow-schema", shadow_schema.is_some()),
+                    ("--branch", branch.is_some()),
+                    ("--partition", partition.is_some()),
+                    ("--from", from.is_some()),
+                    ("--to", to.is_some()),
+                    ("--latest", latest),
+                    ("--missing", missing),
+                    ("--lookback", lookback.is_some()),
+                    ("--parallel", parallel != 1),
+                    ("--dag", dag),
+                    ("--idempotency-key", idempotency_key.is_some()),
+                    ("--env", env.is_some()),
+                    ("--semantic", semantic),
+                    ("--base", base != "main"),
+                ])
+            {
+                anyhow::bail!(
+                    "{flag} applies to the default `rocky plan`, and a plan subcommand was \
+                     given. It would be accepted and then ignored. Drop it, or run \
+                     `rocky plan {flag} ...` without the subcommand."
+                );
+            }
+            match subcommand {
+                None => {
+                    // Mirror the `rocky run` guard: --idempotency-key is mutually
+                    // exclusive with --resume / --resume-latest. Enforced at plan
+                    // time so a malformed plan never lands on disk.
+                    if idempotency_key.is_some() && (resume.is_some() || resume_latest) {
+                        anyhow::bail!(
+                            "--idempotency-key cannot be combined with --resume / --resume-latest \
                          (resume is an explicit override of idempotent skip)"
-                    );
+                        );
+                    }
+                    let gov_override = parse_governance_override(governance_override.as_deref())?;
+                    let partition_opts = rocky_cli::commands::PartitionRunOptions {
+                        partition,
+                        from,
+                        to,
+                        latest,
+                        missing,
+                        lookback,
+                        parallel,
+                    };
+                    // Only persist `shadow_suffix` when shadow mode is actually
+                    // requested (either --shadow or --branch). Otherwise it's the
+                    // clap default `_rocky_shadow` and would pollute every plan's
+                    // payload — and change the plan_id hash — for plans where the
+                    // flag is meaningless.
+                    let shadow_suffix = if shadow || branch.is_some() {
+                        Some(shadow_suffix)
+                    } else {
+                        None
+                    };
+                    let run_options = rocky_cli::commands::PlanRunOptions {
+                        model,
+                        all,
+                        resume,
+                        resume_latest,
+                        shadow,
+                        shadow_suffix,
+                        shadow_schema,
+                        branch,
+                        dag,
+                        idempotency_key,
+                        governance_override: gov_override,
+                        models_dir,
+                        partition_opts,
+                        principal: Some(resolve_cli_principal(cli.principal)?),
+                    };
+                    rocky_cli::commands::plan(
+                        &cli.config,
+                        filter.as_deref(),
+                        pipeline.as_deref(),
+                        env.as_deref(),
+                        &run_options,
+                        semantic,
+                        &base,
+                        &state_path,
+                        json,
+                    )
+                    .await
                 }
-                let gov_override = parse_governance_override(governance_override.as_deref())?;
-                let partition_opts = rocky_cli::commands::PartitionRunOptions {
-                    partition,
-                    from,
-                    to,
-                    latest,
-                    missing,
-                    lookback,
-                    parallel,
-                };
-                // Only persist `shadow_suffix` when shadow mode is actually
-                // requested (either --shadow or --branch). Otherwise it's the
-                // clap default `_rocky_shadow` and would pollute every plan's
-                // payload — and change the plan_id hash — for plans where the
-                // flag is meaningless.
-                let shadow_suffix = if shadow || branch.is_some() {
-                    Some(shadow_suffix)
-                } else {
-                    None
-                };
-                let run_options = rocky_cli::commands::PlanRunOptions {
-                    model,
-                    all,
-                    resume,
-                    resume_latest,
-                    shadow,
-                    shadow_suffix,
-                    shadow_schema,
-                    branch,
-                    dag,
-                    idempotency_key,
-                    governance_override: gov_override,
-                    models_dir,
-                    partition_opts,
-                    principal: Some(resolve_cli_principal(cli.principal)?),
-                };
-                rocky_cli::commands::plan(
-                    &cli.config,
-                    filter.as_deref(),
-                    pipeline.as_deref(),
-                    env.as_deref(),
-                    &run_options,
-                    semantic,
-                    &base,
-                    &state_path,
-                    json,
-                )
-                .await
-            }
-            Some(PlanSubcommand::Promote {
-                name,
-                base,
-                allow_breaking,
-                filter: promote_filter,
-                pipeline: promote_pipeline,
-                models,
-            }) => {
-                let cwd =
-                    std::env::current_dir().context("failed to get current working directory")?;
-                rocky_cli::commands::plan_promote(
-                    &cwd,
-                    &cli.config,
-                    &models,
-                    &base,
-                    &name,
-                    promote_filter.as_deref(),
-                    promote_pipeline.as_deref(),
+                Some(PlanSubcommand::Promote {
+                    name,
+                    base,
                     allow_breaking,
-                    &state_path,
-                    resolve_cli_principal(cli.principal)?,
-                    json,
-                )
-                .await
+                    filter: promote_filter,
+                    pipeline: promote_pipeline,
+                    models,
+                }) => {
+                    let cwd = std::env::current_dir()
+                        .context("failed to get current working directory")?;
+                    rocky_cli::commands::plan_promote(
+                        &cwd,
+                        &cli.config,
+                        &models,
+                        &base,
+                        &name,
+                        promote_filter.as_deref(),
+                        promote_pipeline.as_deref(),
+                        allow_breaking,
+                        &state_path,
+                        resolve_cli_principal(cli.principal)?,
+                        json,
+                    )
+                    .await
+                }
             }
-        },
+        }
         Command::Run {
             filter,
             pipeline,
@@ -4131,6 +4213,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
             port,
             watch,
             token,
+            token_scope,
             allowed_origins,
             scheduler,
             poll_interval_seconds,
@@ -4156,6 +4239,7 @@ async fn run_async(cli: Cli, json: bool) -> Result<()> {
                 port,
                 watch,
                 token,
+                token_scope,
                 allowed_origins,
                 scheduler,
                 poll_interval_seconds,
@@ -5006,6 +5090,96 @@ mod tests {
                 .join()
                 .expect("parser thread panicked")
         })
+    }
+
+    /// Every `plan`-declared flag must appear in the #1550 guard's list.
+    ///
+    /// The guard is an explicit array in the dispatch, so a flag added to
+    /// `Plan` later would be silently unguarded — accepted alongside a
+    /// subcommand and dropped, which is the exact bug. This reads both lists
+    /// out of this file and compares them, so the omission fails here.
+    #[test]
+    fn every_plan_flag_is_covered_by_the_subcommand_guard() {
+        let src = include_str!("main.rs");
+        let variant = between(src, "    Plan {\n", "\n    },\n").expect("the Plan variant");
+
+        let mut declared: Vec<String> = Vec::new();
+        for chunk in variant.split("#[arg(").skip(1) {
+            let (attrs, rest) = chunk.split_once(")]").expect("arg attribute");
+            if !attrs.contains("global = false") {
+                continue;
+            }
+            let field = rest
+                .lines()
+                .find(|l| l.contains(':') && !l.trim_start().starts_with("///"))
+                .and_then(|l| l.trim().split(':').next().map(str::to_string))
+                .expect("field name");
+            declared.push(format!("--{}", field.replace('_', "-")));
+        }
+        assert!(
+            declared.len() > 15,
+            "expected plan to declare many own flags, found {declared:?} — the scan broke and \
+             this test would pass vacuously"
+        );
+
+        let guard = between(
+            src,
+            "offending_default_plan_flag(&[\n",
+            "\n                ])",
+        )
+        .expect("guard");
+        let missing: Vec<&String> = declared
+            .iter()
+            .filter(|flag| !guard.contains(&format!("(\"{flag}\"")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these `plan` flags are missing from the #1550 subcommand guard, so they would be \
+             accepted alongside a subcommand and silently dropped: {missing:?}"
+        );
+    }
+
+    /// Substring between two markers — enough to read this file's own source
+    /// without adding a regex dependency for one test.
+    fn between(src: &str, open: &str, close: &str) -> Option<String> {
+        let start = src.find(open)? + open.len();
+        let end = src[start..].find(close)? + start;
+        Some(src[start..end].to_string())
+    }
+
+    /// A global flag placed BEFORE a plan subcommand must still parse.
+    ///
+    /// This is why the fix is not clap's `args_conflicts_with_subcommands`:
+    /// that conflicts inherited globals too, so
+    /// `rocky plan --output json promote b` — legitimate, and consumed by the
+    /// promote path — was refused. Found by independent review; this test is
+    /// the coverage that was missing when it was.
+    #[test]
+    fn globals_before_a_plan_subcommand_still_parse() {
+        for argv in [
+            vec!["rocky", "plan", "--output", "json", "promote", "b"],
+            vec!["rocky", "plan", "-o", "json", "promote", "b"],
+            vec!["rocky", "plan", "--principal", "agent", "promote", "b"],
+        ] {
+            let cli = try_parse_with_big_stack(&argv);
+            let Command::Plan { subcommand, .. } = cli.command else {
+                panic!("expected the plan command for {argv:?}");
+            };
+            assert!(subcommand.is_some(), "{argv:?} must still parse");
+        }
+    }
+
+    /// The guard reports the FIRST supplied flag and stays quiet otherwise.
+    #[test]
+    fn offending_default_plan_flag_reports_only_what_was_supplied() {
+        assert_eq!(
+            offending_default_plan_flag(&[("--filter", false), ("--shadow", false)]),
+            None
+        );
+        assert_eq!(
+            offending_default_plan_flag(&[("--filter", false), ("--shadow", true)]),
+            Some("--shadow")
+        );
     }
 
     /// `--dag` drops the resume flags on the floor: `run_with_dag` takes no

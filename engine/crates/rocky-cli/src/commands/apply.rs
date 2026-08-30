@@ -1148,6 +1148,18 @@ pub enum PolicyGate {
     /// (AiAuthored → require a review marker; Run/Promote → ungated), so
     /// absent-`[policy]` behaviour is byte-identical to today.
     NotConfigured,
+    /// The config could not be READ, so whether a `[policy]` block exists is
+    /// unknown. Distinct from [`PolicyGate::NotConfigured`] on purpose: "there
+    /// is no policy" and "we could not find out" are different answers, and
+    /// only the first is permission.
+    ///
+    /// Every consumer must refuse on this. Collapsing it into the
+    /// `NotConfigured | Allow` arm is what let a configured `deny` stop denying
+    /// when an unrelated `${VAR}` was unset (#1559).
+    Unloadable {
+        /// Why the config could not be read, for the refusal message.
+        reason: String,
+    },
     /// Every touched model resolved to `allow`. Proceed without a marker.
     Allow,
     /// The most-restrictive effect is `require_review`. A human review marker
@@ -1508,9 +1520,10 @@ pub fn evaluate_apply_policy(
     // the pre-gate sync decision, so the sync-guard and this gate can never
     // disagree about whether `[policy]` is configured (finding A — config-snapshot
     // TOCTOU).
-    let policy = rocky_core::config::load_rocky_config(config_path)
-        .ok()
-        .and_then(|cfg| cfg.policy);
+    let policy = match load_policy_for_gate(config_path) {
+        Ok(policy) => policy,
+        Err(reason) => return PolicyGate::Unloadable { reason },
+    };
     evaluate_apply_policy_with_policy(
         policy.as_ref(),
         plan_id,
@@ -1581,6 +1594,35 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
     )
 }
 
+/// Load the `[policy]` block for a gate decision, distinguishing "no config
+/// file" from "the config could not be read".
+///
+/// `Ok(None)` means there is genuinely no project config — the standalone case,
+/// which keeps the pre-policy-plane posture. `Err` means the file exists and
+/// did not load, so any `[policy]` block in it is unknown and unenforceable.
+///
+/// This is the shape `rocky gc` already uses at its own seam (`gc.rs:1661`),
+/// with the comment that says why: a config-load error "would otherwise
+/// silently unenforce a possibly-configured `[policy]` block". That reasoning
+/// was never applied to the shared gate, which swallowed the error with `.ok()`
+/// and reported `NotConfigured` — indistinguishable from permission (#1559).
+pub(crate) fn load_config_for_gate(
+    config_path: &Path,
+) -> Result<Option<rocky_core::config::RockyConfig>, String> {
+    match rocky_core::config::load_rocky_config(config_path) {
+        Ok(cfg) => Ok(Some(cfg)),
+        Err(rocky_core::config::ConfigError::FileNotFound { .. }) => Ok(None),
+        Err(e) => Err(format!("{e}")),
+    }
+}
+
+/// [`load_config_for_gate`], narrowed to the `[policy]` block.
+fn load_policy_for_gate(
+    config_path: &Path,
+) -> Result<Option<rocky_core::config::PolicyConfig>, String> {
+    Ok(load_config_for_gate(config_path)?.and_then(|cfg| cfg.policy))
+}
+
 /// [`evaluate_apply_policy`] evaluated over BOTH the pre-image and the
 /// post-image classification state, returning the most restrictive verdict.
 ///
@@ -1607,9 +1649,10 @@ pub fn evaluate_apply_policy_with_extra_classifications(
     marker_freezes: &[rocky_core::freeze_marker::ActiveMarkerFreeze],
     prior_classifications: &BTreeMap<String, Vec<String>>,
 ) -> PolicyGate {
-    let policy = rocky_core::config::load_rocky_config(config_path)
-        .ok()
-        .and_then(|cfg| cfg.policy);
+    let policy = match load_policy_for_gate(config_path) {
+        Ok(policy) => policy,
+        Err(reason) => return PolicyGate::Unloadable { reason },
+    };
     evaluate_apply_policy_with_policy_matching_dual(
         policy.as_ref(),
         plan_id,
@@ -2096,6 +2139,10 @@ fn gate_rank(gate: &PolicyGate) -> u8 {
         PolicyGate::Allow => policy::effect_rank(PolicyEffect::Allow),
         PolicyGate::RequireReview { .. } => policy::effect_rank(PolicyEffect::RequireReview),
         PolicyGate::Deny { .. } => policy::effect_rank(PolicyEffect::Deny),
+        // Above `Deny`: an unreadable config might have denied, and the
+        // aggregate keeps the MOST restrictive outcome. Ranking it any lower
+        // would let a readable `allow` on another model out-vote it.
+        PolicyGate::Unloadable { .. } => u8::MAX,
     }
 }
 
@@ -3166,6 +3213,14 @@ pub(crate) async fn gate_maintenance_apply(
 pub(crate) fn apply_policy_gate(root: &Path, plan_id: &str, gate: PolicyGate) -> Result<()> {
     match gate {
         PolicyGate::NotConfigured | PolicyGate::Allow => Ok(()),
+        // NOT grouped with the arm above. A config that would not load may well
+        // carry a `[policy]` block that denies this exact plan; proceeding
+        // would enforce nothing while reporting success (#1559).
+        PolicyGate::Unloadable { reason } => Err(anyhow::anyhow!(
+            "refusing to apply plan '{plan_id}': the project config failed to load, so any \
+             configured [policy] rules cannot be enforced (fail-closed). Fix the config and \
+             re-run. Cause: {reason}"
+        )),
         PolicyGate::RequireReview {
             model,
             rule_id,
@@ -4719,6 +4774,96 @@ pub async fn run_apply_inline_for_run(
 
 #[cfg(test)]
 mod tests {
+
+    // ---- the policy gate fails closed on an unreadable config (#1559) ----
+
+    /// A config that EXISTS but does not load must not read as "no policy
+    /// configured". Those are different answers and only the first is
+    /// permission — a configured `deny` used to stop denying when an unrelated
+    /// `${VAR}` was unset.
+    #[test]
+    fn an_unreadable_config_is_unloadable_not_notconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("rocky.toml");
+        // Parses as a file, fails to LOAD: the variable is not set.
+        std::fs::write(
+            &cfg,
+            "[adapter]\ntype = \"databricks\"\nhost = \"${ROCKY_T_UNSET_1559}\"\n\
+             \n[policy]\nversion = 1\ndefault_agent_effect = \"deny\"\n",
+        )
+        .unwrap();
+
+        let gate = evaluate_apply_policy(
+            &cfg,
+            "plan-1",
+            PolicyPrincipal::Agent,
+            &BTreeMap::new(),
+            dir.path(),
+            &dir.path().join("state.redb"),
+            &[],
+        );
+        assert!(
+            matches!(gate, PolicyGate::Unloadable { .. }),
+            "an unreadable config must be Unloadable, not {gate:?}"
+        );
+
+        // And the gate must refuse it rather than proceeding.
+        let refused = apply_policy_gate(dir.path(), "plan-1", gate);
+        assert!(
+            refused.is_err(),
+            "an unreadable policy must refuse the apply"
+        );
+    }
+
+    /// A genuinely ABSENT config keeps the pre-policy-plane posture. Without
+    /// this, failing closed on an unreadable config would also break every
+    /// standalone `rocky compile --models …` project that has no rocky.toml.
+    #[test]
+    fn a_missing_config_is_still_notconfigured() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = evaluate_apply_policy(
+            &dir.path().join("does-not-exist.toml"),
+            "plan-1",
+            PolicyPrincipal::Agent,
+            &BTreeMap::new(),
+            dir.path(),
+            &dir.path().join("state.redb"),
+            &[],
+        );
+        assert!(
+            matches!(gate, PolicyGate::NotConfigured),
+            "an absent config must stay NotConfigured, not {gate:?}"
+        );
+        assert!(apply_policy_gate(dir.path(), "plan-1", gate).is_ok());
+    }
+
+    /// Aggregation must not lose an `Unloadable`. It ranks above `Deny`, so a
+    /// readable `allow` on another model cannot out-vote it.
+    #[test]
+    fn unloadable_outranks_every_other_gate() {
+        let unloadable = PolicyGate::Unloadable {
+            reason: "boom".to_string(),
+        };
+        for other in [
+            PolicyGate::NotConfigured,
+            PolicyGate::Allow,
+            PolicyGate::RequireReview {
+                model: "m".into(),
+                rule_id: None,
+                reason: "r".into(),
+            },
+            PolicyGate::Deny {
+                model: "m".into(),
+                rule_id: None,
+                reason: "r".into(),
+            },
+        ] {
+            assert!(
+                gate_rank(&unloadable) > gate_rank(&other),
+                "Unloadable must outrank {other:?}"
+            );
+        }
+    }
     use super::*;
     use crate::output::{ReplicationTableSnapshot, RunPlan};
     use crate::plan_store::write_plan;
