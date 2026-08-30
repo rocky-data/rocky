@@ -5429,6 +5429,34 @@ mod tests {
     /// named as NOT available, the hand-off named as the ending) and serves
     /// the skill text below it UNCHANGED; the default profile serves the
     /// skill text verbatim, byte-identical to the compiled file.
+    /// Every `paths:` list in a workflow, as its quoted entries. Enough YAML
+    /// to check a trigger filter without taking a parser dependency: a
+    /// `paths:` line, then the `- '...'` entries indented under it.
+    fn workflow_path_lists(workflow: &str) -> Vec<Vec<String>> {
+        let mut lists = Vec::new();
+        let mut lines = workflow.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim() != "paths:" {
+                continue;
+            }
+            let mut entries = Vec::new();
+            while let Some(next) = lines.peek() {
+                let t = next.trim();
+                if t.starts_with('#') {
+                    lines.next();
+                    continue;
+                }
+                let Some(value) = t.strip_prefix("- ") else {
+                    break;
+                };
+                entries.push(value.trim_matches('\'').trim_matches('"').to_string());
+                lines.next();
+            }
+            lists.push(entries);
+        }
+        lists
+    }
+
     /// `include_str!` reaches OUT of `engine/` for the AI-workflow skill, so
     /// that file is part of the engine build: editing it changes what `rocky
     /// mcp` serves, and renaming or deleting it fails compilation.
@@ -5462,14 +5490,30 @@ mod tests {
                 repo_root.join(repo_relative).exists(),
                 "include_str! names a file that does not exist: {repo_relative}"
             );
-            assert!(
-                workflow.contains(repo_relative),
-                "`{repo_relative}` is compiled into the engine but is not in \
-                 engine-ci.yml's path filters. The required checks would never \
-                 run for a change to it, so the change gets no engine CI AND \
-                 cannot merge (#1557). Add it to BOTH the push and \
-                 pull_request `paths` lists."
+            // EVERY `paths:` list, not merely one of them. `engine-ci.yml`
+            // carries two — `push` and `pull_request` — and a path present in
+            // only one still misses half the trigger. `contains` over the whole
+            // file would pass on a single occurrence; mutation-checking this
+            // test by deleting one of the two proved exactly that.
+            let lists = workflow_path_lists(&workflow);
+            assert_eq!(
+                lists.len(),
+                2,
+                "expected engine-ci.yml to carry a `paths:` list for both `push` \
+                 and `pull_request`; found {}. If the triggers changed, this \
+                 guard needs to change with them.",
+                lists.len()
             );
+            for (n, list) in lists.iter().enumerate() {
+                assert!(
+                    list.iter().any(|entry| entry == repo_relative),
+                    "`{repo_relative}` is compiled into the engine but is missing \
+                     from engine-ci.yml `paths:` list {n}. The required checks \
+                     would never run for a change to it, so the change gets no \
+                     engine CI AND cannot merge (#1557). It must be in BOTH the \
+                     push and pull_request lists."
+                );
+            }
             checked += 1;
         }
 
