@@ -6,12 +6,24 @@ on:
     paths:
       - 'engine/**'
       - 'schemas/**'
+      # Compiled INTO the binary: rocky-mcp `include_str!`s this skill as the
+      # MCP `instructions` (crates/rocky-mcp/src/tools.rs). Editing it changes
+      # what `rocky mcp` serves, and renaming or deleting it fails the build —
+      # so it needs engine CI, and without it the five required contexts never
+      # run and the PR cannot merge at all (#1557).
+      - '.claude/skills/rocky-ai-workflow/SKILL.md'
       - '.github/workflows/engine-ci.yml'
   pull_request:
     branches: [main]
     paths:
       - 'engine/**'
       - 'schemas/**'
+      # Compiled INTO the binary: rocky-mcp `include_str!`s this skill as the
+      # MCP `instructions` (crates/rocky-mcp/src/tools.rs). Editing it changes
+      # what `rocky mcp` serves, and renaming or deleting it fails the build —
+      # so it needs engine CI, and without it the five required contexts never
+      # run and the PR cannot merge at all (#1557).
+      - '.claude/skills/rocky-ai-workflow/SKILL.md'
       - '.github/workflows/engine-ci.yml'
 
 # CI only reads the repo; restrict the token to the minimum (CodeQL ql-for-actions).

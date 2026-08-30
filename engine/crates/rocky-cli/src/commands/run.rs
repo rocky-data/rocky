@@ -10534,8 +10534,32 @@ async fn run_one_partition(
     let partition_start = std::time::Instant::now();
     let partition_started_at = chrono::Utc::now();
 
+    // Every logical partition this batch covers: the leading key plus
+    // `batch_with`. ALL THREE status writes below go through this.
+    //
+    // They used to disagree. The success path marked the whole batch
+    // `Computed` (#1488) while the failure path wrote one `Failed` record for
+    // the leading key only, so a mid-batch failure left the other keys
+    // `Computed` — describing rows that no longer exist on an adapter whose
+    // partition overwrite is not atomic (Trino: `DELETE` then `INSERT`, each in
+    // its own transaction). `--missing` subtracts only `Computed`, so those
+    // keys were never re-planned and the gap was permanent (#1496).
+    //
+    // `PartitionPlan`'s own doc states the invariant this restores: "a failure
+    // mid-batch leaves the whole batch in undefined state."
+    let batch_records = |template: &PartitionRecord| -> Vec<PartitionRecord> {
+        std::iter::once(&key)
+            .chain(&partition_plan.batch_with)
+            .map(|partition_key| PartitionRecord {
+                partition_key: partition_key.clone(),
+                ..template.clone()
+            })
+            .collect()
+    };
+
     // Mark InProgress before executing so a crashed runner leaves a
-    // diagnostic breadcrumb in the state store.
+    // diagnostic breadcrumb in the state store — for the WHOLE batch, so a
+    // crash between here and the verdict is re-planned in full.
     let mut record = PartitionRecord {
         model_name: model_name.into(),
         partition_key: key.clone(),
@@ -10546,7 +10570,7 @@ async fn run_one_partition(
         run_id: run_id.into(),
         checksum: None,
     };
-    if let Err(e) = state_ref.record_partition(&record) {
+    if let Err(e) = state_ref.record_partitions(&batch_records(&record)) {
         return PartitionExecutionResult {
             partition_key: key.clone(),
             outcome: Err(anyhow::Error::from(e).context(format!(
@@ -10622,9 +10646,12 @@ async fn run_one_partition(
         // are expected.
         let _ = warehouse.execute_statement("ROLLBACK").await;
 
+        // The whole batch is undefined now, not just the leading key. Both
+        // `Failed` and `InProgress` are re-planned by `--missing`, so writing
+        // every key heals the batch on the next run.
         record.status = PartitionStatus::Failed;
         record.duration_ms = partition_start.elapsed().as_millis() as u64;
-        let _ = state_ref.record_partition(&record);
+        let _ = state_ref.record_partitions(&batch_records(&record));
 
         return PartitionExecutionResult {
             partition_key: key,
@@ -10636,13 +10663,7 @@ async fn run_one_partition(
     // Computed so --missing does not re-run keys already committed above.
     record.status = PartitionStatus::Computed;
     record.duration_ms = partition_start.elapsed().as_millis() as u64;
-    let records: Vec<_> = std::iter::once(&key)
-        .chain(&partition_plan.batch_with)
-        .map(|partition_key| PartitionRecord {
-            partition_key: partition_key.clone(),
-            ..record.clone()
-        })
-        .collect();
+    let records = batch_records(&record);
     if let Err(e) = state_ref.record_partitions(&records) {
         return PartitionExecutionResult {
             partition_key: key.clone(),
@@ -11993,6 +12014,49 @@ fn is_rate_limit_error(error_msg: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every partition-status write in `run_one_partition` must cover the WHOLE
+    /// batch, not just its leading key.
+    ///
+    /// The success path marked all of `batch_with` `Computed` (#1488) while the
+    /// failure path wrote one `Failed` record for the leading key. On Trino —
+    /// the only adapter whose partition overwrite is not atomic — a mid-batch
+    /// failure then left the other keys `Computed` describing rows the
+    /// committed `DELETE` had already removed. `--missing` subtracts only
+    /// `Computed`, so nothing ever re-planned them (#1496).
+    ///
+    /// The three writes now share one `batch_records` helper. This guards the
+    /// asymmetry from coming back: the singular `record_partition` cannot
+    /// reappear in this file, because every use of it here would be a
+    /// leading-key-only write.
+    #[test]
+    fn every_partition_status_write_covers_the_whole_batch() {
+        // PRODUCTION code only. This test's own body mentions the singular
+        // form in its assertion message, and would otherwise match itself —
+        // which it did on the first run.
+        let full = include_str!("run.rs");
+        let src = &full[..full.find("\n#[cfg(test)]").expect("a test module")];
+        let singular = src.matches(".record_partition(").count();
+        assert_eq!(
+            singular, 0,
+            "`.record_partition()` writes ONE key. In this file every status write \
+             must go through `record_partitions()` with the batch's full key set, or a \
+             mid-batch failure leaves stale rows that --missing will not re-plan (#1496)."
+        );
+        // And the batch helper is actually the thing being used.
+        assert!(
+            src.contains("let batch_records ="),
+            "the shared batch_records helper is gone — the three status writes can \
+             drift apart again"
+        );
+        assert!(
+            src.matches("batch_records(&record)").count() >= 3,
+            "expected the InProgress, Failed and Computed writes to all use \
+             batch_records; found {}",
+            src.matches("batch_records(&record)").count()
+        );
+    }
+
     use super::*;
     use rocky_core::plan_partition::PartitionSelection;
 
