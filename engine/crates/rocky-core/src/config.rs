@@ -2295,6 +2295,30 @@ pub fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
 pub fn substitute_env_vars_with_report(
     input: &str,
 ) -> Result<(String, Vec<EnvVarSubstitution>), ConfigError> {
+    let (text, substitutions, missing) = substitute_env_vars_inner(input);
+    if let Some((name, span)) = missing {
+        return Err(ConfigError::MissingEnvVar {
+            name,
+            span: Some(span),
+        });
+    }
+    Ok((text, substitutions))
+}
+
+/// The expansion itself, with no policy attached: returns the substituted text,
+/// the report, and the FIRST unset variable if there was one.
+///
+/// An unset `${VAR}` is left in the text verbatim either way. Whether that is
+/// an error is the caller's decision — [`substitute_env_vars_with_report`]
+/// refuses, the credential-tolerant loader keeps the literal. Both read the
+/// same expansion, so the two can never disagree about what a config says.
+fn substitute_env_vars_inner(
+    input: &str,
+) -> (
+    String,
+    Vec<EnvVarSubstitution>,
+    Option<(String, std::ops::Range<usize>)>,
+) {
     let re = &*ENV_VAR_RE;
     let mut result = String::with_capacity(input.len());
     let mut last_end = 0;
@@ -2355,16 +2379,11 @@ pub fn substitute_env_vars_with_report(
         last_end = match_end;
     }
 
-    if let Some((name, span)) = first_missing {
-        return Err(ConfigError::MissingEnvVar {
-            name,
-            span: Some(span),
-        });
-    }
-
-    // Copy the tail of the input after the last match.
+    // Copy the tail of the input after the last match. Unconditional: the
+    // refusing wrapper discards this text, but the tolerant caller parses it,
+    // and a truncated config would fail for the wrong reason.
     result.push_str(&input[last_end..]);
-    Ok((result, substitutions))
+    (result, substitutions, first_missing)
 }
 
 /// Formats a list of env-var substitutions into a one-line human-readable
@@ -5887,7 +5906,36 @@ fn read_config_file(path: &Path) -> Result<String, ConfigError> {
 /// deprecation remapping, and shorthand normalization included; `kind`
 /// validation excluded (see [`parse_rocky_config`]).
 fn parse_rocky_config_str(raw: &str) -> Result<RockyConfig, ConfigError> {
-    let (substituted, substitutions) = substitute_env_vars_with_report(raw)?;
+    parse_rocky_config_str_with(raw, CredentialPolicy::Require)
+}
+
+/// What an unset `${VAR}` means to this load.
+///
+/// Compiling and previewing SQL never touch a warehouse, so they must not
+/// require warehouse credentials to be present (#1536). Everything else about
+/// the config is still checked either way: `Tolerate` relaxes ONLY the
+/// unresolved-placeholder rule, never parsing or the validator chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialPolicy {
+    /// An unset `${VAR}` is an error. Every executing path.
+    Require,
+    /// An unset `${VAR}` stays in the config as literal text.
+    Tolerate,
+}
+
+fn parse_rocky_config_str_with(
+    raw: &str,
+    policy: CredentialPolicy,
+) -> Result<RockyConfig, ConfigError> {
+    let (substituted, substitutions) = match policy {
+        CredentialPolicy::Require => substitute_env_vars_with_report(raw)?,
+        // The placeholder is already left verbatim by the expansion; all that
+        // differs is that the unset variable is not raised as an error.
+        CredentialPolicy::Tolerate => {
+            let (text, subs, _missing) = substitute_env_vars_inner(raw);
+            (text, subs)
+        }
+    };
     let env_var_hint = format_env_var_hint(&substitutions);
     let to_parse_err = |source: toml::de::Error| -> ConfigError {
         if env_var_hint.is_empty() {
@@ -5969,6 +6017,29 @@ fn apply_single_adapter_discovery_default(config: &mut RockyConfig) {
 /// chain so it can emit every issue as its own diagnostic.
 pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     let config = parse_rocky_config(path)?;
+    validate_loaded_config(&config)?;
+    Ok(config)
+}
+
+/// [`load_rocky_config`], but an unset `${VAR}` is kept as literal text instead
+/// of refusing the load.
+///
+/// For OFFLINE operations only — compiling and previewing SQL, which never open
+/// a warehouse connection. A project whose `${DATABRICKS_HOST}` is unset could
+/// not be compiled at all, while `rocky emit-sql` on the same project rendered
+/// SQL and exited 0 (#1536). Compilation is offline, so it matches the preview.
+///
+/// This relaxes ONE rule. The TOML must still parse, and the whole
+/// [`CONFIG_VALIDATORS`] chain still runs, so a malformed or semantically
+/// invalid config is refused exactly as before. `rocky validate` keeps
+/// [`load_rocky_config`] and remains the command that requires every variable
+/// to resolve.
+///
+/// Never use this on a path that connects to anything: a literal
+/// `"${DATABRICKS_HOST}"` reaching an adapter is a confusing failure at best.
+pub fn load_rocky_config_credential_tolerant(path: &Path) -> Result<RockyConfig, ConfigError> {
+    let raw = read_config_file(path)?;
+    let config = parse_rocky_config_str_with(&raw, CredentialPolicy::Tolerate)?;
     validate_loaded_config(&config)?;
     Ok(config)
 }
@@ -6242,6 +6313,132 @@ impl ReplicationPipelineConfig {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- credential-tolerant loading (#1536) ----
+
+    /// Compiling never opens a warehouse connection, so an unset credential
+    /// placeholder must not stop the load. The placeholder survives as literal
+    /// text rather than becoming an empty string — an empty host would look
+    /// like a configured value.
+    #[test]
+    fn tolerant_load_keeps_an_unset_placeholder_as_literal_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapters.wh]\ntype = \"databricks\"\n\
+             host = \"${ROCKY_TEST_UNSET_HOST_1536}\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+
+        // Strict refuses — that is the behaviour every executing path keeps.
+        let strict = load_rocky_config(&path);
+        assert!(
+            matches!(strict, Err(ConfigError::MissingEnvVar { .. })),
+            "strict load must still refuse an unset placeholder: {strict:?}"
+        );
+
+        let cfg = load_rocky_config_credential_tolerant(&path)
+            .expect("tolerant load must accept an unset placeholder");
+        assert_eq!(
+            cfg.adapters.get("wh").map(|a| a.host.as_deref()),
+            Some(Some("${ROCKY_TEST_UNSET_HOST_1536}")),
+            "the placeholder must survive verbatim, not collapse to empty"
+        );
+    }
+
+    /// Tolerance is scoped to the unresolved placeholder and nothing else. A
+    /// config that does not parse is still refused.
+    #[test]
+    fn tolerant_load_still_refuses_malformed_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, "this is not = = valid toml [[[\n").unwrap();
+
+        assert!(
+            load_rocky_config_credential_tolerant(&path).is_err(),
+            "a config that cannot parse must still be refused"
+        );
+    }
+
+    /// And a config that parses but fails the validator chain is still refused,
+    /// so "tolerant" cannot be read as "unchecked".
+    #[test]
+    fn tolerant_load_still_runs_the_validator_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        // `freeze_marker_writes` on the `local` backend has no durable object
+        // tier to write to — a semantic failure the validator chain catches,
+        // not a parse error. An unknown adapter `type` would NOT work here: a
+        // type nothing references trips no validator, which is how the first
+        // version of this test passed for the wrong reason.
+        std::fs::write(
+            &path,
+            "[adapters.wh]\ntype = \"databricks\"\n\
+             host = \"${ROCKY_TEST_UNSET_HOST_1536}\"\n\
+             \n[state]\nfreeze_marker_writes = true\n",
+        )
+        .unwrap();
+
+        let err = load_rocky_config_credential_tolerant(&path)
+            .expect_err("an invalid adapter type must still be refused");
+        // Must fail in the VALIDATOR chain, not at parse — otherwise this test
+        // would pass on a typo in the fixture and prove nothing about
+        // tolerance leaving validation intact.
+        assert!(
+            !matches!(err, ConfigError::ParseToml(_) | ConfigError::ParseTomlWithEnvContext { .. }),
+            "expected a validator refusal, got a parse error: {err:?}"
+        );
+    }
+
+    /// A SET variable behaves identically under both policies — the tolerant
+    /// path must not become a second, subtly different expansion.
+    #[test]
+    fn tolerant_load_substitutes_a_set_variable_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapters.wh]\ntype = \"databricks\"\n\
+             host = \"${ROCKY_TEST_SET_HOST_1536}\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+
+        // SAFETY: single-threaded test, and the variable name is unique to it.
+        unsafe { std::env::set_var("ROCKY_TEST_SET_HOST_1536", "https://example.invalid") };
+        let tolerant = load_rocky_config_credential_tolerant(&path).expect("tolerant");
+        let strict = load_rocky_config(&path).expect("strict");
+        unsafe { std::env::remove_var("ROCKY_TEST_SET_HOST_1536") };
+
+        assert_eq!(
+            tolerant.adapters.get("wh").map(|a| a.host.clone()),
+            strict.adapters.get("wh").map(|a| a.host.clone()),
+            "a set variable must expand the same way under both policies"
+        );
+    }
+
+    /// The tail after the last `${...}` match must survive. The refusing path
+    /// used to return before copying it; the tolerant path parses that text, so
+    /// a truncated config would fail for the wrong reason.
+    #[test]
+    fn tolerant_load_keeps_config_after_the_unset_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapters.wh]\ntype = \"databricks\"\n\
+             host = \"${ROCKY_TEST_UNSET_HOST_1536}\"\ntoken = \"t\"\n\
+             \n[adapters.after]\ntype = \"duckdb\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_rocky_config_credential_tolerant(&path).expect("tolerant load");
+        assert!(
+            cfg.adapters.contains_key("after"),
+            "config after the unset placeholder must not be truncated; got adapters: {:?}",
+            cfg.adapters.keys().collect::<Vec<_>>()
+        );
+    }
     use super::*;
 
     #[test]
