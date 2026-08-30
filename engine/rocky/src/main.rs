@@ -756,6 +756,14 @@ enum Command {
     /// <plan-id>` replays the same intent. Flags whose semantics depend on
     /// state observed at apply time — `--resume-latest`, `--missing` — are
     /// evaluated at apply time, not plan time.
+    ///
+    /// Those default-plan flags are refused when a subcommand follows.
+    /// `args_conflicts_with_subcommands` makes clap reject the combination at
+    /// parse time, naming the offending flag. Without it every one of them was
+    /// ACCEPTED and then silently discarded by the subcommand dispatch, which
+    /// reads as "the flag applied" (#1550). `rocky fulfill` already carries the
+    /// same attribute for the same reason.
+    #[command(args_conflicts_with_subcommands = true)]
     Plan {
         /// Optional subcommand (e.g. `promote`). When absent, runs the default
         /// replication dry-run plan.
@@ -5006,6 +5014,66 @@ mod tests {
                 .join()
                 .expect("parser thread panicked")
         })
+    }
+
+    /// `rocky plan`'s default-subcommand flags were ACCEPTED alongside a
+    /// subcommand and then silently discarded — the `Some(PlanSubcommand)`
+    /// dispatch reads none of them. `rocky plan --resume-latest promote <b>`
+    /// parsed, ran the promote, and threw `--resume-latest` away without a
+    /// word (#1550).
+    ///
+    /// `args_conflicts_with_subcommands` refuses the combination at parse
+    /// time, naming the flag. `rocky fulfill` already carried the attribute;
+    /// `plan` is the only other command with the same shape — an optional
+    /// subcommand plus 24 of its own args — and it lacked it.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "expects a PARSE FAILURE, which the Cli-returning helper cannot express; the \
+                  call already runs on an 8 MB spawned thread"
+    )]
+    fn plan_default_args_conflict_with_a_subcommand() {
+        for conflicting in [
+            vec!["rocky", "plan", "--resume-latest", "promote", "b"],
+            vec!["rocky", "plan", "--shadow", "promote", "b"],
+            vec!["rocky", "plan", "--filter", "tenant=acme", "promote", "b"],
+            vec!["rocky", "plan", "--model", "orders", "promote", "b"],
+            vec!["rocky", "plan", "--dag", "promote", "b"],
+            vec!["rocky", "plan", "--all", "promote", "b"],
+        ] {
+            let parsed = std::thread::scope(|s| {
+                let owned: Vec<String> = conflicting.iter().map(ToString::to_string).collect();
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn_scoped(s, move || Cli::try_parse_from(&owned).is_ok())
+                    .expect("spawn parser thread")
+                    .join()
+                    .expect("parser thread panicked")
+            });
+            assert!(
+                !parsed,
+                "{conflicting:?} must be a clap conflict — the flag would otherwise be \
+                 accepted and silently dropped"
+            );
+        }
+
+        // Positive control, the over-restriction direction: the SAME flags must
+        // still parse on the default path, where they are the whole point.
+        let cli = try_parse_with_big_stack(&["rocky", "plan", "--shadow"]);
+        let Command::Plan {
+            subcommand, shadow, ..
+        } = cli.command
+        else {
+            panic!("expected the plan command");
+        };
+        assert!(subcommand.is_none() && shadow);
+
+        // And a subcommand with no default-plan flag is untouched.
+        let cli = try_parse_with_big_stack(&["rocky", "plan", "promote", "b"]);
+        let Command::Plan { subcommand, .. } = cli.command else {
+            panic!("expected the plan command");
+        };
+        assert!(subcommand.is_some(), "`plan promote <b>` must still parse");
     }
 
     /// `--dag` drops the resume flags on the floor: `run_with_dag` takes no
