@@ -13,18 +13,15 @@ on:
       # run and the PR cannot merge at all (#1557).
       - '.claude/skills/rocky-ai-workflow/SKILL.md'
       - '.github/workflows/engine-ci.yml'
+  # No `paths:` filter on pull_request — deliberately. Four required merge
+  # contexts live in this workflow (Test, Clippy, Format, Adapter boundary).
+  # A workflow-level path filter leaves those contexts ABSENT on a PR that
+  # does not match, and an absent required check blocks the merge forever
+  # (#1563). Instead the `changes` job below detects whether engine paths
+  # were touched, and each job skips itself — a job skipped by an `if:`
+  # conditional still reports, and satisfies the required check.
   pull_request:
     branches: [main]
-    paths:
-      - 'engine/**'
-      - 'schemas/**'
-      # Compiled INTO the binary: rocky-mcp `include_str!`s this skill as the
-      # MCP `instructions` (crates/rocky-mcp/src/tools.rs). Editing it changes
-      # what `rocky mcp` serves, and renaming or deleting it fails the build —
-      # so it needs engine CI, and without it the five required contexts never
-      # run and the PR cannot merge at all (#1557).
-      - '.claude/skills/rocky-ai-workflow/SKILL.md'
-      - '.github/workflows/engine-ci.yml'
 
 # CI only reads the repo; restrict the token to the minimum (CodeQL ql-for-actions).
 permissions:
@@ -55,8 +52,52 @@ defaults:
     working-directory: engine
 
 jobs:
+  # Computes whether this PR touches any path engine CI cares about. The list
+  # below must stay in sync with the `push` trigger's `paths:` above. On push
+  # events the trigger's own filter already matched, so the answer is yes.
+  #
+  # Fail closed: the answer is "false" only when the diff was computed and no
+  # relevant path matched. Any error keeps it "true" and the full suite runs.
+  changes:
+    name: Detect engine changes
+    runs-on: ubuntu-latest
+    outputs:
+      engine: ${{ steps.diff.outputs.engine }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The PR merge commit plus both of its parents.
+          fetch-depth: 2
+      - name: Diff the merge commit against its base parent
+        id: diff
+        env:
+          # Mirrors the push trigger paths: engine/**, schemas/**, the skill
+          # compiled into the binary (#1557), and this workflow itself.
+          ENGINE_PATHS_RE: ^(engine/|schemas/|\.claude/skills/rocky-ai-workflow/SKILL\.md$|\.github/workflows/engine-ci\.yml$)
+        run: |
+          set -uo pipefail
+          engine=true
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            if files=$(git diff --name-only HEAD^1 HEAD); then
+              if printf '%s\n' "$files" | grep -qE "$ENGINE_PATHS_RE"; then
+                engine=true
+              else
+                engine=false
+              fi
+            else
+              echo "::warning::could not diff the merge commit; running engine CI to fail closed"
+            fi
+          fi
+          echo "engine=$engine" >> "$GITHUB_OUTPUT"
+          echo "engine=$engine"
+
   test:
     name: Test
+    needs: changes
+    # Skip only on a positive "false" from the detection job. An empty output
+    # (the detection job itself failed) runs the suite — fail closed.
+    if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
     runs-on: ubuntu-latest
     # CI-only: emit `line-tables-only` debuginfo on the dev+test profiles
     # instead of full debuginfo. Linking the workspace's test binaries with
@@ -109,6 +150,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -138,6 +181,8 @@ jobs:
 
   fmt:
     name: Format
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -151,6 +196,8 @@ jobs:
 
   adapter-boundary:
     name: Adapter boundary
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -172,6 +219,8 @@ jobs:
   # `failed to build [adapter.fivetran.cache] backend` (gold-dev 2026-05-20).
   release-build-smoke:
     name: Release-build smoke (valkey feature)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.engine != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

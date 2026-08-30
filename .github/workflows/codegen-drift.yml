@@ -21,22 +21,15 @@ on:
       - 'scripts/copy_project_schema.py'
       - 'justfile'
       - '.github/workflows/codegen-drift.yml'
+  # No `paths:` filter on pull_request — deliberately. "Check codegen is up
+  # to date" is a required merge context. A workflow-level path filter leaves
+  # it ABSENT on a PR that does not match, and an absent required check
+  # blocks the merge forever (#1563). Instead the `changes` job below detects
+  # whether codegen inputs were touched, and the drift job skips itself — a
+  # job skipped by an `if:` conditional still reports, and satisfies the
+  # required check.
   pull_request:
     branches: [main]
-    paths:
-      - 'engine/**'
-      - 'schemas/**'
-      - 'docs/public/openapi.json'
-      - 'sdk/python/src/rocky_sdk/types_generated/**'
-      - 'integrations/dagster/tests/fixtures_generated/**'
-      - 'editors/vscode/src/types/generated/**'
-      - 'editors/vscode/schemas/rocky-project.schema.json'
-      - 'examples/playground/pocs/**'
-      - 'scripts/regen_fixtures.sh'
-      - 'scripts/_normalize_fixture.py'
-      - 'scripts/copy_project_schema.py'
-      - 'justfile'
-      - '.github/workflows/codegen-drift.yml'
 
 # CI only reads the repo; restrict the token to the minimum (CodeQL ql-for-actions).
 permissions:
@@ -54,8 +47,51 @@ env:
   CARGO_BUILD_JOBS: 4
 
 jobs:
+  # Computes whether this PR touches any codegen input or output. The list
+  # below must stay in sync with the `push` trigger's `paths:` above. On push
+  # events the trigger's own filter already matched, so the answer is yes.
+  #
+  # Fail closed: the answer is "false" only when the diff was computed and no
+  # relevant path matched. Any error keeps it "true" and the drift check runs.
+  changes:
+    name: Detect codegen changes
+    runs-on: ubuntu-latest
+    outputs:
+      codegen: ${{ steps.diff.outputs.codegen }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The PR merge commit plus both of its parents.
+          fetch-depth: 2
+      - name: Diff the merge commit against its base parent
+        id: diff
+        env:
+          # Mirrors the push trigger paths above.
+          CODEGEN_PATHS_RE: ^(engine/|schemas/|docs/public/openapi\.json$|sdk/python/src/rocky_sdk/types_generated/|integrations/dagster/tests/fixtures_generated/|editors/vscode/src/types/generated/|editors/vscode/schemas/rocky-project\.schema\.json$|examples/playground/pocs/|scripts/regen_fixtures\.sh$|scripts/_normalize_fixture\.py$|scripts/copy_project_schema\.py$|justfile$|\.github/workflows/codegen-drift\.yml$)
+        run: |
+          set -uo pipefail
+          codegen=true
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            if files=$(git diff --name-only HEAD^1 HEAD); then
+              if printf '%s\n' "$files" | grep -qE "$CODEGEN_PATHS_RE"; then
+                codegen=true
+              else
+                codegen=false
+              fi
+            else
+              echo "::warning::could not diff the merge commit; running the drift check to fail closed"
+            fi
+          fi
+          echo "codegen=$codegen" >> "$GITHUB_OUTPUT"
+          echo "codegen=$codegen"
+
   drift:
     name: Check codegen is up to date
+    needs: changes
+    # Skip only on a positive "false" from the detection job. An empty output
+    # (the detection job itself failed) runs the check — fail closed.
+    if: ${{ !cancelled() && needs.changes.outputs.codegen != 'false' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
