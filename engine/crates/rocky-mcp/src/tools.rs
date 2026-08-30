@@ -5429,6 +5429,59 @@ mod tests {
     /// named as NOT available, the hand-off named as the ending) and serves
     /// the skill text below it UNCHANGED; the default profile serves the
     /// skill text verbatim, byte-identical to the compiled file.
+    /// `include_str!` reaches OUT of `engine/` for the AI-workflow skill, so
+    /// that file is part of the engine build: editing it changes what `rocky
+    /// mcp` serves, and renaming or deleting it fails compilation.
+    ///
+    /// `engine-ci.yml` must watch every such path. A check that never runs is
+    /// never satisfied — and because `Test`, `Clippy`, `Format`, `Adapter
+    /// boundary` and the codegen check are REQUIRED contexts, a path the filter
+    /// misses does not merely skip CI, it blocks the merge outright (#1557).
+    #[test]
+    fn every_out_of_tree_include_is_watched_by_engine_ci() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root from the crate manifest");
+        let src = std::fs::read_to_string(manifest.join("src/tools.rs")).expect("read tools.rs");
+        let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/engine-ci.yml"))
+            .expect("read engine-ci.yml");
+
+        // Paths that climb above `engine/` — `src/` is three levels below the
+        // repo root, so four or more `../` escapes the engine tree.
+        let mut checked = 0;
+        for (at, _) in src.match_indices("include_str!(\"") {
+            let rest = &src[at + "include_str!(\"".len()..];
+            let path = &rest[..rest.find('"').expect("unterminated include_str! path")];
+            if !path.starts_with("../../../../") {
+                continue;
+            }
+            let repo_relative = path.trim_start_matches("../");
+            assert!(
+                repo_root.join(repo_relative).exists(),
+                "include_str! names a file that does not exist: {repo_relative}"
+            );
+            assert!(
+                workflow.contains(repo_relative),
+                "`{repo_relative}` is compiled into the engine but is not in \
+                 engine-ci.yml's path filters. The required checks would never \
+                 run for a change to it, so the change gets no engine CI AND \
+                 cannot merge (#1557). Add it to BOTH the push and \
+                 pull_request `paths` lists."
+            );
+            checked += 1;
+        }
+
+        // A zero here would pass vacuously — the assertion above never runs if
+        // the scan finds nothing, which is exactly how this guard would rot.
+        assert!(
+            checked > 0,
+            "found no out-of-tree include_str! paths to check — the scan broke, \
+             or the coupling moved and this test now proves nothing"
+        );
+    }
+
     #[test]
     fn instructions_carry_the_worker_banner_and_stay_verbatim_by_default() {
         let default_info = server_with(McpProfile::Default).get_info();
