@@ -424,17 +424,14 @@ fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions
     if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!(
-                "refusing to back up {} — not a regular file",
-                path.display()
-            ),
+            format!("refusing to read {} — not a regular file", path.display()),
         ));
     }
     if metadata.len() > MAX_BACKUP_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "refusing to back up {} — {} bytes exceeds the {MAX_BACKUP_BYTES}-byte limit",
+                "refusing to read {} — {} bytes exceeds the {MAX_BACKUP_BYTES}-byte limit",
                 path.display(),
                 metadata.len()
             ),
@@ -451,7 +448,7 @@ fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "refusing to back up {} — it grew past the {MAX_BACKUP_BYTES}-byte limit while being read",
+                "refusing to read {} — it grew past the {MAX_BACKUP_BYTES}-byte limit while being read",
                 path.display()
             ),
         ));
@@ -1190,8 +1187,26 @@ fn run_phase_b_with_ops(
             ),
         ));
     }
-    let sidecar_text = std::fs::read_to_string(&sidecar_path)
-        .map_err(|err| io_reject("reading", &sidecar_path, &err))?;
+    // NO-FOLLOW. A plain read follows a symlink, and Phase B's merge preserves
+    // every key it does not own (`lowering.rs`) — so a process that can write in
+    // the models directory could point the sidecar at any Rocky-readable TOML,
+    // let this read pull it in, and swap a regular file back before the commit
+    // pre-check. Whatever was read would be merged into the project sidecar and
+    // committed as project content (#1501). A hardlink needs no timing at all.
+    //
+    // `read_no_follow` checks the DESCRIPTOR's metadata rather than the path, so
+    // what it validated is what it read. The commit below works from `lowering`,
+    // built out of these bytes — it never re-resolves the path for content, so
+    // there is no second read to race.
+    let (sidecar_bytes, _perms) =
+        read_no_follow(&sidecar_path).map_err(|err| io_reject("reading", &sidecar_path, &err))?;
+    let sidecar_text = String::from_utf8(sidecar_bytes).map_err(|err| {
+        io_reject(
+            "reading",
+            &sidecar_path,
+            &std::io::Error::new(std::io::ErrorKind::InvalidData, err),
+        )
+    })?;
     let lowering = lower_phase_b(parsed, spec_path, &sidecar_text, &committed)?;
     commit_generation_with_ops(project_root, parsed, &lowering, ops)?;
     Ok(lowering)
@@ -2419,6 +2434,91 @@ mod tests {
     ///
     /// The needle is assembled from fragments so this assertion cannot match
     /// its own source text.
+    /// Phase B's sidecar read must not follow a symlink.
+    ///
+    /// The merge preserves every key it does not own, so a sidecar pointed at
+    /// an external TOML would have its contents merged into the project sidecar
+    /// and committed as project content — credentials included (#1501). A
+    /// hardlink needs no timing at all.
+    #[cfg(unix)]
+    #[test]
+    fn phase_b_refuses_a_sidecar_swapped_for_a_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parsed = parsed_d3();
+        let project = project_with_phase_a_and_draft(dir.path(), &parsed);
+
+        // Something outside the project that Rocky can read.
+        let secret = dir.path().join("outside-secret.toml");
+        std::fs::write(&secret, b"exfiltrated_key = \"s3cret\"\n").expect("write secret");
+
+        let sidecar = project.join("models/revenue_daily.toml");
+        assert!(
+            sidecar.is_file(),
+            "fixture: the drafted sidecar must exist before it is swapped — \
+             otherwise this test proves nothing"
+        );
+        std::fs::remove_file(&sidecar).expect("remove drafted sidecar");
+        std::os::unix::fs::symlink(&secret, &sidecar).expect("symlink");
+
+        let error = run_phase_b(&project, SPEC_PATH, &parsed)
+            .expect_err("a symlinked sidecar must be refused");
+        assert_eq!(
+            error.code, "commit-io",
+            "expected the no-follow read to refuse it, got {error:?}"
+        );
+
+        // The plant is untouched: Rocky neither followed it nor wrote through it.
+        assert!(
+            std::fs::symlink_metadata(&sidecar)
+                .expect("sidecar still present")
+                .file_type()
+                .is_symlink(),
+            "the symlink was replaced, so something wrote through the sidecar path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&secret).expect("secret readable"),
+            "exfiltrated_key = \"s3cret\"\n",
+            "the out-of-project file was modified"
+        );
+
+        // And no REGULAR file in the project carries the external key. Symlinks
+        // are skipped: the only one is the plant above, and following it would
+        // just re-read the secret — measuring the fixture, not the behaviour.
+        for entry in std::fs::read_dir(project.join("models")).expect("read models") {
+            let path = entry.expect("entry").path();
+            let is_regular = std::fs::symlink_metadata(&path)
+                .map(|m| m.file_type().is_file())
+                .unwrap_or(false);
+            if is_regular && let Ok(text) = std::fs::read_to_string(&path) {
+                assert!(
+                    !text.contains("exfiltrated_key"),
+                    "{} carries a key from outside the project",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// The Phase B read must go through `read_no_follow`.
+    ///
+    /// The banned and required strings are assembled at runtime so this test's
+    /// own source cannot satisfy the search it performs.
+    #[test]
+    fn the_phase_b_sidecar_read_uses_the_no_follow_helper() {
+        let source = include_str!("commit.rs");
+        let banned = format!("std::fs::read_to_{}(&sidecar_path)", "string");
+        assert!(
+            !source.contains(&banned),
+            "Phase B's sidecar read must go through read_no_follow: a plain read \
+             follows a symlink, and the merge keeps every key it does not own"
+        );
+        let required = format!("read_no_{}(&sidecar_path)", "follow");
+        assert!(
+            source.contains(&required),
+            "expected the Phase B sidecar read to call read_no_follow"
+        );
+    }
+
     #[test]
     fn the_backup_call_site_uses_the_no_follow_copy() {
         let source = include_str!("commit.rs");

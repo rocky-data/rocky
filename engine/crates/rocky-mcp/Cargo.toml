@@ -44,6 +44,9 @@ arrow = { workspace = true }
 schemars = "1"
 
 [dev-dependencies]
+# A stub WarehouseAdapter that fails every query, so the discovery-failure arm
+# of `inspect_schema` is testable without a live warehouse (#1533).
+async-trait = { workspace = true }
 rocky-duckdb = { path = "../rocky-duckdb" }
 # Live Snowflake grounding verification (grounding_snowflake_live.rs) builds the
 # adapter directly to set up / tear down its fixture table.

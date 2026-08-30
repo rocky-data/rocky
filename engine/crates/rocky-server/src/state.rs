@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 use rocky_compiler::compile::{CompileResult, CompilerConfig};
 use rocky_core::dag_status::DagStatusStore;
 
+use crate::auth::ServeToken;
 use crate::schema_cache_throttle::SchemaCacheThrottle;
 
 /// Shared server state holding the latest compilation result.
@@ -44,10 +45,14 @@ pub struct ServerState {
     /// table, serving `GET /api/v1/jobs/{id}` without touching redb on the hot
     /// path. Repopulated lazily from redb after a restart.
     pub jobs: crate::jobs::JobRegistry,
-    /// Bearer token required by the HTTP API auth middleware. `None`
-    /// means "no auth"; in that mode [`crate::api::serve`] refuses to
-    /// bind a non-loopback host. See [`crate::auth::require_bearer_token`].
-    pub auth_token: Option<String>,
+    /// Bearer token required by the HTTP API auth middleware, together with
+    /// the [`crate::auth::TokenScope`] it grants. `None` means "no auth"; in
+    /// that mode `rocky_cli::api::serve` refuses to bind a non-loopback host.
+    /// See [`crate::auth::require_bearer_token`].
+    ///
+    /// Secret and scope travel as one value so a scope can never be set
+    /// without a token to attach it to.
+    pub auth: Option<ServeToken>,
     /// CORS allowlist passed to [`crate::auth::build_cors_layer`]. An
     /// empty list means same-origin only.
     pub allowed_origins: Vec<String>,
@@ -99,7 +104,7 @@ impl ServerState {
         models_dir: PathBuf,
         contracts_dir: Option<PathBuf>,
         config_path: Option<PathBuf>,
-        auth_token: Option<String>,
+        auth: Option<ServeToken>,
         allowed_origins: Vec<String>,
         state_path: Option<PathBuf>,
     ) -> Arc<Self> {
@@ -111,7 +116,7 @@ impl ServerState {
             false,
             contracts_dir,
             config_path,
-            auth_token,
+            auth,
             allowed_origins,
             state_path,
             None,
@@ -129,7 +134,7 @@ impl ServerState {
         models_dir_is_explicit: bool,
         contracts_dir: Option<PathBuf>,
         config_path: Option<PathBuf>,
-        auth_token: Option<String>,
+        auth: Option<ServeToken>,
         allowed_origins: Vec<String>,
         state_path: Option<PathBuf>,
         webhook: Option<crate::webhook_ingress::WebhookIngress>,
@@ -145,7 +150,7 @@ impl ServerState {
             dag_status: DagStatusStore::new(),
             mutation_permit: crate::jobs::MutationPermit::new(),
             jobs: crate::jobs::JobRegistry::new(),
-            auth_token,
+            auth,
             allowed_origins,
             schema_cache_throttle: SchemaCacheThrottle::new(),
         });
