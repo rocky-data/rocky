@@ -199,7 +199,6 @@ impl ServerState {
             models_dir: self.models_dir.clone(),
             contracts_dir: self.contracts_dir.clone(),
             source_schemas,
-            source_column_info: HashMap::new(),
             mask,
             allow_unmasked,
             project_freshness_default,

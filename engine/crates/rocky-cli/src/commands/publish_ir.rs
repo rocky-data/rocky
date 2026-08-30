@@ -81,7 +81,6 @@ pub fn run_publish_ir(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: contracts_dir.map(Path::to_path_buf),
         source_schemas,
-        source_column_info: HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: Vec::new(),
         project_freshness_default: false,

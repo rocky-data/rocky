@@ -266,7 +266,6 @@ fn bench_compile(model_count: usize, iterations: usize) -> Vec<BenchResult> {
         models_dir: dir.path().join("models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 

@@ -443,7 +443,6 @@ impl RockyLsp {
             models_dir: dir_path.clone(),
             contracts_dir: None,
             source_schemas,
-            source_column_info: HashMap::new(),
             mask,
             allow_unmasked,
             project_freshness_default,
@@ -1259,7 +1258,6 @@ impl LanguageServer for RockyLsp {
                     models_dir: dir_path,
                     contracts_dir: None,
                     source_schemas,
-                    source_column_info: HashMap::new(),
                     // Incremental LSP path: W004 stays disabled until
                     // the LSP initialization plumbs rocky.toml in.
                     ..Default::default()
@@ -4988,7 +4986,6 @@ mod tests {
             models_dir: models_dir.clone(),
             contracts_dir: None,
             source_schemas: HashMap::new(),
-            source_column_info: HashMap::new(),
             ..Default::default()
         };
         let result = rocky_compiler::compile::compile(&config).unwrap();
@@ -5172,7 +5169,6 @@ mod tests {
             models_dir: models_dir.clone(),
             contracts_dir: None,
             source_schemas: HashMap::new(),
-            source_column_info: HashMap::new(),
             ..Default::default()
         };
         let result = rocky_compiler::compile::compile(&config).unwrap();
@@ -5700,7 +5696,6 @@ mod tests {
             models_dir: models_dir.clone(),
             contracts_dir: None,
             source_schemas: HashMap::new(),
-            source_column_info: HashMap::new(),
             mask: cfg.mask,
             allow_unmasked: cfg.classifications.allow_unmasked,
             project_freshness_default,

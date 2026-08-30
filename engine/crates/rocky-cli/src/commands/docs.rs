@@ -186,7 +186,6 @@ fn infer_column_map(
             &schema_cache_cfg,
             state_path,
         ),
-        source_column_info: HashMap::new(),
         mask: rocky_cfg.mask.clone(),
         allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
         project_freshness_default: rocky_cfg.freshness.has_default(),

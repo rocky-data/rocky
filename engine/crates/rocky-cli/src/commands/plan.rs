@@ -849,7 +849,6 @@ pub fn plan_preview_output(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
-        source_column_info: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,
@@ -978,7 +977,6 @@ fn build_and_persist_run_plan(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
-        source_column_info: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,
@@ -1491,7 +1489,6 @@ pub fn populate_governance_actions(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
-        source_column_info: std::collections::HashMap::new(),
         mask: cfg.mask.clone(),
         allow_unmasked: cfg.classifications.allow_unmasked.clone(),
         project_freshness_default: cfg.freshness.has_default(),
@@ -1593,7 +1590,6 @@ async fn check_plan_budget(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,
@@ -1912,7 +1908,6 @@ fn compute_semantic_verdict(
             models_dir: models_dir.to_path_buf(),
             contracts_dir: None,
             source_schemas: source_schemas.clone(),
-            source_column_info: std::collections::HashMap::new(),
             ..Default::default()
         };
         match compile::compile(&config) {

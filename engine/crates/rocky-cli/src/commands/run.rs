@@ -7710,7 +7710,6 @@ pub(crate) async fn execute_models(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas,
-        source_column_info: std::collections::HashMap::new(),
         // W004 wiring happens on the governance compile path later in
         // this function (it already holds the loaded `RockyConfig`).
         // This pre-execution compile stays scoped to typecheck +
