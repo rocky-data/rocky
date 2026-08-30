@@ -426,6 +426,13 @@ pub async fn propose_governed_run_plan(
     };
 
     match gate {
+        // Separate from the permissive arm: an unreadable config leaves any
+        // configured `[policy]` unenforceable, and a propose that writes a plan
+        // under an unknown policy is exactly the fail-open #1559 describes.
+        super::PolicyGate::Unloadable { reason } => Err(ProposeError::PlanWrite(format!(
+            "the project config failed to load, so any configured [policy] rules cannot be \
+             enforced (fail-closed). Fix the config and re-run. Cause: {reason}"
+        ))),
         super::PolicyGate::NotConfigured | super::PolicyGate::Allow => {
             let plan_id = write_plan()?;
             Ok(ProposeOutcome::Written {
