@@ -2485,7 +2485,8 @@ impl RockyMcpServer {
                 Err(ToolError::policy_denied(
                     format!(
                         "the project config failed to load, so any configured [policy] rules \
-                         cannot be enforced (fail-closed). The draft was not kept. Cause: {reason}"
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
                     ),
                     "Fix the project config so its policy can be read, then retry. Rocky refuses \
                      to author under a policy it cannot evaluate."
@@ -2621,7 +2622,8 @@ impl RockyMcpServer {
                 Err(ToolError::policy_denied(
                     format!(
                         "the project config failed to load, so any configured [policy] rules \
-                         cannot be enforced (fail-closed). The draft was not kept. Cause: {reason}"
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
                     ),
                     "Fix the project config so its policy can be read, then retry. Rocky refuses \
                      to author under a policy it cannot evaluate."
@@ -2774,7 +2776,8 @@ impl RockyMcpServer {
                 Err(ToolError::policy_denied(
                     format!(
                         "the project config failed to load, so any configured [policy] rules \
-                         cannot be enforced (fail-closed). The draft was not kept. Cause: {reason}"
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
                     ),
                     "Fix the project config so its policy can be read, then retry. Rocky refuses \
                      to author under a policy it cannot evaluate."
@@ -2991,7 +2994,8 @@ impl RockyMcpServer {
                 Err(ToolError::policy_denied(
                     format!(
                         "the project config failed to load, so any configured [policy] rules \
-                         cannot be enforced (fail-closed). The draft was not kept. Cause: {reason}"
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
                     ),
                     "Fix the project config so its policy can be read, then retry. Rocky refuses \
                      to author under a policy it cannot evaluate."
@@ -3132,6 +3136,22 @@ impl RockyMcpServer {
                 return Err(ToolError::internal(
                     format!("failed to compute plan id: {inner}"),
                     "Retry the propose; if it persists, verify the project compiles cleanly.",
+                ));
+            }
+            Err(ProposeError::PolicyUnreadable(inner)) => {
+                // policy_denied, not internal: the propose was REFUSED by the
+                // policy plane's fail-closed rule, and the agent must be told
+                // that plainly rather than reading it as a transient fault to
+                // retry (#1559).
+                return Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). No plan was written. Cause: {inner}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to propose under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
                 ));
             }
             Err(ProposeError::LedgerDownload(inner)) => {

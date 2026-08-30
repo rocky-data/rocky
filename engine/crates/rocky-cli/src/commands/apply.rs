@@ -1606,14 +1606,21 @@ pub(crate) fn evaluate_apply_policy_with_policy_matching(
 /// silently unenforce a possibly-configured `[policy]` block". That reasoning
 /// was never applied to the shared gate, which swallowed the error with `.ok()`
 /// and reported `NotConfigured` — indistinguishable from permission (#1559).
-fn load_policy_for_gate(
+pub(crate) fn load_config_for_gate(
     config_path: &Path,
-) -> Result<Option<rocky_core::config::PolicyConfig>, String> {
+) -> Result<Option<rocky_core::config::RockyConfig>, String> {
     match rocky_core::config::load_rocky_config(config_path) {
-        Ok(cfg) => Ok(cfg.policy),
+        Ok(cfg) => Ok(Some(cfg)),
         Err(rocky_core::config::ConfigError::FileNotFound { .. }) => Ok(None),
         Err(e) => Err(format!("{e}")),
     }
+}
+
+/// [`load_config_for_gate`], narrowed to the `[policy]` block.
+fn load_policy_for_gate(
+    config_path: &Path,
+) -> Result<Option<rocky_core::config::PolicyConfig>, String> {
+    Ok(load_config_for_gate(config_path)?.and_then(|cfg| cfg.policy))
 }
 
 /// [`evaluate_apply_policy`] evaluated over BOTH the pre-image and the
