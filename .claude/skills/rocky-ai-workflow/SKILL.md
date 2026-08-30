@@ -28,7 +28,7 @@ Write models as **raw SQL** (`models/<name>.sql` + a `<name>.toml` sidecar for m
 
 5. **Preview the SQL.** Run `rocky plan` to see exactly what would execute. Read it. Confirm the generated SQL matches your intent.
 
-6. **Test.** Run `rocky test` to exercise assertions (uniqueness, not-null, accepted values, ranges). Add or strengthen assertions that encode what you learned from sampling — they become the contract that protects the model from future drift.
+6. **Test.** Run `rocky test` to compile, seed and materialize the models, and to run any `[[test]]` fixture blocks. Then run `rocky test --declarative` to evaluate the declared assertions (uniqueness, not-null, accepted values, ranges) — plain `rocky test` does not run those. Add or strengthen assertions that encode what you learned from sampling — they become the contract that protects the model from future drift.
 
 ## Shipping safely: propose → review → apply
 

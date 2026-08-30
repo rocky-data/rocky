@@ -2206,9 +2206,10 @@ impl RockyMcpServer {
     /// frozen agent must not keep minting drafts, so the draft tools consult
     /// the same marker set the propose/apply gates enforce. Bounded by the
     /// shared gate guard (no `[policy]` ⇒ no LIST ⇒ zero behavior change; an
-    /// unloadable config resolves to `NotConfigured` in the gate, so it reads
-    /// no markers either). Fail-closed on a transport failure, mirroring the
-    /// governed apply seams.
+    /// unloadable config resolves to `PolicyGate::Unloadable`, which every
+    /// draft gate refuses — it used to resolve to `NotConfigured` and read no
+    /// markers, which is the fail-open #1559 fixed). Fail-closed on a transport
+    /// failure, mirroring the governed apply seams.
     async fn draft_marker_freezes(
         &self,
         stem: &str,
@@ -2436,6 +2437,9 @@ impl RockyMcpServer {
         // agent authoring into a governed scope gets a structured verdict WITH
         // the write, not later at apply. Absent a `[policy]` block this resolves
         // to `NotConfigured` and behaviour is byte-identical to no policy plane.
+        // A config that EXISTS but fails to load is `Unloadable` instead, and
+        // is refused — "no policy" and "could not read the policy" are
+        // different answers, and only the first is permission (#1559).
         let state_path = self.state_path();
         let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
             std::iter::once((
@@ -2472,6 +2476,24 @@ impl RockyMcpServer {
         );
 
         match gate {
+            // NOT grouped with NotConfigured. A config that failed to LOAD may
+            // carry a `[policy]` block denying exactly this write; treating it
+            // as "no policy configured" is what let a configured deny stop
+            // denying (#1559). The rollback is deliberately NOT defused, so the
+            // draft is removed — matching the `Deny` arm below.
+            rocky_cli::commands::PolicyGate::Unloadable { reason } => {
+                Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to author under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
+                ))
+            }
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 rollback.defuse();
@@ -2591,6 +2613,24 @@ impl RockyMcpServer {
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
         match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+            // NOT grouped with NotConfigured. A config that failed to LOAD may
+            // carry a `[policy]` block denying exactly this write; treating it
+            // as "no policy configured" is what let a configured deny stop
+            // denying (#1559). The rollback is deliberately NOT defused, so the
+            // draft is removed — matching the `Deny` arm below.
+            rocky_cli::commands::PolicyGate::Unloadable { reason } => {
+                Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to author under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
+                ))
+            }
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 rollback.defuse();
@@ -2727,6 +2767,24 @@ impl RockyMcpServer {
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
         match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+            // NOT grouped with NotConfigured. A config that failed to LOAD may
+            // carry a `[policy]` block denying exactly this write; treating it
+            // as "no policy configured" is what let a configured deny stop
+            // denying (#1559). The rollback is deliberately NOT defused, so the
+            // draft is removed — matching the `Deny` arm below.
+            rocky_cli::commands::PolicyGate::Unloadable { reason } => {
+                Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to author under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
+                ))
+            }
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 rollback.defuse();
@@ -2927,6 +2985,24 @@ impl RockyMcpServer {
         let decision_id = format!("draft-metadata:{}", paths.stem);
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
         match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+            // NOT grouped with NotConfigured. A config that failed to LOAD may
+            // carry a `[policy]` block denying exactly this write; treating it
+            // as "no policy configured" is what let a configured deny stop
+            // denying (#1559). The rollback is deliberately NOT defused, so the
+            // draft is removed — matching the `Deny` arm below.
+            rocky_cli::commands::PolicyGate::Unloadable { reason } => {
+                Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to author under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
+                ))
+            }
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 rollback.defuse();
@@ -3060,6 +3136,22 @@ impl RockyMcpServer {
                 return Err(ToolError::internal(
                     format!("failed to compute plan id: {inner}"),
                     "Retry the propose; if it persists, verify the project compiles cleanly.",
+                ));
+            }
+            Err(ProposeError::PolicyUnreadable(inner)) => {
+                // policy_denied, not internal: the propose was REFUSED by the
+                // policy plane's fail-closed rule, and the agent must be told
+                // that plainly rather than reading it as a transient fault to
+                // retry (#1559).
+                return Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). No plan was written. Cause: {inner}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to propose under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
                 ));
             }
             Err(ProposeError::LedgerDownload(inner)) => {
@@ -5429,6 +5521,103 @@ mod tests {
     /// named as NOT available, the hand-off named as the ending) and serves
     /// the skill text below it UNCHANGED; the default profile serves the
     /// skill text verbatim, byte-identical to the compiled file.
+    /// Every `paths:` list in a workflow, as its quoted entries. Enough YAML
+    /// to check a trigger filter without taking a parser dependency: a
+    /// `paths:` line, then the `- '...'` entries indented under it.
+    fn workflow_path_lists(workflow: &str) -> Vec<Vec<String>> {
+        let mut lists = Vec::new();
+        let mut lines = workflow.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim() != "paths:" {
+                continue;
+            }
+            let mut entries = Vec::new();
+            while let Some(next) = lines.peek() {
+                let t = next.trim();
+                if t.starts_with('#') {
+                    lines.next();
+                    continue;
+                }
+                let Some(value) = t.strip_prefix("- ") else {
+                    break;
+                };
+                entries.push(value.trim_matches('\'').trim_matches('"').to_string());
+                lines.next();
+            }
+            lists.push(entries);
+        }
+        lists
+    }
+
+    /// `include_str!` reaches OUT of `engine/` for the AI-workflow skill, so
+    /// that file is part of the engine build: editing it changes what `rocky
+    /// mcp` serves, and renaming or deleting it fails compilation.
+    ///
+    /// `engine-ci.yml` must watch every such path. A check that never runs is
+    /// never satisfied — and because `Test`, `Clippy`, `Format`, `Adapter
+    /// boundary` and the codegen check are REQUIRED contexts, a path the filter
+    /// misses does not merely skip CI, it blocks the merge outright (#1557).
+    #[test]
+    fn every_out_of_tree_include_is_watched_by_engine_ci() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root from the crate manifest");
+        let src = std::fs::read_to_string(manifest.join("src/tools.rs")).expect("read tools.rs");
+        let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/engine-ci.yml"))
+            .expect("read engine-ci.yml");
+
+        // Paths that climb above `engine/` — `src/` is three levels below the
+        // repo root, so four or more `../` escapes the engine tree.
+        let mut checked = 0;
+        for (at, _) in src.match_indices("include_str!(\"") {
+            let rest = &src[at + "include_str!(\"".len()..];
+            let path = &rest[..rest.find('"').expect("unterminated include_str! path")];
+            if !path.starts_with("../../../../") {
+                continue;
+            }
+            let repo_relative = path.trim_start_matches("../");
+            assert!(
+                repo_root.join(repo_relative).exists(),
+                "include_str! names a file that does not exist: {repo_relative}"
+            );
+            // EVERY `paths:` list, not merely one of them. `engine-ci.yml`
+            // carries two — `push` and `pull_request` — and a path present in
+            // only one still misses half the trigger. `contains` over the whole
+            // file would pass on a single occurrence; mutation-checking this
+            // test by deleting one of the two proved exactly that.
+            let lists = workflow_path_lists(&workflow);
+            assert_eq!(
+                lists.len(),
+                2,
+                "expected engine-ci.yml to carry a `paths:` list for both `push` \
+                 and `pull_request`; found {}. If the triggers changed, this \
+                 guard needs to change with them.",
+                lists.len()
+            );
+            for (n, list) in lists.iter().enumerate() {
+                assert!(
+                    list.iter().any(|entry| entry == repo_relative),
+                    "`{repo_relative}` is compiled into the engine but is missing \
+                     from engine-ci.yml `paths:` list {n}. The required checks \
+                     would never run for a change to it, so the change gets no \
+                     engine CI AND cannot merge (#1557). It must be in BOTH the \
+                     push and pull_request lists."
+                );
+            }
+            checked += 1;
+        }
+
+        // A zero here would pass vacuously — the assertion above never runs if
+        // the scan finds nothing, which is exactly how this guard would rot.
+        assert!(
+            checked > 0,
+            "found no out-of-tree include_str! paths to check — the scan broke, \
+             or the coupling moved and this test now proves nothing"
+        );
+    }
+
     #[test]
     fn instructions_carry_the_worker_banner_and_stay_verbatim_by_default() {
         let default_info = server_with(McpProfile::Default).get_info();
