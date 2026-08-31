@@ -12323,13 +12323,16 @@ schema_template = "staging__{source}"
         )
         .unwrap();
         let adapter = test_duckdb_adapter(None);
+        // An in-memory DuckDB is process-local, so its identity carries the
+        // process id.
+        let memory = format!("duckdb path=:memory: pid={}", std::process::id());
 
         let plain = replication_resume_scope("p1", &target, &adapter, Some("client=acme"), None);
         assert_eq!(plain.pipeline, "p1");
         assert_eq!(plain.filter.as_deref(), Some("client=acme"));
         assert_eq!(
             plain.target_routing,
-            "default:wh.staging__{source} endpoint(duckdb path=:memory:)"
+            format!("default:wh.staging__{{source}} endpoint({memory})")
         );
 
         let suffix_shadow = rocky_core::shadow::ShadowConfig {
@@ -12341,7 +12344,9 @@ schema_template = "staging__{source}"
             replication_resume_scope("p1", &target, &adapter, None, Some(&suffix_shadow));
         assert_eq!(
             shadowed.target_routing,
-            "default:wh.staging__{source} endpoint(duckdb path=:memory:) shadow(suffix=_rocky_shadow)"
+            format!(
+                "default:wh.staging__{{source}} endpoint({memory}) shadow(suffix=_rocky_shadow)"
+            )
         );
 
         // `--branch` and `--shadow-schema` both arrive as a schema override.
@@ -12354,7 +12359,9 @@ schema_template = "staging__{source}"
             replication_resume_scope("p1", &target, &adapter, None, Some(&branch_shadow));
         assert_eq!(
             branched.target_routing,
-            "default:wh.staging__{source} endpoint(duckdb path=:memory:) shadow(schema=branch__feature)"
+            format!(
+                "default:wh.staging__{{source}} endpoint({memory}) shadow(schema=branch__feature)"
+            )
         );
 
         // The endpoint is the physical warehouse, not the alias: the same

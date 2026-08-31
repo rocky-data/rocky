@@ -3816,9 +3816,9 @@ impl AdapterConfig {
     ///
     /// | type         | locator                                          |
     /// |--------------|--------------------------------------------------|
-    /// | `duckdb`     | `path=` canonical file path, or `:memory:`        |
+    /// | `duckdb`     | `path=` canonical file path, or `:memory: pid=<pid>` |
     /// | `databricks` | `host=` + `http_path=`                           |
-    /// | `snowflake`  | `account=` + `database=` when set                |
+    /// | `snowflake`  | `account=` + `database=`, or `user=` when no database is pinned |
     /// | `bigquery`   | `project_id=`                                    |
     /// | `trino`      | `host=` + `catalog=` (the `database` slot) when set |
     /// | `fivetran`   | `destination_id=` when set                       |
@@ -3827,13 +3827,19 @@ impl AdapterConfig {
     /// | anything else | the type plus whichever locator fields are set  |
     ///
     /// Credentials never appear: the `RedactedString` fields are not read,
-    /// and any `user:password@` userinfo inside a host URL is stripped.
-    /// Compute-only settings (Snowflake `warehouse`/`role`, BigQuery
-    /// `location`, timeouts, retries) are left out on purpose — changing
-    /// them does not move the data.
+    /// and a host URL is reduced to scheme, host, port and path — its
+    /// `user:password@` userinfo, query and fragment are dropped. Compute-only
+    /// settings (Snowflake `warehouse`/`role`, BigQuery `location`, timeouts,
+    /// retries) are left out on purpose — changing them does not move the
+    /// data. A Snowflake config with no `database` writes into the session
+    /// user's default database, so the `username` stands in for it there.
     ///
     /// The DuckDB path is canonicalized when the file exists, so `./wh.duckdb`
-    /// and its absolute spelling agree. Compared for equality, never parsed.
+    /// and its absolute spelling agree; an in-memory database is process-
+    /// local, so its identity carries the process id. The identity describes
+    /// the configured locator, not the file behind it: a DuckDB file replaced
+    /// by another at the same path keeps the same identity. Compared for
+    /// equality, never parsed.
     pub fn endpoint_identity(&self) -> String {
         let mut locators: Vec<String> = Vec::new();
         let mut push = |key: &str, value: Option<&str>| {
@@ -3841,7 +3847,7 @@ impl AdapterConfig {
                 return;
             };
             let value = if key == "host" {
-                strip_url_userinfo(value)
+                sanitize_host_locator(value)
             } else {
                 value.to_string()
             };
@@ -3852,7 +3858,7 @@ impl AdapterConfig {
                 let path = self
                     .path
                     .as_deref()
-                    .map_or_else(|| ":memory:".to_string(), canonical_path_string);
+                    .map_or_else(in_memory_duckdb_locator, canonical_path_string);
                 push("path", Some(&path));
             }
             "databricks" => {
@@ -3861,7 +3867,10 @@ impl AdapterConfig {
             }
             "snowflake" => {
                 push("account", self.account.as_deref());
-                push("database", self.database.as_deref());
+                match self.database.as_deref() {
+                    Some(database) => push("database", Some(database)),
+                    None => push("user", self.username.as_deref()),
+                }
             }
             "bigquery" => push("project_id", self.project_id.as_deref()),
             "trino" => {
@@ -3893,21 +3902,32 @@ impl AdapterConfig {
     }
 }
 
-/// Drops the `user:password@` userinfo from the authority of a URL-shaped
-/// locator (`https://alice:s3cret@host:8443/x` → `https://host:8443/x`).
-/// A bare `user:pw@host` is handled the same way; a value without `@` in its
-/// authority is returned unchanged.
-fn strip_url_userinfo(locator: &str) -> String {
+/// Reduces a URL-shaped `host` to the part that routes: scheme, host, port
+/// and path. The `user:password@` userinfo, any `?query` or `#fragment`,
+/// and a trailing `/` are dropped (`https://alice:s3cret@host:8443/gw/?k=v`
+/// → `https://host:8443/gw`). A bare `user:pw@host` is handled the same
+/// way. The path is kept because a gateway prefix can select a different
+/// cluster; a secret embedded in it is the operator's own routing choice.
+fn sanitize_host_locator(locator: &str) -> String {
+    let locator = locator.split(['?', '#']).next().unwrap_or_default();
     let (scheme, rest) = match locator.split_once("://") {
         Some((scheme, rest)) => (format!("{scheme}://"), rest),
         None => (String::new(), locator),
     };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority_end = rest.find('/').unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(authority_end);
     let authority = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
+    let tail = tail.trim_end_matches('/');
     format!("{scheme}{authority}{tail}")
+}
+
+/// An in-memory DuckDB database lives inside one process and dies with it,
+/// so its identity carries the process id: a checkpoint written against it
+/// can only ever match from the same process.
+fn in_memory_duckdb_locator() -> String {
+    format!(":memory: pid={}", std::process::id())
 }
 
 /// The canonical spelling of a file path: symlinks resolved when the file
@@ -12173,6 +12193,8 @@ adapter = "default"
             "API-KEY-1",
             "API-SECRET-2",
             "s3cret-in-url",
+            "QUERY-SECRET",
+            "FRAGMENT-SECRET",
         ];
         let adapters = [
             adapter_from_toml(
@@ -12201,7 +12223,7 @@ database = "ANALYTICS"
             adapter_from_toml(
                 r#"
 type = "trino"
-host = "https://alice:s3cret-in-url@trino.example.com:8443"
+host = "https://alice:s3cret-in-url@trino.example.com:8443/gateway/?token=QUERY-SECRET#FRAGMENT-SECRET"
 username = "alice"
 password = "sf-PASSWORD-9"
 token = "dapi-TOKEN-1234"
@@ -12250,7 +12272,7 @@ password = "sf-PASSWORD-9"
         );
         assert_eq!(
             adapters[2].endpoint_identity(),
-            "trino host=https://trino.example.com:8443 catalog=hive"
+            "trino host=https://trino.example.com:8443/gateway catalog=hive"
         );
         assert_eq!(
             adapters[3].endpoint_identity(),
@@ -12293,6 +12315,28 @@ database = "ANALYTICS"
         );
         assert_eq!(base.endpoint_identity(), resized.endpoint_identity());
         assert_ne!(base.endpoint_identity(), other_account.endpoint_identity());
+
+        // A pinned database makes the user irrelevant to routing; an unpinned
+        // one writes into the session user's default database, so two users
+        // are two endpoints there.
+        let pinned_as_bob = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"bob\"\ndatabase = \"ANALYTICS\"\n",
+        );
+        assert_eq!(base.endpoint_identity(), pinned_as_bob.endpoint_identity());
+        let unpinned_as_alice = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"alice\"\n",
+        );
+        let unpinned_as_bob = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"bob\"\n",
+        );
+        assert_eq!(
+            unpinned_as_alice.endpoint_identity(),
+            "snowflake account=xy12345.us-east-1 user=alice"
+        );
+        assert_ne!(
+            unpinned_as_alice.endpoint_identity(),
+            unpinned_as_bob.endpoint_identity()
+        );
 
         let bq =
             adapter_from_toml("type = \"bigquery\"\nproject_id = \"my-proj\"\nlocation = \"EU\"\n");
@@ -12347,22 +12391,43 @@ database = "ANALYTICS"
             elsewhere.endpoint_identity()
         );
 
+        // In-memory DuckDB never outlives its process, so the identity is
+        // pinned to this process and can never match from another one.
         let in_memory = adapter_from_toml("type = \"duckdb\"\n");
-        assert_eq!(in_memory.endpoint_identity(), "duckdb path=:memory:");
+        assert_eq!(
+            in_memory.endpoint_identity(),
+            format!("duckdb path=:memory: pid={}", std::process::id())
+        );
     }
 
     #[test]
-    fn strip_url_userinfo_keeps_everything_but_the_credentials() {
+    fn sanitize_host_locator_keeps_the_route_and_drops_the_rest() {
         assert_eq!(
-            strip_url_userinfo("https://alice:s3cret@trino.example.com:8443/path?x=1"),
-            "https://trino.example.com:8443/path?x=1"
+            sanitize_host_locator("https://alice:s3cret@trino.example.com:8443/path?x=1#frag"),
+            "https://trino.example.com:8443/path"
         );
-        assert_eq!(strip_url_userinfo("alice:pw@host"), "host");
-        assert_eq!(strip_url_userinfo("https://host/a@b"), "https://host/a@b");
+        assert_eq!(sanitize_host_locator("alice:pw@host"), "host");
         assert_eq!(
-            strip_url_userinfo("https://adb-1.azuredatabricks.net"),
+            sanitize_host_locator("https://host/a@b"),
+            "https://host/a@b"
+        );
+        assert_eq!(
+            sanitize_host_locator("https://adb-1.azuredatabricks.net"),
             "https://adb-1.azuredatabricks.net"
         );
-        assert_eq!(strip_url_userinfo(""), "");
+        // Equivalent spellings of one coordinator agree.
+        assert_eq!(
+            sanitize_host_locator("https://trino.example/"),
+            sanitize_host_locator("https://trino.example")
+        );
+        assert_eq!(
+            sanitize_host_locator("https://trino.example/gw/"),
+            "https://trino.example/gw"
+        );
+        assert_eq!(
+            sanitize_host_locator("https://host?token=T"),
+            "https://host"
+        );
+        assert_eq!(sanitize_host_locator(""), "");
     }
 }
