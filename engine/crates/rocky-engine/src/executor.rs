@@ -75,7 +75,6 @@ pub fn compile_and_execute(models_dir: &Path) -> anyhow::Result<ExecutionResult>
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
