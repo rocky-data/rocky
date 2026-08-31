@@ -3804,6 +3804,121 @@ impl std::fmt::Debug for AdapterConfig {
     }
 }
 
+impl AdapterConfig {
+    /// A stable, secret-free identity for the physical endpoint this block
+    /// points at.
+    ///
+    /// The adapter *name* is a config alias: two `rocky.toml` files can call
+    /// different warehouses `default`, and one file can be re-pointed between
+    /// runs. Anything that must not cross warehouses — a resume checkpoint,
+    /// for one — needs the endpoint, not the alias. The value is the adapter
+    /// type plus the non-secret locator fields that pick the warehouse:
+    ///
+    /// | type         | locator                                          |
+    /// |--------------|--------------------------------------------------|
+    /// | `duckdb`     | `path=` canonical file path, or `:memory:`        |
+    /// | `databricks` | `host=` + `http_path=`                           |
+    /// | `snowflake`  | `account=` + `database=` when set                |
+    /// | `bigquery`   | `project_id=`                                    |
+    /// | `trino`      | `host=` + `catalog=` (the `database` slot) when set |
+    /// | `fivetran`   | `destination_id=` when set                       |
+    /// | `airbyte`, `iceberg` | `host=`                                  |
+    /// | `manual`     | the type alone                                   |
+    /// | anything else | the type plus whichever locator fields are set  |
+    ///
+    /// Credentials never appear: the `RedactedString` fields are not read,
+    /// and any `user:password@` userinfo inside a host URL is stripped.
+    /// Compute-only settings (Snowflake `warehouse`/`role`, BigQuery
+    /// `location`, timeouts, retries) are left out on purpose — changing
+    /// them does not move the data.
+    ///
+    /// The DuckDB path is canonicalized when the file exists, so `./wh.duckdb`
+    /// and its absolute spelling agree. Compared for equality, never parsed.
+    pub fn endpoint_identity(&self) -> String {
+        let mut locators: Vec<String> = Vec::new();
+        let mut push = |key: &str, value: Option<&str>| {
+            let Some(value) = value else {
+                return;
+            };
+            let value = if key == "host" {
+                strip_url_userinfo(value)
+            } else {
+                value.to_string()
+            };
+            locators.push(format!("{key}={value}"));
+        };
+        match self.adapter_type.as_str() {
+            "duckdb" => {
+                let path = self
+                    .path
+                    .as_deref()
+                    .map_or_else(|| ":memory:".to_string(), canonical_path_string);
+                push("path", Some(&path));
+            }
+            "databricks" => {
+                push("host", self.host.as_deref());
+                push("http_path", self.http_path.as_deref());
+            }
+            "snowflake" => {
+                push("account", self.account.as_deref());
+                push("database", self.database.as_deref());
+            }
+            "bigquery" => push("project_id", self.project_id.as_deref()),
+            "trino" => {
+                push("host", self.host.as_deref());
+                push("catalog", self.database.as_deref());
+            }
+            "fivetran" => push("destination_id", self.destination_id.as_deref()),
+            "airbyte" | "iceberg" => push("host", self.host.as_deref()),
+            "manual" => {}
+            _ => {
+                push("host", self.host.as_deref());
+                push("http_path", self.http_path.as_deref());
+                push("account", self.account.as_deref());
+                push("database", self.database.as_deref());
+                push("project_id", self.project_id.as_deref());
+                push("destination_id", self.destination_id.as_deref());
+                push(
+                    "path",
+                    self.path.as_deref().map(canonical_path_string).as_deref(),
+                );
+            }
+        }
+        let mut identity = self.adapter_type.clone();
+        for locator in locators {
+            identity.push(' ');
+            identity.push_str(&locator);
+        }
+        identity
+    }
+}
+
+/// Drops the `user:password@` userinfo from the authority of a URL-shaped
+/// locator (`https://alice:s3cret@host:8443/x` → `https://host:8443/x`).
+/// A bare `user:pw@host` is handled the same way; a value without `@` in its
+/// authority is returned unchanged.
+fn strip_url_userinfo(locator: &str) -> String {
+    let (scheme, rest) = match locator.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), locator),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}{authority}{tail}")
+}
+
+/// The canonical spelling of a file path: symlinks resolved when the file
+/// exists, otherwise the absolute form, otherwise the input unchanged.
+fn canonical_path_string(path: &str) -> String {
+    let path = std::path::Path::new(path);
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
+}
+
 /// Persistent state cache configuration for the Fivetran adapter (FR-A).
 ///
 /// Cache backends shared across processes let several `rocky` invocations
@@ -12039,5 +12154,215 @@ adapter = "default"
                 "error for {bad:?} should mention {needle}: {err}"
             );
         }
+    }
+
+    // ---- AdapterConfig::endpoint_identity ----
+
+    fn adapter_from_toml(body: &str) -> AdapterConfig {
+        toml::from_str(body).expect("adapter block parses")
+    }
+
+    #[test]
+    fn endpoint_identity_never_contains_credentials() {
+        let secrets = [
+            "dapi-TOKEN-1234",
+            "CLIENT-SECRET-5678",
+            "sf-PASSWORD-9",
+            "OAUTH-TOKEN-abc",
+            "PAT-xyz",
+            "API-KEY-1",
+            "API-SECRET-2",
+            "s3cret-in-url",
+        ];
+        let adapters = [
+            adapter_from_toml(
+                r#"
+type = "databricks"
+host = "https://alice:s3cret-in-url@adb-1.azuredatabricks.net"
+http_path = "/sql/1.0/warehouses/abc"
+token = "dapi-TOKEN-1234"
+client_id = "client-1"
+client_secret = "CLIENT-SECRET-5678"
+"#,
+            ),
+            adapter_from_toml(
+                r#"
+type = "snowflake"
+account = "xy12345.us-east-1"
+warehouse = "COMPUTE_WH"
+username = "alice"
+password = "sf-PASSWORD-9"
+oauth_token = "OAUTH-TOKEN-abc"
+pat = "PAT-xyz"
+private_key_path = "/keys/rsa_key.p8"
+database = "ANALYTICS"
+"#,
+            ),
+            adapter_from_toml(
+                r#"
+type = "trino"
+host = "https://alice:s3cret-in-url@trino.example.com:8443"
+username = "alice"
+password = "sf-PASSWORD-9"
+token = "dapi-TOKEN-1234"
+database = "hive"
+"#,
+            ),
+            adapter_from_toml(
+                r#"
+type = "fivetran"
+api_key = "API-KEY-1"
+api_secret = "API-SECRET-2"
+destination_id = "dest_1"
+"#,
+            ),
+            adapter_from_toml(
+                r#"
+type = "some_future_adapter"
+host = "https://alice:s3cret-in-url@wh.example.com/api"
+token = "dapi-TOKEN-1234"
+password = "sf-PASSWORD-9"
+"#,
+            ),
+        ];
+        for adapter in &adapters {
+            let identity = adapter.endpoint_identity();
+            for secret in secrets {
+                assert!(
+                    !identity.contains(secret),
+                    "{}: identity {identity:?} leaks {secret:?}",
+                    adapter.adapter_type
+                );
+            }
+            assert!(
+                !identity.contains("***"),
+                "{}: identity must not carry a redaction placeholder either: {identity:?}",
+                adapter.adapter_type
+            );
+        }
+        assert_eq!(
+            adapters[0].endpoint_identity(),
+            "databricks host=https://adb-1.azuredatabricks.net http_path=/sql/1.0/warehouses/abc"
+        );
+        assert_eq!(
+            adapters[1].endpoint_identity(),
+            "snowflake account=xy12345.us-east-1 database=ANALYTICS"
+        );
+        assert_eq!(
+            adapters[2].endpoint_identity(),
+            "trino host=https://trino.example.com:8443 catalog=hive"
+        );
+        assert_eq!(
+            adapters[3].endpoint_identity(),
+            "fivetran destination_id=dest_1"
+        );
+        assert_eq!(
+            adapters[4].endpoint_identity(),
+            "some_future_adapter host=https://wh.example.com/api"
+        );
+    }
+
+    #[test]
+    fn endpoint_identity_is_the_locator_not_the_compute_settings() {
+        let base = adapter_from_toml(
+            r#"
+type = "snowflake"
+account = "xy12345.us-east-1"
+warehouse = "SMALL_WH"
+role = "LOADER"
+database = "ANALYTICS"
+"#,
+        );
+        let resized = adapter_from_toml(
+            r#"
+type = "snowflake"
+account = "xy12345.us-east-1"
+warehouse = "XLARGE_WH"
+role = "ADMIN"
+database = "ANALYTICS"
+timeout_secs = 900
+"#,
+        );
+        let other_account = adapter_from_toml(
+            r#"
+type = "snowflake"
+account = "zz99999.eu-west-1"
+warehouse = "SMALL_WH"
+database = "ANALYTICS"
+"#,
+        );
+        assert_eq!(base.endpoint_identity(), resized.endpoint_identity());
+        assert_ne!(base.endpoint_identity(), other_account.endpoint_identity());
+
+        let bq =
+            adapter_from_toml("type = \"bigquery\"\nproject_id = \"my-proj\"\nlocation = \"EU\"\n");
+        assert_eq!(bq.endpoint_identity(), "bigquery project_id=my-proj");
+        let manual = adapter_from_toml("type = \"manual\"\n");
+        assert_eq!(manual.endpoint_identity(), "manual");
+        let airbyte = adapter_from_toml(
+            "type = \"airbyte\"\nhost = \"https://airbyte.example.com\"\ntoken = \"t\"\n",
+        );
+        assert_eq!(
+            airbyte.endpoint_identity(),
+            "airbyte host=https://airbyte.example.com"
+        );
+    }
+
+    #[test]
+    fn duckdb_endpoint_identity_canonicalizes_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("wh.duckdb");
+        std::fs::write(&file, b"").unwrap();
+        let canonical = std::fs::canonicalize(&file).unwrap();
+
+        let spelled_directly = adapter_from_toml(&format!(
+            "type = \"duckdb\"\npath = \"{}\"\n",
+            file.display()
+        ));
+        let spelled_with_dot = adapter_from_toml(&format!(
+            "type = \"duckdb\"\npath = \"{}\"\n",
+            dir.path().join(".").join("wh.duckdb").display()
+        ));
+        assert_eq!(
+            spelled_directly.endpoint_identity(),
+            format!("duckdb path={}", canonical.display())
+        );
+        assert_eq!(
+            spelled_directly.endpoint_identity(),
+            spelled_with_dot.endpoint_identity()
+        );
+
+        let elsewhere = adapter_from_toml(&format!(
+            "type = \"duckdb\"\npath = \"{}\"\n",
+            dir.path().join("other.duckdb").display()
+        ));
+        assert_ne!(
+            spelled_directly.endpoint_identity(),
+            elsewhere.endpoint_identity(),
+            "a file that does not exist yet still gets its own absolute identity"
+        );
+        assert!(
+            elsewhere.endpoint_identity().ends_with("other.duckdb"),
+            "{}",
+            elsewhere.endpoint_identity()
+        );
+
+        let in_memory = adapter_from_toml("type = \"duckdb\"\n");
+        assert_eq!(in_memory.endpoint_identity(), "duckdb path=:memory:");
+    }
+
+    #[test]
+    fn strip_url_userinfo_keeps_everything_but_the_credentials() {
+        assert_eq!(
+            strip_url_userinfo("https://alice:s3cret@trino.example.com:8443/path?x=1"),
+            "https://trino.example.com:8443/path?x=1"
+        );
+        assert_eq!(strip_url_userinfo("alice:pw@host"), "host");
+        assert_eq!(strip_url_userinfo("https://host/a@b"), "https://host/a@b");
+        assert_eq!(
+            strip_url_userinfo("https://adb-1.azuredatabricks.net"),
+            "https://adb-1.azuredatabricks.net"
+        );
+        assert_eq!(strip_url_userinfo(""), "");
     }
 }

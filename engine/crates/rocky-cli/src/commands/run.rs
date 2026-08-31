@@ -1398,19 +1398,30 @@ fn require_resume_progress(
 
 /// The execution identity of the replication invocation asking to resume
 /// (#1549): the resolved pipeline name, the `--filter` selector, and where the
-/// run routes its writes (target adapter + templates, plus any shadow or
-/// branch override — `--branch` arrives here as a `ShadowConfig` with a
-/// `schema_override`). Must mirror what `init_run_progress` stamps on the
-/// checkpoint this run writes, so a later resume compares like with like.
+/// run routes its writes (target adapter + templates, the physical endpoint
+/// behind that adapter name, plus any shadow or branch override — `--branch`
+/// arrives here as a `ShadowConfig` with a `schema_override`). The endpoint
+/// is [`AdapterConfig::endpoint_identity`]: the adapter name is only a
+/// config alias, and the same alias re-pointed at another warehouse (a
+/// DuckDB `path` edited between runs, two `rocky.toml` files sharing one
+/// state file) must not resume the other warehouse's checkpoint. Must mirror
+/// what `init_run_progress` stamps on the checkpoint this run writes, so a
+/// later resume compares like with like.
+///
+/// [`AdapterConfig::endpoint_identity`]: rocky_core::config::AdapterConfig::endpoint_identity
 fn replication_resume_scope(
     pipeline_name: &str,
     target: &rocky_core::config::PipelineTargetConfig,
+    target_adapter: &rocky_core::config::AdapterConfig,
     filter: Option<&str>,
     shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
 ) -> ResumeScope {
     let mut target_routing = format!(
-        "{}:{}.{}",
-        target.adapter, target.catalog_template, target.schema_template
+        "{}:{}.{} endpoint({})",
+        target.adapter,
+        target.catalog_template,
+        target.schema_template,
+        target_adapter.endpoint_identity()
     );
     if let Some(shadow) = shadow_config {
         match &shadow.schema_override {
@@ -1448,9 +1459,13 @@ fn ensure_resume_scope(progress: &RunProgress, current: &ResumeScope) -> Result<
 }
 
 /// Refuse `--resume-latest` when the selected run's own [`RunRecord`] says it
-/// left no work to recover (#1548). No record at all is the crash case — the
-/// run never reached a terminal status — and stays resumable, as do the
-/// failure statuses. There is no searching backwards past a refused run.
+/// left no work to recover (#1548). The failure statuses stay resumable.
+/// No record at all is the crash case — the run never reached a terminal
+/// status — *unless* the checkpoint itself shows the run finished: run-history
+/// retention sweeps run records but never `run_progress`, so a succeeded
+/// run's checkpoint outlives its record (see
+/// [`ensure_recordless_checkpoint_is_incomplete`]). There is no searching
+/// backwards past a refused run.
 ///
 /// [`RunRecord`]: rocky_core::state::RunRecord
 fn ensure_latest_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> Result<()> {
@@ -1458,7 +1473,7 @@ fn ensure_latest_run_is_resumable(state_store: &StateStore, progress: &RunProgre
         .get_run(&progress.run_id)
         .with_context(|| format!("failed to load the run record for '{}'", progress.run_id))?;
     let Some(record) = record else {
-        return Ok(());
+        return ensure_recordless_checkpoint_is_incomplete(progress);
     };
     use rocky_core::state::RunStatus;
     match record.status {
@@ -1474,6 +1489,27 @@ fn ensure_latest_run_is_resumable(state_store: &StateStore, progress: &RunProgre
             record.status
         ),
     }
+}
+
+/// A checkpoint with no run record is the crash case only while it is
+/// incomplete. When every one of its `total_tables` planned tables recorded
+/// `Success`, the run finished and left nothing to recover — resuming it
+/// would skip every table and copy nothing, the #1548 no-op, this time with
+/// the record gone to retention. A checkpoint that planned zero tables
+/// cannot skip anything, so it stays a valid (empty) resume.
+fn ensure_recordless_checkpoint_is_incomplete(progress: &RunProgress) -> Result<()> {
+    let completed = progress
+        .tables
+        .iter()
+        .filter(|t| t.status == rocky_core::state::TableStatus::Success)
+        .count();
+    anyhow::ensure!(
+        progress.total_tables == 0 || completed < progress.total_tables,
+        "nothing to resume: run {} completed all {} tables (its run record is gone)",
+        progress.run_id,
+        progress.total_tables
+    );
+    Ok(())
 }
 
 fn resolve_resume_progress(
@@ -2746,11 +2782,26 @@ pub async fn run(
 
     // Resolve an explicit recovery request before discovery or warehouse
     // setup. A missing or unreadable checkpoint must never degrade into a
-    // fresh run, a checkpoint from another pipeline scope must never be
-    // resumed (#1549), and `--resume-latest` refuses a run whose record says
-    // it left nothing to recover (#1548).
-    let resume_scope =
-        replication_resume_scope(pipeline_name, &pipeline.target, filter, shadow_config);
+    // fresh run, a checkpoint from another pipeline scope or another
+    // physical endpoint must never be resumed (#1549), and `--resume-latest`
+    // refuses a run whose record — or, once retention swept the record, whose
+    // checkpoint — says it left nothing to recover (#1548).
+    let target_adapter = rocky_cfg
+        .adapters
+        .get(&pipeline.target.adapter)
+        .with_context(|| {
+            format!(
+                "no adapter named '{}' to scope the resume checkpoint",
+                pipeline.target.adapter
+            )
+        })?;
+    let resume_scope = replication_resume_scope(
+        pipeline_name,
+        &pipeline.target,
+        target_adapter,
+        filter,
+        shadow_config,
+    );
     let resume_progress =
         resolve_resume_progress(&state_store, resume_run_id, resume_latest, &resume_scope)?;
 
@@ -12194,8 +12245,20 @@ mod tests {
         ResumeScope {
             pipeline: pipeline.to_string(),
             filter: None,
-            target_routing: format!("default:wh.staging_{pipeline}__{{source}}"),
+            target_routing: format!(
+                "default:wh.staging_{pipeline}__{{source}} endpoint(duckdb path=:memory:)"
+            ),
         }
+    }
+
+    /// The single `default` DuckDB adapter of a test project, or an in-memory
+    /// one when no `path` is given.
+    fn test_duckdb_adapter(path: Option<&std::path::Path>) -> rocky_core::config::AdapterConfig {
+        let body = match path {
+            Some(path) => format!("type = \"duckdb\"\npath = \"{}\"\n", path.display()),
+            None => "type = \"duckdb\"\n".to_string(),
+        };
+        toml::from_str(&body).unwrap()
     }
 
     /// Records a minimal [`rocky_core::state::RunRecord`] with the given
@@ -12214,9 +12277,41 @@ mod tests {
         store.record_run(&record).unwrap();
     }
 
+    /// A per-table checkpoint entry with the given status.
+    fn table_entry(
+        index: usize,
+        table_key: &str,
+        status: rocky_core::state::TableStatus,
+    ) -> rocky_core::state::TableProgress {
+        rocky_core::state::TableProgress {
+            index,
+            table_key: table_key.to_string(),
+            asset_key: vec![table_key.rsplit('.').next().unwrap().to_string()],
+            status,
+            error: None,
+            duration_ms: 1,
+            completed_at: Utc::now(),
+        }
+    }
+
+    /// The run-history retention policy at its most aggressive: keep no
+    /// run, drop everything older than right now. Only the `history` domain
+    /// is swept — the same table op the end-of-run auto-sweep performs.
+    fn sweep_all_run_records(store: &StateStore) -> u64 {
+        let policy = rocky_core::retention::StateRetentionConfig {
+            max_age_days: 0,
+            min_runs_kept: 0,
+            applies_to: vec![rocky_core::retention::StateRetentionDomain::History],
+            ..Default::default()
+        };
+        store.sweep_retention(&policy).unwrap().runs_deleted
+    }
+
     /// Pins the persisted `target_routing` format — it is compared for
     /// equality across binaries, so a silent format change would refuse
-    /// every resume after an upgrade.
+    /// every resume after an upgrade. Deliberately re-pinned when the
+    /// endpoint identity joined the scope: checkpoints written by the
+    /// unreleased #1573 build carry no `endpoint(...)` and refuse to resume.
     #[test]
     fn resume_scope_target_routing_format_is_pinned() {
         let target: rocky_core::config::PipelineTargetConfig = toml::from_str(
@@ -12227,21 +12322,26 @@ schema_template = "staging__{source}"
 "#,
         )
         .unwrap();
+        let adapter = test_duckdb_adapter(None);
 
-        let plain = replication_resume_scope("p1", &target, Some("client=acme"), None);
+        let plain = replication_resume_scope("p1", &target, &adapter, Some("client=acme"), None);
         assert_eq!(plain.pipeline, "p1");
         assert_eq!(plain.filter.as_deref(), Some("client=acme"));
-        assert_eq!(plain.target_routing, "default:wh.staging__{source}");
+        assert_eq!(
+            plain.target_routing,
+            "default:wh.staging__{source} endpoint(duckdb path=:memory:)"
+        );
 
         let suffix_shadow = rocky_core::shadow::ShadowConfig {
             suffix: "_rocky_shadow".to_string(),
             schema_override: None,
             cleanup_after: false,
         };
-        let shadowed = replication_resume_scope("p1", &target, None, Some(&suffix_shadow));
+        let shadowed =
+            replication_resume_scope("p1", &target, &adapter, None, Some(&suffix_shadow));
         assert_eq!(
             shadowed.target_routing,
-            "default:wh.staging__{source} shadow(suffix=_rocky_shadow)"
+            "default:wh.staging__{source} endpoint(duckdb path=:memory:) shadow(suffix=_rocky_shadow)"
         );
 
         // `--branch` and `--shadow-schema` both arrive as a schema override.
@@ -12250,11 +12350,28 @@ schema_template = "staging__{source}"
             schema_override: Some("branch__feature".to_string()),
             cleanup_after: false,
         };
-        let branched = replication_resume_scope("p1", &target, None, Some(&branch_shadow));
+        let branched =
+            replication_resume_scope("p1", &target, &adapter, None, Some(&branch_shadow));
         assert_eq!(
             branched.target_routing,
-            "default:wh.staging__{source} shadow(schema=branch__feature)"
+            "default:wh.staging__{source} endpoint(duckdb path=:memory:) shadow(schema=branch__feature)"
         );
+
+        // The endpoint is the physical warehouse, not the alias: the same
+        // `default` name over a different file is a different scope.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("wh.duckdb");
+        std::fs::write(&file, b"").unwrap();
+        let on_disk =
+            replication_resume_scope("p1", &target, &test_duckdb_adapter(Some(&file)), None, None);
+        assert_eq!(
+            on_disk.target_routing,
+            format!(
+                "default:wh.staging__{{source}} endpoint(duckdb path={})",
+                std::fs::canonicalize(&file).unwrap().display()
+            )
+        );
+        assert_ne!(on_disk, plain);
     }
 
     #[test]
@@ -12431,6 +12548,89 @@ schema_template = "staging__{source}"
             seed_run_record(&store, "run-1", status);
             let progress = resolve_resume_progress(&store, None, true, &scope)
                 .unwrap()
+                .unwrap();
+            assert_eq!(progress.run_id, "run-1");
+        }
+    }
+
+    /// Retention sweeps run records but never checkpoints. A succeeded run
+    /// whose record was swept therefore looks like the crash case (no record)
+    /// while its checkpoint says every planned table completed —
+    /// `--resume-latest` must refuse it instead of skipping every table
+    /// again. An explicit `--resume <id>` stays the operator's choice.
+    #[test]
+    fn resume_latest_refuses_a_complete_checkpoint_whose_record_was_swept() {
+        use rocky_core::state::TableStatus;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        let scope = test_resume_scope("p1");
+        store.init_run_progress("run-1", 2, Some(&scope)).unwrap();
+        for (index, key) in ["wh.staging_p1__acme.orders", "wh.staging_p1__acme.items"]
+            .iter()
+            .enumerate()
+        {
+            store
+                .record_table_progress("run-1", &table_entry(index, key, TableStatus::Success))
+                .unwrap();
+        }
+        seed_run_record(&store, "run-1", "Success");
+
+        assert_eq!(sweep_all_run_records(&store), 1);
+        assert!(
+            store.get_run("run-1").unwrap().is_none(),
+            "the sweep must have removed the run record"
+        );
+        assert!(
+            store.get_run_progress("run-1").unwrap().is_some(),
+            "the sweep must leave the checkpoint in place — that is the hazard"
+        );
+
+        let err = resolve_resume_progress(&store, None, true, &scope)
+            .expect_err("a completed checkpoint without a record must not resume");
+        assert!(
+            err.to_string().contains(
+                "nothing to resume: run run-1 completed all 2 tables (its run record is gone)"
+            ),
+            "unexpected error: {err:#}"
+        );
+
+        let explicit = resolve_resume_progress(&store, Some("run-1"), false, &scope)
+            .unwrap()
+            .unwrap();
+        assert_eq!(explicit.run_id, "run-1");
+    }
+
+    /// The crash case proper: no run record AND an incomplete checkpoint —
+    /// a table still unrecorded, or one recorded as not `Success`. Both
+    /// shapes stay resumable.
+    #[test]
+    fn resume_latest_resumes_an_incomplete_checkpoint_without_a_record() {
+        use rocky_core::state::TableStatus;
+
+        for (planned, recorded) in [
+            (2, vec![TableStatus::Success]),
+            (1, vec![TableStatus::Failed]),
+            (1, vec![TableStatus::Interrupted]),
+            (2, vec![TableStatus::Success, TableStatus::Skipped]),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+            let scope = test_resume_scope("p1");
+            store
+                .init_run_progress("run-1", planned, Some(&scope))
+                .unwrap();
+            for (index, status) in recorded.iter().enumerate() {
+                let key = format!("wh.staging_p1__acme.t{index}");
+                store
+                    .record_table_progress("run-1", &table_entry(index, &key, status.clone()))
+                    .unwrap();
+            }
+
+            let progress = resolve_resume_progress(&store, None, true, &scope)
+                .unwrap_or_else(|err| {
+                    panic!("{planned} planned / {recorded:?} recorded must resume: {err:#}")
+                })
                 .unwrap();
             assert_eq!(progress.run_id, "run-1");
         }
@@ -12619,23 +12819,48 @@ auto_create_schemas = true
         p1_schema_template: &str,
         p2_schema_template: &str,
     ) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let db_path = dir.join("warehouse.duckdb");
+        seed_source_db(&db_path).await;
+        let (config_path, state_path) =
+            write_two_pipeline_config(dir, &db_path, p1_schema_template, p2_schema_template);
+        (config_path, state_path, db_path)
+    }
+
+    /// Creates the DuckDB file at `db_path` holding the one source table
+    /// (`raw__acme.orders`) the two-pipeline project replicates.
+    #[cfg(feature = "duckdb")]
+    async fn seed_source_db(db_path: &std::path::Path) {
         use rocky_core::traits::WarehouseAdapter;
         use rocky_duckdb::adapter::DuckDbWarehouseAdapter;
 
-        let db_path = dir.join("warehouse.duckdb");
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let warehouse = DuckDbWarehouseAdapter::open(db_path).unwrap();
+        warehouse
+            .execute_statement("CREATE SCHEMA raw__acme")
+            .await
+            .unwrap();
+        warehouse
+            .execute_statement("CREATE TABLE raw__acme.orders AS SELECT 1 AS id")
+            .await
+            .unwrap();
+    }
+
+    /// Writes (or rewrites) `dir/rocky.toml` for the two-pipeline project so
+    /// its single `default` adapter points at `db_path`. Returns
+    /// `(config_path, state_path)`; the state file is always `dir/state.redb`,
+    /// so rewriting the config with another `db_path` models the same alias
+    /// re-pointed at a different warehouse over one state store.
+    #[cfg(feature = "duckdb")]
+    fn write_two_pipeline_config(
+        dir: &std::path::Path,
+        db_path: &std::path::Path,
+        p1_schema_template: &str,
+        p2_schema_template: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
         let config_path = dir.join("rocky.toml");
         let state_path = dir.join("state.redb");
-        {
-            let warehouse = DuckDbWarehouseAdapter::open(&db_path).unwrap();
-            warehouse
-                .execute_statement("CREATE SCHEMA raw__acme")
-                .await
-                .unwrap();
-            warehouse
-                .execute_statement("CREATE TABLE raw__acme.orders AS SELECT 1 AS id")
-                .await
-                .unwrap();
-        }
         std::fs::write(
             &config_path,
             format!(
@@ -12693,7 +12918,7 @@ auto_create_schemas = true
             ),
         )
         .unwrap();
-        (config_path, state_path, db_path)
+        (config_path, state_path)
     }
 
     #[cfg(feature = "duckdb")]
@@ -12804,7 +13029,11 @@ auto_create_schemas = true
     #[cfg(feature = "duckdb")]
     #[tokio::test]
     async fn resume_latest_resumes_crashed_and_failed_runs() {
-        for run_record_status in [None, Some("Failure")] {
+        // The crash case plans two tables and completed one — an incomplete
+        // checkpoint with no record. (A checkpoint that completed every
+        // planned table without a record is retention's leftover, refused —
+        // see `resume_latest_refuses_a_succeeded_run_after_retention_swept_its_record`.)
+        for (run_record_status, planned_tables) in [(None, 2), (Some("Failure"), 1)] {
             let dir = tempfile::tempdir().unwrap();
             let (config_path, state_path, db_path) = write_two_pipeline_project(
                 dir.path(),
@@ -12815,35 +13044,33 @@ auto_create_schemas = true
 
             // Seed the checkpoint the way an interrupted p2 run leaves it:
             // scope stamped by the same helper the run path uses, the only
-            // table recorded Success — and, for the crash case, no run
-            // record at all (the run never reached a terminal status).
+            // source table recorded Success — and, for the crash case, no
+            // run record at all (the run never reached a terminal status).
             {
                 let loaded =
                     rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
                 let (name, pipeline_config) =
                     registry::resolve_pipeline(&loaded.config, Some("p2")).unwrap();
+                let target = &pipeline_config.as_replication().unwrap().target;
                 let scope = replication_resume_scope(
                     name,
-                    &pipeline_config.as_replication().unwrap().target,
+                    target,
+                    &loaded.config.adapters[&target.adapter],
                     None,
                     None,
                 );
                 let store = StateStore::open(&state_path).unwrap();
                 store
-                    .init_run_progress("run-seeded", 1, Some(&scope))
+                    .init_run_progress("run-seeded", planned_tables, Some(&scope))
                     .unwrap();
                 store
                     .record_table_progress(
                         "run-seeded",
-                        &rocky_core::state::TableProgress {
-                            index: 0,
-                            table_key: "warehouse.staging_p2__acme.orders".to_string(),
-                            asset_key: vec!["orders".to_string()],
-                            status: rocky_core::state::TableStatus::Success,
-                            error: None,
-                            duration_ms: 1,
-                            completed_at: Utc::now(),
-                        },
+                        &table_entry(
+                            0,
+                            "warehouse.staging_p2__acme.orders",
+                            rocky_core::state::TableStatus::Success,
+                        ),
                     )
                     .unwrap();
                 if let Some(status) = run_record_status {
@@ -12895,6 +13122,133 @@ auto_create_schemas = true
         assert!(
             !target_table_exists(&db_path, "staging_p1__acme", "orders").await,
             "a refused resume must not run p1 fresh"
+        );
+    }
+
+    /// The latest run succeeded, then run-history retention swept its run
+    /// record (retention never touches `run_progress`). Before the fix the
+    /// missing record read as a crash and `--resume-latest` skipped every
+    /// table again, exiting 0 having copied nothing.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn resume_latest_refuses_a_succeeded_run_after_retention_swept_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) =
+            write_two_pipeline_project(dir.path(), "staging_p1__{source}", "staging_p2__{source}")
+                .await;
+
+        drive_resume_test_run(&config_path, &state_path, "p2", None, false)
+            .await
+            .expect("p2 runs fresh and succeeds");
+        assert!(target_table_exists(&db_path, "staging_p2__acme", "orders").await);
+        let run_id = {
+            let store = StateStore::open(&state_path).unwrap();
+            let run_id = store.get_latest_run_progress().unwrap().unwrap().run_id;
+            assert_eq!(sweep_all_run_records(&store), 1);
+            assert!(store.get_run(&run_id).unwrap().is_none());
+            run_id
+        };
+
+        let err = drive_resume_test_run(&config_path, &state_path, "p2", None, true)
+            .await
+            .expect_err("a completed checkpoint whose record was swept must not resume");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!(
+                "nothing to resume: run {run_id} completed all 1 tables (its run record is gone)"
+            )),
+            "unexpected error: {message}"
+        );
+        let store = StateStore::open(&state_path).unwrap();
+        assert_eq!(
+            store.get_latest_run_progress().unwrap().unwrap().run_id,
+            run_id,
+            "a refused resume must not write a new checkpoint"
+        );
+    }
+
+    /// The same adapter alias (`default`), the same templates, but the alias
+    /// re-pointed at a different DuckDB file over one state store. Before the
+    /// fix the scope matched, so `--resume-latest` resumed the other
+    /// warehouse's checkpoint and skipped a table never copied here.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn resume_refuses_a_checkpoint_from_another_endpoint_behind_the_same_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_a = dir.path().join("a").join("warehouse.duckdb");
+        let db_b = dir.path().join("b").join("warehouse.duckdb");
+        seed_source_db(&db_a).await;
+        seed_source_db(&db_b).await;
+        let (config_path, state_path) = write_two_pipeline_config(
+            dir.path(),
+            &db_a,
+            "staging_p1__{source}",
+            "staging_p2__{source}",
+        );
+
+        // A resumable checkpoint against warehouse A: the run completed its
+        // table, and its record says Failure (so #1548 does not refuse it).
+        drive_resume_test_run(&config_path, &state_path, "p2", None, false)
+            .await
+            .expect("p2 runs fresh against warehouse A");
+        assert!(target_table_exists(&db_a, "staging_p2__acme", "orders").await);
+        let run_id = {
+            let store = StateStore::open(&state_path).unwrap();
+            let run_id = store.get_latest_run_progress().unwrap().unwrap().run_id;
+            seed_run_record(&store, &run_id, "Failure");
+            run_id
+        };
+        let endpoint_a = std::fs::canonicalize(&db_a).unwrap().display().to_string();
+        let endpoint_b = std::fs::canonicalize(&db_b).unwrap().display().to_string();
+
+        write_two_pipeline_config(
+            dir.path(),
+            &db_b,
+            "staging_p1__{source}",
+            "staging_p2__{source}",
+        );
+
+        let err = drive_resume_test_run(&config_path, &state_path, "p2", None, true)
+            .await
+            .expect_err("warehouse A's checkpoint must not resolve for warehouse B");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("no progress found") && message.contains(&endpoint_b),
+            "the refusal names the asking endpoint: {message}"
+        );
+        assert!(
+            !target_table_exists(&db_b, "staging_p2__acme", "orders").await,
+            "a refused resume must not run p2 fresh against warehouse B"
+        );
+
+        let err = drive_resume_test_run(&config_path, &state_path, "p2", Some(&run_id), false)
+            .await
+            .expect_err("--resume <id> must refuse warehouse A's checkpoint under B");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("different pipeline scope")
+                && message.contains(&endpoint_a)
+                && message.contains(&endpoint_b),
+            "the refusal names both endpoints: {message}"
+        );
+
+        // Same path again: the scope matches and the checkpoint resumes,
+        // skipping the table it already completed.
+        write_two_pipeline_config(
+            dir.path(),
+            &db_a,
+            "staging_p1__{source}",
+            "staging_p2__{source}",
+        );
+        drive_resume_test_run(&config_path, &state_path, "p2", None, true)
+            .await
+            .expect("the checkpoint resumes against the warehouse that wrote it");
+        let store = StateStore::open(&state_path).unwrap();
+        let resumed = store.get_latest_run_progress().unwrap().unwrap();
+        assert_ne!(resumed.run_id, run_id);
+        assert_eq!(
+            resumed.total_tables, 0,
+            "the resumed run skips the one table the checkpoint completed"
         );
     }
 

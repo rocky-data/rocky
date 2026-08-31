@@ -2337,8 +2337,11 @@ pub struct ResumeScope {
     #[serde(default)]
     pub filter: Option<String>,
     /// Where the run routed its writes: the target adapter name plus the
-    /// catalog/schema templates, with any shadow or branch override appended.
-    /// An opaque routing fingerprint — compared for equality, never parsed.
+    /// catalog/schema templates, the physical endpoint behind that adapter
+    /// name (`AdapterConfig::endpoint_identity` — a secret-free locator, so
+    /// the same alias re-pointed at another warehouse is a different scope),
+    /// and any shadow or branch override appended. An opaque routing
+    /// fingerprint — compared for equality, never parsed.
     pub target_routing: String,
 }
 
