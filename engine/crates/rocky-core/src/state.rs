@@ -531,7 +531,21 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   record would let another pod observe a valid-looking approval whose
 ///   spec it cannot read or verify. Revisit to replicated only when
 ///   snapshot bytes gain durable replicated storage of their own.
-const CURRENT_SCHEMA_VERSION: u32 = 22;
+/// - **v23** — adds the serde-additive [`RunProgress::scope`] field
+///   ([`ResumeScope`]): the pipeline name, `--filter`, and target routing a
+///   checkpoint was written under, so `--resume` / `--resume-latest` can
+///   refuse a checkpoint from a different pipeline scope (#1549). Not a
+///   table change — the redb table set is unchanged (`EXPECTED_TABLES` is
+///   untouched). A v22 blob (which lacks the field) forward-deserializes
+///   with it `None`, guarded by
+///   `test_v22_run_progress_forward_deserializes_scope_none`; the CLI
+///   refuses to resume such a scopeless checkpoint (fail-closed — start a
+///   fresh run instead), so old checkpoints degrade to a loud refusal, never
+///   to a cross-pipeline resume. A v23 blob back-reads cleanly on a v22
+///   binary (serde ignores the extra key). The bump tracks the record-shape
+///   addition so `[state] on_schema_mismatch` engages as usual; no blob
+///   walk.
+const CURRENT_SCHEMA_VERSION: u32 = 23;
 
 /// Errors from the embedded redb state store.
 #[derive(Debug, Error)]
@@ -2309,6 +2323,36 @@ pub struct TableProgress {
     pub completed_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// The replication execution identity a checkpoint belongs to (#1549).
+///
+/// Persisted on [`RunProgress`] so `--resume` / `--resume-latest` can refuse
+/// a checkpoint written by a different pipeline instead of silently skipping
+/// that pipeline's completed tables. Equality is the resume gate: every field
+/// must match the resuming invocation exactly.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResumeScope {
+    /// The resolved pipeline name the run built.
+    pub pipeline: String,
+    /// The `--filter key=value` selector the run was invoked with, verbatim.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Where the run routed its writes: the target adapter name plus the
+    /// catalog/schema templates, with any shadow or branch override appended.
+    /// An opaque routing fingerprint — compared for equality, never parsed.
+    pub target_routing: String,
+}
+
+impl std::fmt::Display for ResumeScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pipeline '{}'", self.pipeline)?;
+        match &self.filter {
+            Some(filter) => write!(f, ", filter '{filter}'")?,
+            None => write!(f, ", no filter")?,
+        }
+        write!(f, ", target {}", self.target_routing)
+    }
+}
+
 /// Progress for an entire run (collection of table progresses).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunProgress {
@@ -2316,6 +2360,13 @@ pub struct RunProgress {
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub total_tables: usize,
     pub tables: Vec<TableProgress>,
+    /// The pipeline scope that wrote this checkpoint (#1549). `None` only on
+    /// checkpoints recorded before schema v23 (and on test fixtures that
+    /// simulate them) — a resume refuses those, fail-closed, because they
+    /// cannot prove which pipeline they belong to. Omitted from the blob when
+    /// `None` so a scopeless record's bytes stay identical to pre-v23.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ResumeScope>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2812,12 +2863,23 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     /// Initialize run progress with total table count.
-    pub fn init_run_progress(&self, run_id: &str, total_tables: usize) -> Result<(), StateError> {
+    ///
+    /// `scope` stamps the checkpoint with the pipeline identity that wrote it
+    /// (#1549); every production caller passes `Some`. `None` reproduces the
+    /// pre-v23 scopeless shape and exists for tests that simulate old
+    /// checkpoints — a resume refuses a scopeless checkpoint, fail-closed.
+    pub fn init_run_progress(
+        &self,
+        run_id: &str,
+        total_tables: usize,
+        scope: Option<&ResumeScope>,
+    ) -> Result<(), StateError> {
         let progress = RunProgress {
             run_id: run_id.to_string(),
             started_at: chrono::Utc::now(),
             total_tables,
             tables: Vec::new(),
+            scope: scope.cloned(),
         };
         let bytes = serde_json::to_vec(&progress)?;
         let txn = self.db.begin_write()?;
@@ -2917,6 +2979,53 @@ impl StateStore {
         for entry in header_table.iter()? {
             let (_, value) = entry?;
             let progress: RunProgress = serde_json::from_slice(value.value())?;
+            if latest
+                .as_ref()
+                .is_none_or(|l| progress.started_at > l.started_at)
+            {
+                latest = Some(progress);
+            }
+        }
+
+        let Some(mut progress) = latest else {
+            return Ok(None);
+        };
+        let entries_table = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+        let entries = Self::read_progress_entries(&entries_table, &progress.run_id)?;
+        if !entries.is_empty() {
+            progress.tables = entries;
+        }
+        Ok(Some(progress))
+    }
+
+    /// Get the most recent run progress recorded for `scope` — the
+    /// `--resume-latest` selector (#1548 / #1549).
+    ///
+    /// Candidates are headers whose stored [`RunProgress::scope`] equals
+    /// `scope`, plus scopeless pre-v23 headers — those cannot be attributed
+    /// to any pipeline, so they cannot be ruled out here; the caller decides
+    /// what to do with a scopeless winner (the CLI refuses it, fail-closed).
+    /// Selection is by latest `started_at` among the candidates, and there is
+    /// deliberately no searching past the winner: whether the winning run is
+    /// actually resumable is the caller's verdict, not a reason to fall back
+    /// to an older checkpoint.
+    pub fn get_latest_run_progress_for_scope(
+        &self,
+        scope: &ResumeScope,
+    ) -> Result<Option<RunProgress>, StateError> {
+        let txn = self.db.begin_read()?;
+        let header_table = txn.open_table(RUN_PROGRESS)?;
+        let mut latest: Option<RunProgress> = None;
+        for entry in header_table.iter()? {
+            let (_, value) = entry?;
+            let progress: RunProgress = serde_json::from_slice(value.value())?;
+            let in_scope = progress
+                .scope
+                .as_ref()
+                .is_none_or(|recorded| recorded == scope);
+            if !in_scope {
+                continue;
+            }
             if latest
                 .as_ref()
                 .is_none_or(|l| progress.started_at > l.started_at)
@@ -8047,7 +8156,7 @@ mod tests {
     #[test]
     fn test_init_and_get_run_progress() {
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 50).unwrap();
+        store.init_run_progress("run-001", 50, None).unwrap();
 
         let progress = store.get_run_progress("run-001").unwrap().unwrap();
         assert_eq!(progress.run_id, "run-001");
@@ -8065,7 +8174,7 @@ mod tests {
     #[test]
     fn test_record_table_progress() {
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 3).unwrap();
+        store.init_run_progress("run-001", 3, None).unwrap();
 
         let p1 = TableProgress {
             index: 0,
@@ -8115,10 +8224,10 @@ mod tests {
         let (store, _dir) = temp_store();
 
         // Create two runs with a small time gap to ensure ordering
-        store.init_run_progress("run-001", 10).unwrap();
+        store.init_run_progress("run-001", 10, None).unwrap();
         // Force a slightly later timestamp for the second run
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.init_run_progress("run-002", 20).unwrap();
+        store.init_run_progress("run-002", 20, None).unwrap();
 
         let latest = store.get_latest_run_progress().unwrap().unwrap();
         assert_eq!(latest.run_id, "run-002");
@@ -8132,10 +8241,125 @@ mod tests {
         assert!(latest.is_none());
     }
 
+    /// Builds a distinct [`ResumeScope`] per pipeline name for the scoped
+    /// selection tests.
+    fn progress_scope(pipeline: &str) -> ResumeScope {
+        ResumeScope {
+            pipeline: pipeline.to_string(),
+            filter: None,
+            target_routing: format!("default:wh.staging_{pipeline}__{{source}}"),
+        }
+    }
+
+    #[test]
+    fn test_get_latest_run_progress_for_scope_ignores_other_scopes() {
+        let (store, _dir) = temp_store();
+        let p1 = progress_scope("p1");
+        let p2 = progress_scope("p2");
+
+        store.init_run_progress("run-p1-old", 1, Some(&p1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.init_run_progress("run-p1-new", 2, Some(&p1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.init_run_progress("run-p2", 3, Some(&p2)).unwrap();
+
+        // p2's newer checkpoint must not shadow p1's own latest.
+        let latest = store
+            .get_latest_run_progress_for_scope(&p1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.run_id, "run-p1-new");
+        assert_eq!(latest.scope.as_ref(), Some(&p1));
+
+        // And the per-table entries are stitched in, like the unscoped getter.
+        store
+            .record_table_progress(
+                "run-p1-new",
+                &TableProgress {
+                    index: 0,
+                    table_key: "wh.staging_p1__acme.orders".to_string(),
+                    asset_key: vec!["orders".to_string()],
+                    status: TableStatus::Success,
+                    error: None,
+                    duration_ms: 1,
+                    completed_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        let latest = store
+            .get_latest_run_progress_for_scope(&p1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.tables.len(), 1);
+    }
+
+    #[test]
+    fn test_get_latest_run_progress_for_scope_keeps_scopeless_candidates() {
+        let (store, _dir) = temp_store();
+        let p1 = progress_scope("p1");
+
+        store.init_run_progress("run-p1", 1, Some(&p1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // A pre-v23 checkpoint carries no scope. It cannot be attributed to
+        // any pipeline, so it cannot be ruled out — it stays a candidate and
+        // the caller decides (the CLI refuses it, fail-closed).
+        store.init_run_progress("run-legacy", 1, None).unwrap();
+
+        let latest = store
+            .get_latest_run_progress_for_scope(&p1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.run_id, "run-legacy");
+        assert!(latest.scope.is_none());
+    }
+
+    #[test]
+    fn test_get_latest_run_progress_for_scope_empty_when_nothing_matches() {
+        let (store, _dir) = temp_store();
+        store
+            .init_run_progress("run-p2", 1, Some(&progress_scope("p2")))
+            .unwrap();
+        let latest = store
+            .get_latest_run_progress_for_scope(&progress_scope("p1"))
+            .unwrap();
+        assert!(latest.is_none());
+    }
+
+    /// A v22 `RunProgress` blob (no `scope` key) must forward-deserialize
+    /// with `scope: None`, a scoped v23 record must round-trip losslessly,
+    /// and a scopeless record must serialize without the key — byte-identical
+    /// to the pre-v23 shape. See the v23 stanza on `CURRENT_SCHEMA_VERSION`.
+    #[test]
+    fn test_v22_run_progress_forward_deserializes_scope_none() {
+        let blob = serde_json::json!({
+            "run_id": "run-legacy",
+            "started_at": "2026-08-01T00:00:00Z",
+            "total_tables": 3,
+            "tables": [],
+        });
+        let progress: RunProgress =
+            serde_json::from_value(blob).expect("pre-v23 RunProgress must forward-deserialize");
+        assert!(progress.scope.is_none(), "pre-v23 record has no scope");
+
+        let bytes = serde_json::to_vec(&progress).unwrap();
+        assert!(
+            !String::from_utf8(bytes).unwrap().contains("scope"),
+            "a scopeless record must serialize without the key"
+        );
+
+        let scoped = RunProgress {
+            scope: Some(progress_scope("p1")),
+            ..progress
+        };
+        let round_trip: RunProgress =
+            serde_json::from_slice(&serde_json::to_vec(&scoped).unwrap()).unwrap();
+        assert_eq!(round_trip.scope, scoped.scope);
+    }
+
     #[test]
     fn test_resume_filters_completed() {
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 5).unwrap();
+        store.init_run_progress("run-001", 5, None).unwrap();
 
         // Simulate: 3 succeeded, 1 failed, 1 never reached
         for (i, (key, status)) in [
@@ -8204,7 +8428,7 @@ mod tests {
         // Each recorded table is a single per-entry row; the header blob's
         // `tables` vector is NOT grown. Reads stitch the two together.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 3).unwrap();
+        store.init_run_progress("run-001", 3, None).unwrap();
 
         // Header still has no inline entries.
         {
@@ -8253,7 +8477,7 @@ mod tests {
         // Insert out of index order; read must sort by execution index, not
         // by the lexical entry key.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 3).unwrap();
+        store.init_run_progress("run-001", 3, None).unwrap();
         store
             .record_table_progress(
                 "run-001",
@@ -8287,7 +8511,7 @@ mod tests {
         // Re-recording the same table (interrupted -> final) overwrites the
         // one row rather than appending a duplicate.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 1).unwrap();
+        store.init_run_progress("run-001", 1, None).unwrap();
         store
             .record_table_progress(
                 "run-001",
@@ -8311,8 +8535,8 @@ mod tests {
         // "run-1" and "run-12" share a "run-1" lexical prefix but the trailing
         // "|" separator keeps their entries isolated.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-1", 1).unwrap();
-        store.init_run_progress("run-12", 1).unwrap();
+        store.init_run_progress("run-1", 1, None).unwrap();
+        store.init_run_progress("run-12", 1, None).unwrap();
         store
             .record_table_progress(
                 "run-1",
@@ -8340,9 +8564,9 @@ mod tests {
         // --resume-latest reads `.tables` off the latest run; the latest header
         // must come back with its per-entry rows stitched in.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 2).unwrap();
+        store.init_run_progress("run-001", 2, None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.init_run_progress("run-002", 2).unwrap();
+        store.init_run_progress("run-002", 2, None).unwrap();
 
         store
             .record_table_progress(
@@ -8377,6 +8601,7 @@ mod tests {
                 progress_entry(0, "cat.sch.x", TableStatus::Success),
                 progress_entry(1, "cat.sch.y", TableStatus::Failed),
             ],
+            scope: None,
         };
         let bytes = serde_json::to_vec(&legacy).unwrap();
         {
@@ -10886,7 +11111,11 @@ mod tests {
         // guarded by `test_v22_opens_and_creates_fulfill_tables`. Both are
         // local-only (the approval record points at snapshot bytes replication
         // does not transport — see the v22 stanza on CURRENT_SCHEMA_VERSION).
-        const EXPECTED_VERSION: u32 = 22;
+        // v23 adds `RunProgress::scope` (the pipeline identity a checkpoint
+        // belongs to, #1549), a serde-additive field — the redb table set is
+        // untouched, only the version moves; guarded by
+        // `test_v22_run_progress_forward_deserializes_scope_none`.
+        const EXPECTED_VERSION: u32 = 23;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",
             "check_history",

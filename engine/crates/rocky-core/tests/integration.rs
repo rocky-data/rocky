@@ -624,7 +624,7 @@ fn test_checkpoint_state_persisted() {
     let run_id = "run_001";
 
     // Init run progress
-    store.init_run_progress(run_id, 5).unwrap();
+    store.init_run_progress(run_id, 5, None).unwrap();
     let progress = store.get_run_progress(run_id).unwrap().unwrap();
     assert_eq!(progress.total_tables, 5);
     assert_eq!(progress.tables.len(), 0);
