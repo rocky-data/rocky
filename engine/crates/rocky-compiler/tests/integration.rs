@@ -102,7 +102,6 @@ fn test_simple_project_full_compile() {
         models_dir: fixture_path("simple_project/models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
@@ -119,7 +118,6 @@ fn test_simple_project_lineage_edges() {
         models_dir: fixture_path("simple_project/models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
@@ -211,7 +209,6 @@ fn test_mixed_project_full_compile() {
         models_dir: fixture_path("mixed_project/models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
@@ -229,7 +226,6 @@ fn test_contract_project_loads_contracts() {
         models_dir: fixture_path("contract_project/models"),
         contracts_dir: Some(fixture_path("contract_project/contracts")),
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
@@ -249,7 +245,6 @@ fn test_contract_project_with_no_contracts_dir() {
         models_dir: fixture_path("contract_project/models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
@@ -327,7 +322,6 @@ fn incremental_matches_full_after_leaf_edit() {
         models_dir: dir.path().join("models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
@@ -392,7 +386,6 @@ fn incremental_preserves_reference_map() {
         models_dir: dir.path().join("models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
@@ -432,7 +425,6 @@ fn incremental_handles_new_model_file() {
         models_dir: dir.path().join("models"),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
 
@@ -799,5 +791,90 @@ fn missing_bare_run_var_yields_e028_not_a_parser_crash() {
         e028[0].message.contains("threshold"),
         "the error must name the missing variable: {}",
         e028[0].message
+    );
+}
+
+/// A leaf `SELECT *` over an EXTERNAL source must expand to that source's
+/// columns once its schema is known.
+///
+/// `semantic.rs`'s external-source star-expansion arm read a map that no
+/// production caller ever filled, so the arm was dead code and such a model
+/// reported ZERO columns in `rocky catalog` and `rocky docs` (#1484). The map
+/// is now derived from `source_schemas`, which the compile path does populate.
+#[test]
+fn leaf_star_over_a_known_external_source_expands_to_its_columns() {
+    use rocky_compiler::types::TypedColumn;
+    use rocky_ir::RockyType;
+
+    // A model whose whole body is a star over a table no model produces.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let models = dir.path().join("models");
+    std::fs::create_dir(&models).expect("models dir");
+    std::fs::write(
+        models.join("leaf.sql"),
+        "SELECT * FROM warehouse.main.raw_orders\n",
+    )
+    .expect("sql");
+    std::fs::write(
+        models.join("leaf.toml"),
+        "name = \"leaf\"\n\n[strategy]\ntype = \"full_refresh\"\n\n\
+         [target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"leaf\"\n",
+    )
+    .expect("sidecar");
+
+    let source_cols = vec![
+        TypedColumn {
+            name: "id".to_string(),
+            data_type: RockyType::Int64,
+            nullable: false,
+        },
+        TypedColumn {
+            name: "amount".to_string(),
+            data_type: RockyType::Float64,
+            nullable: true,
+        },
+    ];
+
+    // Baseline: with NO source schema the star cannot expand, and the model
+    // reports nothing. This is what every production caller used to get.
+    let bare = CompilerConfig {
+        models_dir: models.clone(),
+        contracts_dir: None,
+        source_schemas: HashMap::new(),
+        ..Default::default()
+    };
+    let without = compile(&bare).unwrap();
+    let cols_without = without
+        .semantic_graph
+        .model_schema("leaf")
+        .map(|m| m.columns.len())
+        .unwrap_or(0);
+
+    // With the source schema known, the columns must appear.
+    let mut source_schemas = HashMap::new();
+    source_schemas.insert("warehouse.main.raw_orders".to_string(), source_cols);
+    let config = CompilerConfig {
+        models_dir: models,
+        contracts_dir: None,
+        source_schemas,
+        ..Default::default()
+    };
+    let with = compile(&config).unwrap();
+    let schema = with
+        .semantic_graph
+        .model_schema("leaf")
+        .expect("the leaf model must be in the graph");
+    let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+
+    assert!(
+        names.contains(&"id".to_string()) && names.contains(&"amount".to_string()),
+        "a known external source's columns must expand the star; got {names:?} \
+         (without a source schema it reported {cols_without})"
+    );
+    assert!(
+        cols_without < names.len(),
+        "the source schema must be what makes the difference — bare compile \
+         reported {cols_without}, schema-aware reported {}",
+        names.len()
     );
 }

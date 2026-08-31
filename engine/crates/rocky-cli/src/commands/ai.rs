@@ -87,7 +87,6 @@ fn compile_project(
         models_dir: PathBuf::from(models_dir),
         contracts_dir: None,
         source_schemas,
-        source_column_info: std::collections::HashMap::new(),
         ..Default::default()
     };
     compile(&config).map_err(|e| anyhow::anyhow!("{e}"))
@@ -192,13 +191,11 @@ pub async fn run_ai(
     // loader would change prompt grounding in ways that want a dedicated
     // review against `rocky-ai::generate::ValidationContext` semantics.
     let empty_source_schemas = std::collections::HashMap::new();
-    let empty_source_column_info = std::collections::HashMap::new();
     let validation_context = compile_result
         .as_ref()
         .map(|r| generate::ValidationContext {
             project_models: &r.project.models,
             source_schemas: &empty_source_schemas,
-            source_column_info: &empty_source_column_info,
         });
 
     // `--target` goes IN to generation, not on after it.

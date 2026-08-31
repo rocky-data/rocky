@@ -1096,12 +1096,87 @@ impl StateStore {
     /// The forward-incompatible check (`found > CURRENT`) runs in **both** modes,
     /// so a read-only open of a newer store still fails with
     /// [`StateError::SchemaMismatch`] rather than silently misreading it.
+    /// Satisfy a read-only open without a write transaction, when possible.
+    ///
+    /// `Ok(None)` means "escalate": the caller falls through to the write path,
+    /// which is the pre-#1545 behaviour. Only a store stamped at exactly
+    /// [`CURRENT_SCHEMA_VERSION`] takes the fast path — see the note at the
+    /// call site for why that version equality is what makes it safe.
+    ///
+    /// A forward-incompatible stamp is still classified here rather than
+    /// deferred, so `SchemaMismatchPolicy` behaves identically on both paths.
+    fn init_db_read_only(
+        db: &Database,
+        path: &Path,
+        policy: SchemaMismatchPolicy,
+    ) -> Result<Option<InitOutcome>, StateError> {
+        let txn = db.begin_read()?;
+        // A brand-new database has no METADATA table yet. That is an
+        // initialization case, not an error — escalate.
+        let Ok(metadata) = txn.open_table(METADATA) else {
+            return Ok(None);
+        };
+        let Some(version_str) = metadata
+            .get("schema_version")?
+            .map(|g| g.value().to_string())
+        else {
+            // Unstamped (fresh or pre-versioning): the write path handles it.
+            return Ok(None);
+        };
+        let found = version_str
+            .parse::<u32>()
+            .map_err(|_| StateError::VersionParse(version_str.clone()))?;
+
+        if found > CURRENT_SCHEMA_VERSION {
+            return match policy {
+                SchemaMismatchPolicy::Fail => Err(StateError::SchemaMismatch {
+                    found,
+                    expected: CURRENT_SCHEMA_VERSION,
+                    path: path.display().to_string(),
+                }),
+                SchemaMismatchPolicy::Recreate => {
+                    Ok(Some(InitOutcome::RecreateForwardIncompat { found }))
+                }
+            };
+        }
+
+        if found == CURRENT_SCHEMA_VERSION {
+            Ok(Some(InitOutcome::Ready))
+        } else {
+            // Older stamp: a newer binary may have added tables this store does
+            // not carry. Escalate so the write path materializes them, exactly
+            // as it did before.
+            Ok(None)
+        }
+    }
+
     fn init_db(
         db: &Database,
         path: &Path,
         mode: OpenMode,
         policy: SchemaMismatchPolicy,
     ) -> Result<InitOutcome, StateError> {
+        // A read-only open must not take a WRITE transaction. Every
+        // `StateStore::open_read_only` used to land here and commit one, so a
+        // `GET` on `rocky serve` serialized against the scheduler and against
+        // real `run` / `apply` writers on the same state file — a dashboard
+        // polling `/api/v1/runs` contended with the work it was reporting on
+        // (#1545).
+        //
+        // The fast path is deliberately narrow: it applies only when the stamp
+        // reads EXACTLY the current version. The stamp and the eager table
+        // creation below happen in one transaction, so a store stamped at this
+        // version was initialized by a binary with exactly this table set —
+        // every table a read method can touch already exists. Any other state
+        // (unstamped, older, or unreadable) falls through to the write path and
+        // behaves exactly as before, including materializing tables a newer
+        // binary added.
+        if matches!(mode, OpenMode::ReadOnly)
+            && let Some(outcome) = Self::init_db_read_only(db, path, policy)?
+        {
+            return Ok(outcome);
+        }
+
         let txn = db.begin_write()?;
         {
             let mut metadata = txn.open_table(METADATA)?;
@@ -5936,6 +6011,71 @@ fn sanitize_namespace(ns: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- a read-only open takes no write transaction (#1545) ----
+
+    /// Opening read-only must not modify the database file.
+    ///
+    /// Every `open_read_only` used to commit a redb WRITE transaction, so a
+    /// `GET` on `rocky serve` serialized against the scheduler and against real
+    /// `run` / `apply` writers on the same state file.
+    ///
+    /// A committed redb transaction advances the on-disk transaction id, so
+    /// byte-identical file content before and after is direct evidence that no
+    /// transaction was committed.
+    #[test]
+    fn a_read_only_open_does_not_write_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+
+        // Initialize read-write, then close so nothing is buffered.
+        drop(StateStore::open(&path).expect("initial read-write open"));
+        let before = std::fs::read(&path).expect("read state file");
+
+        drop(StateStore::open_read_only(&path).expect("read-only open"));
+        let after = std::fs::read(&path).expect("read state file");
+
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "a read-only open changed the file SIZE, so it wrote"
+        );
+        assert!(
+            before == after,
+            "a read-only open changed the file CONTENT, so it committed a write \
+             transaction — which serializes every read endpoint against real writers"
+        );
+    }
+
+    /// The fast path must not swallow a forward-incompatible store: a
+    /// read-only open of a newer database still fails under the default policy,
+    /// exactly as the write path did.
+    #[test]
+    fn a_read_only_open_still_refuses_a_forward_incompatible_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).expect("initial open"));
+
+        // Stamp a version from the future.
+        {
+            let db = Database::open(&path).expect("reopen");
+            let txn = db.begin_write().expect("write txn");
+            {
+                let mut metadata = txn.open_table(METADATA).expect("metadata");
+                let future = (CURRENT_SCHEMA_VERSION + 1).to_string();
+                metadata.insert("schema_version", &*future).expect("stamp");
+            }
+            txn.commit().expect("commit");
+        }
+
+        let err = StateStore::open_read_only(&path)
+            .map(|_| ())
+            .expect_err("a forward-incompatible store must still be refused");
+        assert!(
+            matches!(err, StateError::SchemaMismatch { .. }),
+            "expected SchemaMismatch, got {err:?}"
+        );
+    }
     use chrono::Utc;
     use tempfile::TempDir;
 

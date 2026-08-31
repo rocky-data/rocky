@@ -1007,8 +1007,19 @@ impl Runner {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
+        // `contained_write_target` validated the TARGET. This tmp is a second,
+        // derived path that no check has seen, and a plain `std::fs::write`
+        // follows a symlink — so a link planted at
+        // `products/<name>.toml.ff-candidate-tmp` was written through during
+        // elicitation (#1500).
+        //
+        // `write_new_no_follow` creates with O_EXCL, which refuses to follow a
+        // link at the leaf, and clears only its own stale scratch from a prior
+        // crash via `remove_file` — which unlinks the link itself rather than
+        // writing through it.
         let tmp = target.with_extension("toml.ff-candidate-tmp");
-        std::fs::write(&tmp, bytes).with_context(|| format!("staging {}", tmp.display()))?;
+        rocky_core::product::commit::write_new_no_follow(&tmp, bytes)
+            .with_context(|| format!("staging {}", tmp.display()))?;
         std::fs::rename(&tmp, &target)
             .with_context(|| format!("renaming into {}", target.display()))?;
         Ok(())
@@ -1213,6 +1224,39 @@ fn fault_point(name: &str) {
 
 #[cfg(not(debug_assertions))]
 fn fault_point(_name: &str) {}
+
+#[cfg(test)]
+mod candidate_write_containment {
+    /// The staged candidate write must not use a plain `std::fs::write`.
+    ///
+    /// `contained_write_target` validates the TARGET; the tmp beside it is a
+    /// second, derived path no check has seen. A plain write follows a symlink,
+    /// so a link planted at `products/<name>.toml.ff-candidate-tmp` was written
+    /// through during elicitation (#1500).
+    ///
+    /// `write_new_no_follow`'s own refusal is proven in `rocky-core`
+    /// (`fresh_commit_refuses_a_symlinked_staged_target_and_leaves_it_untouched`
+    /// and its journal-temp sibling). What this guards is the WIRE: that this
+    /// call site still goes through it.
+    ///
+    /// The banned and required strings are assembled at runtime so this test's
+    /// own source cannot satisfy the search it performs.
+    #[test]
+    fn the_candidate_tmp_write_uses_the_no_follow_helper() {
+        let source = include_str!("step.rs");
+        let banned = format!("std::fs::{}(&tmp, bytes)", "write");
+        assert!(
+            !source.contains(&banned),
+            "the staged candidate must go through write_new_no_follow: a plain \
+             write follows a symlink planted at the derived tmp path"
+        );
+        let required = format!("write_new_no_{}(&tmp, bytes)", "follow");
+        assert!(
+            source.contains(&required),
+            "expected the candidate tmp write to call write_new_no_follow"
+        );
+    }
+}
 
 #[cfg(test)]
 mod deferred_check_counting {
