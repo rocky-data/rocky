@@ -4325,6 +4325,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "chrono",
+ "regex",
  "rmcp",
  "rocky-ai",
  "rocky-cli",

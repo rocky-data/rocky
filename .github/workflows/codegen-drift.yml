@@ -54,9 +54,10 @@ jobs:
   # beyond the runner spin-up.
   #
   # Fail closed: the answer is "false" only when the diff was computed AND
-  # grep itself reported a clean non-match (exit 1). A failed diff, a grep
-  # error, or a step that never ran all keep it "true" and the drift check
-  # runs.
+  # grep itself reported a clean non-match (exit 1). A failed diff or a grep
+  # error still writes "true". A step that never ran writes nothing, so the
+  # job output is empty; the `drift` job tests `!= 'false'`, and an empty
+  # answer runs the check.
   changes:
     name: Detect codegen changes
     runs-on: ubuntu-latest
