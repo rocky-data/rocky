@@ -3804,44 +3804,83 @@ impl std::fmt::Debug for AdapterConfig {
     }
 }
 
+/// Where the data behind an adapter block lives: the adapter type plus the
+/// locator fields that name the data location, as ordered key/value pairs.
+///
+/// Built by [`AdapterConfig::endpoint_identity`]; persisted inside a resume
+/// checkpoint's scope and compared field-wise there (`==`), never parsed
+/// from its rendered form. The [`std::fmt::Display`] rendering
+/// (`snowflake account=xy12345 database=ANALYTICS`) is for messages only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointIdentity {
+    /// The adapter type (`duckdb`, `snowflake`, ...).
+    pub adapter_type: String,
+    /// Locator fields by name, in name order. Every value is a data
+    /// location (a host, a path, an account, a database); never a
+    /// principal or a secret.
+    #[serde(default)]
+    pub locators: std::collections::BTreeMap<String, String>,
+}
+
+impl std::fmt::Display for EndpointIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.adapter_type)?;
+        for (key, value) in &self.locators {
+            write!(f, " {key}={value}")?;
+        }
+        Ok(())
+    }
+}
+
 impl AdapterConfig {
-    /// A stable, secret-free identity for the physical endpoint this block
+    /// A stable, secret-free identity for the data location this block
     /// points at.
     ///
     /// The adapter *name* is a config alias: two `rocky.toml` files can call
     /// different warehouses `default`, and one file can be re-pointed between
     /// runs. Anything that must not cross warehouses — a resume checkpoint,
-    /// for one — needs the endpoint, not the alias. The value is the adapter
-    /// type plus the non-secret locator fields that pick the warehouse:
+    /// for one — needs the endpoint, not the alias.
     ///
-    /// | type         | locator                                          |
-    /// |--------------|--------------------------------------------------|
-    /// | `duckdb`     | `path=` canonical file path, or `:memory: pid=<pid>` |
-    /// | `databricks` | `host=` + `http_path=`                           |
-    /// | `snowflake`  | `account=` + `database=`, or `user=` when no database is pinned |
-    /// | `bigquery`   | `project_id=`                                    |
-    /// | `trino`      | `host=` + `catalog=` (the `database` slot) when set |
-    /// | `fivetran`   | `destination_id=` when set                       |
-    /// | `airbyte`, `iceberg` | `host=`                                  |
-    /// | `manual`     | the type alone                                   |
-    /// | anything else | the type plus whichever locator fields are set  |
+    /// **Contract: the identity is where the data lives, never who connects
+    /// to it.** It is the adapter type plus the locator fields below, each
+    /// only when set:
     ///
-    /// Credentials never appear: the `RedactedString` fields are not read,
-    /// and a host URL is reduced to scheme, host, port and path — its
-    /// `user:password@` userinfo, query and fragment are dropped. Compute-only
-    /// settings (Snowflake `warehouse`/`role`, BigQuery `location`, timeouts,
-    /// retries) are left out on purpose — changing them does not move the
-    /// data. A Snowflake config with no `database` writes into the session
-    /// user's default database, so the `username` stands in for it there.
+    /// | type         | locators                                                   |
+    /// |--------------|------------------------------------------------------------|
+    /// | `duckdb`     | `path`: the canonical file path, or `:memory: pid=<pid>`   |
+    /// | `databricks` | `host`, `http_path`                                        |
+    /// | `snowflake`  | `account`, `host` (when configured), `database`, `warehouse` |
+    /// | `bigquery`   | `project_id`                                               |
+    /// | `trino`      | `host`, `catalog` (the `database` slot)                    |
+    /// | `fivetran`   | `destination_id`                                           |
+    /// | `airbyte`, `iceberg` | `host`                                             |
+    /// | `manual`     | the type alone                                             |
+    /// | anything else | `host`, `http_path`, `account`, `database`, `project_id`, `destination_id`, `path` |
+    ///
+    /// `AdapterConfig` has no `schema` or `dataset` slot, so neither can
+    /// join the identity today; a pipeline's schema routing is carried
+    /// beside the endpoint by the checkpoint scope instead.
+    ///
+    /// Never in the identity: `username`, `password`, `token`, `oauth_token`,
+    /// `pat`, `private_key_path`, `client_id`, `client_secret`, `api_key`,
+    /// `api_secret`, `role`, and the `[extra]` table. A Snowflake session
+    /// with no `database` (a PAT or OAuth session, say) writes into the
+    /// session's default database, and the identity does **not** stand a
+    /// user name in for it: two such sessions on one account are one
+    /// endpoint to Rocky. A `host` that is URL-shaped is reduced to
+    /// `scheme://host[:port]` — userinfo, path, query and fragment are all
+    /// dropped, so a token routed through a proxy path never lands in a
+    /// checkpoint or an error message. `location`, `timeout_secs` and the
+    /// retry policy do not move the data and are left out.
     ///
     /// The DuckDB path is canonicalized when the file exists, so `./wh.duckdb`
     /// and its absolute spelling agree; an in-memory database is process-
-    /// local, so its identity carries the process id. The identity describes
-    /// the configured locator, not the file behind it: a DuckDB file replaced
-    /// by another at the same path keeps the same identity. Compared for
-    /// equality, never parsed.
-    pub fn endpoint_identity(&self) -> String {
-        let mut locators: Vec<String> = Vec::new();
+    /// local, so its identity carries the process id and can only match
+    /// from the same process. The identity describes the configured
+    /// locator, not the file behind it: a DuckDB file replaced by another at
+    /// the same path keeps the same identity.
+    pub fn endpoint_identity(&self) -> EndpointIdentity {
+        let mut locators = std::collections::BTreeMap::new();
         let mut push = |key: &str, value: Option<&str>| {
             let Some(value) = value else {
                 return;
@@ -3851,7 +3890,7 @@ impl AdapterConfig {
             } else {
                 value.to_string()
             };
-            locators.push(format!("{key}={value}"));
+            locators.insert(key.to_string(), value);
         };
         match self.adapter_type.as_str() {
             "duckdb" => {
@@ -3867,10 +3906,9 @@ impl AdapterConfig {
             }
             "snowflake" => {
                 push("account", self.account.as_deref());
-                match self.database.as_deref() {
-                    Some(database) => push("database", Some(database)),
-                    None => push("user", self.username.as_deref()),
-                }
+                push("host", self.host.as_deref());
+                push("database", self.database.as_deref());
+                push("warehouse", self.warehouse.as_deref());
             }
             "bigquery" => push("project_id", self.project_id.as_deref()),
             "trino" => {
@@ -3893,34 +3931,32 @@ impl AdapterConfig {
                 );
             }
         }
-        let mut identity = self.adapter_type.clone();
-        for locator in locators {
-            identity.push(' ');
-            identity.push_str(&locator);
+        EndpointIdentity {
+            adapter_type: self.adapter_type.clone(),
+            locators,
         }
-        identity
     }
 }
 
-/// Reduces a URL-shaped `host` to the part that routes: scheme, host, port
-/// and path. The `user:password@` userinfo, any `?query` or `#fragment`,
-/// and a trailing `/` are dropped (`https://alice:s3cret@host:8443/gw/?k=v`
-/// → `https://host:8443/gw`). A bare `user:pw@host` is handled the same
-/// way. The path is kept because a gateway prefix can select a different
-/// cluster; a secret embedded in it is the operator's own routing choice.
+/// Reduces a `host` locator to the part that names the machine: the scheme
+/// (when present), the host and the port. Everything else is dropped — the
+/// `user:password@` userinfo, the path, any `?query` or `#fragment`
+/// (`https://alice:s3cret@host:8443/tenant/x/token/T/?k=v` →
+/// `https://host:8443`). A bare `user:pw@host/path` is handled the same
+/// way. The path goes too, even though a gateway prefix can route: a path
+/// is where operators put tokens, and a checkpoint or an error message must
+/// never carry one.
 fn sanitize_host_locator(locator: &str) -> String {
     let locator = locator.split(['?', '#']).next().unwrap_or_default();
     let (scheme, rest) = match locator.split_once("://") {
         Some((scheme, rest)) => (format!("{scheme}://"), rest),
         None => (String::new(), locator),
     };
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
+    let authority = rest.split('/').next().unwrap_or_default();
     let authority = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
-    let tail = tail.trim_end_matches('/');
-    format!("{scheme}{authority}{tail}")
+    format!("{scheme}{authority}")
 }
 
 /// An in-memory DuckDB database lives inside one process and dies with it,
@@ -12182,173 +12218,300 @@ adapter = "default"
         toml::from_str(body).expect("adapter block parses")
     }
 
-    #[test]
-    fn endpoint_identity_never_contains_credentials() {
-        let secrets = [
-            "dapi-TOKEN-1234",
-            "CLIENT-SECRET-5678",
-            "sf-PASSWORD-9",
-            "OAUTH-TOKEN-abc",
-            "PAT-xyz",
-            "API-KEY-1",
-            "API-SECRET-2",
-            "s3cret-in-url",
-            "QUERY-SECRET",
-            "FRAGMENT-SECRET",
-        ];
-        let adapters = [
-            adapter_from_toml(
-                r#"
-type = "databricks"
-host = "https://alice:s3cret-in-url@adb-1.azuredatabricks.net"
-http_path = "/sql/1.0/warehouses/abc"
+    /// Every credential and principal field an adapter block can carry,
+    /// each with a value distinctive enough to grep for.
+    const CREDENTIAL_FIELDS: &str = r#"
 token = "dapi-TOKEN-1234"
-client_id = "client-1"
+client_id = "CLIENT-ID-0"
 client_secret = "CLIENT-SECRET-5678"
-"#,
-            ),
-            adapter_from_toml(
-                r#"
-type = "snowflake"
-account = "xy12345.us-east-1"
-warehouse = "COMPUTE_WH"
-username = "alice"
-password = "sf-PASSWORD-9"
-oauth_token = "OAUTH-TOKEN-abc"
-pat = "PAT-xyz"
-private_key_path = "/keys/rsa_key.p8"
-database = "ANALYTICS"
-"#,
-            ),
-            adapter_from_toml(
-                r#"
-type = "trino"
-host = "https://alice:s3cret-in-url@trino.example.com:8443/gateway/?token=QUERY-SECRET#FRAGMENT-SECRET"
-username = "alice"
-password = "sf-PASSWORD-9"
-token = "dapi-TOKEN-1234"
-database = "hive"
-"#,
-            ),
-            adapter_from_toml(
-                r#"
-type = "fivetran"
 api_key = "API-KEY-1"
 api_secret = "API-SECRET-2"
-destination_id = "dest_1"
-"#,
-            ),
-            adapter_from_toml(
-                r#"
-type = "some_future_adapter"
-host = "https://alice:s3cret-in-url@wh.example.com/api"
-token = "dapi-TOKEN-1234"
-password = "sf-PASSWORD-9"
-"#,
-            ),
-        ];
-        for adapter in &adapters {
-            let identity = adapter.endpoint_identity();
-            for secret in secrets {
+username = "USER-alice"
+password = "PASSWORD-9"
+oauth_token = "OAUTH-TOKEN-abc"
+private_key_path = "/keys/PRIVATE-KEY.p8"
+pat = "PAT-xyz"
+role = "ROLE-loader"
+"#;
+
+    const CREDENTIAL_VALUES: [&str; 11] = [
+        "dapi-TOKEN-1234",
+        "CLIENT-ID-0",
+        "CLIENT-SECRET-5678",
+        "API-KEY-1",
+        "API-SECRET-2",
+        "USER-alice",
+        "PASSWORD-9",
+        "OAUTH-TOKEN-abc",
+        "PRIVATE-KEY",
+        "PAT-xyz",
+        "ROLE-loader",
+    ];
+
+    /// The identity, both as rendered for messages and as persisted in a
+    /// checkpoint, carries none of the credential or principal values —
+    /// and none of the extra `leaked` values the caller names (a token
+    /// smuggled through a host URL, say).
+    fn assert_identity_is_location_only(adapter: &AdapterConfig, leaked: &[&str]) {
+        let identity = adapter.endpoint_identity();
+        let rendered = identity.to_string();
+        let persisted = serde_json::to_string(&identity).unwrap();
+        for secret in CREDENTIAL_VALUES.iter().chain(leaked) {
+            for (form, text) in [("rendered", &rendered), ("persisted", &persisted)] {
                 assert!(
-                    !identity.contains(secret),
-                    "{}: identity {identity:?} leaks {secret:?}",
+                    !text.contains(secret),
+                    "{} {form} identity {text:?} leaks {secret:?}",
                     adapter.adapter_type
                 );
             }
-            assert!(
-                !identity.contains("***"),
-                "{}: identity must not carry a redaction placeholder either: {identity:?}",
-                adapter.adapter_type
-            );
         }
-        assert_eq!(
-            adapters[0].endpoint_identity(),
-            "databricks host=https://adb-1.azuredatabricks.net http_path=/sql/1.0/warehouses/abc"
+        assert!(
+            !rendered.contains("***"),
+            "{}: identity must not carry a redaction placeholder either: {rendered:?}",
+            adapter.adapter_type
         );
+    }
+
+    fn locators(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn duckdb_identity_has_no_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("wh.duckdb");
+        std::fs::write(&file, b"").unwrap();
+        let adapter = adapter_from_toml(&format!(
+            "type = \"duckdb\"\npath = \"{}\"\n{CREDENTIAL_FIELDS}",
+            file.display()
+        ));
+        assert_identity_is_location_only(&adapter, &[]);
         assert_eq!(
-            adapters[1].endpoint_identity(),
-            "snowflake account=xy12345.us-east-1 database=ANALYTICS"
-        );
-        assert_eq!(
-            adapters[2].endpoint_identity(),
-            "trino host=https://trino.example.com:8443/gateway catalog=hive"
-        );
-        assert_eq!(
-            adapters[3].endpoint_identity(),
-            "fivetran destination_id=dest_1"
-        );
-        assert_eq!(
-            adapters[4].endpoint_identity(),
-            "some_future_adapter host=https://wh.example.com/api"
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "duckdb".to_string(),
+                locators: locators(&[(
+                    "path",
+                    &std::fs::canonicalize(&file).unwrap().display().to_string()
+                )]),
+            }
         );
     }
 
     #[test]
-    fn endpoint_identity_is_the_locator_not_the_compute_settings() {
-        let base = adapter_from_toml(
+    fn databricks_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
             r#"
-type = "snowflake"
-account = "xy12345.us-east-1"
-warehouse = "SMALL_WH"
-role = "LOADER"
-database = "ANALYTICS"
-"#,
+type = "databricks"
+host = "https://USER-alice:URL-SECRET@adb-1.azuredatabricks.net/?token=QUERY-SECRET#FRAG-SECRET"
+http_path = "/sql/1.0/warehouses/abc"
+timeout_secs = 30
+{CREDENTIAL_FIELDS}"#
+        ));
+        assert_identity_is_location_only(&adapter, &["URL-SECRET", "QUERY-SECRET", "FRAG-SECRET"]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "databricks".to_string(),
+                locators: locators(&[
+                    ("host", "https://adb-1.azuredatabricks.net"),
+                    ("http_path", "/sql/1.0/warehouses/abc"),
+                ]),
+            }
         );
-        let resized = adapter_from_toml(
-            r#"
-type = "snowflake"
-account = "xy12345.us-east-1"
-warehouse = "XLARGE_WH"
-role = "ADMIN"
-database = "ANALYTICS"
-timeout_secs = 900
-"#,
-        );
-        let other_account = adapter_from_toml(
-            r#"
-type = "snowflake"
-account = "zz99999.eu-west-1"
-warehouse = "SMALL_WH"
-database = "ANALYTICS"
-"#,
-        );
-        assert_eq!(base.endpoint_identity(), resized.endpoint_identity());
-        assert_ne!(base.endpoint_identity(), other_account.endpoint_identity());
+    }
 
-        // A pinned database makes the user irrelevant to routing; an unpinned
-        // one writes into the session user's default database, so two users
-        // are two endpoints there.
-        let pinned_as_bob = adapter_from_toml(
-            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"bob\"\ndatabase = \"ANALYTICS\"\n",
+    #[test]
+    fn snowflake_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            r#"
+type = "snowflake"
+account = "xy12345.us-east-1"
+host = "https://USER-alice:URL-SECRET@xy12345.us-east-1.snowflakecomputing.com/session/TOKEN-SECRET"
+warehouse = "COMPUTE_WH"
+database = "ANALYTICS"
+{CREDENTIAL_FIELDS}"#
+        ));
+        assert_identity_is_location_only(&adapter, &["URL-SECRET", "TOKEN-SECRET"]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "snowflake".to_string(),
+                locators: locators(&[
+                    ("account", "xy12345.us-east-1"),
+                    ("database", "ANALYTICS"),
+                    ("host", "https://xy12345.us-east-1.snowflakecomputing.com"),
+                    ("warehouse", "COMPUTE_WH"),
+                ]),
+            }
         );
-        assert_eq!(base.endpoint_identity(), pinned_as_bob.endpoint_identity());
-        let unpinned_as_alice = adapter_from_toml(
-            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"alice\"\n",
+    }
+
+    #[test]
+    fn bigquery_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            "type = \"bigquery\"\nproject_id = \"my-proj\"\nlocation = \"EU\"\n{CREDENTIAL_FIELDS}"
+        ));
+        assert_identity_is_location_only(&adapter, &[]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "bigquery".to_string(),
+                locators: locators(&[("project_id", "my-proj")]),
+            }
+        );
+    }
+
+    /// The reproduced leak: a Trino coordinator reached through a proxy
+    /// whose path carries a token. Only `scheme://host[:port]` survives.
+    #[test]
+    fn trino_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            r#"
+type = "trino"
+host = "https://USER-alice:URL-SECRET@proxy.example.com:8443/tenant/x/token/PATH-SECRET/?token=QUERY-SECRET#FRAG-SECRET"
+database = "hive"
+{CREDENTIAL_FIELDS}"#
+        ));
+        assert_identity_is_location_only(
+            &adapter,
+            &["URL-SECRET", "PATH-SECRET", "QUERY-SECRET", "FRAG-SECRET"],
+        );
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "trino".to_string(),
+                locators: locators(&[
+                    ("catalog", "hive"),
+                    ("host", "https://proxy.example.com:8443"),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn fivetran_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            "type = \"fivetran\"\ndestination_id = \"dest_1\"\n{CREDENTIAL_FIELDS}"
+        ));
+        assert_identity_is_location_only(&adapter, &[]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "fivetran".to_string(),
+                locators: locators(&[("destination_id", "dest_1")]),
+            }
+        );
+    }
+
+    #[test]
+    fn airbyte_iceberg_and_manual_identities_have_no_credentials() {
+        for adapter_type in ["airbyte", "iceberg"] {
+            let adapter = adapter_from_toml(&format!(
+                "type = \"{adapter_type}\"\nhost = \"https://USER-alice:URL-SECRET@svc.example.com/api/PATH-SECRET\"\n{CREDENTIAL_FIELDS}"
+            ));
+            assert_identity_is_location_only(&adapter, &["URL-SECRET", "PATH-SECRET"]);
+            assert_eq!(
+                adapter.endpoint_identity(),
+                EndpointIdentity {
+                    adapter_type: adapter_type.to_string(),
+                    locators: locators(&[("host", "https://svc.example.com")]),
+                }
+            );
+        }
+        let manual = adapter_from_toml(&format!("type = \"manual\"\n{CREDENTIAL_FIELDS}"));
+        assert_identity_is_location_only(&manual, &[]);
+        assert_eq!(
+            manual.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "manual".to_string(),
+                locators: locators(&[]),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_adapter_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            r#"
+type = "some_future_adapter"
+host = "https://USER-alice:URL-SECRET@wh.example.com/api/PATH-SECRET"
+http_path = "/gw"
+account = "acct"
+database = "db"
+project_id = "proj"
+destination_id = "dest"
+warehouse = "WH"
+{CREDENTIAL_FIELDS}
+[extra]
+x_token = "EXTRA-SECRET"
+"#
+        ));
+        assert_identity_is_location_only(&adapter, &["URL-SECRET", "PATH-SECRET", "EXTRA-SECRET"]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "some_future_adapter".to_string(),
+                locators: locators(&[
+                    ("account", "acct"),
+                    ("database", "db"),
+                    ("destination_id", "dest"),
+                    ("host", "https://wh.example.com"),
+                    ("http_path", "/gw"),
+                    ("project_id", "proj"),
+                ]),
+            }
+        );
+    }
+
+    /// The identity is the data location, not the principal: who connects
+    /// never changes it, and a session that pins no database is one
+    /// endpoint per account whoever opens it.
+    #[test]
+    fn snowflake_identity_is_the_location_not_the_principal() {
+        let as_alice = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"alice\"\nrole = \"LOADER\"\ndatabase = \"ANALYTICS\"\n",
+        );
+        let as_bob = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"bob\"\nrole = \"ADMIN\"\ndatabase = \"ANALYTICS\"\ntimeout_secs = 900\n",
+        );
+        assert_eq!(as_alice.endpoint_identity(), as_bob.endpoint_identity());
+
+        // The reproduced collapse: a PAT/OAuth session with no username and
+        // no database. It is `snowflake account=<acct>` on purpose — the
+        // identity never stands a user in for the missing database.
+        let pat_session = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\npat = \"PAT-xyz\"\n",
+        );
+        assert_eq!(
+            pat_session.endpoint_identity().to_string(),
+            "snowflake account=xy12345.us-east-1"
         );
         let unpinned_as_bob = adapter_from_toml(
             "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"bob\"\n",
         );
         assert_eq!(
-            unpinned_as_alice.endpoint_identity(),
-            "snowflake account=xy12345.us-east-1 user=alice"
-        );
-        assert_ne!(
-            unpinned_as_alice.endpoint_identity(),
+            pat_session.endpoint_identity(),
             unpinned_as_bob.endpoint_identity()
         );
 
-        let bq =
-            adapter_from_toml("type = \"bigquery\"\nproject_id = \"my-proj\"\nlocation = \"EU\"\n");
-        assert_eq!(bq.endpoint_identity(), "bigquery project_id=my-proj");
-        let manual = adapter_from_toml("type = \"manual\"\n");
-        assert_eq!(manual.endpoint_identity(), "manual");
-        let airbyte = adapter_from_toml(
-            "type = \"airbyte\"\nhost = \"https://airbyte.example.com\"\ntoken = \"t\"\n",
+        // The location fields do move the identity.
+        let other_account = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"zz99999.eu-west-1\"\ndatabase = \"ANALYTICS\"\n",
         );
-        assert_eq!(
-            airbyte.endpoint_identity(),
-            "airbyte host=https://airbyte.example.com"
+        assert_ne!(
+            as_alice.endpoint_identity(),
+            other_account.endpoint_identity()
+        );
+        let other_warehouse = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\ndatabase = \"ANALYTICS\"\nwarehouse = \"XLARGE_WH\"\n",
+        );
+        assert_ne!(
+            as_alice.endpoint_identity(),
+            other_warehouse.endpoint_identity()
         );
     }
 
@@ -12368,7 +12531,7 @@ database = "ANALYTICS"
             dir.path().join(".").join("wh.duckdb").display()
         ));
         assert_eq!(
-            spelled_directly.endpoint_identity(),
+            spelled_directly.endpoint_identity().to_string(),
             format!("duckdb path={}", canonical.display())
         );
         assert_eq!(
@@ -12386,7 +12549,7 @@ database = "ANALYTICS"
             "a file that does not exist yet still gets its own absolute identity"
         );
         assert!(
-            elsewhere.endpoint_identity().ends_with("other.duckdb"),
+            elsewhere.endpoint_identity().locators["path"].ends_with("other.duckdb"),
             "{}",
             elsewhere.endpoint_identity()
         );
@@ -12395,25 +12558,34 @@ database = "ANALYTICS"
         // pinned to this process and can never match from another one.
         let in_memory = adapter_from_toml("type = \"duckdb\"\n");
         assert_eq!(
-            in_memory.endpoint_identity(),
+            in_memory.endpoint_identity().to_string(),
             format!("duckdb path=:memory: pid={}", std::process::id())
         );
     }
 
     #[test]
-    fn sanitize_host_locator_keeps_the_route_and_drops_the_rest() {
+    fn sanitize_host_locator_keeps_only_scheme_host_and_port() {
         assert_eq!(
             sanitize_host_locator("https://alice:s3cret@trino.example.com:8443/path?x=1#frag"),
-            "https://trino.example.com:8443/path"
+            "https://trino.example.com:8443"
+        );
+        assert_eq!(
+            sanitize_host_locator("https://proxy/tenant/x/token/SECRET/"),
+            "https://proxy"
         );
         assert_eq!(sanitize_host_locator("alice:pw@host"), "host");
         assert_eq!(
-            sanitize_host_locator("https://host/a@b"),
-            "https://host/a@b"
+            sanitize_host_locator("alice:pw@host:8443/gw/SECRET"),
+            "host:8443"
         );
+        assert_eq!(sanitize_host_locator("https://host/a@b"), "https://host");
         assert_eq!(
             sanitize_host_locator("https://adb-1.azuredatabricks.net"),
             "https://adb-1.azuredatabricks.net"
+        );
+        assert_eq!(
+            sanitize_host_locator("https://[::1]:8443/x"),
+            "https://[::1]:8443"
         );
         // Equivalent spellings of one coordinator agree.
         assert_eq!(
@@ -12421,13 +12593,32 @@ database = "ANALYTICS"
             sanitize_host_locator("https://trino.example")
         );
         assert_eq!(
-            sanitize_host_locator("https://trino.example/gw/"),
-            "https://trino.example/gw"
-        );
-        assert_eq!(
             sanitize_host_locator("https://host?token=T"),
             "https://host"
         );
         assert_eq!(sanitize_host_locator(""), "");
+    }
+
+    /// The persisted shape of an identity is pinned: it lives inside every
+    /// checkpoint's scope and is compared field-wise across binaries.
+    #[test]
+    fn endpoint_identity_blob_shape_is_pinned() {
+        let adapter = adapter_from_toml(
+            "type = \"databricks\"\nhost = \"https://adb-1.azuredatabricks.net\"\nhttp_path = \"/sql/1.0/warehouses/abc\"\n",
+        );
+        let identity = adapter.endpoint_identity();
+        assert_eq!(
+            serde_json::to_value(&identity).unwrap(),
+            serde_json::json!({
+                "adapter_type": "databricks",
+                "locators": {
+                    "host": "https://adb-1.azuredatabricks.net",
+                    "http_path": "/sql/1.0/warehouses/abc",
+                },
+            })
+        );
+        let round_trip: EndpointIdentity =
+            serde_json::from_value(serde_json::to_value(&identity).unwrap()).unwrap();
+        assert_eq!(round_trip, identity);
     }
 }
