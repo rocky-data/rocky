@@ -54,6 +54,10 @@ rocky-snowflake = { path = "../rocky-snowflake" }
 rocky-ai = { path = "../rocky-ai" }
 tempfile = "3"
 serde_json = { workspace = true }
+# The mid-flight mutation probes in roundtrip.rs hold the draft handler on a
+# FIFO between its write and its verdict: `O_NONBLOCK` for the write-end open
+# and `ENXIO` for "no reader yet".
+libc = { workspace = true }
 # The scripted round-trip test drives the stdio server in-process with an rmcp
 # client over a duplex pipe, so it needs the client side of rmcp too.
 rmcp = { version = "3.0", features = ["server", "macros", "transport-io", "client"] }
