@@ -2512,19 +2512,26 @@ impl RockyMcpServer {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
-            // denying (#1559). The rollback is deliberately NOT defused, so the
-            // draft is removed — matching the `Deny` arm below.
+            // denying (#1559). Rolled back EXPLICITLY — matching the `Deny`
+            // arm below — so a failed cleanup is reported, never claimed
+            // clean (#1561).
             rocky_cli::commands::PolicyGate::Unloadable { reason } => {
-                Err(ToolError::policy_denied(
+                let (disposition, rollback_failed_paths) = rollback_disposition(
+                    &self.root,
+                    rollback,
+                    "The draft was rolled back.",
+                    "Rolling it back FAILED",
+                );
+                Err(ToolError::policy_denied_after_rollback(
                     format!(
                         "the project config failed to load, so any configured [policy] rules \
-                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
-                         {reason}"
+                         cannot be enforced (fail-closed). {disposition} Cause: {reason}"
                     ),
                     "Fix the project config so its policy can be read, then retry. Rocky refuses \
                      to author under a policy it cannot evaluate."
                         .to_string(),
                     None,
+                    rollback_failed_paths,
                 ))
             }
             rocky_cli::commands::PolicyGate::NotConfigured
@@ -2570,20 +2577,28 @@ impl RockyMcpServer {
                 rule_id,
                 reason,
             } => {
-                // A deny cannot be satisfied by review — the guard rolls the
-                // draft back on return so NO artifact lingers on disk (the
+                // A deny cannot be satisfied by review — the draft is rolled
+                // back EXPLICITLY so NO artifact lingers on disk (the
                 // decision is already in the ledger), consistent with the
-                // propose gate's deny semantics.
+                // propose gate's deny semantics; a failed cleanup is
+                // reported, never claimed clean (#1561).
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
-                Err(ToolError::policy_denied(
+                let (disposition, rollback_failed_paths) = rollback_disposition(
+                    &self.root,
+                    rollback,
+                    "so the draft was not kept.",
+                    "but rolling it back FAILED",
+                );
+                Err(ToolError::policy_denied_after_rollback(
                     format!(
                         "policy denies authoring this model: '{model}'{named} — {reason}. A deny \
-                         cannot be satisfied by human review, so the draft was not kept."
+                         cannot be satisfied by human review, {disposition}"
                     ),
                     "Re-scope the draft — author it under a different, ungoverned name, or drop \
                      it. A denied authorship cannot be applied even after review."
                         .to_string(),
                     rule_id.map(|r| r.to_string()),
+                    rollback_failed_paths,
                 ))
             }
         }
@@ -2649,19 +2664,26 @@ impl RockyMcpServer {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
-            // denying (#1559). The rollback is deliberately NOT defused, so the
-            // draft is removed — matching the `Deny` arm below.
+            // denying (#1559). Rolled back EXPLICITLY — matching the `Deny`
+            // arm below — so a failed cleanup is reported, never claimed
+            // clean (#1561).
             rocky_cli::commands::PolicyGate::Unloadable { reason } => {
-                Err(ToolError::policy_denied(
+                let (disposition, rollback_failed_paths) = rollback_disposition(
+                    &self.root,
+                    rollback,
+                    "The draft was rolled back.",
+                    "Rolling it back FAILED",
+                );
+                Err(ToolError::policy_denied_after_rollback(
                     format!(
                         "the project config failed to load, so any configured [policy] rules \
-                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
-                         {reason}"
+                         cannot be enforced (fail-closed). {disposition} Cause: {reason}"
                     ),
                     "Fix the project config so its policy can be read, then retry. Rocky refuses \
                      to author under a policy it cannot evaluate."
                         .to_string(),
                     None,
+                    rollback_failed_paths,
                 ))
             }
             rocky_cli::commands::PolicyGate::NotConfigured
@@ -2703,16 +2725,22 @@ impl RockyMcpServer {
                 reason,
             } => {
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
-                Err(ToolError::policy_denied(
+                let (disposition, rollback_failed_paths) = rollback_disposition(
+                    &self.root,
+                    rollback,
+                    "so the contract was not kept.",
+                    "but rolling it back FAILED",
+                );
+                Err(ToolError::policy_denied_after_rollback(
                     format!(
                         "policy denies authoring a contract for this model: '{model}'{named} — \
-                         {reason}. A deny cannot be satisfied by human review, so the contract was \
-                         not kept."
+                         {reason}. A deny cannot be satisfied by human review, {disposition}"
                     ),
                     "Re-scope — write the contract for a different, ungoverned model, or drop it. \
                      A denied authorship cannot be applied even after review."
                         .to_string(),
                     rule_id.map(|r| r.to_string()),
+                    rollback_failed_paths,
                 ))
             }
         }
@@ -2803,19 +2831,26 @@ impl RockyMcpServer {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
-            // denying (#1559). The rollback is deliberately NOT defused, so the
-            // draft is removed — matching the `Deny` arm below.
+            // denying (#1559). Rolled back EXPLICITLY — matching the `Deny`
+            // arm below — so a failed cleanup is reported, never claimed
+            // clean (#1561).
             rocky_cli::commands::PolicyGate::Unloadable { reason } => {
-                Err(ToolError::policy_denied(
+                let (disposition, rollback_failed_paths) = rollback_disposition(
+                    &self.root,
+                    rollback,
+                    "The draft was rolled back.",
+                    "Rolling it back FAILED",
+                );
+                Err(ToolError::policy_denied_after_rollback(
                     format!(
                         "the project config failed to load, so any configured [policy] rules \
-                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
-                         {reason}"
+                         cannot be enforced (fail-closed). {disposition} Cause: {reason}"
                     ),
                     "Fix the project config so its policy can be read, then retry. Rocky refuses \
                      to author under a policy it cannot evaluate."
                         .to_string(),
                     None,
+                    rollback_failed_paths,
                 ))
             }
             rocky_cli::commands::PolicyGate::NotConfigured
@@ -2857,16 +2892,22 @@ impl RockyMcpServer {
                 reason,
             } => {
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
-                Err(ToolError::policy_denied(
+                let (disposition, rollback_failed_paths) = rollback_disposition(
+                    &self.root,
+                    rollback,
+                    "so the check was not kept (the model's prior sidecar is restored).",
+                    "but rolling it back FAILED",
+                );
+                Err(ToolError::policy_denied_after_rollback(
                     format!(
                         "policy denies authoring a check for this model: '{model}'{named} — \
-                         {reason}. A deny cannot be satisfied by human review, so the check was \
-                         not kept (the model's prior sidecar is restored)."
+                         {reason}. A deny cannot be satisfied by human review, {disposition}"
                     ),
                     "Re-scope — write the check for a different, ungoverned model, or drop it. A \
                      denied authorship cannot be applied even after review."
                         .to_string(),
                     rule_id.map(|r| r.to_string()),
+                    rollback_failed_paths,
                 ))
             }
         }
@@ -3021,19 +3062,26 @@ impl RockyMcpServer {
             // NOT grouped with NotConfigured. A config that failed to LOAD may
             // carry a `[policy]` block denying exactly this write; treating it
             // as "no policy configured" is what let a configured deny stop
-            // denying (#1559). The rollback is deliberately NOT defused, so the
-            // draft is removed — matching the `Deny` arm below.
+            // denying (#1559). Rolled back EXPLICITLY — matching the `Deny`
+            // arm below — so a failed cleanup is reported, never claimed
+            // clean (#1561).
             rocky_cli::commands::PolicyGate::Unloadable { reason } => {
-                Err(ToolError::policy_denied(
+                let (disposition, rollback_failed_paths) = rollback_disposition(
+                    &self.root,
+                    rollback,
+                    "The draft was rolled back.",
+                    "Rolling it back FAILED",
+                );
+                Err(ToolError::policy_denied_after_rollback(
                     format!(
                         "the project config failed to load, so any configured [policy] rules \
-                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
-                         {reason}"
+                         cannot be enforced (fail-closed). {disposition} Cause: {reason}"
                     ),
                     "Fix the project config so its policy can be read, then retry. Rocky refuses \
                      to author under a policy it cannot evaluate."
                         .to_string(),
                     None,
+                    rollback_failed_paths,
                 ))
             }
             rocky_cli::commands::PolicyGate::NotConfigured
@@ -3075,16 +3123,22 @@ impl RockyMcpServer {
                 reason,
             } => {
                 let named = rule_id.map(|r| format!(" (rule {r})")).unwrap_or_default();
-                Err(ToolError::policy_denied(
+                let (disposition, rollback_failed_paths) = rollback_disposition(
+                    &self.root,
+                    rollback,
+                    "so the patch was not kept (the model's prior sidecar is restored).",
+                    "but rolling it back FAILED",
+                );
+                Err(ToolError::policy_denied_after_rollback(
                     format!(
                         "policy denies authoring metadata for this model: '{model}'{named} — \
-                         {reason}. A deny cannot be satisfied by human review, so the patch was \
-                         not kept (the model's prior sidecar is restored)."
+                         {reason}. A deny cannot be satisfied by human review, {disposition}"
                     ),
                     "Re-scope — patch a different, ungoverned model, or drop the change. A \
                      denied authorship cannot be applied even after review."
                         .to_string(),
                     rule_id.map(|r| r.to_string()),
+                    rollback_failed_paths,
                 ))
             }
         }
@@ -4790,15 +4844,16 @@ struct DraftPaths {
 /// prior content. The rollback primitive for a policy-denied (or failed) draft:
 /// a freshly written draft is removed entirely; a re-draft over an existing
 /// model is restored to the model's prior content, so a deny never corrupts nor
-/// leaves a new artifact.
-fn restore_or_remove(path: &Path, prior: Option<&[u8]>) {
+/// leaves a new artifact. Removing an already-absent file is success (the
+/// desired end state holds); any other failure comes back to the caller — the
+/// artifact is still on disk and the refusal must say so (#1561).
+fn restore_or_remove(path: &Path, prior: Option<&[u8]>) -> std::io::Result<()> {
     match prior {
-        Some(bytes) => {
-            let _ = std::fs::write(path, bytes);
-        }
-        None => {
-            let _ = std::fs::remove_file(path);
-        }
+        Some(bytes) => std::fs::write(path, bytes),
+        None => match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        },
     }
 }
 
@@ -4811,7 +4866,10 @@ fn restore_or_remove(path: &Path, prior: Option<&[u8]>) {
 /// unwinding past it would leave a denied/broken draft on disk, violating the
 /// "a denied draft leaves NO file" contract. Call [`defuse`](Self::defuse) on
 /// the keep paths: success, or require-review (where the draft IS the
-/// reviewable artifact).
+/// reviewable artifact). The deliberate refusal arms (deny / unloadable
+/// policy) call [`rollback`](Self::rollback) instead of dropping the guard —
+/// a `Drop` cannot return the outcome, and a refusal whose cleanup failed
+/// must not claim the draft was removed (#1561).
 struct DraftRollback {
     /// `(path, prior bytes)` — `None` when the file did not exist.
     entries: Vec<(PathBuf, Option<Vec<u8>>)>,
@@ -4864,6 +4922,30 @@ impl DraftRollback {
     fn defuse(mut self) {
         self.defused = true;
     }
+
+    /// Roll back NOW and report the outcome: restore or remove every
+    /// snapshotted path and return the ones that FAILED — artifacts still on
+    /// disk in their drafted state (empty = clean). The deliberate refusal
+    /// arms call this so a failed cleanup reaches the response instead of
+    /// being discarded (#1561); the `Drop` impl stays the unwind-path net.
+    fn rollback(mut self) -> Vec<RollbackFailure> {
+        self.defused = true;
+        self.entries
+            .iter()
+            .filter_map(|(path, prior)| {
+                let error = restore_or_remove(path, prior.as_deref()).err()?;
+                let action = match prior {
+                    Some(_) => "restored to its prior content",
+                    None => "removed",
+                };
+                Some(RollbackFailure {
+                    path: path.clone(),
+                    action,
+                    error,
+                })
+            })
+            .collect()
+    }
 }
 
 impl Drop for DraftRollback {
@@ -4872,9 +4954,70 @@ impl Drop for DraftRollback {
             return;
         }
         for (path, prior) in &self.entries {
-            restore_or_remove(path, prior.as_deref());
+            if let Err(error) = restore_or_remove(path, prior.as_deref()) {
+                // The unwind path cannot return the outcome; the deliberate
+                // refusal arms use `rollback` for that. Log so the leftover
+                // is at least visible to the operator.
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "draft rollback failed; the artifact remains on disk"
+                );
+            }
         }
     }
+}
+
+/// One path a [`DraftRollback::rollback`] could not clean up: the artifact
+/// still on disk, what the rollback tried (reads as "could not be
+/// `{action}`"), and the I/O cause.
+struct RollbackFailure {
+    path: PathBuf,
+    action: &'static str,
+    error: std::io::Error,
+}
+
+/// Roll a refused draft back and word the outcome for the refusal message:
+/// `clean` verbatim when every snapshotted path restored, or a sentence
+/// naming each artifact still on disk (with its I/O cause) when the cleanup
+/// FAILED — a refusal must never claim a rollback it did not perform (#1561).
+/// `failed_lead` opens the failure sentence so it reads in the arm's grammar
+/// (e.g. "but rolling it back FAILED" mid-sentence). A failure also returns
+/// the project-relative paths for the envelope's `rollback_failed_paths`
+/// field.
+fn rollback_disposition(
+    root: &Path,
+    rollback: DraftRollback,
+    clean: &str,
+    failed_lead: &str,
+) -> (String, Option<Vec<String>>) {
+    let failures = rollback.rollback();
+    if failures.is_empty() {
+        return (clean.to_string(), None);
+    }
+    let listed = failures
+        .iter()
+        .map(|f| {
+            format!(
+                "{} could not be {} ({})",
+                rel_display(root, &f.path),
+                f.action,
+                f.error
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let paths = failures
+        .iter()
+        .map(|f| rel_display(root, &f.path))
+        .collect();
+    (
+        format!(
+            "{failed_lead} — {listed}; the refused artifact is STILL ON DISK, remove it or \
+             restore its prior content manually."
+        ),
+        Some(paths),
+    )
 }
 
 /// Filter the pending review queue to plans whose payload carries
@@ -5508,6 +5651,105 @@ mod tests {
             "name = \"m\"\n\n[[tests]]\n",
             "a defused guard keeps the draft"
         );
+    }
+
+    /// The clean half of the refusal disposition (#1561): every path
+    /// restored → the arm's claim comes back verbatim (the refusal message
+    /// is byte-identical to before the fix) and no machine-readable paths
+    /// ride the envelope.
+    #[test]
+    fn rollback_disposition_clean_keeps_the_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("fresh.sql");
+        let guard = DraftRollback::snapshot([&fresh]);
+        std::fs::write(&fresh, "draft body").unwrap();
+
+        let (disposition, failed) = rollback_disposition(
+            dir.path(),
+            guard,
+            "so the draft was not kept.",
+            "but rolling it back FAILED",
+        );
+        assert_eq!(disposition, "so the draft was not kept.");
+        assert_eq!(failed, None);
+        assert!(!fresh.exists(), "the clean rollback removed the draft");
+    }
+
+    /// #1561 fault injection, the new-artifact + deny shape: `remove_file`
+    /// cannot clean the fresh draft up, so the refusal disposition names the
+    /// leftover path and says it could not be removed — never the clean
+    /// "was not kept" claim. The fault: the snapshotted path is occupied by
+    /// a non-empty directory at rollback time, which `remove_file` refuses
+    /// for every user (the read-only-directory fault in the sibling test
+    /// does not fire for root, and local runs may be root).
+    #[test]
+    fn draft_rollback_failure_is_reported_and_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let fresh = root.join("models").join("shadow.sql");
+        std::fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+
+        let guard = DraftRollback::snapshot([&fresh]);
+        std::fs::create_dir_all(fresh.join("occupied")).unwrap();
+
+        let (disposition, failed) = rollback_disposition(
+            root,
+            guard,
+            "so the draft was not kept.",
+            "but rolling it back FAILED",
+        );
+        assert_eq!(failed, Some(vec!["models/shadow.sql".to_string()]));
+        assert!(
+            disposition.contains("models/shadow.sql could not be removed"),
+            "the refusal names the leftover artifact: {disposition}"
+        );
+        assert!(
+            disposition.contains("STILL ON DISK"),
+            "the refusal says the artifact remains: {disposition}"
+        );
+        assert!(
+            !disposition.contains("not kept"),
+            "a failed cleanup must not claim the draft was removed: {disposition}"
+        );
+        assert!(fresh.exists(), "the artifact really is still on disk");
+    }
+
+    /// #1561 fault injection with the real permission fault: a read-only
+    /// models directory refuses the unlink, and `rollback` reports the
+    /// artifact with the I/O cause. Root bypasses directory permissions
+    /// (CAP_DAC_OVERRIDE), so the test probes that the fault arms and
+    /// stands down when it cannot — the sibling test above injects a fault
+    /// that fires for every user. Permissions are restored afterwards so
+    /// the tempdir cleans up.
+    #[cfg(unix)]
+    #[test]
+    fn draft_rollback_reports_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir(&models).unwrap();
+        let fresh = models.join("shadow.sql");
+        let probe = models.join("probe");
+
+        let guard = DraftRollback::snapshot([&fresh]);
+        std::fs::write(&fresh, "SELECT 1 AS id").unwrap();
+        std::fs::write(&probe, "x").unwrap();
+        std::fs::set_permissions(&models, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::remove_file(&probe).is_ok() {
+            // This process bypasses the permission check; the fault cannot
+            // arm here.
+            std::fs::set_permissions(&models, std::fs::Permissions::from_mode(0o755)).unwrap();
+            guard.defuse();
+            return;
+        }
+
+        let failures = guard.rollback();
+        std::fs::set_permissions(&models, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(failures.len(), 1, "the failed unlink is reported");
+        assert_eq!(failures[0].path, fresh);
+        assert_eq!(failures[0].action, "removed");
+        assert!(fresh.exists(), "the artifact really is still on disk");
     }
 
     // --- validate_check_spec (draft_check structural gate) ---
