@@ -711,7 +711,6 @@ impl RockyMcpServer {
             models_dir: self.models_dir.clone(),
             contracts_dir: None,
             source_schemas,
-            source_column_info: std::collections::HashMap::new(),
             ..Default::default()
         };
         compile::compile(&config).map_err(|e| anyhow::anyhow!("compile failed: {e}"))
@@ -756,7 +755,6 @@ impl RockyMcpServer {
             models_dir: self.models_dir.clone(),
             contracts_dir: None,
             source_schemas: source_schemas.clone(),
-            source_column_info: std::collections::HashMap::new(),
             ..Default::default()
         };
         let head_compile = match compile::compile(&config) {
@@ -1019,7 +1017,10 @@ impl RockyMcpServer {
     #[tool(
         description = "Return the typed columns of every model and source table in the project. \
          Use this to learn what's available to select from and the upstream types — never guess \
-         column names."
+         column names. Models and declared sources are exact; physical warehouse tables are \
+         appended best-effort, so CHECK `discovery_incomplete` before concluding the warehouse \
+         holds nothing else — when it is true the append did not run and `discovery_error` says \
+         why."
     )]
     async fn inspect_schema(
         &self,
@@ -1068,20 +1069,52 @@ impl RockyMcpServer {
         // Surface the physical warehouse tables so an agent can ground a raw
         // source the project never declared — and at cold start, before any
         // model exists. Skip a table that is a model's target or is already
-        // reported as a compile-derived source. Best-effort across warehouses:
-        // the discovery query degrades to an empty list on any error.
-        if let Ok(Some(adapter)) = self.warehouse_adapter() {
-            let seen: std::collections::HashSet<String> =
-                sources.iter().map(|s| s.name.clone()).collect();
-            for entry in discover_source_tables(adapter.as_ref()).await {
-                if model_targets.contains(&entry.name) || seen.contains(&entry.name) {
-                    continue;
+        // reported as a compile-derived source.
+        //
+        // Still best-effort: a warehouse Rocky cannot reach must not fail the
+        // whole tool, because `models` and the compile-derived `sources` are
+        // exact and useful on their own. What changed is that the degradation
+        // is now REPORTED. Every arm is handled — the old `if let Ok(Some(..))`
+        // dropped the `Err`, so a resolution failure and an empty warehouse
+        // returned the same thing (#1533).
+        let (discovery_incomplete, discovery_error) = match self.warehouse_adapter() {
+            Ok(Some(adapter)) => {
+                let seen: std::collections::HashSet<String> =
+                    sources.iter().map(|s| s.name.clone()).collect();
+                match discover_source_tables(adapter.as_ref()).await {
+                    Ok(entries) => {
+                        for entry in entries {
+                            if model_targets.contains(&entry.name) || seen.contains(&entry.name) {
+                                continue;
+                            }
+                            sources.push(entry);
+                        }
+                        (false, None)
+                    }
+                    Err(e) => (true, Some(format!("the discovery query failed: {e}"))),
                 }
-                sources.push(entry);
             }
-        }
+            // Not reachable today — `warehouse_adapter` never returns `Ok(None)`
+            // — but handled rather than lumped in with success, so it cannot
+            // become another silent empty if that ever changes.
+            Ok(None) => (
+                true,
+                Some("no target warehouse adapter is configured".to_string()),
+            ),
+            Err(e) => (
+                true,
+                Some(format!(
+                    "the target warehouse adapter did not resolve: {e:#}"
+                )),
+            ),
+        };
 
-        Ok(Json(InspectSchemaResult { models, sources }))
+        Ok(Json(InspectSchemaResult {
+            models,
+            sources,
+            discovery_incomplete,
+            discovery_error,
+        }))
     }
 
     #[tool(
@@ -2206,9 +2239,10 @@ impl RockyMcpServer {
     /// frozen agent must not keep minting drafts, so the draft tools consult
     /// the same marker set the propose/apply gates enforce. Bounded by the
     /// shared gate guard (no `[policy]` ⇒ no LIST ⇒ zero behavior change; an
-    /// unloadable config resolves to `NotConfigured` in the gate, so it reads
-    /// no markers either). Fail-closed on a transport failure, mirroring the
-    /// governed apply seams.
+    /// unloadable config resolves to `PolicyGate::Unloadable`, which every
+    /// draft gate refuses — it used to resolve to `NotConfigured` and read no
+    /// markers, which is the fail-open #1559 fixed). Fail-closed on a transport
+    /// failure, mirroring the governed apply seams.
     async fn draft_marker_freezes(
         &self,
         stem: &str,
@@ -2436,6 +2470,9 @@ impl RockyMcpServer {
         // agent authoring into a governed scope gets a structured verdict WITH
         // the write, not later at apply. Absent a `[policy]` block this resolves
         // to `NotConfigured` and behaviour is byte-identical to no policy plane.
+        // A config that EXISTS but fails to load is `Unloadable` instead, and
+        // is refused — "no policy" and "could not read the policy" are
+        // different answers, and only the first is permission (#1559).
         let state_path = self.state_path();
         let touched: std::collections::BTreeMap<String, rocky_core::config::PolicyCapability> =
             std::iter::once((
@@ -2472,6 +2509,24 @@ impl RockyMcpServer {
         );
 
         match gate {
+            // NOT grouped with NotConfigured. A config that failed to LOAD may
+            // carry a `[policy]` block denying exactly this write; treating it
+            // as "no policy configured" is what let a configured deny stop
+            // denying (#1559). The rollback is deliberately NOT defused, so the
+            // draft is removed — matching the `Deny` arm below.
+            rocky_cli::commands::PolicyGate::Unloadable { reason } => {
+                Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to author under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
+                ))
+            }
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 rollback.defuse();
@@ -2591,6 +2646,24 @@ impl RockyMcpServer {
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
         match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+            // NOT grouped with NotConfigured. A config that failed to LOAD may
+            // carry a `[policy]` block denying exactly this write; treating it
+            // as "no policy configured" is what let a configured deny stop
+            // denying (#1559). The rollback is deliberately NOT defused, so the
+            // draft is removed — matching the `Deny` arm below.
+            rocky_cli::commands::PolicyGate::Unloadable { reason } => {
+                Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to author under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
+                ))
+            }
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 rollback.defuse();
@@ -2727,6 +2800,24 @@ impl RockyMcpServer {
         // synchronous). Fail-closed; no `[policy]` ⇒ no LIST.
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
         match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+            // NOT grouped with NotConfigured. A config that failed to LOAD may
+            // carry a `[policy]` block denying exactly this write; treating it
+            // as "no policy configured" is what let a configured deny stop
+            // denying (#1559). The rollback is deliberately NOT defused, so the
+            // draft is removed — matching the `Deny` arm below.
+            rocky_cli::commands::PolicyGate::Unloadable { reason } => {
+                Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to author under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
+                ))
+            }
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 rollback.defuse();
@@ -2927,6 +3018,24 @@ impl RockyMcpServer {
         let decision_id = format!("draft-metadata:{}", paths.stem);
         let marker_freezes = self.draft_marker_freezes(&paths.stem).await?;
         match self.evaluate_draft_policy(&paths.stem, &decision_id, &marker_freezes) {
+            // NOT grouped with NotConfigured. A config that failed to LOAD may
+            // carry a `[policy]` block denying exactly this write; treating it
+            // as "no policy configured" is what let a configured deny stop
+            // denying (#1559). The rollback is deliberately NOT defused, so the
+            // draft is removed — matching the `Deny` arm below.
+            rocky_cli::commands::PolicyGate::Unloadable { reason } => {
+                Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). The draft was rolled back. Cause: \
+                         {reason}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to author under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
+                ))
+            }
             rocky_cli::commands::PolicyGate::NotConfigured
             | rocky_cli::commands::PolicyGate::Allow => {
                 rollback.defuse();
@@ -3060,6 +3169,22 @@ impl RockyMcpServer {
                 return Err(ToolError::internal(
                     format!("failed to compute plan id: {inner}"),
                     "Retry the propose; if it persists, verify the project compiles cleanly.",
+                ));
+            }
+            Err(ProposeError::PolicyUnreadable(inner)) => {
+                // policy_denied, not internal: the propose was REFUSED by the
+                // policy plane's fail-closed rule, and the agent must be told
+                // that plainly rather than reading it as a transient fault to
+                // retry (#1559).
+                return Err(ToolError::policy_denied(
+                    format!(
+                        "the project config failed to load, so any configured [policy] rules \
+                         cannot be enforced (fail-closed). No plan was written. Cause: {inner}"
+                    ),
+                    "Fix the project config so its policy can be read, then retry. Rocky refuses \
+                     to propose under a policy it cannot evaluate."
+                        .to_string(),
+                    None,
                 ));
             }
             Err(ProposeError::LedgerDownload(inner)) => {
@@ -3605,9 +3730,13 @@ impl RockyMcpServer {
     /// Returns the configured target adapter for the resolved pipeline — any
     /// warehouse (DuckDB, Snowflake, BigQuery, Databricks, Trino). The data
     /// grounding tools (`sample_rows`, `profile_column`, and `inspect_schema`'s
-    /// source discovery) reach the live warehouse through it. Kept as
-    /// `Result<Option<...>>` so `inspect_schema`'s `if let Ok(Some(_))`
-    /// graceful-degradation path survives a resolution failure.
+    /// source discovery) reach the live warehouse through it.
+    ///
+    /// The `Result<Option<...>>` shape is historical: this never returns
+    /// `Ok(None)` today. It used to justify `inspect_schema` discarding the
+    /// `Err` arm with `if let Ok(Some(_))`, which is what made a resolution
+    /// failure look like an empty warehouse (#1533). Callers must now handle
+    /// every arm.
     fn warehouse_adapter(
         &self,
     ) -> anyhow::Result<Option<std::sync::Arc<dyn rocky_core::traits::WarehouseAdapter>>> {
@@ -4515,14 +4644,19 @@ fn breaking_finding_lite(f: &rocky_core::breaking_change::BreakingFinding) -> Br
 /// project never declared, including at cold start.
 async fn discover_source_tables(
     adapter: &dyn rocky_core::traits::WarehouseAdapter,
-) -> Vec<SchemaEntry> {
+) -> Result<Vec<SchemaEntry>, String> {
     let sql = "SELECT table_schema, table_name, column_name, data_type, is_nullable \
                FROM information_schema.columns \
                WHERE table_schema NOT IN ('information_schema', 'pg_catalog') \
                ORDER BY table_schema, table_name, ordinal_position";
-    let Ok(qr) = adapter.execute_query(sql).await else {
-        return Vec::new();
-    };
+    // The error is REPORTED, not swallowed. Returning an empty list here made a
+    // failed query indistinguishable from a warehouse with nothing to find
+    // (#1533) — and on BigQuery a bare `information_schema.columns` does not
+    // resolve at all, so the empty return was the ordinary outcome there.
+    let qr = adapter
+        .execute_query(sql)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
     let cell = |v: Option<&serde_json::Value>| -> String {
         match v {
             Some(serde_json::Value::String(s)) => s.clone(),
@@ -4550,7 +4684,7 @@ async fn discover_source_tables(
             nullable: !cell(row.get(4)).eq_ignore_ascii_case("NO"),
         });
     }
-    order
+    Ok(order
         .into_iter()
         .map(|name| {
             let cols = columns.remove(&name).unwrap_or_default();
@@ -4559,7 +4693,7 @@ async fn discover_source_tables(
                 columns: cols,
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Render one query cell as a display string, truncating long values.
@@ -5074,6 +5208,147 @@ mod tests {
         );
     }
 
+    /// A warehouse Rocky cannot reach must say so, not return an empty list.
+    ///
+    /// `inspect_schema` is the grounding tool. An agent reading empty `sources`
+    /// at cold start concludes there is nothing to ground against — which is
+    /// correct only if discovery actually ran (#1533).
+    #[tokio::test]
+    async fn inspect_schema_reports_discovery_it_could_not_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        // A Databricks target with no credentials: the adapter does not resolve,
+        // so discovery cannot run.
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.default]\ntype = \"databricks\"\n\
+             \n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             \n[pipeline.p.target]\nadapter = \"default\"\n",
+        )
+        .expect("write config");
+        let models = root.join("models");
+        std::fs::create_dir(&models).expect("create models");
+        std::fs::write(models.join("known.sql"), "SELECT 1 AS id").expect("write sql");
+        std::fs::write(
+            models.join("known.toml"),
+            "name = \"known\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"known\"\n",
+        )
+        .expect("write sidecar");
+
+        let server = RockyMcpServer::new(root.join("rocky.toml"));
+        let result = server
+            .inspect_schema(Parameters(InspectSchemaArgs {}))
+            .await
+            .map_err(|_| "inspect_schema returned an error")
+            .expect("inspect_schema must still succeed — models are exact")
+            .0;
+
+        assert!(
+            result.discovery_incomplete,
+            "discovery could not run, so it must be reported, not returned as an empty list"
+        );
+        let why = result
+            .discovery_error
+            .expect("an incomplete discovery must say why");
+        // Must fail on the ADAPTER, not on a malformed fixture. Both produce an
+        // error, so without this the test would pass on a typo in the config
+        // above and prove nothing about the path it claims to cover.
+        assert!(
+            !why.contains("parse TOML") && !why.contains("no pipelines"),
+            "the fixture is broken, so this is not testing adapter resolution: {why}"
+        );
+        // The exact half is unaffected.
+        assert!(
+            result.models.iter().any(|m| m.name == "known"),
+            "compile-derived models must still be reported: {:?}",
+            result.models.iter().map(|m| &m.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// A warehouse adapter whose every query fails — enough to exercise the
+    /// discovery arm without a live warehouse.
+    struct FailingAdapter;
+
+    #[async_trait::async_trait]
+    impl rocky_core::traits::WarehouseAdapter for FailingAdapter {
+        fn dialect(&self) -> &dyn rocky_core::traits::SqlDialect {
+            unimplemented!("not reached: discovery fails at execute_query")
+        }
+        async fn execute_statement(&self, _sql: &str) -> rocky_core::traits::AdapterResult<()> {
+            unimplemented!("not reached: discovery only queries")
+        }
+        async fn execute_query(
+            &self,
+            _sql: &str,
+        ) -> rocky_core::traits::AdapterResult<rocky_core::traits::QueryResult> {
+            Err(rocky_core::traits::AdapterError::msg(
+                "warehouse unreachable",
+            ))
+        }
+        async fn describe_table(
+            &self,
+            _table: &rocky_ir::TableRef,
+        ) -> rocky_core::traits::AdapterResult<Vec<rocky_ir::ColumnInfo>> {
+            unimplemented!("not reached: discovery only queries")
+        }
+    }
+
+    /// The OTHER swallow point: the adapter resolves, but the discovery query
+    /// itself fails. `discover_source_tables` used to return an empty `Vec`
+    /// here — the same silence from a different cause (#1533).
+    ///
+    /// Mutation-checking found this gap: the adapter-resolution test stayed
+    /// green when this arm alone was reverted to swallowing.
+    #[tokio::test]
+    async fn discover_source_tables_reports_a_failed_query() {
+        let err = discover_source_tables(&FailingAdapter)
+            .await
+            .expect_err("a failed discovery query must be reported, not returned as empty");
+        assert!(
+            err.contains("warehouse unreachable"),
+            "the reason must reach the caller: {err}"
+        );
+    }
+
+    /// The positive control: when discovery DOES run, nothing is flagged.
+    /// Without this, the field could be hardcoded true and the test above
+    /// would still pass.
+    #[tokio::test]
+    async fn inspect_schema_flags_nothing_when_discovery_runs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.default]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n\
+             \n[pipeline.p]\ntype = \"transformation\"\nmodels = \"models/**\"\n\
+             \n[pipeline.p.target]\nadapter = \"default\"\n",
+        )
+        .expect("write config");
+        let models = root.join("models");
+        std::fs::create_dir(&models).expect("create models");
+        std::fs::write(models.join("known.sql"), "SELECT 1 AS id").expect("write sql");
+        std::fs::write(
+            models.join("known.toml"),
+            "name = \"known\"\n\n[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"c\"\nschema = \"s\"\ntable = \"known\"\n",
+        )
+        .expect("write sidecar");
+
+        let server = RockyMcpServer::new(root.join("rocky.toml"));
+        let result = server
+            .inspect_schema(Parameters(InspectSchemaArgs {}))
+            .await
+            .map_err(|_| "inspect_schema returned an error")
+            .expect("inspect_schema")
+            .0;
+
+        assert!(
+            !result.discovery_incomplete,
+            "discovery ran against in-memory DuckDB, so nothing should be flagged: {:?}",
+            result.discovery_error
+        );
+        assert!(result.discovery_error.is_none());
+    }
+
     #[tokio::test]
     async fn compile_unknown_model_is_model_not_found() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -5429,6 +5704,123 @@ mod tests {
     /// named as NOT available, the hand-off named as the ending) and serves
     /// the skill text below it UNCHANGED; the default profile serves the
     /// skill text verbatim, byte-identical to the compiled file.
+    /// Every `paths:` list in a workflow, as its quoted entries. Enough YAML
+    /// to check a trigger filter without taking a parser dependency: a
+    /// `paths:` line, then the `- '...'` entries indented under it.
+    fn workflow_path_lists(workflow: &str) -> Vec<Vec<String>> {
+        let mut lists = Vec::new();
+        let mut lines = workflow.lines().peekable();
+        while let Some(line) = lines.next() {
+            if line.trim() != "paths:" {
+                continue;
+            }
+            let mut entries = Vec::new();
+            while let Some(next) = lines.peek() {
+                let t = next.trim();
+                if t.starts_with('#') {
+                    lines.next();
+                    continue;
+                }
+                let Some(value) = t.strip_prefix("- ") else {
+                    break;
+                };
+                entries.push(value.trim_matches('\'').trim_matches('"').to_string());
+                lines.next();
+            }
+            lists.push(entries);
+        }
+        lists
+    }
+
+    /// `include_str!` reaches OUT of `engine/` for the AI-workflow skill, so
+    /// that file is part of the engine build: editing it changes what `rocky
+    /// mcp` serves, and renaming or deleting it fails compilation.
+    ///
+    /// `engine-ci.yml` must watch every such path, in BOTH places that route
+    /// it since #1563: the `push` trigger still carries a `paths:` filter,
+    /// while `pull_request` runs unfiltered and the `changes` job's
+    /// `ENGINE_PATHS_RE` decides whether the required jobs do real work. A
+    /// path the regex misses skips engine CI for exactly the change that
+    /// needs it — #1557's failure mode, moved one level down (#1557, #1563).
+    #[test]
+    fn every_out_of_tree_include_is_watched_by_engine_ci() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root from the crate manifest");
+        let src = std::fs::read_to_string(manifest.join("src/tools.rs")).expect("read tools.rs");
+        let workflow = std::fs::read_to_string(repo_root.join(".github/workflows/engine-ci.yml"))
+            .expect("read engine-ci.yml");
+
+        // The change-detection regex the `changes` job matches PR diffs
+        // against. One line, `ENGINE_PATHS_RE: <regex>`.
+        let engine_paths_re = workflow
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("ENGINE_PATHS_RE:"))
+            .expect(
+                "engine-ci.yml no longer defines ENGINE_PATHS_RE — the \
+                 change-detection mechanism moved, and this guard needs to \
+                 move with it",
+            )
+            .trim();
+
+        // Paths that climb above `engine/` — `src/` is three levels below the
+        // repo root, so four or more `../` escapes the engine tree.
+        let mut checked = 0;
+        for (at, _) in src.match_indices("include_str!(\"") {
+            let rest = &src[at + "include_str!(\"".len()..];
+            let path = &rest[..rest.find('"').expect("unterminated include_str! path")];
+            if !path.starts_with("../../../../") {
+                continue;
+            }
+            let repo_relative = path.trim_start_matches("../");
+            assert!(
+                repo_root.join(repo_relative).exists(),
+                "include_str! names a file that does not exist: {repo_relative}"
+            );
+            // The `push` trigger's `paths:` list is the only one left since
+            // #1563 removed the pull_request filter. Pin that count so a
+            // reintroduced or dropped list changes this guard deliberately.
+            let lists = workflow_path_lists(&workflow);
+            assert_eq!(
+                lists.len(),
+                1,
+                "expected engine-ci.yml to carry exactly one `paths:` list \
+                 (push — pull_request is deliberately unfiltered since #1563); \
+                 found {}. If the triggers changed, this guard needs to change \
+                 with them.",
+                lists.len()
+            );
+            assert!(
+                lists[0].iter().any(|entry| entry == repo_relative),
+                "`{repo_relative}` is compiled into the engine but is missing \
+                 from engine-ci.yml's push `paths:` list. A push touching it \
+                 would run no engine CI (#1557)."
+            );
+            // The PR side: the detection regex must name the file as an
+            // exact-file alternative — the path with its dots escaped, then
+            // `$`. Prefix alternatives like `engine/` do not cover it.
+            let exact_alternative = format!("{}$", repo_relative.replace('.', "\\."));
+            assert!(
+                engine_paths_re.contains(&exact_alternative),
+                "`{repo_relative}` is compiled into the engine but \
+                 ENGINE_PATHS_RE in engine-ci.yml does not carry \
+                 `{exact_alternative}`. A PR touching it would skip the \
+                 required engine jobs (#1557, #1563)."
+            );
+            checked += 1;
+        }
+
+        // A zero here would pass vacuously — the assertion above never runs if
+        // the scan finds nothing, which is exactly how this guard would rot.
+        assert!(
+            checked > 0,
+            "found no out-of-tree include_str! paths to check — the scan broke, \
+             or the coupling moved and this test now proves nothing"
+        );
+    }
+
     #[test]
     fn instructions_carry_the_worker_banner_and_stay_verbatim_by_default() {
         let default_info = server_with(McpProfile::Default).get_info();

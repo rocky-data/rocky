@@ -68,14 +68,15 @@ choice. Require branches to be up to date before merging, do not grant ordinary
 bypass access, and keep any emergency override limited to named maintainers.
 
 Requiring these two checks is not optional hardening, and the repository's other
-required checks are not a substitute. Every other required context is
-path-filtered on `engine/**`, so a pull request that bundles any engine source
-edit with a hostile `.github` edit reports all of them green. If the containment
-check is merely present-and-red rather than required, GitHub returns a mergeable
-state and the change lands with no override and no administrator involvement. The
-absence of an engine change is likewise not a barrier: a `.github`-only pull
-request leaves the engine contexts pending, which is the same state that ordinary
-docs-only work produces, so it is routinely cleared rather than investigated.
+required checks are not a substitute. The engine contexts run real work only for
+changes that touch engine paths (since #1563 their workflows always report — a
+change-detection job skips the expensive jobs on other changes, so the contexts
+read green either way). A pull request that bundles any engine source edit with
+a hostile `.github` edit therefore reports all of them green, and a `.github`-only
+pull request reports them green as skipped. Only the containment check examines
+the `.github` tree itself. If it is merely present-and-red rather than required,
+GitHub returns a mergeable state and the change lands with no override and no
+administrator involvement.
 
 Verify the rule with a disposable pull request that makes a policy regression:
 the first check must fail from trusted `main` tooling, the candidate regression
