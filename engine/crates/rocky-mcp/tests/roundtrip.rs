@@ -4692,6 +4692,203 @@ async fn draft_contract_deny_never_restores_through_a_leaf_swapped_for_a_symlink
     );
 }
 
+/// Drive `draft_model` for `name` with `plant` running in the window between
+/// the up-front leaf check and the rollback snapshot — the window
+/// [`call_with_midflight_mutation`] cannot reach, because the loader's FIFO
+/// handshake only happens after both writes.
+///
+/// The runtime is built with ONE blocking thread and a hog holds it, so the
+/// handler's `snapshot_async` (a `spawn_blocking`) queues instead of running.
+/// `models/` is removed first, and `draft_model` creates it AFTER
+/// `resolve_draft_paths` returns, so the directory appearing is the handler's
+/// own proof that the leaf check has already passed. `plant` runs there;
+/// releasing the hog then lets the snapshot meet what `plant` left at the
+/// leaf.
+///
+/// ```text
+///  handler: resolve_draft_paths ─► create_dir_all ─► snapshot_async ┄┄┄┄► reads the leaf
+///  test:                            (sees models/) ─► plant ─► release hog ┘
+/// ```
+///
+/// Both timeouts turn a regression into a failure instead of a hung suite: a
+/// path-based read parks on a planted FIFO forever.
+#[cfg(unix)]
+fn draft_model_with_a_pre_snapshot_swap(
+    dir: &Path,
+    name: &str,
+    plant: impl FnOnce(),
+) -> rmcp::model::CallToolResult {
+    let dir = dir.to_path_buf();
+    let models = dir.join("models");
+    std::fs::remove_dir_all(&models).expect("clear the models directory");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build a runtime with exactly one blocking thread");
+
+    runtime.block_on(async move {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (hogging, hogged) = tokio::sync::oneshot::channel();
+        let hog = tokio::task::spawn_blocking(move || {
+            let _ = hogging.send(());
+            let _ = held.recv();
+        });
+        hogged.await.expect("the hog holds the blocking thread");
+
+        let server = RockyMcpServer::new(dir.join("rocky.toml"));
+        let client = connect(server).await;
+        let args = draft_args(name, "SELECT 3 AS id", "a draft racing the leaf");
+        let call = tokio::spawn(async move {
+            let result = client
+                .call_tool(CallToolRequestParams::new("draft_model").with_arguments(args))
+                .await;
+            (client, result)
+        });
+
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !models.is_dir() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok(),
+            "draft_model never created the models directory, so the leaf check never passed \
+             and there was no window to plant into"
+        );
+
+        plant();
+        drop(release);
+        hog.await.expect("the hog task finishes");
+
+        let (client, result) = tokio::time::timeout(std::time::Duration::from_secs(30), call)
+            .await
+            .expect("draft_model parked on the planted leaf instead of refusing it")
+            .expect("the call task completes");
+        client.cancel().await.unwrap();
+        result.expect("the tool returns a result")
+    })
+}
+
+/// The READ half of the leaf race, end to end. Between the up-front leaf
+/// check and the snapshot, `models/orders.toml` becomes a symlink to a file
+/// OUTSIDE the project. Before the fix the snapshot's `std::fs::read`
+/// followed it: the outside file became the "prior sidecar" the merge folds
+/// into the draft, the policy read its classifications, and the rollback
+/// would have written it back. The no-follow read refuses the draft instead,
+/// before anything is written. The planted target is valid TOML, so a
+/// followed read would MERGE it rather than refuse for parsing — the bug
+/// cannot hide behind a parse error.
+#[cfg(unix)]
+#[test]
+fn draft_model_never_snapshots_through_a_leaf_swapped_for_an_outside_symlink() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let outside_dir = TempDir::new().unwrap();
+    let outside = outside_dir.path().join("outside.toml");
+    std::fs::write(&outside, "marker = \"OUTSIDE-SECRET\"\n").unwrap();
+
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let (link_at, target) = (sidecar.clone(), outside.clone());
+    let result = draft_model_with_a_pre_snapshot_swap(dir.path(), "orders", move || {
+        std::os::unix::fs::symlink(&target, &link_at).unwrap();
+    });
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a leaf swapped for a symlink refuses the draft"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("invalid_argument"),
+        "refused by the snapshot's no-follow read, not by a later write: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/orders.toml") && message.contains("cannot be read"),
+        "the refusal names the path: {message}"
+    );
+    assert!(
+        !message.contains("OUTSIDE-SECRET"),
+        "the outside file's content never reaches the caller: {message}"
+    );
+
+    // THE PIN: nothing outside the project was read in, and nothing was written.
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "marker = \"OUTSIDE-SECRET\"\n",
+        "the file outside the project is untouched"
+    );
+    assert!(
+        !dir.path().join("models").join("orders.sql").exists(),
+        "the draft refused before any write"
+    );
+    assert!(
+        std::fs::symlink_metadata(&sidecar)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted link is left in place, neither followed nor replaced"
+    );
+}
+
+/// The same window with a FIFO. Before the fix the snapshot's `std::fs::read`
+/// opened it and waited for a writer that never comes, parking the request —
+/// and the tool call — forever. The harness's timeout turns that regression
+/// into a failure instead of a hung suite; the no-follow read refuses
+/// promptly.
+#[cfg(unix)]
+#[test]
+fn draft_model_refuses_a_leaf_swapped_for_a_fifo_before_the_snapshot_without_hanging() {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let fifo_at = sidecar.clone();
+    let result = draft_model_with_a_pre_snapshot_swap(dir.path(), "orders", move || {
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_at)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "mkfifo {}", fifo_at.display());
+    });
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a leaf swapped for a FIFO refuses the draft"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("invalid_argument"),
+        "refused by the snapshot's no-follow read: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/orders.toml") && message.contains("cannot be read"),
+        "the refusal names the path: {message}"
+    );
+    assert!(
+        !dir.path().join("models").join("orders.sql").exists(),
+        "the draft refused before any write"
+    );
+    assert!(
+        std::fs::symlink_metadata(&sidecar)
+            .unwrap()
+            .file_type()
+            .is_fifo(),
+        "the planted FIFO is left in place, neither read nor replaced"
+    );
+}
+
 /// `models/` itself reached through a symlink redirected every draft write
 /// out of the project with no race at all: the leaf check and the no-follow
 /// writes look only at the final path component, and `root.join("models")`
