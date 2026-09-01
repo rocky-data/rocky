@@ -430,6 +430,40 @@ pub fn write_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.write_all(bytes)
 }
 
+/// The largest artifact read whole through the no-follow read helpers.
+///
+/// The files copied here are a lowered contract, sidecar, SQL model, and
+/// manifest — kilobytes. `std::fs::copy` streamed, so it could not be made
+/// to exhaust memory; reading whole can be, which is why the size is
+/// bounded rather than trusted. [`read_no_follow_bytes`] shares the bound,
+/// for the same reason and over the same kind of file.
+const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read `path` whole, refusing to follow a symlink at the leaf, and hand
+/// back just the bytes.
+///
+/// The read counterpart of [`write_no_follow`], for a caller that must
+/// capture a file's CURRENT content before overwriting it — the draft
+/// tools' rollback snapshot. `std::fs::read` resolves the path again, so a
+/// link swapped in after a path-based pre-check is read through to its
+/// target and a FIFO parks the read until a writer appears. This opens
+/// once with `O_NOFOLLOW | O_NONBLOCK`, checks the DESCRIPTOR is a regular
+/// file, and reads from that same descriptor — never a second path lookup.
+/// The read is bounded by [`MAX_BACKUP_BYTES`].
+///
+/// Windows `OpenOptions` has no `O_NOFOLLOW` equivalent, so there the read
+/// still follows a symlink or junction and the caller's pre-check is the
+/// only leaf guard: the same stated gap as [`write_no_follow`].
+///
+/// # Errors
+///
+/// Any error from the open or the read — `NotFound` when nothing is at the
+/// path, `ELOOP` for a symlinked leaf on unix; `InvalidInput` when what was
+/// opened is not a regular file, or is over the size bound.
+pub fn read_no_follow_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_no_follow(path).map(|(bytes, _)| bytes)
+}
+
 /// Read `path` whole, refusing to follow a symlink at the leaf, and hand
 /// back its mode alongside the bytes.
 ///
@@ -443,14 +477,6 @@ pub fn write_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 ///
 /// The mode comes off the DESCRIPTOR, not a second path lookup, so it
 /// describes the same file the bytes came from.
-/// The largest artifact this module will back up.
-///
-/// The files copied here are a lowered contract, sidecar, SQL model, and
-/// manifest — kilobytes. `std::fs::copy` streamed, so it could not be made
-/// to exhaust memory; reading whole can be, which is why the size is
-/// bounded rather than trusted.
-const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
-
 fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions)> {
     use std::io::Read as _;
     let mut options = std::fs::OpenOptions::new();
@@ -2848,6 +2874,127 @@ mod tests {
             "a directory is refused"
         );
         assert!(directory.is_dir(), "the directory is left in place");
+    }
+
+    /// The pub read counterpart: a regular file reads back verbatim, an
+    /// absent path is `NotFound` (the caller's "absent" arm), and a
+    /// symlinked leaf — resolving or dangling — is refused by the open
+    /// itself rather than read through to its target.
+    #[cfg(unix)]
+    #[test]
+    fn read_no_follow_bytes_reads_a_regular_file_and_refuses_a_symlinked_leaf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let regular = dir.path().join("orders.toml");
+        std::fs::write(&regular, b"name = \"orders\"\n").expect("write");
+        assert_eq!(
+            read_no_follow_bytes(&regular).expect("a regular file reads"),
+            b"name = \"orders\"\n"
+        );
+        assert_eq!(
+            read_no_follow_bytes(&dir.path().join("absent.toml"))
+                .expect_err("an absent path is NotFound")
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "the caller maps NotFound to \"absent\"; nothing else may take that arm"
+        );
+
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"bytes the read must not capture").expect("write");
+        let resolving = dir.path().join("resolving.toml");
+        plant_symlink(&resolving, &secret);
+        let dangling = dir.path().join("dangling.toml");
+        plant_symlink(&dangling, &dir.path().join("nowhere.toml"));
+
+        for link in [&resolving, &dangling] {
+            let error = read_no_follow_bytes(link).expect_err("a symlinked leaf is refused");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ELOOP),
+                "refused by the no-follow open itself: {error}"
+            );
+            assert_ne!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "a dangling link must not read as \"absent\""
+            );
+        }
+    }
+
+    /// A non-regular leaf is refused WITHOUT blocking. A FIFO with no writer
+    /// would park a blocking read-open forever — the shape that hung the
+    /// draft snapshot; with a writer the open succeeds and the DESCRIPTOR
+    /// check refuses it. A directory is refused either by the open (Linux)
+    /// or by the same descriptor check (macOS).
+    #[cfg(unix)]
+    #[test]
+    fn read_no_follow_bytes_refuses_a_fifo_and_a_directory_instead_of_blocking() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("orders.sql");
+        make_fifo(&fifo);
+
+        // No writer: a blocking read-open parks here until one appears.
+        // `O_NONBLOCK` returns instead, and the descriptor check refuses.
+        let error = read_no_follow_bytes(&fifo).expect_err("a FIFO with no writer is refused");
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "expected the regular-file refusal, got: {error}"
+        );
+
+        // Bytes waiting in the pipe do not make it a file either: a reader
+        // must exist before the write end can be opened at all.
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("open the read end");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("open the write end");
+        writer.write_all(b"not the model").expect("feed the FIFO");
+        let error = read_no_follow_bytes(&fifo).expect_err("a FIFO with a writer is refused");
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "expected the regular-file refusal, got: {error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .expect("still there")
+                .file_type()
+                .is_fifo(),
+            "the FIFO is left in place"
+        );
+
+        let directory = dir.path().join("orders.toml");
+        std::fs::create_dir(&directory).expect("mkdir");
+        let error = read_no_follow_bytes(&directory).expect_err("a directory is refused");
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "a directory must not read as \"absent\": {error}"
+        );
+        assert!(directory.is_dir(), "the directory is left in place");
+    }
+
+    /// The read is bounded, not trusted: a file over `MAX_BACKUP_BYTES`
+    /// refuses instead of being buffered whole. The bound covers the draft
+    /// snapshot too, so a redraft of a model larger than the limit refuses
+    /// where a plain `std::fs::read` would have loaded it.
+    #[test]
+    fn read_no_follow_bytes_refuses_a_file_over_the_size_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oversized = dir.path().join("huge.sql");
+        std::fs::write(&oversized, vec![b'x'; MAX_BACKUP_BYTES as usize + 1]).expect("write");
+
+        let error = read_no_follow_bytes(&oversized).expect_err("an oversized file is refused");
+        assert!(
+            error.to_string().contains("exceeds the"),
+            "expected the size refusal, got: {error}"
+        );
     }
 
     #[cfg(unix)]

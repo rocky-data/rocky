@@ -20,7 +20,7 @@ use rmcp::{
 
 use rocky_cli::commands;
 use rocky_compiler::compile::{self, CompileResult as CompilerResult, CompilerConfig};
-use rocky_core::product::commit::write_no_follow;
+use rocky_core::product::commit::{read_no_follow_bytes, write_no_follow};
 
 use crate::error::{ToolError, ToolResult};
 use crate::result_types::*;
@@ -2134,8 +2134,9 @@ impl RockyMcpServer {
     /// write: the models directory must resolve inside the project root
     /// ([`Self::refuse_redirected_models_dir`]), and each draft path must be
     /// absent or a regular file ([`refuse_non_regular_draft_target`]). What
-    /// appears at a leaf AFTER these checks meets the no-follow open on every
-    /// write and rollback (`write_no_follow`), not a follow.
+    /// appears at a leaf AFTER these checks meets a no-follow open on both
+    /// sides — the snapshot's read (`read_no_follow_bytes`) and every write
+    /// and rollback (`write_no_follow`) — not a follow.
     fn resolve_draft_paths(&self, name: &str) -> Result<DraftPaths, Json<ToolError>> {
         use std::path::Component;
 
@@ -2180,10 +2181,10 @@ impl RockyMcpServer {
         // The leaf half, up front: a symlink at any draft path — dangling or
         // not; `symlink_metadata` does not follow, where the `exists()` of the
         // canonicalize check this replaced did — or anything else that is not
-        // a regular file refuses before a snapshot or a write. A FIFO would
-        // park the snapshot's read until a writer appeared. A link swapped in
-        // AFTER this check meets the no-follow open on every write and on the
-        // rollback's restore (`write_no_follow`), never a follow.
+        // a regular file refuses before a snapshot or a write. A link swapped
+        // in AFTER this check meets a no-follow open on both sides: the
+        // snapshot's read (`read_no_follow_bytes`) and every write and
+        // rollback restore (`write_no_follow`), never a follow.
         for p in [&sql_path, &sidecar_path, &contract_path] {
             refuse_non_regular_draft_target(&self.root, p)?;
         }
@@ -4948,11 +4949,16 @@ fn restore_or_remove(path: &Path, prior: Option<&[u8]>) -> std::io::Result<()> {
 /// anything is snapshotted or written through it. Every draft tool resolves
 /// its paths through this (via `resolve_draft_paths`): the up-front leaf half
 /// of the no-follow guard. `symlink_metadata` does not follow, so a dangling
-/// link is seen as what it is; a FIFO is refused here because the snapshot's
-/// read would otherwise block until a writer appeared. An absent path is
+/// link is seen as what it is; a FIFO is refused here so the refusal names
+/// its kind rather than surfacing as an unreadable prior. An absent path is
 /// fine; any other inspection failure refuses too, because the write would
 /// land somewhere the tool could not inspect. What appears AFTER this check
-/// meets the no-follow open on every write and rollback (`write_no_follow`).
+/// meets a no-follow open on both sides — the snapshot's read
+/// (`read_no_follow_bytes`) and every write and rollback (`write_no_follow`).
+///
+/// Residual: the refusal's own remediation text still describes only the
+/// write half. It is one of the pinned wire strings, so it is left as it
+/// stands rather than reworded here.
 fn refuse_non_regular_draft_target(root: &Path, path: &Path) -> Result<(), Json<ToolError>> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -5068,6 +5074,16 @@ impl DraftRollback {
     /// directory at the path — refuses the whole snapshot: a path that EXISTS
     /// but cannot be read back has no prior to restore, so the rollback would
     /// take the remove arm and delete it (#1572 follow-up).
+    ///
+    /// The read goes through `read_no_follow_bytes`, the read counterpart of
+    /// the no-follow writes. `std::fs::read` re-resolved the path, so a link
+    /// or FIFO swapped in at a leaf between `resolve_draft_paths` and here
+    /// was read through — the prior content could come from OUTSIDE the
+    /// project and then ride the merge and the rollback — or parked the
+    /// request forever. The open now carries `O_NOFOLLOW | O_NONBLOCK` on
+    /// unix, the regular-file check is on the DESCRIPTOR, and the read is
+    /// bounded: a file over `MAX_BACKUP_BYTES` (16 MiB) refuses rather than
+    /// being buffered whole.
     fn snapshot<I, P>(paths: I) -> Result<Self, UnreadablePrior>
     where
         I: IntoIterator<Item = P>,
@@ -5076,7 +5092,7 @@ impl DraftRollback {
         let mut entries = Vec::new();
         for p in paths {
             let path: PathBuf = p.into();
-            let prior = match std::fs::read(&path) {
+            let prior = match read_no_follow_bytes(&path) {
                 Ok(bytes) => Some(bytes),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(UnreadablePrior { path, error }),
@@ -6071,6 +6087,86 @@ mod tests {
         guard.defuse();
     }
 
+    /// The snapshot's read is guarded at the DESCRIPTOR, like every draft
+    /// write: a leaf swapped for a symlink AFTER the up-front check — the
+    /// window `resolve_draft_paths` cannot close, because a path syscall
+    /// re-traverses the path — refuses instead of being read through. Before
+    /// the fix `std::fs::read` followed it, so a file OUTSIDE the project
+    /// became the "prior content" that the merge folds into the user's
+    /// sidecar and the rollback would restore.
+    #[cfg(unix)]
+    #[test]
+    fn draft_rollback_snapshot_refuses_a_leaf_swapped_for_a_symlink_out_of_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let outside = dir.path().join("outside.toml");
+        std::fs::write(&outside, "marker = \"OUTSIDE-SECRET\"\n").unwrap();
+        let sidecar = models.join("orders.toml");
+        std::os::unix::fs::symlink(&outside, &sidecar).unwrap();
+
+        let refused = DraftRollback::snapshot([&sidecar])
+            .err()
+            .expect("a symlinked leaf refuses the snapshot instead of being read through");
+        assert_eq!(refused.path, sidecar);
+        let err = refused.into_tool_error(&root);
+        assert_eq!(err.0.code, crate::error::ToolErrorCode::InvalidArgument);
+        assert!(
+            err.0.message.contains("models/orders.toml")
+                && err.0.message.contains("cannot be read"),
+            "the refusal names the path: {}",
+            err.0.message
+        );
+        assert!(
+            !err.0.message.contains("OUTSIDE-SECRET"),
+            "the outside file's content never reaches the caller: {}",
+            err.0.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "marker = \"OUTSIDE-SECRET\"\n",
+            "the file outside the project is untouched"
+        );
+    }
+
+    /// A FIFO swapped in at a snapshot path is refused, and refused without
+    /// blocking. Before the fix the snapshot's `std::fs::read` opened it and
+    /// waited for a writer that never comes, parking the draft request
+    /// forever. The read now carries `O_NONBLOCK` with `O_NOFOLLOW` and
+    /// checks the descriptor. The timeout turns a regression into a failure
+    /// instead of a hung suite.
+    #[cfg(unix)]
+    #[test]
+    fn draft_rollback_snapshot_refuses_a_fifo_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let sidecar = models.join("orders.toml");
+        make_fifo(&sidecar);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = sidecar.clone();
+        std::thread::spawn(move || {
+            let refused = match DraftRollback::snapshot([&probe]) {
+                Ok(guard) => {
+                    guard.defuse();
+                    false
+                }
+                Err(_) => true,
+            };
+            let _ = tx.send(refused);
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the snapshot returned instead of parking on the FIFO");
+        assert!(refused, "a FIFO at a snapshot path refuses");
+        assert!(
+            std::fs::symlink_metadata(&sidecar).is_ok(),
+            "the FIFO is left in place, neither read nor replaced"
+        );
+    }
+
     /// A failed restore whose target is GONE says so: the prior file was
     /// removed and its parent went with it, so `std::fs::write` cannot put
     /// the bytes back and there is nothing on disk to "remove". Before the
@@ -6321,6 +6417,17 @@ mod tests {
         assert!(
             source.contains(&required),
             "the rollback restore calls write_no_follow"
+        );
+        let banned = format!("match std::fs::{}(&path)", "read");
+        assert!(
+            !source.contains(&banned),
+            "the snapshot reads a prior with a plain std::fs::read, which follows a link \
+             swapped in at the leaf and parks on a FIFO"
+        );
+        let required = format!("read_no_follow_{}(&path)", "bytes");
+        assert!(
+            source.contains(&required),
+            "the snapshot reads each prior through read_no_follow_bytes"
         );
     }
 
