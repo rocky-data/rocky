@@ -547,12 +547,24 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   walk.
 ///
 ///   The scope's routing half is structured ([`ResumeTarget`], compared
-///   field-wise). The unreleased build between #1573 and that change wrote
-///   the routing as one flat `target_routing` string; such a blob
-///   forward-deserializes with [`ResumeScope::target`] `None` (guarded by
-///   `test_pre_release_v23_scope_forward_deserializes_target_none`), which
-///   never equals a live scope, so it refuses as a scope mismatch. No
-///   released build wrote one, so the version stays at 23.
+///   field-wise). Two earlier unreleased builds wrote other shapes, and
+///   every one of them refuses as a scope mismatch rather than resuming:
+///
+///   ```text
+///     build                       forward-deserializes as   verdict
+///     flat `target_routing`       target: None              refuse
+///     structured, raw separator   separator_role: None      refuse
+///     structured, no separator    separator_role: None      refuse
+///     this build                  separator_role: Some(..)  compare
+///   ```
+///
+///   The raw-separator build wrote a bare string under the `separator` key;
+///   this build neither reads nor writes that key, and serde ignores it, so
+///   an old blob still deserializes (a hard parse error there would break
+///   `--resume-latest` for every scope, since one scan reads every header).
+///   Guarded by `test_pre_release_v23_scope_forward_deserializes_target_none`
+///   and `test_pre_release_v23_unclassified_separators_never_match`. No
+///   released build wrote any of them, so the version stays at 23.
 const CURRENT_SCHEMA_VERSION: u32 = 23;
 
 /// Errors from the embedded redb state store.
@@ -2367,17 +2379,18 @@ pub struct ResumeTarget {
     pub catalog_template: String,
     /// The target schema template, verbatim.
     pub schema_template: String,
-    /// The separator that joins a variadic template component (`{regions}`)
-    /// when the templates above are resolved: `[target] separator`, or the
-    /// source pattern's separator when the target pins none. Two configs
-    /// that differ only here resolve different physical schema names.
+    /// What the separator did to the templates above — see
+    /// [`ResumeSeparator`]. `[target] separator` when set, else the source
+    /// pattern's.
     ///
-    /// `None` only on a checkpoint written by an unreleased build that did
-    /// not record it. Such a checkpoint never equals a current scope, so a
-    /// resume refuses it as a scope mismatch rather than resuming a
-    /// checkpoint whose routing it cannot check.
+    /// `None` only on a checkpoint written by an unreleased build, which
+    /// either did not record the separator or recorded it without
+    /// classifying it (under the old `separator` key, which this build no
+    /// longer reads). A scope this build makes is always `Some`, so such a
+    /// checkpoint never equals a resuming invocation: the resume refuses it
+    /// as a scope mismatch rather than trusting routing it cannot check.
     #[serde(default)]
-    pub separator: Option<String>,
+    pub separator_role: Option<ResumeSeparator>,
     /// The data location behind the adapter alias
     /// ([`crate::config::AdapterConfig::endpoint_identity`]) — secret-free,
     /// so the same alias re-pointed at another warehouse is a different
@@ -2386,6 +2399,31 @@ pub struct ResumeTarget {
     /// The `--shadow` / `--shadow-schema` / `--branch` override, when any.
     #[serde(default)]
     pub shadow: Option<ResumeShadow>,
+}
+
+/// Whether the target separator could reach the names a replication run
+/// resolved — the only reason it belongs in a resume scope.
+///
+/// A separator joins a **bare** multi-valued placeholder (`{regions}`) and
+/// does nothing else: `{regions:_}` pins its own, `{source}` is
+/// single-valued, and a template with no placeholder has nothing to join.
+/// So an edit to `[target] separator` moves a physical schema name in the
+/// first case only. Recording the raw value in the other cases refused a
+/// resume over a config edit that could not reach the warehouse (#1582).
+///
+/// [`crate::schema::SchemaPattern::separator_joins_a_placeholder`] decides
+/// which case a config is in, using the resolver's own scanner.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeSeparator {
+    /// A bare multi-valued placeholder joins with this separator, so its
+    /// value is part of the resolved names. Two configs that differ only
+    /// here route to different physical schemas.
+    Joins(String),
+    /// No template joins a multi-valued placeholder, so no separator value
+    /// changes a resolved name. The value itself is deliberately not
+    /// recorded: it is not part of this run's routing.
+    Unused,
 }
 
 /// The shadow or branch override a replication run wrote under.
@@ -2419,8 +2457,9 @@ impl std::fmt::Display for ResumeTarget {
             "{}:{}.{} ",
             self.adapter, self.catalog_template, self.schema_template
         )?;
-        match &self.separator {
-            Some(separator) => write!(f, "separator({separator}) ")?,
+        match &self.separator_role {
+            Some(ResumeSeparator::Joins(separator)) => write!(f, "separator({separator}) ")?,
+            Some(ResumeSeparator::Unused) => write!(f, "separator unused ")?,
             None => write!(f, "separator unrecorded ")?,
         }
         write!(f, "endpoint({})", self.endpoint)?;
@@ -8355,7 +8394,7 @@ mod tests {
                 adapter: "default".to_string(),
                 catalog_template: "wh".to_string(),
                 schema_template: format!("staging_{pipeline}__{{source}}"),
-                separator: Some("__".to_string()),
+                separator_role: Some(ResumeSeparator::Joins("__".to_string())),
                 endpoint: crate::config::EndpointIdentity {
                     adapter_type: "duckdb".to_string(),
                     locators: [("path".to_string(), "/tmp/wh.duckdb".to_string())]
@@ -8526,53 +8565,98 @@ mod tests {
         );
     }
 
-    /// A checkpoint from the unreleased build that recorded a structured
-    /// target without its separator must still deserialize — a read failure
-    /// would break every scoped lookup over the whole store — and must
-    /// never equal a live scope, because its routing cannot be checked.
+    /// Two unreleased builds wrote a structured target this one cannot
+    /// check: one recorded no separator at all, the other recorded a raw
+    /// `separator` string without saying whether it joined anything. Both
+    /// must still deserialize — a read failure would break every scoped
+    /// lookup over the whole store — and neither may equal a live scope.
     #[test]
-    fn test_pre_release_v23_target_without_a_separator_never_matches() {
-        let (store, _dir) = temp_store();
+    fn test_pre_release_v23_unclassified_separators_never_match() {
         let live = progress_scope("p1");
-        let mut blob = serde_json::to_value(&live).unwrap();
-        blob["target"]
-            .as_object_mut()
-            .expect("the target is an object")
-            .remove("separator")
-            .expect("a live scope records its separator");
-        let header = serde_json::json!({
-            "run_id": "run-no-sep",
-            "started_at": "2026-08-30T00:00:00Z",
-            "total_tables": 1,
-            "tables": [],
-            "scope": blob,
-        });
-        let bytes = serde_json::to_vec(&header).unwrap();
-        {
-            let txn = store.db.begin_write().unwrap();
-            {
-                let mut table = txn.open_table(RUN_PROGRESS).unwrap();
-                table.insert("run-no-sep", bytes.as_slice()).unwrap();
+        let cases = [
+            ("run-no-sep", None),
+            ("run-raw-sep", Some(serde_json::json!("__"))),
+        ];
+        for (run_id, raw_separator) in cases {
+            let (store, _dir) = temp_store();
+            let mut blob = serde_json::to_value(&live).unwrap();
+            let target = blob["target"]
+                .as_object_mut()
+                .expect("the target is an object");
+            target
+                .remove("separator_role")
+                .expect("a live scope classifies its separator");
+            if let Some(raw) = raw_separator.clone() {
+                target.insert("separator".to_string(), raw);
             }
-            txn.commit().unwrap();
-        }
+            let header = serde_json::json!({
+                "run_id": run_id,
+                "started_at": "2026-08-30T00:00:00Z",
+                "total_tables": 1,
+                "tables": [],
+                "scope": blob,
+            });
+            let bytes = serde_json::to_vec(&header).unwrap();
+            {
+                let txn = store.db.begin_write().unwrap();
+                {
+                    let mut table = txn.open_table(RUN_PROGRESS).unwrap();
+                    table.insert(run_id, bytes.as_slice()).unwrap();
+                }
+                txn.commit().unwrap();
+            }
 
-        let progress = store.get_run_progress("run-no-sep").unwrap().unwrap();
-        let recorded = progress.scope.expect("the older target still deserializes");
-        let target = recorded.target.as_ref().expect("the target is structured");
-        assert!(target.separator.is_none());
-        assert_ne!(recorded, live);
-        assert!(
-            recorded.to_string().contains("separator unrecorded"),
-            "the refusal must say what is missing: {recorded}"
-        );
-        assert!(
-            store
-                .get_latest_run_progress_for_scope(&live)
-                .unwrap()
-                .is_none(),
-            "a separator-less header is never a --resume-latest candidate"
-        );
+            let progress = store.get_run_progress(run_id).unwrap().unwrap();
+            let recorded = progress.scope.expect("the older target still deserializes");
+            let target = recorded.target.as_ref().expect("the target is structured");
+            assert!(target.separator_role.is_none(), "{run_id}");
+            assert_ne!(recorded, live, "{run_id}");
+            assert!(
+                recorded.to_string().contains("separator unrecorded"),
+                "the refusal must say what is missing: {recorded}"
+            );
+            assert!(
+                store
+                    .get_latest_run_progress_for_scope(&live)
+                    .unwrap()
+                    .is_none(),
+                "{run_id} is never a --resume-latest candidate"
+            );
+        }
+    }
+
+    /// The classified separator is the compared value, and `Unused` is a
+    /// shape of its own — never the same as any joined separator, and never
+    /// the same as an unclassified one.
+    #[test]
+    fn test_resume_separator_roles_are_three_distinct_shapes() {
+        let with_role = |role: Option<ResumeSeparator>| -> ResumeScope {
+            let mut scope = progress_scope("p1");
+            scope.target.as_mut().unwrap().separator_role = role;
+            scope
+        };
+        let joins = with_role(Some(ResumeSeparator::Joins("__".to_string())));
+        let other = with_role(Some(ResumeSeparator::Joins("_".to_string())));
+        let unused = with_role(Some(ResumeSeparator::Unused));
+        let unrecorded = with_role(None);
+
+        assert_ne!(joins, other);
+        assert_ne!(joins, unused);
+        assert_ne!(unused, unrecorded);
+        assert_eq!(unused, with_role(Some(ResumeSeparator::Unused)));
+
+        // The persisted spelling is pinned: it is compared across binaries.
+        let role_of = |scope: &ResumeScope| {
+            serde_json::to_value(scope).unwrap()["target"]["separator_role"].clone()
+        };
+        assert_eq!(role_of(&joins), serde_json::json!({ "joins": "__" }));
+        assert_eq!(role_of(&unused), serde_json::json!("unused"));
+        assert_eq!(role_of(&unrecorded), serde_json::Value::Null);
+        for scope in [&joins, &unused, &unrecorded] {
+            let round_trip: ResumeScope =
+                serde_json::from_value(serde_json::to_value(scope).unwrap()).unwrap();
+            assert_eq!(&round_trip, scope);
+        }
     }
 
     #[test]
