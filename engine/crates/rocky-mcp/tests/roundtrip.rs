@@ -4729,7 +4729,7 @@ fn draft_model_with_a_pre_snapshot_swap(
         .build()
         .expect("build a runtime with exactly one blocking thread");
 
-    runtime.block_on(async move {
+    let outcome: Result<rmcp::model::CallToolResult, &str> = runtime.block_on(async move {
         let (release, held) = std::sync::mpsc::channel::<()>();
         let (hogging, hogged) = tokio::sync::oneshot::channel();
         let hog = tokio::task::spawn_blocking(move || {
@@ -4754,23 +4754,34 @@ fn draft_model_with_a_pre_snapshot_swap(
             }
         })
         .await;
-        assert!(
-            reached.is_ok(),
-            "draft_model never created the models directory, so the leaf check never passed \
-             and there was no window to plant into"
-        );
+        if reached.is_err() {
+            return Err(
+                "draft_model never created the models directory, so the leaf check never \
+                 passed and there was no window to plant into",
+            );
+        }
 
         plant();
         drop(release);
         hog.await.expect("the hog task finishes");
 
-        let (client, result) = tokio::time::timeout(std::time::Duration::from_secs(30), call)
-            .await
-            .expect("draft_model parked on the planted leaf instead of refusing it")
-            .expect("the call task completes");
+        let Ok(joined) = tokio::time::timeout(std::time::Duration::from_secs(30), call).await
+        else {
+            return Err("draft_model parked on the planted leaf instead of refusing it");
+        };
+        let (client, result) = joined.expect("the call task completes");
         client.cancel().await.unwrap();
-        result.expect("the tool returns a result")
-    })
+        Ok(result.expect("the tool returns a result"))
+    });
+
+    // The verdict is carried out of the runtime, not panicked inside it. A
+    // path-based read parks on a planted FIFO forever, wedging the one
+    // blocking thread; dropping the runtime WAITS for that thread, so a
+    // panic in `block_on` would hang the suite instead of failing it.
+    // `shutdown_timeout(0)` hands the test back and leaks the wedged thread
+    // deliberately — the process is about to fail anyway.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(0));
+    outcome.unwrap_or_else(|why| panic!("{why}"))
 }
 
 /// The READ half of the leaf race, end to end. Between the up-front leaf
