@@ -12908,6 +12908,56 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         );
     }
 
+    /// The scope-mismatch message is the one place a resume failure reaches
+    /// a human, and the checkpoint beside it is the one place the scope is
+    /// stored. Neither may republish a secret an operator wrote into the
+    /// host URL — in the userinfo, the query or the fragment.
+    #[test]
+    fn a_refused_resume_never_prints_or_stores_a_secret_from_the_host() {
+        use rocky_core::config::{AdapterConfig, PipelineTargetConfig};
+
+        let target: PipelineTargetConfig = toml::from_str(
+            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"staging\"\n",
+        )
+        .unwrap();
+        // Three places a secret hides in one host, each with no `/` before
+        // the `://` that follows it.
+        let secrets = ["USERINFO-SECRET", "QUERY-SECRET", "FRAGMENT-SECRET"];
+        let gateway = |tenant: &str| -> AdapterConfig {
+            toml::from_str(&format!(
+                "type = \"trino\"\nhost = \"alice:USERINFO-SECRET@gw.example.com:8443?next=QUERY-SECRET://{tenant}#FRAGMENT-SECRET\"\ndatabase = \"hive\"\n"
+            ))
+            .unwrap()
+        };
+        let scope_a = resume_scope_for_test("p1", &target, &gateway("a"));
+        let scope_b = resume_scope_for_test("p1", &target, &gateway("b"));
+        assert_ne!(scope_a, scope_b, "two routes are two endpoints");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store.init_run_progress("run-a", 1, Some(&scope_a)).unwrap();
+        let err = resolve_resume_progress(&store, Some("run-a"), false, &scope_b)
+            .expect_err("another route's checkpoint must not resume");
+
+        let message = format!("{err:#}");
+        let stored = serde_json::to_string(&store.get_run_progress("run-a").unwrap().unwrap())
+            .expect("the checkpoint serializes");
+        for secret in secrets {
+            for (form, text) in [("message", &message), ("checkpoint", &stored)] {
+                // Name the leaking surface; never print the secret itself.
+                assert!(
+                    !text.contains(secret),
+                    "the refusal {form} leaks {secret}: {}",
+                    text.replace(secret, "<leaked>")
+                );
+            }
+        }
+        assert!(
+            message.contains("host=gw.example.com:8443"),
+            "the message still names the machine: {message}"
+        );
+    }
+
     /// The target separator joins variadic template components, so two
     /// configs that differ only there resolve different physical schema
     /// names. A checkpoint from one must not resume under the other.

@@ -3966,21 +3966,40 @@ impl AdapterConfig {
 /// removed, and the route tail — the path, `?query` and `#fragment` — with
 /// a trailing `/` trimmed, so `https://gw/` and `https://gw` agree.
 ///
-/// A `://` that appears after the first `/` is inside the path, not a
-/// scheme delimiter. Reading it as one would end the authority far to the
-/// right and put a whole credential-bearing prefix into the shown host.
+/// **The delimiter order is the whole safety property.** A scheme ends at
+/// the *first* `://` in the locator, and only when that `://` arrives before
+/// any `/`, `?` or `#` — its own `/` must be the first one in the string:
 ///
-/// The split is textual, never a URL parse, and the comparison downstream
-/// is exact. Two spellings of one URL that are not character-identical —
-/// an IPv6 literal written out in full, a `/` added before `?` — are two
-/// identities, so a resume refuses instead of resuming. That is the safe
-/// direction: it never crosses two endpoints, it only asks for a fresh run.
+/// ```text
+///   https://gw/tenant/a      ://  at 5, first / ? # at 6  ->  scheme
+///   alice:pw@gw/x://tail     ://  at 12, first / ? # at 11 ->  no scheme
+///   alice:pw@gw?k=v://tail   ://  at 15, first / ? # at 11 ->  no scheme
+/// ```
+///
+/// A `://` reached after any of those three is inside the path, the query or
+/// the fragment, never a scheme. Reading it as one ends the authority at the
+/// far right and puts the whole credential-bearing prefix into the shown
+/// host.
+///
+/// The split is textual, never a URL parse. The `url` crate cannot stand in
+/// here for two reasons: it requires a scheme, so the `host:port` and
+/// `user:pw@host` forms Rocky accepts would parse as a scheme plus a path;
+/// and it normalises (default ports dropped, a `/` path added, host case
+/// folded), which would silently move the digested route this function
+/// pins. The comparison downstream is exact, so two spellings of one URL
+/// that are not character-identical — an IPv6 literal written out in full,
+/// a `/` added before `?` — are two identities and a resume refuses instead
+/// of resuming. That is the safe direction: it never crosses two endpoints,
+/// it only asks for a fresh run.
 ///
 /// One parse, two forms: deriving the shown host and the digested route
 /// separately is how they would drift apart.
 fn split_host_locator(locator: &str) -> (&str, &str, &str) {
+    // The first `/`, `?` or `#` closes the authority wherever it is. A
+    // scheme delimiter is the one `://` whose own `/` IS that character.
+    let route_start = locator.find(['/', '?', '#']);
     let (scheme, rest) = match locator.find("://") {
-        Some(index) if !locator[..index].contains('/') => locator.split_at(index + 3),
+        Some(index) if route_start == Some(index + 1) => locator.split_at(index + 3),
         _ => ("", locator),
     };
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -12738,6 +12757,44 @@ x_token = "EXTRA-SECRET"
             )
             .endpoint_identity()
         );
+    }
+
+    /// A `://` reached after the first `?` or `#` is inside the query or the
+    /// fragment, not a scheme. Read as a scheme it ends the authority at the
+    /// far right, and the whole credential-bearing prefix lands in the shown
+    /// host — which a checkpoint stores and a scope-mismatch message prints.
+    #[test]
+    fn a_scheme_delimiter_inside_a_query_or_fragment_does_not_reopen_the_shown_host() {
+        assert_eq!(
+            sanitize_host_locator("alice:pw@gw?next=SECRET://tail"),
+            "gw"
+        );
+        assert_eq!(
+            sanitize_host_locator("alice:pw@gw#next=SECRET://tail"),
+            "gw"
+        );
+        assert_eq!(
+            sanitize_host_locator("https://alice:pw@gw:8443?next=SECRET://tail"),
+            "https://gw:8443"
+        );
+
+        for tail in ["?next=PATH-SECRET://tail", "#next=PATH-SECRET://tail"] {
+            let adapter = adapter_from_toml(&format!(
+                "type = \"trino\"\nhost = \"alice:URL-SECRET@gw{tail}\"\ndatabase = \"hive\"\n"
+            ));
+            assert_identity_is_location_only(&adapter, &["URL-SECRET", "PATH-SECRET"]);
+            assert_eq!(adapter.endpoint_identity().locators["host"], "gw");
+            // The route behind the host still routes: a different query or
+            // fragment is a different endpoint.
+            assert_ne!(
+                adapter.endpoint_identity(),
+                adapter_from_toml(&format!(
+                    "type = \"trino\"\nhost = \"alice:URL-SECRET@gw{}\"\ndatabase = \"hive\"\n",
+                    tail.replace("PATH-SECRET", "OTHER")
+                ))
+                .endpoint_identity()
+            );
+        }
     }
 
     /// A gateway routes by path, so two paths behind one host name are two
