@@ -3818,6 +3818,12 @@ pub struct EndpointIdentity {
     /// Locator fields by name, in name order. Every value is a data
     /// location (a host, a path, an account, a database); never a
     /// principal or a secret.
+    ///
+    /// A `host` contributes two entries: `host` is the shown
+    /// `scheme://host[:port]`, and `host_route_digest` is
+    /// `blake3:<hex>` over the whole route behind it (path, query and
+    /// fragment included). The digest is what makes two gateway paths two
+    /// endpoints; a path that carries a token never appears in either.
     #[serde(default)]
     pub locators: std::collections::BTreeMap<String, String>,
 }
@@ -3845,6 +3851,9 @@ impl AdapterConfig {
     /// to it.** It is the adapter type plus the locator fields below, each
     /// only when set:
     ///
+    /// Every `host` below contributes a second locator,
+    /// `host_route_digest` — see the paragraph on hosts.
+    ///
     /// | type         | locators                                                   |
     /// |--------------|------------------------------------------------------------|
     /// | `duckdb`     | `path`: the canonical file path, or `:memory: pid=<pid>`   |
@@ -3867,11 +3876,21 @@ impl AdapterConfig {
     /// with no `database` (a PAT or OAuth session, say) writes into the
     /// session's default database, and the identity does **not** stand a
     /// user name in for it: two such sessions on one account are one
-    /// endpoint to Rocky. A `host` that is URL-shaped is reduced to
-    /// `scheme://host[:port]` — userinfo, path, query and fragment are all
-    /// dropped, so a token routed through a proxy path never lands in a
-    /// checkpoint or an error message. `location`, `timeout_secs` and the
-    /// retry policy do not move the data and are left out.
+    /// endpoint to Rocky.
+    ///
+    /// A `host` is split in two, because what routes and what is safe to
+    /// show are not the same string. The `host` locator is the shown form,
+    /// reduced to `scheme://host[:port]`: a proxy path is where operators
+    /// put tokens, and neither a checkpoint nor an error message may carry
+    /// one. The `host_route_digest` locator is a `blake3:<hex>` digest over
+    /// the whole route — path, query and fragment included — so a gateway
+    /// that routes by path
+    /// (`https://gw/tenant/a` vs `https://gw/tenant/b`) still yields two
+    /// endpoints. Only the `user:password@` userinfo is dropped from both:
+    /// it is who connects, not where the data lives. `location`,
+    /// `timeout_secs` and the retry policy do not move the data and are
+    /// left out. `http_path` and the DuckDB `path` are kept whole and
+    /// compared whole, so they need no digest.
     ///
     /// The DuckDB path is canonicalized when the file exists, so `./wh.duckdb`
     /// and its absolute spelling agree; an in-memory database is process-
@@ -3885,12 +3904,15 @@ impl AdapterConfig {
             let Some(value) = value else {
                 return;
             };
-            let value = if key == "host" {
-                sanitize_host_locator(value)
-            } else {
-                value.to_string()
-            };
-            locators.insert(key.to_string(), value);
+            if key == "host" {
+                // The shown host names the machine; the digest carries the
+                // whole route, so a gateway path still separates endpoints
+                // without landing in state or in an error message.
+                locators.insert("host_route_digest".to_string(), host_route_digest(value));
+                locators.insert(key.to_string(), sanitize_host_locator(value));
+                return;
+            }
+            locators.insert(key.to_string(), value.to_string());
         };
         match self.adapter_type.as_str() {
             "duckdb" => {
@@ -3938,25 +3960,56 @@ impl AdapterConfig {
     }
 }
 
+/// Splits a `host` locator once, into the three parts both the shown form
+/// and the compared digest are built from: the scheme (`https://`, empty
+/// when there is none), the authority with any `user:password@` userinfo
+/// removed, and the route tail — the path, `?query` and `#fragment` — with
+/// a trailing `/` trimmed so two spellings of one coordinator agree.
+///
+/// One parse, two forms: deriving the shown host and the digested route
+/// separately is how they would drift apart.
+fn split_host_locator(locator: &str) -> (&str, &str, &str) {
+    let (scheme, rest) = match locator.find("://") {
+        Some(index) => locator.split_at(index + 3),
+        None => ("", locator),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    (scheme, authority, tail.trim_end_matches('/'))
+}
+
 /// Reduces a `host` locator to the part that names the machine: the scheme
 /// (when present), the host and the port. Everything else is dropped — the
 /// `user:password@` userinfo, the path, any `?query` or `#fragment`
 /// (`https://alice:s3cret@host:8443/tenant/x/token/T/?k=v` →
-/// `https://host:8443`). A bare `user:pw@host/path` is handled the same
-/// way. The path goes too, even though a gateway prefix can route: a path
-/// is where operators put tokens, and a checkpoint or an error message must
-/// never carry one.
+/// `https://host:8443`). A bare `user:pw@host/path` is handled the same way.
+///
+/// This is the **shown** form only: a path is where operators put tokens, so
+/// neither a checkpoint nor an error message carries one. The path still
+/// routes, so what a checkpoint *compares* is [`host_route_digest`].
 fn sanitize_host_locator(locator: &str) -> String {
-    let locator = locator.split(['?', '#']).next().unwrap_or_default();
-    let (scheme, rest) = match locator.split_once("://") {
-        Some((scheme, rest)) => (format!("{scheme}://"), rest),
-        None => (String::new(), locator),
-    };
-    let authority = rest.split('/').next().unwrap_or_default();
-    let authority = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
+    let (scheme, authority, _) = split_host_locator(locator);
     format!("{scheme}{authority}")
+}
+
+/// The digest a checkpoint compares a `host` locator by: `blake3:<hex>` over
+/// everything in the host that routes — scheme, host, port, path, query and
+/// fragment.
+///
+/// A gateway can route by path (`https://gw/tenant/a` and
+/// `https://gw/tenant/b` are two warehouses behind one host name), so the
+/// path must move the identity. It must not be *readable* in state or in an
+/// error, hence a digest: it separates two routes without republishing
+/// either. The `user:password@` userinfo is dropped first — it is who
+/// connects, not where the data lives, so rotating a password does not
+/// change the endpoint.
+fn host_route_digest(locator: &str) -> String {
+    let (scheme, authority, tail) = split_host_locator(locator);
+    let route = format!("{scheme}{authority}{tail}");
+    format!("blake3:{}", blake3::hash(route.as_bytes()).to_hex())
 }
 
 /// An in-memory DuckDB database lives inside one process and dies with it,
@@ -12289,6 +12342,12 @@ role = "ROLE-loader"
             .collect()
     }
 
+    /// The expected `host_route_digest` for a route each test spells out in
+    /// full. What is pinned is the digest's *input*, not the hash function.
+    fn route_digest(route: &str) -> String {
+        format!("blake3:{}", blake3::hash(route.as_bytes()).to_hex())
+    }
+
     #[test]
     fn duckdb_identity_has_no_credentials() {
         let dir = tempfile::tempdir().unwrap();
@@ -12328,6 +12387,12 @@ timeout_secs = 30
                 adapter_type: "databricks".to_string(),
                 locators: locators(&[
                     ("host", "https://adb-1.azuredatabricks.net"),
+                    (
+                        "host_route_digest",
+                        &route_digest(
+                            "https://adb-1.azuredatabricks.net/?token=QUERY-SECRET#FRAG-SECRET"
+                        ),
+                    ),
                     ("http_path", "/sql/1.0/warehouses/abc"),
                 ]),
             }
@@ -12354,6 +12419,12 @@ database = "ANALYTICS"
                     ("account", "xy12345.us-east-1"),
                     ("database", "ANALYTICS"),
                     ("host", "https://xy12345.us-east-1.snowflakecomputing.com"),
+                    (
+                        "host_route_digest",
+                        &route_digest(
+                            "https://xy12345.us-east-1.snowflakecomputing.com/session/TOKEN-SECRET"
+                        ),
+                    ),
                     ("warehouse", "COMPUTE_WH"),
                 ]),
             }
@@ -12376,7 +12447,8 @@ database = "ANALYTICS"
     }
 
     /// The reproduced leak: a Trino coordinator reached through a proxy
-    /// whose path carries a token. Only `scheme://host[:port]` survives.
+    /// whose path carries a token. Only `scheme://host[:port]` is shown;
+    /// the route survives as a digest, so the path still routes.
     #[test]
     fn trino_identity_has_no_credentials() {
         let adapter = adapter_from_toml(&format!(
@@ -12397,6 +12469,12 @@ database = "hive"
                 locators: locators(&[
                     ("catalog", "hive"),
                     ("host", "https://proxy.example.com:8443"),
+                    (
+                        "host_route_digest",
+                        &route_digest(
+                            "https://proxy.example.com:8443/tenant/x/token/PATH-SECRET/?token=QUERY-SECRET#FRAG-SECRET"
+                        ),
+                    ),
                 ]),
             }
         );
@@ -12428,7 +12506,13 @@ database = "hive"
                 adapter.endpoint_identity(),
                 EndpointIdentity {
                     adapter_type: adapter_type.to_string(),
-                    locators: locators(&[("host", "https://svc.example.com")]),
+                    locators: locators(&[
+                        ("host", "https://svc.example.com"),
+                        (
+                            "host_route_digest",
+                            &route_digest("https://svc.example.com/api/PATH-SECRET"),
+                        ),
+                    ]),
                 }
             );
         }
@@ -12470,6 +12554,10 @@ x_token = "EXTRA-SECRET"
                     ("database", "db"),
                     ("destination_id", "dest"),
                     ("host", "https://wh.example.com"),
+                    (
+                        "host_route_digest",
+                        &route_digest("https://wh.example.com/api/PATH-SECRET"),
+                    ),
                     ("http_path", "/gw"),
                     ("project_id", "proj"),
                 ]),
@@ -12609,6 +12697,63 @@ x_token = "EXTRA-SECRET"
         assert_eq!(sanitize_host_locator(""), "");
     }
 
+    /// A gateway routes by path, so two paths behind one host name are two
+    /// endpoints. The rendered form still shows only `scheme://host[:port]`;
+    /// the route digest is what tells them apart.
+    #[test]
+    fn host_path_and_query_are_part_of_the_endpoint() {
+        let gateway = |suffix: &str| {
+            adapter_from_toml(&format!(
+                "type = \"trino\"\nhost = \"https://gw.example.com:8443{suffix}\"\ndatabase = \"hive\"\n"
+            ))
+            .endpoint_identity()
+        };
+        let tenant_a = gateway("/tenant/a");
+        let tenant_b = gateway("/tenant/b");
+        assert_eq!(
+            tenant_a.locators["host"], tenant_b.locators["host"],
+            "the displayed host is the same machine"
+        );
+        assert_ne!(tenant_a, tenant_b, "the routed endpoint is not");
+        assert_ne!(gateway(""), tenant_a);
+        assert_ne!(gateway("?cluster=a"), gateway("?cluster=b"));
+
+        // Spellings that name one endpoint still agree.
+        assert_eq!(gateway("/tenant/a"), gateway("/tenant/a/"));
+        assert_eq!(gateway(""), gateway("/"));
+    }
+
+    /// The digest input is pinned: it is the host reduced to what routes —
+    /// scheme, host, port, path, query and fragment — with the credentials
+    /// in the userinfo removed and a trailing `/` trimmed.
+    #[test]
+    fn host_route_digest_input_is_pinned() {
+        assert_eq!(
+            host_route_digest("https://alice:s3cret@gw.example.com:8443/tenant/a/?x=1#f"),
+            format!(
+                "blake3:{}",
+                blake3::hash(b"https://gw.example.com:8443/tenant/a/?x=1#f").to_hex()
+            )
+        );
+        assert_eq!(
+            host_route_digest("https://gw.example.com/tenant/a/"),
+            format!(
+                "blake3:{}",
+                blake3::hash(b"https://gw.example.com/tenant/a").to_hex()
+            )
+        );
+        assert_eq!(
+            host_route_digest(""),
+            format!("blake3:{}", blake3::hash(b"").to_hex())
+        );
+        // Who connects is not where the data lives: the userinfo never
+        // moves the digest.
+        assert_eq!(
+            host_route_digest("https://alice:pw1@gw/x"),
+            host_route_digest("https://bob:pw2@gw/x")
+        );
+    }
+
     /// The persisted shape of an identity is pinned: it lives inside every
     /// checkpoint's scope and is compared field-wise across binaries.
     #[test]
@@ -12623,6 +12768,7 @@ x_token = "EXTRA-SECRET"
                 "adapter_type": "databricks",
                 "locators": {
                     "host": "https://adb-1.azuredatabricks.net",
+                    "host_route_digest": route_digest("https://adb-1.azuredatabricks.net"),
                     "http_path": "/sql/1.0/warehouses/abc",
                 },
             })

@@ -2356,9 +2356,9 @@ pub struct ResumeScope {
     pub target: Option<ResumeTarget>,
 }
 
-/// Where a replication run routed its writes: the target adapter alias and
-/// templates from `rocky.toml`, the data location behind that alias, and
-/// any shadow or branch override.
+/// Where a replication run routed its writes: the target adapter alias, the
+/// templates from `rocky.toml` and the separator that resolves them, the
+/// data location behind that alias, and any shadow or branch override.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResumeTarget {
     /// The target adapter name (a config alias).
@@ -2367,6 +2367,17 @@ pub struct ResumeTarget {
     pub catalog_template: String,
     /// The target schema template, verbatim.
     pub schema_template: String,
+    /// The separator that joins a variadic template component (`{regions}`)
+    /// when the templates above are resolved: `[target] separator`, or the
+    /// source pattern's separator when the target pins none. Two configs
+    /// that differ only here resolve different physical schema names.
+    ///
+    /// `None` only on a checkpoint written by an unreleased build that did
+    /// not record it. Such a checkpoint never equals a current scope, so a
+    /// resume refuses it as a scope mismatch rather than resuming a
+    /// checkpoint whose routing it cannot check.
+    #[serde(default)]
+    pub separator: Option<String>,
     /// The data location behind the adapter alias
     /// ([`crate::config::AdapterConfig::endpoint_identity`]) — secret-free,
     /// so the same alias re-pointed at another warehouse is a different
@@ -2405,9 +2416,14 @@ impl std::fmt::Display for ResumeTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}:{}.{} endpoint({})",
-            self.adapter, self.catalog_template, self.schema_template, self.endpoint
+            "{}:{}.{} ",
+            self.adapter, self.catalog_template, self.schema_template
         )?;
+        match &self.separator {
+            Some(separator) => write!(f, "separator({separator}) ")?,
+            None => write!(f, "separator unrecorded ")?,
+        }
+        write!(f, "endpoint({})", self.endpoint)?;
         match &self.shadow {
             Some(ResumeShadow::Suffix(suffix)) => write!(f, " shadow(suffix={suffix})"),
             Some(ResumeShadow::Schema(schema)) => write!(f, " shadow(schema={schema})"),
@@ -8339,6 +8355,7 @@ mod tests {
                 adapter: "default".to_string(),
                 catalog_template: "wh".to_string(),
                 schema_template: format!("staging_{pipeline}__{{source}}"),
+                separator: Some("__".to_string()),
                 endpoint: crate::config::EndpointIdentity {
                     adapter_type: "duckdb".to_string(),
                     locators: [("path".to_string(), "/tmp/wh.duckdb".to_string())]
@@ -8506,6 +8523,55 @@ mod tests {
             store.get_latest_run_progress().unwrap().unwrap().run_id,
             "run-flat",
             "the unscoped reader still lists it — nothing else in the store breaks"
+        );
+    }
+
+    /// A checkpoint from the unreleased build that recorded a structured
+    /// target without its separator must still deserialize — a read failure
+    /// would break every scoped lookup over the whole store — and must
+    /// never equal a live scope, because its routing cannot be checked.
+    #[test]
+    fn test_pre_release_v23_target_without_a_separator_never_matches() {
+        let (store, _dir) = temp_store();
+        let live = progress_scope("p1");
+        let mut blob = serde_json::to_value(&live).unwrap();
+        blob["target"]
+            .as_object_mut()
+            .expect("the target is an object")
+            .remove("separator")
+            .expect("a live scope records its separator");
+        let header = serde_json::json!({
+            "run_id": "run-no-sep",
+            "started_at": "2026-08-30T00:00:00Z",
+            "total_tables": 1,
+            "tables": [],
+            "scope": blob,
+        });
+        let bytes = serde_json::to_vec(&header).unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(RUN_PROGRESS).unwrap();
+                table.insert("run-no-sep", bytes.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let progress = store.get_run_progress("run-no-sep").unwrap().unwrap();
+        let recorded = progress.scope.expect("the older target still deserializes");
+        let target = recorded.target.as_ref().expect("the target is structured");
+        assert!(target.separator.is_none());
+        assert_ne!(recorded, live);
+        assert!(
+            recorded.to_string().contains("separator unrecorded"),
+            "the refusal must say what is missing: {recorded}"
+        );
+        assert!(
+            store
+                .get_latest_run_progress_for_scope(&live)
+                .unwrap()
+                .is_none(),
+            "a separator-less header is never a --resume-latest candidate"
         );
     }
 

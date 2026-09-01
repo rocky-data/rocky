@@ -1398,9 +1398,10 @@ fn require_resume_progress(
 
 /// The execution identity of the replication invocation asking to resume
 /// (#1549): the resolved pipeline name, the `--filter` selector, and where the
-/// run routes its writes (target adapter + templates, the data location
-/// behind that adapter name, plus any shadow or branch override — `--branch`
-/// arrives here as a `ShadowConfig` with a `schema_override`). The location
+/// run routes its writes (target adapter + templates, the separator that
+/// resolves those templates, the data location behind that adapter name, plus
+/// any shadow or branch override — `--branch` arrives here as a
+/// `ShadowConfig` with a `schema_override`). The location
 /// is [`AdapterConfig::endpoint_identity`]: the adapter name is only a
 /// config alias, and the same alias re-pointed at another warehouse (a
 /// DuckDB `path` edited between runs, two `rocky.toml` files sharing one
@@ -1410,6 +1411,11 @@ fn require_resume_progress(
 /// `init_run_progress` stamps on the checkpoint this run writes, so a later
 /// resume compares like with like.
 ///
+/// `separator` is the *effective* one the caller resolved — `[target]
+/// separator` when set, else the source pattern's — and is the same value
+/// the run resolves its target schema names with, taken from the same
+/// binding rather than derived a second time here.
+///
 /// [`AdapterConfig::endpoint_identity`]: rocky_core::config::AdapterConfig::endpoint_identity
 fn replication_resume_scope(
     pipeline_name: &str,
@@ -1417,6 +1423,7 @@ fn replication_resume_scope(
     target_adapter: &rocky_core::config::AdapterConfig,
     filter: Option<&str>,
     shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    separator: &str,
 ) -> ResumeScope {
     use rocky_core::state::{ResumeShadow, ResumeTarget};
 
@@ -1431,6 +1438,7 @@ fn replication_resume_scope(
             adapter: target.adapter.clone(),
             catalog_template: target.catalog_template.clone(),
             schema_template: target.schema_template.clone(),
+            separator: Some(separator.to_string()),
             endpoint: target_adapter.endpoint_identity(),
             shadow,
         }),
@@ -2777,12 +2785,21 @@ pub async fn run(
                 pipeline.target.adapter
             )
         })?;
+    // The separator that joins variadic template components. Resolved ONCE
+    // here: the resume scope records exactly the value the target-name
+    // resolution below uses, so the two can never drift apart.
+    let target_sep = pipeline
+        .target
+        .separator
+        .as_deref()
+        .unwrap_or(&pattern.separator);
     let resume_scope = replication_resume_scope(
         pipeline_name,
         &pipeline.target,
         target_adapter,
         filter,
         shadow_config,
+        target_sep,
     );
     let resume_progress =
         resolve_resume_progress(&state_store, resume_run_id, resume_latest, &resume_scope)?;
@@ -2930,11 +2947,6 @@ pub async fn run(
     let governance = &pipeline.target.governance;
     let target_catalog_template = &pipeline.target.catalog_template;
     let target_schema_template = &pipeline.target.schema_template;
-    let target_sep = pipeline
-        .target
-        .separator
-        .as_deref()
-        .unwrap_or(&pattern.separator);
 
     // Fail-closed replication gate (D), BEFORE any warehouse setup. The setup
     // loop below creates catalogs/schemas, sets tags, binds workspaces, and
@@ -12323,6 +12335,7 @@ mod tests {
                 adapter: "default".to_string(),
                 catalog_template: "wh".to_string(),
                 schema_template: format!("staging_{pipeline}__{{source}}"),
+                separator: Some("__".to_string()),
                 endpoint: rocky_core::config::EndpointIdentity {
                     adapter_type: "duckdb".to_string(),
                     locators: [("path".to_string(), ":memory:".to_string())]
@@ -12332,6 +12345,30 @@ mod tests {
                 shadow: None,
             }),
         }
+    }
+
+    /// `blake3` over `https://adb-1.azuredatabricks.net` — the whole route
+    /// behind the Databricks host these tests configure. Spelled out here so
+    /// the pin does not re-derive the value from the code it pins.
+    const DATABRICKS_ROUTE_DIGEST: &str =
+        "blake3:62ab7bbb309ecda1bcd8e80f04c8afaf9b4103e38bf9c4b5e609ddd374f5e5aa";
+
+    /// A scope built the way the run path builds it, for tests that vary one
+    /// routing input at a time. The separator mirrors the production
+    /// fallback: the target's own, else the source pattern's default.
+    fn resume_scope_for_test(
+        pipeline: &str,
+        target: &rocky_core::config::PipelineTargetConfig,
+        adapter: &rocky_core::config::AdapterConfig,
+    ) -> ResumeScope {
+        replication_resume_scope(
+            pipeline,
+            target,
+            adapter,
+            None,
+            None,
+            target.separator.as_deref().unwrap_or("__"),
+        )
     }
 
     /// The single `default` DuckDB adapter of a test project, or an in-memory
@@ -12430,6 +12467,7 @@ token = "dapi-SECRET"
             &adapter,
             Some("client=acme"),
             Some(&branch_shadow),
+            "__",
         );
         assert_eq!(
             serde_json::to_value(&scope).unwrap(),
@@ -12440,10 +12478,13 @@ token = "dapi-SECRET"
                     "adapter": "default",
                     "catalog_template": "wh",
                     "schema_template": "staging__{source}",
+                    "separator": "__",
                     "endpoint": {
                         "adapter_type": "databricks",
                         "locators": {
                             "host": "https://adb-1.azuredatabricks.net",
+                            // blake3 of the whole route behind that host.
+                            "host_route_digest": DATABRICKS_ROUTE_DIGEST,
                             "http_path": "/sql/1.0/warehouses/abc",
                         },
                     },
@@ -12453,9 +12494,12 @@ token = "dapi-SECRET"
         );
         assert_eq!(
             scope.to_string(),
-            "pipeline 'p1', filter 'client=acme', target default:wh.staging__{source} \
-             endpoint(databricks host=https://adb-1.azuredatabricks.net \
-             http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature)"
+            format!(
+                "pipeline 'p1', filter 'client=acme', target default:wh.staging__{{source}} \
+                 separator(__) endpoint(databricks host=https://adb-1.azuredatabricks.net \
+                 host_route_digest={DATABRICKS_ROUTE_DIGEST} \
+                 http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature)"
+            )
         );
         let round_trip: ResumeScope =
             serde_json::from_value(serde_json::to_value(&scope).unwrap()).unwrap();
@@ -12468,12 +12512,12 @@ token = "dapi-SECRET"
             cleanup_after: false,
         };
         let shadowed =
-            replication_resume_scope("p1", &target, &adapter, None, Some(&suffix_shadow));
+            replication_resume_scope("p1", &target, &adapter, None, Some(&suffix_shadow), "__");
         assert_eq!(
             serde_json::to_value(&shadowed).unwrap()["target"]["shadow"],
             serde_json::json!({ "suffix": "_rocky_shadow" })
         );
-        let plain = replication_resume_scope("p1", &target, &adapter, None, None);
+        let plain = replication_resume_scope("p1", &target, &adapter, None, None, "__");
         assert_eq!(
             serde_json::to_value(&plain).unwrap()["target"]["shadow"],
             serde_json::Value::Null
@@ -12492,13 +12536,14 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
 "#,
         )
         .unwrap();
-        let forged = replication_resume_scope("p1", &target, &injected, None, None);
+        let forged = replication_resume_scope("p1", &target, &injected, None, None, "__");
         let real_shadow = ShadowConfig {
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("x".to_string()),
             cleanup_after: false,
         };
-        let genuine = replication_resume_scope("p1", &target, &adapter, None, Some(&real_shadow));
+        let genuine =
+            replication_resume_scope("p1", &target, &adapter, None, Some(&real_shadow), "__");
         assert_eq!(
             forged.to_string(),
             genuine.to_string(),
@@ -12514,10 +12559,16 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("wh.duckdb");
         std::fs::write(&file, b"").unwrap();
-        let on_disk =
-            replication_resume_scope("p1", &target, &test_duckdb_adapter(Some(&file)), None, None);
+        let on_disk = replication_resume_scope(
+            "p1",
+            &target,
+            &test_duckdb_adapter(Some(&file)),
+            None,
+            None,
+            "__",
+        );
         let in_memory =
-            replication_resume_scope("p1", &target, &test_duckdb_adapter(None), None, None);
+            replication_resume_scope("p1", &target, &test_duckdb_adapter(None), None, None, "__");
         assert_eq!(
             on_disk.target.as_ref().unwrap().endpoint.locators["path"],
             std::fs::canonicalize(&file).unwrap().display().to_string()
@@ -12770,7 +12821,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             "type = \"databricks\"\nhost = \"https://h\"\nhttp_path = \"/p) shadow(schema=x\"\n",
         )
         .unwrap();
-        let forged = replication_resume_scope("p1", &target, &injected, None, None);
+        let forged = replication_resume_scope("p1", &target, &injected, None, None, "__");
         let adapter: AdapterConfig =
             toml::from_str("type = \"databricks\"\nhost = \"https://h\"\nhttp_path = \"/p\"\n")
                 .unwrap();
@@ -12779,7 +12830,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             schema_override: Some("x".to_string()),
             cleanup_after: false,
         };
-        let genuine = replication_resume_scope("p1", &target, &adapter, None, Some(&real_shadow));
+        let genuine =
+            replication_resume_scope("p1", &target, &adapter, None, Some(&real_shadow), "__");
         assert_eq!(forged.to_string(), genuine.to_string());
 
         let dir = tempfile::tempdir().unwrap();
@@ -12795,6 +12847,96 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             "unexpected error: {err:#}"
         );
         let err = resolve_resume_progress(&store, None, true, &genuine)
+            .expect_err("--resume-latest must not select it");
+        assert!(
+            err.to_string().contains("no progress found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// A Trino gateway routes by path: `https://gw/tenant/a` and
+    /// `https://gw/tenant/b` are two warehouses behind one host name. The
+    /// rendered identity shows only `scheme://host[:port]`, so both render
+    /// alike — the persisted route digest is what keeps them apart. A
+    /// checkpoint written against one must not resume against the other,
+    /// or the resume skips tables that were never copied there.
+    #[test]
+    fn resume_refuses_a_checkpoint_from_another_gateway_path() {
+        use rocky_core::config::{AdapterConfig, PipelineTargetConfig};
+
+        let target: PipelineTargetConfig = toml::from_str(
+            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"staging\"\n",
+        )
+        .unwrap();
+        let gateway = |tenant: &str| -> AdapterConfig {
+            toml::from_str(&format!(
+                "type = \"trino\"\nhost = \"https://gw.example.com:8443/tenant/{tenant}\"\ndatabase = \"hive\"\nusername = \"alice\"\npassword = \"pw\"\n"
+            ))
+            .unwrap()
+        };
+        let scope_a = resume_scope_for_test("p1", &target, &gateway("a"));
+        let scope_b = resume_scope_for_test("p1", &target, &gateway("b"));
+        for rendered in [scope_a.to_string(), scope_b.to_string()] {
+            assert!(
+                rendered.contains("host=https://gw.example.com:8443")
+                    && !rendered.contains("tenant"),
+                "the rendered scope must keep the path out of the message: {rendered}"
+            );
+        }
+        assert_ne!(scope_a, scope_b, "two gateway paths are two endpoints");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store.init_run_progress("run-a", 1, Some(&scope_a)).unwrap();
+
+        let err = resolve_resume_progress(&store, Some("run-a"), false, &scope_b)
+            .expect_err("another gateway path's checkpoint must not resume");
+        assert!(
+            err.to_string().contains("different pipeline scope"),
+            "unexpected error: {err:#}"
+        );
+        let err = resolve_resume_progress(&store, None, true, &scope_b)
+            .expect_err("--resume-latest must not select it");
+        assert!(
+            err.to_string().contains("no progress found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// The target separator joins variadic template components, so two
+    /// configs that differ only there resolve different physical schema
+    /// names. A checkpoint from one must not resume under the other.
+    #[test]
+    fn resume_refuses_a_checkpoint_written_with_another_separator() {
+        use rocky_core::config::PipelineTargetConfig;
+
+        let with_separator = |separator: &str| -> PipelineTargetConfig {
+            toml::from_str(&format!(
+                "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"staging__{{regions}}\"\nseparator = \"{separator}\"\n"
+            ))
+            .unwrap()
+        };
+        let adapter = test_duckdb_adapter(None);
+        let underscore = resume_scope_for_test("p1", &with_separator("_"), &adapter);
+        let dashes = resume_scope_for_test("p1", &with_separator("--"), &adapter);
+        assert_ne!(
+            underscore, dashes,
+            "a different separator resolves different target schemas"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-underscore", 1, Some(&underscore))
+            .unwrap();
+
+        let err = resolve_resume_progress(&store, Some("run-underscore"), false, &dashes)
+            .expect_err("another separator's checkpoint must not resume");
+        assert!(
+            err.to_string().contains("different pipeline scope"),
+            "unexpected error: {err:#}"
+        );
+        let err = resolve_resume_progress(&store, None, true, &dashes)
             .expect_err("--resume-latest must not select it");
         assert!(
             err.to_string().contains("no progress found"),
@@ -13409,6 +13551,7 @@ auto_create_schemas = true
                     &loaded.config.adapters[&target.adapter],
                     None,
                     None,
+                    "__",
                 );
                 let store = StateStore::open(&state_path).unwrap();
                 store
@@ -13542,6 +13685,7 @@ auto_create_schemas = true
                 &loaded.config.adapters[&target.adapter],
                 None,
                 None,
+                "__",
             );
             let store = StateStore::open(&state_path).unwrap();
             store
