@@ -12234,18 +12234,20 @@ pat = "PAT-xyz"
 role = "ROLE-loader"
 "#;
 
-    const CREDENTIAL_VALUES: [&str; 11] = [
-        "dapi-TOKEN-1234",
-        "CLIENT-ID-0",
-        "CLIENT-SECRET-5678",
-        "API-KEY-1",
-        "API-SECRET-2",
-        "USER-alice",
-        "PASSWORD-9",
-        "OAUTH-TOKEN-abc",
-        "PRIVATE-KEY",
-        "PAT-xyz",
-        "ROLE-loader",
+    /// The same values, each paired with the field it came from so a failure
+    /// can name the field without printing what leaked.
+    const CREDENTIAL_VALUES: [(&str, &str); 11] = [
+        ("token", "dapi-TOKEN-1234"),
+        ("client_id", "CLIENT-ID-0"),
+        ("client_secret", "CLIENT-SECRET-5678"),
+        ("api_key", "API-KEY-1"),
+        ("api_secret", "API-SECRET-2"),
+        ("username", "USER-alice"),
+        ("password", "PASSWORD-9"),
+        ("oauth_token", "OAUTH-TOKEN-abc"),
+        ("private_key_path", "PRIVATE-KEY"),
+        ("pat", "PAT-xyz"),
+        ("role", "ROLE-loader"),
     ];
 
     /// The identity, both as rendered for messages and as persisted in a
@@ -12256,12 +12258,20 @@ role = "ROLE-loader"
         let identity = adapter.endpoint_identity();
         let rendered = identity.to_string();
         let persisted = serde_json::to_string(&identity).unwrap();
-        for secret in CREDENTIAL_VALUES.iter().chain(leaked) {
+        let named = CREDENTIAL_VALUES
+            .iter()
+            .copied()
+            .chain(leaked.iter().map(|value| ("caller-supplied", *value)));
+        for (field, value) in named {
             for (form, text) in [("rendered", &rendered), ("persisted", &persisted)] {
+                // A test that guards against leaking a credential must not
+                // print one itself. Name the field that leaked and mask its
+                // value inside the identity being reported.
                 assert!(
-                    !text.contains(secret),
-                    "{} {form} identity {text:?} leaks {secret:?}",
-                    adapter.adapter_type
+                    !text.contains(value),
+                    "{}: {form} identity leaks the {field} value: {:?}",
+                    adapter.adapter_type,
+                    text.replace(value, "<leaked>")
                 );
             }
         }
