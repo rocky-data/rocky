@@ -3964,14 +3964,24 @@ impl AdapterConfig {
 /// and the compared digest are built from: the scheme (`https://`, empty
 /// when there is none), the authority with any `user:password@` userinfo
 /// removed, and the route tail — the path, `?query` and `#fragment` — with
-/// a trailing `/` trimmed so two spellings of one coordinator agree.
+/// a trailing `/` trimmed, so `https://gw/` and `https://gw` agree.
+///
+/// A `://` that appears after the first `/` is inside the path, not a
+/// scheme delimiter. Reading it as one would end the authority far to the
+/// right and put a whole credential-bearing prefix into the shown host.
+///
+/// The split is textual, never a URL parse, and the comparison downstream
+/// is exact. Two spellings of one URL that are not character-identical —
+/// an IPv6 literal written out in full, a `/` added before `?` — are two
+/// identities, so a resume refuses instead of resuming. That is the safe
+/// direction: it never crosses two endpoints, it only asks for a fresh run.
 ///
 /// One parse, two forms: deriving the shown host and the digested route
 /// separately is how they would drift apart.
 fn split_host_locator(locator: &str) -> (&str, &str, &str) {
     let (scheme, rest) = match locator.find("://") {
-        Some(index) => locator.split_at(index + 3),
-        None => ("", locator),
+        Some(index) if !locator[..index].contains('/') => locator.split_at(index + 3),
+        _ => ("", locator),
     };
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(authority_end);
@@ -4006,6 +4016,13 @@ fn sanitize_host_locator(locator: &str) -> String {
 /// either. The `user:password@` userinfo is dropped first — it is who
 /// connects, not where the data lives, so rotating a password does not
 /// change the endpoint.
+///
+/// **A digest hides a route; it cannot hide a guessable one.** Telling two
+/// routes apart and confirming a guess at one are the same operation, so
+/// anyone holding the state file or a mismatch message can hash candidate
+/// routes and see which one matches. A high-entropy token in a path
+/// survives that; a short or enumerable one does not. Credentials belong
+/// in the redacted `token` / `password` fields, never in a host URL.
 fn host_route_digest(locator: &str) -> String {
     let (scheme, authority, tail) = split_host_locator(locator);
     let route = format!("{scheme}{authority}{tail}");
@@ -12695,6 +12712,32 @@ x_token = "EXTRA-SECRET"
             "https://host"
         );
         assert_eq!(sanitize_host_locator(""), "");
+    }
+
+    /// A `://` after the first `/` is inside the path, not a scheme. Read
+    /// as a scheme it would end the authority far to the right, and the
+    /// shown host — which a scope-mismatch message prints — would carry the
+    /// userinfo and the path with it.
+    #[test]
+    fn a_late_scheme_delimiter_does_not_reopen_the_shown_host() {
+        assert_eq!(
+            sanitize_host_locator("alice:pw@gw/tenant/SECRET://tail"),
+            "gw"
+        );
+        let adapter = adapter_from_toml(
+            "type = \"trino\"\nhost = \"alice:URL-SECRET@gw/tenant/PATH-SECRET://tail\"\ndatabase = \"hive\"\n",
+        );
+        assert_identity_is_location_only(&adapter, &["URL-SECRET", "PATH-SECRET"]);
+        assert_eq!(adapter.endpoint_identity().locators["host"], "gw");
+        // The route still routes: the path behind that host separates it
+        // from another tenant on the same gateway.
+        assert_ne!(
+            adapter.endpoint_identity(),
+            adapter_from_toml(
+                "type = \"trino\"\nhost = \"alice:URL-SECRET@gw/tenant/OTHER://tail\"\ndatabase = \"hive\"\n",
+            )
+            .endpoint_identity()
+        );
     }
 
     /// A gateway routes by path, so two paths behind one host name are two
