@@ -13110,6 +13110,11 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             .unwrap()
         };
         let adapter = test_duckdb_adapter(None);
+        // A source schema whose `regions` binds TWO values, so a separator
+        // that could join anything would show.
+        let parsed = test_schema_pattern()
+            .parse("src__acme__us_west__us_central__shopify")
+            .unwrap();
 
         for schema_template in ["staging_{source}", "staging_{regions:_}", "staging"] {
             let written = resume_scope_for_test("p1", &target("_", schema_template), &adapter);
@@ -13118,6 +13123,18 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 written, edited,
                 "'{schema_template}' resolves the same names under either separator"
             );
+
+            // Why skipping stays correct: the resume matches completed work
+            // by the fully-qualified target name, and the resolver renders
+            // the same names under both separators. So the tables the
+            // checkpoint records really are the tables this run would write.
+            for template in ["wh", schema_template] {
+                assert_eq!(
+                    parsed.resolve_template(template, "_"),
+                    parsed.resolve_template(template, "--"),
+                    "'{template}' would move under a separator change"
+                );
+            }
 
             let dir = tempfile::tempdir().unwrap();
             let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
