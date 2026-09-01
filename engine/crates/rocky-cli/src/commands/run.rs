@@ -12406,6 +12406,17 @@ mod tests {
         target: &rocky_core::config::PipelineTargetConfig,
         adapter: &rocky_core::config::AdapterConfig,
     ) -> ResumeScope {
+        resume_scope_with_pattern(pipeline, target, adapter, &test_schema_pattern())
+    }
+
+    /// The same scope, for a case that varies the source pattern instead of
+    /// the target block.
+    fn resume_scope_with_pattern(
+        pipeline: &str,
+        target: &rocky_core::config::PipelineTargetConfig,
+        adapter: &rocky_core::config::AdapterConfig,
+        pattern: &rocky_core::schema::SchemaPattern,
+    ) -> ResumeScope {
         replication_resume_scope(
             pipeline,
             target,
@@ -12413,7 +12424,7 @@ mod tests {
             None,
             None,
             target.separator.as_deref().unwrap_or("__"),
-            &test_schema_pattern(),
+            pattern,
         )
     }
 
@@ -13071,6 +13082,74 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         assert_ne!(
             resume_scope_for_test("p1", &by_catalog("_"), &adapter),
             resume_scope_for_test("p1", &by_catalog("--"), &adapter),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-underscore", 1, Some(&underscore))
+            .unwrap();
+
+        let err = resolve_resume_progress(&store, Some("run-underscore"), false, &dashes)
+            .expect_err("another separator's checkpoint must not resume");
+        assert!(
+            err.to_string().contains("different pipeline scope"),
+            "unexpected error: {err:#}"
+        );
+        let err = resolve_resume_progress(&store, None, true, &dashes)
+            .expect_err("--resume-latest must not select it");
+        assert!(
+            err.to_string().contains("no progress found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// A pattern may declare the same component name twice. The parse keeps
+    /// the LAST occurrence, so `{tenant}` below binds the variable-length
+    /// one: the separator joins it and moves the physical schema name.
+    /// Reading the first occurrence instead recorded the separator as unused
+    /// and resumed a checkpoint written under other names (#1582).
+    #[test]
+    fn resume_refuses_a_separator_change_a_repeated_component_name_joins() {
+        use rocky_core::config::PipelineTargetConfig;
+        use rocky_core::schema::SchemaPattern;
+
+        let pattern = SchemaPattern {
+            prefix: "src__".to_string(),
+            separator: "__".to_string(),
+            components: SchemaPattern::parse_components(&[
+                "tenant".to_string(),
+                "tenant...".to_string(),
+                "source".to_string(),
+            ])
+            .unwrap(),
+        };
+        let parsed = pattern
+            .parse("src__acme__us_west__us_central__shopify")
+            .unwrap();
+        assert_ne!(
+            parsed.resolve_template("staging__{tenant}", "_"),
+            parsed.resolve_template("staging__{tenant}", "--"),
+            "the separator really moves this template's target schema"
+        );
+
+        let with_separator = |separator: &str| -> PipelineTargetConfig {
+            toml::from_str(&format!(
+                "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"staging__{{tenant}}\"\nseparator = \"{separator}\"\n"
+            ))
+            .unwrap()
+        };
+        let adapter = test_duckdb_adapter(None);
+        let underscore = resume_scope_with_pattern("p1", &with_separator("_"), &adapter, &pattern);
+        let dashes = resume_scope_with_pattern("p1", &with_separator("--"), &adapter, &pattern);
+        assert_eq!(
+            serde_json::to_value(&underscore).unwrap()["target"]["separator_role"],
+            serde_json::json!({ "joins": "_" }),
+            "a joined separator records its value"
+        );
+        assert_ne!(
+            underscore, dashes,
+            "a different separator resolves different target schemas"
         );
 
         let dir = tempfile::tempdir().unwrap();

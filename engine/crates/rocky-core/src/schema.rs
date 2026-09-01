@@ -277,17 +277,28 @@ impl SchemaPattern {
         Ok(ParsedSchema { values })
     }
 
-    /// The component `name` binds to, or `None` when this pattern has no
-    /// such name. [`PatternComponent::Fixed`] carries no name, so it never
-    /// matches — the same set of names [`Self::parse`] puts in
-    /// [`ParsedSchema::values`].
-    fn component(&self, name: &str) -> Option<&PatternComponent> {
-        self.components.iter().find(|component| match component {
-            PatternComponent::Fixed(_) => false,
-            PatternComponent::Variable { name: bound }
-            | PatternComponent::VariableLength { name: bound }
-            | PatternComponent::Terminal { name: bound } => bound == name,
-        })
+    /// Whether [`Self::parse`] binds `name` to [`SchemaValue::Multiple`], or
+    /// `None` when this pattern never binds it.
+    ///
+    /// Component names are **not** required to be unique, and `parse` writes
+    /// every occurrence of a name into one [`ParsedSchema::values`] entry, so
+    /// a repeated name keeps the **last** occurrence's value. This scans in
+    /// reverse and answers with that same occurrence. A lookup that stopped
+    /// at the first one read `["tenant", "tenant...", "source"]` as
+    /// single-valued while the resolver joined it (#1582).
+    ///
+    /// [`PatternComponent::Fixed`] carries no name, so it never matches —
+    /// the same set of names `parse` binds.
+    fn binds_multiple(&self, name: &str) -> Option<bool> {
+        self.components
+            .iter()
+            .rev()
+            .find_map(|component| match component {
+                PatternComponent::Fixed(_) => None,
+                PatternComponent::Variable { name: bound }
+                | PatternComponent::Terminal { name: bound } => (bound == name).then_some(false),
+                PatternComponent::VariableLength { name: bound } => (bound == name).then_some(true),
+            })
     }
 
     /// Whether a caller-default separator can change what any of
@@ -316,18 +327,31 @@ impl SchemaPattern {
     ///
     /// A resume checkpoint records the separator only when this says it
     /// moves a name (#1582), so a config edit that cannot reach the
-    /// warehouse does not refuse a recovery. It walks templates with the
-    /// resolver's own scanner on purpose: a second reading of the grammar
-    /// is how the rule would drift from what actually renders.
+    /// warehouse does not refuse a recovery.
+    ///
+    /// **The invariant: this rule and [`ParsedSchema::resolve_template`] must
+    /// never disagree about whether the separator changes the output.** So
+    /// both halves of the question reuse the resolver's own reading. The
+    /// template half walks [`render_placeholders`], the scanner that renders.
+    /// The pattern half asks [`Self::binds_multiple`], which resolves a
+    /// repeated component name to the occurrence [`Self::parse`] keeps. A
+    /// second reading of *either* half is how the rule drifts from what
+    /// actually renders — reading the pattern half with a first-match lookup
+    /// is what let a repeated name through.
+    ///
+    /// Where the pattern alone cannot answer, it answers `true`. A `name...`
+    /// that happens to bind one segment renders the same either way, and this
+    /// still calls it joining. Recording a separator that moves nothing only
+    /// refuses a resume that would have been fine; omitting one that moves a
+    /// name resumes onto other tables.
     pub fn separator_joins_a_placeholder(&self, templates: &[&str]) -> bool {
         templates.iter().any(|template| {
             let mut joins = false;
             render_placeholders(template, |name, sep, _out| {
-                let Some(component) = self.component(name) else {
+                let Some(multiple) = self.binds_multiple(name) else {
                     return false;
                 };
-                joins |=
-                    sep.is_none() && matches!(component, PatternComponent::VariableLength { .. });
+                joins |= sep.is_none() && multiple;
                 true
             });
             joins
@@ -876,6 +900,36 @@ mod tests {
                 .unwrap(),
         };
         assert!(!single.separator_joins_a_placeholder(&["staging__{regions}"]));
+
+        // Component names are not required to be unique, and `parse` writes
+        // every occurrence into one entry, so a repeated name keeps the LAST
+        // one. The rule must read that same occurrence. Reading the first
+        // instead called the pattern below single-valued while the resolver
+        // joined it (#1582).
+        //
+        // "src__a__b__c__d" binds tenant = [b, c] in the first pattern and
+        // regions = "c" in the second, so neither cross-check is vacuous.
+        for (specs, template, joins) in [
+            (["tenant", "tenant...", "source"], "{tenant}", true),
+            (["regions...", "regions", "source"], "{regions}", false),
+        ] {
+            let pattern = SchemaPattern {
+                prefix: "src__".into(),
+                separator: "__".into(),
+                components: SchemaPattern::parse_components(&specs.map(str::to_string)).unwrap(),
+            };
+            let parsed = pattern.parse("src__a__b__c__d").unwrap();
+            assert_eq!(
+                pattern.separator_joins_a_placeholder(&[template]),
+                joins,
+                "wrong verdict for {template} under {specs:?}"
+            );
+            assert_eq!(
+                parsed.resolve_template(template, "__") != parsed.resolve_template(template, "-"),
+                joins,
+                "the verdict for {template} under {specs:?} disagrees with the resolver"
+            );
+        }
     }
 
     // Real-world connector pattern tests
