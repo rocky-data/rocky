@@ -20,6 +20,7 @@ use rmcp::{
 
 use rocky_cli::commands;
 use rocky_compiler::compile::{self, CompileResult as CompilerResult, CompilerConfig};
+use rocky_core::product::commit::{read_no_follow_bytes, write_no_follow};
 
 use crate::error::{ToolError, ToolResult};
 use crate::result_types::*;
@@ -2127,10 +2128,15 @@ impl RockyMcpServer {
     ///
     /// Mirrors the import-dbt `safe_join_under` path guard (the traversal fix
     /// that hardened untrusted `model-paths`): reject an absolute name or any
-    /// path-traversal component syntactically, and — when a target path already
-    /// exists — canonicalize it and confirm it stays under the models directory,
-    /// catching a pre-existing symlink that would redirect the write. A draft
-    /// name is a bare identifier, so a separator, `..`, or extension is refused.
+    /// path-traversal component syntactically. A draft name is a bare
+    /// identifier, so a separator, `..`, or extension is refused. Then the
+    /// two up-front halves of the no-follow guard run, before any snapshot or
+    /// write: the models directory must resolve inside the project root
+    /// ([`Self::refuse_redirected_models_dir`]), and each draft path must be
+    /// absent or a regular file ([`refuse_non_regular_draft_target`]). What
+    /// appears at a leaf AFTER these checks meets a no-follow open on both
+    /// sides — the snapshot's read (`read_no_follow_bytes`) and every write
+    /// and rollback (`write_no_follow`) — not a follow.
     fn resolve_draft_paths(&self, name: &str) -> Result<DraftPaths, Json<ToolError>> {
         use std::path::Component;
 
@@ -2162,28 +2168,25 @@ impl RockyMcpServer {
             )));
         }
 
+        // The ancestor half of the no-follow guard: `models/` itself reached
+        // through a link would redirect every draft write with no race at
+        // all, and neither the leaf check below nor the no-follow writes look
+        // above the leaf.
+        self.refuse_redirected_models_dir()?;
+
         let sql_path = self.models_dir.join(format!("{stem}.sql"));
         let sidecar_path = self.models_dir.join(format!("{stem}.toml"));
         let contract_path = self.models_dir.join(format!("{stem}.contract.toml"));
 
-        // Symlink defense-in-depth: if a target already exists, confirm it
-        // resolves under the (canonicalized) models directory before we write
-        // through it. A not-yet-existing path passed the syntactic check above.
+        // The leaf half, up front: a symlink at any draft path — dangling or
+        // not; `symlink_metadata` does not follow, where the `exists()` of the
+        // canonicalize check this replaced did — or anything else that is not
+        // a regular file refuses before a snapshot or a write. A link swapped
+        // in AFTER this check meets a no-follow open on both sides: the
+        // snapshot's read (`read_no_follow_bytes`) and every write and
+        // rollback restore (`write_no_follow`), never a follow.
         for p in [&sql_path, &sidecar_path, &contract_path] {
-            if p.exists() {
-                let base = self.models_dir.canonicalize().map_err(|e| {
-                    bad(format!("failed to canonicalize the models directory: {e}"))
-                })?;
-                let canon = p
-                    .canonicalize()
-                    .map_err(|e| bad(format!("failed to canonicalize {}: {e}", p.display())))?;
-                if !canon.starts_with(&base) {
-                    return Err(bad(format!(
-                        "draft path {} resolves outside the models directory",
-                        p.display()
-                    )));
-                }
-            }
+            refuse_non_regular_draft_target(&self.root, p)?;
         }
 
         Ok(DraftPaths {
@@ -2192,6 +2195,84 @@ impl RockyMcpServer {
             sidecar_path,
             contract_path,
         })
+    }
+
+    /// Refuse to draft while `models/` resolves outside the project root.
+    ///
+    /// The leaf guard and the no-follow writes only look at the final path
+    /// component, so `proj/models -> <outside>/models_real` redirected every
+    /// draft write with no race at all. Both directories are canonicalized
+    /// here and the models directory must sit under the root. A models
+    /// directory that does not exist yet passes — `draft_model` creates it
+    /// under the root just resolved — unless its name is taken by a dangling
+    /// link. This is a check at one point in time: a link swapped into an
+    /// ANCESTOR after it cannot be closed by path-based syscalls at all, only
+    /// by dirfd-relative opens — the residual #1500 records.
+    fn refuse_redirected_models_dir(&self) -> Result<(), Json<ToolError>> {
+        let resolved_root = match self.root.canonicalize() {
+            Ok(resolved) => resolved,
+            // No root on disk means nothing under it either: there is nothing
+            // to resolve yet, and `draft_model` creates the models directory
+            // under the root as before.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(ToolError::internal(
+                    format!(
+                        "failed to resolve the project root {}: {e}",
+                        self.root.display()
+                    ),
+                    "Ensure the project directory is readable, then retry.",
+                ));
+            }
+        };
+        let resolved_models = match self.models_dir.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return match std::fs::symlink_metadata(&self.models_dir) {
+                    Ok(meta) if meta.file_type().is_symlink() => Err(ToolError::invalid_argument(
+                        format!(
+                            "the models directory {}/ is a symlink whose target does not \
+                             exist; refusing to draft through it",
+                            rel_display(&self.root, &self.models_dir)
+                        ),
+                        "Replace the link with a real models directory inside the project, \
+                         then retry. Drafts are written only under the project root.",
+                    )),
+                    Ok(_) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(ToolError::internal(
+                        format!(
+                            "failed to inspect the models directory {}: {e}",
+                            self.models_dir.display()
+                        ),
+                        "Ensure the project directory is readable, then retry.",
+                    )),
+                };
+            }
+            Err(e) => {
+                return Err(ToolError::internal(
+                    format!(
+                        "failed to resolve the models directory {}: {e}",
+                        self.models_dir.display()
+                    ),
+                    "Ensure the models directory is readable, then retry.",
+                ));
+            }
+        };
+        if !resolved_models.starts_with(&resolved_root) {
+            return Err(ToolError::invalid_argument(
+                format!(
+                    "the models directory {}/ resolves to {}, outside the project root {}; \
+                     refusing to draft through it",
+                    rel_display(&self.root, &self.models_dir),
+                    resolved_models.display(),
+                    resolved_root.display()
+                ),
+                "Make models/ a real directory inside the project (or a link that stays inside \
+                 it), then retry. Drafts are written only under the project root.",
+            ));
+        }
+        Ok(())
     }
 
     /// Whether the model `stem` already has a source file under `models/`
@@ -2326,33 +2407,19 @@ impl RockyMcpServer {
         // artifact — a draft the policy plane refuses must not linger on disk
         // (mirrors the propose gate's deny → no plan written). A drop-guard,
         // not a manual closure: unwinding restores too.
+        //
+        // An EXISTS-but-unreadable file REFUSES here, for the SQL and the
+        // sidecar alike, mirroring the unparseable-sidecar refusal below. Read
+        // as "absent", the draft would treat the model as NEW — overwriting
+        // the sidecar's spec-owned metadata, evaluating policy with no prior
+        // classifications, and, on a deny or a failed compile, "restoring"
+        // the absent prior by DELETING the file. The sidecar used to have a
+        // guard for that shape after the snapshot; the SQL file had none, so
+        // the snapshot itself now refuses (#1572 follow-up).
         let rollback =
             DraftRollback::snapshot_async(vec![paths.sql_path.clone(), paths.sidecar_path.clone()])
-                .await;
-
-        // FF-WP1 fix round 2 (item 2): an EXISTS-but-unreadable sidecar must
-        // REFUSE, mirroring the unparseable refusal below. The snapshot
-        // converts read errors to "absent", so without this guard the draft
-        // would treat the model as NEW — overwriting the sidecar's spec-owned
-        // metadata, evaluating policy with no prior classifications, and, on
-        // a deny, "restoring" the absent prior by DELETING the file. Checked
-        // against the same snapshot read the merge decision uses. Nothing has
-        // been written yet, so the guard is defused rather than dropped — a
-        // drop would perform exactly the deletion this refusal prevents.
-        if rollback.prior(&paths.sidecar_path).is_none()
-            && std::fs::metadata(&paths.sidecar_path).is_ok()
-        {
-            rollback.defuse();
-            return Err(ToolError::invalid_argument(
-                format!(
-                    "the sidecar at {} exists but cannot be read; refusing to rewrite it",
-                    rel_display(&self.root, &paths.sidecar_path)
-                ),
-                "Fix the sidecar file's permissions (it must be readable so its spec-owned \
-                 metadata can be preserved), then retry. draft_model never overwrites a sidecar \
-                 it cannot read.",
-            ));
-        }
+                .await
+                .map_err(|e| e.into_tool_error(&self.root))?;
 
         // FF-WP1 fix round (finding 2): build the sidecar to write, and
         // collect the PRIOR sidecar's classifications for the policy
@@ -2423,7 +2490,11 @@ impl RockyMcpServer {
             };
 
         // Write the draft: the SQL body verbatim + the sidecar built above.
-        if let Err(e) = std::fs::write(&paths.sql_path, ensure_trailing_newline(&args.sql)) {
+        // No-follow at the leaf (`write_no_follow`): a link swapped in at a
+        // draft path after `resolve_draft_paths` looked fails the write
+        // instead of carrying it out of the models directory.
+        let sql = ensure_trailing_newline(&args.sql);
+        if let Err(e) = write_no_follow(&paths.sql_path, sql.as_bytes()) {
             return Err(ToolError::internal(
                 format!(
                     "failed to write draft SQL to {}: {e}",
@@ -2432,7 +2503,7 @@ impl RockyMcpServer {
                 "Ensure the models directory is writable.",
             ));
         }
-        if let Err(e) = std::fs::write(&paths.sidecar_path, sidecar_bytes) {
+        if let Err(e) = write_no_follow(&paths.sidecar_path, sidecar_bytes.as_bytes()) {
             return Err(ToolError::internal(
                 format!(
                     "failed to write draft sidecar to {}: {e}",
@@ -2640,9 +2711,12 @@ impl RockyMcpServer {
         // Snapshot so a policy DENY (or a write/compile failure, or a panic
         // before the verdict) rolls back to leave NO new artifact — mirrors
         // `draft_model` and the propose gate. Drop-guard: unwinding restores.
-        let rollback = DraftRollback::snapshot_async(vec![paths.contract_path.clone()]).await;
+        let rollback = DraftRollback::snapshot_async(vec![paths.contract_path.clone()])
+            .await
+            .map_err(|e| e.into_tool_error(&self.root))?;
 
-        if let Err(e) = std::fs::write(&paths.contract_path, ensure_trailing_newline(&spec)) {
+        let contract = ensure_trailing_newline(&spec);
+        if let Err(e) = write_no_follow(&paths.contract_path, contract.as_bytes()) {
             return Err(ToolError::internal(
                 format!(
                     "failed to write draft contract to {}: {e}",
@@ -2795,8 +2869,11 @@ impl RockyMcpServer {
         // Snapshot the sidecar so a DENY (or a failure/panic before the
         // verdict) restores the model's PRIOR sidecar (the name/intent
         // draft_model wrote), never deletes it — the check is what rolls back,
-        // not the model. A model with no sidecar yet snapshots None.
-        let rollback = DraftRollback::snapshot_async(vec![paths.sidecar_path.clone()]).await;
+        // not the model. A model with no sidecar yet snapshots None; a sidecar
+        // that exists but cannot be read refuses.
+        let rollback = DraftRollback::snapshot_async(vec![paths.sidecar_path.clone()])
+            .await
+            .map_err(|e| e.into_tool_error(&self.root))?;
 
         // Merge: append the `[[tests]]` block(s) to the existing sidecar, or seed
         // a minimal sidecar (`name = "<stem>"`) when the model is a bare `.sql`.
@@ -2811,7 +2888,8 @@ impl RockyMcpServer {
             }
             None => format!("name = {}\n\n{}", toml_basic_string(&paths.stem), spec),
         };
-        if let Err(e) = std::fs::write(&paths.sidecar_path, ensure_trailing_newline(&merged)) {
+        let merged = ensure_trailing_newline(&merged);
+        if let Err(e) = write_no_follow(&paths.sidecar_path, merged.as_bytes()) {
             return Err(ToolError::internal(
                 format!(
                     "failed to write draft check to {}: {e}",
@@ -2971,7 +3049,10 @@ impl RockyMcpServer {
 
         // Snapshot the sidecar so a DENY (or a write/compile failure, or a
         // panic before the verdict) restores the model's PRIOR sidecar bytes.
-        let rollback = DraftRollback::snapshot_async(vec![paths.sidecar_path.clone()]).await;
+        // A sidecar that exists but cannot be read refuses.
+        let rollback = DraftRollback::snapshot_async(vec![paths.sidecar_path.clone()])
+            .await
+            .map_err(|e| e.into_tool_error(&self.root))?;
 
         // Parse-merge, never string-append: the existing sidecar must parse as
         // TOML or the call fails naming it — an unparseable sidecar is never
@@ -3039,7 +3120,8 @@ impl RockyMcpServer {
                 "Retry; if it persists this is an internal TOML serialization bug.",
             )
         })?;
-        if let Err(e) = std::fs::write(&paths.sidecar_path, ensure_trailing_newline(&serialized)) {
+        let serialized = ensure_trailing_newline(&serialized);
+        if let Err(e) = write_no_follow(&paths.sidecar_path, serialized.as_bytes()) {
             return Err(ToolError::internal(
                 format!(
                     "failed to write patched sidecar to {}: {e}",
@@ -4846,14 +4928,124 @@ struct DraftPaths {
 /// model is restored to the model's prior content, so a deny never corrupts nor
 /// leaves a new artifact. Removing an already-absent file is success (the
 /// desired end state holds); any other failure comes back to the caller — the
-/// artifact is still on disk and the refusal must say so (#1561).
+/// refusal must say what it left behind (#1561).
+///
+/// Neither arm follows a link at the leaf. `remove_file` unlinks the leaf
+/// itself; the restore goes through `write_no_follow`, so a link swapped in
+/// at the path since the snapshot fails the restore — reported by the caller
+/// — instead of receiving the prior bytes at its target.
 fn restore_or_remove(path: &Path, prior: Option<&[u8]>) -> std::io::Result<()> {
     match prior {
-        Some(bytes) => std::fs::write(path, bytes),
+        Some(bytes) => write_no_follow(path, bytes),
         None => match std::fs::remove_file(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             other => other,
         },
+    }
+}
+
+/// Refuse a draft path occupied by anything but a regular file — a symlink
+/// (dangling or not), a directory, a FIFO, a socket, a device — before
+/// anything is snapshotted or written through it. Every draft tool resolves
+/// its paths through this (via `resolve_draft_paths`): the up-front leaf half
+/// of the no-follow guard. `symlink_metadata` does not follow, so a dangling
+/// link is seen as what it is; a FIFO is refused here so the refusal names
+/// its kind rather than surfacing as an unreadable prior. An absent path is
+/// fine; any other inspection failure refuses too, because the write would
+/// land somewhere the tool could not inspect. What appears AFTER this check
+/// meets a no-follow open on both sides — the snapshot's read
+/// (`read_no_follow_bytes`) and every write and rollback (`write_no_follow`).
+///
+/// Residual: the refusal's own remediation text still describes only the
+/// write half. It is one of the pinned wire strings, so it is left as it
+/// stands rather than reworded here.
+fn refuse_non_regular_draft_target(root: &Path, path: &Path) -> Result<(), Json<ToolError>> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(ToolError::internal(
+                format!(
+                    "failed to inspect draft target {}: {e}",
+                    rel_display(root, path)
+                ),
+                "Ensure the models directory is readable, then retry.",
+            ));
+        }
+    };
+    let file_type = meta.file_type();
+    if file_type.is_file() {
+        return Ok(());
+    }
+    let (what, remedy) = if file_type.is_symlink() {
+        (
+            "is a symlink; refusing to write through it".to_string(),
+            "Replace the symlink with a regular file, or remove it,",
+        )
+    } else {
+        (
+            format!(
+                "is a {}, not a regular file; refusing to write to it",
+                describe_non_regular(file_type)
+            ),
+            "Remove it,",
+        )
+    };
+    Err(ToolError::invalid_argument(
+        format!("draft target {} {what}", rel_display(root, path)),
+        format!(
+            "{remedy} so the draft lands in a regular file inside the models directory, then \
+             retry. Every draft path is checked before the write, and on unix each write and \
+             rollback opens the leaf without following a link, so a link swapped in after this \
+             check fails the write instead of redirecting it (elsewhere this check is the only \
+             leaf guard)."
+        ),
+    ))
+}
+
+/// Name a non-regular file type for a refusal message.
+fn describe_non_regular(file_type: std::fs::FileType) -> &'static str {
+    if file_type.is_dir() {
+        return "directory";
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        if file_type.is_fifo() {
+            return "FIFO";
+        }
+        if file_type.is_socket() {
+            return "socket";
+        }
+        if file_type.is_block_device() || file_type.is_char_device() {
+            return "device";
+        }
+    }
+    "non-regular file"
+}
+
+/// A path [`DraftRollback::snapshot`] found on disk but could not read.
+/// Refused before anything is written: the draft tools never overwrite a file
+/// they cannot read back, because its content is what the rollback would have
+/// to restore.
+#[derive(Debug)]
+struct UnreadablePrior {
+    path: PathBuf,
+    error: std::io::Error,
+}
+
+impl UnreadablePrior {
+    fn into_tool_error(self, root: &Path) -> Json<ToolError> {
+        ToolError::invalid_argument(
+            format!(
+                "the file at {} exists but cannot be read ({}); refusing to draft over it",
+                rel_display(root, &self.path),
+                self.error
+            ),
+            "Fix the file's permissions (it must be readable so its prior content can be \
+             preserved and restored), then retry. The draft tools never overwrite a file they \
+             cannot read back.",
+        )
     }
 }
 
@@ -4877,33 +5069,49 @@ struct DraftRollback {
 }
 
 impl DraftRollback {
-    /// Snapshot `paths` before the draft writes them.
-    fn snapshot<I, P>(paths: I) -> Self
+    /// Snapshot `paths` before the draft writes them. Only a NotFound read is
+    /// "absent" (`None`). Any other read error — permission denied, a
+    /// directory at the path — refuses the whole snapshot: a path that EXISTS
+    /// but cannot be read back has no prior to restore, so the rollback would
+    /// take the remove arm and delete it (#1572 follow-up).
+    ///
+    /// The read goes through `read_no_follow_bytes`, the read counterpart of
+    /// the no-follow writes. `std::fs::read` re-resolved the path, so a link
+    /// or FIFO swapped in at a leaf between `resolve_draft_paths` and here
+    /// was read through — the prior content could come from OUTSIDE the
+    /// project and then ride the merge and the rollback — or parked the
+    /// request forever. The open now carries `O_NOFOLLOW | O_NONBLOCK` on
+    /// unix, the regular-file check is on the DESCRIPTOR, and the read is
+    /// bounded: a file over `MAX_BACKUP_BYTES` (16 MiB) refuses rather than
+    /// being buffered whole.
+    fn snapshot<I, P>(paths: I) -> Result<Self, UnreadablePrior>
     where
         I: IntoIterator<Item = P>,
         P: Into<PathBuf>,
     {
-        let entries = paths
-            .into_iter()
-            .map(|p| {
-                let path = p.into();
-                let prior = std::fs::read(&path).ok();
-                (path, prior)
-            })
-            .collect();
-        Self {
+        let mut entries = Vec::new();
+        for p in paths {
+            let path: PathBuf = p.into();
+            let prior = match read_no_follow_bytes(&path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(UnreadablePrior { path, error }),
+            };
+            entries.push((path, prior));
+        }
+        Ok(Self {
             entries,
             defused: false,
-        }
+        })
     }
 
     /// Async wrapper over [`snapshot`](Self::snapshot) that runs the prior-bytes
     /// reads on the blocking pool. The async draft handlers use this so the
     /// snapshot reads don't block the tokio worker; the sync `snapshot` stays
     /// for the `catch_unwind`-based restore-on-panic unit test.
-    async fn snapshot_async(paths: Vec<PathBuf>) -> Self {
-        // `snapshot` only ever reads with `.ok()`, so the closure can't panic
-        // and the `JoinError` arm is unreachable in practice.
+    async fn snapshot_async(paths: Vec<PathBuf>) -> Result<Self, UnreadablePrior> {
+        // `snapshot` returns every read error, so the closure can't panic and
+        // the `JoinError` arm is unreachable in practice.
         tokio::task::spawn_blocking(move || Self::snapshot(paths))
             .await
             .expect("DraftRollback::snapshot does not panic")
@@ -4934,13 +5142,13 @@ impl DraftRollback {
             .iter()
             .filter_map(|(path, prior)| {
                 let error = restore_or_remove(path, prior.as_deref()).err()?;
-                let action = match prior {
-                    Some(_) => "restored to its prior content",
-                    None => "removed",
+                let arm = match prior {
+                    Some(_) => RollbackArm::Restore,
+                    None => RollbackArm::Remove,
                 };
                 Some(RollbackFailure {
                     path: path.clone(),
-                    action,
+                    arm,
                     error,
                 })
             })
@@ -4957,34 +5165,131 @@ impl Drop for DraftRollback {
             if let Err(error) = restore_or_remove(path, prior.as_deref()) {
                 // The unwind path cannot return the outcome; the deliberate
                 // refusal arms use `rollback` for that. Log so the leftover
-                // is at least visible to the operator.
+                // is at least visible to the operator — checked, not assumed:
+                // a failed restore can leave the path gone, or uninspectable.
+                let left_behind = LeftBehind::inspect(path);
                 tracing::warn!(
                     path = %path.display(),
                     %error,
-                    "draft rollback failed; the artifact remains on disk"
+                    %left_behind,
+                    "draft rollback failed"
                 );
             }
         }
     }
 }
 
-/// One path a [`DraftRollback::rollback`] could not clean up: the artifact
-/// still on disk, what the rollback tried (reads as "could not be
-/// `{action}`"), and the I/O cause.
+/// Which arm a snapshotted path's rollback took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackArm {
+    /// The path had no prior content: the draft is unlinked.
+    Remove,
+    /// The path had prior content: it is written back, no-follow.
+    Restore,
+}
+
+impl RollbackArm {
+    /// Completes "could not be …" in the refusal message.
+    fn failed_verb(self) -> &'static str {
+        match self {
+            RollbackArm::Remove => "removed",
+            RollbackArm::Restore => "restored to its prior content",
+        }
+    }
+}
+
+/// One path a [`DraftRollback::rollback`] could not clean up: the path, the
+/// arm that failed, and the I/O cause.
 struct RollbackFailure {
     path: PathBuf,
-    action: &'static str,
+    arm: RollbackArm,
     error: std::io::Error,
+}
+
+/// What a failed rollback left at a path — CHECKED, never assumed.
+enum LeftBehind {
+    /// Something is at the path. `symlink_metadata` does not follow, so a
+    /// link swapped in at the leaf is reported as the link it is.
+    Present { symlink: bool },
+    /// Nothing is at the path.
+    Absent,
+    /// The path could not be inspected at all — an unsearchable parent, say —
+    /// so whether anything is there is unknown. Before this state existed,
+    /// every inspection error read as "absent".
+    Uninspectable(std::io::Error),
+}
+
+impl LeftBehind {
+    fn inspect(path: &Path) -> Self {
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) => LeftBehind::Present {
+                symlink: meta.file_type().is_symlink(),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => LeftBehind::Absent,
+            Err(e) => LeftBehind::Uninspectable(e),
+        }
+    }
+
+    /// The operator-facing sentence for `name` after `arm` failed, worded by
+    /// what the arm was trying to do and by what is actually there now.
+    fn sentence(&self, name: &str, arm: RollbackArm) -> String {
+        match (arm, self) {
+            (RollbackArm::Remove, LeftBehind::Present { symlink }) => format!(
+                "{name} is STILL ON DISK{}, remove it manually",
+                link_note(*symlink)
+            ),
+            (RollbackArm::Restore, LeftBehind::Present { symlink }) => format!(
+                "{name} is STILL ON DISK{} without its prior content, put that content back \
+                 manually from version control or a backup",
+                link_note(*symlink)
+            ),
+            (RollbackArm::Remove, LeftBehind::Absent) => format!(
+                "{name} could not be removed yet is now absent, check the models directory by \
+                 hand"
+            ),
+            (RollbackArm::Restore, LeftBehind::Absent) => format!(
+                "the prior content of {name} could not be restored and the path is now absent, \
+                 recover it from version control or a backup"
+            ),
+            (RollbackArm::Remove | RollbackArm::Restore, LeftBehind::Uninspectable(e)) => {
+                format!(
+                    "{name} could not be inspected after the failed rollback ({e}), so whether \
+                     it is on disk is unknown; check the models directory by hand"
+                )
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LeftBehind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LeftBehind::Present { symlink } => write!(f, "present{}", link_note(*symlink)),
+            LeftBehind::Absent => f.write_str("absent"),
+            LeftBehind::Uninspectable(e) => write!(f, "uninspectable ({e})"),
+        }
+    }
+}
+
+fn link_note(symlink: bool) -> &'static str {
+    if symlink { " (a symlink)" } else { "" }
 }
 
 /// Roll a refused draft back and word the outcome for the refusal message:
 /// `clean` verbatim when every snapshotted path restored, or a sentence
-/// naming each artifact still on disk (with its I/O cause) when the cleanup
-/// FAILED — a refusal must never claim a rollback it did not perform (#1561).
-/// `failed_lead` opens the failure sentence so it reads in the arm's grammar
-/// (e.g. "but rolling it back FAILED" mid-sentence). A failure also returns
-/// the project-relative paths for the envelope's `rollback_failed_paths`
-/// field.
+/// naming each path the cleanup FAILED on (with its I/O cause) and what that
+/// left behind — a refusal must never claim a rollback it did not perform
+/// (#1561). `failed_lead` opens the failure sentence so it reads in the arm's
+/// grammar (e.g. "but rolling it back FAILED" mid-sentence). A failure also
+/// returns the project-relative paths for the envelope's
+/// `rollback_failed_paths` field.
+///
+/// What was left behind is CHECKED, not assumed, and has three states, each
+/// worded by the arm that failed: present (a leftover to remove, or a path
+/// whose prior content is not back — a swapped-in link is named as one),
+/// absent (a failed restore whose target is gone: the prior content is what
+/// was lost), and uninspectable (the check itself failed, so nothing is
+/// claimed either way and the error is named).
 fn rollback_disposition(
     root: &Path,
     rollback: DraftRollback,
@@ -5001,7 +5306,7 @@ fn rollback_disposition(
             format!(
                 "{} could not be {} ({})",
                 rel_display(root, &f.path),
-                f.action,
+                f.arm.failed_verb(),
                 f.error
             )
         })
@@ -5011,13 +5316,12 @@ fn rollback_disposition(
         .iter()
         .map(|f| rel_display(root, &f.path))
         .collect();
-    (
-        format!(
-            "{failed_lead} — {listed}; the refused artifact is STILL ON DISK, remove it or \
-             restore its prior content manually."
-        ),
-        Some(paths),
-    )
+    let outcome = failures
+        .iter()
+        .map(|f| LeftBehind::inspect(&f.path).sentence(&rel_display(root, &f.path), f.arm))
+        .collect::<Vec<_>>()
+        .join("; ");
+    (format!("{failed_lead} — {listed}; {outcome}."), Some(paths))
 }
 
 /// Filter the pending review queue to plans whose payload carries
@@ -5593,7 +5897,7 @@ mod tests {
         std::fs::write(&existing, "original").unwrap();
         let fresh = dir.path().join("fresh.sql");
 
-        let guard = DraftRollback::snapshot([&existing, &fresh]);
+        let guard = DraftRollback::snapshot([&existing, &fresh]).expect("snapshot");
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = guard;
             std::fs::write(&existing, "clobbered").unwrap();
@@ -5617,7 +5921,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fresh = dir.path().join("fresh.sql");
         {
-            let _guard = DraftRollback::snapshot([&fresh]);
+            let _guard = DraftRollback::snapshot([&fresh]).expect("snapshot");
             std::fs::write(&fresh, "draft body").unwrap();
             // The guard drops here without defuse, as on an Err return.
         }
@@ -5632,7 +5936,7 @@ mod tests {
         let sidecar = dir.path().join("model.toml");
         std::fs::write(&sidecar, "name = \"m\"").unwrap();
 
-        let guard = DraftRollback::snapshot([&sidecar]);
+        let guard = DraftRollback::snapshot([&sidecar]).expect("snapshot");
         assert_eq!(
             guard.prior(&sidecar),
             Some("name = \"m\"".as_bytes()),
@@ -5661,7 +5965,7 @@ mod tests {
     fn rollback_disposition_clean_keeps_the_claim() {
         let dir = tempfile::tempdir().unwrap();
         let fresh = dir.path().join("fresh.sql");
-        let guard = DraftRollback::snapshot([&fresh]);
+        let guard = DraftRollback::snapshot([&fresh]).expect("snapshot");
         std::fs::write(&fresh, "draft body").unwrap();
 
         let (disposition, failed) = rollback_disposition(
@@ -5689,7 +5993,7 @@ mod tests {
         let fresh = root.join("models").join("shadow.sql");
         std::fs::create_dir_all(fresh.parent().unwrap()).unwrap();
 
-        let guard = DraftRollback::snapshot([&fresh]);
+        let guard = DraftRollback::snapshot([&fresh]).expect("snapshot");
         std::fs::create_dir_all(fresh.join("occupied")).unwrap();
 
         let (disposition, failed) = rollback_disposition(
@@ -5732,7 +6036,7 @@ mod tests {
         let fresh = models.join("shadow.sql");
         let probe = models.join("probe");
 
-        let guard = DraftRollback::snapshot([&fresh]);
+        let guard = DraftRollback::snapshot([&fresh]).expect("snapshot");
         std::fs::write(&fresh, "SELECT 1 AS id").unwrap();
         std::fs::write(&probe, "x").unwrap();
         std::fs::set_permissions(&models, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -5748,8 +6052,494 @@ mod tests {
         std::fs::set_permissions(&models, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(failures.len(), 1, "the failed unlink is reported");
         assert_eq!(failures[0].path, fresh);
-        assert_eq!(failures[0].action, "removed");
+        assert_eq!(failures[0].arm, RollbackArm::Remove);
         assert!(fresh.exists(), "the artifact really is still on disk");
+    }
+
+    /// The snapshot refuses a path that EXISTS but cannot be read, instead of
+    /// recording it as absent — the shape that had the rollback DELETE a
+    /// user's file (the remove arm, for a path with "no prior"). A directory
+    /// at the path is the root-proof way to make the read fail; an absent
+    /// sibling still snapshots as `None`.
+    #[test]
+    fn draft_rollback_snapshot_refuses_an_existing_path_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let occupied = root.join("models").join("orders.sql");
+        std::fs::create_dir_all(&occupied).unwrap();
+        let absent = root.join("models").join("fresh.sql");
+
+        let refused = DraftRollback::snapshot([&absent, &occupied])
+            .err()
+            .expect("an existing path that cannot be read refuses the snapshot");
+        assert_eq!(refused.path, occupied);
+        let err = refused.into_tool_error(root);
+        assert_eq!(err.0.code, crate::error::ToolErrorCode::InvalidArgument);
+        assert!(
+            err.0.message.contains("models/orders.sql") && err.0.message.contains("cannot be read"),
+            "the refusal names the path: {}",
+            err.0.message
+        );
+        assert!(occupied.is_dir(), "nothing touched the path");
+
+        let guard = DraftRollback::snapshot([&absent]).expect("an absent path is a None prior");
+        assert_eq!(guard.prior(&absent), None);
+        guard.defuse();
+    }
+
+    /// The snapshot's read is guarded at the DESCRIPTOR, like every draft
+    /// write: a leaf swapped for a symlink AFTER the up-front check — the
+    /// window `resolve_draft_paths` cannot close, because a path syscall
+    /// re-traverses the path — refuses instead of being read through. Before
+    /// the fix `std::fs::read` followed it, so a file OUTSIDE the project
+    /// became the "prior content" that the merge folds into the user's
+    /// sidecar and the rollback would restore.
+    #[cfg(unix)]
+    #[test]
+    fn draft_rollback_snapshot_refuses_a_leaf_swapped_for_a_symlink_out_of_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let outside = dir.path().join("outside.toml");
+        std::fs::write(&outside, "marker = \"OUTSIDE-SECRET\"\n").unwrap();
+        let sidecar = models.join("orders.toml");
+        std::os::unix::fs::symlink(&outside, &sidecar).unwrap();
+
+        let refused = DraftRollback::snapshot([&sidecar])
+            .err()
+            .expect("a symlinked leaf refuses the snapshot instead of being read through");
+        assert_eq!(refused.path, sidecar);
+        let err = refused.into_tool_error(&root);
+        assert_eq!(err.0.code, crate::error::ToolErrorCode::InvalidArgument);
+        assert!(
+            err.0.message.contains("models/orders.toml")
+                && err.0.message.contains("cannot be read"),
+            "the refusal names the path: {}",
+            err.0.message
+        );
+        assert!(
+            !err.0.message.contains("OUTSIDE-SECRET"),
+            "the outside file's content never reaches the caller: {}",
+            err.0.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "marker = \"OUTSIDE-SECRET\"\n",
+            "the file outside the project is untouched"
+        );
+    }
+
+    /// A FIFO swapped in at a snapshot path is refused, and refused without
+    /// blocking. Before the fix the snapshot's `std::fs::read` opened it and
+    /// waited for a writer that never comes, parking the draft request
+    /// forever. The read now carries `O_NONBLOCK` with `O_NOFOLLOW` and
+    /// checks the descriptor. The timeout turns a regression into a failure
+    /// instead of a hung suite.
+    #[cfg(unix)]
+    #[test]
+    fn draft_rollback_snapshot_refuses_a_fifo_instead_of_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let sidecar = models.join("orders.toml");
+        make_fifo(&sidecar);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = sidecar.clone();
+        std::thread::spawn(move || {
+            let refused = match DraftRollback::snapshot([&probe]) {
+                Ok(guard) => {
+                    guard.defuse();
+                    false
+                }
+                Err(_) => true,
+            };
+            let _ = tx.send(refused);
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the snapshot returned instead of parking on the FIFO");
+        assert!(refused, "a FIFO at a snapshot path refuses");
+        assert!(
+            std::fs::symlink_metadata(&sidecar).is_ok(),
+            "the FIFO is left in place, neither read nor replaced"
+        );
+    }
+
+    /// A failed restore whose target is GONE says so: the prior file was
+    /// removed and its parent went with it, so `std::fs::write` cannot put
+    /// the bytes back and there is nothing on disk to "remove". Before the
+    /// fix the refusal asserted "STILL ON DISK" for every failure.
+    #[test]
+    fn rollback_disposition_says_the_path_is_absent_when_the_restore_target_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let sidecar = models.join("orders.toml");
+        std::fs::write(&sidecar, "name = \"orders\"\n").unwrap();
+
+        let guard = DraftRollback::snapshot([&sidecar]).expect("snapshot");
+        std::fs::remove_dir_all(&models).unwrap();
+
+        let (disposition, failed) = rollback_disposition(
+            root,
+            guard,
+            "so the check was not kept.",
+            "but rolling it back FAILED",
+        );
+        assert_eq!(failed, Some(vec!["models/orders.toml".to_string()]));
+        assert!(
+            disposition.contains("models/orders.toml could not be restored to its prior content"),
+            "the refusal names the path and what failed: {disposition}"
+        );
+        assert!(
+            disposition.contains(
+                "the prior content of models/orders.toml could not be restored and the path is \
+                 now absent"
+            ),
+            "the refusal says the path is gone: {disposition}"
+        );
+        assert!(
+            !disposition.contains("STILL ON DISK"),
+            "nothing is on disk; the refusal must not claim otherwise: {disposition}"
+        );
+        assert!(
+            !disposition.contains("not kept"),
+            "a failed rollback must not read as a clean refusal: {disposition}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&sidecar).is_err(),
+            "the path really is absent"
+        );
+    }
+
+    /// Mixed outcome: a path still on disk and a path now gone are each
+    /// reported in their own words, and both ride `rollback_failed_paths`.
+    #[test]
+    fn rollback_disposition_reports_on_disk_and_absent_paths_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let leftover = root.join("models").join("shadow.sql");
+        std::fs::create_dir_all(leftover.parent().unwrap()).unwrap();
+        let gone = root.join("elsewhere").join("orders.toml");
+        std::fs::create_dir_all(gone.parent().unwrap()).unwrap();
+        std::fs::write(&gone, "name = \"orders\"\n").unwrap();
+
+        let guard = DraftRollback::snapshot([&leftover, &gone]).expect("snapshot");
+        std::fs::create_dir_all(leftover.join("occupied")).unwrap();
+        std::fs::remove_dir_all(gone.parent().unwrap()).unwrap();
+
+        let (disposition, failed) =
+            rollback_disposition(root, guard, "clean", "but rolling it back FAILED");
+        assert_eq!(
+            failed,
+            Some(vec![
+                "models/shadow.sql".to_string(),
+                "elsewhere/orders.toml".to_string()
+            ])
+        );
+        assert!(
+            disposition.contains("models/shadow.sql could not be removed")
+                && disposition.contains("STILL ON DISK"),
+            "the leftover is reported as on disk: {disposition}"
+        );
+        assert!(
+            disposition.contains(
+                "the prior content of elsewhere/orders.toml could not be restored and the path \
+                 is now absent"
+            ),
+            "the missing file is reported as absent: {disposition}"
+        );
+    }
+
+    /// Put a directory's mode back on every exit path, so the tempdir cleans
+    /// up and a byte comparison can read it again.
+    #[cfg(unix)]
+    struct RestoreMode(PathBuf, u32);
+
+    #[cfg(unix)]
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    /// Create a FIFO at `path`.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "mkfifo {}", path.display());
+    }
+
+    /// The third disposition state: the leftover could not even be
+    /// inspected. The parent is unsearchable (mode 000), so the unlink fails
+    /// AND the after-the-fact `symlink_metadata` fails; before the fix any
+    /// inspection error read as "absent". Root ignores directory modes, so
+    /// the fault probes itself and stands down when it cannot arm.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_disposition_says_the_leftover_could_not_be_inspected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models).unwrap();
+        let fresh = models.join("shadow.sql");
+
+        let guard = DraftRollback::snapshot([&fresh]).expect("snapshot");
+        std::fs::write(&fresh, "SELECT 1 AS id").unwrap();
+        std::fs::set_permissions(&models, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let restore = RestoreMode(models.clone(), 0o755);
+        if std::fs::symlink_metadata(&fresh).is_ok() {
+            // This process ignores the directory mode; the fault cannot arm.
+            drop(restore);
+            guard.defuse();
+            return;
+        }
+
+        let (disposition, failed) = rollback_disposition(
+            root,
+            guard,
+            "so the draft was not kept.",
+            "but rolling it back FAILED",
+        );
+        drop(restore);
+        assert_eq!(failed, Some(vec!["models/shadow.sql".to_string()]));
+        assert!(
+            disposition.contains("models/shadow.sql could not be removed"),
+            "the refusal names the path and what failed: {disposition}"
+        );
+        assert!(
+            disposition
+                .contains("models/shadow.sql could not be inspected after the failed rollback")
+                && disposition.contains("Permission denied"),
+            "the refusal says the check itself failed, and why: {disposition}"
+        );
+        assert!(
+            !disposition.contains("STILL ON DISK") && !disposition.contains("now absent"),
+            "an uninspectable path is claimed neither present nor absent: {disposition}"
+        );
+        assert!(
+            fresh.exists(),
+            "the artifact really is still there once the directory is searchable again"
+        );
+    }
+
+    /// The restore arm meets a link swapped in at the leaf after the
+    /// snapshot — the race the up-front check cannot close. `std::fs::write`
+    /// followed it and put the PRIOR bytes at the link's target, outside the
+    /// models directory, while the refusal claimed a clean rollback. The
+    /// no-follow restore fails instead: the target is untouched, the
+    /// disposition names the path, and it says a symlink is what is on disk.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_disposition_never_restores_through_a_swapped_in_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir(&models).unwrap();
+        let sidecar = models.join("orders.toml");
+        std::fs::write(&sidecar, "name = \"orders\"\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let leak = outside.path().join("leak.toml");
+
+        let guard = DraftRollback::snapshot([&sidecar]).expect("snapshot");
+        std::fs::write(&sidecar, "name = \"orders\"\nintent = \"draft\"\n").unwrap();
+        std::fs::remove_file(&sidecar).unwrap();
+        std::os::unix::fs::symlink(&leak, &sidecar).unwrap();
+
+        let (disposition, failed) = rollback_disposition(
+            root,
+            guard,
+            "so the draft was not kept.",
+            "but rolling it back FAILED",
+        );
+        assert!(
+            !leak.exists(),
+            "the prior bytes were written through the link to {}",
+            leak.display()
+        );
+        assert_eq!(failed, Some(vec!["models/orders.toml".to_string()]));
+        assert!(
+            disposition.contains("models/orders.toml could not be restored to its prior content"),
+            "the refusal names the path and what failed: {disposition}"
+        );
+        assert!(
+            disposition.contains("models/orders.toml is STILL ON DISK (a symlink)"),
+            "the refusal says a link is what is on disk: {disposition}"
+        );
+        assert!(
+            !disposition.contains("not kept"),
+            "a failed rollback must not read as a clean refusal: {disposition}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&sidecar)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the swapped-in link is left for the operator to see, not replaced"
+        );
+    }
+
+    /// Every draft write and the rollback's restore go through the no-follow
+    /// helper — this guards the WIRE; `rocky-core` proves the helper. The
+    /// banned and required strings are assembled at runtime so this test's
+    /// own source cannot satisfy the search it performs.
+    #[test]
+    fn every_draft_write_and_the_restore_use_the_no_follow_helper() {
+        let source = include_str!("tools.rs");
+        let banned = format!("std::fs::{}(&paths.", "write");
+        assert!(
+            !source.contains(&banned),
+            "a draft write uses a plain std::fs::write, which follows a link swapped in at \
+             the leaf"
+        );
+        let banned = format!("Some(bytes) => std::fs::{}(path, bytes)", "write");
+        assert!(
+            !source.contains(&banned),
+            "the rollback restore uses a plain std::fs::write"
+        );
+        let required = format!("write_no_{}(&paths.", "follow");
+        assert_eq!(
+            source.matches(&required).count(),
+            5,
+            "the five draft write sites (draft_model SQL + sidecar, draft_contract, \
+             draft_check, draft_metadata) call write_no_follow"
+        );
+        let required = format!("Some(bytes) => write_no_{}(path, bytes)", "follow");
+        assert!(
+            source.contains(&required),
+            "the rollback restore calls write_no_follow"
+        );
+        let banned = format!("match std::fs::{}(&path)", "read");
+        assert!(
+            !source.contains(&banned),
+            "the snapshot reads a prior with a plain std::fs::read, which follows a link \
+             swapped in at the leaf and parks on a FIFO"
+        );
+        let required = format!("read_no_follow_{}(&path)", "bytes");
+        assert!(
+            source.contains(&required),
+            "the snapshot reads each prior through read_no_follow_bytes"
+        );
+    }
+
+    /// The ancestor guard: `models/` resolving outside the project root
+    /// refuses, naming both ends; a link that stays inside the root, a real
+    /// directory, and a models directory that does not exist yet pass; a
+    /// dangling link where the models directory would go refuses.
+    #[cfg(unix)]
+    #[test]
+    fn refuse_redirected_models_dir_refuses_a_models_link_that_leaves_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let server = RockyMcpServer::new(root.join("rocky.toml"));
+        let models = root.join("models");
+
+        assert!(
+            server.refuse_redirected_models_dir().is_ok(),
+            "an absent models directory has nothing to redirect"
+        );
+
+        let outside = dir.path().join("elsewhere");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &models).unwrap();
+        let err = server
+            .refuse_redirected_models_dir()
+            .expect_err("a models link that leaves the root refuses");
+        assert_eq!(err.0.code, crate::error::ToolErrorCode::InvalidArgument);
+        let resolved_outside = outside.canonicalize().unwrap().display().to_string();
+        let resolved_root = root.canonicalize().unwrap().display().to_string();
+        assert!(
+            err.0.message.contains("models/ resolves to")
+                && err.0.message.contains(&resolved_outside)
+                && err.0.message.contains(&resolved_root),
+            "the refusal names where models/ resolves and the root it left: {}",
+            err.0.message
+        );
+
+        std::fs::remove_file(&models).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), &models).unwrap();
+        let err = server
+            .refuse_redirected_models_dir()
+            .expect_err("a dangling models link refuses");
+        assert!(
+            err.0.message.contains("target does not exist"),
+            "the refusal says the link dangles: {}",
+            err.0.message
+        );
+
+        std::fs::remove_file(&models).unwrap();
+        let inside = root.join("src").join("models_real");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::os::unix::fs::symlink(&inside, &models).unwrap();
+        assert!(
+            server.refuse_redirected_models_dir().is_ok(),
+            "a models link that stays inside the root passes"
+        );
+
+        std::fs::remove_file(&models).unwrap();
+        std::fs::create_dir(&models).unwrap();
+        assert!(
+            server.refuse_redirected_models_dir().is_ok(),
+            "a real models directory passes"
+        );
+    }
+
+    /// The up-front leaf guard: a symlink at a draft path refuses — dangling
+    /// or resolving — naming the path, and so does any other non-regular
+    /// file (a directory, a FIFO — which would park the snapshot's read); a
+    /// regular file and an absent path pass.
+    #[cfg(unix)]
+    #[test]
+    fn refuse_non_regular_draft_target_refuses_links_and_non_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let regular = models.join("orders.sql");
+        std::fs::write(&regular, "SELECT 1 AS id\n").unwrap();
+        let dangling = models.join("shadow.sql");
+        std::os::unix::fs::symlink(root.join("nowhere.sql"), &dangling).unwrap();
+        let resolving = models.join("alias.sql");
+        std::os::unix::fs::symlink(&regular, &resolving).unwrap();
+        let directory = models.join("nested.sql");
+        std::fs::create_dir(&directory).unwrap();
+        let fifo = models.join("pipe.sql");
+        make_fifo(&fifo);
+
+        assert!(refuse_non_regular_draft_target(root, &regular).is_ok());
+        assert!(refuse_non_regular_draft_target(root, &models.join("absent.sql")).is_ok());
+        for link in [&dangling, &resolving] {
+            let err = refuse_non_regular_draft_target(root, link).expect_err("a symlink refuses");
+            assert_eq!(err.0.code, crate::error::ToolErrorCode::InvalidArgument);
+            assert!(
+                err.0.message.contains(&rel_display(root, link))
+                    && err.0.message.contains("symlink"),
+                "the refusal names the link: {}",
+                err.0.message
+            );
+        }
+        for (path, kind) in [(&directory, "directory"), (&fifo, "FIFO")] {
+            let err = refuse_non_regular_draft_target(root, path)
+                .expect_err("a non-regular file refuses");
+            assert_eq!(err.0.code, crate::error::ToolErrorCode::InvalidArgument);
+            assert!(
+                err.0.message.contains(&rel_display(root, path))
+                    && err.0.message.contains(kind)
+                    && err.0.message.contains("not a regular file"),
+                "the refusal names the path and its kind: {}",
+                err.0.message
+            );
+        }
     }
 
     // --- validate_check_spec (draft_check structural gate) ---
@@ -6006,6 +6796,14 @@ mod tests {
                  move with it",
             )
             .trim();
+        // The workflow hands that line to `grep -E`, so it is a POSIX ERE. It
+        // uses only anchors (`^`, `$`), one group, alternation (`|`) and
+        // escaped dots (`\.`). The `regex` crate reads that subset the same
+        // way, so matching here reruns the CI check instead of guessing at
+        // it from the regex's text.
+        let engine_paths_re = regex::Regex::new(engine_paths_re).unwrap_or_else(|err| {
+            panic!("ENGINE_PATHS_RE in engine-ci.yml does not compile: {err}\n{engine_paths_re}")
+        });
 
         // Paths that climb above `engine/` — `src/` is three levels below the
         // repo root, so four or more `../` escapes the engine tree.
@@ -6040,16 +6838,16 @@ mod tests {
                  from engine-ci.yml's push `paths:` list. A push touching it \
                  would run no engine CI (#1557)."
             );
-            // The PR side: the detection regex must name the file as an
-            // exact-file alternative — the path with its dots escaped, then
-            // `$`. Prefix alternatives like `engine/` do not cover it.
-            let exact_alternative = format!("{}$", repo_relative.replace('.', "\\."));
+            // The PR side: run the regex against the path, the way the
+            // `changes` job does. Searching the regex's text for the path
+            // proved nothing — `|x\.claude/...$|` and `|\|\.claude/...$|`
+            // both contain it and neither matches it.
             assert!(
-                engine_paths_re.contains(&exact_alternative),
+                engine_paths_re.is_match(repo_relative),
                 "`{repo_relative}` is compiled into the engine but \
-                 ENGINE_PATHS_RE in engine-ci.yml does not carry \
-                 `{exact_alternative}`. A PR touching it would skip the \
-                 required engine jobs (#1557, #1563)."
+                 ENGINE_PATHS_RE in engine-ci.yml does not match it. A PR \
+                 touching it would skip the required engine jobs (#1557, \
+                 #1563). ENGINE_PATHS_RE: {engine_paths_re}"
             );
             checked += 1;
         }

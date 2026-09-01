@@ -1667,12 +1667,6 @@ async fn draft_model_refuses_an_existing_but_unreadable_sidecar() {
     // exit path so cleanup (and the byte comparison) can read it again.
     let readable = std::fs::Permissions::from_mode(0o644);
     std::fs::set_permissions(&sidecar_path, std::fs::Permissions::from_mode(0o000)).unwrap();
-    struct RestorePerms(std::path::PathBuf, std::fs::Permissions);
-    impl Drop for RestorePerms {
-        fn drop(&mut self) {
-            let _ = std::fs::set_permissions(&self.0, self.1.clone());
-        }
-    }
     let _restore = RestorePerms(sidecar_path.clone(), readable);
 
     // Probe the condition the test needs: running as root (e.g. a container
@@ -4141,4 +4135,1194 @@ async fn suggest_freshness_block_returns_null_without_api_key() {
     );
 
     client.cancel().await.unwrap();
+}
+
+/// The policy the draft-tool refusal probes below run under: a hard deny on
+/// agent authorship, so every draft tool takes the DENY arm — the one that
+/// rolls its write back — instead of keeping the draft for review.
+const DENY_AGENT_AUTHORING: &str = r#"[policy]
+version = 1
+default_agent_effect = "require_review"
+
+[[policy.rules]]
+principal = "agent"
+capability = "propose"
+scope = { any = true }
+effect = "deny"
+"#;
+
+/// Restore a path's permissions on every exit path, so the tempdir cleans up
+/// and a byte comparison can read the file again.
+#[cfg(unix)]
+struct RestorePerms(std::path::PathBuf, std::fs::Permissions);
+
+#[cfg(unix)]
+impl Drop for RestorePerms {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.0, self.1.clone());
+    }
+}
+
+fn object(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let serde_json::Value::Object(map) = value else {
+        panic!("a JSON object, got {value}");
+    };
+    map
+}
+
+/// A symlink at a draft path refuses BEFORE anything is written — dangling or
+/// not, in every draft tool. `std::fs::write` follows a link, so a dangling
+/// link planted at `models/shadow.sql` carried a DENIED draft out of the
+/// models directory: the SQL landed at the link's target, the rollback's
+/// `remove_file` unlinked only the link, and the refusal reported a clean
+/// rollback while the outside file kept the SQL. `exists()` follows the link
+/// too, so the canonicalize check that guarded existing targets never saw a
+/// dangling one. Every draft tool resolves its paths through the same guard,
+/// so each is driven here, under the deny policy that produced the leak.
+#[cfg(unix)]
+#[tokio::test]
+async fn draft_tools_refuse_a_symlink_at_the_draft_path_before_writing() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        DENY_AGENT_AUTHORING,
+    );
+    write_target_defaults(dir.path());
+    let models = dir.path().join("models");
+    // A sidecar-less model (inline frontmatter) for the sidecar-writing tools,
+    // so the link can sit at its sidecar path while `orders` keeps its fixture
+    // sidecar for the contract case.
+    std::fs::write(
+        models.join("bare.sql"),
+        "---toml\nname = \"bare\"\n---\nSELECT 1 AS id\n",
+    )
+    .unwrap();
+    let outside = TempDir::new().unwrap();
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let contract_spec = "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n";
+    let check_spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n";
+    // (tool, arguments, the planted link, a sibling artifact that must stay
+    // unwritten)
+    let cases = vec![
+        (
+            "draft_model",
+            draft_args("shadow", "SELECT 1 AS id", "through a link"),
+            "shadow.sql",
+            Some("shadow.toml"),
+        ),
+        (
+            "draft_model",
+            draft_args("shade", "SELECT 1 AS id", "through a link"),
+            "shade.toml",
+            Some("shade.sql"),
+        ),
+        (
+            "draft_contract",
+            object(serde_json::json!({ "model": "orders", "spec": contract_spec })),
+            "orders.contract.toml",
+            None,
+        ),
+        (
+            "draft_check",
+            object(serde_json::json!({ "model": "bare", "spec": check_spec })),
+            "bare.toml",
+            None,
+        ),
+        (
+            "draft_metadata",
+            object(serde_json::json!({ "model": "bare", "classifications": { "id": "pii" } })),
+            "bare.toml",
+            None,
+        ),
+    ];
+    for (tool, args, link, sibling) in cases {
+        let link_path = models.join(link);
+        let target = outside.path().join(link);
+        if std::fs::symlink_metadata(&link_path).is_err() {
+            std::os::unix::fs::symlink(&target, &link_path).unwrap();
+        }
+        assert!(!target.exists(), "fixture: the planted link is dangling");
+
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+            .await
+            .unwrap_or_else(|e| panic!("{tool} returns a result: {e}"));
+        assert!(
+            !target.exists(),
+            "{tool}: the draft was written through the link to {} (response: {:?})",
+            target.display(),
+            result.structured_content
+        );
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "{tool}: a symlinked draft path refuses"
+        );
+        let err = result.structured_content.expect("envelope");
+        assert_eq!(
+            err["code"],
+            serde_json::json!("invalid_argument"),
+            "{tool}: refused up front, not denied after a write-through: {err:?}"
+        );
+        let message = err["message"].as_str().unwrap();
+        assert!(
+            message.contains(&format!("models/{link}")) && message.contains("symlink"),
+            "{tool}: the refusal names the link: {message}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link_path)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false),
+            "{tool}: the planted link was replaced or removed"
+        );
+        if let Some(sibling) = sibling {
+            assert!(
+                !models.join(sibling).exists(),
+                "{tool}: the sibling artifact {sibling} was written before the refusal"
+            );
+        }
+    }
+
+    client.cancel().await.unwrap();
+}
+
+/// An EXISTS-but-unreadable SQL file refuses the redraft; before the fix it
+/// was DELETED. `DraftRollback::snapshot` turned every read error into
+/// "absent", so with `models/orders.sql` at mode 0200 the draft overwrote it
+/// (0200 is writable), the compile failed on the unreadable file, and the
+/// rollback took the remove arm for a path that had existed — the user's
+/// model was gone and the response said `compile_failed`. The sidecar had a
+/// guard for this shape; the SQL path had none. The snapshot itself now
+/// refuses any read error but NotFound, for every path, before anything is
+/// written.
+#[cfg(unix)]
+#[tokio::test]
+async fn draft_model_refuses_an_existing_but_unreadable_sql_instead_of_deleting_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let sql_path = dir.path().join("models").join("orders.sql");
+    let sql_before = std::fs::read(&sql_path).unwrap();
+    let sidecar_path = dir.path().join("models").join("orders.toml");
+    let sidecar_before = std::fs::read(&sidecar_path).unwrap();
+
+    std::fs::set_permissions(&sql_path, std::fs::Permissions::from_mode(0o200)).unwrap();
+    let restore = RestorePerms(sql_path.clone(), std::fs::Permissions::from_mode(0o644));
+    if std::fs::read(&sql_path).is_ok() {
+        eprintln!("skipping: chmod 0o200 does not make files unreadable here (running as root?)");
+        return;
+    }
+
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "orders",
+                "SELECT 2 AS id",
+                "must not land",
+            )),
+        )
+        .await
+        .expect("draft_model returns a result");
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "an existing-but-unreadable SQL file refuses"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("invalid_argument"),
+        "refused up front, not compile_failed after a write: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/orders.sql") && message.contains("cannot be read"),
+        "the refusal names the unreadable file: {message}"
+    );
+    client.cancel().await.unwrap();
+
+    drop(restore);
+    assert_eq!(
+        std::fs::read(&sql_path)
+            .expect("the SQL file still exists: neither overwritten nor deleted"),
+        sql_before,
+        "the unreadable SQL file is byte-identical"
+    );
+    assert_eq!(
+        std::fs::read(&sidecar_path).unwrap(),
+        sidecar_before,
+        "the sidecar is untouched"
+    );
+}
+
+/// Drive `tool` with a mid-flight mutation of the project tree — a
+/// deterministic stand-in for "something on the machine changed the artifact
+/// between the draft's write and the policy verdict", the #1561 shape.
+///
+/// `models/test_definitions.toml` is a FIFO. The compile's model loader opens
+/// it right after the draft is written and blocks until this test opens the
+/// write end, so the FIRST handshake is a point where the draft is on disk
+/// and the verdict has not run: `mutate` runs there and returns whether its
+/// fault armed (a fault root bypasses returns false; the call is then fed to
+/// completion and `None` comes back so the caller can stand down). Every
+/// later handshake feeds the loader an empty — valid — definitions file. The
+/// loop ends when the call returns.
+///
+/// Needs a multi-thread runtime: the handler blocks a worker inside `open`.
+#[cfg(unix)]
+async fn call_with_midflight_mutation(
+    dir: &Path,
+    tool: &str,
+    args: serde_json::Map<String, serde_json::Value>,
+    mutate: impl FnOnce() -> bool,
+) -> Option<rmcp::model::CallToolResult> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let fifo = dir.join("models").join("test_definitions.toml");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs");
+    assert!(status.success(), "mkfifo {}", fifo.display());
+
+    let server = RockyMcpServer::new(dir.join("rocky.toml"));
+    let client = connect(server).await;
+    let tool = tool.to_string();
+    let call = tokio::spawn(async move {
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+            .await;
+        (client, result)
+    });
+
+    let mut mutate = Some(mutate);
+    let mut armed = None;
+    while !call.is_finished() {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+        {
+            Ok(writer) => {
+                if let Some(mutate) = mutate.take() {
+                    armed = Some(mutate());
+                }
+                drop(writer);
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            Err(e) => panic!("opening {} for writing: {e}", fifo.display()),
+        }
+    }
+    let (client, result) = call.await.expect("the call task completes");
+    client.cancel().await.unwrap();
+
+    let armed = armed.expect(
+        "the handler never opened models/test_definitions.toml between its write and its \
+         verdict, so the mutation had no deterministic point to run",
+    );
+    if !armed {
+        return None;
+    }
+    Some(result.expect("the tool returns a result"))
+}
+
+/// Make `models` read-only so the rollback's unlink or create fails, and
+/// probe it: root creates files in a read-only directory, so the fault
+/// cannot arm there and the caller stands down. Returns whether it armed.
+#[cfg(unix)]
+fn make_models_read_only(models: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(models, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let probe = models.join(".probe");
+    match std::fs::write(&probe, b"") {
+        Ok(()) => {
+            std::fs::remove_file(&probe).unwrap();
+            std::fs::set_permissions(models, std::fs::Permissions::from_mode(0o755)).unwrap();
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+/// #1561's refusal arm driven end to end through a rollback that REALLY
+/// fails and leaves the path ABSENT. `orders` already has a contract; the
+/// redraft snapshots it, and between the write and the verdict the contract
+/// is deleted and the models directory made read-only, so the deny's
+/// rollback cannot recreate the prior file. The refusal must say so: before
+/// the fix every failed rollback claimed the artifact was "STILL ON DISK",
+/// which here is false — nothing is on disk, and the prior content is what
+/// was lost.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_contract_deny_with_a_failed_restore_says_the_prior_file_is_absent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        DENY_AGENT_AUTHORING,
+    );
+    let models = dir.path().join("models");
+    let contract = models.join("orders.contract.toml");
+    std::fs::write(
+        &contract,
+        "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n",
+    )
+    .unwrap();
+    // The ledger the deny records into must exist before the directory goes
+    // read-only: nothing can be created in models/ after the mutation.
+    let state_path = rocky_core::state::resolve_state_path(None, &models).path;
+    drop(rocky_core::state::StateStore::open(&state_path).expect("pre-create the ledger"));
+    let restore = RestorePerms(models.clone(), std::fs::Permissions::from_mode(0o755));
+
+    let spec = "[[columns]]\nname = \"status\"\ntype = \"String\"\nnullable = true\n";
+    let args = object(serde_json::json!({ "model": "orders", "spec": spec }));
+    let (models_at_mutation, contract_at_mutation) = (models.clone(), contract.clone());
+    let result = call_with_midflight_mutation(dir.path(), "draft_contract", args, move || {
+        assert!(
+            std::fs::read_to_string(&contract_at_mutation)
+                .expect("the draft is on disk when the loader blocks")
+                .contains("status"),
+            "the loader blocked before the draft was written"
+        );
+        std::fs::remove_file(&contract_at_mutation).unwrap();
+        make_models_read_only(&models_at_mutation)
+    })
+    .await;
+    let Some(result) = result else {
+        eprintln!(
+            "skipping: a read-only models directory does not block file creation here (running \
+             as root?)"
+        );
+        return;
+    };
+
+    assert_eq!(result.is_error, Some(true), "the deny is an error");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("policy_denied"),
+        "the class stays policy_denied: {err:?}"
+    );
+    assert_eq!(err["policy_rule"], serde_json::json!("0"));
+    assert_eq!(
+        err["rollback_failed_paths"],
+        serde_json::json!(["models/orders.contract.toml"]),
+        "the leftover rides the envelope as a typed field: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/orders.contract.toml could not be restored to its prior content"),
+        "the refusal names the path and what failed: {message}"
+    );
+    assert!(
+        message.contains("now absent"),
+        "the refusal says the path is gone: {message}"
+    );
+    assert!(
+        !message.contains("STILL ON DISK"),
+        "nothing is on disk; the refusal must not claim otherwise: {message}"
+    );
+    assert!(
+        !message.contains("not kept"),
+        "a failed rollback must not read as a clean refusal: {message}"
+    );
+    drop(restore);
+    assert!(
+        std::fs::symlink_metadata(&contract).is_err(),
+        "the prior contract really is absent"
+    );
+}
+
+/// The sibling shape: the artifact is NEW, the rollback's unlink fails, and
+/// the artifact really is still on disk — the wording that was previously
+/// asserted for every failure is right here, and the typed field names the
+/// path.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_contract_deny_with_a_failed_remove_says_the_draft_is_still_on_disk() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        DENY_AGENT_AUTHORING,
+    );
+    let models = dir.path().join("models");
+    let contract = models.join("orders.contract.toml");
+    let state_path = rocky_core::state::resolve_state_path(None, &models).path;
+    drop(rocky_core::state::StateStore::open(&state_path).expect("pre-create the ledger"));
+    let restore = RestorePerms(models.clone(), std::fs::Permissions::from_mode(0o755));
+
+    let spec = "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n";
+    let args = object(serde_json::json!({ "model": "orders", "spec": spec }));
+    let (models_at_mutation, contract_at_mutation) = (models.clone(), contract.clone());
+    let result = call_with_midflight_mutation(dir.path(), "draft_contract", args, move || {
+        assert!(
+            contract_at_mutation.is_file(),
+            "the loader blocked before the draft was written"
+        );
+        make_models_read_only(&models_at_mutation)
+    })
+    .await;
+    let Some(result) = result else {
+        eprintln!(
+            "skipping: a read-only models directory does not block unlink here (running as root?)"
+        );
+        return;
+    };
+
+    assert_eq!(result.is_error, Some(true), "the deny is an error");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_denied"), "{err:?}");
+    assert_eq!(
+        err["rollback_failed_paths"],
+        serde_json::json!(["models/orders.contract.toml"]),
+        "{err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/orders.contract.toml could not be removed"),
+        "the refusal names the path and what failed: {message}"
+    );
+    assert!(
+        message.contains("STILL ON DISK"),
+        "the artifact remains, and the refusal says so: {message}"
+    );
+    assert!(
+        !message.contains("not kept"),
+        "a failed rollback must not read as a clean refusal: {message}"
+    );
+    drop(restore);
+    assert!(
+        contract.is_file(),
+        "the refused draft really is still on disk"
+    );
+}
+
+/// The leaf-swap race the up-front check cannot close: the draft is on disk
+/// when the loader blocks, and there the drafted contract is replaced by a
+/// symlink to a file OUTSIDE the project. The deny's rollback takes the
+/// restore arm (the contract existed before the redraft), and before the fix
+/// `std::fs::write` followed the link and put the PRIOR contract at its target
+/// while the refusal claimed a clean rollback. The no-follow restore fails
+/// instead: nothing lands outside, the failure rides the envelope, and the
+/// message says a symlink is what is on disk.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_contract_deny_never_restores_through_a_leaf_swapped_for_a_symlink() {
+    let dir = TempDir::new().unwrap();
+    write_project_with_policy(
+        dir.path(),
+        &dir.path().join("test.duckdb"),
+        DENY_AGENT_AUTHORING,
+    );
+    let models = dir.path().join("models");
+    let contract = models.join("orders.contract.toml");
+    std::fs::write(
+        &contract,
+        "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n",
+    )
+    .unwrap();
+    let outside = TempDir::new().unwrap();
+    let leak = outside.path().join("leak.toml");
+
+    let spec = "[[columns]]\nname = \"status\"\ntype = \"String\"\nnullable = true\n";
+    let args = object(serde_json::json!({ "model": "orders", "spec": spec }));
+    let (contract_at_mutation, leak_at_mutation) = (contract.clone(), leak.clone());
+    let result = call_with_midflight_mutation(dir.path(), "draft_contract", args, move || {
+        assert!(
+            std::fs::read_to_string(&contract_at_mutation)
+                .expect("the draft is on disk when the loader blocks")
+                .contains("status"),
+            "the loader blocked before the draft was written"
+        );
+        std::fs::remove_file(&contract_at_mutation).unwrap();
+        std::os::unix::fs::symlink(&leak_at_mutation, &contract_at_mutation).unwrap();
+        true
+    })
+    .await
+    .expect("the swap arms for every user");
+
+    // THE PIN: the prior contract did not land outside the project.
+    assert!(
+        !leak.exists(),
+        "the rollback wrote the prior contract through the link to {}: {:?}",
+        leak.display(),
+        std::fs::read_to_string(&leak)
+    );
+    assert_eq!(result.is_error, Some(true), "the deny is an error");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_denied"), "{err:?}");
+    assert_eq!(
+        err["rollback_failed_paths"],
+        serde_json::json!(["models/orders.contract.toml"]),
+        "the failed restore rides the envelope as a typed field: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/orders.contract.toml could not be restored to its prior content"),
+        "the refusal names the path and what failed: {message}"
+    );
+    assert!(
+        message.contains("models/orders.contract.toml is STILL ON DISK (a symlink)"),
+        "the refusal says a link is what is on disk: {message}"
+    );
+    assert!(
+        !message.contains("not kept"),
+        "a failed rollback must not read as a clean refusal: {message}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&contract)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the swapped-in link is left in place, neither followed nor replaced"
+    );
+}
+
+/// Drive `draft_model` for `name` with `plant` running in the window between
+/// the up-front leaf check and the rollback snapshot — the window
+/// [`call_with_midflight_mutation`] cannot reach, because the loader's FIFO
+/// handshake only happens after both writes.
+///
+/// The runtime is built with ONE blocking thread and a hog holds it, so the
+/// handler's `snapshot_async` (a `spawn_blocking`) queues instead of running.
+/// `models/` is removed first, and `draft_model` creates it AFTER
+/// `resolve_draft_paths` returns, so the directory appearing is the handler's
+/// own proof that the leaf check has already passed. `plant` runs there;
+/// releasing the hog then lets the snapshot meet what `plant` left at the
+/// leaf.
+///
+/// ```text
+///  handler: resolve_draft_paths ─► create_dir_all ─► snapshot_async ┄┄┄┄► reads the leaf
+///  test:                            (sees models/) ─► plant ─► release hog ┘
+/// ```
+///
+/// Both timeouts turn a regression into a failure instead of a hung suite: a
+/// path-based read parks on a planted FIFO forever.
+#[cfg(unix)]
+fn draft_model_with_a_pre_snapshot_swap(
+    dir: &Path,
+    name: &str,
+    plant: impl FnOnce(),
+) -> rmcp::model::CallToolResult {
+    let dir = dir.to_path_buf();
+    let models = dir.join("models");
+    std::fs::remove_dir_all(&models).expect("clear the models directory");
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .expect("build a runtime with exactly one blocking thread");
+
+    let outcome: Result<rmcp::model::CallToolResult, &str> = runtime.block_on(async move {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (hogging, hogged) = tokio::sync::oneshot::channel();
+        let hog = tokio::task::spawn_blocking(move || {
+            let _ = hogging.send(());
+            let _ = held.recv();
+        });
+        hogged.await.expect("the hog holds the blocking thread");
+
+        let server = RockyMcpServer::new(dir.join("rocky.toml"));
+        let client = connect(server).await;
+        let args = draft_args(name, "SELECT 3 AS id", "a draft racing the leaf");
+        let call = tokio::spawn(async move {
+            let result = client
+                .call_tool(CallToolRequestParams::new("draft_model").with_arguments(args))
+                .await;
+            (client, result)
+        });
+
+        let reached = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !models.is_dir() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        if reached.is_err() {
+            return Err(
+                "draft_model never created the models directory, so the leaf check never \
+                 passed and there was no window to plant into",
+            );
+        }
+
+        plant();
+        drop(release);
+        hog.await.expect("the hog task finishes");
+
+        let Ok(joined) = tokio::time::timeout(std::time::Duration::from_secs(30), call).await
+        else {
+            return Err("draft_model parked on the planted leaf instead of refusing it");
+        };
+        let (client, result) = joined.expect("the call task completes");
+        client.cancel().await.unwrap();
+        Ok(result.expect("the tool returns a result"))
+    });
+
+    // The verdict is carried out of the runtime, not panicked inside it. A
+    // path-based read parks on a planted FIFO forever, wedging the one
+    // blocking thread; dropping the runtime WAITS for that thread, so a
+    // panic in `block_on` would hang the suite instead of failing it.
+    // `shutdown_timeout(0)` hands the test back and leaks the wedged thread
+    // deliberately — the process is about to fail anyway.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(0));
+    outcome.unwrap_or_else(|why| panic!("{why}"))
+}
+
+/// The READ half of the leaf race, end to end. Between the up-front leaf
+/// check and the snapshot, `models/orders.toml` becomes a symlink to a file
+/// OUTSIDE the project. Before the fix the snapshot's `std::fs::read`
+/// followed it: the outside file became the "prior sidecar" the merge folds
+/// into the draft, the policy read its classifications, and the rollback
+/// would have written it back. The no-follow read refuses the draft instead,
+/// before anything is written. The planted target is valid TOML, so a
+/// followed read would MERGE it rather than refuse for parsing — the bug
+/// cannot hide behind a parse error.
+#[cfg(unix)]
+#[test]
+fn draft_model_never_snapshots_through_a_leaf_swapped_for_an_outside_symlink() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let outside_dir = TempDir::new().unwrap();
+    let outside = outside_dir.path().join("outside.toml");
+    std::fs::write(&outside, "marker = \"OUTSIDE-SECRET\"\n").unwrap();
+
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let (link_at, target) = (sidecar.clone(), outside.clone());
+    let result = draft_model_with_a_pre_snapshot_swap(dir.path(), "orders", move || {
+        std::os::unix::fs::symlink(&target, &link_at).unwrap();
+    });
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a leaf swapped for a symlink refuses the draft"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("invalid_argument"),
+        "refused by the snapshot's no-follow read, not by a later write: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/orders.toml") && message.contains("cannot be read"),
+        "the refusal names the path: {message}"
+    );
+    assert!(
+        !message.contains("OUTSIDE-SECRET"),
+        "the outside file's content never reaches the caller: {message}"
+    );
+
+    // THE PIN: nothing outside the project was read in, and nothing was written.
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "marker = \"OUTSIDE-SECRET\"\n",
+        "the file outside the project is untouched"
+    );
+    assert!(
+        !dir.path().join("models").join("orders.sql").exists(),
+        "the draft refused before any write"
+    );
+    assert!(
+        std::fs::symlink_metadata(&sidecar)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the planted link is left in place, neither followed nor replaced"
+    );
+}
+
+/// The same window with a FIFO. Before the fix the snapshot's `std::fs::read`
+/// opened it and waited for a writer that never comes, parking the request —
+/// and the tool call — forever. The harness's timeout turns that regression
+/// into a failure instead of a hung suite; the no-follow read refuses
+/// promptly.
+#[cfg(unix)]
+#[test]
+fn draft_model_refuses_a_leaf_swapped_for_a_fifo_before_the_snapshot_without_hanging() {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+
+    let sidecar = dir.path().join("models").join("orders.toml");
+    let fifo_at = sidecar.clone();
+    let result = draft_model_with_a_pre_snapshot_swap(dir.path(), "orders", move || {
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_at)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "mkfifo {}", fifo_at.display());
+    });
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a leaf swapped for a FIFO refuses the draft"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("invalid_argument"),
+        "refused by the snapshot's no-follow read: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/orders.toml") && message.contains("cannot be read"),
+        "the refusal names the path: {message}"
+    );
+    assert!(
+        !dir.path().join("models").join("orders.sql").exists(),
+        "the draft refused before any write"
+    );
+    assert!(
+        std::fs::symlink_metadata(&sidecar)
+            .unwrap()
+            .file_type()
+            .is_fifo(),
+        "the planted FIFO is left in place, neither read nor replaced"
+    );
+}
+
+/// `models/` itself reached through a symlink redirected every draft write
+/// out of the project with no race at all: the leaf check and the no-follow
+/// writes look only at the final path component, and `root.join("models")`
+/// was never resolved. Every draft tool now refuses up front — naming where
+/// the models directory resolves and the root it left — and writes nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn draft_tools_refuse_a_models_directory_that_resolves_outside_the_project() {
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let outside = TempDir::new().unwrap();
+    let real_models = outside.path().join("models_real");
+    let models = dir.path().join("models");
+    std::fs::rename(&models, &real_models).expect("move the models directory out of the project");
+    std::os::unix::fs::symlink(&real_models, &models).unwrap();
+    write_target_defaults(dir.path());
+    let sidecar_before = std::fs::read(real_models.join("orders.toml")).unwrap();
+    let server = RockyMcpServer::new(dir.path().join("rocky.toml"));
+    let client = connect(server).await;
+
+    let contract_spec = "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n";
+    let check_spec = "[[tests]]\ntype = \"not_null\"\ncolumn = \"id\"\n";
+    let cases = vec![
+        (
+            "draft_model",
+            draft_args("shadow", "SELECT 1 AS id", "through a linked directory"),
+        ),
+        (
+            "draft_contract",
+            object(serde_json::json!({ "model": "orders", "spec": contract_spec })),
+        ),
+        (
+            "draft_check",
+            object(serde_json::json!({ "model": "orders", "spec": check_spec })),
+        ),
+        (
+            "draft_metadata",
+            object(serde_json::json!({ "model": "orders", "classifications": { "id": "pii" } })),
+        ),
+    ];
+    let resolved_models = real_models.canonicalize().unwrap().display().to_string();
+    let resolved_root = dir.path().canonicalize().unwrap().display().to_string();
+    for (tool, args) in cases {
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+            .await
+            .unwrap_or_else(|e| panic!("{tool} returns a result: {e}"));
+        assert_eq!(
+            result.is_error,
+            Some(true),
+            "{tool}: a models directory outside the project refuses"
+        );
+        let err = result.structured_content.expect("envelope");
+        assert_eq!(
+            err["code"],
+            serde_json::json!("invalid_argument"),
+            "{tool}: refused up front: {err:?}"
+        );
+        let message = err["message"].as_str().unwrap();
+        assert!(
+            message.contains("models/ resolves to")
+                && message.contains(&resolved_models)
+                && message.contains(&resolved_root),
+            "{tool}: the refusal names where models/ resolves and the root it left: {message}"
+        );
+    }
+    client.cancel().await.unwrap();
+
+    assert!(
+        !real_models.join("shadow.sql").exists() && !real_models.join("shadow.toml").exists(),
+        "draft_model wrote through the linked directory"
+    );
+    assert!(
+        !real_models.join("orders.contract.toml").exists(),
+        "draft_contract wrote through the linked directory"
+    );
+    assert_eq!(
+        std::fs::read(real_models.join("orders.toml")).unwrap(),
+        sidecar_before,
+        "draft_check / draft_metadata rewrote the sidecar through the linked directory"
+    );
+}
+
+/// A FIFO at a draft path is refused, and refused without blocking. Before
+/// the fix the leaf check let anything but a symlink through, and the
+/// snapshot's `std::fs::read` then parked a blocking-pool thread in the
+/// FIFO's open until a writer appeared — which never happens — so the call
+/// hung. The timeout turns a regression into a failure instead of a hung
+/// suite, and the runtime is shut down without waiting because that parked
+/// thread can never be joined.
+#[cfg(unix)]
+#[test]
+fn draft_model_refuses_a_fifo_at_the_draft_path_without_hanging() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    write_target_defaults(dir.path());
+    let models = dir.path().join("models");
+    let fifo = models.join("shadow.sql");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo runs");
+    assert!(status.success(), "mkfifo {}", fifo.display());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let config = dir.path().join("rocky.toml");
+    let outcome = runtime.block_on(async move {
+        let client = connect(RockyMcpServer::new(config)).await;
+        let call = client.call_tool(
+            CallToolRequestParams::new("draft_model").with_arguments(draft_args(
+                "shadow",
+                "SELECT 1 AS id",
+                "into a FIFO",
+            )),
+        );
+        match tokio::time::timeout(std::time::Duration::from_secs(10), call).await {
+            Ok(result) => {
+                client.cancel().await.unwrap();
+                Some(result.expect("draft_model returns a result"))
+            }
+            Err(_elapsed) => None,
+        }
+    });
+    runtime.shutdown_background();
+    let Some(result) = outcome else {
+        panic!("draft_model hung on the FIFO at models/shadow.sql instead of refusing it");
+    };
+
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a FIFO at the draft path refuses"
+    );
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(
+        err["code"],
+        serde_json::json!("invalid_argument"),
+        "refused up front: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("models/shadow.sql")
+            && message.contains("FIFO")
+            && message.contains("not a regular file"),
+        "the refusal names the path and its kind: {message}"
+    );
+    assert!(
+        std::fs::symlink_metadata(&fifo)
+            .unwrap()
+            .file_type()
+            .is_fifo(),
+        "the FIFO is left in place"
+    );
+    assert!(
+        !models.join("shadow.toml").exists(),
+        "the sidecar was written before the refusal"
+    );
+}
+
+/// The `Unloadable` arm driven through a rollback that REALLY fails. The
+/// project config is broken between the compile (which holds its parsed copy)
+/// and the policy gate (which reloads it), and the models directory is made
+/// read-only, so the gate cannot read its policy and the fail-closed
+/// refusal's rollback cannot unlink the draft. The refusal must report both:
+/// the cause, and the leftover it could not remove.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_contract_unloadable_policy_with_a_failed_remove_reports_the_leftover() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let models = dir.path().join("models");
+    let contract = models.join("orders.contract.toml");
+    let config = dir.path().join("rocky.toml");
+    let restore = RestorePerms(models.clone(), std::fs::Permissions::from_mode(0o755));
+
+    let spec = "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n";
+    let args = object(serde_json::json!({ "model": "orders", "spec": spec }));
+    let (models_at_mutation, contract_at_mutation) = (models.clone(), contract.clone());
+    let result = call_with_midflight_mutation(dir.path(), "draft_contract", args, move || {
+        assert!(
+            contract_at_mutation.is_file(),
+            "the loader blocked before the draft was written"
+        );
+        std::fs::write(&config, "this is not = [toml\n").unwrap();
+        make_models_read_only(&models_at_mutation)
+    })
+    .await;
+    let Some(result) = result else {
+        eprintln!(
+            "skipping: a read-only models directory does not block unlink here (running as root?)"
+        );
+        return;
+    };
+
+    assert_eq!(result.is_error, Some(true), "an unloadable policy refuses");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_denied"), "{err:?}");
+    assert_eq!(
+        err["rollback_failed_paths"],
+        serde_json::json!(["models/orders.contract.toml"]),
+        "the leftover rides the envelope as a typed field: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("the project config failed to load") && message.contains("Cause:"),
+        "the refusal is the fail-closed one and names its cause: {message}"
+    );
+    assert!(
+        message.contains("Rolling it back FAILED")
+            && message.contains("models/orders.contract.toml could not be removed")
+            && message.contains("STILL ON DISK"),
+        "the refusal names the leftover and what failed: {message}"
+    );
+    assert!(
+        !message.contains("The draft was rolled back."),
+        "a failed rollback must not read as a clean refusal: {message}"
+    );
+    drop(restore);
+    assert!(
+        contract.is_file(),
+        "the refused draft really is still on disk"
+    );
+}
+
+/// Drive `tool` with a mutation AFTER the compile and BEFORE the policy gate
+/// — the window [`call_with_midflight_mutation`] cannot reach, because the
+/// loader opens its FIFO before it reads the models, so a fault that breaks
+/// reads under `models/` there breaks the compile too.
+///
+/// `rocky.toml` is a FIFO here as well, so every config read is a handshake
+/// this test answers: `config` verbatim while the compile runs, and
+/// `post_compile_config` from the first config read after the loader's
+/// handshake — the marker LIST's; the gate's follows it — where `mutate`
+/// runs, when nothing reads `models/` again before the verdict. Returns
+/// `None` when the fault did not arm.
+#[cfg(unix)]
+async fn call_with_post_compile_mutation(
+    dir: &Path,
+    tool: &str,
+    args: serde_json::Map<String, serde_json::Value>,
+    config: &str,
+    post_compile_config: &str,
+    mutate: impl FnOnce() -> bool,
+) -> Option<rmcp::model::CallToolResult> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let config_fifo = dir.join("rocky.toml");
+    std::fs::remove_file(&config_fifo).unwrap();
+    let loader_fifo = dir.join("models").join("test_definitions.toml");
+    for fifo in [&config_fifo, &loader_fifo] {
+        let status = std::process::Command::new("mkfifo")
+            .arg(fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "mkfifo {}", fifo.display());
+    }
+
+    let server = RockyMcpServer::new(config_fifo.clone());
+    let client = connect(server).await;
+    let tool = tool.to_string();
+    let call = tokio::spawn(async move {
+        let result = client
+            .call_tool(CallToolRequestParams::new(tool).with_arguments(args))
+            .await;
+        (client, result)
+    });
+
+    let open_writer = |fifo: &Path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(fifo)
+    };
+    let mut mutate = Some(mutate);
+    let mut armed = None;
+    let mut loader_seen = false;
+    while !call.is_finished() {
+        match open_writer(&loader_fifo) {
+            Ok(writer) => {
+                loader_seen = true;
+                drop(writer);
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {}
+            // `mutate` may make `models/` unsearchable; then nothing — the
+            // handler included — can open this FIFO, so it cannot block on it.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(e) => panic!("opening {} for writing: {e}", loader_fifo.display()),
+        }
+        match open_writer(&config_fifo) {
+            Ok(mut writer) => {
+                let feed = if loader_seen {
+                    if let Some(mutate) = mutate.take() {
+                        armed = Some(mutate());
+                    }
+                    post_compile_config
+                } else {
+                    config
+                };
+                writer.write_all(feed.as_bytes()).expect("feed the config");
+                drop(writer);
+                // Let the reader drain to EOF and close before the FIFO is
+                // opened again, or the next feed is appended to this read.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            Err(e) => panic!("opening {} for writing: {e}", config_fifo.display()),
+        }
+    }
+    let (client, result) = call.await.expect("the call task completes");
+    client.cancel().await.unwrap();
+
+    let armed = armed.expect(
+        "the handler never read rocky.toml after the loader's handshake, so the mutation had \
+         no post-compile point to run",
+    );
+    if !armed {
+        return None;
+    }
+    Some(result.expect("the tool returns a result"))
+}
+
+/// The third disposition state, end to end: the leftover could not even be
+/// inspected. After the compile, the models directory is made unsearchable
+/// (mode 000) and the config broken, so the gate refuses fail-closed, its
+/// rollback cannot unlink the draft, and the after-the-fact check cannot see
+/// whether the draft is there. Before the fix that inspection error read as
+/// "absent" — the refusal claimed the path was gone while the draft sat on
+/// disk. Root ignores directory modes, so the fault stands down there.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_contract_unloadable_policy_with_an_uninspectable_leftover_says_so() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    write_project(dir.path(), &dir.path().join("test.duckdb"));
+    let models = dir.path().join("models");
+    let contract = models.join("orders.contract.toml");
+    let config = std::fs::read_to_string(dir.path().join("rocky.toml")).unwrap();
+    let restore = RestorePerms(models.clone(), std::fs::Permissions::from_mode(0o755));
+
+    let spec = "[[columns]]\nname = \"id\"\ntype = \"Int64\"\nnullable = true\n";
+    let args = object(serde_json::json!({ "model": "orders", "spec": spec }));
+    let (models_at_mutation, contract_at_mutation) = (models.clone(), contract.clone());
+    let result = call_with_post_compile_mutation(
+        dir.path(),
+        "draft_contract",
+        args,
+        &config,
+        "this is not = [toml\n",
+        move || {
+            assert!(
+                contract_at_mutation.is_file(),
+                "the post-compile handshake came before the draft was written"
+            );
+            std::fs::set_permissions(&models_at_mutation, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            if std::fs::symlink_metadata(&contract_at_mutation).is_ok() {
+                // This process ignores the directory mode; the fault cannot arm.
+                std::fs::set_permissions(
+                    &models_at_mutation,
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+                return false;
+            }
+            true
+        },
+    )
+    .await;
+    let Some(result) = result else {
+        eprintln!(
+            "skipping: an unsearchable models directory does not block inspection here (running \
+             as root?)"
+        );
+        return;
+    };
+
+    assert_eq!(result.is_error, Some(true), "an unloadable policy refuses");
+    let err = result.structured_content.expect("envelope");
+    assert_eq!(err["code"], serde_json::json!("policy_denied"), "{err:?}");
+    assert_eq!(
+        err["rollback_failed_paths"],
+        serde_json::json!(["models/orders.contract.toml"]),
+        "the failed path rides the envelope as a typed field: {err:?}"
+    );
+    let message = err["message"].as_str().unwrap();
+    assert!(
+        message.contains("the project config failed to load") && message.contains("Cause:"),
+        "the refusal is the fail-closed one and names its cause: {message}"
+    );
+    assert!(
+        message.contains("Rolling it back FAILED")
+            && message.contains("models/orders.contract.toml could not be removed"),
+        "the refusal names the path and what failed: {message}"
+    );
+    assert!(
+        message.contains(
+            "models/orders.contract.toml could not be inspected after the failed rollback"
+        ) && message.contains("Permission denied"),
+        "the refusal says the check itself failed, and why: {message}"
+    );
+    assert!(
+        !message.contains("STILL ON DISK") && !message.contains("now absent"),
+        "an uninspectable path is claimed neither present nor absent: {message}"
+    );
+    assert!(
+        !message.contains("The draft was rolled back."),
+        "a failed rollback must not read as a clean refusal: {message}"
+    );
+    drop(restore);
+    assert!(
+        contract.is_file(),
+        "the refused draft really is still on disk once the directory is searchable again"
+    );
 }
