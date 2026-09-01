@@ -12354,8 +12354,13 @@ mod tests {
         "blake3:62ab7bbb309ecda1bcd8e80f04c8afaf9b4103e38bf9c4b5e609ddd374f5e5aa";
 
     /// A scope built the way the run path builds it, for tests that vary one
-    /// routing input at a time. The separator mirrors the production
-    /// fallback: the target's own, else the source pattern's default.
+    /// routing input at a time.
+    ///
+    /// These cases build a `[target]` block by hand and never load a
+    /// pipeline, so the fallback is spelled `"__"` — the default source
+    /// pattern separator. A test that loads a real config must ask the
+    /// pattern instead (`schema_pattern()`), the way the run path does, or
+    /// it stops matching the moment that default moves.
     fn resume_scope_for_test(
         pipeline: &str,
         target: &rocky_core::config::PipelineTargetConfig,
@@ -13544,14 +13549,18 @@ auto_create_schemas = true
                     rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
                 let (name, pipeline_config) =
                     registry::resolve_pipeline(&loaded.config, Some("p2")).unwrap();
-                let target = &pipeline_config.as_replication().unwrap().target;
+                let replication = pipeline_config.as_replication().unwrap();
+                let target = &replication.target;
+                // Derive the separator the way the run path does, so this
+                // seed keeps matching if the pattern default ever moves.
+                let pattern = replication.schema_pattern().unwrap();
                 let scope = replication_resume_scope(
                     name,
                     target,
                     &loaded.config.adapters[&target.adapter],
                     None,
                     None,
-                    "__",
+                    target.separator.as_deref().unwrap_or(&pattern.separator),
                 );
                 let store = StateStore::open(&state_path).unwrap();
                 store
@@ -13678,14 +13687,18 @@ auto_create_schemas = true
             let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
             let (name, pipeline_config) =
                 registry::resolve_pipeline(&loaded.config, Some("p2")).unwrap();
-            let target = &pipeline_config.as_replication().unwrap().target;
+            let replication = pipeline_config.as_replication().unwrap();
+            let target = &replication.target;
+            // Derive the separator the way the run path does, so this seed
+            // keeps matching if the pattern default ever moves.
+            let pattern = replication.schema_pattern().unwrap();
             let scope = replication_resume_scope(
                 name,
                 target,
                 &loaded.config.adapters[&target.adapter],
                 None,
                 None,
-                "__",
+                target.separator.as_deref().unwrap_or(&pattern.separator),
             );
             let store = StateStore::open(&state_path).unwrap();
             store
