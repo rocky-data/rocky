@@ -83,9 +83,13 @@ new_repo() {
     git -C "$CASE_REPO" commit -qm base
 }
 
+# Every builder ends by committing. A silent failure here would leave the repo
+# with no second commit, the block would take its diff-failed branch, and a
+# case expecting "true" would pass for the wrong reason — so callers must stop
+# on a non-zero return.
 commit_change() {
-    git add -A
-    git commit -qm change
+    git add -A || return 1
+    git commit -qm change || return 1
 }
 
 # --- the changes each case commits ------------------------------------------
@@ -102,10 +106,10 @@ build_non_engine_path() {
 
 build_renamed_out() {
     git mv engine/crates/rocky-core/src/lib.rs docs/lib.rs
-    commit_change
+    commit_change || return 1
     # Exhibit the condition: with rename detection on, plain `git diff` folds
     # the move into its destination and the engine path disappears.
-    git diff --name-only HEAD^1 HEAD > "$CASE_SCRATCH/list"
+    git diff --name-only HEAD^1 HEAD > "$CASE_SCRATCH/list" || return 1
     if grep -q '^engine/' "$CASE_SCRATCH/list"; then
         echo "setup: the rename was not folded into its destination" >&2
         return 1
@@ -148,7 +152,7 @@ build_dollar_anchored() {
 
 build_grep_error() {
     : > docs/guide.md
-    commit_change
+    commit_change || return 1
     cat > "$CASE_BIN/grep" <<'STUB'
 #!/usr/bin/env bash
 echo "grep: stubbed failure" >&2
@@ -162,10 +166,10 @@ build_newline_name() {
     target="$(printf 'engine/crates/rocky-core/tests/bad\nname.rs')"
     mkdir -p engine/crates/rocky-core/tests
     : > "$target"
-    commit_change
+    commit_change || return 1
     # Exhibit the condition: git quotes the pathname, so the line starts with
     # a double quote rather than `engine/`.
-    git diff --no-renames --name-only HEAD^1 HEAD > "$CASE_SCRATCH/list"
+    git diff --no-renames --name-only HEAD^1 HEAD > "$CASE_SCRATCH/list" || return 1
     if ! grep -q '^"engine/' "$CASE_SCRATCH/list"; then
         echo "setup: git did not quote the newline pathname" >&2
         return 1
