@@ -48,43 +48,73 @@ env:
 
 jobs:
   # Computes whether this PR touches any codegen input or output. The list
-  # below must stay in sync with the `push` trigger's `paths:` above. On push
-  # events the trigger's own filter already matched, so the answer is yes.
+  # below must stay in sync with the `push` trigger's `paths:` above. On any
+  # other event the trigger's own filter already matched, so the `trigger`
+  # step answers yes without a checkout — a push to main pays nothing here
+  # beyond the runner spin-up.
   #
-  # Fail closed: the answer is "false" only when the diff was computed and no
-  # relevant path matched. Any error keeps it "true" and the drift check runs.
+  # Fail closed: the answer is "false" only when the diff was computed AND
+  # grep itself reported a clean non-match (exit 1). A failed diff or a grep
+  # error still writes "true". A step that never ran writes nothing, so the
+  # job output is empty; the `drift` job tests `!= 'false'`, and an empty
+  # answer runs the check.
   changes:
     name: Detect codegen changes
     runs-on: ubuntu-latest
     outputs:
-      codegen: ${{ steps.diff.outputs.codegen }}
+      # Exactly one of the two steps runs per event; a skipped step's output
+      # is empty, and `||` picks the one that wrote.
+      codegen: ${{ steps.diff.outputs.codegen || steps.trigger.outputs.codegen }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
         with:
           persist-credentials: false
           # The PR merge commit plus both of its parents.
           fetch-depth: 2
       - name: Diff the merge commit against its base parent
         id: diff
+        if: github.event_name == 'pull_request'
         env:
           # Mirrors the push trigger paths above.
           CODEGEN_PATHS_RE: ^(engine/|schemas/|docs/public/openapi\.json$|sdk/python/src/rocky_sdk/types_generated/|integrations/dagster/tests/fixtures_generated/|editors/vscode/src/types/generated/|editors/vscode/schemas/rocky-project\.schema\.json$|examples/playground/pocs/|scripts/regen_fixtures\.sh$|scripts/_normalize_fixture\.py$|scripts/copy_project_schema\.py$|justfile$|\.github/workflows/codegen-drift\.yml$)
         run: |
           set -uo pipefail
           codegen=true
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            if files=$(git diff --name-only HEAD^1 HEAD); then
-              if printf '%s\n' "$files" | grep -qE "$CODEGEN_PATHS_RE"; then
-                codegen=true
-              else
-                codegen=false
-              fi
-            else
-              echo "::warning::could not diff the merge commit; running the drift check to fail closed"
-            fi
+          files=$(mktemp)
+          # --no-renames: a rename lists BOTH its old and its new path. Plain
+          # `git diff` folds a rename into the destination alone, so a file
+          # renamed out of a watched tree never matched and the check skipped.
+          # -z: NUL-terminated paths, and no quoting. Without it git QUOTES a
+          # pathname holding an unusual byte, so a file named with a newline
+          # in it lists as `"engine/...` — the leading double quote defeats
+          # the `^` anchor and a real codegen change read as no-match.
+          if git diff --no-renames --name-only -z HEAD^1 HEAD > "$files"; then
+            # grep reads a file, not a pipe. `printf | grep -q` let grep quit
+            # on the first match while printf was still writing; past the
+            # pipe buffer printf died of SIGPIPE, pipefail made the pipeline
+            # non-zero, and a real match read as "false". Branch on grep's
+            # own exit code instead: only a clean 1 means no match. `-z` here
+            # matches the `-z` above: one record per NUL, so `^` and `$` still
+            # anchor per path.
+            status=0
+            grep -zqE "$CODEGEN_PATHS_RE" "$files" || status=$?
+            case "$status" in
+              0) codegen=true ;;
+              1) codegen=false ;;
+              *) echo "::warning::grep exited $status while matching the changed paths; running the drift check to fail closed" ;;
+            esac
+          else
+            echo "::warning::could not diff the merge commit; running the drift check to fail closed"
           fi
           echo "codegen=$codegen" >> "$GITHUB_OUTPUT"
           echo "codegen=$codegen"
+      - name: Trust the trigger's own paths filter
+        id: trigger
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "codegen=true" >> "$GITHUB_OUTPUT"
+          echo "codegen=true"
 
   drift:
     name: Check codegen is up to date

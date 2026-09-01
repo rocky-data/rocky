@@ -6796,6 +6796,14 @@ mod tests {
                  move with it",
             )
             .trim();
+        // The workflow hands that line to `grep -E`, so it is a POSIX ERE. It
+        // uses only anchors (`^`, `$`), one group, alternation (`|`) and
+        // escaped dots (`\.`). The `regex` crate reads that subset the same
+        // way, so matching here reruns the CI check instead of guessing at
+        // it from the regex's text.
+        let engine_paths_re = regex::Regex::new(engine_paths_re).unwrap_or_else(|err| {
+            panic!("ENGINE_PATHS_RE in engine-ci.yml does not compile: {err}\n{engine_paths_re}")
+        });
 
         // Paths that climb above `engine/` — `src/` is three levels below the
         // repo root, so four or more `../` escapes the engine tree.
@@ -6830,16 +6838,16 @@ mod tests {
                  from engine-ci.yml's push `paths:` list. A push touching it \
                  would run no engine CI (#1557)."
             );
-            // The PR side: the detection regex must name the file as an
-            // exact-file alternative — the path with its dots escaped, then
-            // `$`. Prefix alternatives like `engine/` do not cover it.
-            let exact_alternative = format!("{}$", repo_relative.replace('.', "\\."));
+            // The PR side: run the regex against the path, the way the
+            // `changes` job does. Searching the regex's text for the path
+            // proved nothing — `|x\.claude/...$|` and `|\|\.claude/...$|`
+            // both contain it and neither matches it.
             assert!(
-                engine_paths_re.contains(&exact_alternative),
+                engine_paths_re.is_match(repo_relative),
                 "`{repo_relative}` is compiled into the engine but \
-                 ENGINE_PATHS_RE in engine-ci.yml does not carry \
-                 `{exact_alternative}`. A PR touching it would skip the \
-                 required engine jobs (#1557, #1563)."
+                 ENGINE_PATHS_RE in engine-ci.yml does not match it. A PR \
+                 touching it would skip the required engine jobs (#1557, \
+                 #1563). ENGINE_PATHS_RE: {engine_paths_re}"
             );
             checked += 1;
         }
