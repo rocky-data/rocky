@@ -276,6 +276,139 @@ impl SchemaPattern {
 
         Ok(ParsedSchema { values })
     }
+
+    /// Whether [`Self::parse`] binds `name` to [`SchemaValue::Multiple`], or
+    /// `None` when this pattern never binds it.
+    ///
+    /// Component names are **not** required to be unique, and `parse` writes
+    /// every occurrence of a name into one [`ParsedSchema::values`] entry, so
+    /// a repeated name keeps the **last** occurrence's value. This scans in
+    /// reverse and answers with that same occurrence. A lookup that stopped
+    /// at the first one read `["tenant", "tenant...", "source"]` as
+    /// single-valued while the resolver joined it (#1582).
+    ///
+    /// [`PatternComponent::Fixed`] carries no name, so it never matches —
+    /// the same set of names `parse` binds.
+    fn binds_multiple(&self, name: &str) -> Option<bool> {
+        self.components
+            .iter()
+            .rev()
+            .find_map(|component| match component {
+                PatternComponent::Fixed(_) => None,
+                PatternComponent::Variable { name: bound }
+                | PatternComponent::Terminal { name: bound } => (bound == name).then_some(false),
+                PatternComponent::VariableLength { name: bound } => (bound == name).then_some(true),
+            })
+    }
+
+    /// Whether a caller-default separator can change what any of
+    /// `templates` resolves to.
+    ///
+    /// [`ParsedSchema::resolve_template`] spends the default separator on
+    /// exactly one thing: joining a **bare** `{name}` whose component is
+    /// multi-valued. `{name:SEP}` pins its own separator, a single-valued
+    /// component ignores the separator entirely, and an unknown placeholder
+    /// is copied through untouched. So when no template holds a bare
+    /// placeholder naming a `name...` component, every separator value
+    /// renders exactly the same names.
+    ///
+    /// Only a `name...` component ever parses into
+    /// [`SchemaValue::Multiple`], so the answer is a property of the
+    /// pattern and the templates — it needs no parsed schema name.
+    ///
+    /// ```text
+    ///   components = ["tenant", "regions...", "source"]
+    ///
+    ///   "staging__{regions}"   bare, multi-valued   -> the separator joins
+    ///   "staging__{regions:_}" pins its own         -> it does not
+    ///   "staging__{source}"    single-valued        -> it does not
+    ///   "staging"              no placeholder       -> it does not
+    /// ```
+    ///
+    /// A resume checkpoint records the separator only when this says it
+    /// moves a name (#1582), so a config edit that cannot reach the
+    /// warehouse does not refuse a recovery.
+    ///
+    /// **The invariant: this rule and [`ParsedSchema::resolve_template`] must
+    /// never disagree about whether the separator changes the output.** So
+    /// both halves of the question reuse the resolver's own reading. The
+    /// template half walks [`render_placeholders`], the scanner that renders.
+    /// The pattern half asks [`Self::binds_multiple`], which resolves a
+    /// repeated component name to the occurrence [`Self::parse`] keeps. A
+    /// second reading of *either* half is how the rule drifts from what
+    /// actually renders — reading the pattern half with a first-match lookup
+    /// is what let a repeated name through.
+    ///
+    /// Where the pattern alone cannot answer, it answers `true`. A `name...`
+    /// that happens to bind one segment renders the same either way, and this
+    /// still calls it joining. Recording a separator that moves nothing only
+    /// refuses a resume that would have been fine; omitting one that moves a
+    /// name resumes onto other tables.
+    pub fn separator_joins_a_placeholder(&self, templates: &[&str]) -> bool {
+        templates.iter().any(|template| {
+            let mut joins = false;
+            render_placeholders(template, |name, sep, _out| {
+                let Some(multiple) = self.binds_multiple(name) else {
+                    return false;
+                };
+                joins |= sep.is_none() && multiple;
+                true
+            });
+            joins
+        })
+    }
+}
+
+/// Walks `template` the way a name is rendered from it, so every reader of
+/// the placeholder grammar shares one implementation.
+///
+/// `substitute` is called once per `{name}` / `{name:SEP}` — `sep` is `None`
+/// for the bare form, whose join separator is the caller's default. It
+/// appends the placeholder's value to the output and returns `true`.
+/// Returning `false` leaves the placeholder alone and the scan resumes one
+/// byte past the `{`, which is what an unknown placeholder has always done.
+/// Anything appended before a `false` is rolled back.
+fn render_placeholders(
+    template: &str,
+    mut substitute: impl FnMut(&str, Option<&str>, &mut String) -> bool,
+) -> String {
+    // Single-pass scanner over byte indices. `{` and `}` are ASCII so they
+    // never appear inside multi-byte UTF-8 sequences; that means byte-index
+    // arithmetic stays on char boundaries even when the surrounding text
+    // contains non-ASCII content (the surrounding bytes copy through via
+    // the `&template[start..i]` slice, which preserves UTF-8).
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut start = 0; // start of the next literal run to copy verbatim
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'{'
+            && let Some(rel_end) = template[i + 1..].find('}')
+        {
+            let body = &template[i + 1..i + 1 + rel_end];
+            // The closing `}` terminates SEP, so a literal `}` cannot
+            // appear inside it.
+            let (name, sep) = match body.split_once(':') {
+                Some((name, sep)) => (name, Some(sep)),
+                None => (body, None),
+            };
+            // Flush the literal run accumulated since the last placeholder
+            // so `substitute` appends in the right place; unwind it again
+            // when the placeholder does not resolve.
+            let literal_end = out.len();
+            out.push_str(&template[start..i]);
+            if substitute(name, sep, &mut out) {
+                i += 1 + rel_end + 1; // advance past `{...}`
+                start = i;
+                continue;
+            }
+            out.truncate(literal_end);
+        }
+        i += 1;
+    }
+    out.push_str(&template[start..]);
+    out
 }
 
 impl ParsedSchema {
@@ -332,50 +465,26 @@ impl ParsedSchema {
     /// // {regions:::} → "us_west::us_central"
     /// ```
     pub fn resolve_template(&self, template: &str, default_sep: &str) -> String {
-        // Single-pass scanner over byte indices. `{` and `}` are ASCII so they
-        // never appear inside multi-byte UTF-8 sequences; that means byte-index
-        // arithmetic stays on char boundaries even when the surrounding text
-        // contains non-ASCII content (the surrounding bytes copy through via
-        // the `&template[start..i]` slice, which preserves UTF-8).
-        let mut out = String::with_capacity(template.len());
-        let bytes = template.as_bytes();
-        let mut start = 0; // start of the next literal run to copy verbatim
-        let mut i = 0;
-
-        while i < bytes.len() {
-            if bytes[i] == b'{'
-                && let Some(rel_end) = template[i + 1..].find('}')
-            {
-                let body = &template[i + 1..i + 1 + rel_end];
-                let (name, sep) = match body.split_once(':') {
-                    Some((n, s)) => (n, s),
-                    None => (body, default_sep),
-                };
-                if let Some(value) = self.values.get(name) {
-                    // Flush literal run accumulated since the last placeholder.
-                    out.push_str(&template[start..i]);
-                    match value {
-                        SchemaValue::Single(s) => out.push_str(s),
-                        SchemaValue::Multiple(v) => {
-                            let mut iter = v.iter();
-                            if let Some(first) = iter.next() {
-                                out.push_str(first);
-                                for part in iter {
-                                    out.push_str(sep);
-                                    out.push_str(part);
-                                }
-                            }
+        render_placeholders(template, |name, sep, out| {
+            let Some(value) = self.values.get(name) else {
+                return false;
+            };
+            match value {
+                SchemaValue::Single(s) => out.push_str(s),
+                SchemaValue::Multiple(v) => {
+                    let sep = sep.unwrap_or(default_sep);
+                    let mut iter = v.iter();
+                    if let Some(first) = iter.next() {
+                        out.push_str(first);
+                        for part in iter {
+                            out.push_str(sep);
+                            out.push_str(part);
                         }
                     }
-                    i += 1 + rel_end + 1; // advance past `{...}`
-                    start = i;
-                    continue;
                 }
             }
-            i += 1;
-        }
-        out.push_str(&template[start..]);
-        out
+            true
+        })
     }
 }
 
@@ -734,6 +843,93 @@ mod tests {
         let meta_b = parsed.resolve_template("md5('{regions:_}__{source}')", "_");
         assert_eq!(meta_a, "md5('us_west__shopify')");
         assert_eq!(meta_b, "md5('us_west__shopify')");
+    }
+
+    /// The separator matters to a template only where a **bare**
+    /// multi-valued placeholder joins with it. The rule is checked against
+    /// the resolver itself: for every template below, rendering it under two
+    /// separators must differ exactly when the rule says the separator joins.
+    #[test]
+    fn separator_joins_only_a_bare_multi_valued_placeholder() {
+        let pattern = sample_pattern();
+        let parsed = pattern
+            .parse("src__acme__us_west__us_central__shopify")
+            .unwrap();
+
+        let cases = [
+            ("staging__{regions}", true),
+            ("{regions}", true),
+            ("{tenant}__{regions}__{source}", true),
+            ("{regions:_}", false),
+            ("{regions:}", false),
+            ("staging__{source}", false),
+            ("{tenant}", false),
+            ("staging", false),
+            ("{unknown}", false),
+            // An unresolved placeholder does not swallow a real one after
+            // it: the scanner resumes inside the braces, exactly as it does
+            // when rendering.
+            ("{a{regions}}", true),
+            ("{a{regions:_}}", false),
+        ];
+        for (template, joins) in cases {
+            assert_eq!(
+                pattern.separator_joins_a_placeholder(&[template]),
+                joins,
+                "wrong verdict for {template}"
+            );
+            assert_eq!(
+                parsed.resolve_template(template, "__") != parsed.resolve_template(template, "-"),
+                joins,
+                "the verdict for {template} disagrees with what the resolver renders"
+            );
+        }
+
+        // Either template can be the one that joins.
+        assert!(pattern.separator_joins_a_placeholder(&["staging", "{regions}"]));
+        assert!(pattern.separator_joins_a_placeholder(&["{regions}", "staging"]));
+        assert!(!pattern.separator_joins_a_placeholder(&["staging", "{source}"]));
+        assert!(!pattern.separator_joins_a_placeholder(&[]));
+
+        // The verdict follows the pattern, not the spelling: the same
+        // `{regions}` is single-valued when the component drops the `...`.
+        let single = SchemaPattern {
+            prefix: "src__".into(),
+            separator: "__".into(),
+            components: SchemaPattern::parse_components(&["regions".into(), "source".into()])
+                .unwrap(),
+        };
+        assert!(!single.separator_joins_a_placeholder(&["staging__{regions}"]));
+
+        // Component names are not required to be unique, and `parse` writes
+        // every occurrence into one entry, so a repeated name keeps the LAST
+        // one. The rule must read that same occurrence. Reading the first
+        // instead called the pattern below single-valued while the resolver
+        // joined it (#1582).
+        //
+        // "src__a__b__c__d" binds tenant = [b, c] in the first pattern and
+        // regions = "c" in the second, so neither cross-check is vacuous.
+        for (specs, template, joins) in [
+            (["tenant", "tenant...", "source"], "{tenant}", true),
+            (["regions...", "regions", "source"], "{regions}", false),
+        ] {
+            let pattern = SchemaPattern {
+                prefix: "src__".into(),
+                separator: "__".into(),
+                components: SchemaPattern::parse_components(&specs.map(str::to_string)).unwrap(),
+            };
+            let parsed = pattern.parse("src__a__b__c__d").unwrap();
+            assert_eq!(
+                pattern.separator_joins_a_placeholder(&[template]),
+                joins,
+                "wrong verdict for {template} under {specs:?}"
+            );
+            assert_eq!(
+                parsed.resolve_template(template, "__") != parsed.resolve_template(template, "-"),
+                joins,
+                "the verdict for {template} under {specs:?} disagrees with the resolver"
+            );
+        }
     }
 
     // Real-world connector pattern tests

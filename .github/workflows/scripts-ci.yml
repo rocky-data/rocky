@@ -10,11 +10,19 @@ on:
     paths:
       - "scripts/**"
       - ".github/workflows/scripts-ci.yml"
+      # The change-detector self-test replays these two workflows' own `run:`
+      # blocks. Without them here, a PR that edits only a detector block runs
+      # engine-ci and codegen-drift but not the test that guards them — the
+      # guard absent for exactly the change that needs it (#1557, #1563).
+      - ".github/workflows/engine-ci.yml"
+      - ".github/workflows/codegen-drift.yml"
   push:
     branches: [main]
     paths:
       - "scripts/**"
       - ".github/workflows/scripts-ci.yml"
+      - ".github/workflows/engine-ci.yml"
+      - ".github/workflows/codegen-drift.yml"
 
 permissions:
   contents: read
@@ -43,6 +51,21 @@ jobs:
         # Uses stub commands in scratch repos, so no Rust toolchain is needed.
         run: bash scripts/tests/mutation-check.test.sh
 
+  ci-change-detector:
+    name: CI change detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Replay the detector blocks against scratch repos
+        # Extracts each workflow's own `run:` block and replays it, so no
+        # toolchain and no second copy of the logic are needed. This is also
+        # where the fix runs under the runner's GNU grep rather than a
+        # developer's.
+        run: bash scripts/tests/ci-change-detector.test.sh
+
   shellcheck:
     name: Shellcheck scripts
     runs-on: ubuntu-latest
@@ -54,7 +77,7 @@ jobs:
       - name: Shellcheck the soak harness (full severity)
         # The scripts this workflow exists to protect hold the full bar and
         # already meet it.
-        run: shellcheck scripts/soak-scheduler.sh
+        run: shellcheck scripts/soak-scheduler.sh scripts/tests/ci-change-detector.test.sh
       - name: Shellcheck everything else (error severity)
         # Six pre-existing scripts carry SC2155/SC2012/SC2015 warnings today
         # (release.sh, the vendor_* pair, regen_fixtures.sh, build_rocky_linux.sh).

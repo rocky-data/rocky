@@ -384,6 +384,86 @@ fn create_new_no_follow(path: &Path, mode: Option<u32>) -> std::io::Result<std::
     }
 }
 
+/// Write `bytes` to `path` in place, refusing to follow a symlink at the
+/// leaf.
+///
+/// The counterpart of [`write_new_no_follow`] for a file the caller MEANS
+/// to overwrite — an existing model's SQL or sidecar under a redraft. The
+/// file is truncated in place (same inode, same mode) or created when
+/// absent, so a legitimate overwrite keeps the semantics of
+/// `std::fs::write`. What changes is the leaf: on unix the open carries
+/// `O_NOFOLLOW`, so a link swapped in AFTER a path-based pre-check fails
+/// (`ELOOP`) instead of being written through to its target, and
+/// `O_NONBLOCK`, so a FIFO swapped in cannot park the open waiting for a
+/// reader. The regular-file check is on the DESCRIPTOR — the thing already
+/// opened cannot be swapped underneath it — so a FIFO, socket, or device is
+/// refused before a byte is written.
+///
+/// Windows `OpenOptions` has no `O_NOFOLLOW` equivalent, so there this is a
+/// plain create-or-truncate write and the caller's pre-check is the only
+/// leaf guard: the same stated gap as [`read_no_follow`].
+///
+/// # Errors
+///
+/// Any error from the open, the descriptor's metadata, the truncate, or the
+/// write; `InvalidInput` when what was opened is not a regular file.
+pub fn write_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    // `truncate(false)`: the truncate happens below, once the descriptor is
+    // known to be a regular file.
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to write {} — not a regular file", path.display()),
+        ));
+    }
+    file.set_len(0)?;
+    file.write_all(bytes)
+}
+
+/// The largest artifact read whole through the no-follow read helpers.
+///
+/// The files copied here are a lowered contract, sidecar, SQL model, and
+/// manifest — kilobytes. `std::fs::copy` streamed, so it could not be made
+/// to exhaust memory; reading whole can be, which is why the size is
+/// bounded rather than trusted. [`read_no_follow_bytes`] shares the bound,
+/// for the same reason and over the same kind of file.
+const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read `path` whole, refusing to follow a symlink at the leaf, and hand
+/// back just the bytes.
+///
+/// The read counterpart of [`write_no_follow`], for a caller that must
+/// capture a file's CURRENT content before overwriting it — the draft
+/// tools' rollback snapshot. `std::fs::read` resolves the path again, so a
+/// link swapped in after a path-based pre-check is read through to its
+/// target and a FIFO parks the read until a writer appears. This opens
+/// once with `O_NOFOLLOW | O_NONBLOCK`, checks the DESCRIPTOR is a regular
+/// file, and reads from that same descriptor — never a second path lookup.
+/// The read is bounded by [`MAX_BACKUP_BYTES`].
+///
+/// Windows `OpenOptions` has no `O_NOFOLLOW` equivalent, so there the read
+/// still follows a symlink or junction and the caller's pre-check is the
+/// only leaf guard: the same stated gap as [`write_no_follow`].
+///
+/// # Errors
+///
+/// Any error from the open or the read — `NotFound` when nothing is at the
+/// path, `ELOOP` for a symlinked leaf on unix; `InvalidInput` when what was
+/// opened is not a regular file, or is over the size bound.
+pub fn read_no_follow_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    read_no_follow(path).map(|(bytes, _)| bytes)
+}
+
 /// Read `path` whole, refusing to follow a symlink at the leaf, and hand
 /// back its mode alongside the bytes.
 ///
@@ -397,14 +477,6 @@ fn create_new_no_follow(path: &Path, mode: Option<u32>) -> std::io::Result<std::
 ///
 /// The mode comes off the DESCRIPTOR, not a second path lookup, so it
 /// describes the same file the bytes came from.
-/// The largest artifact this module will back up.
-///
-/// The files copied here are a lowered contract, sidecar, SQL model, and
-/// manifest — kilobytes. `std::fs::copy` streamed, so it could not be made
-/// to exhaust memory; reading whole can be, which is why the size is
-/// bounded rather than trusted.
-const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
-
 fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions)> {
     use std::io::Read as _;
     let mut options = std::fs::OpenOptions::new();
@@ -2636,6 +2708,22 @@ mod tests {
         assert_eq!(mode & 0o777, 0o755, "the ordinary permission bits carry");
     }
 
+    /// Create a FIFO at `path` for the non-regular-file probes.
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .expect("path has no interior nul");
+        // SAFETY: `mkfifo` with a valid NUL-terminated path and a mode is
+        // sound; the worst case is a failure return, asserted below.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
     /// A non-regular source is refused, and refused WITHOUT blocking.
     ///
     /// `std::fs::copy` rejected non-regular sources; reading by hand has to
@@ -2649,17 +2737,7 @@ mod tests {
         let project = seeded_project(dir.path());
         let final_path = project.join("models/revenue_daily.contract.toml");
         std::fs::remove_file(&final_path).ok();
-        let c_path = std::ffi::CString::new(final_path.as_os_str().as_encoded_bytes())
-            .expect("path has no interior nul");
-        // SAFETY: `mkfifo` with a valid NUL-terminated path and a mode is
-        // sound; the worst case is a failure return, asserted below.
-        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
-        assert_eq!(
-            made,
-            0,
-            "mkfifo failed: {}",
-            std::io::Error::last_os_error()
-        );
+        make_fifo(&final_path);
         let prev = prev_sibling(&final_path);
 
         // The assertion is that this RETURNS. Before O_NONBLOCK it would
@@ -2671,6 +2749,252 @@ mod tests {
             "expected the regular-file refusal, got: {error}"
         );
         assert!(!prev.exists(), "a refused copy must leave no backup behind");
+    }
+
+    /// The in-place write refuses a symlink at the leaf — resolving or
+    /// dangling — by the open itself, and leaves the link and its target
+    /// alone. This is the draft tools' race guard: a link swapped in at a
+    /// draft path after the path-based pre-check meets this open, not a
+    /// follow.
+    #[cfg(unix)]
+    #[test]
+    fn write_no_follow_refuses_a_symlinked_leaf_and_leaves_the_target_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"bytes the write must not replace").expect("write");
+        let resolving = dir.path().join("resolving.toml");
+        plant_symlink(&resolving, &secret);
+        let dangling = dir.path().join("dangling.toml");
+        let nowhere = dir.path().join("nowhere.toml");
+        plant_symlink(&dangling, &nowhere);
+
+        for link in [&resolving, &dangling] {
+            let error = write_no_follow(link, b"draft").expect_err("a symlinked leaf is refused");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ELOOP),
+                "refused by the no-follow open itself: {error}"
+            );
+            assert!(
+                std::fs::symlink_metadata(link)
+                    .expect("still there")
+                    .file_type()
+                    .is_symlink(),
+                "the link is left in place"
+            );
+        }
+        assert_eq!(
+            std::fs::read(&secret).expect("still there"),
+            b"bytes the write must not replace"
+        );
+        assert!(
+            !nowhere.exists(),
+            "the dangling link's target was not created"
+        );
+    }
+
+    /// The in-place write keeps the file's identity: an existing regular
+    /// file is truncated and rewritten under the same inode and mode, and an
+    /// absent path is created. (`write_new_no_follow` unlinks and recreates;
+    /// a redraft of a user's own model must not.)
+    #[cfg(unix)]
+    #[test]
+    fn write_no_follow_rewrites_an_existing_file_in_place_and_creates_an_absent_one() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = dir.path().join("orders.toml");
+        std::fs::write(
+            &existing,
+            "name = \"orders\"\n\n[strategy]\ntype = \"full_refresh\"\n",
+        )
+        .expect("write");
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let before = std::fs::metadata(&existing).expect("metadata");
+
+        write_no_follow(&existing, b"name = \"orders\"\n").expect("in-place write");
+
+        let after = std::fs::metadata(&existing).expect("metadata");
+        assert_eq!(
+            std::fs::read(&existing).expect("read"),
+            b"name = \"orders\"\n",
+            "truncated to the new bytes, not appended"
+        );
+        assert_eq!(after.ino(), before.ino(), "the same inode");
+        assert_eq!(after.mode() & 0o777, 0o640, "the same mode");
+
+        let fresh = dir.path().join("fresh.sql");
+        write_no_follow(&fresh, b"SELECT 1 AS id\n").expect("create");
+        assert_eq!(std::fs::read(&fresh).expect("read"), b"SELECT 1 AS id\n");
+    }
+
+    /// A non-regular leaf is refused WITHOUT blocking. A FIFO with no reader
+    /// would park a blocking write-open forever; with a reader the open
+    /// succeeds and the DESCRIPTOR check refuses it. A directory is refused
+    /// by the open. Nothing is written in any case.
+    #[cfg(unix)]
+    #[test]
+    fn write_no_follow_refuses_a_fifo_and_a_directory_instead_of_blocking() {
+        use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("orders.sql");
+        make_fifo(&fifo);
+
+        // No reader: the assertion is that this RETURNS.
+        assert!(
+            write_no_follow(&fifo, b"SELECT 1").is_err(),
+            "a FIFO with no reader is refused"
+        );
+
+        // A reader present: the open succeeds, the descriptor check refuses.
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("open the read end");
+        let error =
+            write_no_follow(&fifo, b"SELECT 1").expect_err("a FIFO with a reader is refused");
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "expected the regular-file refusal, got: {error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .expect("still there")
+                .file_type()
+                .is_fifo(),
+            "the FIFO is left in place"
+        );
+
+        let directory = dir.path().join("orders.toml");
+        std::fs::create_dir(&directory).expect("mkdir");
+        assert!(
+            write_no_follow(&directory, b"name = \"orders\"").is_err(),
+            "a directory is refused"
+        );
+        assert!(directory.is_dir(), "the directory is left in place");
+    }
+
+    /// The pub read counterpart: a regular file reads back verbatim, an
+    /// absent path is `NotFound` (the caller's "absent" arm), and a
+    /// symlinked leaf — resolving or dangling — is refused by the open
+    /// itself rather than read through to its target.
+    #[cfg(unix)]
+    #[test]
+    fn read_no_follow_bytes_reads_a_regular_file_and_refuses_a_symlinked_leaf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let regular = dir.path().join("orders.toml");
+        std::fs::write(&regular, b"name = \"orders\"\n").expect("write");
+        assert_eq!(
+            read_no_follow_bytes(&regular).expect("a regular file reads"),
+            b"name = \"orders\"\n"
+        );
+        assert_eq!(
+            read_no_follow_bytes(&dir.path().join("absent.toml"))
+                .expect_err("an absent path is NotFound")
+                .kind(),
+            std::io::ErrorKind::NotFound,
+            "the caller maps NotFound to \"absent\"; nothing else may take that arm"
+        );
+
+        let secret = dir.path().join("outside-secret");
+        std::fs::write(&secret, b"bytes the read must not capture").expect("write");
+        let resolving = dir.path().join("resolving.toml");
+        plant_symlink(&resolving, &secret);
+        let dangling = dir.path().join("dangling.toml");
+        plant_symlink(&dangling, &dir.path().join("nowhere.toml"));
+
+        for link in [&resolving, &dangling] {
+            let error = read_no_follow_bytes(link).expect_err("a symlinked leaf is refused");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ELOOP),
+                "refused by the no-follow open itself: {error}"
+            );
+            assert_ne!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "a dangling link must not read as \"absent\""
+            );
+        }
+    }
+
+    /// A non-regular leaf is refused WITHOUT blocking. A FIFO with no writer
+    /// would park a blocking read-open forever — the shape that hung the
+    /// draft snapshot; with a writer the open succeeds and the DESCRIPTOR
+    /// check refuses it. A directory is refused either by the open (Linux)
+    /// or by the same descriptor check (macOS).
+    #[cfg(unix)]
+    #[test]
+    fn read_no_follow_bytes_refuses_a_fifo_and_a_directory_instead_of_blocking() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fifo = dir.path().join("orders.sql");
+        make_fifo(&fifo);
+
+        // No writer: a blocking read-open parks here until one appears.
+        // `O_NONBLOCK` returns instead, and the descriptor check refuses.
+        let error = read_no_follow_bytes(&fifo).expect_err("a FIFO with no writer is refused");
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "expected the regular-file refusal, got: {error}"
+        );
+
+        // Bytes waiting in the pipe do not make it a file either: a reader
+        // must exist before the write end can be opened at all.
+        let _reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("open the read end");
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .expect("open the write end");
+        writer.write_all(b"not the model").expect("feed the FIFO");
+        let error = read_no_follow_bytes(&fifo).expect_err("a FIFO with a writer is refused");
+        assert!(
+            error.to_string().contains("not a regular file"),
+            "expected the regular-file refusal, got: {error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .expect("still there")
+                .file_type()
+                .is_fifo(),
+            "the FIFO is left in place"
+        );
+
+        let directory = dir.path().join("orders.toml");
+        std::fs::create_dir(&directory).expect("mkdir");
+        let error = read_no_follow_bytes(&directory).expect_err("a directory is refused");
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "a directory must not read as \"absent\": {error}"
+        );
+        assert!(directory.is_dir(), "the directory is left in place");
+    }
+
+    /// The read is bounded, not trusted: a file over `MAX_BACKUP_BYTES`
+    /// refuses instead of being buffered whole. The bound covers the draft
+    /// snapshot too, so a redraft of a model larger than the limit refuses
+    /// where a plain `std::fs::read` would have loaded it.
+    #[test]
+    fn read_no_follow_bytes_refuses_a_file_over_the_size_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let oversized = dir.path().join("huge.sql");
+        std::fs::write(&oversized, vec![b'x'; MAX_BACKUP_BYTES as usize + 1]).expect("write");
+
+        let error = read_no_follow_bytes(&oversized).expect_err("an oversized file is refused");
+        assert!(
+            error.to_string().contains("exceeds the"),
+            "expected the size refusal, got: {error}"
+        );
     }
 
     #[cfg(unix)]

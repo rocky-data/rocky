@@ -545,6 +545,26 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   binary (serde ignores the extra key). The bump tracks the record-shape
 ///   addition so `[state] on_schema_mismatch` engages as usual; no blob
 ///   walk.
+///
+///   The scope's routing half is structured ([`ResumeTarget`], compared
+///   field-wise). Two earlier unreleased builds wrote other shapes, and
+///   every one of them refuses as a scope mismatch rather than resuming:
+///
+///   ```text
+///     build                       forward-deserializes as   verdict
+///     flat `target_routing`       target: None              refuse
+///     structured, raw separator   separator_role: None      refuse
+///     structured, no separator    separator_role: None      refuse
+///     this build                  separator_role: Some(..)  compare
+///   ```
+///
+///   The raw-separator build wrote a bare string under the `separator` key;
+///   this build neither reads nor writes that key, and serde ignores it, so
+///   an old blob still deserializes (a hard parse error there would break
+///   `--resume-latest` for every scope, since one scan reads every header).
+///   Guarded by `test_pre_release_v23_scope_forward_deserializes_target_none`
+///   and `test_pre_release_v23_unclassified_separators_never_match`. No
+///   released build wrote any of them, so the version stays at 23.
 const CURRENT_SCHEMA_VERSION: u32 = 23;
 
 /// Errors from the embedded redb state store.
@@ -2328,7 +2348,10 @@ pub struct TableProgress {
 /// Persisted on [`RunProgress`] so `--resume` / `--resume-latest` can refuse
 /// a checkpoint written by a different pipeline instead of silently skipping
 /// that pipeline's completed tables. Equality is the resume gate: every field
-/// must match the resuming invocation exactly.
+/// must match the resuming invocation exactly. The scope is structured —
+/// each routing component is its own field and the comparison is
+/// field-wise — so no two invocations can render to one string; the
+/// [`std::fmt::Display`] form exists for messages only.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResumeScope {
     /// The resolved pipeline name the run built.
@@ -2336,10 +2359,81 @@ pub struct ResumeScope {
     /// The `--filter key=value` selector the run was invoked with, verbatim.
     #[serde(default)]
     pub filter: Option<String>,
-    /// Where the run routed its writes: the target adapter name plus the
-    /// catalog/schema templates, with any shadow or branch override appended.
-    /// An opaque routing fingerprint — compared for equality, never parsed.
-    pub target_routing: String,
+    /// Where the run routed its writes. `None` only on a checkpoint written
+    /// by the unreleased build between #1573 and the structured scope, which
+    /// recorded the routing as one flat `target_routing` string; no released
+    /// build wrote one. Such a checkpoint never equals a current scope, so a
+    /// resume refuses it as a scope mismatch.
+    #[serde(default)]
+    pub target: Option<ResumeTarget>,
+}
+
+/// Where a replication run routed its writes: the target adapter alias, the
+/// templates from `rocky.toml` and the separator that resolves them, the
+/// data location behind that alias, and any shadow or branch override.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResumeTarget {
+    /// The target adapter name (a config alias).
+    pub adapter: String,
+    /// The target catalog template, verbatim.
+    pub catalog_template: String,
+    /// The target schema template, verbatim.
+    pub schema_template: String,
+    /// What the separator did to the templates above — see
+    /// [`ResumeSeparator`]. `[target] separator` when set, else the source
+    /// pattern's.
+    ///
+    /// `None` only on a checkpoint written by an unreleased build, which
+    /// either did not record the separator or recorded it without
+    /// classifying it (under the old `separator` key, which this build no
+    /// longer reads). A scope this build makes is always `Some`, so such a
+    /// checkpoint never equals a resuming invocation: the resume refuses it
+    /// as a scope mismatch rather than trusting routing it cannot check.
+    #[serde(default)]
+    pub separator_role: Option<ResumeSeparator>,
+    /// The data location behind the adapter alias
+    /// ([`crate::config::AdapterConfig::endpoint_identity`]) — secret-free,
+    /// so the same alias re-pointed at another warehouse is a different
+    /// scope.
+    pub endpoint: crate::config::EndpointIdentity,
+    /// The `--shadow` / `--shadow-schema` / `--branch` override, when any.
+    #[serde(default)]
+    pub shadow: Option<ResumeShadow>,
+}
+
+/// Whether the target separator could reach the names a replication run
+/// resolved — the only reason it belongs in a resume scope.
+///
+/// A separator joins a **bare** multi-valued placeholder (`{regions}`) and
+/// does nothing else: `{regions:_}` pins its own, `{source}` is
+/// single-valued, and a template with no placeholder has nothing to join.
+/// So an edit to `[target] separator` moves a physical schema name in the
+/// first case only. Recording the raw value in the other cases refused a
+/// resume over a config edit that could not reach the warehouse (#1582).
+///
+/// [`crate::schema::SchemaPattern::separator_joins_a_placeholder`] decides
+/// which case a config is in, using the resolver's own scanner.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeSeparator {
+    /// A bare multi-valued placeholder joins with this separator, so its
+    /// value is part of the resolved names. Two configs that differ only
+    /// here route to different physical schemas.
+    Joins(String),
+    /// No template joins a multi-valued placeholder, so no separator value
+    /// changes a resolved name. The value itself is deliberately not
+    /// recorded: it is not part of this run's routing.
+    Unused,
+}
+
+/// The shadow or branch override a replication run wrote under.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeShadow {
+    /// `--shadow`: every target table name carries this suffix.
+    Suffix(String),
+    /// `--shadow-schema` or `--branch`: the writes land in this schema.
+    Schema(String),
 }
 
 impl std::fmt::Display for ResumeScope {
@@ -2349,7 +2443,31 @@ impl std::fmt::Display for ResumeScope {
             Some(filter) => write!(f, ", filter '{filter}'")?,
             None => write!(f, ", no filter")?,
         }
-        write!(f, ", target {}", self.target_routing)
+        match &self.target {
+            Some(target) => write!(f, ", target {target}"),
+            None => write!(f, ", target unrecorded"),
+        }
+    }
+}
+
+impl std::fmt::Display for ResumeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}.{} ",
+            self.adapter, self.catalog_template, self.schema_template
+        )?;
+        match &self.separator_role {
+            Some(ResumeSeparator::Joins(separator)) => write!(f, "separator({separator}) ")?,
+            Some(ResumeSeparator::Unused) => write!(f, "separator unused ")?,
+            None => write!(f, "separator unrecorded ")?,
+        }
+        write!(f, "endpoint({})", self.endpoint)?;
+        match &self.shadow {
+            Some(ResumeShadow::Suffix(suffix)) => write!(f, " shadow(suffix={suffix})"),
+            Some(ResumeShadow::Schema(schema)) => write!(f, " shadow(schema={schema})"),
+            None => Ok(()),
+        }
     }
 }
 
@@ -3057,9 +3175,16 @@ impl StateStore {
     /// `quality_history` — when each is listed in
     /// [`StateRetentionConfig::applies_to`]. Operational tables
     /// (`schema_cache`, `watermarks`, `partitions`, `loaded_files`,
-    /// `branches`, `idempotency_keys`, `grace_periods`, `run_progress`,
-    /// `check_history`) are never touched: they hold live state, not
-    /// history.
+    /// `branches`, `idempotency_keys`, `grace_periods`, `check_history`)
+    /// are never touched: they hold live state, not history.
+    ///
+    /// A swept run record takes its checkpoint with it: the `run_progress`
+    /// header and the `run_progress_entries` rows keyed by that run id are
+    /// removed in the same write transaction as the record, so a resume can
+    /// never find a checkpoint whose record retention already dropped. A
+    /// checkpoint with **no** record — a run that crashed before writing
+    /// one — is never swept, whatever its age; the sweep only follows
+    /// `run_history` keys.
     ///
     /// For each domain:
     ///
@@ -3163,7 +3288,10 @@ impl StateStore {
     ///
     /// Reads every row, pairs its key with `started_at`, decides which
     /// keys to delete (older than `cutoff` and not in the most recent
-    /// `min_keep`), then issues all deletes in a single write transaction.
+    /// `min_keep`), then issues all deletes in a single write transaction —
+    /// each run record together with its `run_progress` header and
+    /// `run_progress_entries` rows, so a record and its checkpoint are
+    /// dropped atomically or not at all.
     fn sweep_run_history(
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
@@ -3176,9 +3304,24 @@ impl StateStore {
         if !to_delete.is_empty() {
             let txn = self.db.begin_write()?;
             {
-                let mut table = txn.open_table(RUN_HISTORY)?;
-                for key in &to_delete {
-                    table.remove(key.as_str())?;
+                let mut history = txn.open_table(RUN_HISTORY)?;
+                let mut headers = txn.open_table(RUN_PROGRESS)?;
+                let mut entries = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+                for run_id in &to_delete {
+                    history.remove(run_id.as_str())?;
+                    headers.remove(run_id.as_str())?;
+                    let prefix = format!("{run_id}|");
+                    let mut entry_keys = Vec::new();
+                    for entry in entries.range(prefix.as_str()..)? {
+                        let (key, _) = entry?;
+                        if !key.value().starts_with(&prefix) {
+                            break;
+                        }
+                        entry_keys.push(key.value().to_string());
+                    }
+                    for key in &entry_keys {
+                        entries.remove(key.as_str())?;
+                    }
                 }
             }
             self.commit_write(txn)?;
@@ -8247,7 +8390,19 @@ mod tests {
         ResumeScope {
             pipeline: pipeline.to_string(),
             filter: None,
-            target_routing: format!("default:wh.staging_{pipeline}__{{source}}"),
+            target: Some(ResumeTarget {
+                adapter: "default".to_string(),
+                catalog_template: "wh".to_string(),
+                schema_template: format!("staging_{pipeline}__{{source}}"),
+                separator_role: Some(ResumeSeparator::Joins("__".to_string())),
+                endpoint: crate::config::EndpointIdentity {
+                    adapter_type: "duckdb".to_string(),
+                    locators: [("path".to_string(), "/tmp/wh.duckdb".to_string())]
+                        .into_iter()
+                        .collect(),
+                },
+                shadow: None,
+            }),
         }
     }
 
@@ -8354,6 +8509,154 @@ mod tests {
         let round_trip: RunProgress =
             serde_json::from_slice(&serde_json::to_vec(&scoped).unwrap()).unwrap();
         assert_eq!(round_trip.scope, scoped.scope);
+    }
+
+    /// The unreleased build between #1573 and the structured scope wrote
+    /// the routing as one flat `target_routing` string. Such a header must
+    /// forward-deserialize with `target: None` — a read failure would break
+    /// every scoped lookup over the whole store — and must never be
+    /// selected for, or equal to, a live scope.
+    #[test]
+    fn test_pre_release_v23_scope_forward_deserializes_target_none() {
+        let (store, _dir) = temp_store();
+        let blob = serde_json::json!({
+            "run_id": "run-flat",
+            "started_at": "2026-08-30T00:00:00Z",
+            "total_tables": 1,
+            "tables": [],
+            "scope": {
+                "pipeline": "p1",
+                "filter": null,
+                "target_routing":
+                    "default:wh.staging_p1__{source} endpoint(duckdb path=/tmp/wh.duckdb)",
+            },
+        });
+        let bytes = serde_json::to_vec(&blob).unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut header = txn.open_table(RUN_PROGRESS).unwrap();
+                header.insert("run-flat", bytes.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let progress = store.get_run_progress("run-flat").unwrap().unwrap();
+        let recorded = progress.scope.expect("the flat scope still deserializes");
+        assert_eq!(recorded.pipeline, "p1");
+        assert!(recorded.target.is_none());
+        assert_ne!(recorded, progress_scope("p1"));
+        assert_eq!(
+            recorded.to_string(),
+            "pipeline 'p1', no filter, target unrecorded"
+        );
+
+        assert!(
+            store
+                .get_latest_run_progress_for_scope(&progress_scope("p1"))
+                .unwrap()
+                .is_none(),
+            "a flat-scope header is never a --resume-latest candidate"
+        );
+        assert_eq!(
+            store.get_latest_run_progress().unwrap().unwrap().run_id,
+            "run-flat",
+            "the unscoped reader still lists it — nothing else in the store breaks"
+        );
+    }
+
+    /// Two unreleased builds wrote a structured target this one cannot
+    /// check: one recorded no separator at all, the other recorded a raw
+    /// `separator` string without saying whether it joined anything. Both
+    /// must still deserialize — a read failure would break every scoped
+    /// lookup over the whole store — and neither may equal a live scope.
+    #[test]
+    fn test_pre_release_v23_unclassified_separators_never_match() {
+        let live = progress_scope("p1");
+        let cases = [
+            ("run-no-sep", None),
+            ("run-raw-sep", Some(serde_json::json!("__"))),
+        ];
+        for (run_id, raw_separator) in cases {
+            let (store, _dir) = temp_store();
+            let mut blob = serde_json::to_value(&live).unwrap();
+            let target = blob["target"]
+                .as_object_mut()
+                .expect("the target is an object");
+            target
+                .remove("separator_role")
+                .expect("a live scope classifies its separator");
+            if let Some(raw) = raw_separator.clone() {
+                target.insert("separator".to_string(), raw);
+            }
+            let header = serde_json::json!({
+                "run_id": run_id,
+                "started_at": "2026-08-30T00:00:00Z",
+                "total_tables": 1,
+                "tables": [],
+                "scope": blob,
+            });
+            let bytes = serde_json::to_vec(&header).unwrap();
+            {
+                let txn = store.db.begin_write().unwrap();
+                {
+                    let mut table = txn.open_table(RUN_PROGRESS).unwrap();
+                    table.insert(run_id, bytes.as_slice()).unwrap();
+                }
+                txn.commit().unwrap();
+            }
+
+            let progress = store.get_run_progress(run_id).unwrap().unwrap();
+            let recorded = progress.scope.expect("the older target still deserializes");
+            let target = recorded.target.as_ref().expect("the target is structured");
+            assert!(target.separator_role.is_none(), "{run_id}");
+            assert_ne!(recorded, live, "{run_id}");
+            assert!(
+                recorded.to_string().contains("separator unrecorded"),
+                "the refusal must say what is missing: {recorded}"
+            );
+            assert!(
+                store
+                    .get_latest_run_progress_for_scope(&live)
+                    .unwrap()
+                    .is_none(),
+                "{run_id} is never a --resume-latest candidate"
+            );
+        }
+    }
+
+    /// The classified separator is the compared value, and `Unused` is a
+    /// shape of its own — never the same as any joined separator, and never
+    /// the same as an unclassified one.
+    #[test]
+    fn test_resume_separator_roles_are_three_distinct_shapes() {
+        let with_role = |role: Option<ResumeSeparator>| -> ResumeScope {
+            let mut scope = progress_scope("p1");
+            scope.target.as_mut().unwrap().separator_role = role;
+            scope
+        };
+        let joins = with_role(Some(ResumeSeparator::Joins("__".to_string())));
+        let other = with_role(Some(ResumeSeparator::Joins("_".to_string())));
+        let unused = with_role(Some(ResumeSeparator::Unused));
+        let unrecorded = with_role(None);
+
+        assert_ne!(joins, other);
+        assert_ne!(joins, unused);
+        assert_ne!(unused, unrecorded);
+        assert_eq!(unused, with_role(Some(ResumeSeparator::Unused)));
+
+        // The persisted spelling is pinned: it is compared across binaries.
+        let role_of = |scope: &ResumeScope| {
+            serde_json::to_value(scope).unwrap()["target"]["separator_role"].clone()
+        };
+        assert_eq!(role_of(&joins), serde_json::json!({ "joins": "__" }));
+        assert_eq!(role_of(&unused), serde_json::json!("unused"));
+        assert_eq!(role_of(&unrecorded), serde_json::Value::Null);
+        for scope in [&joins, &unused, &unrecorded] {
+            let round_trip: ResumeScope =
+                serde_json::from_value(serde_json::to_value(scope).unwrap()).unwrap();
+            assert_eq!(&round_trip, scope);
+        }
     }
 
     #[test]
@@ -9977,6 +10280,88 @@ mod tests {
         for r in &remaining {
             assert!(r.run_id.starts_with("recent-"));
         }
+    }
+
+    /// A swept run record takes its checkpoint with it — the `run_progress`
+    /// header and its per-table entries — while the checkpoints of kept
+    /// runs, of a run whose id shares a prefix, and of a record-less
+    /// (crashed) run stay put.
+    #[test]
+    fn sweep_retention_drops_the_checkpoint_with_its_run_record() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        let scope = progress_scope("p1");
+        // `old` is swept; `old-2` shares its prefix but is recent, so it is
+        // kept — the entry scan keys on `"{run_id}|"` and must not bleed.
+        for (run_id, age) in [
+            ("old", chrono::Duration::days(700)),
+            ("old-2", chrono::Duration::hours(2)),
+            ("recent", chrono::Duration::days(1)),
+        ] {
+            store.record_run(&run_at(run_id, now - age)).unwrap();
+            store.init_run_progress(run_id, 2, Some(&scope)).unwrap();
+            for (index, key) in ["cat.sch.a", "cat.sch.b"].iter().enumerate() {
+                store
+                    .record_table_progress(
+                        run_id,
+                        &progress_entry(index, key, TableStatus::Success),
+                    )
+                    .unwrap();
+            }
+        }
+        store.init_run_progress("crashed", 1, Some(&scope)).unwrap();
+        store
+            .record_table_progress(
+                "crashed",
+                &progress_entry(0, "cat.sch.a", TableStatus::Success),
+            )
+            .unwrap();
+
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 0,
+            applies_to: vec![StateRetentionDomain::History],
+            ..StateRetentionConfig::default()
+        };
+        let dry = store.sweep_retention_dry_run(&policy).unwrap();
+        assert_eq!(dry.runs_deleted, 1);
+        assert!(
+            store.get_run_progress("old").unwrap().is_some(),
+            "a dry run deletes nothing"
+        );
+
+        let report = store.sweep_retention(&policy).unwrap();
+        assert_eq!(report.runs_deleted, 1);
+        assert!(store.get_run("old").unwrap().is_none());
+        assert!(
+            store.get_run_progress("old").unwrap().is_none(),
+            "the checkpoint header goes with the record"
+        );
+        {
+            let txn = store.db.begin_read().unwrap();
+            let entries = txn.open_table(RUN_PROGRESS_ENTRIES).unwrap();
+            let leftover: Vec<String> = entries
+                .iter()
+                .unwrap()
+                .map(|entry| entry.unwrap().0.value().to_string())
+                .filter(|key| key.starts_with("old|"))
+                .collect();
+            assert!(
+                leftover.is_empty(),
+                "the per-table entries go with the header: {leftover:?}"
+            );
+        }
+        for kept in ["old-2", "recent"] {
+            assert!(store.get_run(kept).unwrap().is_some(), "{kept} is kept");
+            let progress = store.get_run_progress(kept).unwrap().unwrap();
+            assert_eq!(progress.tables.len(), 2, "{kept} keeps its entries");
+        }
+        let crashed = store.get_run_progress("crashed").unwrap().unwrap();
+        assert_eq!(
+            crashed.tables.len(),
+            1,
+            "a checkpoint with no run record is never swept"
+        );
     }
 
     #[test]
