@@ -237,16 +237,29 @@ pub fn generate_custom_check_sql(
 /// Generates the cross-source overlap query for a set of ≥2 sibling tables.
 ///
 /// `key_exprs` is the business key — a list of column names (a composite tuple)
-/// or a single derived expression — already vetted by the caller (columns
-/// validated as identifiers; a `key_expr` is trusted config, passed verbatim).
+/// or a single derived expression. Columns are validated as identifiers by
+/// `CrossSourceOverlapConfig::resolved_key_exprs`; a `key_expr` is free-text
+/// SQL, so it is refused here if it could end the statement and start another
+/// (it is spliced three times per query — the inner `SELECT`, the outer
+/// `SELECT`, and the `GROUP BY`).
+///
 /// Each sibling is tagged with its fully-qualified ref and `UNION ALL`'d; the
 /// outer query returns the key values appearing in more than one sibling, so
 /// the result's row count is the overlap count and the rows are the sample.
+///
+/// # Errors
+///
+/// Returns [`SqlGenError::Validation`] when a key expression carries a
+/// statement terminator or an unbalanced quote, and a dialect error when a
+/// sibling's table reference cannot be formatted.
 pub fn generate_cross_source_overlap_sql(
     siblings: &[TableRef],
     key_exprs: &[String],
     dialect: &dyn SqlDialect,
 ) -> Result<String, SqlGenError> {
+    for k in key_exprs {
+        rocky_sql::validation::reject_statement_terminator("cross_source_overlap `key_expr`", k)?;
+    }
     let key_list = key_exprs.join(", ");
     let not_null = key_exprs
         .iter()
@@ -786,6 +799,35 @@ mod tests {
         assert!(sql.contains("clientid, databaseid"));
         assert!(sql.contains("clientid IS NOT NULL AND databaseid IS NOT NULL"));
         assert!(sql.contains("GROUP BY clientid, databaseid"));
+    }
+
+    #[test]
+    fn test_cross_source_overlap_key_expr_refuses_a_statement_terminator() {
+        // `key_expr` is free-text SQL from `rocky.toml` and lands three times
+        // in one query (inner SELECT, outer SELECT, GROUP BY) — issue #1524.
+        let siblings = vec![sibling("s1", "t"), sibling("s2", "t")];
+        let err = generate_cross_source_overlap_sql(
+            &siblings,
+            &["md5(a)); SELECT 1; --".into()],
+            &dialect(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(msg.contains("cross_source_overlap `key_expr`"), "{msg}");
+    }
+
+    #[test]
+    fn test_cross_source_overlap_key_expr_accepts_quoted_literals() {
+        // The shipped POC key: quoted `'|'` separator, balanced, no terminator.
+        let siblings = vec![sibling("s1", "t"), sibling("s2", "t")];
+        let sql = generate_cross_source_overlap_sql(
+            &siblings,
+            &["md5(CAST(customer_id AS VARCHAR) || '|' || CAST(order_date AS VARCHAR))".into()],
+            &dialect(),
+        )
+        .unwrap();
+        assert!(sql.contains("md5(CAST(customer_id AS VARCHAR)"), "{sql}");
     }
 
     #[test]

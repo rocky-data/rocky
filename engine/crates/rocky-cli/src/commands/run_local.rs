@@ -773,19 +773,34 @@ pub(crate) async fn run_table_assertions(
             continue;
         }
         let test = &assertion.test;
+        let kind = rocky_core::tests::test_type_kind(&test.test_type);
+        let name = assertion.resolved_name();
         let sql = match generate_test_sql_with_dialect(test, full_table, dialect) {
             Ok(s) => s,
             Err(e) => {
+                // A check that will not run must NOT vanish from the tally —
+                // a silent `continue` here made "N checks passed" overstate.
+                // Report it as a failing check at the check's own severity,
+                // the same shape the failed-query arm below uses.
                 warn!(
                     error = %e,
                     table = %full_table,
-                    "failed to generate assertion SQL — skipping"
+                    assertion = %name,
+                    "failed to generate assertion SQL — reporting the check as failed"
                 );
+                results.push(CheckResult {
+                    name,
+                    passed: false,
+                    severity: test.severity,
+                    details: CheckDetails::Assertion {
+                        kind: kind.to_string(),
+                        column: test.column.clone(),
+                        failing_rows: 0,
+                    },
+                });
                 continue;
             }
         };
-        let kind = rocky_core::tests::test_type_kind(&test.test_type);
-        let name = assertion.resolved_name();
 
         match warehouse.execute_query(&sql).await {
             Ok(result) => {
@@ -2351,6 +2366,65 @@ auto_create_schemas = true
             "an unparseable count must fail the check, not pass on a defaulted 0"
         );
         assert!(results[1].passed, "a genuine 0 <= threshold still passes");
+    }
+
+    #[tokio::test]
+    async fn refused_assertion_sql_still_appears_in_the_tally() {
+        // A check whose SQL Rocky refuses to generate must be REPORTED as a
+        // failed check, not dropped. A silent skip made "N checks passed"
+        // overstate — the property #1495 protects, and the reason issue #1524
+        // insists a refusal stays visible.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("assertions.duckdb");
+        {
+            let a = DuckDbWarehouseAdapter::open(&db).expect("open");
+            a.execute_statement("CREATE SCHEMA IF NOT EXISTS main")
+                .await
+                .unwrap();
+            a.execute_statement("CREATE TABLE main.t AS SELECT 1 AS id")
+                .await
+                .unwrap();
+        }
+        let warehouse = DuckDbWarehouseAdapter::open(&db).expect("reopen");
+        let dialect = warehouse.dialect();
+
+        let refused = rocky_core::config::QualityAssertion {
+            table: "t".into(),
+            name: Some("injected".into()),
+            test: rocky_core::tests::TestDecl {
+                test_type: rocky_core::tests::TestType::Expression {
+                    expression: "1=1); SELECT 1; --".into(),
+                },
+                column: None,
+                severity: rocky_core::tests::TestSeverity::Error,
+                filter: None,
+            },
+        };
+        let ok = rocky_core::config::QualityAssertion {
+            table: "t".into(),
+            name: Some("id_not_null".into()),
+            test: rocky_core::tests::TestDecl {
+                test_type: rocky_core::tests::TestType::NotNull,
+                column: Some("id".into()),
+                severity: rocky_core::tests::TestSeverity::Error,
+                filter: None,
+            },
+        };
+
+        let results =
+            super::run_table_assertions(&warehouse, dialect, "main.t", "t", &[refused, ok]).await;
+
+        assert_eq!(
+            results.len(),
+            2,
+            "the refused check must stay in the tally, not vanish: {results:?}"
+        );
+        assert_eq!(results[0].name, "injected");
+        assert!(
+            !results[0].passed,
+            "a refused check must not report as passed"
+        );
+        assert!(results[1].passed);
     }
 
     /// Single-decision lazy gate: the dispatch site's resolved

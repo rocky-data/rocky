@@ -431,6 +431,20 @@ fn generate_test_sql_inner(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
+    // `filter` is user-supplied SQL spliced into every arm below, so refuse a
+    // statement terminator here — before the per-arm dispatch, so a `filter`
+    // on a kind that later returns its own error (e.g. `regex_match` without a
+    // dialect) still reports the injection rather than the other failure.
+    if let Some(f) = filter {
+        validation::reject_statement_terminator(
+            &format!(
+                "{} test `filter` on {table}",
+                test_type_kind(&test.test_type)
+            ),
+            f,
+        )?;
+    }
+
     match &test.test_type {
         TestType::NotNull => {
             let col = require_column(test, "not_null")?;
@@ -488,7 +502,14 @@ fn generate_test_sql_inner(
                 return Err(TestGenError::MissingExpression);
             }
             // Expression is user-supplied SQL — we cannot validate it as an
-            // identifier. The caller is responsible for sandboxing execution.
+            // identifier. It is spliced inside parentheses, so it must be one
+            // expression: refuse anything that could close the statement and
+            // start another. Expression-scoped reads (subqueries, DuckDB
+            // `read_csv`) are still evaluated with the project's credentials.
+            validation::reject_statement_terminator(
+                &format!("expression test `expression` on {table}"),
+                expression,
+            )?;
             Ok(format!(
                 "SELECT COUNT(*) FROM {table} WHERE {}NOT ({expression})",
                 filter_and(filter),
@@ -569,6 +590,14 @@ fn generate_test_sql_inner(
             // `filter` to scope NULL keys out). The expression is repeated in
             // GROUP BY rather than referencing the `_k` alias because not all
             // dialects (Databricks, BigQuery) allow grouping by a select alias.
+            //
+            // The expression is spliced TWICE into one statement, so an
+            // unbalanced quote could pair across the two copies — see
+            // `reject_statement_terminator`, which refuses that too.
+            validation::reject_statement_terminator(
+                &format!("unique_expr test `key_expr` on {table}"),
+                key_expr,
+            )?;
             let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
             Ok(format!(
                 "SELECT ({key_expr}) AS _k, COUNT(*) FROM {table}{where_clause} GROUP BY ({key_expr}) HAVING COUNT(*) > 1"
@@ -1556,5 +1585,137 @@ value = "0"
         };
         let err = generate_test_sql(&decl, "t").unwrap_err();
         assert!(err.to_string().contains("requires a 'days' field"));
+    }
+
+    // ----- Statement-terminator refusal (issue #1524) -----
+    //
+    // Each user-supplied SQL fragment (`expression`, `filter`, `key_expr`) is
+    // spliced inside parentheses into a statement Rocky builds. A `;` in the
+    // fragment would let the author's text end that statement and start
+    // another. `generate_test_sql*` refuses it at generation time.
+
+    #[test]
+    fn expression_refuses_a_statement_terminator() {
+        let decl = TestDecl {
+            test_type: TestType::Expression {
+                expression: "1=1) OR (1=1); SELECT 1; --".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(
+            msg.contains("expression test `expression` on db.sc.orders"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn filter_refuses_a_statement_terminator() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("customer_id".into()),
+            severity: TestSeverity::Error,
+            filter: Some("1=1); SELECT 1; --".into()),
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(
+            msg.contains("not_null test `filter` on db.sc.orders"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn filter_is_refused_before_a_kind_specific_error() {
+        // `regex_match` without a dialect returns `RegexNotSupported`. The
+        // filter gate runs BEFORE the per-kind dispatch, so an injected filter
+        // reports the injection, not the missing dialect.
+        let decl = TestDecl {
+            test_type: TestType::RegexMatch {
+                pattern: "^a".into(),
+            },
+            column: Some("code".into()),
+            severity: TestSeverity::Error,
+            filter: Some("1=1); SELECT 1; --".into()),
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(!msg.contains("not supported"), "{msg}");
+    }
+
+    #[test]
+    fn key_expr_refuses_a_statement_terminator() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "md5(a)); SELECT 1; --".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(
+            msg.contains("unique_expr test `key_expr` on db.sc.orders"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn key_expr_refuses_an_unbalanced_quote() {
+        // `key_expr` is spliced TWICE (SELECT + GROUP BY), so an odd quote
+        // count pairs across the two copies and can expose the tail of the
+        // second copy as live SQL. Refuse the imbalance itself.
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "a' ; SELECT 1; --".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        assert!(err.to_string().contains("unterminated"), "{err}");
+    }
+
+    #[test]
+    fn expression_refuses_a_single_trailing_terminator() {
+        // Strictness call: a trailing `;` is refused, not trimmed. The
+        // fragment is spliced as `NOT (…)`, so `NOT (amount > 0;)` is already
+        // a syntax error at execute time — refusing breaks no working config
+        // and never silently rewrites the author's SQL.
+        let decl = TestDecl {
+            test_type: TestType::Expression {
+                expression: "amount > 0;".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "t").unwrap_err();
+        assert!(err.to_string().contains("statement terminator"), "{err}");
+    }
+
+    #[test]
+    fn fragments_still_accept_quoted_semicolons_and_comments() {
+        // The false-positive set: a `;` inside a string literal, a quoted
+        // identifier, a line comment or a block comment is not a terminator.
+        let decl = TestDecl {
+            test_type: TestType::Expression {
+                expression: "note <> 'a;b' /* ; */ AND \"odd;col\" > 0 -- ;\n".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: Some("region = 'US;CA'".into()),
+        };
+        let sql = generate_test_sql(&decl, "orders").unwrap();
+        assert!(sql.contains("(region = 'US;CA') AND NOT ("), "{sql}");
     }
 }
