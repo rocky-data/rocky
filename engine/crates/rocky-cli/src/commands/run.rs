@@ -1421,6 +1421,15 @@ fn require_resume_progress(
 /// editing it then does not refuse a resume it could not have invalidated
 /// (#1582).
 ///
+/// The templates it asks about are the ones this run **renders**. A
+/// `--shadow-schema` or `--branch` override supplies the schema name
+/// outright, so the resolver never renders `schema_template` and no
+/// separator value can reach a name through it; only `catalog_template`
+/// can be joined then, and it still is, because the override does not
+/// touch the catalog. Classifying a bypassed template recorded a fact that
+/// did not hold, and refused a resume over an edit that moved nothing
+/// (#1586).
+///
 /// [`AdapterConfig::endpoint_identity`]: rocky_core::config::AdapterConfig::endpoint_identity
 /// [`SchemaPattern::separator_joins_a_placeholder`]: rocky_core::schema::SchemaPattern::separator_joins_a_placeholder
 /// [`ResumeSeparator::Unused`]: rocky_core::state::ResumeSeparator::Unused
@@ -1439,11 +1448,21 @@ fn replication_resume_scope(
         Some(schema) => ResumeShadow::Schema(schema.clone()),
         None => ResumeShadow::Suffix(shadow.suffix.clone()),
     });
-    // Both templates are resolved with this separator, so either one having
-    // a bare multi-valued placeholder makes it part of the routing.
-    let separator_role = if pattern
-        .separator_joins_a_placeholder(&[&target.catalog_template, &target.schema_template])
-    {
+    // Ask only the templates the resolver renders with this separator. A
+    // schema override replaces `schema_template` outright, so a separator
+    // that would have joined a placeholder in it reaches no name. The
+    // catalog template is rendered either way. Derived from `shadow` above
+    // rather than reading `schema_override` a second time, so the two
+    // readings cannot drift apart.
+    let renders_schema_template = match &shadow {
+        Some(ResumeShadow::Schema(_)) => false,
+        Some(ResumeShadow::Suffix(_)) | None => true,
+    };
+    let mut rendered_templates = vec![target.catalog_template.as_str()];
+    if renders_schema_template {
+        rendered_templates.push(target.schema_template.as_str());
+    }
+    let separator_role = if pattern.separator_joins_a_placeholder(&rendered_templates) {
         ResumeSeparator::Joins(separator.to_string())
     } else {
         ResumeSeparator::Unused
@@ -12495,9 +12514,13 @@ mod tests {
         use rocky_core::config::{AdapterConfig, PipelineTargetConfig};
         use rocky_core::shadow::ShadowConfig;
 
-        // `{regions}` is the variadic component of `test_schema_pattern()`,
-        // so the separator joins it and rides in the blob. The template that
-        // joins nothing is pinned separately below — both shapes are stored.
+        // `{regions}` is the variadic component of `test_schema_pattern()`.
+        // The branch override below replaces `schema_template`, so the
+        // resolver never renders it and the separator reaches no name
+        // through it — `catalog_template = "wh"` joins nothing either, so
+        // this fully populated scope pins the `unused` shape (#1586). The
+        // joined shape is pinned by
+        // `resume_refuses_a_checkpoint_written_with_another_separator`.
         let target: PipelineTargetConfig = toml::from_str(
             r#"
 adapter = "default"
@@ -12539,7 +12562,7 @@ token = "dapi-SECRET"
                     "adapter": "default",
                     "catalog_template": "wh",
                     "schema_template": "staging__{regions}",
-                    "separator_role": { "joins": "__" },
+                    "separator_role": "unused",
                     "endpoint": {
                         "adapter_type": "databricks",
                         "locators": {
@@ -12557,14 +12580,15 @@ token = "dapi-SECRET"
             scope.to_string(),
             format!(
                 "pipeline 'p1', filter 'client=acme', target default:wh.staging__{{regions}} \
-                 separator(__) endpoint(databricks host=https://adb-1.azuredatabricks.net \
+                 separator unused endpoint(databricks host=https://adb-1.azuredatabricks.net \
                  host_route_digest={DATABRICKS_ROUTE_DIGEST} \
                  http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature)"
             )
         );
 
         // A template no separator joins stores the fact, never the value —
-        // and says so in the message.
+        // and says so in the message. This one reaches `unused` with no
+        // override at all, so both routes to that shape are covered.
         let single_valued: PipelineTargetConfig = toml::from_str(
             "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"staging__{source}\"\nseparator = \"--\"\n",
         )
@@ -12613,6 +12637,20 @@ token = "dapi-SECRET"
         // old `endpoint(...)` text and open a `shadow(schema=x)` of its own
         // renders exactly like a real `--shadow-schema x` run on the plain
         // path. The rendered strings collide; the structured scopes do not.
+        //
+        // The pair needs a target whose separator role is the same with and
+        // without a schema override, or the two would differ on that field
+        // instead and the collision would not be exercised. The variadic
+        // placeholder therefore sits in the CATALOG template, which an
+        // override does not replace: both sides classify as `joins` (#1586).
+        let injection_target: PipelineTargetConfig = toml::from_str(
+            r#"
+adapter = "default"
+catalog_template = "wh__{regions}"
+schema_template = "staging__{regions}"
+"#,
+        )
+        .unwrap();
         let injected: AdapterConfig = toml::from_str(
             r#"
 type = "databricks"
@@ -12621,7 +12659,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
 "#,
         )
         .unwrap();
-        let forged = resume_scope_for_test("p1", &target, &injected);
+        let forged = resume_scope_for_test("p1", &injection_target, &injected);
         let real_shadow = ShadowConfig {
             suffix: "_rocky_shadow".to_string(),
             schema_override: Some("x".to_string()),
@@ -12629,12 +12667,17 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         };
         let genuine = replication_resume_scope(
             "p1",
-            &target,
+            &injection_target,
             &adapter,
             None,
             Some(&real_shadow),
             "__",
             &test_schema_pattern(),
+        );
+        assert_eq!(
+            serde_json::to_value(&genuine).unwrap()["target"]["separator_role"],
+            serde_json::json!({ "joins": "__" }),
+            "an override does not replace the catalog template, so it still joins"
         );
         assert_eq!(
             forged.to_string(),
@@ -13249,6 +13292,123 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
                 .unwrap_or_else(|err| panic!("'{schema_template}' must still resume: {err:#}"))
                 .expect("--resume-latest selects it");
         }
+    }
+
+    /// A `--shadow-schema` or `--branch` override supplies the target schema
+    /// name outright, so the resolver never renders `schema_template` (see
+    /// the `schema_override.clone().unwrap_or_else(...)` pair in this file).
+    /// A separator that would have joined a bare `{regions}` in that template
+    /// therefore reaches no physical name, and editing it must not refuse a
+    /// resume. Classifying the bypassed template as joined recorded a fact
+    /// that did not hold (#1586).
+    ///
+    /// The catalog template is the carve-out: an override does not replace
+    /// it, the resolver still renders it with the same separator, and a
+    /// separator change there still refuses.
+    #[test]
+    fn resume_survives_a_separator_change_a_schema_override_bypasses() {
+        use rocky_core::config::PipelineTargetConfig;
+        use rocky_core::shadow::ShadowConfig;
+
+        let branch = ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__feature".to_string()),
+            cleanup_after: false,
+        };
+        let adapter = test_duckdb_adapter(None);
+        let scope = |target: &PipelineTargetConfig, separator: &str| -> ResumeScope {
+            replication_resume_scope(
+                "p1",
+                target,
+                &adapter,
+                None,
+                Some(&branch),
+                separator,
+                &test_schema_pattern(),
+            )
+        };
+        // A source schema whose `regions` binds TWO values, so a separator
+        // that could join anything would show.
+        let parsed = test_schema_pattern()
+            .parse("src__acme__us_west__us_central__shopify")
+            .unwrap();
+
+        // The schema template WOULD join under no override — that is the
+        // whole point of the case.
+        let bypassed: PipelineTargetConfig = toml::from_str(
+            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"raw__{regions}\"\n",
+        )
+        .unwrap();
+        assert_ne!(
+            parsed.resolve_template("raw__{regions}", "_"),
+            parsed.resolve_template("raw__{regions}", "--"),
+            "the template really would move under a separator change"
+        );
+        assert_eq!(
+            serde_json::to_value(scope(&bypassed, "_")).unwrap()["target"]["separator_role"],
+            serde_json::json!("unused"),
+            "the override replaces the only template the separator could join"
+        );
+        // Why skipping stays correct: the run writes into `branch__feature`
+        // whatever the separator is, and the catalog resolves the same too.
+        assert_eq!(
+            parsed.resolve_template("wh", "_"),
+            parsed.resolve_template("wh", "--"),
+            "'wh' would move under a separator change"
+        );
+
+        let written = scope(&bypassed, "_");
+        let edited = scope(&bypassed, "--");
+        assert_eq!(
+            written, edited,
+            "a separator the override bypasses resolves the same names"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-written", 1, Some(&written))
+            .unwrap();
+        resolve_resume_progress(&store, Some("run-written"), false, &edited)
+            .expect("the bypassed separator must still resume")
+            .expect("the checkpoint is found");
+        resolve_resume_progress(&store, None, true, &edited)
+            .expect("the bypassed separator must still resume")
+            .expect("--resume-latest selects it");
+
+        // The carve-out: the same override, with the placeholder moved into
+        // the catalog template the override does not replace.
+        let catalog_joins: PipelineTargetConfig = toml::from_str(
+            "adapter = \"default\"\ncatalog_template = \"wh__{regions}\"\nschema_template = \"raw__{regions}\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(scope(&catalog_joins, "_")).unwrap()["target"]["separator_role"],
+            serde_json::json!({ "joins": "_" }),
+            "the catalog template is rendered under an override, so it counts"
+        );
+        let catalog_written = scope(&catalog_joins, "_");
+        let catalog_edited = scope(&catalog_joins, "--");
+        assert_ne!(
+            catalog_written, catalog_edited,
+            "a separator the catalog template joins still resolves other names"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-catalog", 1, Some(&catalog_written))
+            .unwrap();
+        let err = resolve_resume_progress(&store, Some("run-catalog"), false, &catalog_edited)
+            .expect_err("another catalog separator's checkpoint must not resume");
+        assert!(
+            err.to_string().contains("different pipeline scope"),
+            "unexpected error: {err:#}"
+        );
+        let err = resolve_resume_progress(&store, None, true, &catalog_edited)
+            .expect_err("--resume-latest must not select it");
+        assert!(
+            err.to_string().contains("no progress found"),
+            "unexpected error: {err:#}"
+        );
     }
 
     /// A checkpoint written by the unreleased build between #1573 and the

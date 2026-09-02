@@ -2411,6 +2411,11 @@ pub struct ResumeTarget {
 /// first case only. Recording the raw value in the other cases refused a
 /// resume over a config edit that could not reach the warehouse (#1582).
 ///
+/// Only the templates the run **renders** are asked. A `--shadow-schema`
+/// or `--branch` override supplies the schema name, so `schema_template`
+/// is never rendered and cannot carry the separator to a name; the catalog
+/// template is rendered either way and still can (#1586).
+///
 /// [`crate::schema::SchemaPattern::separator_joins_a_placeholder`] decides
 /// which case a config is in, using the resolver's own scanner.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2420,9 +2425,9 @@ pub enum ResumeSeparator {
     /// value is part of the resolved names. Two configs that differ only
     /// here route to different physical schemas.
     Joins(String),
-    /// No template joins a multi-valued placeholder, so no separator value
-    /// changes a resolved name. The value itself is deliberately not
-    /// recorded: it is not part of this run's routing.
+    /// No template this run renders joins a multi-valued placeholder, so no
+    /// separator value changes a resolved name. The value itself is
+    /// deliberately not recorded: it is not part of this run's routing.
     Unused,
 }
 
