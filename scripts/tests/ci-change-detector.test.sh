@@ -244,13 +244,20 @@ run_case() {
 }
 
 # $1 workflow file   $2 regex env var   $3 output key   $4 dir the step runs in
-# $5 a watched path this regex matches only through a `$`-anchored alternative
+# $5.. the watched paths this regex matches only through a `$`-anchored
+#      alternative — each is replayed as its own case, so a regex that drops
+#      one of them fails by name rather than hiding behind a sibling.
+#
+# They arrive as SEPARATE arguments, not one space-separated string. A string
+# would have to be word-split unquoted, and unquoted word-splitting also does
+# pathname expansion: `editors/vscode/package*.json` would silently become two
+# cases and mislabel both.
 run_suite() {
     WORKFLOW="$ROOT/.github/workflows/$1"
     REGEX_VAR="$2"
     OUT_KEY="$3"
     RUNDIR="$4"
-    DOLLAR_PATH="$5"
+    shift 4
 
     echo "$1 (${REGEX_VAR}, working directory: $RUNDIR):"
 
@@ -284,7 +291,9 @@ run_suite() {
     run_case "a path renamed out of the tree runs"     build_renamed_out     true
     run_case "a match early in a huge listing runs"    build_long_list       true
     run_case "a match after a non-match runs"          build_non_match_first true
-    run_case "$DOLLAR_PATH runs (\$-anchored)"         build_dollar_anchored true
+    for DOLLAR_PATH in "$@"; do
+        run_case "$DOLLAR_PATH runs (\$-anchored)"     build_dollar_anchored true
+    done
     run_case "a newline in a pathname runs"            build_newline_name    true
     run_case "a grep error runs and warns"             build_grep_error      true warn
     run_case "a failed diff runs and warns"            build_no_parent       true warn
@@ -295,8 +304,78 @@ run_suite() {
 
 run_suite engine-ci.yml      ENGINE_PATHS_RE  engine  engine \
     .claude/skills/rocky-ai-workflow/SKILL.md
+# The four generator pins are listed explicitly: they are the paths #1587 was
+# filed about, and a regex that watches the generated OUTPUT but not the tool
+# that writes it reads as covered while a dependabot bump skips the check.
 run_suite codegen-drift.yml  CODEGEN_PATHS_RE codegen . \
-    justfile
+    justfile \
+    editors/vscode/package.json \
+    editors/vscode/package-lock.json \
+    sdk/python/pyproject.toml \
+    sdk/python/uv.lock
+
+# --- the two lists must be the SAME list ------------------------------------
+
+# Each workflow states its watched paths twice: once as the `push:` trigger's
+# `paths:` filter, once as the regex the pull_request `changes` job matches
+# against. A comment says they must stay in sync. A comment is not a gate —
+# and the cases above only replay the paths someone remembered to list here,
+# so a path added to one side and forgotten on the other escapes them.
+#
+# This compares the whole of both sides, in BOTH directions. A path watched on
+# push but missing from the regex is a pull request that silently skips the
+# check (#1563, #1587). A regex alternative with no `paths:` entry is a push
+# that never runs it.
+parity_case() {
+    # $1 workflow file   $2 regex env var
+    WORKFLOW="$ROOT/.github/workflows/$1"
+    REGEX="$(extract_regex "$WORKFLOW" "$2")"
+
+    # `paths:` entries, normalized to the regex's own spelling: a `dir/**`
+    # glob is the prefix `dir/`, and an exact file is itself.
+    # A comment or a blank line inside the list is skipped, not treated as the
+    # end of it — the list carries explanatory comments between entries, and an
+    # earlier version of this parser stopped at the first one and then reported
+    # every path after it as missing.
+    FROM_PATHS="$(
+        awk '
+            /^  push:/                { in_push = 1; next }
+            in_push && /^  [a-z]/     { in_push = 0 }
+            in_push && /^    paths:/  { in_paths = 1; next }
+            in_paths && /^ *#/        { next }
+            in_paths && /^[[:space:]]*$/ { next }
+            in_paths && !/^      - /  { in_paths = 0 }
+            in_paths { gsub(/^      - .|.$/, ""); sub(/\/\*\*$/, "/"); print }
+        ' "$WORKFLOW" | sort -u
+    )"
+
+    # Regex alternatives, unescaped back to plain paths: strip the leading
+    # `^(`, the trailing `)`, split on `|`, drop a trailing `$`, unescape `\.`.
+    FROM_REGEX="$(
+        printf '%s\n' "$REGEX" \
+            | sed -e 's/^\^(//' -e 's/)$//' \
+            | tr '|' '\n' \
+            | sed -e 's/\$$//' -e 's/\\\././g' \
+            | sort -u
+    )"
+
+    if [ "$FROM_PATHS" = "$FROM_REGEX" ]; then
+        echo "  ok    $1 paths: and $2 are the same set ($(printf '%s\n' "$FROM_PATHS" | wc -l | tr -d ' ') paths)"
+        pass=$((pass + 1))
+        return
+    fi
+    echo "  FAIL  $1 paths: and $2 have diverged"
+    echo "        watched on push but NOT in the regex (a PR would skip the check):"
+    comm -23 <(printf '%s\n' "$FROM_PATHS") <(printf '%s\n' "$FROM_REGEX") | sed 's/^/          /'
+    echo "        in the regex but NOT watched on push (a push would not run it):"
+    comm -13 <(printf '%s\n' "$FROM_PATHS") <(printf '%s\n' "$FROM_REGEX") | sed 's/^/          /'
+    fail=$((fail + 1))
+}
+
+echo "push paths: <-> regex parity:"
+parity_case engine-ci.yml     ENGINE_PATHS_RE
+parity_case codegen-drift.yml CODEGEN_PATHS_RE
+echo
 
 if [ "$fail" -gt 0 ]; then
     echo "$pass passed, $fail FAILED"

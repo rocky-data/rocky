@@ -179,7 +179,12 @@ jobs:
       # clippy job's `--all-targets`). Like the prior `cargo test --all-targets`
       # it does not run doctests; the workspace has none.
       - name: Run tests (nextest)
-        run: cargo nextest run --all-features
+        # --no-fail-fast: one flake used to cancel the remaining ~5000 tests,
+        # so a red run reported a single failure and hid every unrelated one
+        # behind "N tests were not run due to test failure" (#1405). Retries
+        # are deliberately NOT added — they would bury a real intermittent
+        # hang, which is the defect #1405 exists to keep visible.
+        run: cargo nextest run --all-features --no-fail-fast
 
   clippy:
     name: Clippy
