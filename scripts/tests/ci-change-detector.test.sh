@@ -244,13 +244,15 @@ run_case() {
 }
 
 # $1 workflow file   $2 regex env var   $3 output key   $4 dir the step runs in
-# $5 a watched path this regex matches only through a `$`-anchored alternative
+# $5 space-separated watched paths this regex matches only through a
+#    `$`-anchored alternative — each is replayed as its own case, so a regex
+#    that drops one of them fails by name rather than hiding behind a sibling
 run_suite() {
     WORKFLOW="$ROOT/.github/workflows/$1"
     REGEX_VAR="$2"
     OUT_KEY="$3"
     RUNDIR="$4"
-    DOLLAR_PATH="$5"
+    DOLLAR_PATHS="$5"
 
     echo "$1 (${REGEX_VAR}, working directory: $RUNDIR):"
 
@@ -284,7 +286,9 @@ run_suite() {
     run_case "a path renamed out of the tree runs"     build_renamed_out     true
     run_case "a match early in a huge listing runs"    build_long_list       true
     run_case "a match after a non-match runs"          build_non_match_first true
-    run_case "$DOLLAR_PATH runs (\$-anchored)"         build_dollar_anchored true
+    for DOLLAR_PATH in $DOLLAR_PATHS; do
+        run_case "$DOLLAR_PATH runs (\$-anchored)"     build_dollar_anchored true
+    done
     run_case "a newline in a pathname runs"            build_newline_name    true
     run_case "a grep error runs and warns"             build_grep_error      true warn
     run_case "a failed diff runs and warns"            build_no_parent       true warn
@@ -295,8 +299,11 @@ run_suite() {
 
 run_suite engine-ci.yml      ENGINE_PATHS_RE  engine  engine \
     .claude/skills/rocky-ai-workflow/SKILL.md
+# The four generator pins are listed explicitly: they are the paths #1587 was
+# filed about, and a regex that watches the generated OUTPUT but not the tool
+# that writes it reads as covered while a dependabot bump skips the check.
 run_suite codegen-drift.yml  CODEGEN_PATHS_RE codegen . \
-    justfile
+    "justfile editors/vscode/package.json editors/vscode/package-lock.json sdk/python/pyproject.toml sdk/python/uv.lock"
 
 if [ "$fail" -gt 0 ]; then
     echo "$pass passed, $fail FAILED"
