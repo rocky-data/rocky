@@ -13036,18 +13036,19 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             .expect("the checkpoint serializes");
         for (part, secret) in secrets {
             for (form, text) in [("message", &message), ("checkpoint", &stored)] {
-                // Name the leaking surface and the URL part; never print the
-                // secret itself, not even in a failure.
+                // Name the leaking surface and the URL part, and print neither
+                // the secret nor the text holding it. A failure here means a
+                // credential reached that surface; re-run to inspect it.
                 assert!(
                     !text.contains(secret),
-                    "the refusal {form} leaks the {part} secret: {}",
-                    text.replace(secret, "<leaked>")
+                    "the refusal {form} leaks the {part} secret"
                 );
             }
         }
         assert!(
             message.contains("host=gw.example.com:8443"),
-            "the message still names the machine: {message}"
+            "the message no longer names the machine, so the operator cannot \
+             tell the endpoints apart"
         );
     }
 
