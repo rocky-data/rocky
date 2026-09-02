@@ -187,7 +187,6 @@ pub fn compute_catalog_output(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas,
-        source_column_info: HashMap::new(),
         ..Default::default()
     };
     let result = compile::compile(&config).context("compile failed")?;

@@ -44,6 +44,9 @@ arrow = { workspace = true }
 schemars = "1"
 
 [dev-dependencies]
+# A stub WarehouseAdapter that fails every query, so the discovery-failure arm
+# of `inspect_schema` is testable without a live warehouse (#1533).
+async-trait = { workspace = true }
 rocky-duckdb = { path = "../rocky-duckdb" }
 # Live Snowflake grounding verification (grounding_snowflake_live.rs) builds the
 # adapter directly to set up / tear down its fixture table.
@@ -55,6 +58,13 @@ serde_json = { workspace = true }
 # a wording change cannot land without a re-bless. Any stable hash would do;
 # blake3 is already a workspace dependency.
 blake3 = { workspace = true }
+# The mid-flight mutation probes in roundtrip.rs hold the draft handler on a
+# FIFO between its write and its verdict: `O_NONBLOCK` for the write-end open
+# and `ENXIO` for "no reader yet".
+libc = { workspace = true }
+# The engine-ci guard test compiles ENGINE_PATHS_RE from the workflow and runs
+# it against the out-of-tree include paths, the way `grep -E` does in CI.
+regex = { workspace = true }
 # The scripted round-trip test drives the stdio server in-process with an rmcp
 # client over a duplex pipe, so it needs the client side of rmcp too.
 rmcp = { version = "3.0", features = ["server", "macros", "transport-io", "client"] }

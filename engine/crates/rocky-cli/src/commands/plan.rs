@@ -628,11 +628,15 @@ pub(crate) fn dialect_for_adapter_type(
 /// - [`ConfigError::FileNotFound`](rocky_core::config::ConfigError::FileNotFound)
 ///   — `--config` defaults to `rocky.toml`, so this path runs even when the
 ///   user passed no flag and no project file exists. Resolves DuckDB.
-/// - An unset `${CREDENTIAL}`. Both callers are OFFLINE renderers whose
-///   published contract is "without a warehouse connection" and "resolved
-///   from `rocky.toml` without credentials", so the load runs under
-///   [`load_rocky_config_env_tolerant`](rocky_core::config::load_rocky_config_env_tolerant)
-///   and the placeholder survives as literal text.
+/// - An unset `${CREDENTIAL}` in an adapter's connection fields. Both
+///   callers are OFFLINE renderers whose published contract is "without a
+///   warehouse connection" and "resolved from `rocky.toml` without
+///   credentials", so the load runs under
+///   [`load_rocky_config_credential_tolerant`](rocky_core::config::load_rocky_config_credential_tolerant)
+///   and the placeholder survives as literal text. The tolerance is scoped
+///   to those fields (#1558): an unset variable anywhere else — an adapter
+///   `type`, an `[imports]` path — still refuses, because it selects
+///   behaviour rather than describing an endpoint.
 ///
 /// SEVENTEENTH ROUND, finding 1: the round-sixteen version of this function
 /// used the full `load_rocky_config`, which expands env vars. An initialized
@@ -656,7 +660,7 @@ pub(crate) fn preview_dialect(
     config_path: Option<&Path>,
 ) -> Result<Box<dyn rocky_core::traits::SqlDialect>> {
     let config = match config_path {
-        Some(path) => match rocky_core::config::load_rocky_config_env_tolerant(path) {
+        Some(path) => match rocky_core::config::load_rocky_config_credential_tolerant(path) {
             Ok(config) => Some(config),
             Err(rocky_core::config::ConfigError::FileNotFound { .. }) => None,
             Err(error) => {
@@ -930,7 +934,6 @@ pub fn plan_preview_output(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
-        source_column_info: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,
@@ -1097,7 +1100,6 @@ fn build_and_persist_run_plan(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
-        source_column_info: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,
@@ -1610,7 +1612,6 @@ pub fn populate_governance_actions(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: std::collections::HashMap::new(),
-        source_column_info: std::collections::HashMap::new(),
         mask: cfg.mask.clone(),
         allow_unmasked: cfg.classifications.allow_unmasked.clone(),
         project_freshness_default: cfg.freshness.has_default(),
@@ -1712,7 +1713,6 @@ async fn check_plan_budget(
         models_dir: models_dir.to_path_buf(),
         contracts_dir: None,
         source_schemas: HashMap::new(),
-        source_column_info: HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
         project_freshness_default: false,
@@ -2031,7 +2031,6 @@ fn compute_semantic_verdict(
             models_dir: models_dir.to_path_buf(),
             contracts_dir: None,
             source_schemas: source_schemas.clone(),
-            source_column_info: std::collections::HashMap::new(),
             ..Default::default()
         };
         match compile::compile(&config) {

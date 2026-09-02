@@ -516,7 +516,7 @@ Three outcomes, and the middle one is the point of the no-credentials promise:
 | `rocky.toml` | What happens |
 |---|---|
 | No file at the given path | Renders in DuckDB, the default dialect. |
-| Present, with `${VAR}` placeholders you have not exported | Renders in the configured dialect. The placeholder is never sent anywhere, so it does not have to resolve. |
+| Present, with `${VAR}` placeholders in an adapter's connection fields you have not exported | Renders in the configured dialect. A credential is never sent anywhere, so it does not have to resolve. An unset placeholder anywhere else — an adapter `type`, an `[imports]` path — still refuses, because it changes what the config means. |
 | Present but malformed, or it breaks a config rule | Refuses, and names the file. Rendering a broken Snowflake project in DuckDB would answer a question you did not ask. |
 
 One exception sits under row two: a placeholder written as a bare value, such as `port = ${PORT}`, is not valid TOML whether or not the variable is set. That is row three, and the error names `PORT`.

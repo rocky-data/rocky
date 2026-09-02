@@ -531,22 +531,63 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   record would let another pod observe a valid-looking approval whose
 ///   spec it cannot read or verify. Revisit to replicated only when
 ///   snapshot bytes gain durable replicated storage of their own.
-/// - **v23** — adds the fulfillment loop's post-apply data-check surface:
-///   the [`crate::fulfill::FulfillState::ObservedFailing`] state, the
+/// - **v23** — two serde-additive record-shape additions that landed on
+///   separate branches while the version was unreleased, so they share one
+///   bump (no released build wrote a v23 store, so the version stays at 23
+///   rather than moving to 24). Neither is a table change — the redb table
+///   set is unchanged (`EXPECTED_TABLES` is untouched). The bump tracks the
+///   record-shape additions so `[state] on_schema_mismatch` engages as
+///   usual; no blob walk.
+///
+///   **Resume scope.** Adds the [`RunProgress::scope`] field
+///   ([`ResumeScope`]): the pipeline name, `--filter`, and target routing a
+///   checkpoint was written under, so `--resume` / `--resume-latest` can
+///   refuse a checkpoint from a different pipeline scope (#1549). A v22 blob
+///   (which lacks the field) forward-deserializes with it `None`, guarded by
+///   `test_v22_run_progress_forward_deserializes_scope_none`; the CLI
+///   refuses to resume such a scopeless checkpoint (fail-closed — start a
+///   fresh run instead), so old checkpoints degrade to a loud refusal, never
+///   to a cross-pipeline resume. A v23 `RunProgress` blob back-reads cleanly
+///   on a v22 binary (serde ignores the extra key) — but see the fulfillment
+///   half below, which does NOT share that property.
+///
+///   The scope's routing half is structured ([`ResumeTarget`], compared
+///   field-wise). Two earlier unreleased builds wrote other shapes, and
+///   every one of them refuses as a scope mismatch rather than resuming:
+///
+///   ```text
+///     build                       forward-deserializes as   verdict
+///     flat `target_routing`       target: None              refuse
+///     structured, raw separator   separator_role: None      refuse
+///     structured, no separator    separator_role: None      refuse
+///     this build                  separator_role: Some(..)  compare
+///   ```
+///
+///   The raw-separator build wrote a bare string under the `separator` key;
+///   this build neither reads nor writes that key, and serde ignores it, so
+///   an old blob still deserializes (a hard parse error there would break
+///   `--resume-latest` for every scope, since one scan reads every header).
+///   Guarded by `test_pre_release_v23_scope_forward_deserializes_target_none`
+///   and `test_pre_release_v23_unclassified_separators_never_match`. No
+///   released build wrote any of them, so the version stays at 23.
+///
+///   **Fulfillment observation.** Adds the fulfillment loop's post-apply
+///   data-check surface: the
+///   [`crate::fulfill::FulfillState::ObservedFailing`] state, the
 ///   [`crate::fulfill::DraftingRound::DataRepair`] round, and two
 ///   serde-additive [`crate::fulfill::FulfillStateRecord`] fields
-///   (`data_repair_rounds`, `observation_detail`). Not a table change —
-///   the redb table set is unchanged (`EXPECTED_TABLES` is untouched) —
-///   and a v22 blob (which lacks the fields) forward-deserializes with
-///   the counter 0 and the detail `None`, guarded by
+///   (`data_repair_rounds`, `observation_detail`). A v22 blob (which lacks
+///   the fields) forward-deserializes with the counter 0 and the detail
+///   `None`, guarded by
 ///   `fulfill::tests::the_f3_observation_fields_read_across_the_version_that_added_them`.
 ///
-///   **Why this bump is load-bearing rather than bookkeeping:** the two
-///   fields are additive, but `observed_failing` is a NEW VARIANT of a
-///   `#[serde(tag = "state")]` enum. An added field forward-defaults; an
-///   unknown variant is a hard read failure. A v22 binary opening a v23
-///   store must therefore never reach that blob — and it does not,
-///   because the version check runs at OPEN and `[state]
+///   **Why this half of the bump is load-bearing rather than bookkeeping:**
+///   the two fields are additive, but `observed_failing` is a NEW VARIANT of
+///   a `#[serde(tag = "state")]` enum. An added field forward-defaults; an
+///   unknown variant is a hard read failure. So unlike the resume-scope
+///   half, a v23 `fulfill_state` blob does NOT back-read on a v22 binary. A
+///   v22 binary opening a v23 store must therefore never reach that blob —
+///   and it does not, because the version check runs at OPEN and `[state]
 ///   on_schema_mismatch` engages there ([`SchemaMismatchPolicy::Fail`]
 ///   refuses with the version pair; [`SchemaMismatchPolicy::Recreate`]
 ///   bootstraps a fresh store).
@@ -1137,12 +1178,87 @@ impl StateStore {
     /// The forward-incompatible check (`found > CURRENT`) runs in **both** modes,
     /// so a read-only open of a newer store still fails with
     /// [`StateError::SchemaMismatch`] rather than silently misreading it.
+    /// Satisfy a read-only open without a write transaction, when possible.
+    ///
+    /// `Ok(None)` means "escalate": the caller falls through to the write path,
+    /// which is the pre-#1545 behaviour. Only a store stamped at exactly
+    /// [`CURRENT_SCHEMA_VERSION`] takes the fast path — see the note at the
+    /// call site for why that version equality is what makes it safe.
+    ///
+    /// A forward-incompatible stamp is still classified here rather than
+    /// deferred, so `SchemaMismatchPolicy` behaves identically on both paths.
+    fn init_db_read_only(
+        db: &Database,
+        path: &Path,
+        policy: SchemaMismatchPolicy,
+    ) -> Result<Option<InitOutcome>, StateError> {
+        let txn = db.begin_read()?;
+        // A brand-new database has no METADATA table yet. That is an
+        // initialization case, not an error — escalate.
+        let Ok(metadata) = txn.open_table(METADATA) else {
+            return Ok(None);
+        };
+        let Some(version_str) = metadata
+            .get("schema_version")?
+            .map(|g| g.value().to_string())
+        else {
+            // Unstamped (fresh or pre-versioning): the write path handles it.
+            return Ok(None);
+        };
+        let found = version_str
+            .parse::<u32>()
+            .map_err(|_| StateError::VersionParse(version_str.clone()))?;
+
+        if found > CURRENT_SCHEMA_VERSION {
+            return match policy {
+                SchemaMismatchPolicy::Fail => Err(StateError::SchemaMismatch {
+                    found,
+                    expected: CURRENT_SCHEMA_VERSION,
+                    path: path.display().to_string(),
+                }),
+                SchemaMismatchPolicy::Recreate => {
+                    Ok(Some(InitOutcome::RecreateForwardIncompat { found }))
+                }
+            };
+        }
+
+        if found == CURRENT_SCHEMA_VERSION {
+            Ok(Some(InitOutcome::Ready))
+        } else {
+            // Older stamp: a newer binary may have added tables this store does
+            // not carry. Escalate so the write path materializes them, exactly
+            // as it did before.
+            Ok(None)
+        }
+    }
+
     fn init_db(
         db: &Database,
         path: &Path,
         mode: OpenMode,
         policy: SchemaMismatchPolicy,
     ) -> Result<InitOutcome, StateError> {
+        // A read-only open must not take a WRITE transaction. Every
+        // `StateStore::open_read_only` used to land here and commit one, so a
+        // `GET` on `rocky serve` serialized against the scheduler and against
+        // real `run` / `apply` writers on the same state file — a dashboard
+        // polling `/api/v1/runs` contended with the work it was reporting on
+        // (#1545).
+        //
+        // The fast path is deliberately narrow: it applies only when the stamp
+        // reads EXACTLY the current version. The stamp and the eager table
+        // creation below happen in one transaction, so a store stamped at this
+        // version was initialized by a binary with exactly this table set —
+        // every table a read method can touch already exists. Any other state
+        // (unstamped, older, or unreadable) falls through to the write path and
+        // behaves exactly as before, including materializing tables a newer
+        // binary added.
+        if matches!(mode, OpenMode::ReadOnly)
+            && let Some(outcome) = Self::init_db_read_only(db, path, policy)?
+        {
+            return Ok(outcome);
+        }
+
         let txn = db.begin_write()?;
         {
             let mut metadata = txn.open_table(METADATA)?;
@@ -2275,6 +2391,134 @@ pub struct TableProgress {
     pub completed_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// The replication execution identity a checkpoint belongs to (#1549).
+///
+/// Persisted on [`RunProgress`] so `--resume` / `--resume-latest` can refuse
+/// a checkpoint written by a different pipeline instead of silently skipping
+/// that pipeline's completed tables. Equality is the resume gate: every field
+/// must match the resuming invocation exactly. The scope is structured —
+/// each routing component is its own field and the comparison is
+/// field-wise — so no two invocations can render to one string; the
+/// [`std::fmt::Display`] form exists for messages only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResumeScope {
+    /// The resolved pipeline name the run built.
+    pub pipeline: String,
+    /// The `--filter key=value` selector the run was invoked with, verbatim.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Where the run routed its writes. `None` only on a checkpoint written
+    /// by the unreleased build between #1573 and the structured scope, which
+    /// recorded the routing as one flat `target_routing` string; no released
+    /// build wrote one. Such a checkpoint never equals a current scope, so a
+    /// resume refuses it as a scope mismatch.
+    #[serde(default)]
+    pub target: Option<ResumeTarget>,
+}
+
+/// Where a replication run routed its writes: the target adapter alias, the
+/// templates from `rocky.toml` and the separator that resolves them, the
+/// data location behind that alias, and any shadow or branch override.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResumeTarget {
+    /// The target adapter name (a config alias).
+    pub adapter: String,
+    /// The target catalog template, verbatim.
+    pub catalog_template: String,
+    /// The target schema template, verbatim.
+    pub schema_template: String,
+    /// What the separator did to the templates above — see
+    /// [`ResumeSeparator`]. `[target] separator` when set, else the source
+    /// pattern's.
+    ///
+    /// `None` only on a checkpoint written by an unreleased build, which
+    /// either did not record the separator or recorded it without
+    /// classifying it (under the old `separator` key, which this build no
+    /// longer reads). A scope this build makes is always `Some`, so such a
+    /// checkpoint never equals a resuming invocation: the resume refuses it
+    /// as a scope mismatch rather than trusting routing it cannot check.
+    #[serde(default)]
+    pub separator_role: Option<ResumeSeparator>,
+    /// The data location behind the adapter alias
+    /// ([`crate::config::AdapterConfig::endpoint_identity`]) — secret-free,
+    /// so the same alias re-pointed at another warehouse is a different
+    /// scope.
+    pub endpoint: crate::config::EndpointIdentity,
+    /// The `--shadow` / `--shadow-schema` / `--branch` override, when any.
+    #[serde(default)]
+    pub shadow: Option<ResumeShadow>,
+}
+
+/// Whether the target separator could reach the names a replication run
+/// resolved — the only reason it belongs in a resume scope.
+///
+/// A separator joins a **bare** multi-valued placeholder (`{regions}`) and
+/// does nothing else: `{regions:_}` pins its own, `{source}` is
+/// single-valued, and a template with no placeholder has nothing to join.
+/// So an edit to `[target] separator` moves a physical schema name in the
+/// first case only. Recording the raw value in the other cases refused a
+/// resume over a config edit that could not reach the warehouse (#1582).
+///
+/// [`crate::schema::SchemaPattern::separator_joins_a_placeholder`] decides
+/// which case a config is in, using the resolver's own scanner.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeSeparator {
+    /// A bare multi-valued placeholder joins with this separator, so its
+    /// value is part of the resolved names. Two configs that differ only
+    /// here route to different physical schemas.
+    Joins(String),
+    /// No template joins a multi-valued placeholder, so no separator value
+    /// changes a resolved name. The value itself is deliberately not
+    /// recorded: it is not part of this run's routing.
+    Unused,
+}
+
+/// The shadow or branch override a replication run wrote under.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeShadow {
+    /// `--shadow`: every target table name carries this suffix.
+    Suffix(String),
+    /// `--shadow-schema` or `--branch`: the writes land in this schema.
+    Schema(String),
+}
+
+impl std::fmt::Display for ResumeScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pipeline '{}'", self.pipeline)?;
+        match &self.filter {
+            Some(filter) => write!(f, ", filter '{filter}'")?,
+            None => write!(f, ", no filter")?,
+        }
+        match &self.target {
+            Some(target) => write!(f, ", target {target}"),
+            None => write!(f, ", target unrecorded"),
+        }
+    }
+}
+
+impl std::fmt::Display for ResumeTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}.{} ",
+            self.adapter, self.catalog_template, self.schema_template
+        )?;
+        match &self.separator_role {
+            Some(ResumeSeparator::Joins(separator)) => write!(f, "separator({separator}) ")?,
+            Some(ResumeSeparator::Unused) => write!(f, "separator unused ")?,
+            None => write!(f, "separator unrecorded ")?,
+        }
+        write!(f, "endpoint({})", self.endpoint)?;
+        match &self.shadow {
+            Some(ResumeShadow::Suffix(suffix)) => write!(f, " shadow(suffix={suffix})"),
+            Some(ResumeShadow::Schema(schema)) => write!(f, " shadow(schema={schema})"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Progress for an entire run (collection of table progresses).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunProgress {
@@ -2282,6 +2526,13 @@ pub struct RunProgress {
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub total_tables: usize,
     pub tables: Vec<TableProgress>,
+    /// The pipeline scope that wrote this checkpoint (#1549). `None` only on
+    /// checkpoints recorded before schema v23 (and on test fixtures that
+    /// simulate them) — a resume refuses those, fail-closed, because they
+    /// cannot prove which pipeline they belong to. Omitted from the blob when
+    /// `None` so a scopeless record's bytes stay identical to pre-v23.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ResumeScope>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2778,12 +3029,23 @@ impl StateStore {
     // -----------------------------------------------------------------------
 
     /// Initialize run progress with total table count.
-    pub fn init_run_progress(&self, run_id: &str, total_tables: usize) -> Result<(), StateError> {
+    ///
+    /// `scope` stamps the checkpoint with the pipeline identity that wrote it
+    /// (#1549); every production caller passes `Some`. `None` reproduces the
+    /// pre-v23 scopeless shape and exists for tests that simulate old
+    /// checkpoints — a resume refuses a scopeless checkpoint, fail-closed.
+    pub fn init_run_progress(
+        &self,
+        run_id: &str,
+        total_tables: usize,
+        scope: Option<&ResumeScope>,
+    ) -> Result<(), StateError> {
         let progress = RunProgress {
             run_id: run_id.to_string(),
             started_at: chrono::Utc::now(),
             total_tables,
             tables: Vec::new(),
+            scope: scope.cloned(),
         };
         let bytes = serde_json::to_vec(&progress)?;
         let txn = self.db.begin_write()?;
@@ -2901,6 +3163,53 @@ impl StateStore {
         }
         Ok(Some(progress))
     }
+
+    /// Get the most recent run progress recorded for `scope` — the
+    /// `--resume-latest` selector (#1548 / #1549).
+    ///
+    /// Candidates are headers whose stored [`RunProgress::scope`] equals
+    /// `scope`, plus scopeless pre-v23 headers — those cannot be attributed
+    /// to any pipeline, so they cannot be ruled out here; the caller decides
+    /// what to do with a scopeless winner (the CLI refuses it, fail-closed).
+    /// Selection is by latest `started_at` among the candidates, and there is
+    /// deliberately no searching past the winner: whether the winning run is
+    /// actually resumable is the caller's verdict, not a reason to fall back
+    /// to an older checkpoint.
+    pub fn get_latest_run_progress_for_scope(
+        &self,
+        scope: &ResumeScope,
+    ) -> Result<Option<RunProgress>, StateError> {
+        let txn = self.db.begin_read()?;
+        let header_table = txn.open_table(RUN_PROGRESS)?;
+        let mut latest: Option<RunProgress> = None;
+        for entry in header_table.iter()? {
+            let (_, value) = entry?;
+            let progress: RunProgress = serde_json::from_slice(value.value())?;
+            let in_scope = progress
+                .scope
+                .as_ref()
+                .is_none_or(|recorded| recorded == scope);
+            if !in_scope {
+                continue;
+            }
+            if latest
+                .as_ref()
+                .is_none_or(|l| progress.started_at > l.started_at)
+            {
+                latest = Some(progress);
+            }
+        }
+
+        let Some(mut progress) = latest else {
+            return Ok(None);
+        };
+        let entries_table = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+        let entries = Self::read_progress_entries(&entries_table, &progress.run_id)?;
+        if !entries.is_empty() {
+            progress.tables = entries;
+        }
+        Ok(Some(progress))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2914,9 +3223,16 @@ impl StateStore {
     /// `quality_history` — when each is listed in
     /// [`StateRetentionConfig::applies_to`]. Operational tables
     /// (`schema_cache`, `watermarks`, `partitions`, `loaded_files`,
-    /// `branches`, `idempotency_keys`, `grace_periods`, `run_progress`,
-    /// `check_history`) are never touched: they hold live state, not
-    /// history.
+    /// `branches`, `idempotency_keys`, `grace_periods`, `check_history`)
+    /// are never touched: they hold live state, not history.
+    ///
+    /// A swept run record takes its checkpoint with it: the `run_progress`
+    /// header and the `run_progress_entries` rows keyed by that run id are
+    /// removed in the same write transaction as the record, so a resume can
+    /// never find a checkpoint whose record retention already dropped. A
+    /// checkpoint with **no** record — a run that crashed before writing
+    /// one — is never swept, whatever its age; the sweep only follows
+    /// `run_history` keys.
     ///
     /// For each domain:
     ///
@@ -3020,7 +3336,10 @@ impl StateStore {
     ///
     /// Reads every row, pairs its key with `started_at`, decides which
     /// keys to delete (older than `cutoff` and not in the most recent
-    /// `min_keep`), then issues all deletes in a single write transaction.
+    /// `min_keep`), then issues all deletes in a single write transaction —
+    /// each run record together with its `run_progress` header and
+    /// `run_progress_entries` rows, so a record and its checkpoint are
+    /// dropped atomically or not at all.
     fn sweep_run_history(
         &self,
         cutoff: chrono::DateTime<chrono::Utc>,
@@ -3033,9 +3352,24 @@ impl StateStore {
         if !to_delete.is_empty() {
             let txn = self.db.begin_write()?;
             {
-                let mut table = txn.open_table(RUN_HISTORY)?;
-                for key in &to_delete {
-                    table.remove(key.as_str())?;
+                let mut history = txn.open_table(RUN_HISTORY)?;
+                let mut headers = txn.open_table(RUN_PROGRESS)?;
+                let mut entries = txn.open_table(RUN_PROGRESS_ENTRIES)?;
+                for run_id in &to_delete {
+                    history.remove(run_id.as_str())?;
+                    headers.remove(run_id.as_str())?;
+                    let prefix = format!("{run_id}|");
+                    let mut entry_keys = Vec::new();
+                    for entry in entries.range(prefix.as_str()..)? {
+                        let (key, _) = entry?;
+                        if !key.value().starts_with(&prefix) {
+                            break;
+                        }
+                        entry_keys.push(key.value().to_string());
+                    }
+                    for key in &entry_keys {
+                        entries.remove(key.as_str())?;
+                    }
                 }
             }
             self.commit_write(txn)?;
@@ -5977,6 +6311,71 @@ fn sanitize_namespace(ns: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- a read-only open takes no write transaction (#1545) ----
+
+    /// Opening read-only must not modify the database file.
+    ///
+    /// Every `open_read_only` used to commit a redb WRITE transaction, so a
+    /// `GET` on `rocky serve` serialized against the scheduler and against real
+    /// `run` / `apply` writers on the same state file.
+    ///
+    /// A committed redb transaction advances the on-disk transaction id, so
+    /// byte-identical file content before and after is direct evidence that no
+    /// transaction was committed.
+    #[test]
+    fn a_read_only_open_does_not_write_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+
+        // Initialize read-write, then close so nothing is buffered.
+        drop(StateStore::open(&path).expect("initial read-write open"));
+        let before = std::fs::read(&path).expect("read state file");
+
+        drop(StateStore::open_read_only(&path).expect("read-only open"));
+        let after = std::fs::read(&path).expect("read state file");
+
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "a read-only open changed the file SIZE, so it wrote"
+        );
+        assert!(
+            before == after,
+            "a read-only open changed the file CONTENT, so it committed a write \
+             transaction — which serializes every read endpoint against real writers"
+        );
+    }
+
+    /// The fast path must not swallow a forward-incompatible store: a
+    /// read-only open of a newer database still fails under the default policy,
+    /// exactly as the write path did.
+    #[test]
+    fn a_read_only_open_still_refuses_a_forward_incompatible_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        drop(StateStore::open(&path).expect("initial open"));
+
+        // Stamp a version from the future.
+        {
+            let db = Database::open(&path).expect("reopen");
+            let txn = db.begin_write().expect("write txn");
+            {
+                let mut metadata = txn.open_table(METADATA).expect("metadata");
+                let future = (CURRENT_SCHEMA_VERSION + 1).to_string();
+                metadata.insert("schema_version", &*future).expect("stamp");
+            }
+            txn.commit().expect("commit");
+        }
+
+        let err = StateStore::open_read_only(&path)
+            .map(|_| ())
+            .expect_err("a forward-incompatible store must still be refused");
+        assert!(
+            matches!(err, StateError::SchemaMismatch { .. }),
+            "expected SchemaMismatch, got {err:?}"
+        );
+    }
     use chrono::Utc;
     use tempfile::TempDir;
 
@@ -7948,7 +8347,7 @@ mod tests {
     #[test]
     fn test_init_and_get_run_progress() {
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 50).unwrap();
+        store.init_run_progress("run-001", 50, None).unwrap();
 
         let progress = store.get_run_progress("run-001").unwrap().unwrap();
         assert_eq!(progress.run_id, "run-001");
@@ -7966,7 +8365,7 @@ mod tests {
     #[test]
     fn test_record_table_progress() {
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 3).unwrap();
+        store.init_run_progress("run-001", 3, None).unwrap();
 
         let p1 = TableProgress {
             index: 0,
@@ -8016,10 +8415,10 @@ mod tests {
         let (store, _dir) = temp_store();
 
         // Create two runs with a small time gap to ensure ordering
-        store.init_run_progress("run-001", 10).unwrap();
+        store.init_run_progress("run-001", 10, None).unwrap();
         // Force a slightly later timestamp for the second run
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.init_run_progress("run-002", 20).unwrap();
+        store.init_run_progress("run-002", 20, None).unwrap();
 
         let latest = store.get_latest_run_progress().unwrap().unwrap();
         assert_eq!(latest.run_id, "run-002");
@@ -8033,10 +8432,285 @@ mod tests {
         assert!(latest.is_none());
     }
 
+    /// Builds a distinct [`ResumeScope`] per pipeline name for the scoped
+    /// selection tests.
+    fn progress_scope(pipeline: &str) -> ResumeScope {
+        ResumeScope {
+            pipeline: pipeline.to_string(),
+            filter: None,
+            target: Some(ResumeTarget {
+                adapter: "default".to_string(),
+                catalog_template: "wh".to_string(),
+                schema_template: format!("staging_{pipeline}__{{source}}"),
+                separator_role: Some(ResumeSeparator::Joins("__".to_string())),
+                endpoint: crate::config::EndpointIdentity {
+                    adapter_type: "duckdb".to_string(),
+                    locators: [("path".to_string(), "/tmp/wh.duckdb".to_string())]
+                        .into_iter()
+                        .collect(),
+                },
+                shadow: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn test_get_latest_run_progress_for_scope_ignores_other_scopes() {
+        let (store, _dir) = temp_store();
+        let p1 = progress_scope("p1");
+        let p2 = progress_scope("p2");
+
+        store.init_run_progress("run-p1-old", 1, Some(&p1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.init_run_progress("run-p1-new", 2, Some(&p1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store.init_run_progress("run-p2", 3, Some(&p2)).unwrap();
+
+        // p2's newer checkpoint must not shadow p1's own latest.
+        let latest = store
+            .get_latest_run_progress_for_scope(&p1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.run_id, "run-p1-new");
+        assert_eq!(latest.scope.as_ref(), Some(&p1));
+
+        // And the per-table entries are stitched in, like the unscoped getter.
+        store
+            .record_table_progress(
+                "run-p1-new",
+                &TableProgress {
+                    index: 0,
+                    table_key: "wh.staging_p1__acme.orders".to_string(),
+                    asset_key: vec!["orders".to_string()],
+                    status: TableStatus::Success,
+                    error: None,
+                    duration_ms: 1,
+                    completed_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        let latest = store
+            .get_latest_run_progress_for_scope(&p1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.tables.len(), 1);
+    }
+
+    #[test]
+    fn test_get_latest_run_progress_for_scope_keeps_scopeless_candidates() {
+        let (store, _dir) = temp_store();
+        let p1 = progress_scope("p1");
+
+        store.init_run_progress("run-p1", 1, Some(&p1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // A pre-v23 checkpoint carries no scope. It cannot be attributed to
+        // any pipeline, so it cannot be ruled out — it stays a candidate and
+        // the caller decides (the CLI refuses it, fail-closed).
+        store.init_run_progress("run-legacy", 1, None).unwrap();
+
+        let latest = store
+            .get_latest_run_progress_for_scope(&p1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.run_id, "run-legacy");
+        assert!(latest.scope.is_none());
+    }
+
+    #[test]
+    fn test_get_latest_run_progress_for_scope_empty_when_nothing_matches() {
+        let (store, _dir) = temp_store();
+        store
+            .init_run_progress("run-p2", 1, Some(&progress_scope("p2")))
+            .unwrap();
+        let latest = store
+            .get_latest_run_progress_for_scope(&progress_scope("p1"))
+            .unwrap();
+        assert!(latest.is_none());
+    }
+
+    /// A v22 `RunProgress` blob (no `scope` key) must forward-deserialize
+    /// with `scope: None`, a scoped v23 record must round-trip losslessly,
+    /// and a scopeless record must serialize without the key — byte-identical
+    /// to the pre-v23 shape. See the v23 stanza on `CURRENT_SCHEMA_VERSION`.
+    #[test]
+    fn test_v22_run_progress_forward_deserializes_scope_none() {
+        let blob = serde_json::json!({
+            "run_id": "run-legacy",
+            "started_at": "2026-08-01T00:00:00Z",
+            "total_tables": 3,
+            "tables": [],
+        });
+        let progress: RunProgress =
+            serde_json::from_value(blob).expect("pre-v23 RunProgress must forward-deserialize");
+        assert!(progress.scope.is_none(), "pre-v23 record has no scope");
+
+        let bytes = serde_json::to_vec(&progress).unwrap();
+        assert!(
+            !String::from_utf8(bytes).unwrap().contains("scope"),
+            "a scopeless record must serialize without the key"
+        );
+
+        let scoped = RunProgress {
+            scope: Some(progress_scope("p1")),
+            ..progress
+        };
+        let round_trip: RunProgress =
+            serde_json::from_slice(&serde_json::to_vec(&scoped).unwrap()).unwrap();
+        assert_eq!(round_trip.scope, scoped.scope);
+    }
+
+    /// The unreleased build between #1573 and the structured scope wrote
+    /// the routing as one flat `target_routing` string. Such a header must
+    /// forward-deserialize with `target: None` — a read failure would break
+    /// every scoped lookup over the whole store — and must never be
+    /// selected for, or equal to, a live scope.
+    #[test]
+    fn test_pre_release_v23_scope_forward_deserializes_target_none() {
+        let (store, _dir) = temp_store();
+        let blob = serde_json::json!({
+            "run_id": "run-flat",
+            "started_at": "2026-08-30T00:00:00Z",
+            "total_tables": 1,
+            "tables": [],
+            "scope": {
+                "pipeline": "p1",
+                "filter": null,
+                "target_routing":
+                    "default:wh.staging_p1__{source} endpoint(duckdb path=/tmp/wh.duckdb)",
+            },
+        });
+        let bytes = serde_json::to_vec(&blob).unwrap();
+        {
+            let txn = store.db.begin_write().unwrap();
+            {
+                let mut header = txn.open_table(RUN_PROGRESS).unwrap();
+                header.insert("run-flat", bytes.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let progress = store.get_run_progress("run-flat").unwrap().unwrap();
+        let recorded = progress.scope.expect("the flat scope still deserializes");
+        assert_eq!(recorded.pipeline, "p1");
+        assert!(recorded.target.is_none());
+        assert_ne!(recorded, progress_scope("p1"));
+        assert_eq!(
+            recorded.to_string(),
+            "pipeline 'p1', no filter, target unrecorded"
+        );
+
+        assert!(
+            store
+                .get_latest_run_progress_for_scope(&progress_scope("p1"))
+                .unwrap()
+                .is_none(),
+            "a flat-scope header is never a --resume-latest candidate"
+        );
+        assert_eq!(
+            store.get_latest_run_progress().unwrap().unwrap().run_id,
+            "run-flat",
+            "the unscoped reader still lists it — nothing else in the store breaks"
+        );
+    }
+
+    /// Two unreleased builds wrote a structured target this one cannot
+    /// check: one recorded no separator at all, the other recorded a raw
+    /// `separator` string without saying whether it joined anything. Both
+    /// must still deserialize — a read failure would break every scoped
+    /// lookup over the whole store — and neither may equal a live scope.
+    #[test]
+    fn test_pre_release_v23_unclassified_separators_never_match() {
+        let live = progress_scope("p1");
+        let cases = [
+            ("run-no-sep", None),
+            ("run-raw-sep", Some(serde_json::json!("__"))),
+        ];
+        for (run_id, raw_separator) in cases {
+            let (store, _dir) = temp_store();
+            let mut blob = serde_json::to_value(&live).unwrap();
+            let target = blob["target"]
+                .as_object_mut()
+                .expect("the target is an object");
+            target
+                .remove("separator_role")
+                .expect("a live scope classifies its separator");
+            if let Some(raw) = raw_separator.clone() {
+                target.insert("separator".to_string(), raw);
+            }
+            let header = serde_json::json!({
+                "run_id": run_id,
+                "started_at": "2026-08-30T00:00:00Z",
+                "total_tables": 1,
+                "tables": [],
+                "scope": blob,
+            });
+            let bytes = serde_json::to_vec(&header).unwrap();
+            {
+                let txn = store.db.begin_write().unwrap();
+                {
+                    let mut table = txn.open_table(RUN_PROGRESS).unwrap();
+                    table.insert(run_id, bytes.as_slice()).unwrap();
+                }
+                txn.commit().unwrap();
+            }
+
+            let progress = store.get_run_progress(run_id).unwrap().unwrap();
+            let recorded = progress.scope.expect("the older target still deserializes");
+            let target = recorded.target.as_ref().expect("the target is structured");
+            assert!(target.separator_role.is_none(), "{run_id}");
+            assert_ne!(recorded, live, "{run_id}");
+            assert!(
+                recorded.to_string().contains("separator unrecorded"),
+                "the refusal must say what is missing: {recorded}"
+            );
+            assert!(
+                store
+                    .get_latest_run_progress_for_scope(&live)
+                    .unwrap()
+                    .is_none(),
+                "{run_id} is never a --resume-latest candidate"
+            );
+        }
+    }
+
+    /// The classified separator is the compared value, and `Unused` is a
+    /// shape of its own — never the same as any joined separator, and never
+    /// the same as an unclassified one.
+    #[test]
+    fn test_resume_separator_roles_are_three_distinct_shapes() {
+        let with_role = |role: Option<ResumeSeparator>| -> ResumeScope {
+            let mut scope = progress_scope("p1");
+            scope.target.as_mut().unwrap().separator_role = role;
+            scope
+        };
+        let joins = with_role(Some(ResumeSeparator::Joins("__".to_string())));
+        let other = with_role(Some(ResumeSeparator::Joins("_".to_string())));
+        let unused = with_role(Some(ResumeSeparator::Unused));
+        let unrecorded = with_role(None);
+
+        assert_ne!(joins, other);
+        assert_ne!(joins, unused);
+        assert_ne!(unused, unrecorded);
+        assert_eq!(unused, with_role(Some(ResumeSeparator::Unused)));
+
+        // The persisted spelling is pinned: it is compared across binaries.
+        let role_of = |scope: &ResumeScope| {
+            serde_json::to_value(scope).unwrap()["target"]["separator_role"].clone()
+        };
+        assert_eq!(role_of(&joins), serde_json::json!({ "joins": "__" }));
+        assert_eq!(role_of(&unused), serde_json::json!("unused"));
+        assert_eq!(role_of(&unrecorded), serde_json::Value::Null);
+        for scope in [&joins, &unused, &unrecorded] {
+            let round_trip: ResumeScope =
+                serde_json::from_value(serde_json::to_value(scope).unwrap()).unwrap();
+            assert_eq!(&round_trip, scope);
+        }
+    }
+
     #[test]
     fn test_resume_filters_completed() {
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 5).unwrap();
+        store.init_run_progress("run-001", 5, None).unwrap();
 
         // Simulate: 3 succeeded, 1 failed, 1 never reached
         for (i, (key, status)) in [
@@ -8105,7 +8779,7 @@ mod tests {
         // Each recorded table is a single per-entry row; the header blob's
         // `tables` vector is NOT grown. Reads stitch the two together.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 3).unwrap();
+        store.init_run_progress("run-001", 3, None).unwrap();
 
         // Header still has no inline entries.
         {
@@ -8154,7 +8828,7 @@ mod tests {
         // Insert out of index order; read must sort by execution index, not
         // by the lexical entry key.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 3).unwrap();
+        store.init_run_progress("run-001", 3, None).unwrap();
         store
             .record_table_progress(
                 "run-001",
@@ -8188,7 +8862,7 @@ mod tests {
         // Re-recording the same table (interrupted -> final) overwrites the
         // one row rather than appending a duplicate.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 1).unwrap();
+        store.init_run_progress("run-001", 1, None).unwrap();
         store
             .record_table_progress(
                 "run-001",
@@ -8212,8 +8886,8 @@ mod tests {
         // "run-1" and "run-12" share a "run-1" lexical prefix but the trailing
         // "|" separator keeps their entries isolated.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-1", 1).unwrap();
-        store.init_run_progress("run-12", 1).unwrap();
+        store.init_run_progress("run-1", 1, None).unwrap();
+        store.init_run_progress("run-12", 1, None).unwrap();
         store
             .record_table_progress(
                 "run-1",
@@ -8241,9 +8915,9 @@ mod tests {
         // --resume-latest reads `.tables` off the latest run; the latest header
         // must come back with its per-entry rows stitched in.
         let (store, _dir) = temp_store();
-        store.init_run_progress("run-001", 2).unwrap();
+        store.init_run_progress("run-001", 2, None).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        store.init_run_progress("run-002", 2).unwrap();
+        store.init_run_progress("run-002", 2, None).unwrap();
 
         store
             .record_table_progress(
@@ -8278,6 +8952,7 @@ mod tests {
                 progress_entry(0, "cat.sch.x", TableStatus::Success),
                 progress_entry(1, "cat.sch.y", TableStatus::Failed),
             ],
+            scope: None,
         };
         let bytes = serde_json::to_vec(&legacy).unwrap();
         {
@@ -9655,6 +10330,88 @@ mod tests {
         }
     }
 
+    /// A swept run record takes its checkpoint with it — the `run_progress`
+    /// header and its per-table entries — while the checkpoints of kept
+    /// runs, of a run whose id shares a prefix, and of a record-less
+    /// (crashed) run stay put.
+    #[test]
+    fn sweep_retention_drops_the_checkpoint_with_its_run_record() {
+        let (store, _dir) = temp_store();
+        let now = Utc::now();
+        let scope = progress_scope("p1");
+        // `old` is swept; `old-2` shares its prefix but is recent, so it is
+        // kept — the entry scan keys on `"{run_id}|"` and must not bleed.
+        for (run_id, age) in [
+            ("old", chrono::Duration::days(700)),
+            ("old-2", chrono::Duration::hours(2)),
+            ("recent", chrono::Duration::days(1)),
+        ] {
+            store.record_run(&run_at(run_id, now - age)).unwrap();
+            store.init_run_progress(run_id, 2, Some(&scope)).unwrap();
+            for (index, key) in ["cat.sch.a", "cat.sch.b"].iter().enumerate() {
+                store
+                    .record_table_progress(
+                        run_id,
+                        &progress_entry(index, key, TableStatus::Success),
+                    )
+                    .unwrap();
+            }
+        }
+        store.init_run_progress("crashed", 1, Some(&scope)).unwrap();
+        store
+            .record_table_progress(
+                "crashed",
+                &progress_entry(0, "cat.sch.a", TableStatus::Success),
+            )
+            .unwrap();
+
+        let policy = StateRetentionConfig {
+            max_age_days: 30,
+            min_runs_kept: 0,
+            applies_to: vec![StateRetentionDomain::History],
+            ..StateRetentionConfig::default()
+        };
+        let dry = store.sweep_retention_dry_run(&policy).unwrap();
+        assert_eq!(dry.runs_deleted, 1);
+        assert!(
+            store.get_run_progress("old").unwrap().is_some(),
+            "a dry run deletes nothing"
+        );
+
+        let report = store.sweep_retention(&policy).unwrap();
+        assert_eq!(report.runs_deleted, 1);
+        assert!(store.get_run("old").unwrap().is_none());
+        assert!(
+            store.get_run_progress("old").unwrap().is_none(),
+            "the checkpoint header goes with the record"
+        );
+        {
+            let txn = store.db.begin_read().unwrap();
+            let entries = txn.open_table(RUN_PROGRESS_ENTRIES).unwrap();
+            let leftover: Vec<String> = entries
+                .iter()
+                .unwrap()
+                .map(|entry| entry.unwrap().0.value().to_string())
+                .filter(|key| key.starts_with("old|"))
+                .collect();
+            assert!(
+                leftover.is_empty(),
+                "the per-table entries go with the header: {leftover:?}"
+            );
+        }
+        for kept in ["old-2", "recent"] {
+            assert!(store.get_run(kept).unwrap().is_some(), "{kept} is kept");
+            let progress = store.get_run_progress(kept).unwrap().unwrap();
+            assert_eq!(progress.tables.len(), 2, "{kept} keeps its entries");
+        }
+        let crashed = store.get_run_progress("crashed").unwrap().unwrap();
+        assert_eq!(
+            crashed.tables.len(),
+            1,
+            "a checkpoint with no run record is never swept"
+        );
+    }
+
     #[test]
     fn sweep_retention_dry_run_does_not_delete() {
         let (store, _dir) = temp_store();
@@ -10788,12 +11545,16 @@ mod tests {
         // local-only (the approval record points at snapshot bytes replication
         // does not transport — see the v22 stanza on CURRENT_SCHEMA_VERSION).
         //
-        // v23 adds the F3 data-red vocabulary to `FulfillStateRecord` and
-        // `FulfillState`. NO table change — `EXPECTED_TABLES` is deliberately
-        // unchanged below — so this stanza moves the version only. The
-        // record-shape and unknown-variant behaviour are guarded in
-        // `fulfill.rs`; what is pinned HERE is that the on-disk version moved
-        // with them, which is the thing the open-time mismatch gate reads.
+        // v23 adds two serde-additive record shapes in ONE unreleased bump:
+        // `RunProgress::scope` (the pipeline identity a checkpoint belongs
+        // to, #1549), guarded by
+        // `test_v22_run_progress_forward_deserializes_scope_none`; and the
+        // F3 data-red vocabulary on `FulfillStateRecord` and `FulfillState`,
+        // whose record-shape and unknown-variant behaviour are guarded in
+        // `fulfill.rs`. NO table change — `EXPECTED_TABLES` is deliberately
+        // unchanged below — so this stanza moves the version only. What is
+        // pinned HERE is that the on-disk version moved with them, which is
+        // the thing the open-time mismatch gate reads.
         const EXPECTED_VERSION: u32 = 23;
         const EXPECTED_TABLES: &[&str] = &[
             "branches",

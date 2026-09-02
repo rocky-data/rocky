@@ -110,6 +110,14 @@ pub struct ToolError {
     /// helpers).
     #[serde(flatten)]
     pub recorded_plan: Option<Box<RecordedPlanHandoff>>,
+    /// The project-relative paths a refused draft's rollback FAILED to put
+    /// back (#1561) — each is either a refused artifact still on disk or a
+    /// prior file that is now absent; the refusal `message` says which, per
+    /// path. Set only by [`ToolError::policy_denied_after_rollback`] when the
+    /// rollback reported failures; absent (nothing on the wire) on every
+    /// other error, a clean rollback included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_failed_paths: Option<Vec<String>>,
 }
 
 /// The typed recorded-plan reference riding on `propose`'s
@@ -147,6 +155,7 @@ impl ToolError {
             remediation_hint: remediation_hint.into(),
             policy_rule: None,
             recorded_plan: None,
+            rollback_failed_paths: None,
         })
     }
 
@@ -229,6 +238,7 @@ impl ToolError {
             remediation_hint: remediation_hint.into(),
             policy_rule,
             recorded_plan: None,
+            rollback_failed_paths: None,
         })
     }
 
@@ -241,6 +251,23 @@ impl ToolError {
         policy_rule: Option<String>,
     ) -> Json<Self> {
         Self::wrap_policy(ToolErrorCode::PolicyDenied, message, hint, policy_rule)
+    }
+
+    /// [`Self::policy_denied`] for a refusal that rolled a draft back first
+    /// (#1561). `rollback_failed_paths` carries the project-relative
+    /// artifacts the rollback could not clean up — still on disk despite the
+    /// refusal — so a caller can act on the leftovers without parsing prose;
+    /// `None` (a clean rollback) is wire-identical to [`Self::policy_denied`].
+    pub fn policy_denied_after_rollback(
+        message: impl Into<String>,
+        hint: impl Into<String>,
+        policy_rule: Option<String>,
+        rollback_failed_paths: Option<Vec<String>>,
+    ) -> Json<Self> {
+        let mut wrapped =
+            Self::wrap_policy(ToolErrorCode::PolicyDenied, message, hint, policy_rule);
+        wrapped.0.rollback_failed_paths = rollback_failed_paths;
+        wrapped
     }
 
     /// The agent policy plane requires human review before the proposed
@@ -366,7 +393,18 @@ mod tests {
                 "`{field}` is an always-present envelope field; required = {required:?}"
             );
         }
-        for field in ["plan_id", "product_id", "spec_digest", "policy_rule"] {
+        for field in [
+            "plan_id",
+            "product_id",
+            "spec_digest",
+            "policy_rule",
+            "rollback_failed_paths",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "`{field}` must be a property of the ToolError schema; got properties {:?}",
+                properties.keys().collect::<Vec<_>>()
+            );
             assert!(
                 !required.contains(&field),
                 "`{field}` must stay OPTIONAL on the wire; required = {required:?}"
@@ -404,5 +442,30 @@ mod tests {
                 "`{field}` is absent (not null) on a plain envelope: {value:#}"
             );
         }
+    }
+
+    /// #1561: a deny whose draft rollback failed carries the leftover paths
+    /// as a typed field; a clean rollback puts nothing on the wire, keeping
+    /// the envelope byte-identical to [`ToolError::policy_denied`].
+    #[test]
+    fn rollback_failed_paths_ride_the_envelope_only_on_failure() {
+        let err = ToolError::policy_denied_after_rollback(
+            "m",
+            "h",
+            None,
+            Some(vec!["models/shadow.sql".to_string()]),
+        );
+        let value = serde_json::to_value(&err.0).expect("serializes");
+        assert_eq!(
+            value["rollback_failed_paths"],
+            serde_json::json!(["models/shadow.sql"])
+        );
+
+        let clean = ToolError::policy_denied_after_rollback("m", "h", None, None);
+        let value = serde_json::to_value(&clean.0).expect("serializes");
+        assert!(
+            value.get("rollback_failed_paths").is_none(),
+            "absent (not null) on a clean rollback: {value:#}"
+        );
     }
 }

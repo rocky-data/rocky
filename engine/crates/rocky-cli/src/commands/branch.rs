@@ -1465,7 +1465,6 @@ fn evaluate_breaking_change_gate(
             models_dir: models_dir.to_path_buf(),
             contracts_dir: None,
             source_schemas: source_schemas.clone(),
-            source_column_info: std::collections::HashMap::new(),
             ..Default::default()
         };
         match compile::compile(&config) {

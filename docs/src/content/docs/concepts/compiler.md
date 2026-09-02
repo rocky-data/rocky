@@ -110,6 +110,16 @@ It infers types from:
 Every model comes out with a typed schema: a list of `TypedColumn` entries,
 each with a name, a `RockyType`, and a nullability flag.
 
+Outer joins can introduce nulls even when source columns are non-nullable.
+Rocky marks direct references and ordinary casts of those references from the right side of `LEFT JOIN` as nullable.
+`RIGHT JOIN` marks the accumulated left side; `FULL JOIN` marks both sides.
+Aliases remain distinct in self-joins, and downstream models inherit the resulting nullability.
+A `nullable = false` contract on an affected column with a known type raises `E012`.
+This analysis is conservative: a later `WHERE` filter does not narrow nullability.
+It does not change the existing nullability inference for casts of computed expressions.
+
+For `USING` and `NATURAL` joins, Rocky distinguishes merged join keys from qualified references to either input.
+
 ### 5. Validate contracts
 
 If a contracts directory exists, Rocky loads the `.contract.toml` files and

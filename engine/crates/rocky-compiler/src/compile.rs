@@ -53,6 +53,32 @@ pub struct ModelCompileTimings {
     pub total_ms: u64,
 }
 
+/// The semantic graph's view of known source columns, derived from
+/// [`CompilerConfig::source_schemas`].
+///
+/// Kept as a derivation rather than a second config field on purpose. The field
+/// this replaces had no production producer at all: every call site passed an
+/// empty map, so `semantic.rs`'s external-source star-expansion arm was dead
+/// code that still read as wired (#1484).
+fn source_column_info(
+    source_schemas: &HashMap<String, Vec<TypedColumn>>,
+) -> HashMap<String, Vec<rocky_ir::ColumnInfo>> {
+    source_schemas
+        .iter()
+        .map(|(table, cols)| {
+            let cols = cols
+                .iter()
+                .map(|c| rocky_ir::ColumnInfo {
+                    name: c.name.clone(),
+                    data_type: c.data_type.to_string(),
+                    nullable: c.nullable,
+                })
+                .collect();
+            (table.clone(), cols)
+        })
+        .collect()
+}
+
 /// Configuration for the compiler.
 #[derive(Clone, Default)]
 pub struct CompilerConfig {
@@ -62,9 +88,14 @@ pub struct CompilerConfig {
     pub contracts_dir: Option<PathBuf>,
     /// Known source schemas (from warehouse DESCRIBE or cache).
     /// Keys are fully qualified table names (e.g., "catalog.schema.table").
+    ///
+    /// The semantic graph's external-source `SELECT *` expansion is DERIVED
+    /// from this (see [`source_column_info`]). It used to require a second
+    /// field, `source_column_info`, that every production caller left empty —
+    /// so the expansion never ran and a leaf `SELECT * FROM <raw source>`
+    /// reported zero columns in both `rocky catalog` and `rocky docs` (#1484).
+    /// One field cannot fall out of step with itself.
     pub source_schemas: HashMap<String, Vec<TypedColumn>>,
-    /// Known source column info for semantic graph (name, type string, nullable).
-    pub source_column_info: HashMap<String, Vec<rocky_ir::ColumnInfo>>,
     /// Project `[mask]` table from `rocky.toml` — used by the W004
     /// classification-tag completeness check. Empty by default; callers
     /// that don't load a `RockyConfig` get the status quo (no W004).
@@ -313,8 +344,9 @@ pub fn compile_project(
 
     // 2. Build semantic graph
     let sg_start = Instant::now();
-    let semantic_graph = semantic::build_semantic_graph(&project, &config.source_column_info)
-        .map_err(CompileError::SemanticGraph)?;
+    let semantic_graph =
+        semantic::build_semantic_graph(&project, &source_column_info(&config.source_schemas))
+            .map_err(CompileError::SemanticGraph)?;
     timings.semantic_graph_ms = sg_start.elapsed().as_millis() as u64;
 
     // 3. Type check (with model SQL/paths for reference tracking)
@@ -442,7 +474,7 @@ pub fn compile_project(
 /// time — when the incremental path would either (a) touch too much of
 /// the graph to be worth the bookkeeping, (b) hit a case we don't yet
 /// reason about safely, or (c) affect inputs that aren't per-model
-/// (source_schemas / source_column_info).
+/// (`source_schemas`).
 ///
 /// This is deliberately a hand-rolled optimization. §P5.1 (salsa) is
 /// the long-term answer; this function exists so the LSP's per-keystroke
@@ -458,8 +490,9 @@ pub fn compile_incremental(
     let total_start = Instant::now();
 
     // The caller is responsible for guaranteeing that `previous` was
-    // produced against the same `config.source_schemas` and
-    // `config.source_column_info` as the current call. Source-schema
+    // produced against the same `config.source_schemas` as the current call.
+    // (It used to name a second field too; that field is now derived from this
+    // one, so there is only one thing to hold steady.) Source-schema
     // changes affect every downstream model, so if they shift the caller
     // must invoke `compile` directly rather than this path.
     // The LSP constructs `CompilerConfig` once per workspace-init
@@ -478,8 +511,9 @@ pub fn compile_incremental(
     let project_load_ms = load_start.elapsed().as_millis() as u64;
 
     let sg_start = Instant::now();
-    let semantic_graph = semantic::build_semantic_graph(&project, &config.source_column_info)
-        .map_err(CompileError::SemanticGraph)?;
+    let semantic_graph =
+        semantic::build_semantic_graph(&project, &source_column_info(&config.source_schemas))
+            .map_err(CompileError::SemanticGraph)?;
     let semantic_graph_ms = sg_start.elapsed().as_millis() as u64;
 
     // 2. Compute the affected set. The comparison must be with the NEW
@@ -755,6 +789,137 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outer_join_rejects_non_null_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("joined.toml"),
+            "name = \"joined\"\n[target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"joined\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("joined.contract.toml"),
+            "[[columns]]\nname = \"customer_name\"\ntype = \"String\"\nnullable = false\n",
+        )
+        .unwrap();
+        let column = |name: &str, data_type| TypedColumn {
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+        };
+        let config = CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            source_schemas: HashMap::from([
+                (
+                    "raw.orders".to_string(),
+                    vec![
+                        column("id", RockyType::Int64),
+                        column("customer_id", RockyType::Int64),
+                    ],
+                ),
+                (
+                    "raw.customers".to_string(),
+                    vec![
+                        column("id", RockyType::Int64),
+                        column("name", RockyType::String),
+                    ],
+                ),
+            ]),
+            ..Default::default()
+        };
+        for (expression, join, nullable) in [
+            ("c.name", "LEFT JOIN", true),
+            ("c.name", "INNER JOIN", false),
+            ("CAST(c.name AS STRING)", "LEFT JOIN", true),
+            ("CAST(c.name AS STRING)", "INNER JOIN", false),
+            ("c.name::STRING", "LEFT JOIN", true),
+            ("c.name::STRING", "INNER JOIN", false),
+            ("CAST(CAST(c.name AS STRING) AS STRING)", "LEFT JOIN", true),
+            (
+                "CAST(CAST(c.name AS STRING) AS STRING)",
+                "INNER JOIN",
+                false,
+            ),
+        ] {
+            std::fs::write(
+                dir.path().join("joined.sql"),
+                format!(
+                    "SELECT o.id, {expression} AS customer_name FROM raw.orders o \
+                     {join} raw.customers c ON o.customer_id = c.id"
+                ),
+            )
+            .unwrap();
+            let result = compile(&config).unwrap();
+            let diagnostics: Vec<_> = result
+                .diagnostics
+                .iter()
+                .filter(|d| d.is_error())
+                .map(|d| (&*d.code, d.model.as_str()))
+                .collect();
+            assert_eq!(
+                diagnostics,
+                if nullable {
+                    vec![("E012", "joined")]
+                } else {
+                    vec![]
+                },
+                "{expression}: {join}"
+            );
+            assert_eq!(result.has_errors, nullable, "{expression}: {join}");
+            let columns = &result.type_check.typed_models["joined"];
+            assert_eq!(columns[0].data_type, RockyType::Int64);
+            assert!(!columns[0].nullable, "preserved order id: {join}");
+            assert_eq!(
+                columns[1].data_type,
+                RockyType::String,
+                "{expression}: {join}"
+            );
+            assert_eq!(columns[1].nullable, nullable, "{expression}: {join}");
+        }
+    }
+
+    #[test]
+    fn outer_join_propagation_preserves_grouped_cast_contracts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("totals.toml"),
+            "name = \"totals\"\n[target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"totals\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("totals.contract.toml"),
+            "[[columns]]\nname = \"total\"\ntype = \"Int64\"\nnullable = false\n",
+        )
+        .unwrap();
+        let config = CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            source_schemas: HashMap::from([(
+                "raw.orders".to_string(),
+                vec![TypedColumn {
+                    name: "id".to_string(),
+                    data_type: RockyType::Int64,
+                    nullable: false,
+                }],
+            )]),
+            ..Default::default()
+        };
+        for join in ["", "LEFT JOIN raw.orders r ON o.id = r.id"] {
+            std::fs::write(
+                dir.path().join("totals.sql"),
+                format!(
+                    "SELECT o.id, CAST(SUM(o.id) AS BIGINT) AS total \
+                     FROM raw.orders o {join} GROUP BY o.id"
+                ),
+            )
+            .unwrap();
+            let result = compile(&config).unwrap();
+            assert!(!result.has_errors, "{join}: {:?}", result.diagnostics);
+            let total = &result.type_check.typed_models["totals"][1];
+            assert_eq!(total.data_type, RockyType::Int64);
+            assert!(!total.nullable, "{join}");
+        }
+    }
 
     #[test]
     fn test_default_type_mapper() {

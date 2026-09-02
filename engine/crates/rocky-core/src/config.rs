@@ -2289,74 +2289,50 @@ pub fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
     substitute_env_vars_with_report(input).map(|(text, _)| text)
 }
 
-/// What [`parse_rocky_config_str_with_policy`] does with a `${VAR}` that has
-/// no value and no `:-default`.
-///
-/// SEVENTEENTH ROUND, finding 1. Two different questions were being answered
-/// by one loader. "Is this config well formed?" must be fatal everywhere.
-/// "Are this project's credentials available?" is only a question for a
-/// command that is about to connect. `rocky emit-sql` and MCP `plan_preview`
-/// connect to nothing, and their documented contract says so
-/// (`docs/.../reference/commands/modeling.md`, "without a warehouse
-/// connection"). Requiring `${DATABRICKS_HOST}` to be exported before an
-/// offline renderer will pick a dialect answers the second question on a
-/// path that only ever asked the first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnvPolicy {
-    /// Refuse with [`ConfigError::MissingEnvVar`]. Every path that executes,
-    /// connects, or persists — i.e. everything except the offline previews.
-    Require,
-    /// Leave the `${VAR}` text in place and carry on. OFFLINE readers only.
-    ///
-    /// This is NOT a tolerance for broken configs: the TOML still has to
-    /// parse and the whole [`CONFIG_VALIDATORS`] chain still has to pass.
-    /// The placeholder survives as literal text, which is valid inside the
-    /// quoted string every credential field uses. A placeholder written as a
-    /// BARE value (`port = ${PORT}`) was never valid TOML and still fails —
-    /// as a parse error naming the unresolved variable, see
-    /// [`format_env_var_hint`].
-    KeepPlaceholder,
-}
-
 /// Like [`substitute_env_vars`], but also returns a report of every
 /// substitution performed. Used by the config loader to attach env-var
 /// origin context to post-substitution parse errors (§P2.9).
 pub fn substitute_env_vars_with_report(
     input: &str,
 ) -> Result<(String, Vec<EnvVarSubstitution>), ConfigError> {
-    let (text, substitutions, unresolved) = substitute_env_vars_keeping_placeholders(input);
-    match unresolved.into_iter().next() {
-        Some((name, span)) => Err(ConfigError::MissingEnvVar {
-            name,
-            span: Some(span),
-        }),
-        None => Ok((text, substitutions)),
+    let expanded = substitute_env_vars_inner(input);
+    // The FIRST missing variable, with its span — the historical error, byte
+    // for byte. `missing` is ordered by position, so `first()` is that one.
+    if let Some((name, span)) = expanded.missing.first() {
+        return Err(ConfigError::MissingEnvVar {
+            name: name.clone(),
+            span: Some(span.clone()),
+        });
     }
+    Ok((expanded.text, expanded.substitutions))
 }
 
-/// What [`substitute_env_vars_keeping_placeholders`] hands back: the
-/// substituted text, every substitution performed, and every `${VAR}` that had
-/// no value — each with the byte span of its placeholder in the raw input.
-type EnvSubstitutionOutcome = (
-    String,
-    Vec<EnvVarSubstitution>,
-    Vec<(String, std::ops::Range<usize>)>,
-);
+/// The result of expanding `${VAR}` references, with no policy attached.
+struct EnvExpansion {
+    /// The expanded text. An unset `${VAR}` is left in it verbatim.
+    text: String,
+    /// Every substitution actually performed, for error context.
+    substitutions: Vec<EnvVarSubstitution>,
+    /// Every variable that was referenced and not set, in the order they
+    /// appear, each with the byte span of its `${...}`.
+    missing: Vec<(String, std::ops::Range<usize>)>,
+}
 
-/// The substitution body, with no opinion about a missing variable: the
-/// `${VAR}` text is copied through verbatim and reported back to the caller,
-/// which decides whether that is fatal.
+/// The expansion itself, with no policy attached.
 ///
-/// Returns `(substituted text, substitutions performed, unresolved vars)`.
-/// The unresolved list is in source order and carries each placeholder's byte
-/// span, so [`substitute_env_vars_with_report`] can raise exactly the
-/// [`ConfigError::MissingEnvVar`] it always did — same name, same span.
-fn substitute_env_vars_keeping_placeholders(input: &str) -> EnvSubstitutionOutcome {
+/// An unset `${VAR}` is left in the text verbatim either way. Whether that is
+/// an error is the caller's decision — [`substitute_env_vars_with_report`]
+/// refuses on the first one, the credential-tolerant loader decides per field.
+/// Both read the same expansion, so the two can never disagree about what a
+/// config says.
+fn substitute_env_vars_inner(input: &str) -> EnvExpansion {
     let re = &*ENV_VAR_RE;
     let mut result = String::with_capacity(input.len());
     let mut last_end = 0;
-    // Every missing env var and its byte span, in source order, for diagnostics.
-    let mut unresolved: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+    // Every missing env var and its byte span. The refusing caller reports the
+    // first; the tolerant caller needs them all, to tell an unresolved
+    // placeholder apart from a string that merely looks like one.
+    let mut missing: Vec<(String, std::ops::Range<usize>)> = Vec::new();
     let mut substitutions: Vec<EnvVarSubstitution> = Vec::new();
 
     for cap in re.captures_iter(input) {
@@ -2400,7 +2376,7 @@ fn substitute_env_vars_keeping_placeholders(input: &str) -> EnvSubstitutionOutco
                     });
                 }
                 Err(_) => {
-                    unresolved.push((expr.to_string(), match_start..match_end));
+                    missing.push((expr.to_string(), match_start..match_end));
                     // Keep the placeholder verbatim so the rest of the string
                     // stays intact for context.
                     result.push_str(&input[match_start..match_end]);
@@ -2410,9 +2386,15 @@ fn substitute_env_vars_keeping_placeholders(input: &str) -> EnvSubstitutionOutco
         last_end = match_end;
     }
 
-    // Copy the tail of the input after the last match.
+    // Copy the tail of the input after the last match. Unconditional: the
+    // refusing wrapper discards this text, but the tolerant caller parses it,
+    // and a truncated config would fail for the wrong reason.
     result.push_str(&input[last_end..]);
-    (result, substitutions, unresolved)
+    EnvExpansion {
+        text: result,
+        substitutions,
+        missing,
+    }
 }
 
 /// Formats the env-var context into a one-line human-readable hint appended
@@ -2420,10 +2402,12 @@ fn substitute_env_vars_keeping_placeholders(input: &str) -> EnvSubstitutionOutco
 /// secrets / multi-KB strings into a log line; the operator just needs enough
 /// context to find the misbehaving env var.
 ///
-/// `unresolved` matters only under [`EnvPolicy::KeepPlaceholder`], and it is
-/// the whole reason that policy does not degrade diagnostics. Under
-/// [`EnvPolicy::Require`] an unset `${PORT}` is a `MissingEnvVar` naming
-/// `PORT`. Under `KeepPlaceholder` the text `${PORT}` survives into the TOML,
+/// `unresolved` matters only under
+/// [`CredentialPolicy::TolerateAdapterCredentials`], and it is the whole
+/// reason that policy does not degrade diagnostics. Under
+/// [`CredentialPolicy::Require`] an unset `${PORT}` is a `MissingEnvVar`
+/// naming `PORT`. Under the tolerant policy the text `${PORT}` survives into
+/// the TOML,
 /// and a BARE `port = ${PORT}` then fails to parse — for a reason the parse
 /// error itself cannot express. Listing the unresolved names here keeps that
 /// error pointing at `PORT` instead of at a stray `$`.
@@ -3846,6 +3830,266 @@ impl std::fmt::Debug for AdapterConfig {
             .field("extra", &self.extra)
             .finish()
     }
+}
+
+/// Where the data behind an adapter block lives: the adapter type plus the
+/// locator fields that name the data location, as ordered key/value pairs.
+///
+/// Built by [`AdapterConfig::endpoint_identity`]; persisted inside a resume
+/// checkpoint's scope and compared field-wise there (`==`), never parsed
+/// from its rendered form. The [`std::fmt::Display`] rendering
+/// (`snowflake account=xy12345 database=ANALYTICS`) is for messages only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointIdentity {
+    /// The adapter type (`duckdb`, `snowflake`, ...).
+    pub adapter_type: String,
+    /// Locator fields by name, in name order. Every value is a data
+    /// location (a host, a path, an account, a database); never a
+    /// principal or a secret.
+    ///
+    /// A `host` contributes two entries: `host` is the shown
+    /// `scheme://host[:port]`, and `host_route_digest` is
+    /// `blake3:<hex>` over the whole route behind it (path, query and
+    /// fragment included). The digest is what makes two gateway paths two
+    /// endpoints; a path that carries a token never appears in either.
+    #[serde(default)]
+    pub locators: std::collections::BTreeMap<String, String>,
+}
+
+impl std::fmt::Display for EndpointIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.adapter_type)?;
+        for (key, value) in &self.locators {
+            write!(f, " {key}={value}")?;
+        }
+        Ok(())
+    }
+}
+
+impl AdapterConfig {
+    /// A stable, secret-free identity for the data location this block
+    /// points at.
+    ///
+    /// The adapter *name* is a config alias: two `rocky.toml` files can call
+    /// different warehouses `default`, and one file can be re-pointed between
+    /// runs. Anything that must not cross warehouses — a resume checkpoint,
+    /// for one — needs the endpoint, not the alias.
+    ///
+    /// **Contract: the identity is where the data lives, never who connects
+    /// to it.** It is the adapter type plus the locator fields below, each
+    /// only when set:
+    ///
+    /// Every `host` below contributes a second locator,
+    /// `host_route_digest` — see the paragraph on hosts.
+    ///
+    /// | type         | locators                                                   |
+    /// |--------------|------------------------------------------------------------|
+    /// | `duckdb`     | `path`: the canonical file path, or `:memory: pid=<pid>`   |
+    /// | `databricks` | `host`, `http_path`                                        |
+    /// | `snowflake`  | `account`, `host` (when configured), `database`, `warehouse` |
+    /// | `bigquery`   | `project_id`                                               |
+    /// | `trino`      | `host`, `catalog` (the `database` slot)                    |
+    /// | `fivetran`   | `destination_id`                                           |
+    /// | `airbyte`, `iceberg` | `host`                                             |
+    /// | `manual`     | the type alone                                             |
+    /// | anything else | `host`, `http_path`, `account`, `database`, `project_id`, `destination_id`, `path` |
+    ///
+    /// `AdapterConfig` has no `schema` or `dataset` slot, so neither can
+    /// join the identity today; a pipeline's schema routing is carried
+    /// beside the endpoint by the checkpoint scope instead.
+    ///
+    /// Never in the identity: `username`, `password`, `token`, `oauth_token`,
+    /// `pat`, `private_key_path`, `client_id`, `client_secret`, `api_key`,
+    /// `api_secret`, `role`, and the `[extra]` table. A Snowflake session
+    /// with no `database` (a PAT or OAuth session, say) writes into the
+    /// session's default database, and the identity does **not** stand a
+    /// user name in for it: two such sessions on one account are one
+    /// endpoint to Rocky.
+    ///
+    /// A `host` is split in two, because what routes and what is safe to
+    /// show are not the same string. The `host` locator is the shown form,
+    /// reduced to `scheme://host[:port]`: a proxy path is where operators
+    /// put tokens, and neither a checkpoint nor an error message may carry
+    /// one. The `host_route_digest` locator is a `blake3:<hex>` digest over
+    /// the whole route — path, query and fragment included — so a gateway
+    /// that routes by path
+    /// (`https://gw/tenant/a` vs `https://gw/tenant/b`) still yields two
+    /// endpoints. Only the `user:password@` userinfo is dropped from both:
+    /// it is who connects, not where the data lives. `location`,
+    /// `timeout_secs` and the retry policy do not move the data and are
+    /// left out. `http_path` and the DuckDB `path` are kept whole and
+    /// compared whole, so they need no digest.
+    ///
+    /// The DuckDB path is canonicalized when the file exists, so `./wh.duckdb`
+    /// and its absolute spelling agree; an in-memory database is process-
+    /// local, so its identity carries the process id and can only match
+    /// from the same process. The identity describes the configured
+    /// locator, not the file behind it: a DuckDB file replaced by another at
+    /// the same path keeps the same identity.
+    pub fn endpoint_identity(&self) -> EndpointIdentity {
+        let mut locators = std::collections::BTreeMap::new();
+        let mut push = |key: &str, value: Option<&str>| {
+            let Some(value) = value else {
+                return;
+            };
+            if key == "host" {
+                // The shown host names the machine; the digest carries the
+                // whole route, so a gateway path still separates endpoints
+                // without landing in state or in an error message.
+                locators.insert("host_route_digest".to_string(), host_route_digest(value));
+                locators.insert(key.to_string(), sanitize_host_locator(value));
+                return;
+            }
+            locators.insert(key.to_string(), value.to_string());
+        };
+        match self.adapter_type.as_str() {
+            "duckdb" => {
+                let path = self
+                    .path
+                    .as_deref()
+                    .map_or_else(in_memory_duckdb_locator, canonical_path_string);
+                push("path", Some(&path));
+            }
+            "databricks" => {
+                push("host", self.host.as_deref());
+                push("http_path", self.http_path.as_deref());
+            }
+            "snowflake" => {
+                push("account", self.account.as_deref());
+                push("host", self.host.as_deref());
+                push("database", self.database.as_deref());
+                push("warehouse", self.warehouse.as_deref());
+            }
+            "bigquery" => push("project_id", self.project_id.as_deref()),
+            "trino" => {
+                push("host", self.host.as_deref());
+                push("catalog", self.database.as_deref());
+            }
+            "fivetran" => push("destination_id", self.destination_id.as_deref()),
+            "airbyte" | "iceberg" => push("host", self.host.as_deref()),
+            "manual" => {}
+            _ => {
+                push("host", self.host.as_deref());
+                push("http_path", self.http_path.as_deref());
+                push("account", self.account.as_deref());
+                push("database", self.database.as_deref());
+                push("project_id", self.project_id.as_deref());
+                push("destination_id", self.destination_id.as_deref());
+                push(
+                    "path",
+                    self.path.as_deref().map(canonical_path_string).as_deref(),
+                );
+            }
+        }
+        EndpointIdentity {
+            adapter_type: self.adapter_type.clone(),
+            locators,
+        }
+    }
+}
+
+/// Splits a `host` locator once, into the three parts both the shown form
+/// and the compared digest are built from: the scheme (`https://`, empty
+/// when there is none), the authority with any `user:password@` userinfo
+/// removed, and the route tail — the path, `?query` and `#fragment` — with
+/// a trailing `/` trimmed, so `https://gw/` and `https://gw` agree.
+///
+/// **The delimiter order is the whole safety property.** A scheme ends at
+/// the *first* `://` in the locator, and only when that `://` arrives before
+/// any `/`, `?` or `#` — its own `/` must be the first one in the string:
+///
+/// ```text
+///   https://gw/tenant/a      ://  at 5, first / ? # at 6  ->  scheme
+///   alice:pw@gw/x://tail     ://  at 12, first / ? # at 11 ->  no scheme
+///   alice:pw@gw?k=v://tail   ://  at 15, first / ? # at 11 ->  no scheme
+/// ```
+///
+/// A `://` reached after any of those three is inside the path, the query or
+/// the fragment, never a scheme. Reading it as one ends the authority at the
+/// far right and puts the whole credential-bearing prefix into the shown
+/// host.
+///
+/// The split is textual, never a URL parse. The `url` crate cannot stand in
+/// here for two reasons: it requires a scheme, so the `host:port` and
+/// `user:pw@host` forms Rocky accepts would parse as a scheme plus a path;
+/// and it normalises (default ports dropped, a `/` path added, host case
+/// folded), which would silently move the digested route this function
+/// pins. The comparison downstream is exact, so two spellings of one URL
+/// that are not character-identical — an IPv6 literal written out in full,
+/// a `/` added before `?` — are two identities and a resume refuses instead
+/// of resuming. That is the safe direction: it never crosses two endpoints,
+/// it only asks for a fresh run.
+///
+/// One parse, two forms: deriving the shown host and the digested route
+/// separately is how they would drift apart.
+fn split_host_locator(locator: &str) -> (&str, &str, &str) {
+    // The first `/`, `?` or `#` closes the authority wherever it is. A
+    // scheme delimiter is the one `://` whose own `/` IS that character.
+    let route_start = locator.find(['/', '?', '#']);
+    let (scheme, rest) = match locator.find("://") {
+        Some(index) if route_start == Some(index + 1) => locator.split_at(index + 3),
+        _ => ("", locator),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    (scheme, authority, tail.trim_end_matches('/'))
+}
+
+/// Reduces a `host` locator to the part that names the machine: the scheme
+/// (when present), the host and the port. Everything else is dropped — the
+/// `user:password@` userinfo, the path, any `?query` or `#fragment`
+/// (`https://alice:s3cret@host:8443/tenant/x/token/T/?k=v` →
+/// `https://host:8443`). A bare `user:pw@host/path` is handled the same way.
+///
+/// This is the **shown** form only: a path is where operators put tokens, so
+/// neither a checkpoint nor an error message carries one. The path still
+/// routes, so what a checkpoint *compares* is [`host_route_digest`].
+fn sanitize_host_locator(locator: &str) -> String {
+    let (scheme, authority, _) = split_host_locator(locator);
+    format!("{scheme}{authority}")
+}
+
+/// The digest a checkpoint compares a `host` locator by: `blake3:<hex>` over
+/// everything in the host that routes — scheme, host, port, path, query and
+/// fragment.
+///
+/// A gateway can route by path (`https://gw/tenant/a` and
+/// `https://gw/tenant/b` are two warehouses behind one host name), so the
+/// path must move the identity. It must not be *readable* in state or in an
+/// error, hence a digest: it separates two routes without republishing
+/// either. The `user:password@` userinfo is dropped first — it is who
+/// connects, not where the data lives, so rotating a password does not
+/// change the endpoint.
+///
+/// **A digest hides a route; it cannot hide a guessable one.** Telling two
+/// routes apart and confirming a guess at one are the same operation, so
+/// anyone holding the state file or a mismatch message can hash candidate
+/// routes and see which one matches. A high-entropy token in a path
+/// survives that; a short or enumerable one does not. Credentials belong
+/// in the redacted `token` / `password` fields, never in a host URL.
+fn host_route_digest(locator: &str) -> String {
+    let (scheme, authority, tail) = split_host_locator(locator);
+    let route = format!("{scheme}{authority}{tail}");
+    format!("blake3:{}", blake3::hash(route.as_bytes()).to_hex())
+}
+
+/// An in-memory DuckDB database lives inside one process and dies with it,
+/// so its identity carries the process id: a checkpoint written against it
+/// can only ever match from the same process.
+fn in_memory_duckdb_locator() -> String {
+    format!(":memory: pid={}", std::process::id())
+}
+
+/// The canonical spelling of a file path: symlinks resolved when the file
+/// exists, otherwise the absolute form, otherwise the input unchanged.
+fn canonical_path_string(path: &str) -> String {
+    let path = std::path::Path::new(path);
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
 }
 
 /// Persistent state cache configuration for the Fivetran adapter (FR-A).
@@ -5961,32 +6205,124 @@ fn read_config_file(path: &Path) -> Result<String, ConfigError> {
 /// deprecation remapping, and shorthand normalization included; `kind`
 /// validation excluded (see [`parse_rocky_config`]).
 fn parse_rocky_config_str(raw: &str) -> Result<RockyConfig, ConfigError> {
-    parse_rocky_config_str_with_policy(raw, EnvPolicy::Require)
+    parse_rocky_config_str_with(raw, CredentialPolicy::Require)
 }
 
-/// [`parse_rocky_config_str`] with an explicit [`EnvPolicy`].
+/// What an unset `${VAR}` means to this load.
 ///
-/// ONE body, deliberately. The offline previews and every executing path
-/// differ in exactly one decision — what an unset `${VAR}` means — and share
-/// the parse, the deprecation remap, the shorthand normalization and (via
-/// their callers) the whole validator chain. A second parse body is how the
-/// two aligned reads in `plan::preview_dialect` drifted apart in the first
-/// place; this is the same mistake one layer down, so it is not made.
-fn parse_rocky_config_str_with_policy(
+/// Compiling and previewing SQL never touch a warehouse, so they must not
+/// require warehouse credentials to be present (#1536). Everything else about
+/// the config is still checked either way: `Tolerate` relaxes ONLY the
+/// unresolved-placeholder rule, never parsing or the validator chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialPolicy {
+    /// An unset `${VAR}` is an error, wherever it appears. Every executing path.
+    Require,
+    /// An unset `${VAR}` may stay as literal text, but ONLY in an adapter's
+    /// connection fields. Anywhere else it is still an error — see
+    /// [`tolerated_placeholder_path`].
+    TolerateAdapterCredentials,
+}
+
+/// May an unresolved `${VAR}` survive at this key path?
+///
+/// Only inside `[adapters.<name>]`, and not on `type` or `kind`.
+///
+/// The scope matters more than it looks. Tolerating EVERY unset variable —
+/// which is what "credential tolerant" turned into on the first attempt —
+/// silently disarms things that are not credentials at all:
+///
+/// - `[imports] path` / `snapshot` become literal, the snapshot read fails, and
+///   the failure is a W012 *warning* — so E030-E033 pin and compatibility
+///   enforcement is skipped and the compile still reports success. A pin that
+///   looks enforced and checks nothing.
+/// - `type = "${ADAPTER_TYPE}"` is accepted, because the validator chain skips
+///   adapter types it does not recognise.
+///
+/// Both are refused here. `type` and `kind` are excluded even inside an adapter
+/// because they select behaviour rather than describe an endpoint.
+///
+/// BOTH spellings are matched. `normalize_toml_shorthands` only wraps a bare
+/// `[adapter]` into `adapter.default` — it does NOT rename the key to
+/// `adapters`; that happens later, in serde, on a tree this check never sees.
+/// A test for the shorthand caught that assumption.
+fn tolerated_placeholder_path(path: &[String]) -> bool {
+    matches!(path, [table, _name, field]
+        if (table == "adapters" || table == "adapter")
+            && field != "type"
+            && field != "kind")
+}
+
+/// Walk a normalized config tree and report the first unresolved placeholder
+/// sitting somewhere [`tolerated_placeholder_path`] does not allow.
+fn first_untolerated_placeholder(
+    value: &toml::Value,
+    missing: &[(String, std::ops::Range<usize>)],
+    path: &mut Vec<String>,
+) -> Option<String> {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, child) in table {
+                path.push(key.clone());
+                let found = first_untolerated_placeholder(child, missing, path);
+                path.pop();
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        toml::Value::Array(items) => {
+            for child in items {
+                if let Some(found) = first_untolerated_placeholder(child, missing, path) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        toml::Value::String(text) => {
+            if tolerated_placeholder_path(path) {
+                return None;
+            }
+            // Matched against the names we KNOW went unresolved, so a config
+            // that legitimately contains the literal text `${...}` — one that
+            // was never a reference to an unset variable — is not refused.
+            missing
+                .iter()
+                .find(|(name, _)| text.contains(&format!("${{{name}}}")))
+                .map(|(name, _)| name.clone())
+        }
+        _ => None,
+    }
+}
+
+fn parse_rocky_config_str_with(
     raw: &str,
-    env_policy: EnvPolicy,
+    policy: CredentialPolicy,
 ) -> Result<RockyConfig, ConfigError> {
-    let (substituted, substitutions, unresolved) = substitute_env_vars_keeping_placeholders(raw);
-    let unresolved_names: Vec<String> = unresolved.iter().map(|(name, _)| name.clone()).collect();
-    if env_policy == EnvPolicy::Require
-        && let Some((name, span)) = unresolved.into_iter().next()
+    let expanded = substitute_env_vars_inner(raw);
+    if policy == CredentialPolicy::Require
+        && let Some((name, span)) = expanded.missing.first()
     {
         return Err(ConfigError::MissingEnvVar {
-            name,
-            span: Some(span),
+            name: name.clone(),
+            span: Some(span.clone()),
         });
     }
-    let env_var_hint = format_env_var_hint(&substitutions, &unresolved_names);
+    // The names the parse-error hint lists. Under `Require` this is empty —
+    // the first missing variable already returned above — so every executing
+    // path keeps the hint it always had. Under the tolerant policy a surviving
+    // placeholder can still break the PARSE (a bare `port = ${PORT}` was never
+    // valid TOML), and the parse error cannot say why the `$` is there; the
+    // hint names the variable instead.
+    let missing_names: Vec<String> = expanded
+        .missing
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let expanded_missing = expanded.missing;
+    let (substituted, substitutions) = (expanded.text, expanded.substitutions);
+    let env_var_hint = format_env_var_hint(&substitutions, &missing_names);
     let to_parse_err = |source: toml::de::Error| -> ConfigError {
         if env_var_hint.is_empty() {
             ConfigError::ParseToml(source)
@@ -6000,6 +6336,14 @@ fn parse_rocky_config_str_with_policy(
     let mut value: toml::Value = toml::from_str(&substituted).map_err(to_parse_err)?;
     apply_deprecations(&mut value);
     normalize_toml_shorthands(&mut value);
+    // AFTER normalization: the `[adapter]` shorthand has become `adapters.<name>`
+    // by now, so one rule covers both spellings.
+    if policy == CredentialPolicy::TolerateAdapterCredentials
+        && let Some(name) =
+            first_untolerated_placeholder(&value, &expanded_missing, &mut Vec::new())
+    {
+        return Err(ConfigError::MissingEnvVar { name, span: None });
+    }
     let mut config: RockyConfig = value.try_into().map_err(to_parse_err)?;
     apply_single_adapter_discovery_default(&mut config);
     Ok(config)
@@ -6071,44 +6415,47 @@ pub fn load_rocky_config(path: &Path) -> Result<RockyConfig, ConfigError> {
     Ok(config)
 }
 
-/// [`load_rocky_config`] for a reader that will never connect: an unset
-/// `${VAR}` leaves its placeholder in place instead of failing the load.
+/// [`load_rocky_config`], but an unset `${VAR}` in an adapter's connection
+/// fields is kept as literal text instead of refusing the load.
 ///
-/// # What this is for
+/// For OFFLINE operations only — compiling and previewing SQL. A project whose
+/// `${DATABRICKS_HOST}` is unset could not be compiled at all, while
+/// `rocky emit-sql` on the same project rendered SQL and exited 0 (#1536).
 ///
-/// The offline SQL renderers — `rocky emit-sql` and MCP `plan_preview` — read
-/// `rocky.toml` for ONE fact: which adapter type the project targets, so the
-/// preview renders in the right dialect. They open no connection, so a
-/// credential they will never send is not a precondition for answering that.
-/// The published contract says as much: "without a warehouse connection",
-/// "resolved from `rocky.toml` without credentials".
+/// # What this does NOT relax
 ///
-/// # What is still fatal
-///
-/// Everything that is actually wrong with the file:
+/// The tolerance is scoped to adapter connection fields, and nothing else:
 ///
 /// ```text
-///   rocky.toml state                     load_rocky_config   ..._env_tolerant
-///   ------------------------------------ ------------------- ----------------
-///   malformed TOML                       refuse              refuse
-///   fails a CONFIG_VALIDATORS rule       refuse              refuse
-///   unreadable / permission denied       refuse              refuse
-///   unset ${CREDENTIAL} in a string      refuse              LOADS
-///   unset ${VAR} as a bare TOML value    refuse              refuse (parse)
+///  [adapters.wh] host/token/password/...   unset ${VAR} tolerated
+///  [adapters.wh] type / kind               REFUSED — selects behaviour
+///  [imports] path / snapshot / pin         REFUSED
+///  [state], [policy], [cache], everything  REFUSED
 /// ```
 ///
-/// The last row is not a gap: `port = ${PORT}` is not valid TOML with or
-/// without substitution. It fails as a parse error whose hint names `PORT`
-/// (see [`format_env_var_hint`]).
+/// Scoping it is the whole point. Tolerating every unset variable disarms
+/// things that are not credentials: an unresolved `[imports] snapshot` makes
+/// the snapshot read fail, and that failure is a W012 *warning*, so E030-E033
+/// pin enforcement is skipped while the compile still reports success. An
+/// unresolved adapter `type` is accepted because the validator chain skips
+/// adapter types it does not recognise. Both are refused here.
 ///
-/// # What it must NOT be used for
+/// Beyond that one rule the load is unchanged: the TOML must parse, and the
+/// whole [`CONFIG_VALIDATORS`] chain still runs, so a malformed or semantically
+/// invalid config is refused exactly as before. `rocky validate` keeps
+/// [`load_rocky_config`] and remains the command that requires every variable
+/// to resolve.
 ///
-/// Anything that connects, executes, or persists. A placeholder that reached
-/// an adapter would be sent as a literal `${DATABRICKS_HOST}`. Every such
-/// path calls [`load_rocky_config`] and keeps `MissingEnvVar` fatal.
-pub fn load_rocky_config_env_tolerant(path: &Path) -> Result<RockyConfig, ConfigError> {
+/// A placeholder written as a BARE value (`port = ${PORT}`) is not tolerated
+/// either, and never could be: it was not valid TOML before substitution, so
+/// it fails as a parse error — one whose hint names `PORT`, so the operator
+/// is not left decoding a stray `$` (see [`format_env_var_hint`]).
+///
+/// Never use this on a path that connects to anything: a literal
+/// `"${DATABRICKS_HOST}"` reaching an adapter is a confusing failure at best.
+pub fn load_rocky_config_credential_tolerant(path: &Path) -> Result<RockyConfig, ConfigError> {
     let raw = read_config_file(path)?;
-    let config = parse_rocky_config_str_with_policy(&raw, EnvPolicy::KeepPlaceholder)?;
+    let config = parse_rocky_config_str_with(&raw, CredentialPolicy::TolerateAdapterCredentials)?;
     validate_loaded_config(&config)?;
     Ok(config)
 }
@@ -6382,6 +6729,219 @@ impl ReplicationPipelineConfig {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- credential-tolerant loading (#1536) ----
+
+    fn write_cfg(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    /// The scope rule, both directions, in one place. Tolerance covers an
+    /// adapter's CONNECTION fields and nothing else — found by independent
+    /// review after the first attempt tolerated every unset variable anywhere.
+    #[test]
+    fn tolerance_is_scoped_to_adapter_connection_fields() {
+        // Tolerated: a credential field.
+        let (_d, path) =
+            write_cfg("[adapters.wh]\ntype = \"databricks\"\nhost = \"${ROCKY_T_1536}\"\n");
+        assert!(
+            load_rocky_config_credential_tolerant(&path).is_ok(),
+            "an unset credential field is the case this exists for"
+        );
+
+        // Refused: `type` selects behaviour, and the validator chain skips
+        // adapter types it does not recognise — so a literal would sail past.
+        let (_d, path) = write_cfg("[adapters.wh]\ntype = \"${ROCKY_T_1536}\"\n");
+        assert!(
+            matches!(
+                load_rocky_config_credential_tolerant(&path),
+                Err(ConfigError::MissingEnvVar { .. })
+            ),
+            "an unresolved adapter `type` must be refused"
+        );
+
+        // Refused: an unresolved import path makes the snapshot read fail, and
+        // that failure is a W012 WARNING — so E030-E033 pin enforcement would
+        // be skipped while the compile still reported success.
+        let (_d, path) = write_cfg(
+            "[adapters.wh]\ntype = \"duckdb\"\n\
+             \n[imports.orders]\npath = \"${ROCKY_T_1536}\"\n\
+             snapshot = \"snap.json\"\n",
+        );
+        assert!(
+            matches!(
+                load_rocky_config_credential_tolerant(&path),
+                Err(ConfigError::MissingEnvVar { .. })
+            ),
+            "an unresolved [imports] path must be refused — a pin that looks \
+             enforced and checks nothing is worse than no pin"
+        );
+    }
+
+    /// The `[adapter]` shorthand must get the same treatment as
+    /// `[adapters.<name>]`. The scope check runs after normalization precisely
+    /// so one rule covers both spellings.
+    #[test]
+    fn tolerance_covers_the_adapter_shorthand() {
+        let (_d, path) =
+            write_cfg("[adapter]\ntype = \"databricks\"\nhost = \"${ROCKY_T_1536}\"\n");
+        assert!(
+            load_rocky_config_credential_tolerant(&path).is_ok(),
+            "the [adapter] shorthand normalizes to adapters.<name> before the \
+             scope check, so it must behave identically"
+        );
+    }
+
+    /// A config that contains the literal text `${...}` for a variable that was
+    /// never referenced-and-unset must not be refused. The check matches the
+    /// names that actually went unresolved, not the `${` shape.
+    #[test]
+    fn a_literal_that_is_not_an_unresolved_reference_is_not_refused() {
+        // SAFETY: single-threaded test, name unique to it.
+        unsafe { std::env::set_var("ROCKY_T_SET_1536", "${NOT_A_REFERENCE}") };
+        let (_d, path) = write_cfg(
+            "[adapters.wh]\ntype = \"duckdb\"\n\
+             \n[imports.orders]\npath = \"${ROCKY_T_SET_1536}\"\n\
+             snapshot = \"snap.json\"\n",
+        );
+        let got = load_rocky_config_credential_tolerant(&path);
+        unsafe { std::env::remove_var("ROCKY_T_SET_1536") };
+        assert!(
+            got.is_ok(),
+            "the variable WAS set; that its value looks like a placeholder is \
+             not this check's business: {got:?}"
+        );
+    }
+
+    /// Compiling never opens a warehouse connection, so an unset credential
+    /// placeholder must not stop the load. The placeholder survives as literal
+    /// text rather than becoming an empty string — an empty host would look
+    /// like a configured value.
+    #[test]
+    fn tolerant_load_keeps_an_unset_placeholder_as_literal_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapters.wh]\ntype = \"databricks\"\n\
+             host = \"${ROCKY_TEST_UNSET_HOST_1536}\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+
+        // Strict refuses — that is the behaviour every executing path keeps.
+        let strict = load_rocky_config(&path);
+        assert!(
+            matches!(strict, Err(ConfigError::MissingEnvVar { .. })),
+            "strict load must still refuse an unset placeholder: {strict:?}"
+        );
+
+        let cfg = load_rocky_config_credential_tolerant(&path)
+            .expect("tolerant load must accept an unset placeholder");
+        assert_eq!(
+            cfg.adapters.get("wh").map(|a| a.host.as_deref()),
+            Some(Some("${ROCKY_TEST_UNSET_HOST_1536}")),
+            "the placeholder must survive verbatim, not collapse to empty"
+        );
+    }
+
+    /// Tolerance is scoped to the unresolved placeholder and nothing else. A
+    /// config that does not parse is still refused.
+    #[test]
+    fn tolerant_load_still_refuses_malformed_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(&path, "this is not = = valid toml [[[\n").unwrap();
+
+        assert!(
+            load_rocky_config_credential_tolerant(&path).is_err(),
+            "a config that cannot parse must still be refused"
+        );
+    }
+
+    /// And a config that parses but fails the validator chain is still refused,
+    /// so "tolerant" cannot be read as "unchecked".
+    #[test]
+    fn tolerant_load_still_runs_the_validator_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        // `freeze_marker_writes` on the `local` backend has no durable object
+        // tier to write to — a semantic failure the validator chain catches,
+        // not a parse error. An unknown adapter `type` would NOT work here: a
+        // type nothing references trips no validator, which is how the first
+        // version of this test passed for the wrong reason.
+        std::fs::write(
+            &path,
+            "[adapters.wh]\ntype = \"databricks\"\n\
+             host = \"${ROCKY_TEST_UNSET_HOST_1536}\"\n\
+             \n[state]\nfreeze_marker_writes = true\n",
+        )
+        .unwrap();
+
+        let err = load_rocky_config_credential_tolerant(&path)
+            .expect_err("an invalid adapter type must still be refused");
+        // Must fail in the VALIDATOR chain, not at parse — otherwise this test
+        // would pass on a typo in the fixture and prove nothing about
+        // tolerance leaving validation intact.
+        assert!(
+            !matches!(
+                err,
+                ConfigError::ParseToml(_) | ConfigError::ParseTomlWithEnvContext { .. }
+            ),
+            "expected a validator refusal, got a parse error: {err:?}"
+        );
+    }
+
+    /// A SET variable behaves identically under both policies — the tolerant
+    /// path must not become a second, subtly different expansion.
+    #[test]
+    fn tolerant_load_substitutes_a_set_variable_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapters.wh]\ntype = \"databricks\"\n\
+             host = \"${ROCKY_TEST_SET_HOST_1536}\"\ntoken = \"t\"\n",
+        )
+        .unwrap();
+
+        // SAFETY: single-threaded test, and the variable name is unique to it.
+        unsafe { std::env::set_var("ROCKY_TEST_SET_HOST_1536", "https://example.invalid") };
+        let tolerant = load_rocky_config_credential_tolerant(&path).expect("tolerant");
+        let strict = load_rocky_config(&path).expect("strict");
+        unsafe { std::env::remove_var("ROCKY_TEST_SET_HOST_1536") };
+
+        assert_eq!(
+            tolerant.adapters.get("wh").map(|a| a.host.clone()),
+            strict.adapters.get("wh").map(|a| a.host.clone()),
+            "a set variable must expand the same way under both policies"
+        );
+    }
+
+    /// The tail after the last `${...}` match must survive. The refusing path
+    /// used to return before copying it; the tolerant path parses that text, so
+    /// a truncated config would fail for the wrong reason.
+    #[test]
+    fn tolerant_load_keeps_config_after_the_unset_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rocky.toml");
+        std::fs::write(
+            &path,
+            "[adapters.wh]\ntype = \"databricks\"\n\
+             host = \"${ROCKY_TEST_UNSET_HOST_1536}\"\ntoken = \"t\"\n\
+             \n[adapters.after]\ntype = \"duckdb\"\n",
+        )
+        .unwrap();
+
+        let cfg = load_rocky_config_credential_tolerant(&path).expect("tolerant load");
+        assert!(
+            cfg.adapters.contains_key("after"),
+            "config after the unset placeholder must not be truncated; got adapters: {:?}",
+            cfg.adapters.keys().collect::<Vec<_>>()
+        );
+    }
     use super::*;
 
     #[test]
@@ -6585,7 +7145,12 @@ snapshot = "snap.json"
     }
 
     // -----------------------------------------------------------------
-    // SEVENTEENTH ROUND, finding 1 — `load_rocky_config_env_tolerant`.
+    // SEVENTEENTH ROUND, finding 1 — the tolerant loader. The branch
+    // shipped it as `load_rocky_config_env_tolerant` (every unset `${VAR}`
+    // tolerated); `main` shipped `load_rocky_config_credential_tolerant`
+    // (#1558, adapter connection fields only). The merge kept main's,
+    // and these fixtures all place the placeholder in a connection field,
+    // so they pin the same behaviour on the surviving API.
     //
     // These use a variable that is never set by construction rather than
     // `set_var`/`remove_var`: the process environment is global, `cargo
@@ -6597,7 +7162,7 @@ snapshot = "snap.json"
     /// literal text — so the caller sees exactly what it would have to
     /// resolve before connecting.
     #[test]
-    fn env_tolerant_load_keeps_an_unset_credential_placeholder() {
+    fn credential_tolerant_load_keeps_an_unset_credential_placeholder() {
         assert!(
             std::env::var("ROCKY_DEFINITELY_NOT_SET_TOLERANT_HOST").is_err(),
             "premise: the variable is unset"
@@ -6623,7 +7188,7 @@ token = "pat"
             Err(ConfigError::MissingEnvVar { .. })
         ));
 
-        let config = load_rocky_config_env_tolerant(&path)
+        let config = load_rocky_config_credential_tolerant(&path)
             .expect("an offline reader needs no credential to learn the adapter type");
         let adapter = config.adapters.get("default").expect("adapter parsed");
         assert_eq!(adapter.adapter_type, "databricks");
@@ -6638,14 +7203,14 @@ token = "pat"
     /// halves, because "it loaded" is only good news if the things that
     /// should still fail still fail.
     #[test]
-    fn env_tolerant_load_still_refuses_malformed_and_invalid_configs() {
+    fn credential_tolerant_load_still_refuses_malformed_and_invalid_configs() {
         let tmp = tempfile::tempdir().unwrap();
 
         // Malformed: unterminated table header.
         let malformed = tmp.path().join("malformed.toml");
         std::fs::write(&malformed, "[adapter.default\ntype = \"snowflake\"\n").unwrap();
         assert!(
-            load_rocky_config_env_tolerant(&malformed).is_err(),
+            load_rocky_config_credential_tolerant(&malformed).is_err(),
             "malformed TOML stays fatal"
         );
 
@@ -6660,7 +7225,7 @@ token = "pat"
         .unwrap();
         assert!(
             matches!(
-                load_rocky_config_env_tolerant(&invalid),
+                load_rocky_config_credential_tolerant(&invalid),
                 Err(ConfigError::AdapterKindUnsupported { .. })
             ),
             "the whole CONFIG_VALIDATORS chain still runs"
@@ -6679,7 +7244,7 @@ token = "pat"
     /// "this variable is not set" rather than a `$` the operator has to
     /// interpret — and that is what is pinned.
     #[test]
-    fn env_tolerant_load_names_an_unresolved_var_in_a_parse_error() {
+    fn credential_tolerant_load_names_an_unresolved_var_in_a_parse_error() {
         assert!(
             std::env::var("ROCKY_DEFINITELY_NOT_SET_BARE_PORT").is_err(),
             "premise: the variable is unset"
@@ -6692,7 +7257,7 @@ token = "pat"
         )
         .unwrap();
 
-        let err = load_rocky_config_env_tolerant(&path)
+        let err = load_rocky_config_credential_tolerant(&path)
             .expect_err("a bare ${VAR} is not valid TOML with or without substitution");
         let rendered = err.to_string();
         assert!(
@@ -11905,5 +12470,582 @@ adapter = "default"
                 "error for {bad:?} should mention {needle}: {err}"
             );
         }
+    }
+
+    // ---- AdapterConfig::endpoint_identity ----
+
+    fn adapter_from_toml(body: &str) -> AdapterConfig {
+        toml::from_str(body).expect("adapter block parses")
+    }
+
+    /// Every credential and principal field an adapter block can carry,
+    /// each with a value distinctive enough to grep for.
+    const CREDENTIAL_FIELDS: &str = r#"
+token = "dapi-TOKEN-1234"
+client_id = "CLIENT-ID-0"
+client_secret = "CLIENT-SECRET-5678"
+api_key = "API-KEY-1"
+api_secret = "API-SECRET-2"
+username = "USER-alice"
+password = "PASSWORD-9"
+oauth_token = "OAUTH-TOKEN-abc"
+private_key_path = "/keys/PRIVATE-KEY.p8"
+pat = "PAT-xyz"
+role = "ROLE-loader"
+"#;
+
+    /// The same values, each paired with the field it came from so a failure
+    /// can name the field without printing what leaked.
+    const CREDENTIAL_VALUES: [(&str, &str); 11] = [
+        ("token", "dapi-TOKEN-1234"),
+        ("client_id", "CLIENT-ID-0"),
+        ("client_secret", "CLIENT-SECRET-5678"),
+        ("api_key", "API-KEY-1"),
+        ("api_secret", "API-SECRET-2"),
+        ("username", "USER-alice"),
+        ("password", "PASSWORD-9"),
+        ("oauth_token", "OAUTH-TOKEN-abc"),
+        ("private_key_path", "PRIVATE-KEY"),
+        ("pat", "PAT-xyz"),
+        ("role", "ROLE-loader"),
+    ];
+
+    /// The identity, both as rendered for messages and as persisted in a
+    /// checkpoint, carries none of the credential or principal values —
+    /// and none of the extra `leaked` values the caller names (a token
+    /// smuggled through a host URL, say).
+    fn assert_identity_is_location_only(adapter: &AdapterConfig, leaked: &[&str]) {
+        let identity = adapter.endpoint_identity();
+        let rendered = identity.to_string();
+        let persisted = serde_json::to_string(&identity).unwrap();
+        let named = CREDENTIAL_VALUES
+            .iter()
+            .copied()
+            .chain(leaked.iter().map(|value| ("caller-supplied", *value)));
+        for (field, value) in named {
+            for (form, text) in [("rendered", &rendered), ("persisted", &persisted)] {
+                // A test that guards against leaking a credential must not
+                // print one itself. Name the field that leaked and mask its
+                // value inside the identity being reported.
+                assert!(
+                    !text.contains(value),
+                    "{}: {form} identity leaks the {field} value: {:?}",
+                    adapter.adapter_type,
+                    text.replace(value, "<leaked>")
+                );
+            }
+        }
+        assert!(
+            !rendered.contains("***"),
+            "{}: identity must not carry a redaction placeholder either: {rendered:?}",
+            adapter.adapter_type
+        );
+    }
+
+    fn locators(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// The expected `host_route_digest` for a route each test spells out in
+    /// full. What is pinned is the digest's *input*, not the hash function.
+    fn route_digest(route: &str) -> String {
+        format!("blake3:{}", blake3::hash(route.as_bytes()).to_hex())
+    }
+
+    #[test]
+    fn duckdb_identity_has_no_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("wh.duckdb");
+        std::fs::write(&file, b"").unwrap();
+        let adapter = adapter_from_toml(&format!(
+            "type = \"duckdb\"\npath = \"{}\"\n{CREDENTIAL_FIELDS}",
+            file.display()
+        ));
+        assert_identity_is_location_only(&adapter, &[]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "duckdb".to_string(),
+                locators: locators(&[(
+                    "path",
+                    &std::fs::canonicalize(&file).unwrap().display().to_string()
+                )]),
+            }
+        );
+    }
+
+    #[test]
+    fn databricks_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            r#"
+type = "databricks"
+host = "https://USER-alice:URL-SECRET@adb-1.azuredatabricks.net/?token=QUERY-SECRET#FRAG-SECRET"
+http_path = "/sql/1.0/warehouses/abc"
+timeout_secs = 30
+{CREDENTIAL_FIELDS}"#
+        ));
+        assert_identity_is_location_only(&adapter, &["URL-SECRET", "QUERY-SECRET", "FRAG-SECRET"]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "databricks".to_string(),
+                locators: locators(&[
+                    ("host", "https://adb-1.azuredatabricks.net"),
+                    (
+                        "host_route_digest",
+                        &route_digest(
+                            "https://adb-1.azuredatabricks.net/?token=QUERY-SECRET#FRAG-SECRET"
+                        ),
+                    ),
+                    ("http_path", "/sql/1.0/warehouses/abc"),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn snowflake_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            r#"
+type = "snowflake"
+account = "xy12345.us-east-1"
+host = "https://USER-alice:URL-SECRET@xy12345.us-east-1.snowflakecomputing.com/session/TOKEN-SECRET"
+warehouse = "COMPUTE_WH"
+database = "ANALYTICS"
+{CREDENTIAL_FIELDS}"#
+        ));
+        assert_identity_is_location_only(&adapter, &["URL-SECRET", "TOKEN-SECRET"]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "snowflake".to_string(),
+                locators: locators(&[
+                    ("account", "xy12345.us-east-1"),
+                    ("database", "ANALYTICS"),
+                    ("host", "https://xy12345.us-east-1.snowflakecomputing.com"),
+                    (
+                        "host_route_digest",
+                        &route_digest(
+                            "https://xy12345.us-east-1.snowflakecomputing.com/session/TOKEN-SECRET"
+                        ),
+                    ),
+                    ("warehouse", "COMPUTE_WH"),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn bigquery_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            "type = \"bigquery\"\nproject_id = \"my-proj\"\nlocation = \"EU\"\n{CREDENTIAL_FIELDS}"
+        ));
+        assert_identity_is_location_only(&adapter, &[]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "bigquery".to_string(),
+                locators: locators(&[("project_id", "my-proj")]),
+            }
+        );
+    }
+
+    /// The reproduced leak: a Trino coordinator reached through a proxy
+    /// whose path carries a token. Only `scheme://host[:port]` is shown;
+    /// the route survives as a digest, so the path still routes.
+    #[test]
+    fn trino_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            r#"
+type = "trino"
+host = "https://USER-alice:URL-SECRET@proxy.example.com:8443/tenant/x/token/PATH-SECRET/?token=QUERY-SECRET#FRAG-SECRET"
+database = "hive"
+{CREDENTIAL_FIELDS}"#
+        ));
+        assert_identity_is_location_only(
+            &adapter,
+            &["URL-SECRET", "PATH-SECRET", "QUERY-SECRET", "FRAG-SECRET"],
+        );
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "trino".to_string(),
+                locators: locators(&[
+                    ("catalog", "hive"),
+                    ("host", "https://proxy.example.com:8443"),
+                    (
+                        "host_route_digest",
+                        &route_digest(
+                            "https://proxy.example.com:8443/tenant/x/token/PATH-SECRET/?token=QUERY-SECRET#FRAG-SECRET"
+                        ),
+                    ),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn fivetran_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            "type = \"fivetran\"\ndestination_id = \"dest_1\"\n{CREDENTIAL_FIELDS}"
+        ));
+        assert_identity_is_location_only(&adapter, &[]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "fivetran".to_string(),
+                locators: locators(&[("destination_id", "dest_1")]),
+            }
+        );
+    }
+
+    #[test]
+    fn airbyte_iceberg_and_manual_identities_have_no_credentials() {
+        for adapter_type in ["airbyte", "iceberg"] {
+            let adapter = adapter_from_toml(&format!(
+                "type = \"{adapter_type}\"\nhost = \"https://USER-alice:URL-SECRET@svc.example.com/api/PATH-SECRET\"\n{CREDENTIAL_FIELDS}"
+            ));
+            assert_identity_is_location_only(&adapter, &["URL-SECRET", "PATH-SECRET"]);
+            assert_eq!(
+                adapter.endpoint_identity(),
+                EndpointIdentity {
+                    adapter_type: adapter_type.to_string(),
+                    locators: locators(&[
+                        ("host", "https://svc.example.com"),
+                        (
+                            "host_route_digest",
+                            &route_digest("https://svc.example.com/api/PATH-SECRET"),
+                        ),
+                    ]),
+                }
+            );
+        }
+        let manual = adapter_from_toml(&format!("type = \"manual\"\n{CREDENTIAL_FIELDS}"));
+        assert_identity_is_location_only(&manual, &[]);
+        assert_eq!(
+            manual.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "manual".to_string(),
+                locators: locators(&[]),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_adapter_identity_has_no_credentials() {
+        let adapter = adapter_from_toml(&format!(
+            r#"
+type = "some_future_adapter"
+host = "https://USER-alice:URL-SECRET@wh.example.com/api/PATH-SECRET"
+http_path = "/gw"
+account = "acct"
+database = "db"
+project_id = "proj"
+destination_id = "dest"
+warehouse = "WH"
+{CREDENTIAL_FIELDS}
+[extra]
+x_token = "EXTRA-SECRET"
+"#
+        ));
+        assert_identity_is_location_only(&adapter, &["URL-SECRET", "PATH-SECRET", "EXTRA-SECRET"]);
+        assert_eq!(
+            adapter.endpoint_identity(),
+            EndpointIdentity {
+                adapter_type: "some_future_adapter".to_string(),
+                locators: locators(&[
+                    ("account", "acct"),
+                    ("database", "db"),
+                    ("destination_id", "dest"),
+                    ("host", "https://wh.example.com"),
+                    (
+                        "host_route_digest",
+                        &route_digest("https://wh.example.com/api/PATH-SECRET"),
+                    ),
+                    ("http_path", "/gw"),
+                    ("project_id", "proj"),
+                ]),
+            }
+        );
+    }
+
+    /// The identity is the data location, not the principal: who connects
+    /// never changes it, and a session that pins no database is one
+    /// endpoint per account whoever opens it.
+    #[test]
+    fn snowflake_identity_is_the_location_not_the_principal() {
+        let as_alice = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"alice\"\nrole = \"LOADER\"\ndatabase = \"ANALYTICS\"\n",
+        );
+        let as_bob = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"bob\"\nrole = \"ADMIN\"\ndatabase = \"ANALYTICS\"\ntimeout_secs = 900\n",
+        );
+        assert_eq!(as_alice.endpoint_identity(), as_bob.endpoint_identity());
+
+        // The reproduced collapse: a PAT/OAuth session with no username and
+        // no database. It is `snowflake account=<acct>` on purpose — the
+        // identity never stands a user in for the missing database.
+        let pat_session = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\npat = \"PAT-xyz\"\n",
+        );
+        assert_eq!(
+            pat_session.endpoint_identity().to_string(),
+            "snowflake account=xy12345.us-east-1"
+        );
+        let unpinned_as_bob = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"bob\"\n",
+        );
+        assert_eq!(
+            pat_session.endpoint_identity(),
+            unpinned_as_bob.endpoint_identity()
+        );
+
+        // The location fields do move the identity.
+        let other_account = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"zz99999.eu-west-1\"\ndatabase = \"ANALYTICS\"\n",
+        );
+        assert_ne!(
+            as_alice.endpoint_identity(),
+            other_account.endpoint_identity()
+        );
+        let other_warehouse = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\ndatabase = \"ANALYTICS\"\nwarehouse = \"XLARGE_WH\"\n",
+        );
+        assert_ne!(
+            as_alice.endpoint_identity(),
+            other_warehouse.endpoint_identity()
+        );
+    }
+
+    #[test]
+    fn duckdb_endpoint_identity_canonicalizes_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("wh.duckdb");
+        std::fs::write(&file, b"").unwrap();
+        let canonical = std::fs::canonicalize(&file).unwrap();
+
+        let spelled_directly = adapter_from_toml(&format!(
+            "type = \"duckdb\"\npath = \"{}\"\n",
+            file.display()
+        ));
+        let spelled_with_dot = adapter_from_toml(&format!(
+            "type = \"duckdb\"\npath = \"{}\"\n",
+            dir.path().join(".").join("wh.duckdb").display()
+        ));
+        assert_eq!(
+            spelled_directly.endpoint_identity().to_string(),
+            format!("duckdb path={}", canonical.display())
+        );
+        assert_eq!(
+            spelled_directly.endpoint_identity(),
+            spelled_with_dot.endpoint_identity()
+        );
+
+        let elsewhere = adapter_from_toml(&format!(
+            "type = \"duckdb\"\npath = \"{}\"\n",
+            dir.path().join("other.duckdb").display()
+        ));
+        assert_ne!(
+            spelled_directly.endpoint_identity(),
+            elsewhere.endpoint_identity(),
+            "a file that does not exist yet still gets its own absolute identity"
+        );
+        assert!(
+            elsewhere.endpoint_identity().locators["path"].ends_with("other.duckdb"),
+            "{}",
+            elsewhere.endpoint_identity()
+        );
+
+        // In-memory DuckDB never outlives its process, so the identity is
+        // pinned to this process and can never match from another one.
+        let in_memory = adapter_from_toml("type = \"duckdb\"\n");
+        assert_eq!(
+            in_memory.endpoint_identity().to_string(),
+            format!("duckdb path=:memory: pid={}", std::process::id())
+        );
+    }
+
+    #[test]
+    fn sanitize_host_locator_keeps_only_scheme_host_and_port() {
+        assert_eq!(
+            sanitize_host_locator("https://alice:s3cret@trino.example.com:8443/path?x=1#frag"),
+            "https://trino.example.com:8443"
+        );
+        assert_eq!(
+            sanitize_host_locator("https://proxy/tenant/x/token/SECRET/"),
+            "https://proxy"
+        );
+        assert_eq!(sanitize_host_locator("alice:pw@host"), "host");
+        assert_eq!(
+            sanitize_host_locator("alice:pw@host:8443/gw/SECRET"),
+            "host:8443"
+        );
+        assert_eq!(sanitize_host_locator("https://host/a@b"), "https://host");
+        assert_eq!(
+            sanitize_host_locator("https://adb-1.azuredatabricks.net"),
+            "https://adb-1.azuredatabricks.net"
+        );
+        assert_eq!(
+            sanitize_host_locator("https://[::1]:8443/x"),
+            "https://[::1]:8443"
+        );
+        // Equivalent spellings of one coordinator agree.
+        assert_eq!(
+            sanitize_host_locator("https://trino.example/"),
+            sanitize_host_locator("https://trino.example")
+        );
+        assert_eq!(
+            sanitize_host_locator("https://host?token=T"),
+            "https://host"
+        );
+        assert_eq!(sanitize_host_locator(""), "");
+    }
+
+    /// A `://` after the first `/` is inside the path, not a scheme. Read
+    /// as a scheme it would end the authority far to the right, and the
+    /// shown host — which a scope-mismatch message prints — would carry the
+    /// userinfo and the path with it.
+    #[test]
+    fn a_late_scheme_delimiter_does_not_reopen_the_shown_host() {
+        assert_eq!(
+            sanitize_host_locator("alice:pw@gw/tenant/SECRET://tail"),
+            "gw"
+        );
+        let adapter = adapter_from_toml(
+            "type = \"trino\"\nhost = \"alice:URL-SECRET@gw/tenant/PATH-SECRET://tail\"\ndatabase = \"hive\"\n",
+        );
+        assert_identity_is_location_only(&adapter, &["URL-SECRET", "PATH-SECRET"]);
+        assert_eq!(adapter.endpoint_identity().locators["host"], "gw");
+        // The route still routes: the path behind that host separates it
+        // from another tenant on the same gateway.
+        assert_ne!(
+            adapter.endpoint_identity(),
+            adapter_from_toml(
+                "type = \"trino\"\nhost = \"alice:URL-SECRET@gw/tenant/OTHER://tail\"\ndatabase = \"hive\"\n",
+            )
+            .endpoint_identity()
+        );
+    }
+
+    /// A `://` reached after the first `?` or `#` is inside the query or the
+    /// fragment, not a scheme. Read as a scheme it ends the authority at the
+    /// far right, and the whole credential-bearing prefix lands in the shown
+    /// host — which a checkpoint stores and a scope-mismatch message prints.
+    #[test]
+    fn a_scheme_delimiter_inside_a_query_or_fragment_does_not_reopen_the_shown_host() {
+        assert_eq!(
+            sanitize_host_locator("alice:pw@gw?next=SECRET://tail"),
+            "gw"
+        );
+        assert_eq!(
+            sanitize_host_locator("alice:pw@gw#next=SECRET://tail"),
+            "gw"
+        );
+        assert_eq!(
+            sanitize_host_locator("https://alice:pw@gw:8443?next=SECRET://tail"),
+            "https://gw:8443"
+        );
+
+        for tail in ["?next=PATH-SECRET://tail", "#next=PATH-SECRET://tail"] {
+            let adapter = adapter_from_toml(&format!(
+                "type = \"trino\"\nhost = \"alice:URL-SECRET@gw{tail}\"\ndatabase = \"hive\"\n"
+            ));
+            assert_identity_is_location_only(&adapter, &["URL-SECRET", "PATH-SECRET"]);
+            assert_eq!(adapter.endpoint_identity().locators["host"], "gw");
+            // The route behind the host still routes: a different query or
+            // fragment is a different endpoint.
+            assert_ne!(
+                adapter.endpoint_identity(),
+                adapter_from_toml(&format!(
+                    "type = \"trino\"\nhost = \"alice:URL-SECRET@gw{}\"\ndatabase = \"hive\"\n",
+                    tail.replace("PATH-SECRET", "OTHER")
+                ))
+                .endpoint_identity()
+            );
+        }
+    }
+
+    /// A gateway routes by path, so two paths behind one host name are two
+    /// endpoints. The rendered form still shows only `scheme://host[:port]`;
+    /// the route digest is what tells them apart.
+    #[test]
+    fn host_path_and_query_are_part_of_the_endpoint() {
+        let gateway = |suffix: &str| {
+            adapter_from_toml(&format!(
+                "type = \"trino\"\nhost = \"https://gw.example.com:8443{suffix}\"\ndatabase = \"hive\"\n"
+            ))
+            .endpoint_identity()
+        };
+        let tenant_a = gateway("/tenant/a");
+        let tenant_b = gateway("/tenant/b");
+        assert_eq!(
+            tenant_a.locators["host"], tenant_b.locators["host"],
+            "the displayed host is the same machine"
+        );
+        assert_ne!(tenant_a, tenant_b, "the routed endpoint is not");
+        assert_ne!(gateway(""), tenant_a);
+        assert_ne!(gateway("?cluster=a"), gateway("?cluster=b"));
+
+        // Spellings that name one endpoint still agree.
+        assert_eq!(gateway("/tenant/a"), gateway("/tenant/a/"));
+        assert_eq!(gateway(""), gateway("/"));
+    }
+
+    /// The digest input is pinned: it is the host reduced to what routes —
+    /// scheme, host, port, path, query and fragment — with the credentials
+    /// in the userinfo removed and a trailing `/` trimmed.
+    #[test]
+    fn host_route_digest_input_is_pinned() {
+        assert_eq!(
+            host_route_digest("https://alice:s3cret@gw.example.com:8443/tenant/a/?x=1#f"),
+            format!(
+                "blake3:{}",
+                blake3::hash(b"https://gw.example.com:8443/tenant/a/?x=1#f").to_hex()
+            )
+        );
+        assert_eq!(
+            host_route_digest("https://gw.example.com/tenant/a/"),
+            format!(
+                "blake3:{}",
+                blake3::hash(b"https://gw.example.com/tenant/a").to_hex()
+            )
+        );
+        assert_eq!(
+            host_route_digest(""),
+            format!("blake3:{}", blake3::hash(b"").to_hex())
+        );
+        // Who connects is not where the data lives: the userinfo never
+        // moves the digest.
+        assert_eq!(
+            host_route_digest("https://alice:pw1@gw/x"),
+            host_route_digest("https://bob:pw2@gw/x")
+        );
+    }
+
+    /// The persisted shape of an identity is pinned: it lives inside every
+    /// checkpoint's scope and is compared field-wise across binaries.
+    #[test]
+    fn endpoint_identity_blob_shape_is_pinned() {
+        let adapter = adapter_from_toml(
+            "type = \"databricks\"\nhost = \"https://adb-1.azuredatabricks.net\"\nhttp_path = \"/sql/1.0/warehouses/abc\"\n",
+        );
+        let identity = adapter.endpoint_identity();
+        assert_eq!(
+            serde_json::to_value(&identity).unwrap(),
+            serde_json::json!({
+                "adapter_type": "databricks",
+                "locators": {
+                    "host": "https://adb-1.azuredatabricks.net",
+                    "host_route_digest": route_digest("https://adb-1.azuredatabricks.net"),
+                    "http_path": "/sql/1.0/warehouses/abc",
+                },
+            })
+        );
+        let round_trip: EndpointIdentity =
+            serde_json::from_value(serde_json::to_value(&identity).unwrap()).unwrap();
+        assert_eq!(round_trip, identity);
     }
 }
