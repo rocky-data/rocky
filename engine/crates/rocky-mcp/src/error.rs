@@ -110,12 +110,12 @@ pub struct ToolError {
     /// helpers).
     #[serde(flatten)]
     pub recorded_plan: Option<Box<RecordedPlanHandoff>>,
-    /// The project-relative paths a refused draft's rollback FAILED to clean
-    /// up — each is an artifact still on disk that the refusal `message` says
-    /// to remove or restore (#1561). Set only by
-    /// [`ToolError::policy_denied_after_rollback`] when the rollback reported
-    /// failures; absent (nothing on the wire) on every other error, a clean
-    /// rollback included.
+    /// The project-relative paths a refused draft's rollback FAILED to put
+    /// back (#1561) — each is either a refused artifact still on disk or a
+    /// prior file that is now absent; the refusal `message` says which, per
+    /// path. Set only by [`ToolError::policy_denied_after_rollback`] when the
+    /// rollback reported failures; absent (nothing on the wire) on every
+    /// other error, a clean rollback included.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback_failed_paths: Option<Vec<String>>,
 }
@@ -393,7 +393,18 @@ mod tests {
                 "`{field}` is an always-present envelope field; required = {required:?}"
             );
         }
-        for field in ["plan_id", "product_id", "spec_digest", "policy_rule"] {
+        for field in [
+            "plan_id",
+            "product_id",
+            "spec_digest",
+            "policy_rule",
+            "rollback_failed_paths",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "`{field}` must be a property of the ToolError schema; got properties {:?}",
+                properties.keys().collect::<Vec<_>>()
+            );
             assert!(
                 !required.contains(&field),
                 "`{field}` must stay OPTIONAL on the wire; required = {required:?}"

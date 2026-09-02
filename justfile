@@ -297,3 +297,7 @@ soak-verdict-selftest:
 # Pin mutation-check.sh's three verdicts (killed / survived / inconclusive).
 mutation-check-selftest:
     bash scripts/tests/mutation-check.test.sh
+
+# Replay engine-ci and codegen-drift's change detectors against scratch repos.
+ci-change-detector-selftest:
+    bash scripts/tests/ci-change-detector.test.sh
