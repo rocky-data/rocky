@@ -5354,9 +5354,31 @@ pub async fn run(
                         }
                         Err(e) => {
                             // A missing key column / keyless table surfaces as a
-                            // query error — skip the group with a reason, don't
-                            // fail (FR acceptance criterion).
-                            warn!(source_type, table, error = %e, "cross_source_overlap query failed (missing key column / keyless table?) — skipping group");
+                            // query error, and that case is tolerated by design
+                            // (FR acceptance criterion) — but the ERROR TYPE does
+                            // not say which case this is. Syntax, permission and
+                            // transport failures arrive here too, and skipping
+                            // silently dropped the check from `check_results`,
+                            // the `after_checks` tally and the JSON entirely, so
+                            // a group that was never evaluated read as a group
+                            // with nothing to report. Record the same explicit
+                            // not-evaluated state the generation arm above uses:
+                            // still not a hard failure, but never invisible.
+                            warn!(source_type, table, error = %e, "cross_source_overlap query failed (missing key column / keyless table?) — reporting the check as not evaluated");
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(
+                                rocky_core::checks::cross_source_overlap_not_evaluated(
+                                    name,
+                                    contributing,
+                                    e.to_string(),
+                                    overlap_cfg.severity,
+                                ),
+                            );
                         }
                     }
                 }

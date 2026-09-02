@@ -295,6 +295,13 @@ pub fn reject_statement_terminator(context: &str, sql: &str) -> Result<(), Valid
             // the rest of the line as SQL, so neither skipping it nor ignoring
             // it is safe for all five.
             '/' if at(i + 1) == Some('/') => return Err(ambiguous("a `//` line comment")),
+            // A BigQuery-only line comment, and the same split as `//`: on
+            // BigQuery the rest of the line is comment, everywhere else it is
+            // live SQL. Ignoring it is the dangerous half — a quote inside a
+            // `#` comment would move THIS scanner's quote state while BigQuery
+            // resumed reading SQL at the newline, so a later terminator could
+            // be classified as string content.
+            '#' => return Err(ambiguous("a `#` line comment")),
             '/' if at(i + 1) == Some('*') => {
                 i += 2;
                 let mut closed = false;
@@ -592,6 +599,22 @@ mod tests {
         assert!(rejects("amount > 0 -- c\r\n; SELECT 1"));
         // A comment that really does run to the end is still fine.
         assert!(reject_statement_terminator("ctx", "amount > 0 -- ; trailing").is_ok());
+    }
+
+    #[test]
+    fn terminator_refuses_a_hash_line_comment() {
+        // Same split as `//`, found by the round-3 review. BigQuery reads `#`
+        // to end of line as a comment; the other four keep reading SQL. So a
+        // quote inside a `#` run moves THIS scanner's quote state while
+        // BigQuery has already resumed live SQL at the newline — and a `;`
+        // after it lands top-level there while the scan files it as string
+        // content. The fragment below is balanced to the scan and carries no
+        // scan-visible top-level `;`.
+        let f = "x = 1 # it's fine\n AND y = 'a' ; SELECT 1; -- '";
+        let err = reject_statement_terminator("ctx", f).unwrap_err();
+        assert!(err.to_string().contains('#'), "{err}");
+        // A `#` inside a string literal is ordinary text, not a comment.
+        assert!(reject_statement_terminator("ctx", "tag = '#1'").is_ok());
     }
 
     #[test]
