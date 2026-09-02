@@ -13008,7 +13008,13 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         .unwrap();
         // Three places a secret hides in one host, each with no `/` before
         // the `://` that follows it.
-        let secrets = ["USERINFO-SECRET", "QUERY-SECRET", "FRAGMENT-SECRET"];
+        // Paired with the URL part each one sits in, so a failure can name the
+        // part without printing what leaked.
+        let secrets = [
+            ("userinfo", "USERINFO-SECRET"),
+            ("query", "QUERY-SECRET"),
+            ("fragment", "FRAGMENT-SECRET"),
+        ];
         let gateway = |tenant: &str| -> AdapterConfig {
             toml::from_str(&format!(
                 "type = \"trino\"\nhost = \"alice:USERINFO-SECRET@gw.example.com:8443?next=QUERY-SECRET://{tenant}#FRAGMENT-SECRET\"\ndatabase = \"hive\"\n"
@@ -13028,12 +13034,13 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let message = format!("{err:#}");
         let stored = serde_json::to_string(&store.get_run_progress("run-a").unwrap().unwrap())
             .expect("the checkpoint serializes");
-        for secret in secrets {
+        for (part, secret) in secrets {
             for (form, text) in [("message", &message), ("checkpoint", &stored)] {
-                // Name the leaking surface; never print the secret itself.
+                // Name the leaking surface and the URL part; never print the
+                // secret itself, not even in a failure.
                 assert!(
                     !text.contains(secret),
-                    "the refusal {form} leaks {secret}: {}",
+                    "the refusal {form} leaks the {part} secret: {}",
                     text.replace(secret, "<leaked>")
                 );
             }
