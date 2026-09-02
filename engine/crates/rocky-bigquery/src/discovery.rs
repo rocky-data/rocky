@@ -69,7 +69,11 @@ impl DiscoveryAdapter for BigQueryDiscoveryAdapter {
         // SQL string-literal escape. The prefix is user input; `'`
         // would otherwise close the literal. `STARTS_WITH` makes
         // wildcard characters (`_`, `%`) safe — they're treated as
-        // literals.
+        // literals. Doubling is not enough on its own: BigQuery also honours
+        // a backslash escape, so a prefix ending in `\` would escape the first
+        // quote of the pair and let the second close the literal (#1524).
+        rocky_sql::validation::reject_unquotable_literal("schema_pattern `prefix`", schema_prefix)
+            .map_err(AdapterError::new)?;
         let prefix_lit = schema_prefix.replace('\'', "''");
 
         let schemas_sql = format!(

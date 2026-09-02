@@ -66,6 +66,12 @@ export type CheckResult1 =
        */
       contributing_tables: string[];
       /**
+       * Set when the check could NOT be evaluated, carrying the reason.
+       *
+       * `overlap_count` is only a measurement when this is `None`. A refused key expression or a misconfigured key would otherwise report `overlap_count: 0`, which reads as "no overlap found" — the check never ran, and the tally must not imply that it did.
+       */
+      not_evaluated?: string | null;
+      /**
        * Count of distinct keys that appear in more than one sibling table.
        */
       overlap_count: number;

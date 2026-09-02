@@ -83,6 +83,14 @@ pub enum CheckDetails {
         contributing_tables: Vec<String>,
         /// Bounded sample of overlapping key values (stringified) for triage.
         sample: Vec<String>,
+        /// Set when the check could NOT be evaluated, carrying the reason.
+        ///
+        /// `overlap_count` is only a measurement when this is `None`. A refused
+        /// key expression or a misconfigured key would otherwise report
+        /// `overlap_count: 0`, which reads as "no overlap found" — the check
+        /// never ran, and the tally must not imply that it did.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        not_evaluated: Option<String>,
     },
 }
 
@@ -303,6 +311,31 @@ pub fn check_cross_source_overlap(
             overlap_count,
             contributing_tables,
             sample,
+            not_evaluated: None,
+        },
+    }
+}
+
+/// Builds a `CheckResult` for a cross-source overlap check that could NOT be
+/// evaluated — a refused key expression, or a `keys`/`key_expr` misconfiguration.
+///
+/// Always fails. A check Rocky declined to run must stay in the tally and must
+/// not report a zero overlap count as if it had measured one.
+pub fn cross_source_overlap_not_evaluated(
+    name: impl Into<String>,
+    contributing_tables: Vec<String>,
+    reason: impl Into<String>,
+    severity: TestSeverity,
+) -> CheckResult {
+    CheckResult {
+        name: name.into(),
+        passed: false,
+        severity,
+        details: CheckDetails::CrossSourceOverlap {
+            overlap_count: 0,
+            contributing_tables,
+            sample: Vec::new(),
+            not_evaluated: Some(reason.into()),
         },
     }
 }
@@ -828,6 +861,40 @@ mod tests {
         )
         .unwrap();
         assert!(sql.contains("md5(CAST(customer_id AS VARCHAR)"), "{sql}");
+    }
+
+    #[test]
+    fn test_cross_source_overlap_not_evaluated_is_distinct_from_zero_overlap() {
+        // A genuine measurement of zero overlap PASSES.
+        let measured = check_cross_source_overlap("x", 0, 0, vec![], vec![], TestSeverity::Error);
+        assert!(measured.passed);
+        match &measured.details {
+            CheckDetails::CrossSourceOverlap {
+                overlap_count,
+                not_evaluated,
+                ..
+            } => {
+                assert_eq!(*overlap_count, 0);
+                assert!(not_evaluated.is_none(), "a measurement carries no reason");
+            }
+            other => panic!("expected CrossSourceOverlap, got {other:?}"),
+        }
+
+        // A check that never ran FAILS and says so, so a consumer cannot read
+        // its `overlap_count: 0` as "no overlap found".
+        let skipped = cross_source_overlap_not_evaluated(
+            "x",
+            vec!["cat.s1.t".into()],
+            "key expression refused",
+            TestSeverity::Error,
+        );
+        assert!(!skipped.passed, "a check that did not run must not pass");
+        match &skipped.details {
+            CheckDetails::CrossSourceOverlap { not_evaluated, .. } => {
+                assert_eq!(not_evaluated.as_deref(), Some("key expression refused"));
+            }
+            other => panic!("expected CrossSourceOverlap, got {other:?}"),
+        }
     }
 
     #[test]

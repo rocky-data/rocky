@@ -321,6 +321,14 @@ fn lower_valid_predicate(
                     name: label.to_string(),
                 });
             }
+            // Same quote-doubling limit as `generate_test_sql_inner` — see
+            // `reject_unquotable_literal`.
+            for v in values {
+                validation::reject_unquotable_literal(
+                    &format!("quarantine assertion '{label}' accepted_values value"),
+                    v,
+                )?;
+            }
             let in_list = values
                 .iter()
                 .map(|v| format!("'{}'", v.replace('\'', "''")))
@@ -1098,6 +1106,22 @@ mod unit_tests {
     }
 
     // ----- Statement-terminator refusal (issue #1524) -----
+
+    #[test]
+    fn quarantine_accepted_values_refuses_a_backslash_in_a_value() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::AcceptedValues {
+                values: vec!["ok".into(), "trailing_backslash\\".into()],
+            },
+            Some("status"),
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        assert!(err.to_string().contains("backslash"), "{err}");
+    }
 
     #[test]
     fn quarantine_expression_refuses_a_statement_terminator() {

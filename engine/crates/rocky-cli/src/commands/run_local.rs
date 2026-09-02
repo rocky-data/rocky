@@ -2368,6 +2368,39 @@ auto_create_schemas = true
         assert!(results[1].passed, "a genuine 0 <= threshold still passes");
     }
 
+    #[test]
+    fn a_not_evaluated_overlap_check_reaches_the_severity_tally() {
+        // `after_checks` and the severity roll-up both walk
+        // `output.check_results`. A cross-source check Rocky declined to run is
+        // pushed there as a failed check, so it must be counted — the silent
+        // skip it replaced left the run green with no record.
+        use crate::output::{RunOutput, TableCheckOutput};
+        let mut output = RunOutput::new("test".to_string(), 0, 1);
+        output.check_results.push(TableCheckOutput {
+            asset_key: vec!["duckdb".into(), "t".into()],
+            checks: vec![rocky_core::checks::cross_source_overlap_not_evaluated(
+                "cross_source_overlap_duckdb_t",
+                vec!["cat.s1.t".into(), "cat.s2.t".into()],
+                "key expression refused",
+                rocky_core::tests::TestSeverity::Error,
+            )],
+        });
+
+        let (errors, warnings) = super::count_failures_by_severity(&output);
+        assert_eq!(errors, 1, "a refused check must count as an error failure");
+        assert_eq!(warnings, 0);
+
+        // And the after_checks roll-up counts it as failed, not absent.
+        let total: usize = output.check_results.iter().map(|t| t.checks.len()).sum();
+        let failed: usize = output
+            .check_results
+            .iter()
+            .flat_map(|t| &t.checks)
+            .filter(|c| !c.passed)
+            .count();
+        assert_eq!((total, failed), (1, 1));
+    }
+
     #[tokio::test]
     async fn refused_assertion_sql_still_appears_in_the_tally() {
         // A check whose SQL Rocky refuses to generate must be REPORTED as a

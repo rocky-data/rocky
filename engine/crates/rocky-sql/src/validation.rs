@@ -55,6 +55,16 @@ pub enum ValidationError {
         context: String,
         region: &'static str,
     },
+
+    #[error(
+        "{context}: SQL fragment contains {token}, which the warehouses Rocky targets read \
+         differently. Rocky refuses it rather than guess which reading applies. Rewrite the \
+         fragment using plain '...' / \"...\" literals, -- or /* */ comments"
+    )]
+    AmbiguousSqlToken {
+        context: String,
+        token: &'static str,
+    },
 }
 
 /// Validates a SQL identifier (catalog, schema, table, column names).
@@ -108,142 +118,231 @@ pub fn validate_principal(value: &str) -> Result<&str, ValidationError> {
     Ok(value)
 }
 
-/// Refuses a user-supplied SQL *fragment* that could end the generated
-/// statement and start a new one.
+/// Refuses a user-supplied SQL *fragment* that Rocky cannot lex with certainty.
 ///
 /// A fragment is a piece of SQL an author writes in config (a declarative
 /// check's `expression`, `filter` or `key_expr`) that Rocky splices into a
-/// statement it builds. The fragment is always spliced inside parentheses, so
-/// it is an *expression*, never a statement. This function enforces that:
+/// statement it builds. Rocky generates for five warehouses — Databricks/Spark,
+/// Snowflake, BigQuery, DuckDB and Trino — and their lexers disagree about
+/// several constructs. This function therefore accepts only the subset all five
+/// read identically, and refuses everything else.
 ///
-/// - a `;` outside a string literal, a quoted identifier or a comment is
-///   [`ValidationError::StatementTerminator`];
-/// - a fragment that ends inside an unclosed `'…'`, `"…"` or `/* … */` is
-///   [`ValidationError::UnterminatedSqlRegion`].
+/// # The accepted subset
 ///
-/// `context` names the field and the table under check; it is quoted verbatim
-/// in the error so the author knows which line to fix.
+/// - `'…'` and `"…"`, where the only escape is `''` / `""` doubling;
+/// - `-- …` line comments;
+/// - non-nested `/* … */` block comments;
+/// - any other text with no `;` in it.
 ///
-/// # Why both rules are needed
+/// # What is refused, and why each one
 ///
-/// Statement injection needs a `;` in the fragment — rule one refuses that.
-/// Rule two closes the way a fragment can *manufacture* one. Some templates
-/// splice the same fragment **twice** into one statement
+/// | Refused | Reason |
+/// |---|---|
+/// | `;` outside a literal or comment | it ends Rocky's statement and starts another |
+/// | a `\` inside a quoted literal | Snowflake, DuckDB and BigQuery read `\'` as an escaped quote; standard SQL reads it as the quote that closes the literal. The two readings pair the *following* quotes differently, so a `;` this scan sees as string content can be top-level at the warehouse. `rocky-snowflake/src/governance.rs` documents the same bypass for tag literals. |
+/// | a triple quote | a BigQuery triple-quoted string; elsewhere an empty literal followed by another quote |
+/// | `$$…$$` / `$tag$…$tag$` | dollar quoting is Snowflake and DuckDB; on the others the quotes inside it are real quotes |
+/// | a backtick | an identifier quote on Databricks and BigQuery, a syntax error on Snowflake — and a `'` inside one is inert for the first group, a literal opener for the second |
+/// | `//` | a line comment on Snowflake only; elsewhere the rest of the line is live SQL |
+/// | `/*` inside a block comment | Spark nests block comments, the others end at the first `*/` |
+/// | an unterminated `'…'`, `"…"` or `/* … */` | see below |
+///
+/// Every one of these is a *refusal*, never a guess. Refusing an exotic but
+/// legal fragment is a loud error the author can fix in one line. Mis-lexing one
+/// is the defect this function exists to prevent.
+///
+/// # Why unterminated regions are refused
+///
+/// Some templates splice the same fragment **twice** into one statement
 /// (`generate_test_sql_inner`'s `unique_expr` arm repeats `key_expr` in the
 /// `SELECT` and the `GROUP BY`; `quarantine::build_quarantine_ctas` repeats a
-/// predicate in the error-label column and the `WHERE`). A fragment with an
-/// odd number of quotes pairs its quotes *across* the two copies: template
-/// text becomes string content, and the tail of the second copy becomes live
-/// SQL — including a `;` this scanner had classified as "inside a string".
-/// Requiring balanced quotes makes the scan's view of the fragment the same as
-/// the warehouse's view, for any number of copies.
+/// predicate in the error-label column and the `WHERE`). A fragment with an odd
+/// number of quotes pairs its quotes *across* the two copies: template text
+/// becomes string content and the tail of the second copy becomes live SQL.
+/// Requiring every region to close inside the fragment keeps each copy
+/// self-contained.
 ///
-/// The invariant is therefore: **balanced quotes plus no top-level `;` means no
-/// statement injection, however many times the fragment is embedded.**
+/// # The invariant this actually gives you
 ///
-/// # Scanner shape and its deliberate deviations
+/// **Within the accepted subset, this scan and every target warehouse agree on
+/// which characters are literal or comment text. So a fragment that passes
+/// contributes no statement terminator, however many times it is embedded.**
 ///
-/// Same shape as the live-verified `count_statements` in
-/// `rocky-snowflake/src/connector.rs`, with the opposite bias. That one
-/// *counts* statements for one dialect, so it models Snowflake's lexer exactly.
-/// This one is a *security* check across every dialect Rocky targets
-/// (Databricks, Snowflake, BigQuery, DuckDB, Trino), so every ambiguity resolves
-/// toward refusing:
+/// That is the whole guarantee. It does **not** prove the fragment is a single
+/// expression:
 ///
-/// - **Backslash escapes are not honoured.** Spark and Snowflake read `\'` as an
-///   escaped quote; standard SQL (DuckDB, BigQuery, Trino) reads it as a quote
-///   that closes the literal. Honouring it would *extend* the literal and could
-///   swallow a real terminator — fail-open. Ignoring it *shortens* the literal
-///   and surfaces more top-level `;` — fail-closed.
-/// - **`$$…$$`, backticks and `//` are not skip regions.** Dollar quoting and
-///   `//` comments are Snowflake-only; backticks are not Snowflake. Skipping a
-///   region a dialect does not recognise hides a `;` that dialect would execute.
-///   A `;` inside one of those is refused instead. Refusing is loud and the
-///   author can rewrite the literal; accepting destroys data.
-/// - **Block comments do not nest** (they end at the first `*/`, as Snowflake's
-///   lexer does). Under nesting, `/* a /* b */ ; */` hides the `;`; flat, the
-///   `;` is top-level and refused. Flat is the fail-closed reading.
+/// - **Parentheses are not tracked.** A fragment can close the parenthesis Rocky
+///   wraps it in and add its own clauses (`1=1) OR (1=1`), or append a `UNION`.
+///   That reshapes the query Rocky built without needing a `;` at all.
+/// - **Reads are not bounded.** A correlated subquery, or a DuckDB `read_csv` /
+///   `read_text` call, is still evaluated with the project's warehouse
+///   credentials.
 ///
-/// Only `''` / `""` doubling escapes a quote — every dialect Rocky targets
-/// agrees on that.
+/// `context` names the field and the table under check; it is quoted verbatim in
+/// the error so the author knows which line to fix.
 ///
-/// # What this does not cover
+/// # Relationship to `count_statements`
 ///
-/// It bounds the fragment to a single statement. It does **not** bound what the
-/// expression may *read*: a correlated subquery, or a DuckDB `read_csv` /
-/// `read_text` call, is still evaluated with the project's warehouse
-/// credentials.
+/// The scan shape is borrowed from the live-verified `count_statements` in
+/// `rocky-snowflake/src/connector.rs`, but the two have opposite jobs. That one
+/// *counts* statements for one dialect, so it models Snowflake's lexer as
+/// closely as it can — including its backslash and dollar-quote rules. This one
+/// must be right for five lexers at once, so where they differ it refuses
+/// instead of picking one.
 ///
 /// # Errors
 ///
-/// Returns [`ValidationError::StatementTerminator`] or
-/// [`ValidationError::UnterminatedSqlRegion`] as described above.
+/// [`ValidationError::StatementTerminator`] for a top-level `;`,
+/// [`ValidationError::AmbiguousSqlToken`] for a construct the dialects read
+/// differently, and [`ValidationError::UnterminatedSqlRegion`] for a region that
+/// does not close inside the fragment.
 pub fn reject_statement_terminator(context: &str, sql: &str) -> Result<(), ValidationError> {
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
+    let ambiguous = |token: &'static str| ValidationError::AmbiguousSqlToken {
+        context: context.to_string(),
+        token,
+    };
+    let unterminated = |region: &'static str| ValidationError::UnterminatedSqlRegion {
+        context: context.to_string(),
+        region,
+    };
+
+    let c: Vec<char> = sql.chars().collect();
+    let at = |i: usize| c.get(i).copied();
+    let mut i = 0usize;
+
+    while i < c.len() {
+        match c[i] {
             ';' => {
                 return Err(ValidationError::StatementTerminator {
                     context: context.to_string(),
                 });
             }
+            // Databricks and BigQuery quote identifiers with backticks;
+            // Snowflake rejects them outright. A quote inside one is inert for
+            // the first group and a literal opener for the second, which shifts
+            // every later quote pairing. Rocky identifiers are `[A-Za-z0-9_]+`
+            // anyway; use `"..."` for anything that needs quoting.
+            '`' => return Err(ambiguous("a backtick-quoted identifier")),
+            // A dollar-quote opener. A bare `$` inside a word (`col$1`) is not
+            // an opener and stays allowed.
+            '$' => {
+                let mut j = i + 1;
+                while matches!(at(j), Some(ch) if ch.is_ascii_alphanumeric() || ch == '_') {
+                    j += 1;
+                }
+                if at(j) == Some('$') {
+                    return Err(ambiguous("a dollar-quoted string"));
+                }
+                i += 1;
+            }
             '\'' | '"' => {
-                let quote = c;
-                let mut closed = false;
-                while let Some(q) = chars.next() {
-                    if q != quote {
-                        continue;
-                    }
-                    // `''` / `""` doubles the quote and stays inside.
-                    if chars.peek() == Some(&quote) {
-                        chars.next();
+                let quote = c[i];
+                // Three in a row opens a BigQuery triple-quoted string, and is
+                // an empty literal plus a stray quote everywhere else. A bare
+                // `''` (empty literal) is unambiguous and stays allowed.
+                if at(i + 1) == Some(quote) && at(i + 2) == Some(quote) {
+                    return Err(ambiguous(if quote == '\'' {
+                        "a triple-quoted string (three single quotes)"
                     } else {
-                        closed = true;
-                        break;
-                    }
+                        "a triple-quoted string (three double quotes)"
+                    }));
                 }
-                if !closed {
-                    return Err(ValidationError::UnterminatedSqlRegion {
-                        context: context.to_string(),
-                        region: if quote == '\'' {
-                            "string literal (')"
-                        } else {
-                            "quoted identifier or string (\")"
-                        },
-                    });
-                }
-            }
-            '-' if chars.peek() == Some(&'-') => {
-                // `-- …` runs to end of line. Running off the end of the
-                // fragment is allowed: it comments out the remainder of the
-                // generated statement, which is a syntax error, not a way to
-                // smuggle a terminator past this scan.
-                for nc in chars.by_ref() {
-                    if nc == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut prev = ' ';
+                let region = if quote == '\'' {
+                    "string literal (')"
+                } else {
+                    "quoted identifier or string (\")"
+                };
+                i += 1;
                 let mut closed = false;
-                for nc in chars.by_ref() {
-                    if prev == '*' && nc == '/' {
+                while i < c.len() {
+                    if c[i] == '\\' {
+                        return Err(ambiguous("a backslash escape inside a quoted literal"));
+                    }
+                    if c[i] == quote {
+                        if at(i + 1) == Some(quote) {
+                            i += 2; // doubling: still inside the literal
+                            continue;
+                        }
                         closed = true;
+                        i += 1;
                         break;
                     }
-                    prev = nc;
+                    i += 1;
                 }
                 if !closed {
-                    return Err(ValidationError::UnterminatedSqlRegion {
-                        context: context.to_string(),
-                        region: "block comment (/* */)",
-                    });
+                    return Err(unterminated(region));
                 }
             }
-            _ => {}
+            '-' if at(i + 1) == Some('-') => {
+                // `-- ...` runs to end of line on every dialect. Running off the
+                // end of the fragment is allowed: it comments out the remainder
+                // of the generated statement, which is a syntax error, not a way
+                // to smuggle a terminator past this scan.
+                i += 2;
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            }
+            // A Snowflake-only line comment. Every other dialect keeps reading
+            // the rest of the line as SQL, so neither skipping it nor ignoring
+            // it is safe for all five.
+            '/' if at(i + 1) == Some('/') => return Err(ambiguous("a `//` line comment")),
+            '/' if at(i + 1) == Some('*') => {
+                i += 2;
+                let mut closed = false;
+                while i < c.len() {
+                    if c[i] == '/' && at(i + 1) == Some('*') {
+                        // Spark nests block comments; the others end at the
+                        // first `*/`. The two readings leave different text
+                        // outside the comment.
+                        return Err(ambiguous("a nested `/*` block comment"));
+                    }
+                    if c[i] == '*' && at(i + 1) == Some('/') {
+                        closed = true;
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    return Err(unterminated("block comment (/* */)"));
+                }
+            }
+            _ => i += 1,
         }
+    }
+    Ok(())
+}
+
+/// Refuses a value Rocky cannot safely wrap in a `'…'` SQL literal.
+///
+/// Rocky encodes a config-supplied string constant — a declarative check's
+/// `accepted_values`, for instance — by doubling single quotes. That is enough
+/// only where `''` is the *only* escape. Snowflake, DuckDB and BigQuery also
+/// honour a backslash escape, so a value ending in `\` escapes the first quote
+/// of the `''` pair Rocky emits and the second quote closes the literal — the
+/// bypass `rocky-snowflake/src/governance.rs` documents for tag values.
+///
+/// Escaping backslashes as well closes the bypass on those three but changes the
+/// *value* on Trino and standard-SQL DuckDB, where a doubled backslash is two
+/// literal backslashes. No single encoding is correct everywhere, and these call
+/// sites have no dialect to ask. So a backslash is refused and the author is
+/// told which value to change.
+///
+/// The proper fix is dialect-owned literal encoding or parameter binding at
+/// these call sites; this is the cheap, sound guard until that lands.
+///
+/// # Errors
+///
+/// Returns [`ValidationError::AmbiguousSqlToken`] when `value` contains a
+/// backslash.
+pub fn reject_unquotable_literal(context: &str, value: &str) -> Result<(), ValidationError> {
+    if value.contains('\\') {
+        return Err(ValidationError::AmbiguousSqlToken {
+            context: context.to_string(),
+            token: "a backslash in a string value (dialects disagree whether it escapes the \
+                    next character, so quote-doubling alone cannot contain it)",
+        });
     }
     Ok(())
 }
@@ -473,6 +572,89 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("statement terminator"), "{msg}");
+    }
+
+    #[test]
+    fn terminator_refuses_a_backslash_inside_a_literal() {
+        // The defect this rule exists for. On Snowflake / DuckDB / BigQuery a
+        // backslash escapes the next quote, so the warehouse closes the literal
+        // one quote LATER than a doubling-only scan does. Every quote after that
+        // point is paired differently, and a `;` the scan filed as string
+        // content is top-level at the warehouse. The fragment below is balanced
+        // (four quotes) and has no scan-visible top-level `;`, so a scan that
+        // merely ignored backslashes would ACCEPT it.
+        let f = r"x = 'a\'b') ; SELECT 1; -- '";
+        let err = reject_statement_terminator("ctx", f).unwrap_err();
+        assert!(err.to_string().contains("backslash"), "{err}");
+        // Same shape without the escape is still refused, by the `;` rule.
+        assert!(rejects("x = 'ab') ; SELECT 1; -- '"));
+    }
+
+    #[test]
+    fn terminator_refuses_a_backslash_even_with_no_semicolon() {
+        // Refuse the construct, not just the payload — the scan cannot tell
+        // where the literal ends, so nothing after it can be trusted.
+        assert!(rejects(r"x = 'a\'b'"));
+        assert!(rejects(r#"x = "a\"b""#));
+        assert!(rejects(r"x LIKE 'a\%'"));
+    }
+
+    #[test]
+    fn terminator_refuses_triple_quotes() {
+        // BigQuery reads three quotes as a triple-quoted string; the others read
+        // an empty literal plus a stray quote. Different text ends up inside.
+        assert!(rejects("x = '''a ; b'''"));
+        assert!(rejects("x = \"\"\"a ; b\"\"\""));
+    }
+
+    #[test]
+    fn terminator_still_accepts_an_empty_literal() {
+        // `''` on its own is unambiguous everywhere — only THREE quotes are the
+        // ambiguous case, so the triple-quote rule must not swallow this.
+        assert!(reject_statement_terminator("ctx", "x = ''").is_ok());
+        assert!(reject_statement_terminator("ctx", "x = '' OR y = ''").is_ok());
+        assert!(reject_statement_terminator("ctx", "x = 'it''s'").is_ok());
+    }
+
+    #[test]
+    fn terminator_refuses_a_nested_block_comment() {
+        // Spark nests block comments, so it reads the whole thing as a comment;
+        // the others end at the first `*/`, which leaves the quote and the `;`
+        // outside. Two readings, so refuse.
+        assert!(rejects("/* a /* b */ ' */ ; SELECT 1"));
+        assert!(rejects("x /* a /* b */ */ > 0"));
+    }
+
+    #[test]
+    fn terminator_refuses_dollar_quotes_but_not_a_dollar_in_a_word() {
+        assert!(rejects("x = $$ ; SELECT 1; $$"));
+        assert!(rejects("x = $tag$ ; SELECT 1; $tag$"));
+        // A `$` that opens nothing is ordinary text.
+        assert!(reject_statement_terminator("ctx", "col$1 > 0").is_ok());
+        assert!(reject_statement_terminator("ctx", "amount > 0 AND x$ = 1").is_ok());
+    }
+
+    #[test]
+    fn unquotable_literal_refuses_a_backslash() {
+        // Quote-doubling alone cannot contain a value ending in a backslash:
+        // the backslash escapes the first quote of the `''` pair Rocky emits and
+        // the second closes the literal. Same class as the scanner rule above.
+        let err = reject_unquotable_literal("accepted_values on t", "ends_with_a_backslash\\")
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("backslash"), "{msg}");
+        assert!(msg.contains("accepted_values on t"), "{msg}");
+        assert!(reject_unquotable_literal("ctx", r"a\b").is_err());
+    }
+
+    #[test]
+    fn unquotable_literal_accepts_ordinary_values() {
+        for v in ["pending", "shipped", "O'Brien", "a;b", "US/Eastern", ""] {
+            assert!(
+                reject_unquotable_literal("ctx", v).is_ok(),
+                "should accept: {v}"
+            );
+        }
     }
 
     #[test]

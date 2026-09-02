@@ -174,12 +174,15 @@ pub enum TestType {
     /// be stable across a multi-tenant union), not any stored column.
     ///
     /// `key_expr` is a SQL scalar expression evaluated against the target
-    /// (e.g. `md5(databasename || '-' || id)`). Rocky does not parse it — it
-    /// is spliced into the generated query as written, minus one check: SQL
-    /// generation refuses a fragment that is not a single expression (a
-    /// statement terminator `;` outside a string, a quoted identifier or a
-    /// comment, or an unbalanced quote). Nothing bounds what the expression
-    /// may READ; it runs with the project's warehouse credentials.
+    /// (e.g. `md5(databasename || '-' || id)`). Rocky does not parse it — it is
+    /// spliced into the generated query as written, minus one narrow check: SQL
+    /// generation refuses a `;` outside a literal or comment, and refuses any
+    /// construct the five target dialects lex differently (see
+    /// `rocky_sql::validation::reject_statement_terminator`). That stops the
+    /// fragment ending Rocky's statement. It does NOT make the fragment a
+    /// single expression — parentheses are not tracked, so it can still close
+    /// Rocky's parenthesis and add clauses — and nothing bounds what it may
+    /// READ. It runs with the project's warehouse credentials.
     ///
     /// Set-based; not quarantinable. Mirrors `Unique`'s NULL handling (NULL
     /// keys are not excluded; use `filter` to scope them out).
@@ -346,8 +349,8 @@ pub struct TestDecl {
     /// is `FALSE` or `NULL` pass unconditionally.
     ///
     /// Filter is user-supplied SQL, spliced in as written (same contract as
-    /// `expression`). SQL generation refuses only a fragment that is not a
-    /// single expression — see [`TestType::UniqueExpr`].
+    /// `expression`). SQL generation applies the same narrow refusal — see
+    /// [`TestType::UniqueExpr`] for exactly what it does and does not bound.
     ///
     /// Example: `filter = "created_at > current_date - interval 30 day"`
     /// restricts a `not_null` check to rows created in the last 30 days.
@@ -471,6 +474,15 @@ fn generate_test_sql_inner(
             if values.is_empty() {
                 return Err(TestGenError::EmptyAcceptedValues);
             }
+            // Each value is wrapped in a `'...'` literal by doubling quotes.
+            // That is only safe where `''` is the sole escape; a backslash makes
+            // three of the five dialects read the closing quote differently.
+            for v in values {
+                validation::reject_unquotable_literal(
+                    &format!("accepted_values test value on {table}"),
+                    v,
+                )?;
+            }
             let in_list = values
                 .iter()
                 .map(|v| format!("'{}'", v.replace('\'', "''")))
@@ -505,10 +517,12 @@ fn generate_test_sql_inner(
                 return Err(TestGenError::MissingExpression);
             }
             // Expression is user-supplied SQL — we cannot validate it as an
-            // identifier. It is spliced inside parentheses, so it must be one
-            // expression: refuse anything that could close the statement and
-            // start another. Expression-scoped reads (subqueries, DuckDB
-            // `read_csv`) are still evaluated with the project's credentials.
+            // identifier. The gate below refuses anything that could END this
+            // statement and start another. It does NOT make the fragment one
+            // expression: parentheses are not tracked, so the fragment can
+            // still close the `NOT (` below and add clauses. Nor does it bound
+            // reads — a subquery or a DuckDB `read_csv` still runs with the
+            // project's credentials. See `reject_statement_terminator`.
             validation::reject_statement_terminator(
                 &format!("expression test `expression` on {table}"),
                 expression,
@@ -1596,6 +1610,45 @@ value = "0"
     // spliced inside parentheses into a statement Rocky builds. A `;` in the
     // fragment would let the author's text end that statement and start
     // another. `generate_test_sql*` refuses it at generation time.
+
+    #[test]
+    fn accepted_values_refuses_a_backslash_in_a_value() {
+        // The value is wrapped in a `'...'` literal by doubling quotes. On
+        // Snowflake / DuckDB / BigQuery a trailing backslash escapes the first
+        // quote of that pair, so the second closes the literal and the rest of
+        // the value becomes live SQL. Quote-doubling alone cannot contain it.
+        let decl = TestDecl {
+            test_type: TestType::AcceptedValues {
+                values: vec!["pending".into(), "trailing_backslash\\".into()],
+            },
+            column: Some("status".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("backslash"), "{msg}");
+        assert!(
+            msg.contains("accepted_values test value on db.sc.orders"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn accepted_values_still_accepts_a_quote_and_a_semicolon() {
+        // Quote doubling still handles the ordinary cases — this must not
+        // become a blanket refusal of punctuation.
+        let decl = TestDecl {
+            test_type: TestType::AcceptedValues {
+                values: vec!["O'Brien".into(), "a;b".into()],
+            },
+            column: Some("name".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let sql = generate_test_sql(&decl, "t").unwrap();
+        assert!(sql.contains("('O''Brien', 'a;b')"), "{sql}");
+    }
 
     #[test]
     fn expression_refuses_a_statement_terminator() {

@@ -1534,7 +1534,8 @@ pub struct CrossSourceOverlapConfig {
     /// Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources
     /// without a single natural key. Mutually exclusive with `keys`. Spliced
     /// into the overlap query as written (like `unique_expr`); SQL generation
-    /// refuses a fragment that is not a single expression.
+    /// refuses a statement terminator and any construct the target dialects lex
+    /// differently, but does not bound the expression otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_expr: Option<String>,
     /// Severity reported when the overlap-key count exceeds `max_overlap_rows`.
@@ -1560,8 +1561,8 @@ impl CrossSourceOverlapConfig {
     /// Enforces the mutual-exclusion invariant: exactly one of `keys` /
     /// `key_expr` must be set (both-set or neither-set is an error). Column
     /// names in `keys` are validated as SQL identifiers; `key_expr` is passed
-    /// through, and `generate_cross_source_overlap_sql` refuses one that is not
-    /// a single expression.
+    /// through, and `generate_cross_source_overlap_sql` refuses a statement
+    /// terminator or an ambiguously-lexed construct in it.
     pub fn resolved_key_exprs(&self) -> Result<Vec<String>, String> {
         let has_keys = !self.keys.is_empty();
         let has_expr = self

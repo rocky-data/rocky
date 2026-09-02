@@ -5188,8 +5188,14 @@ pub async fn run(
     // replication checks; a missing-key/keyless table is skipped with a logged
     // reason rather than failing.
     if let Some(ref overlap_cfg) = pipeline.checks.cross_source_overlap {
-        match overlap_cfg.resolved_key_exprs() {
-            Ok(key_exprs) => {
+        // Resolved once, but NOT unwrapped here: a `keys`/`key_expr`
+        // misconfiguration used to be logged and skipped, which left the run
+        // green with no record that the check existed. The groups are walked
+        // either way so a refusal is reported per group, like any other
+        // check that cannot run.
+        let key_exprs_result = overlap_cfg.resolved_key_exprs();
+        {
+            {
                 // (source_type, table) -> sibling members (target ref, asset key).
                 // The ≥2 grouping and the result name come from shared helpers
                 // in rocky-core so `rocky discover` can declare the exact same
@@ -5216,8 +5222,31 @@ pub async fn run(
                     let siblings: Vec<TableRef> =
                         members.iter().map(|(t, _)| t.clone()).collect();
                     let name = checks::cross_source_overlap_name(source_type, table);
+                    let contributing: Vec<String> =
+                        siblings.iter().map(TableRef::full_name).collect();
+                    let key_exprs = match &key_exprs_result {
+                        Ok(k) => k,
+                        Err(e) => {
+                            warn!(source_type, table, error = %e, "cross_source_overlap key is misconfigured — reporting the check as not evaluated");
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(
+                                rocky_core::checks::cross_source_overlap_not_evaluated(
+                                    name,
+                                    contributing,
+                                    e.clone(),
+                                    overlap_cfg.severity,
+                                ),
+                            );
+                            continue;
+                        }
+                    };
                     let sql = match rocky_core::checks::generate_cross_source_overlap_sql(
-                        &siblings, &key_exprs, dialect,
+                        &siblings, key_exprs, dialect,
                     ) {
                         Ok(s) => s,
                         Err(e) => {
@@ -5226,27 +5255,21 @@ pub async fn run(
                             // `check_results` claim a clean group that was never
                             // evaluated. (The QUERY-error arm below still skips
                             // by design — that is the keyless-table case.)
-                            warn!(source_type, table, error = %e, "cross_source_overlap SQL generation failed — reporting the check as failed");
+                            warn!(source_type, table, error = %e, "cross_source_overlap SQL generation failed — reporting the check as not evaluated");
                             let entry = pending_checks
                                 .entry(siblings[0].full_name())
                                 .or_insert_with(|| PendingCheck {
                                     asset_key: members[0].1.clone(),
                                     checks: Vec::new(),
                                 });
-                            entry.checks.push(rocky_core::checks::CheckResult {
-                                name,
-                                passed: false,
-                                severity: overlap_cfg.severity,
-                                details:
-                                    rocky_core::checks::CheckDetails::CrossSourceOverlap {
-                                        overlap_count: 0,
-                                        contributing_tables: siblings
-                                            .iter()
-                                            .map(TableRef::full_name)
-                                            .collect(),
-                                        sample: Vec::new(),
-                                    },
-                            });
+                            entry.checks.push(
+                                rocky_core::checks::cross_source_overlap_not_evaluated(
+                                    name,
+                                    contributing,
+                                    e.to_string(),
+                                    overlap_cfg.severity,
+                                ),
+                            );
                             continue;
                         }
                     };
@@ -5298,7 +5321,6 @@ pub async fn run(
                     }
                 }
             }
-            Err(e) => warn!(error = %e, "cross_source_overlap misconfigured — skipping"),
         }
     }
 
