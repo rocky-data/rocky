@@ -388,18 +388,27 @@ const WORKER_INSTRUCTIONS_REWRITES: &[(&str, &str)] = &[
     // TENTH ROUND, findings 1B and 1D together — the fourth imperative,
     // whose replacement also has to be exact about WHICH suite it runs.
     // `rocky test` and the `test` tool are the same code path
-    // (`commands::test_output` → `rocky_engine::test_runner`), and neither
-    // "exercises assertions (uniqueness, not-null, accepted values,
-    // ranges)": `run_tests` compiles the project and materializes every
-    // model against an in-memory DuckDB, and `run_unit_tests` runs the
-    // fixture-driven `[[test]]` blocks. The declarative check set is
+    // (`commands::test_output` → `rocky_engine::test_runner`): `run_tests`
+    // compiles the project and materializes every model against an
+    // in-memory DuckDB, and `run_unit_tests` runs the fixture-driven
+    // `[[test]]` blocks. The declarative check set is
     // `rocky test --declarative`, a different runner, and its checks need
-    // an applied table besides. Rewriting the route while carrying the
-    // wrong claim forward would ship a fresh false promise on the surface
-    // this table exists to remove them from.
+    // an applied table besides.
+    //
+    // The needle used to read "Run `rocky test` to exercise assertions
+    // (uniqueness, not-null, accepted values, ranges)" — a claim that was
+    // simply false, and the reason this pair carried such a long argument.
+    // The skill has since been corrected upstream to split the two runners
+    // itself, so what is left to rewrite is only the ROUTE: the corrected
+    // sentence hands the worker two `rocky` invocations, and
+    // `--declarative` additionally names a suite that needs an applied
+    // table this profile never reaches. The replacement is unchanged
+    // because it was already accurate about both.
     (
-        "**Test.** Run `rocky test` to exercise assertions (uniqueness, not-null, accepted \
-         values, ranges).",
+        "**Test.** Run `rocky test` to compile, seed and materialize the models, and to run \
+         any `[[test]]` fixture blocks. Then run `rocky test --declarative` to evaluate the \
+         declared assertions (uniqueness, not-null, accepted values, ranges) — plain `rocky \
+         test` does not run those.",
         "**Test.** Call the `test` tool. It compiles the project, materializes every model \
          against a local DuckDB, and runs the fixture-driven `[[test]]` blocks. That local \
          suite is the only one you can run here — the checks the product spec declares are \
