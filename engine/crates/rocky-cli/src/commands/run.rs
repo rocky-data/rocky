@@ -13036,13 +13036,11 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             .expect("the checkpoint serializes");
         for (part, secret) in secrets {
             for (form, text) in [("message", &message), ("checkpoint", &stored)] {
-                // Name the leaking surface and the URL part, and print neither
-                // the secret nor the text holding it. A failure here means a
-                // credential reached that surface; re-run to inspect it.
-                assert!(
-                    !text.contains(secret),
-                    "the refusal {form} leaks the {part} secret"
-                );
+                // Reduce to a bool BEFORE asserting, so neither the secret nor
+                // the text holding it reaches the panic path. A failure names
+                // the surface and the URL part; re-run to inspect the value.
+                let leaked = text.contains(secret);
+                assert!(!leaked, "the refusal {form} leaks the {part} secret");
             }
         }
         assert!(
