@@ -58,10 +58,10 @@ PYPI_PUBLISH_SOURCE = (
     "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
 )
 GH_RELEASE_SOURCE = (
-    "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228"
+    "softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64"
 )
 TAIKI_INSTALL_SOURCE = (
-    "taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1"
+    "taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833"
 )
 # Actions a job may run when it is not reachable from a pull request. Release,
 # publish and deployment workflows never execute candidate code, so the
