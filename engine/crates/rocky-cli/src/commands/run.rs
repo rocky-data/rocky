@@ -1421,17 +1421,32 @@ fn require_resume_progress(
 /// editing it then does not refuse a resume it could not have invalidated
 /// (#1582).
 ///
-/// The templates it asks about are the ones this run **renders**. A
-/// `--shadow-schema` or `--branch` override supplies the schema name
+/// Two things have to hold before a separator is elided, and #1586 is
+/// about both.
+///
+/// **The template must be one this run renders.** A `--shadow
+/// --shadow-schema` or `--branch` override supplies the schema name
 /// outright, so the resolver never renders `schema_template` and no
-/// separator value can reach a name through it; only `catalog_template`
+/// separator value can reach a name through it. Only `catalog_template`
 /// can be joined then, and it still is, because the override does not
 /// touch the catalog. Classifying a bypassed template recorded a fact that
-/// did not hold, and refused a resume over an edit that moved nothing
-/// (#1586).
+/// did not hold and refused a resume over an edit that moved nothing.
+///
+/// **The separator must be target-only.** `[target] separator` is: it
+/// moves rendered target names and nothing else. The source pattern's is
+/// not, and `separator` falls back to it when the target pins none.
+/// [`SchemaPattern::parse`] splits every source schema name on that value,
+/// so editing it changes which sources parse at all. Under a schema
+/// override the target schema is a constant, and a catalog template with
+/// no placeholder is too — so a different set of sources lands on exactly
+/// the same `catalog.schema.table` keys. Eliding an inherited separator
+/// would let a resume skip a table this run never copied. It is therefore
+/// always recorded, whatever the templates say. Carrying the source
+/// pattern itself in the scope is #1583.
 ///
 /// [`AdapterConfig::endpoint_identity`]: rocky_core::config::AdapterConfig::endpoint_identity
 /// [`SchemaPattern::separator_joins_a_placeholder`]: rocky_core::schema::SchemaPattern::separator_joins_a_placeholder
+/// [`SchemaPattern::parse`]: rocky_core::schema::SchemaPattern::parse
 /// [`ResumeSeparator::Unused`]: rocky_core::state::ResumeSeparator::Unused
 fn replication_resume_scope(
     pipeline_name: &str,
@@ -1462,7 +1477,13 @@ fn replication_resume_scope(
     if renders_schema_template {
         rendered_templates.push(target.schema_template.as_str());
     }
-    let separator_role = if pattern.separator_joins_a_placeholder(&rendered_templates) {
+    // An inherited separator is the source pattern's, and that one also
+    // splits every source schema name, so it is never elided — see the
+    // doc comment. `target.separator` is read off the same `target` the
+    // caller resolved `separator` from, so the two cannot disagree.
+    let separator_role = if target.separator.is_none()
+        || pattern.separator_joins_a_placeholder(&rendered_templates)
+    {
         ResumeSeparator::Joins(separator.to_string())
     } else {
         ResumeSeparator::Unused
@@ -12515,12 +12536,11 @@ mod tests {
         use rocky_core::shadow::ShadowConfig;
 
         // `{regions}` is the variadic component of `test_schema_pattern()`.
-        // The branch override below replaces `schema_template`, so the
-        // resolver never renders it and the separator reaches no name
-        // through it — `catalog_template = "wh"` joins nothing either, so
-        // this fully populated scope pins the `unused` shape (#1586). The
-        // joined shape is pinned by
-        // `resume_refuses_a_checkpoint_written_with_another_separator`.
+        // This block pins no `[target] separator`, so the run inherits the
+        // SOURCE pattern's — which also splits source schema names — and it
+        // rides in the blob even under the branch override below (#1586).
+        // The `unused` shapes are pinned separately further down: one with
+        // no override, one with an override plus a target-only separator.
         let target: PipelineTargetConfig = toml::from_str(
             r#"
 adapter = "default"
@@ -12562,7 +12582,7 @@ token = "dapi-SECRET"
                     "adapter": "default",
                     "catalog_template": "wh",
                     "schema_template": "staging__{regions}",
-                    "separator_role": "unused",
+                    "separator_role": { "joins": "__" },
                     "endpoint": {
                         "adapter_type": "databricks",
                         "locators": {
@@ -12580,15 +12600,16 @@ token = "dapi-SECRET"
             scope.to_string(),
             format!(
                 "pipeline 'p1', filter 'client=acme', target default:wh.staging__{{regions}} \
-                 separator unused endpoint(databricks host=https://adb-1.azuredatabricks.net \
+                 separator(__) endpoint(databricks host=https://adb-1.azuredatabricks.net \
                  host_route_digest={DATABRICKS_ROUTE_DIGEST} \
                  http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature)"
             )
         );
 
         // A template no separator joins stores the fact, never the value —
-        // and says so in the message. This one reaches `unused` with no
-        // override at all, so both routes to that shape are covered.
+        // and says so in the message. This one pins its own `[target]
+        // separator`, which is what makes eliding sound: the value moves
+        // rendered target names and nothing else.
         let single_valued: PipelineTargetConfig = toml::from_str(
             "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"staging__{source}\"\nseparator = \"--\"\n",
         )
@@ -12606,6 +12627,32 @@ token = "dapi-SECRET"
         let round_trip: ResumeScope =
             serde_json::from_value(serde_json::to_value(&scope).unwrap()).unwrap();
         assert_eq!(round_trip, scope);
+
+        // The same `unused` shape reached the other way: a template the
+        // override bypasses, plus a target-only separator. BOTH conditions
+        // are needed — the fully populated pin above differs from this one
+        // only by inheriting its separator, and it records `joins` (#1586).
+        let overridden_target: PipelineTargetConfig = toml::from_str(
+            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"staging__{regions}\"\nseparator = \"--\"\n",
+        )
+        .unwrap();
+        let overridden = replication_resume_scope(
+            "p1",
+            &overridden_target,
+            &adapter,
+            None,
+            Some(&branch_shadow),
+            "--",
+            &test_schema_pattern(),
+        );
+        assert_eq!(
+            serde_json::to_value(&overridden).unwrap()["target"]["separator_role"],
+            serde_json::json!("unused")
+        );
+        assert!(
+            overridden.to_string().contains("separator unused"),
+            "unexpected rendering: {overridden}"
+        );
 
         // `--shadow` (a suffix) and no shadow are their own shapes.
         let suffix_shadow = ShadowConfig {
@@ -12679,11 +12726,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             serde_json::json!({ "joins": "__" }),
             "an override does not replace the catalog template, so it still joins"
         );
-        // The rendered half of the `joins` shape. The fully populated pin
-        // above carries a branch override, so it renders `separator unused`
-        // — without this, no full-string assertion would hold
-        // `separator(__)` any more, and the joined rendering could change
-        // silently.
+        // The catalog template is rendered under an override, so it joins
+        // and its value is rendered too.
         assert!(
             genuine.to_string().contains("separator(__)"),
             "unexpected rendering: {genuine}"
@@ -13303,13 +13347,18 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         }
     }
 
-    /// A `--shadow-schema` or `--branch` override supplies the target schema
-    /// name outright, so the resolver never renders `schema_template` (see
-    /// the `schema_override.clone().unwrap_or_else(...)` pair in this file).
-    /// A separator that would have joined a bare `{regions}` in that template
-    /// therefore reaches no physical name, and editing it must not refuse a
-    /// resume. Classifying the bypassed template as joined recorded a fact
-    /// that did not hold (#1586).
+    /// A `--shadow --shadow-schema` or `--branch` override supplies the
+    /// target schema name outright, so the resolver never renders
+    /// `schema_template` (see the `schema_override.clone().unwrap_or_else(...)`
+    /// pair in this file). A separator that would have joined a bare
+    /// `{regions}` in that template therefore reaches no physical name, and
+    /// editing it must not refuse a resume. Classifying the bypassed template
+    /// as joined recorded a fact that did not hold (#1586).
+    ///
+    /// Every case here pins its own `[target] separator`, which is the other
+    /// half of the rule: only a target-only separator is ever elided. The
+    /// inherited half is
+    /// `resume_refuses_an_inherited_separator_change_under_a_schema_override`.
     ///
     /// The catalog template is the carve-out: an override does not replace
     /// it, the resolver still renders it with the same separator, and a
@@ -13325,36 +13374,43 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             cleanup_after: false,
         };
         let adapter = test_duckdb_adapter(None);
-        let scope = |target: &PipelineTargetConfig, separator: &str| -> ResumeScope {
+        let pattern = test_schema_pattern();
+        // Resolve the separator the way the run path does, off the `[target]`
+        // block. Handing one in directly would exercise a pairing production
+        // cannot produce — an absent `[target] separator` is never an
+        // arbitrary value, it is the source pattern's.
+        let scope = |target: &PipelineTargetConfig| -> ResumeScope {
             replication_resume_scope(
                 "p1",
                 target,
                 &adapter,
                 None,
                 Some(&branch),
-                separator,
-                &test_schema_pattern(),
+                target.separator.as_deref().unwrap_or(&pattern.separator),
+                &pattern,
             )
         };
         // A source schema whose `regions` binds TWO values, so a separator
         // that could join anything would show.
-        let parsed = test_schema_pattern()
+        let parsed = pattern
             .parse("src__acme__us_west__us_central__shopify")
             .unwrap();
 
         // The schema template WOULD join under no override — that is the
         // whole point of the case.
-        let bypassed: PipelineTargetConfig = toml::from_str(
-            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"raw__{regions}\"\n",
-        )
-        .unwrap();
+        let bypassed = |separator: &str| -> PipelineTargetConfig {
+            toml::from_str(&format!(
+                "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"raw__{{regions}}\"\nseparator = \"{separator}\"\n"
+            ))
+            .unwrap()
+        };
         assert_ne!(
             parsed.resolve_template("raw__{regions}", "_"),
             parsed.resolve_template("raw__{regions}", "--"),
             "the template really would move under a separator change"
         );
         assert_eq!(
-            serde_json::to_value(scope(&bypassed, "_")).unwrap()["target"]["separator_role"],
+            serde_json::to_value(scope(&bypassed("_"))).unwrap()["target"]["separator_role"],
             serde_json::json!("unused"),
             "the override replaces the only template the separator could join"
         );
@@ -13366,8 +13422,8 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             "'wh' would move under a separator change"
         );
 
-        let written = scope(&bypassed, "_");
-        let edited = scope(&bypassed, "--");
+        let written = scope(&bypassed("_"));
+        let edited = scope(&bypassed("--"));
         assert_eq!(
             written, edited,
             "a separator the override bypasses resolves the same names"
@@ -13386,17 +13442,19 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
 
         // The carve-out: the same override, with the placeholder moved into
         // the catalog template the override does not replace.
-        let catalog_joins: PipelineTargetConfig = toml::from_str(
-            "adapter = \"default\"\ncatalog_template = \"wh__{regions}\"\nschema_template = \"raw__{regions}\"\n",
-        )
-        .unwrap();
+        let catalog_joins = |separator: &str| -> PipelineTargetConfig {
+            toml::from_str(&format!(
+                "adapter = \"default\"\ncatalog_template = \"wh__{{regions}}\"\nschema_template = \"raw__{{regions}}\"\nseparator = \"{separator}\"\n"
+            ))
+            .unwrap()
+        };
         assert_eq!(
-            serde_json::to_value(scope(&catalog_joins, "_")).unwrap()["target"]["separator_role"],
+            serde_json::to_value(scope(&catalog_joins("_"))).unwrap()["target"]["separator_role"],
             serde_json::json!({ "joins": "_" }),
             "the catalog template is rendered under an override, so it counts"
         );
-        let catalog_written = scope(&catalog_joins, "_");
-        let catalog_edited = scope(&catalog_joins, "--");
+        let catalog_written = scope(&catalog_joins("_"));
+        let catalog_edited = scope(&catalog_joins("--"));
         assert_ne!(
             catalog_written, catalog_edited,
             "a separator the catalog template joins still resolves other names"
@@ -13413,6 +13471,125 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             "unexpected error: {err:#}"
         );
         let err = resolve_resume_progress(&store, None, true, &catalog_edited)
+            .expect_err("--resume-latest must not select it");
+        assert!(
+            err.to_string().contains("no progress found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// The other half of #1586, and the dangerous one. Eliding a separator
+    /// is only sound when the value is **target-only**. With no `[target]
+    /// separator` the run inherits the source pattern's, and
+    /// [`SchemaPattern::parse`] splits every source schema name on that
+    /// value — so editing it changes which sources parse at all.
+    ///
+    /// Under a schema override the target schema is a constant, and
+    /// `catalog_template = "wh"` is too. So a different set of sources lands
+    /// on exactly the same `catalog.schema.table` keys, and a resume that
+    /// accepted the checkpoint would skip a table this run never copied.
+    /// The inherited separator is recorded whatever the templates say.
+    ///
+    /// [`SchemaPattern::parse`]: rocky_core::schema::SchemaPattern::parse
+    #[test]
+    fn resume_refuses_an_inherited_separator_change_under_a_schema_override() {
+        use rocky_core::config::PipelineTargetConfig;
+        use rocky_core::schema::SchemaPattern;
+        use rocky_core::shadow::ShadowConfig;
+
+        let source_pattern = |separator: &str| -> SchemaPattern {
+            SchemaPattern {
+                prefix: "src__".to_string(),
+                separator: separator.to_string(),
+                components: SchemaPattern::parse_components(&[
+                    "tenant".to_string(),
+                    "regions...".to_string(),
+                    "source".to_string(),
+                ])
+                .unwrap(),
+            }
+        };
+        // The hazard in three lines: the two patterns disagree about which
+        // source schemas exist at all.
+        assert!(
+            source_pattern("__")
+                .parse("src__acme__us_west__shopify")
+                .is_ok()
+        );
+        assert!(
+            source_pattern("---")
+                .parse("src__acme__us_west__shopify")
+                .is_err(),
+            "the edited pattern no longer parses the schema the run copied"
+        );
+        let after_edit = source_pattern("---")
+            .parse("src__acme---us_west---shopify")
+            .expect("a different source schema parses instead");
+
+        // And both route to the SAME physical target, because the override
+        // fixes the schema and the catalog template has no placeholder. Only
+        // the separator can tell the two source sets apart.
+        let before_edit = source_pattern("__")
+            .parse("src__acme__us_west__shopify")
+            .unwrap();
+        assert_eq!(
+            before_edit.resolve_template("wh", "__"),
+            after_edit.resolve_template("wh", "---"),
+            "the two runs resolve the same catalog"
+        );
+
+        // No `[target] separator`: the run inherits the pattern's.
+        let target: PipelineTargetConfig = toml::from_str(
+            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"raw__{regions}\"\n",
+        )
+        .unwrap();
+        assert!(
+            target.separator.is_none(),
+            "the case is about an inherited separator"
+        );
+        let branch = ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__feature".to_string()),
+            cleanup_after: false,
+        };
+        let adapter = test_duckdb_adapter(None);
+        let scope = |pattern: &SchemaPattern| -> ResumeScope {
+            replication_resume_scope(
+                "p1",
+                &target,
+                &adapter,
+                None,
+                Some(&branch),
+                target.separator.as_deref().unwrap_or(&pattern.separator),
+                pattern,
+            )
+        };
+        let written = scope(&source_pattern("__"));
+        let edited = scope(&source_pattern("---"));
+        assert_eq!(
+            serde_json::to_value(&written).unwrap()["target"]["separator_role"],
+            serde_json::json!({ "joins": "__" }),
+            "an inherited separator is recorded even though the override \
+             bypasses the only template that could join it"
+        );
+        assert_ne!(
+            written, edited,
+            "the two scopes must not compare equal, or the resume skips a \
+             table it never copied"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-written", 1, Some(&written))
+            .unwrap();
+        let err = resolve_resume_progress(&store, Some("run-written"), false, &edited)
+            .expect_err("an edited source separator must not resume");
+        assert!(
+            err.to_string().contains("different pipeline scope"),
+            "unexpected error: {err:#}"
+        );
+        let err = resolve_resume_progress(&store, None, true, &edited)
             .expect_err("--resume-latest must not select it");
         assert!(
             err.to_string().contains("no progress found"),
