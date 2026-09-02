@@ -130,7 +130,7 @@ pub fn validate_principal(value: &str) -> Result<&str, ValidationError> {
 /// # The accepted subset
 ///
 /// - `'…'` and `"…"`, where the only escape is `''` / `""` doubling;
-/// - `-- …` line comments;
+/// - `-- …` line comments, ending at `\n` or `\r`;
 /// - non-nested `/* … */` block comments;
 /// - any other text with no `;` in it.
 ///
@@ -274,12 +274,20 @@ pub fn reject_statement_terminator(context: &str, sql: &str) -> Result<(), Valid
                 }
             }
             '-' if at(i + 1) == Some('-') => {
-                // `-- ...` runs to end of line on every dialect. Running off the
-                // end of the fragment is allowed: it comments out the remainder
-                // of the generated statement, which is a syntax error, not a way
-                // to smuggle a terminator past this scan.
+                // `-- ...` runs to end of line on every dialect. A LONE `\r`
+                // ends it too (Postgres, DuckDB and Snowflake all treat a
+                // carriage return as the line end), so stopping only at `\n`
+                // would keep swallowing text those lexers had already resumed
+                // reading as live SQL — including a `;`. Ending the comment
+                // EARLIER than a given dialect might is always the safe
+                // direction: it can only surface more top-level characters.
+                //
+                // Running off the end of the fragment is allowed: it comments
+                // out the remainder of the generated statement, which is a
+                // syntax error, not a way to smuggle a terminator past this
+                // scan.
                 i += 2;
-                while i < c.len() && c[i] != '\n' {
+                while i < c.len() && c[i] != '\n' && c[i] != '\r' {
                     i += 1;
                 }
             }
@@ -572,6 +580,18 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("statement terminator"), "{msg}");
+    }
+
+    #[test]
+    fn terminator_ends_a_line_comment_at_a_carriage_return() {
+        // Postgres, DuckDB and Snowflake end a `--` comment at a lone `\r`, so
+        // a scan that stopped only at `\n` would keep treating live SQL as
+        // comment text and skip the `;` in it.
+        assert!(rejects("amount > 0 -- c\r; SELECT 1"));
+        // CRLF behaves the same way.
+        assert!(rejects("amount > 0 -- c\r\n; SELECT 1"));
+        // A comment that really does run to the end is still fine.
+        assert!(reject_statement_terminator("ctx", "amount > 0 -- ; trailing").is_ok());
     }
 
     #[test]
