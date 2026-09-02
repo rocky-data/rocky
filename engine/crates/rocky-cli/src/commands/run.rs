@@ -12679,6 +12679,15 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             serde_json::json!({ "joins": "__" }),
             "an override does not replace the catalog template, so it still joins"
         );
+        // The rendered half of the `joins` shape. The fully populated pin
+        // above carries a branch override, so it renders `separator unused`
+        // — without this, no full-string assertion would hold
+        // `separator(__)` any more, and the joined rendering could change
+        // silently.
+        assert!(
+            genuine.to_string().contains("separator(__)"),
+            "unexpected rendering: {genuine}"
+        );
         assert_eq!(
             forged.to_string(),
             genuine.to_string(),
