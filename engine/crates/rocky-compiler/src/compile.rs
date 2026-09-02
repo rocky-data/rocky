@@ -791,6 +791,137 @@ mod tests {
     use super::*;
 
     #[test]
+    fn outer_join_rejects_non_null_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("joined.toml"),
+            "name = \"joined\"\n[target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"joined\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("joined.contract.toml"),
+            "[[columns]]\nname = \"customer_name\"\ntype = \"String\"\nnullable = false\n",
+        )
+        .unwrap();
+        let column = |name: &str, data_type| TypedColumn {
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+        };
+        let config = CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            source_schemas: HashMap::from([
+                (
+                    "raw.orders".to_string(),
+                    vec![
+                        column("id", RockyType::Int64),
+                        column("customer_id", RockyType::Int64),
+                    ],
+                ),
+                (
+                    "raw.customers".to_string(),
+                    vec![
+                        column("id", RockyType::Int64),
+                        column("name", RockyType::String),
+                    ],
+                ),
+            ]),
+            ..Default::default()
+        };
+        for (expression, join, nullable) in [
+            ("c.name", "LEFT JOIN", true),
+            ("c.name", "INNER JOIN", false),
+            ("CAST(c.name AS STRING)", "LEFT JOIN", true),
+            ("CAST(c.name AS STRING)", "INNER JOIN", false),
+            ("c.name::STRING", "LEFT JOIN", true),
+            ("c.name::STRING", "INNER JOIN", false),
+            ("CAST(CAST(c.name AS STRING) AS STRING)", "LEFT JOIN", true),
+            (
+                "CAST(CAST(c.name AS STRING) AS STRING)",
+                "INNER JOIN",
+                false,
+            ),
+        ] {
+            std::fs::write(
+                dir.path().join("joined.sql"),
+                format!(
+                    "SELECT o.id, {expression} AS customer_name FROM raw.orders o \
+                     {join} raw.customers c ON o.customer_id = c.id"
+                ),
+            )
+            .unwrap();
+            let result = compile(&config).unwrap();
+            let diagnostics: Vec<_> = result
+                .diagnostics
+                .iter()
+                .filter(|d| d.is_error())
+                .map(|d| (&*d.code, d.model.as_str()))
+                .collect();
+            assert_eq!(
+                diagnostics,
+                if nullable {
+                    vec![("E012", "joined")]
+                } else {
+                    vec![]
+                },
+                "{expression}: {join}"
+            );
+            assert_eq!(result.has_errors, nullable, "{expression}: {join}");
+            let columns = &result.type_check.typed_models["joined"];
+            assert_eq!(columns[0].data_type, RockyType::Int64);
+            assert!(!columns[0].nullable, "preserved order id: {join}");
+            assert_eq!(
+                columns[1].data_type,
+                RockyType::String,
+                "{expression}: {join}"
+            );
+            assert_eq!(columns[1].nullable, nullable, "{expression}: {join}");
+        }
+    }
+
+    #[test]
+    fn outer_join_propagation_preserves_grouped_cast_contracts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("totals.toml"),
+            "name = \"totals\"\n[target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"totals\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("totals.contract.toml"),
+            "[[columns]]\nname = \"total\"\ntype = \"Int64\"\nnullable = false\n",
+        )
+        .unwrap();
+        let config = CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            source_schemas: HashMap::from([(
+                "raw.orders".to_string(),
+                vec![TypedColumn {
+                    name: "id".to_string(),
+                    data_type: RockyType::Int64,
+                    nullable: false,
+                }],
+            )]),
+            ..Default::default()
+        };
+        for join in ["", "LEFT JOIN raw.orders r ON o.id = r.id"] {
+            std::fs::write(
+                dir.path().join("totals.sql"),
+                format!(
+                    "SELECT o.id, CAST(SUM(o.id) AS BIGINT) AS total \
+                     FROM raw.orders o {join} GROUP BY o.id"
+                ),
+            )
+            .unwrap();
+            let result = compile(&config).unwrap();
+            assert!(!result.has_errors, "{join}: {:?}", result.diagnostics);
+            let total = &result.type_check.typed_models["totals"][1];
+            assert_eq!(total.data_type, RockyType::Int64);
+            assert!(!total.nullable, "{join}");
+        }
+    }
+
+    #[test]
     fn test_default_type_mapper() {
         assert_eq!(default_type_mapper("STRING"), RockyType::String);
         assert_eq!(default_type_mapper("BIGINT"), RockyType::Int64);

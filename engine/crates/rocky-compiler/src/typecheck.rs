@@ -97,7 +97,7 @@ impl TypeScope {
         self.qualified
             .get(CiStr::new(table))
             .and_then(|m| m.get(CiStr::new(col)).cloned())
-            .unwrap_or_else(|| self.lookup(col))
+            .unwrap_or((RockyType::Unknown, true))
     }
 }
 
@@ -488,26 +488,62 @@ fn compute_model_typecheck(
         });
     }
 
-    // Step 2: Parse cast target types that lineage intentionally leaves Unknown.
-    let has_unknown_cast = typed_cols.iter().any(|col| {
-        col.data_type == RockyType::Unknown
-            && graph
-                .producing_edge(model_name, &col.name)
-                .is_some_and(|edge| edge.transform.is_cast())
+    // Lineage resolves aliases to source models, losing which occurrence an
+    // outer join null-extends. Infer in the SQL relation scope before using
+    // the resulting nullable bit for contracts and downstream models.
+    let needs_inference = typed_cols.iter().any(|col| {
+        graph
+            .producing_edge(model_name, &col.name)
+            .is_some_and(|edge| {
+                edge.transform.is_cast()
+                    || (!col.nullable
+                        && edge.transform == rocky_sql::lineage::TransformKind::Direct)
+            })
     });
-    let inferred_cols = if has_unknown_cast {
-        model_by_name
-            .get(model_name)
-            .and_then(|model| infer_select_types(&model.sql, &HashMap::new(), model_name).ok())
-    } else {
-        None
-    };
+    let inferred_cols = model_by_name
+        .get(model_name)
+        .filter(|_| needs_inference)
+        .and_then(|model| {
+            infer_select_types_with_lookup(&model.sql, &|name| {
+                typed_models.get(name).map(Vec::as_slice)
+            })
+            .ok()
+        });
+    if let Some(inferred) = &inferred_cols {
+        let mut nullable_by_name = HashMap::new();
+        for (index, col) in inferred.columns.iter().enumerate() {
+            // Match semantic-graph star expansion, which keeps the first
+            // occurrence when multiple relations expose the same name.
+            nullable_by_name
+                .entry(col.name.as_str())
+                .or_insert((col.nullable, inferred.reference_outputs.contains(&index)));
+        }
+        for col in &mut typed_cols {
+            let Some(edge) = graph.producing_edge(model_name, &col.name) else {
+                continue;
+            };
+            let Some(&(nullable, reference_output)) = nullable_by_name.get(col.name.as_str())
+            else {
+                continue;
+            };
+            if edge.transform == rocky_sql::lineage::TransformKind::Direct
+                || (edge.transform == rocky_sql::lineage::TransformKind::Cast && reference_output)
+            {
+                // Lineage also labels CAST(SUM(...)) as Cast. Preserve existing
+                // computed-expression behavior; only reference casts carry this
+                // join-side correction. Cast target refinement still runs below.
+                col.nullable |= nullable;
+            }
+        }
+    }
     let enhanced_diags = enhanced_inference(
         model_name,
         graph,
         typed_models,
         col_index,
-        inferred_cols.as_deref(),
+        inferred_cols
+            .as_ref()
+            .map(|inferred| inferred.columns.as_slice()),
         &mut typed_cols,
     );
     diagnostics.extend(enhanced_diags);
@@ -1523,9 +1559,17 @@ fn infer_expr_type(expr: &Expr, scope: &TypeScope) -> (RockyType, bool) {
         },
 
         // CAST(expr AS type)
-        Expr::Cast { data_type, .. } => {
-            let rocky_type = sql_type_to_rocky(data_type);
-            (rocky_type, true) // CAST result can be null if input is null
+        Expr::Cast {
+            expr,
+            data_type,
+            kind,
+            ..
+        } => {
+            let nullable = match kind {
+                ast::CastKind::Cast | ast::CastKind::DoubleColon => infer_expr_type(expr, scope).1,
+                ast::CastKind::TryCast | ast::CastKind::SafeCast => true,
+            };
+            (sql_type_to_rocky(data_type), nullable)
         }
 
         // Binary operations
@@ -1899,74 +1943,104 @@ fn validate_window_columns(spec: &ast::WindowSpec, scope: &TypeScope) -> Vec<(St
 pub fn infer_select_types(
     sql: &str,
     scope: &HashMap<String, Vec<TypedColumn>>,
-    model_name: &str,
+    _model_name: &str,
 ) -> Result<Vec<TypedColumn>, String> {
+    infer_select_types_with_lookup(sql, &|name| {
+        scope
+            .get(name)
+            .or_else(|| scope.get(name.rsplit('.').next().unwrap_or(name)))
+            .map(Vec::as_slice)
+    })
+    .map(|inferred| inferred.columns)
+}
+
+#[derive(Default)]
+struct SelectInference {
+    columns: Vec<TypedColumn>,
+    // Projection indexes keep metadata aligned with duplicate wildcard names.
+    reference_outputs: HashSet<usize>,
+}
+
+impl SelectInference {
+    fn push_expression(&mut self, name: String, expr: &Expr, scope: &TypeScope) {
+        if is_column_reference(expr) {
+            self.reference_outputs.insert(self.columns.len());
+        }
+        let (data_type, nullable) = infer_expr_type(expr, scope);
+        self.columns.push(TypedColumn {
+            name,
+            data_type,
+            nullable,
+        });
+    }
+}
+
+fn is_column_reference(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+        Expr::Nested(expr)
+        | Expr::Cast {
+            expr,
+            kind: ast::CastKind::Cast | ast::CastKind::DoubleColon,
+            ..
+        } => is_column_reference(expr),
+        _ => false,
+    }
+}
+
+fn infer_select_types_with_lookup<'a>(
+    sql: &str,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+) -> Result<SelectInference, String> {
     let dialect = rocky_sql::dialect::DatabricksDialect;
     let stmts = Parser::parse_sql(&dialect, sql).map_err(|e| e.to_string())?;
-    let stmt = stmts.first().ok_or("empty SQL")?;
-
-    let Statement::Query(query) = stmt else {
+    let Statement::Query(query) = stmts.first().ok_or("empty SQL")? else {
         return Err("only SELECT statements supported".to_string());
     };
+    infer_query_types(query, lookup)
+}
 
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Err("unsupported query form".to_string());
-    };
-
-    // Build TypeScope from provided schemas
-    let mut type_scope = TypeScope::new();
-    let mut cte_scope: HashMap<String, Vec<TypedColumn>> = HashMap::new();
-
-    // Step 0: Process CTEs (WITH clause) — type-check each CTE body
-    // and add its columns to scope so downstream CTEs and the main query
-    // can reference them.
-    if let Some(ref with) = query.with {
+fn infer_query_types<'a>(
+    query: &ast::Query,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+) -> Result<SelectInference, String> {
+    let mut ctes: HashMap<String, Vec<TypedColumn>> = HashMap::new();
+    if let Some(with) = &query.with {
         for cte in &with.cte_tables {
-            let cte_name = cte.alias.name.value.clone();
-
-            // Build scope for this CTE: parent scope + prior CTEs
-            let mut cte_input_scope = scope.clone();
-            cte_input_scope.extend(cte_scope.clone());
-
-            // Recursively type-check the CTE body
-            let cte_sql = cte.query.to_string();
-            match infer_select_types(&cte_sql, &cte_input_scope, &cte_name) {
-                Ok(cte_cols) => {
-                    // Register CTE columns in scope
-                    for col in &cte_cols {
-                        type_scope.columns.insert(
-                            CiKey::owned(col.name.clone()),
-                            (col.data_type.clone(), col.nullable),
-                        );
-                        type_scope
-                            .qualified
-                            .entry(CiKey::owned(cte_name.clone()))
-                            .or_default()
-                            .insert(
-                                CiKey::owned(col.name.clone()),
-                                (col.data_type.clone(), col.nullable),
-                            );
-                    }
-                    cte_scope.insert(cte_name, cte_cols);
-                }
-                Err(_) => {
-                    // CTE failed to type-check — register with Unknown types
-                    // This allows the rest of the query to still be checked
-                }
-            }
+            let mut columns = infer_query_types(&cte.query, &|name| {
+                ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name))
+            })
+            .unwrap_or_default()
+            .columns;
+            rename_relation_columns(&mut columns, &cte.alias);
+            ctes.insert(cte.alias.name.value.clone(), columns);
         }
     }
-
-    for (table_name, cols) in scope {
-        for col in cols {
-            type_scope.columns.insert(
-                CiKey::owned(col.name.clone()),
-                (col.data_type.clone(), col.nullable),
-            );
-            let short_name = table_name.split('.').next_back().unwrap_or(table_name);
+    let lookup = |name: &str| ctes.get(name).map(Vec::as_slice).or_else(|| lookup(name));
+    let select = match query.body.as_ref() {
+        SetExpr::Select(select) => select,
+        SetExpr::Query(query) => return infer_query_types(query, &lookup),
+        _ => return Err("unsupported query form".to_string()),
+    };
+    let mut from_scope = JoinScope::default();
+    for from in &select.from {
+        let joined = infer_join_relations(from, &lookup);
+        from_scope.relations.extend(joined.relations);
+        from_scope.columns.extend(joined.columns);
+    }
+    let mut type_scope = TypeScope::new();
+    for col in &from_scope.columns {
+        type_scope
+            .columns
+            .entry(CiKey::owned(col.name.clone()))
+            .and_modify(|ty| *ty = (RockyType::Unknown, true))
+            .or_insert_with(|| (col.data_type.clone(), col.nullable));
+    }
+    for relation in &from_scope.relations {
+        for col in &relation.columns {
             type_scope
                 .qualified
-                .entry(CiKey::owned(short_name.to_string()))
+                .entry(CiKey::owned(relation.qualifier.clone()))
                 .or_default()
                 .insert(
                     CiKey::owned(col.name.clone()),
@@ -1975,63 +2049,15 @@ pub fn infer_select_types(
         }
     }
 
-    // Also build alias map from FROM clause
-    for from_item in &select.from {
-        if let ast::TableFactor::Table { name, alias, .. } = &from_item.relation {
-            let table_name = name.to_string();
-            if let Some(alias) = alias {
-                let alias_str = alias.name.value.clone();
-                // Map alias.column to the same types as the table
-                if let Some(cols) = scope.get(&table_name) {
-                    for col in cols {
-                        type_scope
-                            .qualified
-                            .entry(CiKey::owned(alias_str.clone()))
-                            .or_default()
-                            .insert(
-                                CiKey::owned(col.name.clone()),
-                                (col.data_type.clone(), col.nullable),
-                            );
-                    }
-                }
-                // Also try short name
-                let short = table_name.split('.').next_back().unwrap_or(&table_name);
-                if let Some(cols) = scope.get(short) {
-                    for col in cols {
-                        type_scope
-                            .qualified
-                            .entry(CiKey::owned(alias_str.clone()))
-                            .or_default()
-                            .insert(
-                                CiKey::owned(col.name.clone()),
-                                (col.data_type.clone(), col.nullable),
-                            );
-                    }
-                }
-            }
-        }
-    }
-
-    let mut typed_cols = Vec::new();
+    let mut inferred = SelectInference::default();
 
     for item in &select.projection {
         match item {
             SelectItem::UnnamedExpr(expr) => {
-                let (data_type, nullable) = infer_expr_type(expr, &type_scope);
-                let name = expr_name(expr);
-                typed_cols.push(TypedColumn {
-                    name,
-                    data_type,
-                    nullable,
-                });
+                inferred.push_expression(expr_name(expr), expr, &type_scope);
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                let (data_type, nullable) = infer_expr_type(expr, &type_scope);
-                typed_cols.push(TypedColumn {
-                    name: alias.value.clone(),
-                    data_type,
-                    nullable,
-                });
+                inferred.push_expression(alias.value.clone(), expr, &type_scope);
             }
             // Spark SQL `SELECT expr AS (a, b, c)` — multi-alias binding.
             // Emit one typed column per alias with the same inferred type
@@ -2039,34 +2065,221 @@ pub fn infer_select_types(
             // expression's inferred type — same conservative shape as
             // `ExprWithAlias` above).
             SelectItem::ExprWithAliases { expr, aliases } => {
-                let (data_type, nullable) = infer_expr_type(expr, &type_scope);
                 for alias in aliases {
-                    typed_cols.push(TypedColumn {
-                        name: alias.value.clone(),
-                        data_type: data_type.clone(),
-                        nullable,
-                    });
+                    inferred.push_expression(alias.value.clone(), expr, &type_scope);
                 }
             }
             SelectItem::Wildcard(_) => {
-                // Expand * from all tables in scope
-                for cols in scope.values() {
-                    for col in cols {
-                        typed_cols.push(col.clone());
+                inferred.columns.extend(from_scope.columns.iter().cloned());
+            }
+            SelectItem::QualifiedWildcard(
+                ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+                _,
+            ) => {
+                let Some(name) = name.0.last().and_then(ast::ObjectNamePart::as_ident) else {
+                    continue;
+                };
+                for relation in &from_scope.relations {
+                    if relation.qualifier.eq_ignore_ascii_case(&name.value) {
+                        inferred.columns.extend(relation.columns.iter().cloned());
                     }
                 }
             }
-            SelectItem::QualifiedWildcard(name, _) => {
-                let table_name = name.to_string();
-                if let Some(cols) = scope.get(&table_name) {
-                    typed_cols.extend(cols.clone());
-                }
-            }
+            SelectItem::QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::Expr(_), _) => {}
         }
     }
 
-    let _ = model_name; // used for future diagnostics
-    Ok(typed_cols)
+    Ok(inferred)
+}
+
+struct RelationColumns {
+    qualifier: String,
+    columns: Vec<TypedColumn>,
+}
+
+#[derive(Default)]
+struct JoinScope {
+    // Qualified references retain each side's columns. USING/NATURAL keys
+    // merge only in the unqualified output used by SELECT * and bare names.
+    relations: Vec<RelationColumns>,
+    columns: Vec<TypedColumn>,
+}
+
+fn infer_join_relations<'a>(
+    from: &ast::TableWithJoins,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+) -> JoinScope {
+    use ast::JoinOperator;
+
+    let mut left = infer_relation_columns(&from.relation, lookup);
+    for join in &from.joins {
+        let mut right = infer_relation_columns(&join.relation, lookup);
+        let merged = merged_join_columns(&left.columns, &right.columns, &join.join_operator);
+        if matches!(
+            join.join_operator,
+            JoinOperator::Right(_) | JoinOperator::RightOuter(_) | JoinOperator::FullOuter(_)
+        ) {
+            null_extend_scope(&mut left);
+        }
+        if matches!(
+            join.join_operator,
+            JoinOperator::Left(_)
+                | JoinOperator::LeftOuter(_)
+                | JoinOperator::FullOuter(_)
+                | JoinOperator::OuterApply
+        ) {
+            null_extend_scope(&mut right);
+        }
+        for col in &mut left.columns {
+            if let Some(key) = merged.get(CiStr::new(&col.name)) {
+                *col = key.clone();
+            }
+        }
+        left.columns.extend(
+            right
+                .columns
+                .into_iter()
+                .filter(|col| !merged.contains_key(CiStr::new(&col.name))),
+        );
+        left.relations.extend(right.relations);
+    }
+    left
+}
+
+fn merged_join_columns(
+    left: &[TypedColumn],
+    right: &[TypedColumn],
+    operator: &ast::JoinOperator,
+) -> HashMap<CiKey<'static>, TypedColumn> {
+    use ast::{JoinConstraint, JoinOperator};
+
+    let constraint = match operator {
+        JoinOperator::Join(c)
+        | JoinOperator::Inner(c)
+        | JoinOperator::Left(c)
+        | JoinOperator::LeftOuter(c)
+        | JoinOperator::Right(c)
+        | JoinOperator::RightOuter(c)
+        | JoinOperator::FullOuter(c) => c,
+        _ => return HashMap::new(),
+    };
+    if !matches!(
+        constraint,
+        JoinConstraint::Using(_) | JoinConstraint::Natural
+    ) {
+        return HashMap::new();
+    }
+    let right: HashMap<_, _> = right
+        .iter()
+        .map(|col| (CiKey::owned(col.name.clone()), col))
+        .collect();
+    let using: HashSet<_> = match constraint {
+        JoinConstraint::Using(names) => names
+            .iter()
+            .filter_map(|name| name.0.last().and_then(ast::ObjectNamePart::as_ident))
+            .map(|name| CiKey::owned(name.value.clone()))
+            .collect(),
+        _ => right.keys().cloned().collect(),
+    };
+    left.iter()
+        .filter_map(|left| {
+            if !using.contains(CiStr::new(&left.name)) {
+                return None;
+            }
+            let right = right.get(CiStr::new(&left.name))?;
+            let nullable = match operator {
+                JoinOperator::Left(_) | JoinOperator::LeftOuter(_) => left.nullable,
+                JoinOperator::Right(_) | JoinOperator::RightOuter(_) => right.nullable,
+                // FULL JOIN can emit unmatched rows from either input. The
+                // coalesced key is non-null only when BOTH input keys are non-null.
+                JoinOperator::FullOuter(_) => left.nullable || right.nullable,
+                // An inner join emits only matched rows, and the merged key's
+                // equality never matches a NULL, so the key is non-null as soon
+                // as either input key is.
+                JoinOperator::Join(_) | JoinOperator::Inner(_) => left.nullable && right.nullable,
+                // The guard above admits only the operators named here. Treat a
+                // variant that ever reaches this arm as nullable, the
+                // conservative answer.
+                _ => true,
+            };
+            Some((
+                CiKey::owned(left.name.clone()),
+                TypedColumn {
+                    name: left.name.clone(),
+                    data_type: if left.data_type == right.data_type {
+                        left.data_type.clone()
+                    } else {
+                        RockyType::Unknown
+                    },
+                    nullable,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn null_extend_scope(scope: &mut JoinScope) {
+    for col in &mut scope.columns {
+        col.nullable = true;
+    }
+    for relation in &mut scope.relations {
+        for col in &mut relation.columns {
+            col.nullable = true;
+        }
+    }
+}
+
+fn infer_relation_columns<'a>(
+    factor: &TableFactor,
+    lookup: &dyn Fn(&str) -> Option<&'a [TypedColumn]>,
+) -> JoinScope {
+    let (qualifier, mut columns, alias) = match factor {
+        TableFactor::Table { name, alias, .. } => {
+            let name = name.to_string();
+            let short = name.rsplit('.').next().unwrap_or(&name);
+            let columns = lookup(&name).unwrap_or_default().to_vec();
+            (short.to_string(), columns, alias)
+        }
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => (
+            String::new(),
+            infer_query_types(subquery, lookup)
+                .unwrap_or_default()
+                .columns,
+            alias,
+        ),
+        TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            let scope = infer_join_relations(table_with_joins, lookup);
+            if alias.is_none() {
+                return scope;
+            }
+            (String::new(), scope.columns, alias)
+        }
+        _ => return JoinScope::default(),
+    };
+    let qualifier = if let Some(alias) = alias {
+        rename_relation_columns(&mut columns, alias);
+        alias.name.value.clone()
+    } else {
+        qualifier
+    };
+    JoinScope {
+        relations: vec![RelationColumns {
+            qualifier,
+            columns: columns.clone(),
+        }],
+        columns,
+    }
+}
+
+fn rename_relation_columns(columns: &mut [TypedColumn], alias: &ast::TableAlias) {
+    for (col, alias) in columns.iter_mut().zip(&alias.columns) {
+        col.name.clone_from(&alias.name.value);
+    }
 }
 
 /// Extract a reasonable name from an expression (for unnamed SELECT items).
@@ -2291,6 +2504,443 @@ mod tests {
                 nullable: *nullable,
             })
             .collect()
+    }
+
+    #[test]
+    fn outer_join_nullability_preserves_relation_identity() {
+        let sources = HashMap::from([(
+            "raw.users".to_string(),
+            source_schema(&[("id", RockyType::Int64, false)]),
+        )]);
+        for (join, expected) in [
+            ("LEFT JOIN", [false, true]),
+            ("LEFT OUTER JOIN", [false, true]),
+            ("RIGHT JOIN", [true, false]),
+            ("RIGHT OUTER JOIN", [true, false]),
+            ("FULL OUTER JOIN", [true, true]),
+            ("INNER JOIN", [false, false]),
+        ] {
+            let sql = format!(
+                "SELECT a.id AS left_id, b.id AS right_id \
+                 FROM raw.users a {join} raw.users b ON a.id = b.id"
+            );
+            let project = Project::from_models(vec![make_model("joined", &sql)]).unwrap();
+            let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+            let result =
+                typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+            let columns = &result.typed_models["joined"];
+            for (col, nullable) in columns.iter().zip(expected) {
+                assert_eq!(col.data_type, RockyType::Int64, "{sql}");
+                assert_eq!(col.nullable, nullable, "{}: {sql}", col.name);
+            }
+            assert_eq!(columns.len(), 2);
+        }
+    }
+
+    #[test]
+    fn outer_join_scope_handles_chains_nesting_and_stars() {
+        let sources = HashMap::from([
+            (
+                "a".to_string(),
+                source_schema(&[("a_id", RockyType::Int64, false)]),
+            ),
+            (
+                "b".to_string(),
+                source_schema(&[("b_id", RockyType::Int64, false)]),
+            ),
+            (
+                "c".to_string(),
+                source_schema(&[("c_id", RockyType::Int64, false)]),
+            ),
+        ]);
+        for (sql, expected) in [
+            (
+                "SELECT * FROM a LEFT JOIN b ON true INNER JOIN c ON true",
+                vec![false, true, false],
+            ),
+            (
+                "SELECT * FROM a INNER JOIN b ON true RIGHT JOIN c ON true",
+                vec![true, true, false],
+            ),
+            (
+                "SELECT * FROM a LEFT JOIN (b INNER JOIN c ON true) ON true",
+                vec![false, true, true],
+            ),
+            (
+                "SELECT * FROM (a LEFT JOIN b ON true) RIGHT JOIN c ON true",
+                vec![true, true, false],
+            ),
+            (
+                "SELECT * FROM a, b RIGHT JOIN c ON true",
+                vec![false, true, false],
+            ),
+            ("SELECT r.* FROM a l LEFT JOIN b r ON true", vec![true]),
+            ("SELECT l.* FROM a l LEFT JOIN b r ON true", vec![false]),
+            (
+                "SELECT r.* FROM a l LEFT JOIN (SELECT b_id FROM b) r ON true",
+                vec![true],
+            ),
+            (
+                "WITH r AS (SELECT b_id FROM b) SELECT r.* FROM a LEFT JOIN r ON true",
+                vec![true],
+            ),
+            (
+                "SELECT r.* FROM a LEFT JOIN (b INNER JOIN c ON true) r ON true",
+                vec![true, true],
+            ),
+        ] {
+            let columns = infer_select_types(sql, &sources, "joined").unwrap();
+            assert_eq!(columns.len(), expected.len(), "{sql}");
+            for (col, nullable) in columns.iter().zip(expected) {
+                assert_eq!(col.data_type, RockyType::Int64, "{sql}");
+                assert_eq!(col.nullable, nullable, "{}: {sql}", col.name);
+            }
+        }
+    }
+
+    #[test]
+    fn outer_join_casts_and_null_replacing_expressions() {
+        let sources = HashMap::from([(
+            "users".to_string(),
+            source_schema(&[("id", RockyType::Int64, false)]),
+        )]);
+        let sql = "SELECT CAST(a.id AS BIGINT) AS kept, CAST(b.id AS BIGINT) AS extended, \
+                   TRY_CAST(a.id AS BIGINT) AS fallible, COALESCE(b.id, 0) AS fallback, \
+                   COUNT(b.id) AS count_id FROM users a LEFT JOIN users b ON a.id = b.id";
+        let columns = infer_select_types(sql, &sources, "joined").unwrap();
+        assert_eq!(columns.len(), 5);
+        for (col, nullable) in columns.iter().zip([false, true, true, false, false]) {
+            assert_eq!(col.data_type, RockyType::Int64, "{}", col.name);
+            assert_eq!(col.nullable, nullable, "{}", col.name);
+        }
+        let project = Project::from_models(vec![make_model("joined", sql)]).unwrap();
+        let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
+        let result = typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+        let columns = &result.typed_models["joined"];
+        for (col, nullable) in columns[..3].iter().zip([false, true, true]) {
+            assert_eq!(col.data_type, RockyType::Int64, "{}", col.name);
+            assert_eq!(col.nullable, nullable, "{}", col.name);
+        }
+        assert_eq!(columns[3].data_type, RockyType::Unknown);
+        assert!(
+            !columns[4].nullable,
+            "COUNT stays non-null even over null-extended input"
+        );
+        let columns = infer_select_types(
+            "SELECT CAST(SUM(id) AS BIGINT) AS total FROM users GROUP BY id",
+            &sources,
+            "totals",
+        )
+        .unwrap();
+        assert!(
+            columns[0].nullable,
+            "expression inference remains conservative for casted aggregates"
+        );
+    }
+
+    #[test]
+    fn outer_join_star_nullability_matches_selected_alias() {
+        let sources = HashMap::from([(
+            "users".to_string(),
+            source_schema(&[("id", RockyType::Int64, false)]),
+        )]);
+        let external = HashMap::from([(
+            "users".to_string(),
+            vec![rocky_ir::ColumnInfo {
+                name: "id".to_string(),
+                data_type: "BIGINT".to_string(),
+                nullable: false,
+            }],
+        )]);
+        for (projection, nullable) in [
+            ("*", false),
+            ("l.*", false),
+            ("r.*", true),
+            ("\"r\".*", true),
+        ] {
+            let sql = format!("SELECT {projection} FROM users l LEFT JOIN users r ON l.id = r.id");
+            let project = Project::from_models(vec![make_model("joined", &sql)]).unwrap();
+            let graph = build_semantic_graph(&project, &external).unwrap();
+            let result =
+                typecheck_project_with_models(&graph, &sources, None, &project.models, None);
+            let columns = &result.typed_models["joined"];
+            assert_eq!(
+                columns.len(),
+                1,
+                "semantic graph keeps the first duplicate name"
+            );
+            assert_eq!(columns[0].data_type, RockyType::Int64, "{sql}");
+            assert_eq!(columns[0].nullable, nullable, "{sql}");
+        }
+    }
+
+    #[test]
+    fn outer_join_using_and_natural_keys_keep_merged_nullability() {
+        for right_nullable in [false, true] {
+            let sources = HashMap::from([
+                (
+                    "a".to_string(),
+                    source_schema(&[("id", RockyType::Int64, false)]),
+                ),
+                (
+                    "b".to_string(),
+                    source_schema(&[("id", RockyType::Int64, right_nullable)]),
+                ),
+            ]);
+            let external: HashMap<_, _> = sources
+                .iter()
+                .map(|(name, columns)| {
+                    (
+                        name.clone(),
+                        columns
+                            .iter()
+                            .map(|col| rocky_ir::ColumnInfo {
+                                name: col.name.clone(),
+                                data_type: "BIGINT".to_string(),
+                                nullable: col.nullable,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            for (join, merged_nullable, left_nullable) in [
+                ("LEFT JOIN", false, false),
+                ("RIGHT JOIN", right_nullable, true),
+                ("FULL OUTER JOIN", right_nullable, true),
+            ] {
+                for clause in [
+                    format!("{join} b r USING (id)"),
+                    format!("NATURAL {join} b r"),
+                ] {
+                    for projection in ["id", "*"] {
+                        let sql = format!("SELECT {projection} FROM a l {clause}");
+                        let columns = infer_select_types(&sql, &sources, "joined").unwrap();
+                        assert_eq!(columns.len(), 1, "{sql}");
+                        assert_eq!(columns[0].data_type, RockyType::Int64, "{sql}");
+                        assert_eq!(columns[0].nullable, merged_nullable, "{sql}");
+                        if projection == "*" {
+                            let project =
+                                Project::from_models(vec![make_model("joined", &sql)]).unwrap();
+                            let graph = build_semantic_graph(&project, &external).unwrap();
+                            let result = typecheck_project_with_models(
+                                &graph,
+                                &sources,
+                                None,
+                                &project.models,
+                                None,
+                            );
+                            let columns = &result.typed_models["joined"];
+                            assert_eq!(columns[0].nullable, merged_nullable, "{sql}");
+                            let contract = CompilerContract {
+                                columns: vec![ContractColumn {
+                                    name: "id".to_string(),
+                                    type_name: Some("Int64".to_string()),
+                                    nullable: Some(false),
+                                    description: None,
+                                }],
+                                rules: ContractRules::default(),
+                            };
+                            assert_eq!(
+                                validate_contract("joined", columns, &contract)
+                                    .iter()
+                                    .any(|d| &*d.code == "E012"),
+                                merged_nullable,
+                                "{sql}"
+                            );
+                        }
+                    }
+                    let sql = format!("SELECT l.id AS left_id, r.id AS right_id FROM a l {clause}");
+                    let columns = infer_select_types(&sql, &sources, "joined").unwrap();
+                    assert_eq!(columns[0].nullable, left_nullable, "{sql}");
+                    assert_eq!(
+                        columns[1].nullable,
+                        right_nullable || join != "RIGHT JOIN",
+                        "{sql}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An inner join emits only matched rows, and its merged key never matches a
+    /// NULL, so the key stays non-null as soon as either input key is. Sharing
+    /// the FULL rule here widened it and rejected valid contracts with E012.
+    #[test]
+    fn inner_join_using_and_natural_keys_keep_the_merged_key_non_null() {
+        for (left_nullable, right_nullable, merged_nullable) in [
+            (false, false, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let sources = HashMap::from([
+                (
+                    "a".to_string(),
+                    source_schema(&[("id", RockyType::Int64, left_nullable)]),
+                ),
+                (
+                    "b".to_string(),
+                    source_schema(&[("id", RockyType::Int64, right_nullable)]),
+                ),
+            ]);
+            let external: HashMap<_, _> = sources
+                .iter()
+                .map(|(name, columns)| {
+                    (
+                        name.clone(),
+                        columns
+                            .iter()
+                            .map(|col| rocky_ir::ColumnInfo {
+                                name: col.name.clone(),
+                                data_type: "BIGINT".to_string(),
+                                nullable: col.nullable,
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            // The whole-project path starts from the star's lineage edge, which
+            // resolves to the first relation, and the join overlay only widens.
+            // A nullable left key therefore stays nullable there even though the
+            // merged key itself cannot be null.
+            let project_nullable = merged_nullable || left_nullable;
+            for join in ["JOIN", "INNER JOIN"] {
+                for clause in [
+                    format!("{join} b r USING (id)"),
+                    format!("NATURAL {join} b r"),
+                ] {
+                    for projection in ["id", "*"] {
+                        let sql = format!("SELECT {projection} FROM a l {clause}");
+                        let columns = infer_select_types(&sql, &sources, "joined").unwrap();
+                        assert_eq!(
+                            columns.len(),
+                            1,
+                            "{sql} ({left_nullable}, {right_nullable})"
+                        );
+                        assert_eq!(
+                            columns[0].data_type,
+                            RockyType::Int64,
+                            "{sql} ({left_nullable}, {right_nullable})"
+                        );
+                        assert_eq!(
+                            columns[0].nullable, merged_nullable,
+                            "{sql} ({left_nullable}, {right_nullable})"
+                        );
+                    }
+
+                    let sql = format!("SELECT * FROM a l {clause}");
+                    let project = Project::from_models(vec![make_model("joined", &sql)]).unwrap();
+                    let graph = build_semantic_graph(&project, &external).unwrap();
+                    let result = typecheck_project_with_models(
+                        &graph,
+                        &sources,
+                        None,
+                        &project.models,
+                        None,
+                    );
+                    let columns = &result.typed_models["joined"];
+                    assert_eq!(
+                        columns[0].nullable, project_nullable,
+                        "{sql} ({left_nullable}, {right_nullable})"
+                    );
+                    let contract = CompilerContract {
+                        columns: vec![ContractColumn {
+                            name: "id".to_string(),
+                            type_name: Some("Int64".to_string()),
+                            nullable: Some(false),
+                            description: None,
+                        }],
+                        rules: ContractRules::default(),
+                    };
+                    assert_eq!(
+                        validate_contract("joined", columns, &contract)
+                            .iter()
+                            .any(|d| &*d.code == "E012"),
+                        project_nullable,
+                        "{sql} ({left_nullable}, {right_nullable})"
+                    );
+
+                    let sql = format!("SELECT l.id AS left_id, r.id AS right_id FROM a l {clause}");
+                    let columns = infer_select_types(&sql, &sources, "joined").unwrap();
+                    assert_eq!(
+                        columns[0].nullable, left_nullable,
+                        "{sql} ({left_nullable}, {right_nullable})"
+                    );
+                    assert_eq!(
+                        columns[1].nullable, right_nullable,
+                        "{sql} ({left_nullable}, {right_nullable})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outer_join_scope_respects_column_aliases_and_missing_sources() {
+        let sources = HashMap::from([(
+            "users".to_string(),
+            source_schema(&[("id", RockyType::Int64, false)]),
+        )]);
+        for sql in [
+            "SELECT l.kept, r.extended FROM users l(kept) LEFT JOIN users r(extended) ON true",
+            "WITH c(renamed) AS (SELECT id FROM users) SELECT l.renamed, r.renamed FROM c l LEFT JOIN c r ON true",
+        ] {
+            let columns = infer_select_types(sql, &sources, "joined").unwrap();
+            assert_eq!(columns.len(), 2, "{sql}");
+            for (col, nullable) in columns.iter().zip([false, true]) {
+                assert_eq!(col.data_type, RockyType::Int64, "{sql}");
+                assert_eq!(col.nullable, nullable, "{sql}");
+            }
+        }
+        let columns = infer_select_types_with_lookup("SELECT u.id FROM raw.users u", &|name| {
+            sources.get(name).map(Vec::as_slice)
+        })
+        .unwrap()
+        .columns;
+        assert_eq!(columns[0].data_type, RockyType::Unknown);
+        assert!(
+            columns[0].nullable,
+            "raw.users must not resolve to the unrelated users model"
+        );
+    }
+
+    #[test]
+    fn outer_join_incremental_nullability_matches_full_typecheck() {
+        let sources = HashMap::from([(
+            "users".to_string(),
+            source_schema(&[("id", RockyType::Int64, false)]),
+        )]);
+        let models = |join| {
+            vec![
+                make_model(
+                    "joined",
+                    &format!("SELECT b.id AS id FROM users a {join} users b ON a.id = b.id"),
+                ),
+                make_model("downstream", "SELECT id FROM joined"),
+            ]
+        };
+        let initial = Project::from_models(models("INNER JOIN")).unwrap();
+        let graph = build_semantic_graph(&initial, &HashMap::new()).unwrap();
+        let previous = typecheck_project_with_models(&graph, &sources, None, &initial.models, None);
+        assert!(!previous.typed_models["downstream"][0].nullable);
+
+        let updated = Project::from_models(models("LEFT JOIN")).unwrap();
+        let graph = build_semantic_graph(&updated, &HashMap::new()).unwrap();
+        let affected = HashSet::from(["joined".to_string(), "downstream".to_string()]);
+        let incremental = typecheck_project_incremental(
+            &graph,
+            &sources,
+            &updated.models,
+            &affected,
+            &previous,
+            None,
+        );
+        let full = typecheck_project_with_models(&graph, &sources, None, &updated.models, None);
+        assert_eq!(incremental.typed_models, full.typed_models);
+        for name in ["joined", "downstream"] {
+            assert_eq!(full.typed_models[name][0].data_type, RockyType::Int64);
+            assert!(full.typed_models[name][0].nullable, "{name}");
+        }
     }
 
     fn make_time_interval_select_star_model(name: &str, time_column: &str, sql: &str) -> Model {
