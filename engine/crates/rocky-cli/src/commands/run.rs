@@ -13008,13 +13008,6 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         .unwrap();
         // Three places a secret hides in one host, each with no `/` before
         // the `://` that follows it.
-        // Paired with the URL part each one sits in, so a failure can name the
-        // part without printing what leaked.
-        let secrets = [
-            ("userinfo", "USERINFO-SECRET"),
-            ("query", "QUERY-SECRET"),
-            ("fragment", "FRAGMENT-SECRET"),
-        ];
         let gateway = |tenant: &str| -> AdapterConfig {
             toml::from_str(&format!(
                 "type = \"trino\"\nhost = \"alice:USERINFO-SECRET@gw.example.com:8443?next=QUERY-SECRET://{tenant}#FRAGMENT-SECRET\"\ndatabase = \"hive\"\n"
@@ -13034,19 +13027,42 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         let message = format!("{err:#}");
         let stored = serde_json::to_string(&store.get_run_progress("run-a").unwrap().unwrap())
             .expect("the checkpoint serializes");
-        for (part, secret) in secrets {
-            for (form, text) in [("message", &message), ("checkpoint", &stored)] {
-                // Reduce to a bool BEFORE asserting, so neither the secret nor
-                // the text holding it reaches the panic path. A failure names
-                // the surface and the URL part; re-run to inspect the value.
-                let leaked = text.contains(secret);
-                assert!(!leaked, "the refusal {form} leaks the {part} secret");
-            }
-        }
+        // Assert the whole recorded identity, not the absence of the strings
+        // this test planted. An exact locator set proves nothing else survived,
+        // and it keeps the planted material out of the assertions themselves.
+        let stored: serde_json::Value =
+            serde_json::from_str(&stored).expect("the checkpoint is JSON");
+        let locators = stored["scope"]["target"]["endpoint"]["locators"]
+            .as_object()
+            .expect("the identity has locators")
+            .clone();
+        assert_eq!(
+            locators.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["catalog", "host", "host_route_digest"],
+            "the identity records the catalog, the authority and the route digest"
+        );
+        assert_eq!(locators["host"], serde_json::json!("gw.example.com:8443"));
+        assert_eq!(locators["catalog"], serde_json::json!("hive"));
+        assert!(
+            locators["host_route_digest"]
+                .as_str()
+                .expect("the route is a string")
+                .starts_with("blake3:"),
+            "the route is recorded as a digest, so it tells two paths apart \
+             without keeping either"
+        );
+
+        // Comparing the whole refusal leaves no room for extra text from the
+        // host to appear anywhere in it.
+        let expected = format!(
+            "cannot resume run 'run-a': its checkpoint belongs to a different \
+             pipeline scope (checkpoint: {scope_a}; this invocation: {scope_b})"
+        );
+        assert_eq!(message, expected);
         assert!(
             message.contains("host=gw.example.com:8443"),
-            "the message no longer names the machine, so the operator cannot \
-             tell the endpoints apart"
+            "the message still names the machine, so the operator can tell the \
+             endpoints apart"
         );
     }
 
