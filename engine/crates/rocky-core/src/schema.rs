@@ -327,7 +327,14 @@ impl SchemaPattern {
     ///
     /// A resume checkpoint records the separator only when this says it
     /// moves a name (#1582), so a config edit that cannot reach the
-    /// warehouse does not refuse a recovery.
+    /// warehouse does not refuse a recovery. `templates` is the set the
+    /// caller actually renders — a template a shadow or branch override
+    /// replaces is not in it, because a separator cannot reach a name
+    /// through a template nothing renders (#1586). Note what this does
+    /// **not** answer: joining nothing is necessary but not sufficient for
+    /// a resume to elide the value. The caller must also know the separator
+    /// is target-only, because [`Self::parse`] splits source schema names
+    /// on the pattern's own separator.
     ///
     /// **The invariant: this rule and [`ParsedSchema::resolve_template`] must
     /// never disagree about whether the separator changes the output.** So
