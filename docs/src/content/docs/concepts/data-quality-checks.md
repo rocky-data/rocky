@@ -154,7 +154,7 @@ filter = "region = 'US'"
 |---|---|---|---|
 | `not_null` | row | — | Column contains no NULL values. |
 | `unique` | set | — | Column contains only unique values. |
-| `unique_expr` | set | `key_expr: String` | A derived **key expression** is unique across rows (`GROUP BY <expr> HAVING COUNT(*) > 1`). For when the meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union) that neither `unique` (single column) nor `composite` (column tuple) can express. `key_expr` is passed through verbatim (trusted config, like `expression`); NULL keys are not excluded — use `filter` to scope them out. |
+| `unique_expr` | set | `key_expr: String` | A derived **key expression** is unique across rows (`GROUP BY <expr> HAVING COUNT(*) > 1`). For when the meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union) that neither `unique` (single column) nor `composite` (column tuple) can express. `key_expr` is passed through as written (like `expression`), except that Rocky refuses a fragment that is not a single expression — see the note under **Filters**. NULL keys are not excluded — use `filter` to scope them out. |
 | `accepted_values` | row | `values: [String]` | Every non-NULL value is in the fixed set. |
 | `relationships` | row | `to_table`, `to_column` | Every non-NULL value exists in `to_table.to_column` (referential integrity). |
 | `expression` | row | `expression: String` | Custom SQL boolean predicate must hold per row. |
@@ -241,7 +241,14 @@ min = "0"
 filter = "region = 'US' AND status != 'cancelled'"
 ```
 
-The filter is your SQL. You are responsible for making it valid in the target dialect. Rocky validates identifiers inside structured parameters, such as columns and values, but it passes the filter expression through verbatim.
+The filter is your SQL. You are responsible for making it valid in the target dialect. Rocky validates identifiers inside structured parameters, such as columns and values, but it passes the filter expression through as written.
+
+One check does apply, to `filter`, `expression` and `key_expr` alike. Rocky refuses a fragment that is not a single expression:
+
+- a statement terminator `;` outside a string literal, a quoted identifier or a comment — including a trailing one;
+- an unbalanced quote or an unclosed `/* */` comment.
+
+The check runs when Rocky builds the query, and it names the field and the table so you know which line to fix. It does not limit what the expression may read: the expression runs with the same warehouse credentials as the rest of the pipeline.
 
 ### Row quarantine
 
@@ -296,7 +303,7 @@ max_overlap_rows = 0          # any overlap fails; raise to tolerate a known set
 sample = 20                   # overlapping keys attached to the result for triage
 ```
 
-Give exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression, passed through verbatim). This mirrors `unique` and `unique_expr`.
+Give exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression, passed through as written). This mirrors `unique` and `unique_expr`.
 
 **How it works.** The runner buckets the pipeline's managed source tables into **sibling groups**. Siblings share a source type and a table name, and they landed in more than one target schema. That is the tenant or region fan-out that gets unioned downstream. Rocky tags each sibling's rows with its source identity and runs:
 

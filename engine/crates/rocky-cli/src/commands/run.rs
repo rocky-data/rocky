@@ -5215,16 +5215,41 @@ pub async fn run(
                     let (source_type, table) = gk;
                     let siblings: Vec<TableRef> =
                         members.iter().map(|(t, _)| t.clone()).collect();
+                    let name = checks::cross_source_overlap_name(source_type, table);
                     let sql = match rocky_core::checks::generate_cross_source_overlap_sql(
                         &siblings, &key_exprs, dialect,
                     ) {
                         Ok(s) => s,
                         Err(e) => {
-                            warn!(source_type, table, error = %e, "cross_source_overlap SQL generation failed — skipping group");
+                            // A check that will not run must stay in the tally.
+                            // Skipping silently let `after_checks` and the JSON
+                            // `check_results` claim a clean group that was never
+                            // evaluated. (The QUERY-error arm below still skips
+                            // by design — that is the keyless-table case.)
+                            warn!(source_type, table, error = %e, "cross_source_overlap SQL generation failed — reporting the check as failed");
+                            let entry = pending_checks
+                                .entry(siblings[0].full_name())
+                                .or_insert_with(|| PendingCheck {
+                                    asset_key: members[0].1.clone(),
+                                    checks: Vec::new(),
+                                });
+                            entry.checks.push(rocky_core::checks::CheckResult {
+                                name,
+                                passed: false,
+                                severity: overlap_cfg.severity,
+                                details:
+                                    rocky_core::checks::CheckDetails::CrossSourceOverlap {
+                                        overlap_count: 0,
+                                        contributing_tables: siblings
+                                            .iter()
+                                            .map(TableRef::full_name)
+                                            .collect(),
+                                        sample: Vec::new(),
+                                    },
+                            });
                             continue;
                         }
                     };
-                    let name = checks::cross_source_overlap_name(source_type, table);
                     match shared_warehouse.execute_query(&sql).await {
                         Ok(result) => {
                             let overlap_count = result.rows.len() as u64;

@@ -174,10 +174,12 @@ pub enum TestType {
     /// be stable across a multi-tenant union), not any stored column.
     ///
     /// `key_expr` is a SQL scalar expression evaluated against the target
-    /// (e.g. `md5(databasename || '-' || id)`). It is passed through
-    /// **verbatim** — the same trusted-config contract as
-    /// [`TestType::Expression`] — so the caller is responsible for sandboxing
-    /// execution.
+    /// (e.g. `md5(databasename || '-' || id)`). Rocky does not parse it — it
+    /// is spliced into the generated query as written, minus one check: SQL
+    /// generation refuses a fragment that is not a single expression (a
+    /// statement terminator `;` outside a string, a quoted identifier or a
+    /// comment, or an unbalanced quote). Nothing bounds what the expression
+    /// may READ; it runs with the project's warehouse credentials.
     ///
     /// Set-based; not quarantinable. Mirrors `Unique`'s NULL handling (NULL
     /// keys are not excluded; use `filter` to scope them out).
@@ -343,8 +345,9 @@ pub struct TestDecl {
     /// to `TRUE` are subject to the assertion — rows where the filter
     /// is `FALSE` or `NULL` pass unconditionally.
     ///
-    /// Filter is user-supplied SQL; the caller is responsible for
-    /// sandboxing execution (same contract as `expression`).
+    /// Filter is user-supplied SQL, spliced in as written (same contract as
+    /// `expression`). SQL generation refuses only a fragment that is not a
+    /// single expression — see [`TestType::UniqueExpr`].
     ///
     /// Example: `filter = "created_at > current_date - interval 30 day"`
     /// restricts a `not_null` check to rows created in the last 30 days.
@@ -585,7 +588,7 @@ fn generate_test_sql_inner(
                 return Err(TestGenError::EmptyKeyExpr);
             }
             // key_expr is user-supplied SQL (same contract as Expression) —
-            // not an identifier, so it's passed through verbatim, wrapped in
+            // not an identifier, so it's spliced in as written, wrapped in
             // parens. NULL handling mirrors `Unique` (no auto-exclusion; use
             // `filter` to scope NULL keys out). The expression is repeated in
             // GROUP BY rather than referencing the `_k` alias because not all
