@@ -1802,8 +1802,17 @@ async fn replay_execute_warehouse_node(
                      case is ignored, and this warehouse treats case as part of object \
                      identity — so whether they name that upstream cannot be decided here. \
                      Redirecting could read the wrong table and not redirecting would read \
-                     production, so neither is safe",
-                    outcome.case_fold_only_refs
+                     production, so neither is safe. {} This replay reads a RECORDED run, so \
+                     editing the model now does not change what was recorded: fix the spelling, \
+                     record a new run, and replay that one",
+                    outcome.case_fold_only_refs,
+                    // The same remedy text the shadow refusal prints, from the
+                    // same function. On a folding dialect the reference is
+                    // normally spelled EXACTLY like the recorded upstream and
+                    // still names another object, so a message that talks only
+                    // about case sends the operator hunting a difference that is
+                    // not there (#1282).
+                    crate::commands::run::case_near_miss_remedy(case_rules)
                 )],
             );
         }

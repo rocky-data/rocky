@@ -51,11 +51,7 @@ fn duckdb_replication_ir(
             table: source_table.into(),
         },
         ColumnSelection::All,
-        vec![MetadataColumn {
-            name: "_loaded_by".into(),
-            data_type: "VARCHAR".into(),
-            value: "NULL".into(),
-        }],
+        vec![MetadataColumn::new("_loaded_by", "VARCHAR", "NULL").unwrap()],
         GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: false,

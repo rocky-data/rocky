@@ -94,6 +94,27 @@ impl DeferTarget {
 /// `case_rules` governs CTE-alias comparison ONLY. The `deferred` lookup itself
 /// stays exact — see the note in `pre_visit_relation`.
 ///
+/// ‼️ There is NO near-miss report on this path and no way to refuse, so the
+/// scope answer is ACTED ON rather than checked — and on a dialect that folds
+/// unquoted identifiers it rests on an assumption. Under Snowflake's DEFAULT
+/// `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE` the stack matches the warehouse
+/// exactly: a quoted lowercase alias does not hide an unquoted reference, so the
+/// reference is a table reference, which `--defer` qualifies to the deferred
+/// model's target because a bare name matching a model name IS that model
+/// (`resolve::classify_table_ref`). Pinned by
+/// `defer_cte_alias_comparison_follows_dialect_identity`.
+///
+/// Under `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` that parameter folds a
+/// DOUBLE-QUOTED identifier to upper case too, so the CTE does bind and this
+/// qualification is wrong — silently, because nothing here can refuse. Clearing
+/// the axis does NOT close that: the same pair is then mis-bound under the
+/// DEFAULT instead, which is what the rules before #1282 did. The change moves
+/// the error from the default configuration to an opt-out one; it does not
+/// create it. Closing it properly needs a three-valued binding — bound, free, or
+/// setting-dependent, refusing the third — or #1281's live probe. Tracked in
+/// #1622; deliberately not built here on an unverified reading of how that
+/// parameter treats a CTE alias.
+///
 /// Unlike [`rewrite_upstream_refs`] this reports no case near-misses, and that
 /// asymmetry is deliberate rather than an omission. That matcher compares a
 /// *spelled qualified reference* against a *configured warehouse target* — two
@@ -1823,6 +1844,98 @@ mod tests {
         .unwrap();
         assert_eq!(out.sql, "SELECT * FROM cat.shadow.orders");
         assert!(out.case_fold_only_refs.is_empty());
+    }
+
+    /// #1282 makes the CTE-scope axis REACHABLE on `--defer`, which
+    /// `defer_cte_alias_comparison_follows_dialect_identity` had only pinned
+    /// latently. This states the delta the flag causes, in one place.
+    ///
+    /// `uniform(true)` — Snowflake's rules before this change — treats a quoted
+    /// lowercase alias as hiding an unquoted reference. Snowflake does not bind
+    /// those two names, so that was Rocky modelling the SQL wrongly.
+    /// `uniform_uppercasing(true)` leaves the reference free, and `--defer`
+    /// qualifies it to the deferred model's target, because a bare name matching
+    /// a model name is that model.
+    #[test]
+    fn snowflake_cte_shadowing_honours_the_quoting_axis() {
+        let deferred = deferred_map(&[("orders", target("cat", "prod", "orders"))]);
+
+        // An unquoted alias folds exactly the way the reference does, so it
+        // still hides it. That is the ordinary shape and it does not change.
+        let unquoted_alias = qualify_deferred_refs(
+            "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
+            &deferred,
+            IdentifierCaseRules::uniform_uppercasing(true),
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
+        assert!(
+            !unquoted_alias.contains("prod"),
+            "an unquoted alias still shadows: {unquoted_alias}"
+        );
+
+        // The delta, both halves side by side.
+        let quoted_alias_sql = "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders";
+        let before = qualify_deferred_refs(
+            quoted_alias_sql,
+            &deferred,
+            IdentifierCaseRules::uniform(true),
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
+        assert!(
+            !before.contains("prod"),
+            "premise: the old rules treated the quoted alias as hiding the reference: {before}"
+        );
+        let after = qualify_deferred_refs(
+            quoted_alias_sql,
+            &deferred,
+            IdentifierCaseRules::uniform_uppercasing(true),
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
+        assert!(
+            after.contains("prod"),
+            "Snowflake does not bind a quoted alias to a bare reference, so the reference is \
+             the deferred model: {after}"
+        );
+    }
+
+    /// The shadow/replay matcher DOES honour the axis in its CTE scope, and it
+    /// can, because it fails closed.
+    ///
+    /// On Snowflake a quoted lowercase CTE alias does not hide an unquoted
+    /// reference — the warehouse does not bind those two names. So the reference
+    /// reaches the matcher. Against an UPPERCASE routed target it resolves onto
+    /// it and routes, which is the fix: before, the CTE was treated as hiding it
+    /// and the read stayed on production while the model wrote its shadow.
+    /// Against a lowercase target it is reported as a near-miss and the caller
+    /// refuses. Neither outcome is silent.
+    #[test]
+    fn shadow_cte_scope_honours_the_quoting_axis_and_fails_closed() {
+        let rules = IdentifierCaseRules::uniform_uppercasing(true);
+        let sql = "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders";
+
+        let upper = renames_map(&[("CAT.RAW.ORDERS", target("CAT", "SHADOW", "ORDERS"))]);
+        let out =
+            rewrite_upstream_refs(sql, &upper, rules, RecursiveCteVisibility::PrecedingAndSelf)
+                .unwrap();
+        assert!(
+            out.sql.contains("CAT.SHADOW.ORDERS"),
+            "the unquoted reference names the routed upstream, so it must route: {}",
+            out.sql
+        );
+
+        let lower = renames_map(&[("cat.raw.orders", target("cat", "shadow", "orders"))]);
+        let out =
+            rewrite_upstream_refs(sql, &lower, rules, RecursiveCteVisibility::PrecedingAndSelf)
+                .unwrap();
+        assert!(out.rewritten_keys.is_empty());
+        assert_eq!(
+            out.case_fold_only_refs,
+            vec!["orders".to_string()],
+            "a near-miss must be reported so the caller refuses, never rewritten silently"
+        );
     }
 
     /// A CTE still shadows a bare name before any of this runs.

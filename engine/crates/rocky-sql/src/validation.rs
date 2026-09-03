@@ -34,6 +34,15 @@ pub enum ValidationError {
     )]
     InvalidGcpProjectId { value: String },
 
+    #[error("SQL type cannot be empty")]
+    EmptySqlType,
+
+    #[error(
+        "invalid SQL type '{value}': must contain only letters, digits, underscores, \
+         spaces, parentheses and commas"
+    )]
+    InvalidSqlType { value: String },
+
     #[error("SQL identifier cannot be empty")]
     EmptyIdentifier,
 
@@ -100,6 +109,44 @@ pub fn validate_gcp_project_id(value: &str) -> Result<&str, ValidationError> {
         });
     }
     Ok(value)
+}
+
+/// Validates a SQL type string for safe interpolation into generated SQL.
+///
+/// A type name is spliced raw into `CAST(<value> AS <type>)` and
+/// `ALTER … TYPE <type>`, so it must not be able to close the cast and add
+/// SQL of its own. The rule is a pure character allowlist: ASCII letters,
+/// digits, `_`, space, `(`, `)` and `,` — enough for `STRING`, `INT`,
+/// `DECIMAL(10,2)` and `DOUBLE PRECISION`, and nothing else.
+///
+/// It is an allowlist, **not** a type grammar. `NOT A TYPE (1,2)` passes:
+/// the warehouse rejects it as a syntax error. What the allowlist buys is
+/// that nothing accepted can carry a quote, a `;`, a comment or an operator
+/// out of the cast.
+///
+/// This is the single owner of the rule. `rocky_core::sql_gen::validate_sql_type`
+/// delegates here and only re-wraps the error, so the check cannot drift
+/// between the two crates. (`rocky-databricks`'s loader keeps a separate,
+/// deliberately looser allowlist that also accepts `<`/`>` for `array<int>`;
+/// that one is not this rule and is out of scope here.)
+///
+/// # Errors
+///
+/// [`ValidationError::EmptySqlType`] for an empty string and
+/// [`ValidationError::InvalidSqlType`] for any character outside the allowlist.
+pub fn validate_sql_type(data_type: &str) -> Result<(), ValidationError> {
+    if data_type.is_empty() {
+        return Err(ValidationError::EmptySqlType);
+    }
+    let valid = data_type
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ' ' | '(' | ')' | ','));
+    if !valid {
+        return Err(ValidationError::InvalidSqlType {
+            value: data_type.to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Validates a principal name for use in GRANT/REVOKE statements.
@@ -463,6 +510,44 @@ mod tests {
         // Injection attempts.
         assert!(validate_gcp_project_id("'; DROP TABLE users; --").is_err());
         assert!(validate_gcp_project_id("project`backtick").is_err());
+    }
+
+    // ----- validate_sql_type -----
+
+    #[test]
+    fn sql_type_accepts_the_shapes_the_engine_emits() {
+        for ty in [
+            "STRING",
+            "INT",
+            "DECIMAL(10,2)",
+            "DOUBLE PRECISION",
+            "varchar",
+            "TIMESTAMP_NTZ",
+        ] {
+            assert!(validate_sql_type(ty).is_ok(), "should accept: {ty}");
+        }
+    }
+
+    #[test]
+    fn sql_type_refuses_empty_and_anything_that_can_close_the_cast() {
+        assert!(matches!(
+            validate_sql_type(""),
+            Err(ValidationError::EmptySqlType)
+        ));
+        for ty in [
+            "VARCHAR) AS x, (SELECT secret FROM creds) AS leak --",
+            "STRING;--",
+            "STRING'",
+            "array<int>",
+        ] {
+            assert!(
+                matches!(
+                    validate_sql_type(ty),
+                    Err(ValidationError::InvalidSqlType { .. })
+                ),
+                "should refuse: {ty}"
+            );
+        }
     }
 
     // ----- reject_statement_terminator -----

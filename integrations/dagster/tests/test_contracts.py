@@ -276,6 +276,83 @@ def test_results_e014_maps_to_column_constraints():
     assert r.passed is False, "an E014 violation must fail the check, not pass silently"
 
 
+def test_results_i003_passes_but_is_listed_as_unverified():
+    """I003 is not a violation, so the check passes — but it must not be hidden.
+
+    The column-constraints check would otherwise claim a declared type was
+    satisfied when Rocky never compared it against anything.
+    """
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=False, has_protected=False, has_column_constraints=True)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[
+                _diag(
+                    "I003",
+                    "orders",
+                    "column 'id' declares type Int64 in the contract, but Rocky could not "
+                    "work out the column's type, so it did not check the declared type",
+                    severity=Severity.info,
+                ),
+            ],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert len(results) == 1
+    r = results[0]
+    assert r.check_name == CONTRACT_COLUMN_CONSTRAINTS_CHECK
+    assert r.passed is True, "an unchecked type is not a violation"
+    assert r.metadata["rocky/unverified_count"].value == 1
+    assert "I003" in r.metadata["rocky/unverified_0"].value
+    assert "rocky/violation_count" not in r.metadata
+
+
+def test_results_i003_rides_along_with_a_real_violation():
+    """A failing check keeps its violations and still lists the unchecked ones."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=False, has_protected=False, has_column_constraints=True)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[
+                _diag("E011", "orders", "column 'amount' type mismatch"),
+                _diag("I003", "orders", "column 'id' ...", severity=Severity.info),
+            ],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    r = results[0]
+    assert r.passed is False
+    assert r.metadata["rocky/violation_count"].value == 1
+    assert r.metadata["rocky/unverified_count"].value == 1
+
+
+def test_results_pass_with_no_unverified_metadata_when_nothing_is_unchecked():
+    """A clean check carries no `rocky/unverified_*` keys at all."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=False, has_protected=False, has_column_constraints=True)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    r = results[0]
+    assert r.passed is True
+    assert not any(k.startswith("rocky/unverified") for k in r.metadata)
+
+
 def test_results_e011_e012_map_to_column_constraints():
     """E011 (type mismatch) and E012 (nullability) → contract_column_constraints fails."""
     asset_key = dg.AssetKey(["orders"])

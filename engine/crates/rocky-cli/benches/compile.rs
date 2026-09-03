@@ -352,11 +352,7 @@ fn bench_sql_generation(c: &mut Criterion) {
                         table: format!("table_{i}"),
                     },
                     ColumnSelection::All,
-                    vec![MetadataColumn {
-                        name: "_loaded_by".into(),
-                        data_type: "VARCHAR".into(),
-                        value: "NULL".into(),
-                    }],
+                    vec![MetadataColumn::new("_loaded_by", "VARCHAR", "NULL").unwrap()],
                     GovernanceConfig {
                         permissions_file: None,
                         auto_create_catalogs: false,

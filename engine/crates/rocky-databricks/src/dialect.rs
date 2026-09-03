@@ -127,15 +127,25 @@ impl SqlDialect for DatabricksSqlDialect {
         }
 
         for mc in metadata {
-            validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
+            validation::validate_identifier(mc.name()).map_err(AdapterError::new)?;
             // `data_type` is interpolated raw into the CAST — validate it as a
             // SQL type (the same guard the drift path uses) so a hostile
             // `rocky.toml` metadata `type` can't break out of the cast.
-            rocky_core::sql_gen::validate_sql_type(&mc.data_type).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(mc.data_type()).map_err(AdapterError::new)?;
+            // `value` is an SQL expression, not an identifier, and it is NOT
+            // trusted: `rocky-cli` substitutes `{placeholder}`s in it from source
+            // schema names read back from the warehouse.
+            // `rocky_ir::MetadataColumn::new` is the boundary that guards it;
+            // this repeats the scan because `new_unchecked` and any future
+            // construction path must not reach a raw splice.
+            validation::reject_statement_terminator("metadata_columns[].value", mc.value())
+                .map_err(AdapterError::new)?;
             write!(
                 sql,
                 ", CAST({} AS {}) AS {}",
-                mc.value, mc.data_type, mc.name
+                mc.value(),
+                mc.data_type(),
+                mc.name()
             )
             .unwrap();
         }
@@ -460,17 +470,43 @@ mod tests {
         assert_eq!(sql, "SELECT *");
     }
 
+    /// #1594: `value` is spliced raw into the CAST alongside `name` and
+    /// `data_type`. The IR boundary (`rocky_ir::MetadataColumn::new`) refuses
+    /// this input, so `new_unchecked` is the only way to build it — which is
+    /// exactly what makes this a test of THIS dialect's own scan rather than
+    /// of the constructor. Both the serde path and any future construction
+    /// site land here.
+    #[test]
+    fn select_clause_rejects_a_hostile_metadata_value() {
+        let d = dialect();
+        // Ends Rocky's statement and starts another.
+        let terminator = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "STRING",
+            "NULL) AS x; SELECT 1 --",
+        )];
+        assert!(d.select_clause(&ColumnSelection::All, &terminator).is_err());
+
+        // Unbalanced quote: pairs its quotes across the rest of the SELECT.
+        let unbalanced = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "STRING",
+            "'o'brien'",
+        )];
+        assert!(d.select_clause(&ColumnSelection::All, &unbalanced).is_err());
+
+        // The benign expression still renders.
+        let ok = vec![MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()];
+        assert!(d.select_clause(&ColumnSelection::All, &ok).is_ok());
+    }
+
     #[test]
     fn test_select_clause_with_metadata() {
         let d = dialect();
         let sql = d
             .select_clause(
                 &ColumnSelection::All,
-                &[MetadataColumn {
-                    name: "_loaded_by".into(),
-                    data_type: "STRING".into(),
-                    value: "NULL".into(),
-                }],
+                &[MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()],
             )
             .unwrap();
         assert_eq!(sql, "SELECT *, CAST(NULL AS STRING) AS _loaded_by");

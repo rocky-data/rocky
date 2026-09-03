@@ -3008,6 +3008,67 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
         .map(|(name, _)| *name)
 }
 
+/// How long process exit waits for blocking-pool work that is still running.
+///
+/// Dropping a `tokio` runtime waits — with no bound — for every `spawn_blocking`
+/// task that has already started. That wait is invisible while a command runs to
+/// completion, because nothing is in flight by then. It is reachable whenever a
+/// future is dropped mid-statement, which is exactly what `rocky run --watch`
+/// does when a signal lands during an iteration: the watch loop's `select!`
+/// drops the iteration, `main` returns, and the process then sat waiting for the
+/// abandoned statement after the operator pressed Ctrl-C (#1590).
+///
+/// # What this bounds, and what it does not
+///
+/// Only the **blocking pool**. Runtime shutdown drops async tasks immediately,
+/// with or without this timeout, so nothing changes for the adapters that await
+/// an async client — Databricks, Snowflake, BigQuery, Trino — or for the
+/// content-addressed S3 path. Those were already abandoned the instant the
+/// future was dropped.
+///
+/// The blocking pool carries two different kinds of work, and the timeout
+/// cannot tell them apart:
+///
+/// - **Warehouse statements.** The DuckDB adapter runs every statement in
+///   `spawn_blocking`. Each of those closures issues one statement, so cutting
+///   one is the same as a crash during it and the WAL covers it. The one
+///   closure that used to issue several — the loader's truncate-then-load — is
+///   now a single explicit transaction for this reason
+///   (`rocky-duckdb/src/loader.rs`).
+/// - **State-ledger commits.** Deferred watermarks, table-progress checkpoints
+///   and source markers are all handed to `spawn_blocking` so the redb fsync
+///   does not stall the async task (`rocky-cli/src/commands/run.rs`).
+///
+/// The second kind is the known cost of this timeout, and it is deliberate
+/// rather than overlooked. A redb batch is atomic, so a cut commit cannot tear
+/// the ledger — but it can leave it *logically stale*. If a replication table's
+/// rows committed in the warehouse and its watermark commit is then cut, the
+/// next run re-reads from the old watermark and appends the same delta twice.
+/// The unbounded drop this replaces would let that commit finish, at the price
+/// of the hang it also produces. Removing the trade-off needs a cancellation
+/// protocol that separates "stop starting warehouse work" from "settle the
+/// state tail", which a process-wide timer cannot express — tracked in #1606.
+///
+/// # Why five seconds
+///
+/// `shutdown_timeout` is strictly the bounded form of what the drop already
+/// does, so this can only make an exit faster; there is no slower path to
+/// regress. The number trades two things off:
+///
+/// - **Long enough** that work about to land still lands. A redb commit is
+///   normally milliseconds; five seconds is three orders of magnitude of
+///   headroom, which is what keeps the staleness above rare rather than
+///   routine.
+/// - **Short enough** that the operator is not stuck. Once `main` returns there
+///   is no escape hatch: `tokio`'s signal handler is still installed
+///   process-wide, so a second Ctrl-C during this window does nothing and only
+///   SIGKILL would work.
+///
+/// Five seconds is a deliberate budget, not a default — well clear of a local
+/// commit, and well inside the patience of someone who has already asked rocky
+/// to stop.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn main() -> Result<()> {
     // Must run before `Cli::parse()`: clap emits `--help` / `--version`
     // through `println!`, which panics on EPIPE if SIGPIPE is ignored.
@@ -3030,7 +3091,24 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-    runtime.block_on(run_async(cli, json))
+
+    // Bound the shutdown wait — see `RUNTIME_SHUTDOWN_GRACE`.
+    //
+    // `shutdown_timeout` consumes the runtime, so it cannot be reached by a
+    // `?` or a panic escaping `block_on`. `catch_unwind` keeps the two ordered
+    // on every exit path: the payload is re-raised unchanged afterwards, so the
+    // panic message, the hook and the exit status are all what they were. In
+    // the release profile `panic = "abort"` means the `Err` arm is never taken;
+    // it is the debug binary `install-dev.sh` builds by default, and `cargo
+    // test`, that unwind.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(run_async(cli, json))
+    }));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Install the process-level rustls [`CryptoProvider`] before any TLS.

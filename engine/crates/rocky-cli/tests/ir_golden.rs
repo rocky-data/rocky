@@ -413,11 +413,7 @@ fn build_02_replication_incremental() -> ModelIr {
             Arc::from("payload"),
             Arc::from("_synced_at"),
         ]),
-        vec![MetadataColumn {
-            name: "_loaded_by".into(),
-            data_type: "STRING".into(),
-            value: "'rocky'".into(),
-        }],
+        vec![MetadataColumn::new("_loaded_by", "STRING", "'rocky'").unwrap()],
         baseline_governance(),
     );
     ir.name = Arc::from("events");

@@ -343,9 +343,12 @@ fn bench_dag(iterations: usize) -> Vec<BenchResult> {
     results
 }
 
-fn bench_sql_gen(iterations: usize) -> Vec<BenchResult> {
+fn bench_sql_gen(iterations: usize) -> Result<Vec<BenchResult>> {
     let dialect = DuckDbSqlDialect;
     let mut results = Vec::new();
+
+    let metadata_column = MetadataColumn::new("_loaded_by", "VARCHAR", "NULL")
+        .context("benchmark metadata column")?;
 
     for size in [10, 100, 500, 1000, 5000, 10000] {
         let model_irs: Vec<_> = (0..size)
@@ -363,11 +366,7 @@ fn bench_sql_gen(iterations: usize) -> Vec<BenchResult> {
                         table: format!("table_{i}"),
                     },
                     ColumnSelection::All,
-                    vec![MetadataColumn {
-                        name: "_loaded_by".into(),
-                        data_type: "VARCHAR".into(),
-                        value: "NULL".into(),
-                    }],
+                    vec![metadata_column.clone()],
                     GovernanceConfig {
                         permissions_file: None,
                         auto_create_catalogs: false,
@@ -392,7 +391,7 @@ fn bench_sql_gen(iterations: usize) -> Vec<BenchResult> {
         ));
     }
 
-    results
+    Ok(results)
 }
 
 fn bench_startup(iterations: usize) -> Vec<BenchResult> {
@@ -435,7 +434,7 @@ pub fn run_bench(
         match *g {
             "compile" => results.extend(bench_compile(model_count, iterations)),
             "dag" => results.extend(bench_dag(iterations)),
-            "sql_gen" => results.extend(bench_sql_gen(iterations)),
+            "sql_gen" => results.extend(bench_sql_gen(iterations)?),
             "startup" => results.extend(bench_startup(iterations)),
             other => anyhow::bail!("unknown benchmark group: {other}"),
         }

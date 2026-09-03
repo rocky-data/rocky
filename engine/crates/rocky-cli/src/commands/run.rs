@@ -1432,6 +1432,16 @@ fn require_resume_progress(
 /// touch the catalog. Classifying a bypassed template recorded a fact that
 /// did not hold and refused a resume over an edit that moved nothing.
 ///
+/// The same predicate decides whether `schema_template` itself is recorded
+/// (#1592). A template the resolver never reads is not part of this run's
+/// routing, and editing it between two `--branch branch__feature` runs
+/// refused the later resume for a difference that changed nothing. Eliding
+/// it is not fail-open, because [`ResumeShadow::Schema`] above already
+/// records the override — the physical schema every table task is keyed by
+/// (`table_key` is `{target_catalog}.{target_schema}.{target_table_name}`,
+/// and `target_schema` is the override verbatim). `catalog_template` stays
+/// recorded on every path: the override does not replace it.
+///
 /// **The separator must be target-only.** `[target] separator` is: it
 /// moves rendered target names and nothing else. The source pattern's is
 /// not, and `separator` falls back to it when the target pins none.
@@ -1448,6 +1458,7 @@ fn require_resume_progress(
 /// [`SchemaPattern::separator_joins_a_placeholder`]: rocky_core::schema::SchemaPattern::separator_joins_a_placeholder
 /// [`SchemaPattern::parse`]: rocky_core::schema::SchemaPattern::parse
 /// [`ResumeSeparator::Unused`]: rocky_core::state::ResumeSeparator::Unused
+/// [`ResumeShadow::Schema`]: rocky_core::state::ResumeShadow::Schema
 fn replication_resume_scope(
     pipeline_name: &str,
     target: &rocky_core::config::PipelineTargetConfig,
@@ -1494,7 +1505,16 @@ fn replication_resume_scope(
         target: Some(ResumeTarget {
             adapter: target.adapter.clone(),
             catalog_template: target.catalog_template.clone(),
-            schema_template: target.schema_template.clone(),
+            // Recorded only when this run renders it — the same predicate,
+            // and the same reading of it, that decided the separator above
+            // (#1592). Under a schema override the resolver takes the
+            // override string and never reads the template, so a difference
+            // here moves no name. `ResumeShadow::Schema` above carries the
+            // override, which is what keeps the elision from being
+            // fail-open: it pins the physical schema every table is keyed
+            // by. `catalog_template` is NOT elided — the override does not
+            // replace it.
+            schema_template: renders_schema_template.then(|| target.schema_template.clone()),
             separator_role: Some(separator_role),
             endpoint: target_adapter.endpoint_identity(),
             shadow,
@@ -3114,6 +3134,15 @@ pub async fn run(
             }
             let empty = std::collections::HashSet::new();
             let source_tables = source_tables_by_schema.get(&conn.schema).unwrap_or(&empty);
+            // Refusing a `metadata_columns` value must land here, not at
+            // collection: the setup loop below creates catalogs and schemas,
+            // sets tags, binds workspaces and applies grants, so a refusal
+            // during collection would abort only after changing access
+            // control. Resolved once per connector, lazily — the first table
+            // that survives the SAME skip conditions the collection loop uses,
+            // so a connector whose tables are all filtered, missing or
+            // disabled is not refused for a value `run` never renders.
+            let mut metadata_preflighted = false;
             let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
             let target_schema = if let Some(cfg) = shadow_config {
                 cfg.schema_override
@@ -3140,6 +3169,15 @@ pub async fn run(
                     == Some(false)
                 {
                     continue;
+                }
+                if !metadata_preflighted {
+                    rocky_core::schema::resolve_metadata_columns(
+                        &parsed,
+                        &pipeline.metadata_columns,
+                        &pattern.separator,
+                    )
+                    .with_context(|| format!("source schema '{}'", conn.schema))?;
+                    metadata_preflighted = true;
                 }
                 let target_table_name = if let Some(cfg) = shadow_config {
                     if cfg.schema_override.is_none() {
@@ -3656,6 +3694,18 @@ pub async fn run(
                 }
                 claimed_targets.insert(target_identity, this_source);
 
+                // The single producer `rocky plan` also uses, so the preview
+                // and the run cannot disagree. It substitutes the
+                // warehouse-derived schema components, checks each one is a
+                // plain identifier, and validates the resolved triple.
+                let metadata_columns: Vec<MetadataColumn> =
+                    rocky_core::schema::resolve_metadata_columns(
+                        &parsed,
+                        &pipeline.metadata_columns,
+                        &pattern.separator,
+                    )
+                    .with_context(|| format!("source schema '{}'", conn.schema))?;
+
                 tables_to_process.push(TableTask {
                     source_catalog: source_catalog.clone(),
                     source_schema: conn.schema.clone(),
@@ -3697,15 +3747,7 @@ pub async fn run(
                         .iter()
                         .map(|mc| mc.name.clone())
                         .collect(),
-                    metadata_columns: pipeline
-                        .metadata_columns
-                        .iter()
-                        .map(|mc| MetadataColumn {
-                            name: mc.name.clone(),
-                            data_type: mc.data_type.clone(),
-                            value: parsed.resolve_template(&mc.value, &pattern.separator),
-                        })
-                        .collect(),
+                    metadata_columns,
                     governance_tags: governance.build_tags(&components),
                     // Populated later by batch pre-fetch phase
                     prefetched_source_cols: None,
@@ -6466,6 +6508,20 @@ fn apply_defer_rewrite(
     // Governs CTE-alias comparison inside the rewrite, not the `deferred`
     // lookup (which is by exact model name). Same dialect table the shadow path
     // uses, deliberately shared rather than copied.
+    //
+    // ‼️ #1282 makes one thing reachable here that was latent before. These rules
+    // reach `qualify_deferred_refs` ONLY as the CTE-shadowing question, and on
+    // Snowflake that question now gets the answer the warehouse gives UNDER ITS
+    // DEFAULT `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`: a quoted lowercase alias
+    // does not hide an unquoted reference, because Snowflake does not bind those
+    // either. The reference is then a table reference, and `--defer` qualifies it
+    // to the deferred model's target — a bare name matching a model name IS that
+    // model (`resolve::classify_table_ref`).
+    //
+    // Read that scope narrowly: there is no near-miss to report on this path and
+    // therefore no refusal, so the answer is acted on rather than checked. The
+    // note on `qualify_deferred_refs` says what is still assumed and what it
+    // costs.
     let case_rules = dialect_case_rules(dialect)?;
     let recursive_visibility = dialect_recursive_cte_visibility(dialect);
 
@@ -6519,7 +6575,11 @@ fn apply_defer_rewrite(
 /// ‼️ Keep this function's dialect arms in step with [`dialect_case_rules`].
 /// Both are called on the `--defer` and shadow paths, so a dialect added to one
 /// and not the other turns a supported warehouse into a hard refusal on a path
-/// nobody was thinking about.
+/// nobody was thinking about. "In step" means the same SET of dialect names, not
+/// the same grouping: `dialect_case_rules` splits `snowflake` out from
+/// `bigquery` because Snowflake also folds UNQUOTED identifiers, while this
+/// function groups `snowflake` with `trino` because both render double quotes.
+/// Those two groupings answer different questions and are meant to disagree.
 fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
@@ -6663,31 +6723,46 @@ pub(crate) fn dialect_case_rules(
         // therefore do not collide. That question is deliberately NOT asked here:
         // `apply_shadow_rewrite` answers it with its own always-folding
         // `collision_identity`. Do not reuse this function for it.
-        // ‼️ Snowflake has a SECOND identity axis this deliberately does not
-        // model yet: it resolves an UNQUOTED identifier by upper-casing it,
-        // while Rocky renders its targets QUOTED. So a configured target
-        // `orders` is the object `orders`, which an unquoted `FROM orders` does
-        // NOT name — it names `ORDERS`. Matching on spelled text therefore
-        // rewrites a read of one object to the replacement for another.
+        "bigquery" => Ok(uniform(true)),
+        // Snowflake carries a SECOND identity axis on top of case: it resolves
+        // an UNQUOTED identifier by upper-casing it, while
+        // `SnowflakeSqlDialect::format_table_ref` renders every component of a
+        // target QUOTED. So a configured target `orders` is the object
+        // `orders`, which an unquoted `FROM orders` does NOT name — that names
+        // `ORDERS`. Matching on spelled text alone therefore rewrote a read of
+        // one object to the replacement registered for another (#1282).
         //
-        // `IdentifierCaseRules::uniform_uppercasing` implements and tests that
-        // resolution (see `defer.rs`'s
-        // `snowflake_resolves_unquoted_identifiers_before_matching`), and
-        // enabling it here is a one-line change. It is NOT enabled because doing
-        // so refuses any lowercase-configured Snowflake project, and while the
-        // reasoning says such a project could not read its upstream in
-        // production either, that conclusion has not been verified against a
-        // live Snowflake account.
+        // `uniform_uppercasing` resolves the reference the way Snowflake
+        // resolves it before matching, so such a read becomes a reported
+        // near-miss and the caller refuses. The idiomatic uppercase-target
+        // project is unaffected: an unquoted reference resolves onto an
+        // uppercase target and routes exactly as before. See `defer.rs`'s
+        // `snowflake_resolves_unquoted_identifiers_before_matching` for the
+        // full matrix.
         //
-        // The in-repo blast radius is one test fixture, not the examples: the
-        // only Snowflake POC (`05-orchestration/08-circuit-breaker`) is
-        // uppercase throughout (`catalog = "ANALYTICS"`), so it is unaffected.
-        // Do not read this deferral as "it would break our own examples". Shipping it
-        // untested would trade a known, pre-existing and unchanged hazard for an
-        // unmeasured break. Tracked as #1282; #1281 would settle it exactly.
+        // What this refuses that it did not refuse before: a lowercase or
+        // mixed-case configured target read through an UNQUOTED reference. On
+        // an account with the default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`
+        // that project cannot read its upstream on a plain run either — Rocky
+        // created `"main"."orders"` and the model asks for `MAIN.ORDERS` — so
+        // the refusal replaces a silent wrong read on a shape that is already
+        // broken. On an account that sets that parameter to TRUE the read does
+        // resolve today and is now refused; that parameter is connection state
+        // Rocky cannot observe (#1281 tracks reading it), and the refusal names
+        // both remedies. The remedy is trivial either way: quote the reference
+        // so it spells the target exactly, or spell the target in upper case.
         //
-        // Unchanged from the behaviour on `main`, which also matched on text.
-        "bigquery" | "snowflake" => Ok(uniform(true)),
+        // The only in-repo Snowflake project
+        // (`examples/playground/pocs/07-adapters/01-snowflake-dynamic-table`)
+        // is uppercase throughout — `catalog = "ANALYTICS"`, `schema = "MARTS"`
+        // and `FROM RAW__ORDERS.ORDERS` — so it is unaffected.
+        //
+        // ‼️ This arm differs in SHAPE from the `bigquery` one above on purpose:
+        // BigQuery is case-sensitive but does not fold unquoted identifiers, so
+        // it takes `uniform`. Do not "tidy" the two back into one arm.
+        "snowflake" => Ok(rocky_sql::defer::IdentifierCaseRules::uniform_uppercasing(
+            true,
+        )),
         other => anyhow::bail!(
             "shadow/branch execution does not know whether '{other}' treats identifier case as \
              part of object identity, so it cannot tell whether two targets differing only by \
@@ -6695,6 +6770,41 @@ pub(crate) fn dialect_case_rules(
              `dialect_case_rules` after checking how it folds identifiers"
         ),
     }
+}
+
+/// What to tell an operator whose reference matched a routed upstream only when
+/// identifier case was ignored.
+///
+/// Shared by the shadow and the replay refusal so the two cannot drift, and
+/// keyed on the dialect's own rules because the right advice differs.
+///
+/// On a dialect that folds UNQUOTED identifiers the generic "spell the reference
+/// exactly as the configured target" line is not merely incomplete, it is wrong:
+/// the reference in such a near-miss is normally spelled EXACTLY like the target
+/// and still names a different object, because `format_table_ref` created the
+/// target quoted while the model wrote the reference bare. An operator following
+/// the generic advice would compare two identical strings and conclude Rocky was
+/// broken (#1282).
+pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules) -> &'static str {
+    if rules.unquoted_uppercases {
+        return "On this warehouse an UNQUOTED identifier resolves UPPER-CASED, so \
+                `main.orders` names `MAIN.ORDERS` while Rocky creates a configured target \
+                `main.orders` quoted, as `\"main\".\"orders\"` — two different objects with \
+                identical text. Make the reference name the object the target is, per component: \
+                either quote EVERY component of the reference so it spells the target exactly \
+                (`\"main\".\"orders\"`), or leave every component unquoted AND spell the \
+                configured target in upper case (`MAIN.ORDERS`), so the reference resolves onto \
+                it. A half-quoted reference such as `\"main\".orders` needs both — its quoted \
+                part must match the target's spelling and its unquoted part must be upper case in \
+                the target. Where a component is a reserved word (`ORDER`, `SELECT`, …) only the \
+                quoting remedy is available: such a name cannot be read unquoted at all. An \
+                account that sets QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE, or a \
+                catalog-linked database with CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE, makes \
+                the two one object — but Rocky cannot read either setting (#1281), so the \
+                spelling still has to be unambiguous without them";
+    }
+    "Spell the reference exactly as the upstream's configured target, or rename one so they \
+     differ by more than case (#1281 tracks reading the live setting instead of assuming it)"
 }
 
 /// Route the models built by this invocation and their in-run dependency reads
@@ -7087,6 +7197,15 @@ fn apply_shadow_rewrite(
             // reads a table the model never named, while leaving it reads
             // PRODUCTION while this model writes its shadow — an isolation break
             // that exits 0 and then shows up as a clean `rocky compare`. Refuse.
+            //
+            // On a dialect that folds UNQUOTED identifiers the near-miss is
+            // usually not a spelling difference at all: the reference is spelled
+            // exactly like the configured target and STILL names a different
+            // object, because Rocky created the target quoted and the model
+            // wrote the reference bare. "Spell it the same" is useless advice
+            // there, so the message names quoting explicitly and gives both
+            // remedies — an operator must not have to read this file to learn
+            // what to change (#1282).
             anyhow::ensure!(
                 outcome.case_fold_only_refs.is_empty(),
                 "shadow mode cannot tell whether upstream reference(s) {:?} in model '{}' name a \
@@ -7094,11 +7213,10 @@ fn apply_shadow_rewrite(
                  whether case separates two objects depends on connection state Rocky cannot \
                  observe (a Snowflake account may set QUOTED_IDENTIFIERS_IGNORE_CASE, a BigQuery \
                  dataset may be is_case_insensitive). Redirecting could read the wrong table and \
-                 not redirecting would read production, so neither is safe. Spell the reference \
-                 exactly as the upstream's configured target, or rename one so they differ by \
-                 more than case (#1281 tracks reading the live setting instead of assuming it)",
+                 not redirecting would read production, so neither is safe. {}",
                 outcome.case_fold_only_refs,
-                model.config.name
+                model.config.name,
+                case_near_miss_remedy(case_rules)
             );
             // Every reference actually redirected is now a read of a table
             // THIS run produces, so it is a real dependency regardless of what
@@ -8663,7 +8781,7 @@ pub(crate) async fn execute_models(
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                );
+                )?;
                 match gate
                     .evaluate(model, &typed_ir, warehouse, state_store)
                     .await
@@ -8944,7 +9062,7 @@ pub(crate) async fn execute_models(
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                );
+                )?;
                 if let ColumnSkipOutcome::Skip {
                     prior_output_column_hashes,
                     prior_blake3,
@@ -9041,7 +9159,7 @@ pub(crate) async fn execute_models(
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                );
+                )?;
                 let model_started_at = Utc::now();
                 let target_table_full_name = format!(
                     "{}.{}.{}",
@@ -10284,7 +10402,7 @@ fn typed_model_ir(
     typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
     surrogate_keys: &HashMap<String, Vec<rocky_core::models::SurrogateKeySpec>>,
     dialect: &dyn rocky_core::traits::SqlDialect,
-) -> rocky_ir::ModelIr {
+) -> Result<rocky_ir::ModelIr> {
     let mut ir = model.to_model_ir();
     if let Some(cols) = typed_models.get(&model.config.name) {
         ir.typed_columns = cols.clone();
@@ -10293,9 +10411,9 @@ fn typed_model_ir(
     // declared surrogate key: a model that *gains* a key changes its IR and
     // re-materializes instead of being skipped as unchanged.
     if let Some(specs) = surrogate_keys.get(&model.config.name) {
-        rocky_core::models::apply_surrogate_keys(&mut ir, specs, dialect);
+        rocky_core::models::apply_surrogate_keys(&mut ir, specs, dialect)?;
     }
-    ir
+    Ok(ir)
 }
 
 /// Execute exactly one "plain" single-statement transformation model:
@@ -10338,7 +10456,7 @@ async fn execute_one_plain_model(
     // replication-only metadata-column path), so the wrap is what surfaces the
     // computed column into the CTAS / merge-source schema.
     if let Some(specs) = exec_ctx.surrogate_keys.get(model_name) {
-        rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect);
+        rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect)?;
     }
     let target_ref = dialect
         .format_table_ref(
@@ -11192,7 +11310,7 @@ fn resolve_merge_update_columns(
         .map(|c| Arc::from(c.name.as_str()))
         .collect();
     for m in metadata_columns {
-        cols.push(Arc::from(m.name.as_str()));
+        cols.push(Arc::from(m.name()));
     }
     MaterializationStrategy::Merge {
         unique_key: unique_key.clone(),
@@ -12463,7 +12581,8 @@ mod tests {
             target: Some(ResumeTarget {
                 adapter: "default".to_string(),
                 catalog_template: "wh".to_string(),
-                schema_template: format!("staging_{pipeline}__{{source}}"),
+                // `shadow: None`, so the run renders the template (#1592).
+                schema_template: Some(format!("staging_{pipeline}__{{source}}")),
                 // `{source}` is single-valued, so no separator joins it.
                 separator_role: Some(rocky_core::state::ResumeSeparator::Unused),
                 endpoint: rocky_core::config::EndpointIdentity {
@@ -12650,7 +12769,10 @@ token = "dapi-SECRET"
                 "target": {
                     "adapter": "default",
                     "catalog_template": "wh",
-                    "schema_template": "staging__{regions}",
+                    // The branch override supplies the schema, so the
+                    // template this run never renders is not recorded
+                    // (#1592). The catalog template is, on every path.
+                    "schema_template": null,
                     "separator_role": { "joins": "__" },
                     "endpoint": {
                         "adapter_type": "databricks",
@@ -12668,7 +12790,7 @@ token = "dapi-SECRET"
         assert_eq!(
             scope.to_string(),
             format!(
-                "pipeline 'p1', filter 'client=acme', target default:wh.staging__{{regions}} \
+                "pipeline 'p1', filter 'client=acme', target default:wh.<overridden> \
                  separator(__) endpoint(databricks host=https://adb-1.azuredatabricks.net \
                  host_route_digest={DATABRICKS_ROUTE_DIGEST} \
                  http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature)"
@@ -12748,6 +12870,26 @@ token = "dapi-SECRET"
             serde_json::Value::Null
         );
         assert_ne!(plain, shadowed);
+        // The recorded half of #1592, pinned on the same `[target]` block
+        // the override elided it from: with no override the run renders the
+        // template, so its exact text rides in the blob. A `--shadow`
+        // suffix does not replace the schema either, so it records it too.
+        for (label, scope) in [("no override", &plain), ("suffix shadow", &shadowed)] {
+            assert_eq!(
+                serde_json::to_value(scope).unwrap()["target"]["schema_template"],
+                serde_json::json!("staging__{regions}"),
+                "{label} renders the schema template"
+            );
+            assert!(
+                scope.to_string().contains("wh.staging__{regions} "),
+                "{label} must name the template it renders: {scope}"
+            );
+        }
+        assert_ne!(
+            plain.target.as_ref().unwrap().schema_template,
+            scope.target.as_ref().unwrap().schema_template,
+            "the override case records no template at all"
+        );
 
         // The delimiter-injection pair: an `http_path` spelled to close the
         // old `endpoint(...)` text and open a `shadow(schema=x)` of its own
@@ -12759,11 +12901,17 @@ token = "dapi-SECRET"
         // instead and the collision would not be exercised. The variadic
         // placeholder therefore sits in the CATALOG template, which an
         // override does not replace: both sides classify as `joins` (#1586).
+        //
+        // The schema template is spelled `<overridden>` for the same
+        // reason: that is what the message shows for the elided template
+        // (#1592), and nothing stops a config from spelling it literally.
+        // The sentinel is forgeable exactly like the delimiters — which is
+        // the point. Only the structured comparison tells the two apart.
         let injection_target: PipelineTargetConfig = toml::from_str(
             r#"
 adapter = "default"
 catalog_template = "wh__{regions}"
-schema_template = "staging__{regions}"
+schema_template = "<overridden>"
 "#,
         )
         .unwrap();
@@ -12808,7 +12956,18 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         );
         assert_ne!(
             forged, genuine,
-            "the structured scopes must not: shadow and endpoint are separate fields"
+            "the structured scopes must not: shadow, endpoint and the \
+             schema template are separate fields"
+        );
+        assert_eq!(
+            genuine.target.as_ref().unwrap().schema_template,
+            None,
+            "the override elides the template it bypasses"
+        );
+        assert_eq!(
+            forged.target.as_ref().unwrap().schema_template,
+            Some("<overridden>".to_string()),
+            "the forged side records the template it really renders"
         );
 
         // The endpoint is the data location, not the alias: the same
@@ -13057,13 +13216,18 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
     /// exactly like this invocation's but differs field-wise is another
     /// scope. `--resume <id>` refuses it and `--resume-latest` never
     /// selects it — the comparison is structural at both seams.
+    ///
+    /// The template is spelled `<overridden>` because that is what the
+    /// message shows where an override elided one (#1592), and a config can
+    /// spell it literally. Forging it is exactly as easy as forging the
+    /// `endpoint(...)` delimiters, and just as ineffective.
     #[test]
     fn resume_refuses_a_checkpoint_whose_scope_only_renders_the_same() {
         use rocky_core::config::{AdapterConfig, PipelineTargetConfig};
         use rocky_core::shadow::ShadowConfig;
 
         let target: PipelineTargetConfig = toml::from_str(
-            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"staging\"\n",
+            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"<overridden>\"\n",
         )
         .unwrap();
         let injected: AdapterConfig = toml::from_str(
@@ -13547,6 +13711,138 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         );
     }
 
+    /// The template itself, not just the separator that joins it (#1592).
+    ///
+    /// A `--shadow --shadow-schema` or `--branch` override supplies the
+    /// target schema name outright, so the resolver never reads
+    /// `schema_template` — the two `schema_override.clone().unwrap_or_else(..)`
+    /// sites in this file take the override and never call the closure.
+    /// Editing the template between two `--branch branch__feature` runs
+    /// therefore refused the later resume over a difference that moved
+    /// nothing.
+    ///
+    /// Why eliding it is not fail-open, which is the question that matters:
+    /// a resume skips a table by its `table_key`
+    /// (`{target_catalog}.{target_schema}.{target_table_name}`), and under
+    /// an override `target_schema` is the override string verbatim.
+    /// [`ResumeShadow::Schema`] records that string, so the physical schema
+    /// is pinned whatever the template says. Two scopes that differ only in
+    /// `schema_template` really do write the same objects. With no
+    /// override the template IS the schema, and a change to it still
+    /// refuses — the second half of this test.
+    ///
+    /// [`ResumeShadow::Schema`]: rocky_core::state::ResumeShadow::Schema
+    #[test]
+    fn resume_survives_a_schema_template_change_an_override_bypasses() {
+        use rocky_core::config::PipelineTargetConfig;
+        use rocky_core::shadow::ShadowConfig;
+
+        let branch = ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__feature".to_string()),
+            cleanup_after: false,
+        };
+        let adapter = test_duckdb_adapter(None);
+        let pattern = test_schema_pattern();
+        // Both fixtures pin the SAME `[target] separator` and a catalog
+        // template with no placeholder, so `separator_role` classifies as
+        // `Unused` on both sides. `schema_template` is then the only field
+        // that moves — otherwise the case would pass for the wrong reason.
+        let target = |schema_template: &str| -> PipelineTargetConfig {
+            toml::from_str(&format!(
+                "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"{schema_template}\"\nseparator = \"--\"\n"
+            ))
+            .unwrap()
+        };
+        let scope = |target: &PipelineTargetConfig, shadow: Option<&ShadowConfig>| -> ResumeScope {
+            replication_resume_scope(
+                "p1",
+                target,
+                &adapter,
+                None,
+                shadow,
+                target.separator.as_deref().unwrap_or(&pattern.separator),
+                &pattern,
+            )
+        };
+        // A source schema whose `regions` binds TWO values, so a template
+        // edit that could move a name would show.
+        let parsed = pattern
+            .parse("src__acme__us_west__us_central__shopify")
+            .unwrap();
+        assert_ne!(
+            parsed.resolve_template("raw__{regions}", "--"),
+            parsed.resolve_template("staging__{regions}", "--"),
+            "the two templates really would resolve different schemas"
+        );
+
+        let written = scope(&target("raw__{regions}"), Some(&branch));
+        let edited = scope(&target("staging__{regions}"), Some(&branch));
+        assert_eq!(
+            serde_json::to_value(&written).unwrap()["target"]["schema_template"],
+            serde_json::Value::Null,
+            "a bypassed template is not recorded"
+        );
+        assert_eq!(
+            written, edited,
+            "an edit the override bypasses moves no name"
+        );
+        // Why skipping stays correct: every table this run checkpoints is
+        // keyed `wh.branch__feature.<table>` under either template, and
+        // `shadow(schema=branch__feature)` is what the scope compares.
+        assert_eq!(
+            written.target.as_ref().unwrap().shadow,
+            Some(rocky_core::state::ResumeShadow::Schema(
+                "branch__feature".to_string()
+            )),
+            "the physical schema is pinned by the shadow, not by the template"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-written", 1, Some(&written))
+            .unwrap();
+        resolve_resume_progress(&store, Some("run-written"), false, &edited)
+            .expect("a bypassed template edit must still resume")
+            .expect("the checkpoint is found");
+        resolve_resume_progress(&store, None, true, &edited)
+            .expect("a bypassed template edit must still resume")
+            .expect("--resume-latest selects it");
+
+        // The carve-out, and the reason this is not fail-open: with no
+        // override the resolver renders the template, so the same edit
+        // moves every target schema and the resume refuses.
+        let plain_written = scope(&target("raw__{regions}"), None);
+        let plain_edited = scope(&target("staging__{regions}"), None);
+        assert_eq!(
+            serde_json::to_value(&plain_written).unwrap()["target"]["schema_template"],
+            serde_json::json!("raw__{regions}"),
+            "a rendered template is recorded verbatim"
+        );
+        assert_ne!(
+            plain_written, plain_edited,
+            "a rendered template edit resolves other names"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-plain", 1, Some(&plain_written))
+            .unwrap();
+        let err = resolve_resume_progress(&store, Some("run-plain"), false, &plain_edited)
+            .expect_err("another schema template's checkpoint must not resume");
+        assert!(
+            err.to_string().contains("different pipeline scope"),
+            "unexpected error: {err:#}"
+        );
+        let err = resolve_resume_progress(&store, None, true, &plain_edited)
+            .expect_err("--resume-latest must not select it");
+        assert!(
+            err.to_string().contains("no progress found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
     /// The other half of #1586, and the dangerous one. Eliding a separator
     /// is only sound when the value is **target-only**. With no `[target]
     /// separator` the run inherits the source pattern's, and
@@ -13858,6 +14154,28 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         resume_run_id: Option<&str>,
         resume_latest: bool,
     ) -> anyhow::Result<()> {
+        drive_shadowed_resume_test_run(
+            config_path,
+            state_path,
+            pipeline,
+            resume_run_id,
+            resume_latest,
+            None,
+        )
+        .await
+    }
+
+    /// The same driver with a `--shadow` / `--shadow-schema` / `--branch`
+    /// override, for the cases that need the run to route somewhere other
+    /// than its rendered `schema_template` (#1592).
+    async fn drive_shadowed_resume_test_run(
+        config_path: &std::path::Path,
+        state_path: &std::path::Path,
+        pipeline: &str,
+        resume_run_id: Option<&str>,
+        resume_latest: bool,
+        shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    ) -> anyhow::Result<()> {
         super::run(
             config_path,
             std::sync::Arc::new(
@@ -13872,7 +14190,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             false,
             resume_run_id,
             resume_latest,
-            None,
+            shadow_config,
             &PartitionRunOptions::default(),
             None,
             None,
@@ -14308,6 +14626,109 @@ auto_create_schemas = true
                 !target_table_exists(&db_path, "staging_p2__acme", "orders").await,
                 "the resumed run must skip the table the checkpoint completed \
                  (seeded record: {run_record_status:?})"
+            );
+        }
+    }
+
+    /// #1592 acceptance, end to end: the checkpoint key really is
+    /// `catalog.<override>.table`, so eliding the bypassed template is not
+    /// fail-open.
+    ///
+    /// A `--branch branch__feature` run writes into `branch__feature`
+    /// whatever `schema_template` says. This test seeds that run's
+    /// checkpoint, edits the template, then resumes under the same branch.
+    /// Two things must hold, and the second is the direction-of-harm proof:
+    ///
+    /// ```text
+    ///   run 1  --branch branch__feature   template staging_p1__{source}
+    ///          checkpoint: warehouse.branch__feature.orders = Success
+    ///   edit   template -> edited_p1__{source}
+    ///   run 2  --branch branch__feature   --resume-latest
+    ///          scope matches  ->  orders SKIPPED  ->  table never created
+    /// ```
+    ///
+    /// The resume is accepted (it refused before this fix), and the only
+    /// source table stays uncopied — which it can only do if the seeded key
+    /// equals the key run 2 would have written. Neither template names a
+    /// schema the run touches.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn resume_under_a_branch_skips_the_recorded_table_after_a_template_edit() {
+        use rocky_core::shadow::ShadowConfig;
+
+        let branch = ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__feature".to_string()),
+            cleanup_after: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) =
+            write_two_pipeline_project(dir.path(), "staging_p1__{source}", "staging_p2__{source}")
+                .await;
+
+        // The checkpoint a `--branch branch__feature` run leaves: the scope
+        // built by the run path's own helper, and the one source table
+        // recorded under the key that run writes. No run record — the crash
+        // shape, which stays resumable.
+        {
+            let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+            let (name, pipeline_config) =
+                registry::resolve_pipeline(&loaded.config, Some("p1")).unwrap();
+            let replication = pipeline_config.as_replication().unwrap();
+            let target = &replication.target;
+            let pattern = replication.schema_pattern().unwrap();
+            let scope = replication_resume_scope(
+                name,
+                target,
+                &loaded.config.adapters[&target.adapter],
+                None,
+                Some(&branch),
+                target.separator.as_deref().unwrap_or(&pattern.separator),
+                &pattern,
+            );
+            assert_eq!(
+                scope.target.as_ref().unwrap().schema_template,
+                None,
+                "the branch override bypasses the template, so it is not recorded"
+            );
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .init_run_progress("run-branch", 1, Some(&scope))
+                .unwrap();
+            store
+                .record_table_progress(
+                    "run-branch",
+                    &table_entry(
+                        0,
+                        "warehouse.branch__feature.orders",
+                        rocky_core::state::TableStatus::Success,
+                    ),
+                )
+                .unwrap();
+        }
+
+        // Edit the one field this change is about. Nothing else moves.
+        write_two_pipeline_config(
+            dir.path(),
+            &db_path,
+            "edited_p1__{source}",
+            "staging_p2__{source}",
+        );
+
+        drive_shadowed_resume_test_run(&config_path, &state_path, "p1", None, true, Some(&branch))
+            .await
+            .expect("a template edit the branch bypasses must not refuse the resume");
+
+        assert!(
+            !target_table_exists(&db_path, "branch__feature", "orders").await,
+            "the resumed run must skip the table the checkpoint completed — \
+             the seeded key is the key this run would write"
+        );
+        for schema in ["staging_p1__acme", "edited_p1__acme"] {
+            assert!(
+                !target_table_exists(&db_path, schema, "orders").await,
+                "'{schema}' comes from a template the override replaces; \
+                 no run may write there"
             );
         }
     }
@@ -16415,11 +16836,8 @@ merge_keys_fallback = ["fallback_only"]
                 nullable: true,
             },
         ];
-        let metadata = vec![MetadataColumn {
-            name: "_loaded_at".to_string(),
-            data_type: "TIMESTAMP".to_string(),
-            value: "CURRENT_TIMESTAMP()".to_string(),
-        }];
+        let metadata =
+            vec![MetadataColumn::new("_loaded_at", "TIMESTAMP", "CURRENT_TIMESTAMP()").unwrap()];
 
         let resolved = resolve_merge_update_columns(&strategy, &source_cols, &metadata);
 
@@ -20762,7 +21180,7 @@ backend = "local"
         let surrogate_keys = std::collections::HashMap::new();
         let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
 
-        let ir = super::typed_model_ir(&model, &typed_models, &surrogate_keys, &dialect);
+        let ir = super::typed_model_ir(&model, &typed_models, &surrogate_keys, &dialect).unwrap();
         assert_eq!(
             ir.typed_columns.len(),
             2,
@@ -21353,19 +21771,32 @@ auto_create_schemas = true
     /// quoted too; DuckDB renders bare. Nothing else in the suite exercises
     /// these dialects, so this asserts the serialized SQL directly rather than
     /// reasoning about how each warehouse resolves it.
+    ///
+    /// The identifier case is a parameter because Snowflake resolves an
+    /// UNQUOTED reference upper-cased (#1282): the lowercase `main.orders` this
+    /// fixture used to write for every dialect is a shape Snowflake now refuses,
+    /// since the producer creates `"main"."orders"` and the consumer's bare
+    /// `FROM main.orders` names `MAIN.ORDERS`. The uppercase spelling is the
+    /// Snowflake-idiomatic one and keeps this test about QUOTING, which is what
+    /// it exists to pin. DuckDB keeps the lowercase spelling so the bare-render
+    /// assertion still means something.
     #[cfg(feature = "duckdb")]
     #[test]
     fn shadow_rewritten_reads_match_the_producer_quoting_per_dialect() {
-        fn rewritten_sql(dialect: &dyn rocky_core::traits::SqlDialect) -> String {
+        fn rewritten_sql(
+            dialect: &dyn rocky_core::traits::SqlDialect,
+            schema: &str,
+            table: &str,
+        ) -> String {
             let tmp = tempfile::TempDir::new().expect("temp dir");
             let models_dir = tmp.path().join("models");
             std::fs::create_dir(&models_dir).expect("mkdir models");
-            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", schema, table);
             write_model_with_target(
                 &models_dir,
                 "mart",
-                "SELECT id FROM main.orders",
-                "main",
+                &format!("SELECT id FROM {schema}.{table}"),
+                schema,
                 "mart",
             );
             let mut compiled =
@@ -21393,7 +21824,7 @@ auto_create_schemas = true
                 .clone()
         }
 
-        let duck = rewritten_sql(&rocky_duckdb::dialect::DuckDbSqlDialect);
+        let duck = rewritten_sql(&rocky_duckdb::dialect::DuckDbSqlDialect, "main", "orders");
         assert!(
             duck.contains("orders_rocky_shadow") && !duck.contains('"'),
             "DuckDB renders bare identifiers: {duck}"
@@ -21402,16 +21833,223 @@ auto_create_schemas = true
         for (name, sql) in [
             (
                 "snowflake",
-                rewritten_sql(&rocky_snowflake::dialect::SnowflakeSqlDialect),
+                rewritten_sql(
+                    &rocky_snowflake::dialect::SnowflakeSqlDialect,
+                    "MAIN",
+                    "ORDERS",
+                ),
             ),
-            ("trino", rewritten_sql(&rocky_trino::dialect::TrinoDialect)),
+            (
+                "trino",
+                rewritten_sql(&rocky_trino::dialect::TrinoDialect, "MAIN", "ORDERS"),
+            ),
         ] {
             assert!(
-                sql.contains("\"orders_rocky_shadow\""),
+                sql.contains("\"ORDERS_rocky_shadow\""),
                 "{name} quotes its targets, so the rewritten read must be quoted too or it \
                  folds case and names a different object: {sql}"
             );
         }
+    }
+
+    /// #1282: on Snowflake a lowercase configured target read through an
+    /// UNQUOTED reference must be REFUSED, not silently rewritten.
+    ///
+    /// `SnowflakeSqlDialect::format_table_ref` creates the target as
+    /// `"main"."orders"`. Snowflake resolves the consumer's bare
+    /// `FROM main.orders` to `MAIN.ORDERS`. Those are two different objects with
+    /// identical text, so the text match this fixture used to satisfy redirected
+    /// a read of one object to the other's shadow replacement.
+    ///
+    /// This goes through `apply_shadow_rewrite` on purpose. Constructing
+    /// `IdentifierCaseRules::uniform_uppercasing(true)` by hand passes with the
+    /// dialect table unchanged and proves only that the rules type works; the
+    /// thing under test is that `dialect_case_rules` hands Snowflake those
+    /// rules.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_refuses_a_snowflake_read_that_folds_to_a_different_object() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(
+            &models_dir,
+            "mart",
+            "SELECT id FROM main.orders",
+            "main",
+            "mart",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err("an unquoted read of a quoted lowercase target must be refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[\"main.orders\"]"),
+            "the refusal must name the reference it could not decide: {message}"
+        );
+        // The remedy has to be in the message. An operator hitting this sees a
+        // reference spelled exactly like the target, so "spell it the same" on
+        // its own would send them hunting a difference that is not there.
+        assert!(
+            message.contains("quote EVERY component of the reference so it spells the target"),
+            "the refusal must name the quoting remedy: {message}"
+        );
+        assert!(
+            message.contains("spell the configured target in upper case"),
+            "the refusal must name the upper-case remedy: {message}"
+        );
+        assert!(
+            message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+            "the refusal must name the account setting that makes this ambiguous: {message}"
+        );
+    }
+
+    /// #1282's other half: the shapes that must keep working.
+    ///
+    /// An uppercase configured target — the Snowflake-idiomatic spelling — is
+    /// what an unquoted reference resolves onto, so it routes exactly as before.
+    /// And the remedy the refusal message prints has to actually work: a
+    /// lowercase target read through a QUOTED reference names the object Rocky
+    /// created, so it routes too. Without this second half the change could have
+    /// been "refuse everything on Snowflake" and still looked correct.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_routes_snowflake_reads_that_name_the_object_rocky_created() {
+        fn routed_sql(schema: &str, table: &str, reference: &str) -> String {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", schema, table);
+            write_model_with_target(
+                &models_dir,
+                "mart",
+                &format!("SELECT id FROM {reference}"),
+                schema,
+                "mart",
+            );
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            super::apply_shadow_rewrite(
+                &mut compiled,
+                None,
+                None,
+                &rocky_core::shadow::ShadowConfig::default(),
+                &rocky_snowflake::dialect::SnowflakeSqlDialect,
+                false,
+            )
+            .expect("a reference that names the created object must route");
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == "mart")
+                .expect("mart missing")
+                .sql
+                .clone()
+        }
+
+        let idiomatic = routed_sql("MAIN", "ORDERS", "MAIN.ORDERS");
+        assert!(
+            idiomatic.contains("\"ORDERS_rocky_shadow\""),
+            "an uppercase target read unquoted must still route: {idiomatic}"
+        );
+
+        let quoted_remedy = routed_sql("main", "orders", "\"main\".\"orders\"");
+        assert!(
+            quoted_remedy.contains("\"orders_rocky_shadow\""),
+            "quoting the reference is the remedy the refusal prints, so it must route: \
+             {quoted_remedy}"
+        );
+
+        // This one is a LOOSENING, not a break. Before #1282 the matcher
+        // compared spelled text, so a lowercase unquoted reference to an
+        // uppercase target failed the exact comparison, matched only when case
+        // was ignored, and the run was REFUSED. Snowflake resolves that
+        // reference to `MAIN.ORDERS`, which is exactly the target, so it now
+        // routes. Reverting the arm makes this assertion fail, which is what
+        // makes "it used to be refused" evidence rather than a claim.
+        let case_insensitive_unquoted = routed_sql("MAIN", "ORDERS", "main.orders");
+        assert!(
+            case_insensitive_unquoted.contains("\"ORDERS_rocky_shadow\""),
+            "an unquoted reference in any case resolves onto an uppercase target: \
+             {case_insensitive_unquoted}"
+        );
+    }
+
+    /// `--defer` is the third path these rules reach, and this proves the
+    /// wiring rather than the rule: it runs `apply_defer_rewrite` with the real
+    /// Snowflake dialect.
+    ///
+    /// The behaviour is a change and is disclosed as one. A quoted lowercase CTE
+    /// alias no longer hides an unquoted reference, because Snowflake does not
+    /// bind those two names. The reference is then a table reference, and a bare
+    /// name matching a model name is that model, so `--defer` qualifies it to
+    /// the deferred model's target. There is no refusal on this path — the
+    /// qualifier substitutes on an exact model-name match and reports no
+    /// near-miss — so the scope answer has to be the warehouse's own.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn defer_on_snowflake_qualifies_a_reference_a_quoted_cte_does_not_bind() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(
+            &models_dir,
+            "mart",
+            "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
+            "main",
+            "mart",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        super::apply_defer_rewrite(
+            &mut compiled,
+            Some("mart"),
+            &super::DeferOptions {
+                enabled: true,
+                defer_to: None,
+            },
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+        )
+        .expect("defer rewrite must succeed");
+
+        let mart = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "mart")
+            .expect("mart missing")
+            .sql
+            .clone();
+        assert!(
+            mart.contains("\"main\".\"orders\""),
+            "Snowflake does not bind the quoted alias to the bare reference, so the reference \
+             is the deferred model and is qualified to its target: {mart}"
+        );
     }
 
     /// A run that routes a single model rewrites nothing — a model's own

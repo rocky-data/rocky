@@ -44,7 +44,10 @@ required-features = ["test-support"]
 
 [dev-dependencies]
 rocky-core = { path = "../rocky-core" }
-rocky-ir = { path = "../rocky-ir" }
+# `test-support` exposes `MetadataColumn::new_unchecked`, which this crate's
+# tests use to build the hostile metadata columns `select_clause` must refuse.
+# Dev-only: resolver v2 keeps the feature out of normal builds.
+rocky-ir = { path = "../rocky-ir", features = ["test-support"] }
 # rocky-verify is the standalone, no-engine-dep offline manifest verifier.
 # Used here (dev-only) to validate the reconstituted manifest against the
 # published rocky-manifest v0.1 schema in creds-free unit tests; it never

@@ -17,7 +17,7 @@ manifest file, and no separate parse step.
                           │               E001-E036  errors
                           ▼               W001-W031  warnings
                       typed IR            P001-P002  lints
-              (every column's type)       I001-I002  information
+              (every column's type)       I001-I003  information
                           │
                           ▼
                     dialect SQL ──► rocky plan prints it
@@ -204,7 +204,7 @@ stable code, so you can grep for it and gate on it.
 | `E` | E001-E036 | Error. `rocky compile` exits non-zero. |
 | `W` | W001-W031 | Warning. Compilation still succeeds. |
 | `P` | P001-P002 | Lint. P001 flags SQL that does not port to your target dialect. P002 warns on a `SELECT *` whose downstream consumers name specific columns. |
-| `I` | I001-I002 | Information. |
+| `I` | I001-I003 | Information. I003 flags a contract column whose type Rocky could not infer, so its declared type went unchecked. |
 
 Two examples. A column whose type no longer matches its contract is `E011`. A
 Snowflake-only construct in a Databricks project is `P001`.

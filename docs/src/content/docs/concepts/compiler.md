@@ -264,6 +264,7 @@ span, and sometimes a suggested fix.
 | `W031` | Imported producer widened the type of a column this project reads (cross-team contract) |
 | `I001` | Model dependency inferred from SQL |
 | `I002` | Some columns have unknown types — provide source schemas for full type checking |
+| `I003` | A contract declares a type for a column whose type Rocky could not infer, so `E011` did not check it |
 | `P001` | Construct not portable to the target dialect (opt-in via `--target-dialect`) |
 | `P002` | `SELECT *` model has downstream consumers that read specific columns |
 

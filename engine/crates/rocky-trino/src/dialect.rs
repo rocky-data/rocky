@@ -108,17 +108,24 @@ impl SqlDialect for TrinoDialect {
         if metadata.is_empty() {
             return Ok(base);
         }
-        // `name` and `data_type` are both interpolated raw into the CAST — the
-        // other dialects validate them and this one did not, so a metadata
-        // block from a hostile config could inject here. Validate both (the
-        // trusted `value` expression is intentionally left as-is).
+        // All three fields are interpolated raw into the CAST, so all three are
+        // validated. `value` is an SQL expression, not an identifier, and it is
+        // NOT trusted: `rocky-cli` substitutes `{placeholder}`s in it from source
+        // schema names read back from the warehouse. `rocky_ir::MetadataColumn::new`
+        // is the boundary that guards it; this repeats the scan because
+        // `new_unchecked` and any future construction path must not reach a raw
+        // splice.
         let mut meta_cols: Vec<String> = Vec::with_capacity(metadata.len());
         for m in metadata {
-            validation::validate_identifier(&m.name).map_err(AdapterError::new)?;
-            rocky_core::sql_gen::validate_sql_type(&m.data_type).map_err(AdapterError::new)?;
+            validation::validate_identifier(m.name()).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(m.data_type()).map_err(AdapterError::new)?;
+            validation::reject_statement_terminator("metadata_columns[].value", m.value())
+                .map_err(AdapterError::new)?;
             meta_cols.push(format!(
                 "CAST({} AS {}) AS {}",
-                m.value, m.data_type, m.name
+                m.value(),
+                m.data_type(),
+                m.name()
             ));
         }
         Ok(format!("{base}, {}", meta_cols.join(", ")))
@@ -373,31 +380,57 @@ mod tests {
     #[test]
     fn select_clause_with_metadata_columns() {
         let d = TrinoDialect::new();
-        let meta = vec![MetadataColumn {
-            name: "_loaded_by".to_string(),
-            data_type: "VARCHAR".to_string(),
-            value: "NULL".to_string(),
-        }];
+        let meta = vec![MetadataColumn::new("_loaded_by", "VARCHAR", "NULL").unwrap()];
         let sql = d.select_clause(&ColumnSelection::All, &meta).unwrap();
         assert!(sql.contains("CAST(NULL AS VARCHAR) AS _loaded_by"));
+    }
+
+    /// #1594: `value` is spliced raw into the CAST alongside `name` and
+    /// `data_type`. The IR boundary (`rocky_ir::MetadataColumn::new`) refuses
+    /// this input, so `new_unchecked` is the only way to build it — which is
+    /// exactly what makes this a test of THIS dialect's own scan rather than
+    /// of the constructor. Both the serde path and any future construction
+    /// site land here.
+    #[test]
+    fn select_clause_rejects_a_hostile_metadata_value() {
+        let d = TrinoDialect::new();
+        // Ends Rocky's statement and starts another.
+        let terminator = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "VARCHAR",
+            "NULL) AS x; SELECT 1 --",
+        )];
+        assert!(d.select_clause(&ColumnSelection::All, &terminator).is_err());
+
+        // Unbalanced quote: pairs its quotes across the rest of the SELECT.
+        let unbalanced = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "VARCHAR",
+            "'o'brien'",
+        )];
+        assert!(d.select_clause(&ColumnSelection::All, &unbalanced).is_err());
+
+        // The benign expression still renders.
+        let ok = vec![MetadataColumn::new("_loaded_by", "VARCHAR", "NULL").unwrap()];
+        assert!(d.select_clause(&ColumnSelection::All, &ok).is_ok());
     }
 
     #[test]
     fn select_clause_rejects_injection_in_metadata_type_and_name() {
         let d = TrinoDialect::new();
         // A hostile `data_type` that tries to break out of the CAST.
-        let bad_type = vec![MetadataColumn {
-            name: "_loaded_by".to_string(),
-            data_type: "VARCHAR) AS x, (SELECT secret FROM creds) AS leak --".to_string(),
-            value: "NULL".to_string(),
-        }];
+        let bad_type = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "VARCHAR) AS x, (SELECT secret FROM creds) AS leak --",
+            "NULL",
+        )];
         assert!(d.select_clause(&ColumnSelection::All, &bad_type).is_err());
         // A hostile alias `name`.
-        let bad_name = vec![MetadataColumn {
-            name: "x, (SELECT 1) AS y".to_string(),
-            data_type: "VARCHAR".to_string(),
-            value: "NULL".to_string(),
-        }];
+        let bad_name = vec![MetadataColumn::new_unchecked(
+            "x, (SELECT 1) AS y",
+            "VARCHAR",
+            "NULL",
+        )];
         assert!(d.select_clause(&ColumnSelection::All, &bad_name).is_err());
     }
 

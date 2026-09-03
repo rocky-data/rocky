@@ -58,6 +58,10 @@ tempfile = { version = "3", optional = true }
 test-support = ["dep:tempfile"]
 
 [dev-dependencies]
+# `test-support` exposes `MetadataColumn::new_unchecked`, which this crate's
+# tests use to build the hostile metadata columns `select_clause` must refuse.
+# Dev-only: resolver v2 keeps the feature out of normal builds.
+rocky-ir = { path = "../rocky-ir", features = ["test-support"] }
 tempfile = "3"
 # redb's eviction counter is `#[cfg(feature = "cache_metrics")]`, so without
 # this it reports 0 unconditionally. Enabled for test builds only, so

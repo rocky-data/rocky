@@ -233,10 +233,36 @@ fn test_contract_project_loads_contracts() {
 
     // Contract validation should have run (even if columns are Unknown type)
     assert_eq!(result.project.model_count(), 1);
-    // With unknown types, contract type checks produce no errors (Unknown matches any type)
-    // But the contract_diagnostics vector should exist
-    // Contract validation ran without panicking — diagnostics vector exists
-    let _ = &result.diagnostics;
+
+    // No source schemas, so every column infers `Unknown` and the E011 type
+    // check cannot run. That must not raise E011 — and must not be silent
+    // either: one I003 per contract column that declares a type (#1240).
+    // (The fixture's own `nullable = false` columns still raise E012; that is
+    // a separate check and unrelated to the type gate.)
+    assert!(
+        result
+            .contract_diagnostics
+            .iter()
+            .all(|d| &*d.code != "E011"),
+        "an unresolved type must not raise E011: {:?}",
+        result.contract_diagnostics
+    );
+    let i003: Vec<_> = result
+        .contract_diagnostics
+        .iter()
+        .filter(|d| &*d.code == "I003")
+        .collect();
+    assert_eq!(
+        i003.len(),
+        2,
+        "one I003 per typed contract column (customer_id, total_revenue): {:?}",
+        result.contract_diagnostics
+    );
+    assert!(
+        i003.iter()
+            .all(|d| d.severity == rocky_compiler::diagnostic::Severity::Info),
+        "I003 must be info severity: {i003:?}"
+    );
 }
 
 #[test]
