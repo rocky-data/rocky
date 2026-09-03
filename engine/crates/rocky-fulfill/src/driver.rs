@@ -265,7 +265,14 @@ impl AgentDriver for SubprocessDriver {
             .map(|a| a.replace("{brief}", &brief.text))
             .collect();
 
-        let transcript = std::fs::File::create(&transcript_path)
+        // NOT `std::fs::File::create`: O_CREAT|O_TRUNC follows a symlink at
+        // the leaf and truncates through a hardlink, and the transcript name
+        // is a plain UTC-second stamp in a directory a lower-privilege
+        // process can write. A squatter planted there took the worker's whole
+        // stdout/stderr out of the project, or emptied a file the project
+        // does not own, with no race to win. The O_EXCL create only ever
+        // opens a file it just created (#1500).
+        let transcript = rocky_core::product::commit::create_new_no_follow_handle(&transcript_path)
             .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;
         let transcript_err = transcript
             .try_clone()
@@ -752,8 +759,12 @@ impl AgentDriver for ReplayDriver {
             }
         };
 
-        let mut transcript = std::fs::File::create(&transcript_path)
-            .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;
+        // Same O_EXCL no-follow create as the subprocess driver above: a
+        // symlink or hardlink squatter at the stamped transcript name is
+        // unlinked, never written through (#1500).
+        let mut transcript =
+            rocky_core::product::commit::create_new_no_follow_handle(&transcript_path)
+                .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;
         let stderr_file = transcript
             .try_clone()
             .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;
@@ -1368,6 +1379,88 @@ mod escape_scope_tests {
             transcript_dir: dir.join("transcripts"),
             outbox_dir: dir.join("outbox"),
         }
+    }
+
+    /// Plant a squatter at the transcript name for `seconds` consecutive
+    /// UTC seconds starting now, so the run lands on one of them whatever
+    /// second it happens to start in, and hand back the paths.
+    fn plant_transcript_squatters(
+        brief: &TaskBrief,
+        seconds: i64,
+        mut plant: impl FnMut(&Path),
+    ) -> Vec<PathBuf> {
+        std::fs::create_dir_all(&brief.transcript_dir).expect("mkdir");
+        (0..seconds)
+            .map(|offset| {
+                let stamp = (Utc::now() + chrono::Duration::seconds(offset))
+                    .format("%Y%m%dT%H%M%SZ")
+                    .to_string();
+                let path = brief
+                    .transcript_dir
+                    .join(format!("{stamp}-{}.log", brief.kind.as_str()));
+                plant(&path);
+                path
+            })
+            .collect()
+    }
+
+    fn run_a_trivial_task(brief: &TaskBrief) {
+        let driver = SubprocessDriver::new(
+            vec!["python3".into(), "-c".into(), "print(\"{brief}\")".into()],
+            vec!["PATH".into()],
+            Duration::from_secs(20),
+            Duration::from_millis(300),
+        )
+        .expect("valid");
+        let mut on_group = |_group: GroupStamp| Ok(());
+        let runtime = tokio::runtime::Handle::current();
+        let _ = runtime.block_on(async { driver.run_task(brief, &mut on_group).await });
+    }
+
+    /// The worker's transcript is the one file this driver creates at a
+    /// PREDICTABLE name (a UTC-second stamp) in a directory a lower-privilege
+    /// process can write. `std::fs::File::create` truncated through a hard
+    /// link planted there — no race to win — emptying a file outside the
+    /// project before the worker even started (#1500).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hardlinked_transcript_name_is_never_truncated_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("outside-secret");
+        std::fs::write(&victim, b"private bytes the transcript must not truncate").expect("write");
+        let brief = brief(dir.path());
+        plant_transcript_squatters(&brief, 4, |path| {
+            std::fs::hard_link(&victim, path).expect("hard link");
+        });
+
+        tokio::task::block_in_place(|| run_a_trivial_task(&brief));
+
+        assert_eq!(
+            std::fs::read(&victim).expect("still there"),
+            b"private bytes the transcript must not truncate",
+            "the out-of-project name must be untouched"
+        );
+    }
+
+    /// The same leaf, the other link kind: `File::create` FOLLOWED a symlink
+    /// planted at the transcript name and redirected the worker's entire
+    /// stdout and stderr through it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlinked_transcript_name_is_never_written_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("outside-secret");
+        std::fs::write(&victim, b"private bytes the transcript must not overwrite").expect("write");
+        let brief = brief(dir.path());
+        plant_transcript_squatters(&brief, 4, |path| {
+            std::os::unix::fs::symlink(&victim, path).expect("symlink");
+        });
+
+        tokio::task::block_in_place(|| run_a_trivial_task(&brief));
+
+        assert_eq!(
+            std::fs::read(&victim).expect("still there"),
+            b"private bytes the transcript must not overwrite",
+            "the out-of-project target must be untouched"
+        );
     }
 
     async fn wait_for_pid_file(path: &Path) -> u32 {

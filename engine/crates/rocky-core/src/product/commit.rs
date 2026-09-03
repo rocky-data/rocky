@@ -34,26 +34,44 @@
 //! # Leaf containment: what is covered, and what is not
 //!
 //! ```text
-//!   vector                       unix                      windows
-//!   --------------------------------------------------------------------
-//!   symlink at the leaf          refused at the syscall    pre-check only
-//!                                (O_EXCL on a create,      (O_NOFOLLOW is
-//!                                O_NOFOLLOW on an          a unix flag)
-//!                                in-place write or read)
-//!   hardlink at the leaf         refused on the opened     not checked
-//!                                DESCRIPTOR (nlink > 1)    (see below)
-//!   parent directory swapped     NOT closed — only dirfd-relative APIs
-//!     after validation           close it, and v0 does not use them
+//!   vector                        unix                     windows
+//!   ---------------------------------------------------------------------
+//!   symlink at a CREATED leaf     never written THROUGH    same — O_EXCL
+//!     (.ff-staged, .ff-prev,      (O_EXCL refuses to open  is portable
+//!      the journal tmp)           it; the squatter is
+//!                                 unlinked and a fresh
+//!                                 file created — not the
+//!                                 same thing as refusal)
+//!   symlink at an EXISTING leaf   refused (O_NOFOLLOW      pre-check only
+//!     (in-place write; the        on the open)             (O_NOFOLLOW is
+//!      backup / sidecar read)                              a unix flag)
+//!   hardlink at an EXISTING leaf  refused on the opened    not checked
+//!                                 DESCRIPTOR (nlink > 1)   (see below)
+//!   parent directory swapped      NOT closed — only dirfd-relative APIs
+//!     after validation            close it, and v0 does not use them
 //! ```
+//!
+//! The rows say what the SYSCALL does. On the commit path a symlink parked
+//! at any of these leaves before the run is additionally refused up front
+//! by [`commit_generation`]'s pre-check, before the first mutation.
 //!
 //! Stated residuals, accepted under the v0 same-machine threat posture.
 //! Path-based syscalls re-traverse the path at syscall time, so a
 //! DIRECTORY swapped for a symlink in the instant between validation and
 //! a rename/unlink is only fully closed by dirfd-relative APIs, which v0
-//! does not use. Every LEAF the protocol writes or reads is guarded at
-//! the syscall itself — O_EXCL on each create, `O_NOFOLLOW` on an
-//! in-place write and on the backup read, and a link-count check on the
-//! descriptor those two already hold.
+//! does not use. Every leaf the protocol WRITES is guarded at the syscall
+//! itself — O_EXCL on each create, `O_NOFOLLOW` on an in-place write — and
+//! so is every read whose bytes go on to LAND somewhere: the `.ff-prev`
+//! backup source, Phase B's sidecar read, the draft rollback snapshot.
+//! Those two carry a link-count check on the descriptor as well.
+//!
+//! Not every read: recovery's own `std::fs::read` of the journal, of a
+//! final, and of a committed manifest are pathname-based and follow a link.
+//! They are digest COMPARISONS — the bytes are hashed and dropped, never
+//! written anywhere — and the journal is already declared untrusted input
+//! whose every named path is validated, so a link there redirects a
+//! comparison, not a mutation. Stated rather than swept into the sentence
+//! above.
 //!
 //! That link-count check exists because a HARDLINK needs no timing at
 //! all. A second name for one inode IS an ordinary regular file, so every
@@ -67,6 +85,16 @@
 //! deliberately NOT checked: the descriptor they hand back names a file
 //! this process just created, so its link count is 1 by construction, and
 //! a link added afterwards is past anything an open-time check can see.
+//!
+//! The refusal cannot tell a hostile link from a benign one, so it is a
+//! stated COMPATIBILITY BREAK, not a free win: a project tree materialised
+//! with `cp -l` / `cp -al`, restored from an archive that preserves hard
+//! links, or deduplicated by its filesystem into shared names, is refused
+//! at the first in-place draft write or `.ff-prev` backup. That is the
+//! accepted trade — writing through a link the project does not own is
+//! silent, and refusing is loud, rare, and prints how to undo it — but it
+//! is a break, and a report of a legitimately hard-linked models tree is
+//! the evidence that should reopen it.
 //!
 //! Windows is a stated gap, not a claim. `O_NOFOLLOW` is a unix flag, and
 //! `std::os::windows::fs::MetadataExt::number_of_links` is unstable
@@ -389,6 +417,24 @@ pub fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     create_new_no_follow(path, None)?.write_all(bytes)
 }
 
+/// The handle half of [`write_new_no_follow`], for a caller that hands the
+/// DESCRIPTOR to something else — a child process's stdout, say — instead
+/// of writing bytes itself.
+///
+/// Same guarantee, same single legitimate `AlreadyExists` recovery.
+/// `std::fs::File::create` (O_CREAT|O_TRUNC) follows a symlink at the leaf
+/// and truncates through a hardlink; this cannot, because O_EXCL only ever
+/// opens a file it just created. A stale squatter from a prior crash is
+/// cleared with `remove_file`, which unlinks THAT name and leaves any other
+/// name's bytes untouched, and the create is retried once.
+///
+/// # Errors
+///
+/// Any error from the create, or from clearing a stale squatter.
+pub fn create_new_no_follow_handle(path: &Path) -> std::io::Result<std::fs::File> {
+    create_new_no_follow(path, None)
+}
+
 /// The open half of [`write_new_no_follow`], handing back the handle so a
 /// caller can also set the mode on the descriptor rather than by path.
 fn create_new_no_follow(path: &Path, mode: Option<u32>) -> std::io::Result<std::fs::File> {
@@ -449,6 +495,11 @@ fn create_new_no_follow(path: &Path, mode: Option<u32>) -> std::io::Result<std::
 /// no Windows `cargo test` lane, so a Windows arm would be untested code
 /// claiming a protection nobody had run. See the module header.
 ///
+/// The remedy in the message is deliberately prose, not a pasteable shell
+/// command: a fixed scratch name (`<path>.unlinked`) is one more predictable
+/// path for the same attacker to squat, and a project path can hold spaces
+/// and shell metacharacters that no unquoted one-liner survives.
+///
 /// # Errors
 ///
 /// The `fstat`'s own failure, or `InvalidInput` naming the path, the link
@@ -467,8 +518,8 @@ fn refuse_hard_linked(
             std::io::ErrorKind::InvalidInput,
             format!(
                 "refusing to {verb} {p} — {links} names refer to these bytes, so it is a hard \
-                 link. {harm} Replace it with an independent copy \
-                 (`cp {p} {p}.unlinked && mv {p}.unlinked {p}`), then re-run.",
+                 link. {harm} Break the link before re-running: copy this file's contents to a \
+                 path that does NOT exist yet, then move that copy over this one.",
                 p = path.display(),
             ),
         ));
