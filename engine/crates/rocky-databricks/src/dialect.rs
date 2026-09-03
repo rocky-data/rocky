@@ -6,7 +6,7 @@
 
 use std::fmt::Write;
 
-use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
+use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
@@ -20,6 +20,21 @@ pub struct DatabricksSqlDialect;
 impl SqlDialect for DatabricksSqlDialect {
     fn name(&self) -> &'static str {
         "databricks"
+    }
+
+    /// Spark SQL's `'…'` literal processes backslash escapes; a quote is
+    /// `\'` and a backslash is `\\`.
+    ///
+    /// Executed under the default parser
+    /// (`tests/lakehouse_initial_ddl_live.rs::literal_escape_round_trips_live`).
+    /// The legacy `spark.sql.parser.escapedStringLiterals=true` turns that
+    /// off and is out of scope. It breaks both ways, so state both: `\'`
+    /// becomes two literal characters, the quote closes the literal and the
+    /// statement fails to parse (loud); `\\` stays two characters, so a value
+    /// holding a backslash reads back doubled (silent corruption). Run under
+    /// the default.
+    fn literal_escape(&self) -> LiteralEscape {
+        LiteralEscape::Backslash
     }
 
     // Databricks (Spark) is the only dialect that renders the lakehouse

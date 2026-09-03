@@ -539,6 +539,10 @@ mod unit_tests {
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn format_table_ref(&self, c: &str, s: &str, t: &str) -> AdapterResult<String> {
             rocky_sql::validation::format_table_ref(c, s, t).map_err(AdapterError::new)
         }

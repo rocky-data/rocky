@@ -14,6 +14,12 @@ publish = false
 # build this crate exists to keep out of `target/tests/trybuild/`.
 [dependencies]
 rocky-core = { path = "../rocky-core" }
+# Needed only by `compile_fail/missing_literal_escape.rs`, which has to spell
+# every required `SqlDialect` method to prove that exactly one of them is what
+# fails. Both are already in rocky-core's own graph and cost nothing extra;
+# the heavyweight dependency this crate exists to exclude is `rocky-duckdb`.
+rocky-ir = { path = "../rocky-ir" }
+chrono = { workspace = true }
 
 [dev-dependencies]
 trybuild = { workspace = true }

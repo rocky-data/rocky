@@ -869,6 +869,10 @@ post_hook = ["ANALYZE main.seeds.dim_date"]
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn format_table_ref(
             &self,
             catalog: &str,

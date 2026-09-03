@@ -22,6 +22,12 @@ use rocky_ir::{
     ColumnInfo, ColumnSelection, Grant, GrantTarget, MaskStrategy, MetadataColumn, TableRef,
 };
 
+/// Re-exported so a `SqlDialect` impl needs one import, not two.
+///
+/// The encoding itself lives in [`rocky_sql::literal::encode_string_literal`];
+/// a dialect only states which rule its lexer follows.
+pub use rocky_sql::literal::LiteralEscape;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -1228,6 +1234,27 @@ pub trait SqlDialect: Send + Sync {
     fn quote_identifier(&self, name: &str) -> String {
         format!("\"{name}\"")
     }
+
+    /// How this warehouse's lexer reads a single-quoted string literal.
+    ///
+    /// The literal twin of [`SqlDialect::quote_identifier`]. Feed the answer
+    /// to [`rocky_sql::literal::encode_string_literal`] — or call
+    /// [`crate::sql_gen::string_literal`], which does it for you — instead of
+    /// splicing a value into `'…'` by hand.
+    ///
+    /// **There is deliberately no default.** A default would let a new
+    /// adapter inherit one dialect's lexer rule silently, and a silently
+    /// wrong lexer rule is exactly the defect this method exists to remove:
+    /// it corrupts values on some dialects and lets a quote close the literal
+    /// on others. An implementor states a one-word fact about its own lexer.
+    ///
+    /// That is a claim about the trait, so it is guarded like one. Every
+    /// implementation in the tree supplies the method, so *adding* a default
+    /// would leave the whole suite green. The guard is a `trybuild` case:
+    /// `rocky-core-compiletest/tests/compile_fail/missing_literal_escape.rs`
+    /// implements every other required method and omits this one, and is
+    /// pinned to fail with `E0046`.
+    fn literal_escape(&self) -> LiteralEscape;
 
     /// SQL expression that computes a single-row hash over `columns`,
     /// returning an integer wide enough to feed `BIT_XOR(...)` for

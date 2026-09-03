@@ -4140,7 +4140,9 @@ dependencies = [
 name = "rocky-core-compiletest"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "rocky-core",
+ "rocky-ir",
  "trybuild",
 ]
 

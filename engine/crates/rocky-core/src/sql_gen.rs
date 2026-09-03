@@ -884,6 +884,32 @@ pub fn archive_from_ir(
     Ok(statements)
 }
 
+/// Encodes `value` as a complete single-quoted string literal for `dialect`.
+///
+/// A convenience over [`rocky_sql::literal::encode_string_literal`] that asks
+/// the dialect for its own lexer rule, so a caller that already holds a
+/// `&dyn SqlDialect` never picks a rule by hand. The return value includes
+/// the surrounding quotes.
+///
+/// This is a free function on purpose: a provided trait method could be
+/// overridden into a third encoding, which is the failure this lane removes.
+///
+/// # Examples
+///
+/// ```
+/// use rocky_core::sql_gen::string_literal;
+/// use rocky_duckdb::dialect::DuckDbSqlDialect;
+///
+/// // DuckDB's lexer reads no backslash escapes, so a quote is doubled and a
+/// // backslash stands for itself.
+/// assert_eq!(string_literal(&DuckDbSqlDialect, "it's"), "'it''s'");
+/// assert_eq!(string_literal(&DuckDbSqlDialect, r"C:\tmp"), r"'C:\tmp'");
+/// ```
+#[must_use]
+pub fn string_literal(dialect: &dyn SqlDialect, value: &str) -> String {
+    rocky_sql::literal::encode_string_literal(dialect.literal_escape(), value)
+}
+
 /// Validates a SQL type string for safety (no injection).
 ///
 /// The rule itself lives in [`rocky_sql::validation::validate_sql_type`] so
@@ -1085,6 +1111,10 @@ mod tests {
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn name(&self) -> &'static str {
             "test"
         }
@@ -2616,6 +2646,10 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     struct MaintenanceDialect(TestDialect);
 
     impl SqlDialect for MaintenanceDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn name(&self) -> &'static str {
             "maintenance"
         }
@@ -2736,6 +2770,10 @@ SELECT id, name, email FROM cat.sch.src WHERE active = true";
     struct PredropDialect(TestDialect);
 
     impl SqlDialect for PredropDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn name(&self) -> &'static str {
             "predrop"
         }

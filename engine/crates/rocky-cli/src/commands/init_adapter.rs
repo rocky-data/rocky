@@ -63,7 +63,7 @@ pub mod types;
     let name_pascal = to_pascal_case(name);
     std::fs::write(
         src_dir.join("dialect.rs"),
-        dialect_source(name, &name_pascal),
+        render_dialect_rs(name, &name_pascal),
     )?;
 
     // adapter.rs — WarehouseAdapter skeleton
@@ -164,35 +164,66 @@ fn test_live_connection() {{
     println!();
     println!("Next steps:");
     println!("  1. Add \"{crate_name}\" to workspace members in Cargo.toml");
-    println!("  2. Implement SqlDialect methods in dialect.rs");
-    println!("  3. Add an HTTP connector in connector.rs");
-    println!("  4. Implement WarehouseAdapter in adapter.rs");
-    println!("  5. Add \"{name}\" case to registry.rs");
+    println!(
+        "  2. Pick `literal_escape` in dialect.rs — the crate deliberately refuses to\n     \
+         compile until you state how {name}'s lexer reads a quoted string"
+    );
+    println!("  3. Implement the remaining SqlDialect methods in dialect.rs");
+    println!("  4. Add an HTTP connector in connector.rs");
+    println!("  5. Implement WarehouseAdapter in adapter.rs");
+    println!("  6. Add \"{name}\" case to registry.rs");
 
     Ok(())
 }
 
-/// Renders the scaffolded `dialect.rs` for `rocky init-adapter <name>`.
+/// Renders the scaffold's `src/dialect.rs`.
 ///
-/// Split out of [`run_init_adapter`] so the emitted text is testable without
-/// writing to disk. The `#[cfg(test)]` blocks *inside* the template are the
-/// new crate's tests, not this crate's, so nothing in CI compiles this output
-/// — a missing guard here would ship silently. `scaffold_select_clause_validates_every_spliced_field`
-/// is what catches that.
-fn dialect_source(name: &str, name_pascal: &str) -> String {
+/// Split out from [`run_init_adapter`] so a test can assert on the text
+/// without writing into the repository — `run_init_adapter` resolves its
+/// output against a relative `crates/` path.
+///
+/// Nothing in CI compiles this output: the `#[cfg(test)]` blocks *inside* the
+/// template belong to the new crate, not to this one. A guard dropped from the
+/// template would therefore ship silently, which is what
+/// `scaffold_select_clause_validates_every_spliced_field` exists to catch.
+fn render_dialect_rs(name: &str, name_pascal: &str) -> String {
     format!(
         r#"//! {name} SQL dialect implementation.
 //!
 //! TODO: Implement each method for {name}-specific SQL syntax.
 
 use rocky_ir::{{ColumnSelection, MetadataColumn}};
-use rocky_core::traits::{{AdapterError, AdapterResult, SqlDialect}};
+use rocky_core::traits::{{AdapterError, AdapterResult, LiteralEscape, SqlDialect}};
 
 /// {name} SQL dialect.
 #[derive(Debug, Clone, Default)]
 pub struct {name_pascal}SqlDialect;
 
 impl SqlDialect for {name_pascal}SqlDialect {{
+    /// How {name}'s lexer reads a single-quoted string literal.
+    ///
+    ///   - `LiteralEscape::Standard`  — no backslash escapes; a quote is
+    ///     doubled (`''`), a backslash stands for itself, a line break stays
+    ///     raw. Trino, DuckDB.
+    ///   - `LiteralEscape::Backslash` — backslash escapes are read; a quote
+    ///     is `\'`, a backslash `\\`, a line break `\n` / `\r`. Snowflake,
+    ///     Databricks, BigQuery.
+    ///
+    /// **This does not compile until you choose.** The trait has no default
+    /// and neither does the scaffold: the wrong rule corrupts values on some
+    /// warehouses and lets a quote close the literal on others, and a guess
+    /// that compiles is exactly how that ships unnoticed. Read {name}'s own
+    /// lexer documentation, then prove it — encode a value holding a quote
+    /// AND a backslash, `SELECT` it back, and assert it round-trips
+    /// byte-identical. Replace the line below with your answer.
+    fn literal_escape(&self) -> LiteralEscape {{
+        compile_error!(
+            "pick LiteralEscape::Standard or LiteralEscape::Backslash for {name} — \
+             read its string-literal lexer documentation and prove the choice with a \
+             round trip, then delete this line"
+        )
+    }}
+
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {{
         // TODO: Implement {name}-specific table reference formatting
         rocky_sql::validation::format_table_ref(catalog, schema, table).map_err(AdapterError::new)
@@ -210,7 +241,7 @@ impl SqlDialect for {name_pascal}SqlDialect {{
         &self,
         _target: &str,
         _source_sql: &str,
-        _keys: &[String],
+        _keys: &[std::sync::Arc<str>],
         _update_cols: &ColumnSelection,
     ) -> AdapterResult<String> {{
         // TODO: Implement {name}-specific MERGE syntax
@@ -348,7 +379,7 @@ mod tests {
     /// generated crate is never compiled here. Assert on the emitted text.
     #[test]
     fn scaffold_select_clause_validates_every_spliced_field() {
-        let src = dialect_source("redshift", "Redshift");
+        let src = render_dialect_rs("redshift", "Redshift");
         assert!(
             src.contains("validate_identifier(mc.name())"),
             "scaffold must validate the metadata column name"
@@ -378,5 +409,110 @@ mod tests {
         assert_eq!(to_pascal_case("big_query"), "BigQuery");
         assert_eq!(to_pascal_case("snowflake"), "Snowflake");
         assert_eq!(to_pascal_case("redshift"), "Redshift");
+    }
+
+    /// Nothing in CI compiles the scaffold — the tests inside the template
+    /// are text, not code — so a required trait method missing from the
+    /// template would make `rocky init-adapter` emit a broken crate with
+    /// nothing noticing. These three render tests are the whole guard.
+    ///
+    /// The list below is **hand-maintained**: this test cannot enumerate the
+    /// trait's required methods, so it does not prove the scaffold is
+    /// complete — only that it still emits the names named here. Add a name
+    /// whenever a required method is added to `SqlDialect`.
+    #[test]
+    fn the_scaffolded_dialect_emits_the_methods_this_list_names() {
+        let rendered = render_dialect_rs("redshift", "Redshift");
+
+        for required in [
+            "fn format_table_ref(",
+            "fn create_table_as(",
+            "fn insert_into(",
+            "fn merge_into(",
+            "fn select_clause(",
+            "fn watermark_where(",
+            "fn describe_table_sql(",
+            "fn drop_table_sql(",
+            "fn create_catalog_sql(",
+            "fn create_schema_sql(",
+            "fn tablesample_clause(",
+            "fn insert_overwrite_partition(",
+            "fn literal_escape(",
+        ] {
+            assert!(
+                rendered.contains(required),
+                "scaffolded dialect.rs is missing `{required}` — `rocky init-adapter` \
+                 would emit a crate that does not compile"
+            );
+        }
+    }
+
+    /// The scaffold must not answer `literal_escape` for the author. A rule
+    /// that compiles is a guess about somebody else's lexer, and a wrong one
+    /// is silent: it corrupts values on some warehouses and lets a quote close
+    /// the literal on others. So the emitted body is a `compile_error!` — the
+    /// scaffolded crate refuses to build until a human states the fact.
+    ///
+    /// This is the test that would have to be deleted to reintroduce a
+    /// default, which is the point of it.
+    #[test]
+    fn the_scaffolded_literal_escape_refuses_to_compile_until_it_is_chosen() {
+        let rendered = render_dialect_rs("redshift", "Redshift");
+
+        assert!(
+            rendered.contains(
+                "use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};"
+            ),
+            "scaffolded dialect.rs does not import LiteralEscape"
+        );
+
+        let (_, body) = rendered
+            .split_once("fn literal_escape(&self) -> LiteralEscape {")
+            .expect("literal_escape is rendered");
+        let (body, _) = body.split_once("\n    }").expect("the method body closes");
+
+        assert!(
+            body.contains("compile_error!"),
+            "scaffolded literal_escape must not compile until the author chooses: {body}"
+        );
+        assert!(
+            body.contains("redshift"),
+            "the refusal must name the adapter it is asking about: {body}"
+        );
+
+        // The refusal message names both variants on purpose, so look for a
+        // variant used as a *value* — outside the message's quotes. That is
+        // the silent default this method exists to remove.
+        let code: String = body
+            .split('"')
+            .step_by(2)
+            .collect::<Vec<_>>()
+            .join(" <message> ");
+        assert!(
+            !code.contains("LiteralEscape::Standard") && !code.contains("LiteralEscape::Backslash"),
+            "scaffolded literal_escape returns a variant instead of refusing: {code}"
+        );
+    }
+
+    /// The refusal is only useful if it says how to answer it: both rules by
+    /// name, and the evidence bar for picking one.
+    #[test]
+    fn the_scaffolded_literal_escape_documents_both_rules_and_the_evidence_bar() {
+        let rendered = render_dialect_rs("redshift", "Redshift");
+        let (doc, _) = rendered
+            .split_once("fn literal_escape(")
+            .expect("literal_escape is rendered");
+        let (_, doc) = doc
+            .rsplit_once("/// How redshift's lexer reads")
+            .expect("literal_escape carries a doc comment naming the adapter");
+
+        assert!(
+            doc.contains("LiteralEscape::Standard") && doc.contains("LiteralEscape::Backslash"),
+            "the doc must name both rules so the author picks one"
+        );
+        assert!(
+            doc.contains("round-trips\n    /// byte-identical"),
+            "the doc must ask for executed evidence, not a guess"
+        );
     }
 }
