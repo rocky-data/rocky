@@ -203,18 +203,6 @@ pub async fn plan(
             if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
                 continue;
             }
-            // The single producer `rocky run` also uses, so the preview and
-            // the run cannot disagree. It substitutes the warehouse-derived
-            // schema components, checks each one is a plain identifier, and
-            // validates the resolved triple.
-            let metadata_columns: Vec<MetadataColumn> =
-                rocky_core::schema::resolve_metadata_columns(
-                    &parsed,
-                    &pipeline.metadata_columns,
-                    &pattern.separator,
-                )
-                .with_context(|| format!("source schema '{}'", conn.schema))?;
-
             let target_label = if effective_target_catalog.is_empty() {
                 format!("{target_schema}.{}", table.name)
             } else {
@@ -248,6 +236,24 @@ pub async fn plan(
                 });
                 continue;
             }
+
+            // Resolved AFTER the exclusion branches, mirroring `rocky run`,
+            // which preflights the same value only for a table that survives
+            // the filter / missing-from-source / disabled skips. Resolving
+            // earlier would let `plan` refuse a source schema whose tables
+            // `run` never renders.
+            //
+            // Same producer `run` uses, so the preview and the run cannot
+            // disagree: it substitutes the warehouse-derived schema
+            // components, checks each one is a plain identifier, and validates
+            // the resolved triple.
+            let metadata_columns: Vec<MetadataColumn> =
+                rocky_core::schema::resolve_metadata_columns(
+                    &parsed,
+                    &pipeline.metadata_columns,
+                    &pattern.separator,
+                )
+                .with_context(|| format!("source schema '{}'", conn.schema))?;
             let strategy = match super::run::build_replication_strategy_with_override(
                 pipeline,
                 &effective_override,

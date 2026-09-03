@@ -30,8 +30,10 @@ rust-version.workspace = true
 
 [dependencies]
 rocky-core = {{ path = "../rocky-core" }}
+rocky-ir = {{ path = "../rocky-ir" }}
 rocky-sql = {{ path = "../rocky-sql" }}
 async-trait = {{ workspace = true }}
+chrono = {{ workspace = true }}
 reqwest = {{ workspace = true }}
 serde = {{ workspace = true }}
 serde_json = {{ workspace = true }}
@@ -234,14 +236,19 @@ impl SqlDialect for {name_pascal}SqlDialect {{
         // validated. Do not drop these: `value` carries `{{placeholder}}`s
         // resolved from source schema names read back from the warehouse.
         for mc in metadata {{
-            rocky_sql::validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
-            rocky_core::sql_gen::validate_sql_type(&mc.data_type).map_err(AdapterError::new)?;
+            rocky_sql::validation::validate_identifier(mc.name()).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(mc.data_type()).map_err(AdapterError::new)?;
             rocky_sql::validation::reject_statement_terminator(
                 "metadata_columns[].value",
-                &mc.value,
+                mc.value(),
             )
             .map_err(AdapterError::new)?;
-            sql.push_str(&format!(", CAST({{}} AS {{}}) AS {{}}", mc.value, mc.data_type, mc.name));
+            sql.push_str(&format!(
+                ", CAST({{}} AS {{}}) AS {{}}",
+                mc.value(),
+                mc.data_type(),
+                mc.name()
+            ));
         }}
         Ok(sql)
     }}
@@ -343,16 +350,16 @@ mod tests {
     fn scaffold_select_clause_validates_every_spliced_field() {
         let src = dialect_source("redshift", "Redshift");
         assert!(
-            src.contains("validate_identifier(&mc.name)"),
+            src.contains("validate_identifier(mc.name())"),
             "scaffold must validate the metadata column name"
         );
         assert!(
-            src.contains("validate_sql_type(&mc.data_type)"),
+            src.contains("validate_sql_type(mc.data_type())"),
             "scaffold must validate the metadata column type"
         );
         assert!(
             src.contains(
-                "reject_statement_terminator(\n                \"metadata_columns[].value\",\n                &mc.value,\n            )"
+                "reject_statement_terminator(\n                \"metadata_columns[].value\",\n                mc.value(),\n            )"
             ),
             "scaffold must scan the metadata column value"
         );

@@ -3114,6 +3114,15 @@ pub async fn run(
             }
             let empty = std::collections::HashSet::new();
             let source_tables = source_tables_by_schema.get(&conn.schema).unwrap_or(&empty);
+            // Refusing a `metadata_columns` value must land here, not at
+            // collection: the setup loop below creates catalogs and schemas,
+            // sets tags, binds workspaces and applies grants, so a refusal
+            // during collection would abort only after changing access
+            // control. Resolved once per connector, lazily — the first table
+            // that survives the SAME skip conditions the collection loop uses,
+            // so a connector whose tables are all filtered, missing or
+            // disabled is not refused for a value `run` never renders.
+            let mut metadata_preflighted = false;
             let target_catalog = parsed.resolve_template(target_catalog_template, target_sep);
             let target_schema = if let Some(cfg) = shadow_config {
                 cfg.schema_override
@@ -3140,6 +3149,15 @@ pub async fn run(
                     == Some(false)
                 {
                     continue;
+                }
+                if !metadata_preflighted {
+                    rocky_core::schema::resolve_metadata_columns(
+                        &parsed,
+                        &pipeline.metadata_columns,
+                        &pattern.separator,
+                    )
+                    .with_context(|| format!("source schema '{}'", conn.schema))?;
+                    metadata_preflighted = true;
                 }
                 let target_table_name = if let Some(cfg) = shadow_config {
                     if cfg.schema_override.is_none() {
