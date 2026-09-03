@@ -965,7 +965,7 @@ async fn count_rows(
 }
 
 /// Count failed checks bucketed by severity across every table result.
-fn count_failures_by_severity(output: &RunOutput) -> (usize, usize) {
+pub(crate) fn count_failures_by_severity(output: &RunOutput) -> (usize, usize) {
     use rocky_core::tests::TestSeverity;
     let mut error = 0usize;
     let mut warning = 0usize;

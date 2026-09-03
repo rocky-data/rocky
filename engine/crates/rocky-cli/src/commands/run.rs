@@ -189,6 +189,31 @@ pub struct RunFailed {
 /// JSON consumer reads regardless of exit code. This is what makes a
 /// compile-failed model a first-class run failure instead of a silently
 /// skipped no-op that still reported `status: "Success"`, exit 0.
+/// Fold failed error-severity checks into `tables_failed` so the replication
+/// path's exit code, recorded status and check results agree (#1598).
+///
+/// [`RunOutput::derive_run_status`] keys only on `tables_copied` /
+/// `tables_failed` / `interrupted` and ignores `check_results`, so a run whose
+/// assertions failed persisted as `Success` and exited 0. `[pipeline.X.checks]
+/// fail_on_error` already promised the opposite and defaults to `true`; it was
+/// never read on this path. The quality path folds the same condition in
+/// [`super::run_local::run_quality`].
+///
+/// A `not_evaluated` check counts as failed. It carries `passed: false` and its
+/// configured severity, and "the engine could not run this check" is not a
+/// pass — the reason #1595 gave it a state distinct from `overlap_count: 0`.
+///
+/// A warning-severity failure never folds, with or without the flag: severity
+/// is the author's statement about what a failure means, and the flag governs
+/// only whether an *error* is fatal.
+pub(crate) fn fold_failed_checks_into_tables_failed(output: &mut RunOutput, fail_on_error: bool) {
+    if !fail_on_error {
+        return;
+    }
+    let (error_failures, _) = super::run_local::count_failures_by_severity(output);
+    output.tables_failed += error_failures;
+}
+
 pub(crate) fn run_status_exit_result(output: &RunOutput, run_id: &str) -> Result<()> {
     match output.derive_run_status() {
         rocky_core::state::RunStatus::PartialFailure => Err(PartialFailure {
@@ -5743,6 +5768,30 @@ pub async fn run(
     if model_phase_clean {
         write_recipe_manifests(&output, governance_adapter.as_ref(), &run_id).await;
     }
+
+    // Replication check trap (#1598), the twin of the quality-path fold in
+    // `run_local::run_quality`. `RunOutput::derive_run_status` keys only on
+    // `tables_copied` / `tables_failed` / `interrupted` and IGNORES
+    // `check_results`, and nothing on this path folded a failed check into
+    // `tables_failed` — so a replication run whose error-severity assertions
+    // FAILED persisted as `Success` and exited 0. `[pipeline.X.checks]
+    // fail_on_error` already promised the opposite ("the run exits non-zero if
+    // any error-severity check fails") and defaults to true; it was simply
+    // never read here. This wires the documented control rather than inventing
+    // a policy.
+    //
+    // Placed BEFORE `persist_run_record` — unlike the quality path, which folds
+    // after its JSON emit — because this path persists first (below) and prints
+    // later (~`print_json`). Folding here keeps the recorded status, the
+    // reconciler's view and the exit code agreeing; the JSON payload is
+    // unaffected either way, since `tables_failed` already carries compile
+    // failures and the `check_results` array is unchanged.
+    //
+    // A `not_evaluated` check counts as failed: it carries `passed: false` and
+    // its configured severity, and "the engine could not run this check" is not
+    // a pass. That is the whole reason #1595 gave it a state distinct from
+    // `overlap_count: 0`.
+    fold_failed_checks_into_tables_failed(&mut output, pipeline.checks.fail_on_error);
 
     // Persist the RunRecord so `rocky history`, `rocky replay`,
     // `rocky trace`, and `rocky cost` have real data to read.
@@ -18426,6 +18475,80 @@ backend = "local"
             "[strategy]\ntype = \"full_refresh\"\n\n[target]\ncatalog = \"\"\nschema = \"main\"\n",
         )
         .expect("write model toml");
+    }
+
+    /// #1598: a replication run whose error-severity checks FAILED must not
+    /// exit 0. The fold is what makes `derive_run_status` — which reads only
+    /// the table tallies — see a failure that lives in `check_results`.
+    ///
+    /// The `not_evaluated` case is the one worth reading. #1595 gave a check
+    /// the engine could not run its own state precisely so it would stop
+    /// reading as a clean zero; folding it here is what makes that visible in
+    /// the exit code rather than only in the JSON.
+    #[test]
+    fn failed_error_checks_fold_into_the_replication_exit_contract() {
+        use rocky_core::checks::{CheckDetails, CheckResult};
+        use rocky_core::tests::TestSeverity;
+
+        let check = |passed: bool, severity: TestSeverity| CheckResult {
+            name: "c".to_string(),
+            passed,
+            severity,
+            details: CheckDetails::RowCount {
+                source_count: 1,
+                target_count: 1,
+            },
+        };
+        let with = |checks: Vec<CheckResult>| {
+            let mut o = RunOutput::new(String::new(), 0, 1);
+            o.tables_copied = 1;
+            o.check_results.push(crate::output::TableCheckOutput {
+                asset_key: vec!["t".to_string()],
+                checks,
+            });
+            o
+        };
+
+        // A failed error-severity check makes the run fail, and the exit
+        // contract maps it like any other partial failure.
+        let mut failed = with(vec![check(false, TestSeverity::Error)]);
+        super::fold_failed_checks_into_tables_failed(&mut failed, true);
+        assert_eq!(failed.tables_failed, 1, "an error failure must fold");
+        assert!(
+            super::run_status_exit_result(&failed, "r").is_err(),
+            "a failed error-severity check must not exit 0"
+        );
+
+        // `fail_on_error = false` is the documented opt-out.
+        let mut opted_out = with(vec![check(false, TestSeverity::Error)]);
+        super::fold_failed_checks_into_tables_failed(&mut opted_out, false);
+        assert_eq!(opted_out.tables_failed, 0);
+        assert!(super::run_status_exit_result(&opted_out, "r").is_ok());
+
+        // A warning failure never folds — severity is the author's statement.
+        let mut warned = with(vec![check(false, TestSeverity::Warning)]);
+        super::fold_failed_checks_into_tables_failed(&mut warned, true);
+        assert_eq!(warned.tables_failed, 0);
+
+        // A passing check folds nothing.
+        let mut clean = with(vec![check(true, TestSeverity::Error)]);
+        super::fold_failed_checks_into_tables_failed(&mut clean, true);
+        assert_eq!(clean.tables_failed, 0);
+
+        // A not-evaluated check is a failure, not a clean zero (#1595).
+        let mut not_evaluated = with(vec![
+            rocky_core::checks::cross_source_overlap_not_evaluated(
+                "overlap",
+                vec!["a".to_string(), "b".to_string()],
+                "the query could not run".to_string(),
+                TestSeverity::Error,
+            ),
+        ]);
+        super::fold_failed_checks_into_tables_failed(&mut not_evaluated, true);
+        assert_eq!(
+            not_evaluated.tables_failed, 1,
+            "a check the engine could not run is not a pass"
+        );
     }
 
     /// `run_status_exit_result` maps the derived run status onto the CLI
