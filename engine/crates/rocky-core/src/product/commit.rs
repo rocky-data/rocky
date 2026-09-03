@@ -74,14 +74,14 @@
 //! the staged name with a symlink between the close and the rename gets that
 //! symlink renamed into place as the artifact, because `rename` acts on the
 //! name it is given and never follows it. Nothing is written through the
-//! link — but a symlink now sits where a regular file belongs, and what
-//! happens next depends on which reader arrives. The `O_NOFOLLOW` readers
-//! refuse it on unix: `read_no_follow`, behind Phase B's sidecar read and
-//! the `.ff-prev` backup. The plain `std::fs::read` readers FOLLOW it —
-//! [`verify_artifact_hashes`] and `committed_manifest` among them — so the
-//! swap surfaces there as content drift only when the link's target does not
-//! hold the staged bytes, and never as "this is a link". Same check-then-use
-//! class as the parent directory
+//! link — but a symlink now sits where a regular file belongs, and NOTHING
+//! downstream detects it as a link. The `O_NOFOLLOW` readers refuse it on
+//! unix (`read_no_follow`, behind Phase B's sidecar read and the `.ff-prev`
+//! backup); every other reader of a committed artifact here uses a plain
+//! `std::fs::read` and follows it to its target. What each of those then
+//! does with the bytes — parse them, digest them against a recorded hash —
+//! is their own business, and none of it is a link check. Same
+//! check-then-use class as the parent directory
 //! above, closed by the same fix (a dirfd plus `renameat`, or holding the
 //! staged descriptor through publication), and v0 accepts it.
 //!
