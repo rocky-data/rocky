@@ -40,7 +40,7 @@ pub fn run_docs(
     // malformed `.rocky` — fails the docs build here, before any rendering.
     // Only COMPILE failures degrade below; a docs page silently missing an
     // unparseable model would misrepresent the project.
-    let models = crate::models_loader::load_project_models(models_dir)?;
+    let models = crate::models_loader::load_project_models(models_dir, Some(&rocky_cfg.freshness))?;
 
     // Zero models is a refusal, not an empty page. The loader treats a
     // missing directory as empty, so a typo'd `--models` would render a
@@ -188,7 +188,7 @@ fn infer_column_map(
         ),
         mask: rocky_cfg.mask.clone(),
         allow_unmasked: rocky_cfg.classifications.allow_unmasked.clone(),
-        project_freshness_default: rocky_cfg.freshness.has_default(),
+        project_freshness: rocky_cfg.freshness.clone(),
         run_vars: run_vars.clone(),
     };
     // The models are already loaded (and were loaded strictly), so compile

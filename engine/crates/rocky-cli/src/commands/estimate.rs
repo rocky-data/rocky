@@ -43,7 +43,7 @@ pub async fn run_estimate(
     let (pricing_source, pricing) = resolve_pricing(&rocky_cfg, pipeline.target_adapter());
 
     // 2. Load all models.
-    let all_models = load_all_models(models_dir)?;
+    let all_models = load_all_models(models_dir, Some(&rocky_cfg.freshness))?;
 
     let models_to_estimate: Vec<_> = all_models
         .iter()
@@ -256,8 +256,11 @@ async fn run_explain(
 
 /// Load all models from a directory including one level of subdirectories
 /// (including `.rocky` DSL files).
-fn load_all_models(models_dir: &Path) -> Result<Vec<models::Model>> {
-    let mut all = crate::models_loader::load_project_models(models_dir)?;
+fn load_all_models(
+    models_dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<models::Model>> {
+    let mut all = crate::models_loader::load_project_models(models_dir, project_freshness)?;
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(all)
 }

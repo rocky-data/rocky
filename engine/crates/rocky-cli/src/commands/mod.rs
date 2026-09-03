@@ -322,7 +322,10 @@ pub(crate) fn transformation_prod_targets(
     // so this enumeration matches the rest of the transformation surface
     // (run, plan, list).
     let models_glob = crate::models_loader::resolved_models_glob(&pipeline.models, config_path);
-    let all_models = crate::models_loader::load_project_models_matching(&models_dir, &models_glob)?;
+    // No project `[freshness]`: this helper resolves target coordinates only,
+    // and it holds the pipeline config rather than the whole `RockyConfig`.
+    let all_models =
+        crate::models_loader::load_project_models_matching(&models_dir, &models_glob, None)?;
 
     let mut targets = Vec::new();
     for model in &all_models {

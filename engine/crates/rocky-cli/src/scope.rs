@@ -137,7 +137,10 @@ pub(crate) fn resolve_transformation_managed_tables(
     // Load all models the same way `rocky list models` does: top-level +
     // immediate subdirectories, including `.rocky` DSL files.
     let models_glob = crate::models_loader::resolved_models_glob(&tx.models, config_path);
-    let all_models = crate::models_loader::load_project_models_matching(&models_dir, &models_glob)?;
+    // No project `[freshness]`: this resolves managed-table FQNs only, and it
+    // holds the pipeline config rather than the whole `RockyConfig`.
+    let all_models =
+        crate::models_loader::load_project_models_matching(&models_dir, &models_glob, None)?;
 
     let mut managed = HashSet::new();
     for model in &all_models {

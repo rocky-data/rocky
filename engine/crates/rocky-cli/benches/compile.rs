@@ -275,7 +275,7 @@ fn bench_phase_breakdown(c: &mut Criterion) {
             &models_dir,
             |b, models_dir| {
                 b.iter(|| {
-                    Project::load(models_dir).unwrap();
+                    Project::load(models_dir, None).unwrap();
                 });
             },
         );

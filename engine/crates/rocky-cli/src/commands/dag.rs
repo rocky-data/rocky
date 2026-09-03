@@ -151,7 +151,7 @@ pub fn dag_output(
             } else {
                 vec![("--models".to_string(), dir.to_path_buf())]
             };
-            let models = load_all_models(dir)?;
+            let models = load_all_models(dir, Some(&cfg.freshness))?;
             let mut by_pipeline = rocky_core::unified_dag::ModelsByPipeline::new();
             for (name, pipeline) in &cfg.pipelines {
                 if matches!(
@@ -544,8 +544,11 @@ fn union_by_model_name(by_pipeline: &rocky_core::unified_dag::ModelsByPipeline) 
 
 /// Load models from a directory and its immediate subdirectories
 /// (including `.rocky` DSL files), sorted by name.
-pub(super) fn load_all_models(models_dir: &Path) -> Result<Vec<Model>> {
-    let mut all = crate::models_loader::load_project_models(models_dir)?;
+pub(super) fn load_all_models(
+    models_dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>> {
+    let mut all = crate::models_loader::load_project_models(models_dir, project_freshness)?;
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(all)
 }

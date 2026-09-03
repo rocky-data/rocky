@@ -23,7 +23,7 @@ fn fixture_path(name: &str) -> PathBuf {
 #[test]
 fn test_simple_project_loads() {
     let models_dir = fixture_path("simple_project/models");
-    let project = Project::load(&models_dir).unwrap();
+    let project = Project::load(&models_dir, None).unwrap();
 
     assert_eq!(project.model_count(), 3);
     assert!(project.model("raw_orders").is_some());
@@ -34,7 +34,7 @@ fn test_simple_project_loads() {
 #[test]
 fn test_simple_project_dag_order() {
     let models_dir = fixture_path("simple_project/models");
-    let project = Project::load(&models_dir).unwrap();
+    let project = Project::load(&models_dir, None).unwrap();
 
     // raw_orders → customer_orders → revenue_summary
     let raw_pos = project
@@ -66,7 +66,7 @@ fn test_simple_project_dag_order() {
 #[test]
 fn test_simple_project_execution_layers() {
     let models_dir = fixture_path("simple_project/models");
-    let project = Project::load(&models_dir).unwrap();
+    let project = Project::load(&models_dir, None).unwrap();
 
     // Should have 3 layers (linear chain)
     assert_eq!(project.layers.len(), 3);
@@ -78,7 +78,7 @@ fn test_simple_project_execution_layers() {
 #[test]
 fn test_simple_project_semantic_graph() {
     let models_dir = fixture_path("simple_project/models");
-    let project = Project::load(&models_dir).unwrap();
+    let project = Project::load(&models_dir, None).unwrap();
     let graph = build_semantic_graph(&project, &HashMap::new()).unwrap();
 
     assert_eq!(graph.models.len(), 3);
@@ -153,7 +153,7 @@ fn test_simple_project_lineage_edges() {
 #[test]
 fn test_mixed_project_loads() {
     let models_dir = fixture_path("mixed_project/models");
-    let project = Project::load(&models_dir).unwrap();
+    let project = Project::load(&models_dir, None).unwrap();
 
     assert_eq!(project.model_count(), 2);
     assert!(project.model("orders").is_some());
@@ -163,7 +163,7 @@ fn test_mixed_project_loads() {
 #[test]
 fn test_mixed_project_dag_order() {
     let models_dir = fixture_path("mixed_project/models");
-    let project = Project::load(&models_dir).unwrap();
+    let project = Project::load(&models_dir, None).unwrap();
 
     // orders (.sql) → order_summary (.rocky)
     let orders_pos = project
@@ -186,7 +186,7 @@ fn test_mixed_project_dag_order() {
 #[test]
 fn test_mixed_project_rocky_model_has_sql() {
     let models_dir = fixture_path("mixed_project/models");
-    let project = Project::load(&models_dir).unwrap();
+    let project = Project::load(&models_dir, None).unwrap();
 
     // The .rocky model should have been lowered to SQL
     let order_summary = project.model("order_summary").unwrap();

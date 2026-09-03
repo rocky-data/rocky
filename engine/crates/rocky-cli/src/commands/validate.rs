@@ -185,8 +185,12 @@ fn validate_inner(config_path: &Path) -> Result<ValidateOutput> {
             .iter()
             .try_fold(Vec::new(), |mut acc, (dir, glob)| {
                 let loaded = match glob {
-                    Some(glob) => crate::models_loader::load_project_models_matching(dir, glob),
-                    None => crate::models_loader::load_project_models(dir),
+                    Some(glob) => crate::models_loader::load_project_models_matching(
+                        dir,
+                        glob,
+                        Some(&cfg.freshness),
+                    ),
+                    None => crate::models_loader::load_project_models(dir, Some(&cfg.freshness)),
                 };
                 loaded.map(|models| {
                     acc.extend(models);

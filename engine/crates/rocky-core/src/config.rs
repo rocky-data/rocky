@@ -1432,32 +1432,40 @@ fn default_suffix_quarantine() -> String {
 
 /// Project-level freshness defaults.
 ///
-/// Top-level `[freshness]` block on `rocky.toml`. Provides defaults
-/// inherited by per-model
-/// [`crate::models::ModelFreshnessConfig`] declarations that omit one
-/// or more fields. Independent of the
+/// Top-level `[freshness]` block on `rocky.toml`. A model that declares
+/// no [`crate::models::ModelFreshnessConfig`] of its own, and sits under
+/// no `_defaults.toml` that declares one, inherits this block **whole**
+/// (see [`crate::models::ModelFreshnessConfig::from_project_default`]).
+/// Inheritance is not field-by-field: a model that declares its own
+/// block keeps exactly what it wrote. Independent of the
 /// [`ChecksConfig::freshness`](FreshnessConfig) check (which lives
 /// under `[checks.freshness]` and feeds the data-quality test pipeline).
 ///
 /// All fields are optional. A project-level `[freshness]` with no
-/// `expected_lag_seconds` is treated as "no project default" for the
-/// W005 soft-warn — the suppression still requires a concrete TTL.
+/// `expected_lag_seconds` supplies nothing at all: it is "no project
+/// default" for the W005 soft-warn, and it is not inherited, because a
+/// model freshness block needs a concrete TTL.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectFreshnessConfig {
     /// Default maximum lag in seconds before models are considered
     /// stale. When set, every model without its own `freshness` block
-    /// inherits this value (plus the other fields). When `None`, no
-    /// project-level default applies — per-model declarations are the
-    /// only source of freshness metadata.
+    /// inherits this value and the other fields alongside it. When
+    /// `None`, no project-level default applies — per-model declarations
+    /// are the only source of freshness metadata, and the other two
+    /// fields here are inherited by nobody.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_lag_seconds: Option<u64>,
     /// Default timestamp column used to evaluate freshness at runtime.
-    /// Inherited by per-model freshness blocks that don't specify their
-    /// own `time_column`.
+    /// Carried into a model that declares no `[freshness]` block of its
+    /// own; a model that declares one keeps its own value, or none. Only
+    /// inherited alongside an `expected_lag_seconds`. No runtime check
+    /// reads it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_column: Option<String>,
     /// Default severity reported when the freshness check trips.
+    /// Inherited on the same terms as `time_column`. No runtime check
+    /// reads it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<crate::tests::TestSeverity>,
 }
@@ -1876,32 +1884,35 @@ impl GovernanceOverride {
     }
 }
 
-/// Schema evolution configuration.
+/// Message returned when a config still declares the removed
+/// `[schema_evolution]` section.
 ///
-/// Controls how Rocky handles columns that disappear from the source but
-/// still exist in the target table. Instead of immediately dropping them,
-/// Rocky can keep them for a grace period (filling with NULL) so downstream
-/// consumers have time to adapt.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SchemaEvolutionConfig {
-    /// Number of days to keep a dropped column before removing it from the
-    /// target table. During this window the column is filled with NULL for
-    /// new rows and a warning is emitted on every run.
-    /// Default: 7.
-    #[serde(default = "default_grace_period_days")]
-    pub grace_period_days: u32,
-}
+/// Says what was removed, why it never did anything, and what to do about
+/// it. Kept as a constant so the parse test asserts the exact text a user
+/// sees.
+pub const SCHEMA_EVOLUTION_REMOVED: &str = "the `[schema_evolution]` section was removed because nothing ever read it: \
+     drift detection never reported a column that disappeared from the source, so Rocky never dropped one and \
+     `grace_period_days` never took effect. Delete the `[schema_evolution]` section from this config; \
+     removing it changes no behaviour. Grace-period column drops are tracked in \
+     https://github.com/rocky-data/rocky/issues/1616 (see issue #1435)";
 
-fn default_grace_period_days() -> u32 {
-    7
-}
+/// The removed `[schema_evolution]` section.
+///
+/// This type exists only to refuse the section loudly. Its
+/// [`Deserialize`] impl always fails with [`SCHEMA_EVOLUTION_REMOVED`], so
+/// [`RockyConfig::schema_evolution`] is `None` on every config that loads.
+/// It is hidden from the generated JSON schema (`#[schemars(skip)]` on the
+/// field), so no binding advertises a key that can only error.
+///
+/// Silently ignoring the section is what produced issue #1435 in the first
+/// place; refusing it is one edit for the user to fix and it names the
+/// edit.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemovedSchemaEvolution(());
 
-impl Default for SchemaEvolutionConfig {
-    fn default() -> Self {
-        Self {
-            grace_period_days: default_grace_period_days(),
-        }
+impl<'de> Deserialize<'de> for RemovedSchemaEvolution {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(SCHEMA_EVOLUTION_REMOVED))
     }
 }
 
@@ -2532,9 +2543,14 @@ pub struct RockyConfig {
     #[serde(default)]
     pub budget: BudgetConfig,
 
-    /// Schema evolution configuration (grace-period column drops).
-    #[serde(default)]
-    pub schema_evolution: SchemaEvolutionConfig,
+    /// The removed `[schema_evolution]` section.
+    ///
+    /// Always `None` on a config that loads: declaring the section is a
+    /// hard error carrying [`SCHEMA_EVOLUTION_REMOVED`]. See
+    /// [`RemovedSchemaEvolution`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub schema_evolution: Option<RemovedSchemaEvolution>,
 
     /// Run-level retry budget shared across every adapter for this run.
     ///
@@ -2610,10 +2626,8 @@ pub struct RockyConfig {
     #[serde(default)]
     pub branch: BranchSection,
 
-    /// Project-level freshness defaults inherited by per-model
-    /// [`crate::models::ModelFreshnessConfig`] declarations that omit
-    /// individual fields. See [`ProjectFreshnessConfig`] for the TOML
-    /// shape:
+    /// Project-level freshness defaults. See [`ProjectFreshnessConfig`]
+    /// for the TOML shape:
     ///
     /// ```toml
     /// [freshness]
@@ -2622,11 +2636,12 @@ pub struct RockyConfig {
     /// severity = "warning"
     /// ```
     ///
-    /// Inheritance is field-by-field: a per-model `[freshness]` table
-    /// always wins for the fields it sets; absent fields fall through to
-    /// the project-level default. Models with no per-model `[freshness]`
-    /// at all inherit the project default when it carries an
-    /// `expected_lag_seconds` value (the required field).
+    /// Precedence, first match wins: a model's own `[freshness]`
+    /// sidecar table, then its directory `_defaults.toml`, then this
+    /// block. Inheritance is **whole-block**: a model that declares its
+    /// own table keeps exactly what it wrote and picks up nothing from
+    /// here. This block is inherited only when it carries an
+    /// `expected_lag_seconds`.
     #[serde(default)]
     pub freshness: ProjectFreshnessConfig,
 
@@ -7394,6 +7409,65 @@ effect = "deny"
             ),
             "got {errors:?}"
         );
+    }
+
+    /// A config that still declares `[schema_evolution]` is refused, and
+    /// the message says what to delete and where the feature is tracked.
+    ///
+    /// The section parsed and validated before this change while nothing
+    /// read it (#1435). Swapping one silence for another (an anonymous
+    /// `unknown field` error) would repeat the defect, so the removal
+    /// carries its own remedy.
+    #[test]
+    fn removed_schema_evolution_section_is_refused_with_the_remedy() {
+        let err = toml::from_str::<RockyConfig>(
+            r#"
+[schema_evolution]
+grace_period_days = 30
+"#,
+        )
+        .expect_err("[schema_evolution] must be refused, not ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`[schema_evolution]` section was removed"),
+            "message must name the removed section, got: {msg}"
+        );
+        assert!(
+            msg.contains("Delete the `[schema_evolution]` section"),
+            "message must name the remedy, got: {msg}"
+        );
+        assert!(
+            msg.contains("issues/1616"),
+            "message must point at the follow-up issue, got: {msg}"
+        );
+    }
+
+    /// An empty `[schema_evolution]` table is refused too.
+    ///
+    /// The refusal is on the section, not on any one key, so a config that
+    /// declares the header and no keys cannot slip through.
+    #[test]
+    fn removed_schema_evolution_section_is_refused_even_when_empty() {
+        let err = toml::from_str::<RockyConfig>("[schema_evolution]\n")
+            .expect_err("an empty [schema_evolution] table must be refused");
+        assert!(err.to_string().contains("was removed"), "got: {err}");
+    }
+
+    /// A config that never mentions the section still loads.
+    ///
+    /// `#[serde(default)]` must keep the absent case free of the erroring
+    /// `Deserialize` impl.
+    #[test]
+    fn absent_schema_evolution_section_still_parses() {
+        let cfg = toml::from_str::<RockyConfig>(
+            r#"
+[adapter.wh]
+type = "duckdb"
+database = ":memory:"
+"#,
+        )
+        .expect("a config without [schema_evolution] must still parse");
+        assert!(cfg.schema_evolution.is_none());
     }
 
     #[test]

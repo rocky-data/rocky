@@ -83,7 +83,7 @@ pub fn run_publish_ir(
         source_schemas,
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: Vec::new(),
-        project_freshness_default: false,
+        project_freshness: Default::default(),
         run_vars: rocky_core::run_vars::RunVars::new(),
     };
 

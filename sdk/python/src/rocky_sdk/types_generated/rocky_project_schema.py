@@ -1593,22 +1593,6 @@ class SchemaCacheConfig(BaseModel):
     """
 
 
-class SchemaEvolutionConfig(BaseModel):
-    """
-    Schema evolution configuration.
-
-    Controls how Rocky handles columns that disappear from the source but still exist in the target table. Instead of immediately dropping them, Rocky can keep them for a grace period (filling with NULL) so downstream consumers have time to adapt.
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    grace_period_days: conint(ge=0) | None = 7
-    """
-    Number of days to keep a dropped column before removing it from the target table. During this window the column is filled with NULL for new rows and a warning is emitted on every run. Default: 7.
-    """
-
-
 class SchemaMismatchPolicy1(StrEnum):
     """
     Treat a forward-incompatible store as cold: log a single `WARN`, bootstrap a fresh local state, and **never write the downgraded state back** to the shared tier (so the newer state upgraded pods depend on is left intact). The run proceeds as a full refresh. Default — it turns a hard, run-stranding failure into a graceful one-time full refresh during the mixed-version window of a schema-changing upgrade.
@@ -2358,9 +2342,9 @@ class ProjectFreshnessConfig(BaseModel):
     """
     Project-level freshness defaults.
 
-    Top-level `[freshness]` block on `rocky.toml`. Provides defaults inherited by per-model [`crate::models::ModelFreshnessConfig`] declarations that omit one or more fields. Independent of the [`ChecksConfig::freshness`](FreshnessConfig) check (which lives under `[checks.freshness]` and feeds the data-quality test pipeline).
+    Top-level `[freshness]` block on `rocky.toml`. A model that declares no [`crate::models::ModelFreshnessConfig`] of its own, and sits under no `_defaults.toml` that declares one, inherits this block **whole** (see [`crate::models::ModelFreshnessConfig::from_project_default`]). Inheritance is not field-by-field: a model that declares its own block keeps exactly what it wrote. Independent of the [`ChecksConfig::freshness`](FreshnessConfig) check (which lives under `[checks.freshness]` and feeds the data-quality test pipeline).
 
-    All fields are optional. A project-level `[freshness]` with no `expected_lag_seconds` is treated as "no project default" for the W005 soft-warn — the suppression still requires a concrete TTL.
+    All fields are optional. A project-level `[freshness]` with no `expected_lag_seconds` supplies nothing at all: it is "no project default" for the W005 soft-warn, and it is not inherited, because a model freshness block needs a concrete TTL.
     """
 
     model_config = ConfigDict(
@@ -2368,15 +2352,15 @@ class ProjectFreshnessConfig(BaseModel):
     )
     expected_lag_seconds: conint(ge=0) | None = None
     """
-    Default maximum lag in seconds before models are considered stale. When set, every model without its own `freshness` block inherits this value (plus the other fields). When `None`, no project-level default applies — per-model declarations are the only source of freshness metadata.
+    Default maximum lag in seconds before models are considered stale. When set, every model without its own `freshness` block inherits this value and the other fields alongside it. When `None`, no project-level default applies — per-model declarations are the only source of freshness metadata, and the other two fields here are inherited by nobody.
     """
     severity: TestSeverity5 | TestSeverity6 | None = None
     """
-    Default severity reported when the freshness check trips.
+    Default severity reported when the freshness check trips. Inherited on the same terms as `time_column`. No runtime check reads it yet.
     """
     time_column: str | None = None
     """
-    Default timestamp column used to evaluate freshness at runtime. Inherited by per-model freshness blocks that don't specify their own `time_column`.
+    Default timestamp column used to evaluate freshness at runtime. Carried into a model that declares no `[freshness]` block of its own; a model that declares one keeps its own value, or none. Only inherited alongside an `expected_lag_seconds`. No runtime check reads it yet.
     """
 
 
@@ -3854,11 +3838,11 @@ class RockyConfig(BaseModel):
     """
     freshness: ProjectFreshnessConfig | None = Field({}, validate_default=True)
     """
-    Project-level freshness defaults inherited by per-model [`crate::models::ModelFreshnessConfig`] declarations that omit individual fields. See [`ProjectFreshnessConfig`] for the TOML shape:
+    Project-level freshness defaults. See [`ProjectFreshnessConfig`] for the TOML shape:
 
     ```toml [freshness] expected_lag_seconds = 3600 time_column = "updated_at" severity = "warning" ```
 
-    Inheritance is field-by-field: a per-model `[freshness]` table always wins for the fields it sets; absent fields fall through to the project-level default. Models with no per-model `[freshness]` at all inherit the project default when it carries an `expected_lag_seconds` value (the required field).
+    Precedence, first match wins: a model's own `[freshness]` sidecar table, then its directory `_defaults.toml`, then this block. Inheritance is **whole-block**: a model that declares its own table keeps exactly what it wrote and picks up nothing from here. This block is inherited only when it carries an `expected_lag_seconds`.
     """
     fulfill: FulfillConfig | None = Field({}, validate_default=True)
     """
@@ -3982,12 +3966,6 @@ class RockyConfig(BaseModel):
     )
     """
     Project-level schedule defaults for native demand reconciliation. Supplies the fallback timezone for per-pipeline `[…schedule]` cron blocks and the resident-loop poll cadence. See [`ScheduleDefaultsConfig`].
-    """
-    schema_evolution: SchemaEvolutionConfig | None = Field(
-        {"grace_period_days": 7}, validate_default=True
-    )
-    """
-    Schema evolution configuration (grace-period column drops).
     """
     state: StateConfig | None = Field(
         {

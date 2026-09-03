@@ -400,6 +400,35 @@ impl RockyLsp {
         notified.await;
     }
 
+    /// The project-level compiler inputs, read from `rocky.toml`.
+    ///
+    /// One derivation for both compile paths — the initial
+    /// [`Self::recompile`] and the debounced `didChange` pass. They used to
+    /// disagree: `recompile` loaded `rocky.toml` while the incremental path
+    /// built its `CompilerConfig` from `Default`, so W004 and the project
+    /// `[freshness]` block were present on open and gone after the first
+    /// keystroke.
+    ///
+    /// Project root = `models_dir.parent()`, the same assumption the
+    /// schema-cache loader makes. A missing or unreadable `rocky.toml`
+    /// falls back to empty defaults, which is the "no project config"
+    /// behaviour rather than an error: an editor must keep type-checking a
+    /// models directory that has no project around it.
+    fn project_compiler_inputs(
+        models_dir: &std::path::Path,
+    ) -> (
+        std::collections::BTreeMap<String, rocky_core::config::MaskEntry>,
+        Vec<String>,
+        rocky_core::config::ProjectFreshnessConfig,
+    ) {
+        models_dir
+            .parent()
+            .map(|root| root.join("rocky.toml"))
+            .and_then(|toml_path| rocky_core::config::load_rocky_config(&toml_path).ok())
+            .map(|c| (c.mask, c.classifications.allow_unmasked, c.freshness))
+            .unwrap_or_default()
+    }
+
     async fn recompile(&self) {
         let models_dir = self.models_dir.read().await;
         let Some(ref dir) = *models_dir else { return };
@@ -418,26 +447,9 @@ impl RockyLsp {
         .await;
 
         // Load `rocky.toml` so the W004 classification-tag check + W005
-        // freshness coverage check fire in the LSP. Without `mask` +
-        // `allow_unmasked` populated, the compiler's
-        // `check_classification_tags` is a no-op and the IDE never sees
-        // the warning. Without `project_freshness_default`, W005 fires
-        // on every model with a temporal column regardless of the
-        // project-level default. Project root = `models_dir.parent()`
-        // (the same assumption the schema-cache loader makes above).
-        // Missing or unreadable `rocky.toml` falls back to empty defaults.
-        let (mask, allow_unmasked, project_freshness_default) = dir_path
-            .parent()
-            .map(|root| root.join("rocky.toml"))
-            .and_then(|toml_path| rocky_core::config::load_rocky_config(&toml_path).ok())
-            .map(|c| {
-                (
-                    c.mask,
-                    c.classifications.allow_unmasked,
-                    c.freshness.has_default(),
-                )
-            })
-            .unwrap_or_default();
+        // freshness coverage check fire in the LSP, and so a model with no
+        // `[freshness]` block of its own carries the project's.
+        let (mask, allow_unmasked, project_freshness) = Self::project_compiler_inputs(&dir_path);
 
         let config = CompilerConfig {
             models_dir: dir_path.clone(),
@@ -445,7 +457,7 @@ impl RockyLsp {
             source_schemas,
             mask,
             allow_unmasked,
-            project_freshness_default,
+            project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
         };
 
@@ -1254,13 +1266,21 @@ impl LanguageServer for RockyLsp {
                 let source_schemas =
                     Self::load_cached_source_schemas(&dir_path, &schema_cache_throttle, dir).await;
 
+                // Same project inputs as the initial compile. Building
+                // this from `Default` left W004 off and dropped the project
+                // `[freshness]` block after the first edit, so a model's
+                // inherited freshness vanished from the IDE's view of the
+                // project the moment the user typed.
+                let (mask, allow_unmasked, project_freshness) =
+                    Self::project_compiler_inputs(&dir_path);
                 let config = CompilerConfig {
                     models_dir: dir_path,
                     contracts_dir: None,
                     source_schemas,
-                    // Incremental LSP path: W004 stays disabled until
-                    // the LSP initialization plumbs rocky.toml in.
-                    ..Default::default()
+                    mask,
+                    allow_unmasked,
+                    project_freshness,
+                    run_vars: rocky_core::run_vars::RunVars::new(),
                 };
 
                 // Try incremental compilation if we have a previous result.
@@ -4421,6 +4441,38 @@ mod tests {
     use rocky_sql::lineage::TransformKind;
     use std::sync::Arc;
 
+    /// Both LSP compile paths read the project's `rocky.toml` through one
+    /// derivation, so `mask` / `allow_unmasked` / the project `[freshness]`
+    /// block cannot be present on open and absent after the first edit.
+    ///
+    /// The debounced `didChange` path used to build its `CompilerConfig`
+    /// from `Default`, which dropped all three.
+    #[test]
+    fn project_compiler_inputs_reads_the_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("rocky.toml"),
+            "[adapter.wh]\ntype = \"duckdb\"\ndatabase = \":memory:\"\n\n\
+             [freshness]\nexpected_lag_seconds = 900\ntime_column = \"updated_at\"\n\n\
+             [classifications]\nallow_unmasked = [\"public\"]\n",
+        )
+        .unwrap();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+
+        let (_mask, allow_unmasked, freshness) = RockyLsp::project_compiler_inputs(&models);
+        assert_eq!(freshness.expected_lag_seconds, Some(900));
+        assert_eq!(freshness.time_column.as_deref(), Some("updated_at"));
+        assert_eq!(allow_unmasked, vec!["public".to_string()]);
+
+        // No project around the models directory is not an error.
+        let bare = tempfile::tempdir().unwrap();
+        let (_m, a, f) = RockyLsp::project_compiler_inputs(bare.path());
+        assert!(a.is_empty());
+        assert_eq!(f.expected_lag_seconds, None);
+    }
+
     fn make_graph() -> SemanticGraph {
         let mut models = IndexMap::new();
         models.insert(
@@ -5691,14 +5743,14 @@ mod tests {
 
         // Mirror `recompile()`'s mask/allow_unmasked threading.
         let cfg = rocky_core::config::load_rocky_config(&root.join("rocky.toml")).unwrap();
-        let project_freshness_default = cfg.freshness.has_default();
+        let project_freshness = cfg.freshness.clone();
         let compile_config = rocky_compiler::compile::CompilerConfig {
             models_dir: models_dir.clone(),
             contracts_dir: None,
             source_schemas: HashMap::new(),
             mask: cfg.mask,
             allow_unmasked: cfg.classifications.allow_unmasked,
-            project_freshness_default,
+            project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();

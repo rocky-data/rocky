@@ -3043,7 +3043,7 @@ effect = "require_review"
                 source_schemas,
                 mask: cfg.mask.clone(),
                 allow_unmasked: cfg.classifications.allow_unmasked.clone(),
-                project_freshness_default: cfg.freshness.has_default(),
+                project_freshness: cfg.freshness.clone(),
                 run_vars: rocky_core::run_vars::RunVars::new(),
             })
         };

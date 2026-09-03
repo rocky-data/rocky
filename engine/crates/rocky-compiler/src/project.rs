@@ -168,9 +168,12 @@ impl Project {
     /// calls re-parse from disk. Use [`Project::load_with_db`] when the
     /// caller already owns a `RockyDatabase` and wants the per-file
     /// parse cache to persist across compiles (LSP, watch-mode, tests).
-    pub fn load(models_dir: &Path) -> Result<Self, ProjectError> {
+    pub fn load(
+        models_dir: &Path,
+        project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+    ) -> Result<Self, ProjectError> {
         let mut db = crate::salsa_compile::RockyDatabase::default();
-        Self::load_with_db(models_dir, &mut db)
+        Self::load_with_db(models_dir, &mut db, project_freshness)
     }
 
     /// Load a project from a models directory, reusing the caller's
@@ -187,8 +190,13 @@ impl Project {
     pub fn load_with_db(
         models_dir: &Path,
         db: &mut crate::salsa_compile::RockyDatabase,
+        project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
     ) -> Result<Self, ProjectError> {
-        Self::from_models(Self::load_models_with_db(models_dir, db)?)
+        Self::from_models(Self::load_models_with_db(
+            models_dir,
+            db,
+            project_freshness,
+        )?)
     }
 
     /// Load every model from a directory **without** resolving dependencies.
@@ -202,8 +210,9 @@ impl Project {
     pub fn load_models_with_db(
         models_dir: &Path,
         db: &mut crate::salsa_compile::RockyDatabase,
+        project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
     ) -> Result<Vec<Model>, ProjectError> {
-        Self::load_models_with_db_filtered(models_dir, db, &|_| true)
+        Self::load_models_with_db_filtered(models_dir, db, &|_| true, project_freshness)
     }
 
     /// Load only model source files matching `models_glob`, without resolving
@@ -216,6 +225,7 @@ impl Project {
         models_dir: &Path,
         models_glob: &str,
         db: &mut crate::salsa_compile::RockyDatabase,
+        project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
     ) -> Result<Vec<Model>, ProjectError> {
         let pattern = compile_models_glob(models_glob)?;
         if !has_matching_model_source(models_dir, &pattern)? {
@@ -223,15 +233,19 @@ impl Project {
                 path: models_dir.display().to_string(),
             });
         }
-        Self::load_models_with_db_filtered(models_dir, db, &|path| {
-            model_path_matches(&pattern, path)
-        })
+        Self::load_models_with_db_filtered(
+            models_dir,
+            db,
+            &|path| model_path_matches(&pattern, path),
+            project_freshness,
+        )
     }
 
     fn load_models_with_db_filtered(
         models_dir: &Path,
         db: &mut crate::salsa_compile::RockyDatabase,
         include: &impl Fn(&Path) -> bool,
+        project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
     ) -> Result<Vec<Model>, ProjectError> {
         // The whole tree, through the one shared walk (#1262) — the same
         // directory set every other scanner sees, so `rocky list models`
@@ -254,10 +268,15 @@ impl Project {
             if !dir_contributes_models(dir, include) {
                 continue;
             }
-            models.extend(models::load_models_from_dir_filtered(dir, include)?);
+            models.extend(models::load_models_from_dir_filtered(
+                dir,
+                include,
+                project_freshness,
+            )?);
 
             // Also load matching .rocky files via the salsa pipeline.
-            let rocky_models = load_rocky_models_with_db_filtered(dir, db, include)?;
+            let rocky_models =
+                load_rocky_models_with_db_filtered(dir, db, include, project_freshness)?;
             if !rocky_models.is_empty() {
                 info!(count = rocky_models.len(), dir = %dir.display(), "loaded .rocky models");
                 models.extend(rocky_models);
@@ -278,9 +297,12 @@ impl Project {
     ///
     /// The non-`db` counterpart to [`Project::load_models_with_db`] — mirrors
     /// [`Project::load`]'s relationship to [`Project::load_with_db`].
-    pub fn load_models(models_dir: &Path) -> Result<Vec<Model>, ProjectError> {
+    pub fn load_models(
+        models_dir: &Path,
+        project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+    ) -> Result<Vec<Model>, ProjectError> {
         let mut db = crate::salsa_compile::RockyDatabase::default();
-        Self::load_models_with_db(models_dir, &mut db)
+        Self::load_models_with_db(models_dir, &mut db, project_freshness)
     }
 
     /// Build a project from pre-loaded models.
@@ -353,15 +375,22 @@ impl Project {
 /// this includes them. Unlike [`Project::load`] it never fails on dependency
 /// resolution (it does none), so a partial or broken DAG still yields the
 /// models that parsed.
-pub fn load_dir_models(dir: &Path) -> Result<Vec<Model>, ProjectError> {
-    let mut models = models::load_models_from_dir(dir)?;
+pub fn load_dir_models(
+    dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>, ProjectError> {
+    let mut models = models::load_models_from_dir(dir, project_freshness)?;
     let mut db = crate::salsa_compile::RockyDatabase::default();
-    models.extend(load_rocky_models_with_db(dir, &mut db)?);
+    models.extend(load_rocky_models_with_db(dir, &mut db, project_freshness)?);
     Ok(models)
 }
 
 /// Load matching `.sql` and `.rocky` models without resolving dependencies.
-pub fn load_dir_models_matching(dir: &Path, models_glob: &str) -> Result<Vec<Model>, ProjectError> {
+pub fn load_dir_models_matching(
+    dir: &Path,
+    models_glob: &str,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>, ProjectError> {
     let pattern = compile_models_glob(models_glob)?;
     // Per-DIRECTORY on purpose: callers walk the tree themselves and invoke
     // this once per visited directory, so the participation question here is
@@ -372,9 +401,14 @@ pub fn load_dir_models_matching(dir: &Path, models_glob: &str) -> Result<Vec<Mod
         return Ok(Vec::new());
     }
     let include = |path: &Path| model_path_matches(&pattern, path);
-    let mut models = models::load_models_from_dir_filtered(dir, include)?;
+    let mut models = models::load_models_from_dir_filtered(dir, include, project_freshness)?;
     let mut db = crate::salsa_compile::RockyDatabase::default();
-    models.extend(load_rocky_models_with_db_filtered(dir, &mut db, &include)?);
+    models.extend(load_rocky_models_with_db_filtered(
+        dir,
+        &mut db,
+        &include,
+        project_freshness,
+    )?);
     Ok(models)
 }
 
@@ -444,8 +478,9 @@ fn dir_has_matching_model_source(
 fn load_rocky_models_with_db(
     dir: &Path,
     db: &mut crate::salsa_compile::RockyDatabase,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
 ) -> Result<Vec<Model>, ProjectError> {
-    load_rocky_models_with_db_filtered(dir, db, &|_| true)
+    load_rocky_models_with_db_filtered(dir, db, &|_| true, project_freshness)
 }
 
 /// Whether `dir` contributes any model under `include` — the participation
@@ -480,6 +515,7 @@ fn load_rocky_models_with_db_filtered(
     dir: &Path,
     db: &mut crate::salsa_compile::RockyDatabase,
     include: &impl Fn(&Path) -> bool,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
 ) -> Result<Vec<Model>, ProjectError> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -500,6 +536,7 @@ fn load_rocky_models_with_db_filtered(
     let ctx = models::ModelLoadContext {
         groups: (!groups.is_empty()).then_some(&groups),
         test_defs: (!test_defs.is_empty()).then_some(&test_defs),
+        project_freshness,
     };
 
     let rocky_paths: Vec<PathBuf> = std::fs::read_dir(dir)
@@ -620,7 +657,21 @@ fn load_single_rocky_model_with_db(
             sources: vec![],
             adapter: None,
             intent: defaults.as_ref().and_then(|d| d.intent.clone()),
-            freshness: defaults.as_ref().and_then(|d| d.freshness.clone()),
+            // Same precedence as the sidecar path in
+            // `rocky_core::models::resolve_model_config`: directory
+            // `_defaults.toml` first, then the project `[freshness]` block
+            // (#1435). A `.rocky` model with no sidecar builds its config
+            // here instead of going through that function, so the project
+            // rung has to be repeated — without it, a DSL model would
+            // report no freshness where its `.sql` neighbour reports the
+            // inherited block.
+            freshness: defaults
+                .as_ref()
+                .and_then(|d| d.freshness.clone())
+                .or_else(|| {
+                    ctx.project_freshness
+                        .and_then(models::ModelFreshnessConfig::from_project_default)
+                }),
             tests: vec![],
             format: None,
             format_options: None,
@@ -908,7 +959,7 @@ mod tests {
         )
         .unwrap();
 
-        let models = load_dir_models(d).unwrap();
+        let models = load_dir_models(d, None).unwrap();
         let names: Vec<_> = models.iter().map(|m| m.config.name.as_str()).collect();
         assert!(names.contains(&"stg"), "sql model loaded: {names:?}");
         assert!(names.contains(&"agg"), "rocky DSL model loaded: {names:?}");
@@ -931,9 +982,60 @@ mod tests {
         .unwrap();
 
         let glob = d.join("agg*.rocky").to_string_lossy().into_owned();
-        let models = load_dir_models_matching(d, &glob).expect("load matching model");
+        let models = load_dir_models_matching(d, &glob, None).expect("load matching model");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].config.name, "agg");
+    }
+
+    /// A `.rocky` DSL model inherits the project `[freshness]` block, with
+    /// and without a `.toml` sidecar.
+    ///
+    /// The two shapes take different code paths: with a sidecar the config
+    /// comes from `resolve_model_config`; without one it is built inline in
+    /// `load_single_rocky_model_with_db`. Both must reach the project rung,
+    /// or a DSL model reports no freshness where its `.sql` neighbour
+    /// reports the inherited block (#1435).
+    #[test]
+    fn rocky_models_inherit_the_project_freshness_block() {
+        let _guard = crate::salsa_compile::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // With a sidecar that declares no freshness.
+        std::fs::write(d.join("with_sidecar.rocky"), "from orders\nselect { id }\n").unwrap();
+        std::fs::write(
+            d.join("with_sidecar.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+        // With no sidecar at all.
+        std::fs::write(d.join("bare.rocky"), "from orders\nselect { id }\n").unwrap();
+
+        let project = rocky_core::config::ProjectFreshnessConfig {
+            expected_lag_seconds: Some(1800),
+            time_column: Some("updated_at".to_string()),
+            severity: None,
+        };
+        let models = load_dir_models(d, Some(&project)).unwrap();
+
+        for name in ["with_sidecar", "bare"] {
+            let m = models
+                .iter()
+                .find(|m| m.config.name == name)
+                .unwrap_or_else(|| panic!("{name} loaded"));
+            let f = m
+                .config
+                .freshness
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} must inherit the project [freshness] block"));
+            assert_eq!(f.max_lag_seconds, 1800);
+            assert_eq!(f.time_column.as_deref(), Some("updated_at"));
+        }
+
+        // Baseline: with no project block, neither shape gains freshness.
+        let none = load_dir_models(d, None).unwrap();
+        assert!(none.iter().all(|m| m.config.freshness.is_none()));
     }
 
     /// Regression: a `.rocky` DSL model resolves a config group through the
@@ -960,7 +1062,7 @@ mod tests {
         )
         .unwrap();
 
-        let models = load_dir_models(d).unwrap();
+        let models = load_dir_models(d, None).unwrap();
         let flow = models
             .iter()
             .find(|m| m.config.name == "flow")
@@ -993,7 +1095,7 @@ mod tests {
         )
         .unwrap();
 
-        let models = load_dir_models(d).unwrap();
+        let models = load_dir_models(d, None).unwrap();
         let flow = models
             .iter()
             .find(|m| m.config.name == "flow")
@@ -1031,7 +1133,7 @@ mod tests {
         )
         .unwrap();
 
-        let models = load_dir_models(d).unwrap();
+        let models = load_dir_models(d, None).unwrap();
         let flow = models
             .iter()
             .find(|m| m.config.name == "flow")
@@ -1077,7 +1179,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = load_dir_models(d).unwrap_err();
+        let err = load_dir_models(d, None).unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -1123,7 +1225,7 @@ mod recursive_load_tests {
         write_model(&models, "top");
         write_model(&models.join("a").join("b"), "lvl2");
 
-        let loaded = Project::load_models(&models).expect("load");
+        let loaded = Project::load_models(&models, None).expect("load");
         let mut names: Vec<&str> = loaded.iter().map(|m| m.config.name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, ["lvl2", "top"]);
@@ -1139,7 +1241,7 @@ mod recursive_load_tests {
 
         let mut db = crate::salsa_compile::RockyDatabase::default();
         let glob = format!("{}/**", models.display());
-        let loaded = Project::load_models_matching_with_db(&models, &glob, &mut db)
+        let loaded = Project::load_models_matching_with_db(&models, &glob, &mut db, None)
             .expect("a deep-only project must load, not report NoModels");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].config.name, "only");
@@ -1166,12 +1268,12 @@ mod recursive_load_tests {
 
         let glob = format!("{}/orders*.sql", models.display());
         let mut db = crate::salsa_compile::RockyDatabase::default();
-        let compiled = Project::load_models_matching_with_db(&models, &glob, &mut db)
+        let compiled = Project::load_models_matching_with_db(&models, &glob, &mut db, None)
             .expect("the compiler must skip a non-participating directory's metadata");
         assert_eq!(compiled.len(), 1);
         assert_eq!(compiled[0].config.name, "orders");
 
-        let listed = load_dir_models_matching(&models, &glob)
+        let listed = load_dir_models_matching(&models, &glob, None)
             .expect("the matching loader must skip it identically");
         assert_eq!(listed.len(), 1, "both surfaces agree: orders only");
     }
@@ -1189,6 +1291,7 @@ mod recursive_load_tests {
             "name = [\n",
         );
 
-        Project::load_models(&models).expect_err("a deep malformed sidecar must fail the load");
+        Project::load_models(&models, None)
+            .expect_err("a deep malformed sidecar must fail the load");
     }
 }

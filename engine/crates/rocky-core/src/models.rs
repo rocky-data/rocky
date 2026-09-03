@@ -326,9 +326,16 @@ pub struct ModelFreshnessConfig {
 
 impl ModelFreshnessConfig {
     /// Construct from a project-level default (see
-    /// [`crate::config::ProjectFreshnessConfig`]). Used when a model
-    /// declares no `[freshness]` block of its own but the project has a
-    /// `[freshness]` section that should inherit.
+    /// [`crate::config::ProjectFreshnessConfig`]).
+    ///
+    /// Called by [`resolve_model_config`] as the last rung of the freshness
+    /// precedence chain, for a model that declares no `[freshness]` block of
+    /// its own and sits under no `_defaults.toml` that declares one.
+    ///
+    /// Returns `None` when the project block carries no
+    /// `expected_lag_seconds`: a model freshness block needs a TTL, so
+    /// a project `[freshness]` that sets only `time_column` or `severity`
+    /// supplies nothing.
     pub fn from_project_default(default: &crate::config::ProjectFreshnessConfig) -> Option<Self> {
         let max_lag_seconds = default.expected_lag_seconds?;
         Some(Self {
@@ -838,6 +845,15 @@ pub struct ModelLoadContext<'a> {
     pub groups: Option<&'a std::collections::HashMap<String, GroupConfig>>,
     /// Named test definitions (`models/test_definitions.toml`), keyed by name.
     pub test_defs: Option<&'a std::collections::HashMap<String, NamedTest>>,
+    /// The project's `[freshness]` block, when the caller holds the project
+    /// config. Last in the freshness precedence chain: a model that declares
+    /// no `[freshness]` of its own, and sits under no `_defaults.toml` that
+    /// declares one, inherits this (#1435).
+    ///
+    /// `None` means "resolve without a project" — the directory loader on
+    /// its own has no config to read, and one caller wants declared-only
+    /// budgets on purpose (see `member_max_lags` in the CLI's `tick`).
+    pub project_freshness: Option<&'a crate::config::ProjectFreshnessConfig>,
 }
 
 /// Resolve a model's `[[use_test]]` references into concrete [`TestDecl`]s by
@@ -1050,9 +1066,17 @@ fn resolve_model_config(
         .intent
         .or_else(|| defaults.and_then(|d| d.intent.clone()));
 
+    // Precedence: per-model sidecar > directory `_defaults.toml` > project
+    // `[freshness]`. The project step is the one #1435 was missing: the
+    // block parsed and validated, and no model ever saw it. (`group` carries
+    // no freshness today, unlike `strategy` above.)
     let freshness = raw
         .freshness
-        .or_else(|| defaults.and_then(|d| d.freshness.clone()));
+        .or_else(|| defaults.and_then(|d| d.freshness.clone()))
+        .or_else(|| {
+            ctx.project_freshness
+                .and_then(ModelFreshnessConfig::from_project_default)
+        });
 
     // Resolve target
     let raw_target = raw.target.unwrap_or(RawTargetConfig {
@@ -1490,8 +1514,11 @@ pub fn parse_model_inline_with_context(
 /// If `_defaults.toml` exists in the directory, it is loaded as
 /// directory-level defaults for `target.catalog`, `target.schema`,
 /// and `strategy`. Per-model sidecars override these defaults.
-pub fn load_models_from_dir(dir: &Path) -> Result<Vec<Model>, ModelError> {
-    load_models_from_dir_filtered(dir, |_| true)
+pub fn load_models_from_dir(
+    dir: &Path,
+    project_freshness: Option<&crate::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>, ModelError> {
+    load_models_from_dir_filtered(dir, |_| true, project_freshness)
 }
 
 /// Load models from one directory whose primary `.sql` paths satisfy
@@ -1502,6 +1529,7 @@ pub fn load_models_from_dir(dir: &Path) -> Result<Vec<Model>, ModelError> {
 pub fn load_models_from_dir_filtered(
     dir: &Path,
     include: impl Fn(&Path) -> bool,
+    project_freshness: Option<&crate::config::ProjectFreshnessConfig>,
 ) -> Result<Vec<Model>, ModelError> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -1519,6 +1547,7 @@ pub fn load_models_from_dir_filtered(
     let ctx = ModelLoadContext {
         groups: (!groups.is_empty()).then_some(&groups),
         test_defs: (!test_defs.is_empty()).then_some(&test_defs),
+        project_freshness,
     };
 
     // Collect all .sql file paths first (fs::read_dir is not Send)
@@ -2310,6 +2339,142 @@ table = "fct_orders"
         ));
     }
 
+    /// Build a project `[freshness]` block for the inheritance tests.
+    fn project_freshness_fixture() -> crate::config::ProjectFreshnessConfig {
+        crate::config::ProjectFreshnessConfig {
+            expected_lag_seconds: Some(3600),
+            time_column: Some("updated_at".to_string()),
+            severity: Some(crate::tests::TestSeverity::Warning),
+        }
+    }
+
+    /// Write one sidecar model into `dir`, with `extra` appended to its
+    /// `.toml`.
+    fn write_sidecar_model(dir: &Path, name: &str, extra: &str) {
+        std::fs::write(
+            dir.join(format!("{name}.toml")),
+            format!(
+                "name = \"{name}\"\ntarget = {{ catalog = \"c\", schema = \"s\", table = \"{name}\" }}\n{extra}"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join(format!("{name}.sql")), "SELECT 1").unwrap();
+    }
+
+    /// A model with no `[freshness]` sidecar inherits the project block.
+    ///
+    /// This is the #1435 gap: the project `[freshness]` section parsed and
+    /// validated, and `ModelFreshnessConfig::from_project_default` — the
+    /// function that converts it — had no caller, so no model ever saw it.
+    #[test]
+    fn model_without_sidecar_freshness_inherits_the_project_block() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_sidecar_model(dir.path(), "plain", "");
+
+        let project = project_freshness_fixture();
+        let models = load_models_from_dir(dir.path(), Some(&project)).unwrap();
+
+        let freshness = models[0]
+            .config
+            .freshness
+            .as_ref()
+            .expect("the project [freshness] block must reach a model with no sidecar block");
+        assert_eq!(freshness.max_lag_seconds, 3600);
+        assert_eq!(freshness.time_column.as_deref(), Some("updated_at"));
+        assert_eq!(
+            freshness.severity,
+            Some(crate::tests::TestSeverity::Warning)
+        );
+    }
+
+    /// A sidecar `[freshness]` block still wins over the project block.
+    ///
+    /// Precedence is sidecar > `_defaults.toml` > project. Inheritance must
+    /// not overwrite a value the model author wrote.
+    #[test]
+    fn sidecar_freshness_wins_over_the_project_block() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_sidecar_model(
+            dir.path(),
+            "own",
+            "[freshness]\nmax_lag_seconds = 60\ntime_column = \"event_ts\"\n",
+        );
+
+        let project = project_freshness_fixture();
+        let models = load_models_from_dir(dir.path(), Some(&project)).unwrap();
+
+        let freshness = models[0].config.freshness.as_ref().expect("sidecar block");
+        assert_eq!(
+            freshness.max_lag_seconds, 60,
+            "the sidecar value must survive project inheritance"
+        );
+        assert_eq!(freshness.time_column.as_deref(), Some("event_ts"));
+        assert_eq!(
+            freshness.severity, None,
+            "inheritance is whole-block, not field-by-field: an unset sidecar \
+             field stays unset rather than picking up the project value"
+        );
+    }
+
+    /// A directory `_defaults.toml` freshness block wins over the project
+    /// block, keeping the documented middle rung of the precedence chain.
+    #[test]
+    fn dir_defaults_freshness_wins_over_the_project_block() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_sidecar_model(dir.path(), "plain", "");
+        std::fs::write(
+            dir.path().join("_defaults.toml"),
+            "[freshness]\nmax_lag_seconds = 900\n",
+        )
+        .unwrap();
+
+        let project = project_freshness_fixture();
+        let models = load_models_from_dir(dir.path(), Some(&project)).unwrap();
+
+        assert_eq!(
+            models[0]
+                .config
+                .freshness
+                .as_ref()
+                .expect("defaults block")
+                .max_lag_seconds,
+            900
+        );
+    }
+
+    /// Loading without a project config leaves freshness unset.
+    ///
+    /// The baseline the inheritance test is measured against, and the
+    /// behaviour the scheduler's declared-only budget collection relies on.
+    #[test]
+    fn no_project_block_leaves_model_freshness_unset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_sidecar_model(dir.path(), "plain", "");
+
+        let models = load_models_from_dir(dir.path(), None).unwrap();
+        assert!(models[0].config.freshness.is_none());
+    }
+
+    /// A project block with no `expected_lag_seconds` supplies nothing.
+    ///
+    /// `from_project_default` needs a TTL to build a model block, so a
+    /// project `[freshness]` that sets only `time_column` or `severity`
+    /// still resolves to nothing. Pinned so the limit is visible rather
+    /// than discovered.
+    #[test]
+    fn project_block_without_a_ttl_supplies_no_model_freshness() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_sidecar_model(dir.path(), "plain", "");
+
+        let project = crate::config::ProjectFreshnessConfig {
+            expected_lag_seconds: None,
+            time_column: Some("updated_at".to_string()),
+            severity: Some(crate::tests::TestSeverity::Error),
+        };
+        let models = load_models_from_dir(dir.path(), Some(&project)).unwrap();
+        assert!(models[0].config.freshness.is_none());
+    }
+
     #[test]
     fn test_load_models_from_dir_sidecar() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -2337,7 +2502,7 @@ target = { catalog = "c", schema = "s", table = "b" }
         .unwrap();
         std::fs::write(dir.path().join("model_b.sql"), "SELECT 2").unwrap();
 
-        let models = load_models_from_dir(dir.path()).unwrap();
+        let models = load_models_from_dir(dir.path(), None).unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].config.name, "model_a");
         assert_eq!(models[1].config.name, "model_b");
@@ -2365,7 +2530,7 @@ target = { catalog = "c", schema = "s", table = "t" }
         )
         .unwrap();
 
-        let models = load_models_from_dir(dir.path()).unwrap();
+        let models = load_models_from_dir(dir.path(), None).unwrap();
         assert_eq!(models.len(), 2);
 
         let names: Vec<&str> = models.iter().map(|m| m.config.name.as_str()).collect();
@@ -2659,7 +2824,7 @@ schema = "marts"
         .unwrap();
         std::fs::write(dir.path().join("m2.sql"), "SELECT 2").unwrap();
 
-        let models = load_models_from_dir(dir.path()).unwrap();
+        let models = load_models_from_dir(dir.path(), None).unwrap();
         assert_eq!(models.len(), 2);
 
         let m1 = models.iter().find(|m| m.config.name == "m1").unwrap();
@@ -2690,7 +2855,7 @@ schema = "s"
         std::fs::write(dir.path().join("only.toml"), "").unwrap();
         std::fs::write(dir.path().join("only.sql"), "SELECT 1").unwrap();
 
-        let models = load_models_from_dir(dir.path()).unwrap();
+        let models = load_models_from_dir(dir.path(), None).unwrap();
         // Should only find "only", not "_defaults"
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].config.name, "only");
@@ -2723,7 +2888,7 @@ schema = "s"
         std::fs::write(dir.path().join("bad.toml"), "").unwrap();
         std::fs::write(dir.path().join("bad.sql"), "SELECT 1").unwrap();
 
-        let result = load_models_from_dir(dir.path());
+        let result = load_models_from_dir(dir.path(), None);
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("catalog"));
@@ -2800,7 +2965,7 @@ timestamp_column = "updated_at"
         std::fs::write(dir.path().join("m.toml"), "").unwrap();
         std::fs::write(dir.path().join("m.sql"), "SELECT 1").unwrap();
 
-        let models = load_models_from_dir(dir.path()).unwrap();
+        let models = load_models_from_dir(dir.path(), None).unwrap();
         assert_eq!(models.len(), 1);
         assert!(matches!(
             models[0].config.strategy,
@@ -3034,7 +3199,7 @@ ssn = "confidential"
         )
         .unwrap();
 
-        let models = load_models_from_dir(dir.path()).unwrap();
+        let models = load_models_from_dir(dir.path(), None).unwrap();
         assert_eq!(models.len(), 1);
         let m = &models[0];
         assert_eq!(
@@ -3215,7 +3380,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
 
-        let models = load_models_from_dir(dir.path()).unwrap();
+        let models = load_models_from_dir(dir.path(), None).unwrap();
         assert_eq!(models.len(), 1);
         let m = &models[0];
         assert_eq!(m.config.target.schema, "mart_emea");
@@ -3242,7 +3407,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
 
-        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        let m = &load_models_from_dir(dir.path(), None).unwrap()[0];
         assert_eq!(m.config.target.schema, "custom");
         assert!(matches!(m.config.strategy, StrategyConfig::FullRefresh));
     }
@@ -3267,7 +3432,7 @@ columns = ["order_id"]
         std::fs::write(dir.path().join("orders.toml"), "group = \"daily_marts\"\n").unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
 
-        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        let m = &load_models_from_dir(dir.path(), None).unwrap()[0];
         assert!(
             matches!(m.config.strategy, StrategyConfig::Merge { .. }),
             "group strategy must override the directory default"
@@ -3295,7 +3460,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT id FROM upstream").unwrap();
 
-        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        let m = &load_models_from_dir(dir.path(), None).unwrap()[0];
         assert_eq!(
             m.config.tags.get("domain").map(String::as_str),
             Some("finance")
@@ -3321,7 +3486,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT id FROM upstream").unwrap();
 
-        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        let m = &load_models_from_dir(dir.path(), None).unwrap()[0];
         assert_eq!(
             m.config.tags.get("owner").map(String::as_str),
             Some("data-eng")
@@ -3344,7 +3509,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
 
-        let err = load_models_from_dir(dir.path()).unwrap_err();
+        let err = load_models_from_dir(dir.path(), None).unwrap_err();
         assert!(
             matches!(err, ModelError::UnknownGroup { .. }),
             "got {err:?}"
@@ -3369,7 +3534,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
 
-        let err = load_models_from_dir(dir.path()).unwrap_err();
+        let err = load_models_from_dir(dir.path(), None).unwrap_err();
         assert!(
             matches!(err, ModelError::InvalidGroup { .. }),
             "got {err:?}"
@@ -3400,7 +3565,7 @@ columns = ["order_id"]
             .unwrap();
             std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
 
-            let err = load_models_from_dir(dir.path()).unwrap_err();
+            let err = load_models_from_dir(dir.path(), None).unwrap_err();
             assert!(
                 matches!(&err, ModelError::GroupOverride { field: f, .. } if f == field),
                 "expected GroupOverride for {field}, got {err:?}"
@@ -3426,7 +3591,7 @@ columns = ["order_id"]
         )
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
-        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        let m = &load_models_from_dir(dir.path(), None).unwrap()[0];
         assert_eq!(m.config.target.schema, "mart_emea");
 
         // The same override under a NON-enforced group is allowed (pin a schema
@@ -3443,7 +3608,7 @@ columns = ["order_id"]
         )
         .unwrap();
         std::fs::write(dir2.path().join("orders.sql"), "SELECT id, v FROM upstream").unwrap();
-        let m2 = &load_models_from_dir(dir2.path()).unwrap()[0];
+        let m2 = &load_models_from_dir(dir2.path(), None).unwrap()[0];
         assert_eq!(
             m2.config.target.schema, "escape",
             "non-enforced group allows override"
@@ -3467,7 +3632,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
 
-        let err = load_models_from_dir(dir.path()).unwrap_err();
+        let err = load_models_from_dir(dir.path(), None).unwrap_err();
         assert!(
             matches!(err, ModelError::GroupArgsWithPinnedSchema { ref model, ref group }
                 if model == "orders" && group == "marts"),
@@ -3489,7 +3654,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
 
-        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        let m = &load_models_from_dir(dir.path(), None).unwrap()[0];
         assert_eq!(
             m.config.target.schema, "escape",
             "a pin without args overrides the group, bypassing the template"
@@ -3513,7 +3678,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
 
-        let err = load_models_from_dir(dir.path()).unwrap_err();
+        let err = load_models_from_dir(dir.path(), None).unwrap_err();
         assert!(
             matches!(err, ModelError::InvalidGroup { ref model, .. } if model == "orders"),
             "got {err:?}"
@@ -3543,7 +3708,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
 
-        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        let m = &load_models_from_dir(dir.path(), None).unwrap()[0];
         assert_eq!(m.config.tests.len(), 2);
         // Definition default column is used when the reference omits one.
         let status = &m.config.tests[0];
@@ -3574,7 +3739,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
 
-        let m = &load_models_from_dir(dir.path()).unwrap()[0];
+        let m = &load_models_from_dir(dir.path(), None).unwrap()[0];
         assert_eq!(m.config.tests.len(), 2, "inline test + resolved reference");
         // The reference's column overrides the definition default ("id").
         assert_eq!(m.config.tests[1].column.as_deref(), Some("email"));
@@ -3598,7 +3763,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
 
-        let err = load_models_from_dir(dir.path()).unwrap_err();
+        let err = load_models_from_dir(dir.path(), None).unwrap_err();
         assert!(
             matches!(err, ModelError::ParseFrontmatter { .. }),
             "expected ParseFrontmatter for unknown [[use_test]] field, got {err:?}"
@@ -3621,7 +3786,7 @@ columns = ["order_id"]
         .unwrap();
         std::fs::write(dir.path().join("orders.sql"), "SELECT 1 AS id").unwrap();
 
-        let err = load_models_from_dir(dir.path()).unwrap_err();
+        let err = load_models_from_dir(dir.path(), None).unwrap_err();
         assert!(matches!(err, ModelError::UnknownTest { .. }), "got {err:?}");
     }
 
