@@ -156,7 +156,7 @@ export type QualityAssertion = {
   /**
    * Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
    *
-   * Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+   * Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
    *
    * Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
    */
@@ -1245,7 +1245,7 @@ export interface ChecksConfig {
  */
 export interface CrossSourceOverlapConfig {
   /**
-   * Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources without a single natural key. Mutually exclusive with `keys`. Passed through verbatim (trusted config, like `unique_expr`).
+   * Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources without a single natural key. Mutually exclusive with `keys`. Spliced into the overlap query as written (like `unique_expr`); SQL generation refuses a statement terminator and any construct the target dialects lex differently, but does not bound the expression otherwise.
    */
   key_expr?: string | null;
   /**

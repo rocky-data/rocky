@@ -425,7 +425,7 @@ Type-specific parameters:
 | `regex_match` | `pattern: String` (dialect-specific regex; no single quotes, backticks, or semicolons) |
 | `aggregate` | `op: sum\|count\|avg\|min\|max`, `cmp: lt\|lte\|gt\|gte\|eq\|ne`, `value: String` |
 | `composite` | `kind: "unique"`, `columns: [String]` (≥2) |
-| `unique_expr` | `key_expr: String` (derived SQL key, e.g. `md5(tenant \|\| '-' \|\| id)`; passed through verbatim) |
+| `unique_expr` | `key_expr: String` (derived SQL key, e.g. `md5(tenant \|\| '-' \|\| id)`; passed through as written, minus the statement-terminator refusal) |
 | `older_than_n_days` | `days: u32` |
 
 ```toml

@@ -261,10 +261,13 @@ class CheckResult(BaseModel):
     # the failing-row count. ``kind`` is snake_case (e.g. ``"not_null"``).
     kind: str | None = None
     failing_rows: int | None = None
-    # Cross-source-overlap check fields.
+    # Cross-source-overlap check fields. ``not_evaluated`` carries the reason
+    # when the check could NOT run; ``overlap_count`` is only a measurement
+    # while it is ``None``.
     contributing_tables: list[str] | None = None
     overlap_count: int | None = None
     sample: list[str] | None = None
+    not_evaluated: str | None = None
 
 
 class TableCheckResult(BaseModel):

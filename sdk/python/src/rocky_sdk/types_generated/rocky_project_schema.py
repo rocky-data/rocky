@@ -2116,7 +2116,7 @@ class CrossSourceOverlapConfig(BaseModel):
     )
     key_expr: str | None = None
     """
-    Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources without a single natural key. Mutually exclusive with `keys`. Passed through verbatim (trusted config, like `unique_expr`).
+    Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources without a single natural key. Mutually exclusive with `keys`. Spliced into the overlap query as written (like `unique_expr`); SQL generation refuses a statement terminator and any construct the target dialects lex differently, but does not bound the expression otherwise.
     """
     keys: list[str] | None = []
     """
@@ -2393,7 +2393,7 @@ class QualityAssertion1(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2425,7 +2425,7 @@ class QualityAssertion2(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2457,7 +2457,7 @@ class QualityAssertion3(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2493,7 +2493,7 @@ class QualityAssertion4(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2533,7 +2533,7 @@ class QualityAssertion5(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2569,7 +2569,7 @@ class QualityAssertion6(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2611,7 +2611,7 @@ class QualityAssertion7(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2655,7 +2655,7 @@ class QualityAssertion8(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2693,7 +2693,7 @@ class QualityAssertion9(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2739,7 +2739,7 @@ class QualityAssertion10(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2770,7 +2770,7 @@ class QualityAssertion11(BaseModel):
     """
     Assert that a derived **key expression** is unique across all rows — the `GROUP BY <expr> HAVING COUNT(*) > 1` form that neither `Unique` (single column) nor `Composite` (column tuple) can express. The meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union), not any stored column.
 
-    `key_expr` is a SQL scalar expression evaluated against the target (e.g. `md5(databasename || '-' || id)`). It is passed through **verbatim** — the same trusted-config contract as [`TestType::Expression`] — so the caller is responsible for sandboxing execution.
+    `key_expr` is a SQL scalar expression evaluated against the target (e.g. `md5(databasename || '-' || id)`). Rocky does not parse it — it is spliced into the generated query as written, minus one narrow check: SQL generation refuses a `;` outside a literal or comment, and refuses any construct the five target dialects lex differently (see `rocky_sql::validation::reject_statement_terminator`). That stops the fragment ending Rocky's statement. It does NOT make the fragment a single expression — parentheses are not tracked, so it can still close Rocky's parenthesis and add clauses — and nothing bounds what it may READ. It runs with the project's warehouse credentials.
 
     Set-based; not quarantinable. Mirrors `Unique`'s NULL handling (NULL keys are not excluded; use `filter` to scope them out).
     """
@@ -2783,7 +2783,7 @@ class QualityAssertion11(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2819,7 +2819,7 @@ class QualityAssertion12(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """
@@ -2851,7 +2851,7 @@ class QualityAssertion13(BaseModel):
     """
     Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.
 
-    Filter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).
+    Filter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.
 
     Example: `filter = "created_at > current_date - interval 30 day"` restricts a `not_null` check to rows created in the last 30 days.
     """

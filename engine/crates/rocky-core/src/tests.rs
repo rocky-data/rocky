@@ -174,10 +174,15 @@ pub enum TestType {
     /// be stable across a multi-tenant union), not any stored column.
     ///
     /// `key_expr` is a SQL scalar expression evaluated against the target
-    /// (e.g. `md5(databasename || '-' || id)`). It is passed through
-    /// **verbatim** — the same trusted-config contract as
-    /// [`TestType::Expression`] — so the caller is responsible for sandboxing
-    /// execution.
+    /// (e.g. `md5(databasename || '-' || id)`). Rocky does not parse it — it is
+    /// spliced into the generated query as written, minus one narrow check: SQL
+    /// generation refuses a `;` outside a literal or comment, and refuses any
+    /// construct the five target dialects lex differently (see
+    /// `rocky_sql::validation::reject_statement_terminator`). That stops the
+    /// fragment ending Rocky's statement. It does NOT make the fragment a
+    /// single expression — parentheses are not tracked, so it can still close
+    /// Rocky's parenthesis and add clauses — and nothing bounds what it may
+    /// READ. It runs with the project's warehouse credentials.
     ///
     /// Set-based; not quarantinable. Mirrors `Unique`'s NULL handling (NULL
     /// keys are not excluded; use `filter` to scope them out).
@@ -343,8 +348,9 @@ pub struct TestDecl {
     /// to `TRUE` are subject to the assertion — rows where the filter
     /// is `FALSE` or `NULL` pass unconditionally.
     ///
-    /// Filter is user-supplied SQL; the caller is responsible for
-    /// sandboxing execution (same contract as `expression`).
+    /// Filter is user-supplied SQL, spliced in as written (same contract as
+    /// `expression`). SQL generation applies the same narrow refusal — see
+    /// [`TestType::UniqueExpr`] for exactly what it does and does not bound.
     ///
     /// Example: `filter = "created_at > current_date - interval 30 day"`
     /// restricts a `not_null` check to rows created in the last 30 days.
@@ -431,6 +437,20 @@ fn generate_test_sql_inner(
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
+    // `filter` is user-supplied SQL spliced into every arm below, so refuse a
+    // statement terminator here — before the per-arm dispatch, so a `filter`
+    // on a kind that later returns its own error (e.g. `regex_match` without a
+    // dialect) still reports the injection rather than the other failure.
+    if let Some(f) = filter {
+        validation::reject_statement_terminator(
+            &format!(
+                "{} test `filter` on {table}",
+                test_type_kind(&test.test_type)
+            ),
+            f,
+        )?;
+    }
+
     match &test.test_type {
         TestType::NotNull => {
             let col = require_column(test, "not_null")?;
@@ -453,6 +473,15 @@ fn generate_test_sql_inner(
             validation::validate_identifier(col)?;
             if values.is_empty() {
                 return Err(TestGenError::EmptyAcceptedValues);
+            }
+            // Each value is wrapped in a `'...'` literal by doubling quotes.
+            // That is only safe where `''` is the sole escape; a backslash makes
+            // three of the five dialects read the closing quote differently.
+            for v in values {
+                validation::reject_unquotable_literal(
+                    &format!("accepted_values test value on {table}"),
+                    v,
+                )?;
             }
             let in_list = values
                 .iter()
@@ -488,7 +517,16 @@ fn generate_test_sql_inner(
                 return Err(TestGenError::MissingExpression);
             }
             // Expression is user-supplied SQL — we cannot validate it as an
-            // identifier. The caller is responsible for sandboxing execution.
+            // identifier. The gate below refuses anything that could END this
+            // statement and start another. It does NOT make the fragment one
+            // expression: parentheses are not tracked, so the fragment can
+            // still close the `NOT (` below and add clauses. Nor does it bound
+            // reads — a subquery or a DuckDB `read_csv` still runs with the
+            // project's credentials. See `reject_statement_terminator`.
+            validation::reject_statement_terminator(
+                &format!("expression test `expression` on {table}"),
+                expression,
+            )?;
             Ok(format!(
                 "SELECT COUNT(*) FROM {table} WHERE {}NOT ({expression})",
                 filter_and(filter),
@@ -564,11 +602,19 @@ fn generate_test_sql_inner(
                 return Err(TestGenError::EmptyKeyExpr);
             }
             // key_expr is user-supplied SQL (same contract as Expression) —
-            // not an identifier, so it's passed through verbatim, wrapped in
+            // not an identifier, so it's spliced in as written, wrapped in
             // parens. NULL handling mirrors `Unique` (no auto-exclusion; use
             // `filter` to scope NULL keys out). The expression is repeated in
             // GROUP BY rather than referencing the `_k` alias because not all
             // dialects (Databricks, BigQuery) allow grouping by a select alias.
+            //
+            // The expression is spliced TWICE into one statement, so an
+            // unbalanced quote could pair across the two copies — see
+            // `reject_statement_terminator`, which refuses that too.
+            validation::reject_statement_terminator(
+                &format!("unique_expr test `key_expr` on {table}"),
+                key_expr,
+            )?;
             let where_clause = filter.map(|f| format!(" WHERE ({f})")).unwrap_or_default();
             Ok(format!(
                 "SELECT ({key_expr}) AS _k, COUNT(*) FROM {table}{where_clause} GROUP BY ({key_expr}) HAVING COUNT(*) > 1"
@@ -1556,5 +1602,176 @@ value = "0"
         };
         let err = generate_test_sql(&decl, "t").unwrap_err();
         assert!(err.to_string().contains("requires a 'days' field"));
+    }
+
+    // ----- Statement-terminator refusal (issue #1524) -----
+    //
+    // Each user-supplied SQL fragment (`expression`, `filter`, `key_expr`) is
+    // spliced inside parentheses into a statement Rocky builds. A `;` in the
+    // fragment would let the author's text end that statement and start
+    // another. `generate_test_sql*` refuses it at generation time.
+
+    #[test]
+    fn accepted_values_refuses_a_backslash_in_a_value() {
+        // The value is wrapped in a `'...'` literal by doubling quotes. On
+        // Snowflake / DuckDB / BigQuery a trailing backslash escapes the first
+        // quote of that pair, so the second closes the literal and the rest of
+        // the value becomes live SQL. Quote-doubling alone cannot contain it.
+        let decl = TestDecl {
+            test_type: TestType::AcceptedValues {
+                values: vec!["pending".into(), "trailing_backslash\\".into()],
+            },
+            column: Some("status".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("backslash"), "{msg}");
+        assert!(
+            msg.contains("accepted_values test value on db.sc.orders"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn accepted_values_still_accepts_a_quote_and_a_semicolon() {
+        // Quote doubling still handles the ordinary cases — this must not
+        // become a blanket refusal of punctuation.
+        let decl = TestDecl {
+            test_type: TestType::AcceptedValues {
+                values: vec!["O'Brien".into(), "a;b".into()],
+            },
+            column: Some("name".into()),
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let sql = generate_test_sql(&decl, "t").unwrap();
+        assert!(sql.contains("('O''Brien', 'a;b')"), "{sql}");
+    }
+
+    #[test]
+    fn expression_refuses_a_statement_terminator() {
+        let decl = TestDecl {
+            test_type: TestType::Expression {
+                expression: "1=1) OR (1=1); SELECT 1; --".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(
+            msg.contains("expression test `expression` on db.sc.orders"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn filter_refuses_a_statement_terminator() {
+        let decl = TestDecl {
+            test_type: TestType::NotNull,
+            column: Some("customer_id".into()),
+            severity: TestSeverity::Error,
+            filter: Some("1=1); SELECT 1; --".into()),
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(
+            msg.contains("not_null test `filter` on db.sc.orders"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn filter_is_refused_before_a_kind_specific_error() {
+        // `regex_match` without a dialect returns `RegexNotSupported`. The
+        // filter gate runs BEFORE the per-kind dispatch, so an injected filter
+        // reports the injection, not the missing dialect.
+        let decl = TestDecl {
+            test_type: TestType::RegexMatch {
+                pattern: "^a".into(),
+            },
+            column: Some("code".into()),
+            severity: TestSeverity::Error,
+            filter: Some("1=1); SELECT 1; --".into()),
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(!msg.contains("not supported"), "{msg}");
+    }
+
+    #[test]
+    fn key_expr_refuses_a_statement_terminator() {
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "md5(a)); SELECT 1; --".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(
+            msg.contains("unique_expr test `key_expr` on db.sc.orders"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn key_expr_refuses_an_unbalanced_quote() {
+        // `key_expr` is spliced TWICE (SELECT + GROUP BY), so an odd quote
+        // count pairs across the two copies and can expose the tail of the
+        // second copy as live SQL. Refuse the imbalance itself.
+        let decl = TestDecl {
+            test_type: TestType::UniqueExpr {
+                key_expr: "a' ; SELECT 1; --".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "db.sc.orders").unwrap_err();
+        assert!(err.to_string().contains("unterminated"), "{err}");
+    }
+
+    #[test]
+    fn expression_refuses_a_single_trailing_terminator() {
+        // Strictness call: a trailing `;` is refused, not trimmed. The
+        // fragment is spliced as `NOT (…)`, so `NOT (amount > 0;)` is already
+        // a syntax error at execute time — refusing breaks no working config
+        // and never silently rewrites the author's SQL.
+        let decl = TestDecl {
+            test_type: TestType::Expression {
+                expression: "amount > 0;".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: None,
+        };
+        let err = generate_test_sql(&decl, "t").unwrap_err();
+        assert!(err.to_string().contains("statement terminator"), "{err}");
+    }
+
+    #[test]
+    fn fragments_still_accept_quoted_semicolons_and_comments() {
+        // The false-positive set: a `;` inside a string literal, a quoted
+        // identifier, a line comment or a block comment is not a terminator.
+        let decl = TestDecl {
+            test_type: TestType::Expression {
+                expression: "note <> 'a;b' /* ; */ AND \"odd;col\" > 0 -- ;\n".into(),
+            },
+            column: None,
+            severity: TestSeverity::Error,
+            filter: Some("region = 'US;CA'".into()),
+        };
+        let sql = generate_test_sql(&decl, "orders").unwrap();
+        assert!(sql.contains("(region = 'US;CA') AND NOT ("), "{sql}");
     }
 }

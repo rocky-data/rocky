@@ -798,7 +798,7 @@
       "description": "Cross-source overlap check: flags the same business key appearing in more than one *sibling* source feeding a shared consolidation target (the \"same account onboarded twice under two paths\" case). Siblings are grouped by the runner; this config carries only the key + thresholds.\n\n`keys` (a column tuple) and `key_expr` (a derived SQL expression) are mutually exclusive — exactly one must be set, mirroring `unique` / `unique_expr`.",
       "properties": {
         "key_expr": {
-          "description": "Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources without a single natural key. Mutually exclusive with `keys`. Passed through verbatim (trusted config, like `unique_expr`).",
+          "description": "Derived business-key expression (e.g. `md5(a || '-' || b)`), for sources without a single natural key. Mutually exclusive with `keys`. Spliced into the overlap query as written (like `unique_expr`); SQL generation refuses a statement terminator and any construct the target dialects lex differently, but does not bound the expression otherwise.",
           "type": [
             "string",
             "null"
@@ -2912,7 +2912,7 @@
           "type": "object"
         },
         {
-          "description": "Assert that a derived **key expression** is unique across all rows — the `GROUP BY <expr> HAVING COUNT(*) > 1` form that neither `Unique` (single column) nor `Composite` (column tuple) can express. The meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union), not any stored column.\n\n`key_expr` is a SQL scalar expression evaluated against the target (e.g. `md5(databasename || '-' || id)`). It is passed through **verbatim** — the same trusted-config contract as [`TestType::Expression`] — so the caller is responsible for sandboxing execution.\n\nSet-based; not quarantinable. Mirrors `Unique`'s NULL handling (NULL keys are not excluded; use `filter` to scope them out).",
+          "description": "Assert that a derived **key expression** is unique across all rows — the `GROUP BY <expr> HAVING COUNT(*) > 1` form that neither `Unique` (single column) nor `Composite` (column tuple) can express. The meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union), not any stored column.\n\n`key_expr` is a SQL scalar expression evaluated against the target (e.g. `md5(databasename || '-' || id)`). Rocky does not parse it — it is spliced into the generated query as written, minus one narrow check: SQL generation refuses a `;` outside a literal or comment, and refuses any construct the five target dialects lex differently (see `rocky_sql::validation::reject_statement_terminator`). That stops the fragment ending Rocky's statement. It does NOT make the fragment a single expression — parentheses are not tracked, so it can still close Rocky's parenthesis and add clauses — and nothing bounds what it may READ. It runs with the project's warehouse credentials.\n\nSet-based; not quarantinable. Mirrors `Unique`'s NULL handling (NULL keys are not excluded; use `filter` to scope them out).",
           "properties": {
             "key_expr": {
               "description": "SQL scalar expression whose value must be unique across rows.",
@@ -2980,7 +2980,7 @@
         },
         "filter": {
           "default": null,
-          "description": "Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.\n\nFilter is user-supplied SQL; the caller is responsible for sandboxing execution (same contract as `expression`).\n\nExample: `filter = \"created_at > current_date - interval 30 day\"` restricts a `not_null` check to rows created in the last 30 days.",
+          "description": "Optional SQL boolean predicate that scopes the assertion to a subset of rows. When set, only rows where `(filter)` evaluates to `TRUE` are subject to the assertion — rows where the filter is `FALSE` or `NULL` pass unconditionally.\n\nFilter is user-supplied SQL, spliced in as written (same contract as `expression`). SQL generation applies the same narrow refusal — see [`TestType::UniqueExpr`] for exactly what it does and does not bound.\n\nExample: `filter = \"created_at > current_date - interval 30 day\"` restricts a `not_null` check to rows created in the last 30 days.",
           "type": [
             "string",
             "null"
