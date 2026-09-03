@@ -6469,14 +6469,17 @@ fn apply_defer_rewrite(
     //
     // ‼️ #1282 makes one thing reachable here that was latent before. These rules
     // reach `qualify_deferred_refs` ONLY as the CTE-shadowing question, and on
-    // Snowflake that question now has Snowflake's answer: a quoted lowercase
-    // alias does not hide an unquoted reference, because the warehouse does not
-    // bind those either. The reference is then a table reference, and `--defer`
-    // qualifies it to the deferred model's target — a bare name matching a model
-    // name IS that model (`resolve::classify_table_ref`). There is no near-miss
-    // to report on this path, so the answer has to be right rather than
-    // reported; see the note on `qualify_deferred_refs` for why matching the
-    // warehouse is the right answer and clearing the axis would be worse.
+    // Snowflake that question now gets the answer the warehouse gives UNDER ITS
+    // DEFAULT `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`: a quoted lowercase alias
+    // does not hide an unquoted reference, because Snowflake does not bind those
+    // either. The reference is then a table reference, and `--defer` qualifies it
+    // to the deferred model's target — a bare name matching a model name IS that
+    // model (`resolve::classify_table_ref`).
+    //
+    // Read that scope narrowly: there is no near-miss to report on this path and
+    // therefore no refusal, so the answer is acted on rather than checked. The
+    // note on `qualify_deferred_refs` says what is still assumed and what it
+    // costs.
     let case_rules = dialect_case_rules(dialect)?;
     let recursive_visibility = dialect_recursive_cte_visibility(dialect);
 
@@ -6751,7 +6754,9 @@ pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules
                 configured target in upper case (`MAIN.ORDERS`), so the reference resolves onto \
                 it. A half-quoted reference such as `\"main\".orders` needs both — its quoted \
                 part must match the target's spelling and its unquoted part must be upper case in \
-                the target. An account that sets QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE, or a \
+                the target. Where a component is a reserved word (`ORDER`, `SELECT`, …) only the \
+                quoting remedy is available: such a name cannot be read unquoted at all. An \
+                account that sets QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE, or a \
                 catalog-linked database with CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE, makes \
                 the two one object — but Rocky cannot read either setting (#1281), so the \
                 spelling still has to be unambiguous without them";

@@ -95,17 +95,25 @@ impl DeferTarget {
 /// stays exact — see the note in `pre_visit_relation`.
 ///
 /// ‼️ There is NO near-miss report on this path and no way to refuse, so the
-/// scope answer has to be right rather than merely reported. It is: the stack
-/// resolves an alias and a reference exactly as the warehouse does, so a CTE
-/// hides a reference here in precisely the cases the warehouse binds them. On
-/// Snowflake that means a quoted lowercase alias does NOT hide an unquoted
-/// reference — the warehouse does not bind those either — and the reference is
-/// therefore a table reference, which `--defer` qualifies to the deferred
+/// scope answer is ACTED ON rather than checked — and on a dialect that folds
+/// unquoted identifiers it rests on an assumption. Under Snowflake's DEFAULT
+/// `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE` the stack matches the warehouse
+/// exactly: a quoted lowercase alias does not hide an unquoted reference, so the
+/// reference is a table reference, which `--defer` qualifies to the deferred
 /// model's target because a bare name matching a model name IS that model
-/// (`resolve::classify_table_ref`). Clearing the axis here would be worse, not
-/// safer: Rocky would treat the alias as capturing a reference the warehouse
-/// leaves free, and emit SQL whose meaning it had modelled wrongly. Pinned by
+/// (`resolve::classify_table_ref`). Pinned by
 /// `defer_cte_alias_comparison_follows_dialect_identity`.
+///
+/// Under `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` that parameter folds a
+/// DOUBLE-QUOTED identifier to upper case too, so the CTE does bind and this
+/// qualification is wrong — silently, because nothing here can refuse. Clearing
+/// the axis does NOT close that: the same pair is then mis-bound under the
+/// DEFAULT instead, which is what the rules before #1282 did. The change moves
+/// the error from the default configuration to an opt-out one; it does not
+/// create it. Closing it properly needs a three-valued binding — bound, free, or
+/// setting-dependent, refusing the third — or #1281's live probe. Deliberately
+/// not built here on an unverified reading of how that parameter treats a CTE
+/// alias.
 ///
 /// Unlike [`rewrite_upstream_refs`] this reports no case near-misses, and that
 /// asymmetry is deliberate rather than an omission. That matcher compares a

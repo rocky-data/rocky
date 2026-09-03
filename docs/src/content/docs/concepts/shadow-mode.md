@@ -114,8 +114,10 @@ Those are two different tables with the same text.
 
 Rocky resolves the reference the way Snowflake resolves it before matching. So
 an upper-case target read by an unquoted reference routes normally — that is the
-idiomatic Snowflake project, and nothing changes for it. A lower-case or
-mixed-case target read by an unquoted reference is refused instead of redirected.
+idiomatic Snowflake project. It also routes when the reference is written in a
+different case, such as `FROM main.orders` against `MAIN.ORDERS`; that spelling
+used to be refused. A lower-case or mixed-case target read by an unquoted
+reference is refused instead of redirected.
 
 Two ways to fix a refusal, either one:
 
@@ -126,7 +128,8 @@ Two ways to fix a refusal, either one:
 
 A half-quoted reference such as `"main".orders` needs both: the quoted part must
 match the target's spelling, and the unquoted part must be upper case in the
-target.
+target. A name that is a reserved word (`ORDER`, `SELECT`, …) has only the first
+remedy — it cannot be read unquoted at all.
 
 On an account with Snowflake's default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`,
 a lower-case target read unquoted could not be read on a plain run either. The
@@ -139,16 +142,23 @@ can read neither, so it asks for an unambiguous spelling instead.
 
 ### CTE names on Snowflake
 
-The same rule decides whether a CTE hides a bare table name. On Snowflake that
-answer is now Snowflake's own: `WITH "orders" AS (…)` does not hide an unquoted
-`FROM orders`, because the warehouse does not bind those two names either. An
-unquoted CTE alias still hides an unquoted reference, which is the ordinary
-shape.
+The same rule decides whether a CTE hides a bare table name. Under Snowflake's
+default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE` that answer is now the
+warehouse's own: `WITH "orders" AS (…)` does not hide an unquoted `FROM orders`,
+and `WITH "ORDERS" AS (…)` does. An unquoted CTE alias still hides an unquoted
+reference, which is the ordinary shape.
 
 In a shadow or branch run the freed reference goes to the matcher, which routes
 it or refuses it. `--defer` has no matcher and no refusal: the freed reference is
 a table reference, and a bare name that matches a model name is that model, so
 `--defer` qualifies it to that model's target.
+
+With `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` a double-quoted identifier folds to
+upper case too, so `WITH "orders"` does hide `FROM orders` and Rocky's answer is
+wrong. On `--defer` that is silent, because nothing on that path can refuse.
+Rocky cannot read the setting. The rule before this one had the mirror of that
+problem under the default setting, so the error now falls on an opt-out
+configuration rather than the common one.
 
 ## Shadow target rewriting
 
