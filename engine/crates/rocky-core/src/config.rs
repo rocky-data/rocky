@@ -3861,7 +3861,7 @@ impl AdapterConfig {
     /// |--------------|------------------------------------------------------------|
     /// | `duckdb`     | `path`: the canonical file path, or `:memory: pid=<pid>`   |
     /// | `databricks` | `host`, `http_path`                                        |
-    /// | `snowflake`  | `account`, `host` (when configured), `database`, `warehouse` |
+    /// | `snowflake`  | `account`, `host` (when configured), `database`            |
     /// | `bigquery`   | `project_id`                                               |
     /// | `trino`      | `host`, `catalog` (the `database` slot)                    |
     /// | `fivetran`   | `destination_id`                                           |
@@ -3880,6 +3880,21 @@ impl AdapterConfig {
     /// session's default database, and the identity does **not** stand a
     /// user name in for it: two such sessions on one account are one
     /// endpoint to Rocky.
+    ///
+    /// The Snowflake `warehouse` is out too, for the other half of the
+    /// contract: it is compute, not location (#1584). It rides in the SQL
+    /// API request beside `database` and `schema` but selects the virtual
+    /// warehouse that runs the statement — it resolves no name, so it
+    /// cannot decide which `catalog.schema.table` a write lands in. The
+    /// one place it reaches emitted SQL is a *transformation* model's
+    /// Snowflake dynamic-table DDL (`WAREHOUSE = <wh>`, the refresh
+    /// compute stored on the object), whose target is formatted
+    /// separately from the model's own catalog/schema/table; a
+    /// replication pipeline refuses `dynamic_table` before any DDL is
+    /// generated, and resume is replication-only, so no resumable path
+    /// emits it at all. Keeping it in the identity refused a resume after
+    /// a compute resize that moved nothing; the catch-all arm below has
+    /// never treated it as a locator.
     ///
     /// A `host` is split in two, because what routes and what is safe to
     /// show are not the same string. The `host` locator is the shown form,
@@ -3933,7 +3948,6 @@ impl AdapterConfig {
                 push("account", self.account.as_deref());
                 push("host", self.host.as_deref());
                 push("database", self.database.as_deref());
-                push("warehouse", self.warehouse.as_deref());
             }
             "bigquery" => push("project_id", self.project_id.as_deref()),
             "trino" => {
@@ -12450,6 +12464,8 @@ database = "ANALYTICS"
 {CREDENTIAL_FIELDS}"#
         ));
         assert_identity_is_location_only(&adapter, &["URL-SECRET", "TOKEN-SECRET"]);
+        // `warehouse` is configured above and is deliberately absent below:
+        // it is compute, not location (#1584).
         assert_eq!(
             adapter.endpoint_identity(),
             EndpointIdentity {
@@ -12464,7 +12480,6 @@ database = "ANALYTICS"
                             "https://xy12345.us-east-1.snowflakecomputing.com/session/TOKEN-SECRET"
                         ),
                     ),
-                    ("warehouse", "COMPUTE_WH"),
                 ]),
             }
         );
@@ -12643,12 +12658,37 @@ x_token = "EXTRA-SECRET"
             as_alice.endpoint_identity(),
             other_account.endpoint_identity()
         );
-        let other_warehouse = adapter_from_toml(
-            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\ndatabase = \"ANALYTICS\"\nwarehouse = \"XLARGE_WH\"\n",
+        let other_database = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nusername = \"alice\"\nrole = \"LOADER\"\ndatabase = \"REPORTING\"\n",
         );
         assert_ne!(
             as_alice.endpoint_identity(),
-            other_warehouse.endpoint_identity()
+            other_database.endpoint_identity(),
+            "the database is where the data lands and must separate two endpoints"
+        );
+
+        // Compute does not. These two differ in `warehouse` and in nothing
+        // else. A warehouse resolves no name — it selects the compute that
+        // runs the statement, never the database a write lands in — so they
+        // are one endpoint, and resizing compute between runs no longer
+        // refuses a resume (#1584).
+        let compute_wh = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\ndatabase = \"ANALYTICS\"\nwarehouse = \"COMPUTE_WH\"\n",
+        );
+        let xlarge_wh = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\ndatabase = \"ANALYTICS\"\nwarehouse = \"XLARGE_WH\"\n",
+        );
+        assert_eq!(
+            compute_wh.endpoint_identity(),
+            xlarge_wh.endpoint_identity(),
+            "two configs differing only in compute are one data location"
+        );
+        assert!(
+            !compute_wh
+                .endpoint_identity()
+                .locators
+                .contains_key("warehouse"),
+            "warehouse is compute, not location, and must not be a locator"
         );
     }
 
@@ -12879,5 +12919,22 @@ x_token = "EXTRA-SECRET"
         let round_trip: EndpointIdentity =
             serde_json::from_value(serde_json::to_value(&identity).unwrap()).unwrap();
         assert_eq!(round_trip, identity);
+
+        // Snowflake carries its own pin: `warehouse` is configured here and
+        // must not reach the blob (#1584). Pinning the shape that changed is
+        // what catches a re-add.
+        let snowflake = adapter_from_toml(
+            "type = \"snowflake\"\naccount = \"xy12345.us-east-1\"\nwarehouse = \"COMPUTE_WH\"\ndatabase = \"ANALYTICS\"\n",
+        );
+        assert_eq!(
+            serde_json::to_value(snowflake.endpoint_identity()).unwrap(),
+            serde_json::json!({
+                "adapter_type": "snowflake",
+                "locators": {
+                    "account": "xy12345.us-east-1",
+                    "database": "ANALYTICS",
+                },
+            })
+        );
     }
 }

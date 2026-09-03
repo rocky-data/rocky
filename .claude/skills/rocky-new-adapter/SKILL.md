@@ -93,6 +93,8 @@ host = "${MY_HOST}"
 The `SqlDialect` trait is where adapters actually diverge. Things to get right:
 
 - **Quoting**: backticks vs double-quotes vs brackets. `rocky-databricks` uses backticks for principals; most warehouses use the standard double-quote identifier.
+- **String literals**: never splice a value into `'…'` by hand. State the lexer fact once with `literal_escape()` — `LiteralEscape::Standard` (no backslash escapes; a quote is doubled: Trino, DuckDB) or `LiteralEscape::Backslash` (a quote is `\'`, a backslash `\\`, a line break `\n`: Snowflake, Databricks, BigQuery) — then call `rocky_core::sql_gen::string_literal(dialect, value)`. Answer from the warehouse's own lexer documentation, and prove it: encode a value holding a quote AND a backslash, `SELECT` it back, assert byte-identical.
+  `literal_escape()` is required only on `rocky_core::traits::SqlDialect` — the in-tree trait, whose `init-adapter` scaffold emits a `compile_error!` so the crate will not build until you answer. `rocky_adapter_sdk::traits::SqlDialect`, the out-of-process trait, does **not** carry it yet, so an SDK adapter compiles without stating anything. If you are writing one, pick the rule by hand and encode with `rocky_sql::literal::encode_string_literal` — nothing will remind you.
 - **Safe type widening allowlist**: `is_safe_type_widening(from, to)` controls whether Rocky will `ALTER TABLE` or fall back to full refresh. Be conservative — data loss from an unsafe cast is worse than an extra full refresh.
 - **Partition overwrite atomicity**: Databricks has `INSERT INTO ... REPLACE WHERE` as a single atomic op. Snowflake and DuckDB need `BEGIN; DELETE; INSERT; COMMIT;` — hence the `Vec<String>` return type.
 - **MV / dynamic table semantics**: Databricks materialized views and Snowflake dynamic tables have different refresh models. Read `engine/AGENTS.md` for the canonical DDL strings.
@@ -106,6 +108,7 @@ The `SqlDialect` trait is where adapters actually diverge. Things to get right:
 - [ ] Crate added to `engine/Cargo.toml` workspace members
 - [ ] `impl Adapter` (or `SourceAdapter`) complete
 - [ ] `impl SqlDialect` with all required methods
+- [ ] `literal_escape()` answered from the warehouse's lexer docs and proved with an executed round trip
 - [ ] Auth module with env-var auto-detection
 - [ ] Conformance test wired up (`rocky test-adapter <name>` passes)
 - [ ] Factory registration so `rocky.toml` `type = "<name>"` resolves

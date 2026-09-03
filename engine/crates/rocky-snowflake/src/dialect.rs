@@ -10,7 +10,7 @@
 
 use std::fmt::Write;
 
-use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
+use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
@@ -21,6 +21,22 @@ pub struct SnowflakeSqlDialect;
 impl SqlDialect for SnowflakeSqlDialect {
     fn name(&self) -> &'static str {
         "snowflake"
+    }
+
+    /// Snowflake's `'…'` literal processes backslash escapes; a quote is
+    /// `\'` and a backslash is `\\`.
+    ///
+    /// Snowflake accepts `''` too, but `Backslash` is the only rule that is
+    /// also correct on BigQuery, and one rule per lexer family is one fewer
+    /// thing to get wrong. The bypass this closes is the one
+    /// `governance.rs::format_set_tags_sql` documents: with backslashes read,
+    /// doubling the quote alone lets a leading `\` escape the first quote of
+    /// the pair and the second quote closes the literal.
+    ///
+    /// Executed: `SELECT <literal>` round-trips byte-identical against a live
+    /// account (`tests/dialect_sweep_live.rs::literal_escape_round_trips_live`).
+    fn literal_escape(&self) -> LiteralEscape {
+        LiteralEscape::Backslash
     }
 
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {

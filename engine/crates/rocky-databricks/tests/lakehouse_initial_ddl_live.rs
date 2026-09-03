@@ -306,3 +306,72 @@ async fn live_incremental_iceberg_initial_ddl_uses_iceberg_format() {
     drop_schema(&adapter, &catalog, &src_schema).await;
     drop_schema(&adapter, &catalog, &tgt_schema).await;
 }
+
+/// Live proof that `DatabricksSqlDialect::literal_escape` states the truth.
+///
+/// Spark SQL's `'…'` processes backslash escapes under the default parser, so
+/// the `Backslash` rule must round-trip a quote, a backslash and the `\'` pair
+/// byte-identical. Runs `SELECT <literal>` per value — no schema needed.
+///
+/// Out of scope: the legacy `spark.sql.parser.escapedStringLiterals=true`.
+/// This probe runs under the default.
+#[tokio::test]
+#[ignore]
+async fn literal_escape_round_trips_live() {
+    use rocky_core::sql_gen::string_literal;
+    use rocky_core::traits::{LiteralEscape, SqlDialect};
+
+    let Some((adapter, _catalog)) = adapter_from_env() else {
+        eprintln!("SKIP literal_escape: ROCKY_TEST_DATABRICKS_* env not set");
+        return;
+    };
+
+    let dialect = DatabricksSqlDialect;
+    assert_eq!(
+        dialect.literal_escape(),
+        LiteralEscape::Backslash,
+        "this probe pins the Backslash rule; update it deliberately"
+    );
+
+    // CONTROL: a value with neither a quote nor a backslash must round-trip,
+    // proving the warehouse was reached before any hostile value is judged.
+    let control = string_literal(&dialect, "plain");
+    adapter
+        .execute_query(&format!("SELECT {control} AS v"))
+        .await
+        .expect("CONTROL SELECT must succeed — proves the warehouse was reached");
+
+    for value in [
+        "it's",
+        r"C:\tmp",
+        r"a\'b",
+        r"trailing\",
+        "",
+        "line1\nline2",
+        "crlf\r\nvalue",
+        r"'; DROP TABLE t; --",
+        r"\'; DROP TABLE t; --",
+        "plain",
+    ] {
+        let literal = string_literal(&dialect, value);
+        let sql = format!("SELECT {literal} AS v");
+        let result = adapter
+            .execute_query(&sql)
+            .await
+            .unwrap_or_else(|e| panic!("Databricks rejected `{sql}`: {e}"));
+        assert_eq!(result.rows.len(), 1, "expected one row from `{sql}`");
+        // Only a JSON string counts. Coercing a returned SQL NULL to "" would
+        // let the empty-value case pass on a result that is not the value we
+        // sent — the oracle has to be as strict as the claim.
+        let read_back = match result.rows[0].first() {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            other => panic!("expected a string from `{sql}`, got {other:?}"),
+        };
+        assert_eq!(
+            read_back, value,
+            "value {value:?} did not survive Databricks as {literal}"
+        );
+    }
+
+    println!("VERDICT: Databricks LiteralEscape::Backslash round-trips byte-identical.");
+}

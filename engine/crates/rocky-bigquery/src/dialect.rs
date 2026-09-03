@@ -1,6 +1,6 @@
 //! BigQuery SQL dialect implementation.
 
-use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
+use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
@@ -11,6 +11,28 @@ pub struct BigQueryDialect;
 impl SqlDialect for BigQueryDialect {
     fn name(&self) -> &'static str {
         "bigquery"
+    }
+
+    /// GoogleSQL's `'…'` literal processes backslash escapes; a quote is
+    /// `\'` and a backslash is `\\`.
+    ///
+    /// **Doc-derived, not executed** — the BigQuery sandbox is expired. Both
+    /// halves come from the GoogleSQL/ZetaSQL lexical spec, which lists the
+    /// supported escapes — the C-style set plus the three quote characters
+    /// and the octal/hex/unicode forms — and then says "Any sequence not in
+    /// this table produces an error":
+    ///   - `\'` **is** supported, so this rule is valid;
+    ///   - `''` is **not** an escape, so the `Standard` rule would be a
+    ///     syntax error here, not a wrong value. BigQuery is the reason
+    ///     `LiteralEscape` exists rather than one hand-written encoder.
+    ///
+    /// The same spec says "Quoted strings can't contain newlines, even when
+    /// preceded by a backslash". That is why `Backslash` encodes a line break
+    /// as `\n` / `\r` rather than passing it through: a raw one would be a
+    /// BigQuery parse error, and the escaped form is documented here and on
+    /// both of the other `Backslash` dialects.
+    fn literal_escape(&self) -> LiteralEscape {
+        LiteralEscape::Backslash
     }
 
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {
