@@ -80,8 +80,9 @@
 //! back through [`contained_target`], which rejects a symlinked leaf; the
 //! `O_NOFOLLOW` readers refuse it on unix (`read_no_follow`, behind Phase B's
 //! sidecar read and the `.ff-prev` backup); and every other reader of a
-//! committed artifact uses a plain `std::fs::read` and follows it to its
-//! target. Same check-then-use class as the parent directory
+//! committed artifact — the sidecar and contract loaders included — uses a
+//! plain following read (`std::fs::read`, `read_to_string`) and resolves it
+//! to its target. Same check-then-use class as the parent directory
 //! above, closed by the same fix (a dirfd plus `renameat`, or holding the
 //! staged descriptor through publication), and v0 accepts it.
 //!
