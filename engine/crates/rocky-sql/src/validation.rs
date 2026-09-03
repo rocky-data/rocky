@@ -119,6 +119,11 @@ pub fn validate_gcp_project_id(value: &str) -> Result<&str, ValidationError> {
 /// digits, `_`, space, `(`, `)` and `,` — enough for `STRING`, `INT`,
 /// `DECIMAL(10,2)` and `DOUBLE PRECISION`, and nothing else.
 ///
+/// It is an allowlist, **not** a type grammar. `NOT A TYPE (1,2)` passes:
+/// the warehouse rejects it as a syntax error. What the allowlist buys is
+/// that nothing accepted can carry a quote, a `;`, a comment or an operator
+/// out of the cast.
+///
 /// This is the single owner of the rule. `rocky_core::sql_gen::validate_sql_type`
 /// delegates here and only re-wraps the error, so the check cannot drift
 /// between the two crates. (`rocky-databricks`'s loader keeps a separate,
