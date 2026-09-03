@@ -19,5 +19,9 @@
 
 #[test]
 fn discarded_authority_fails_to_compile() {
-    trybuild::TestCases::new().compile_fail("tests/compile_fail/*.rs");
+    // Named, not globbed: `tests/compile_fail/` now holds a second,
+    // unrelated case (`missing_literal_escape.rs`, owned by
+    // `literal_escape_required.rs`), and a glob here would run it under a
+    // test whose name and doc are about `#[must_use]`.
+    trybuild::TestCases::new().compile_fail("tests/compile_fail/discarded_authority.rs");
 }

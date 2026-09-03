@@ -136,10 +136,27 @@ rocky init-adapter bigquery
 ```
 
 This creates `crates/rocky-bigquery/` with:
-- `Cargo.toml` depending on `rocky-core` and `rocky-sql`
+- `Cargo.toml` depending on `rocky-core`, `rocky-ir`, `rocky-sql` and `chrono`
 - `src/lib.rs` declaring the `adapter`, `dialect`, and `types` modules
 - `src/{dialect,adapter,types}.rs` trait implementation stubs
 - `tests/integration.rs` — an `#[ignore]`d live-connection test stub
+
+**The scaffolded crate does not compile until you answer one question.** (Add
+it to the workspace first — Cargo refuses a crate that inherits workspace
+settings before it is a member.)
+`SqlDialect::literal_escape` says how your warehouse's lexer reads a
+single-quoted string. There are two answers. `LiteralEscape::Standard` means
+the lexer ignores backslashes, so a quote is doubled (`''`) — Trino and DuckDB.
+`LiteralEscape::Backslash` means it reads them, so a quote is `\'`, a backslash
+is `\\`, and a line break is `\n` — Snowflake, Databricks and BigQuery. The
+scaffold emits a `compile_error!` instead of guessing, because a wrong answer is
+silent: it corrupts values on some warehouses and lets a quote end the literal
+early on others. Read your warehouse's own documentation, then prove it — encode
+a value holding a quote and a backslash, `SELECT` it back, and check it comes
+back unchanged.
+
+A process adapter is different. The out-of-process trait does not carry this
+question yet, so nothing asks it and nothing refuses to build.
 
 Implement the required traits, then run the conformance suite.
 
