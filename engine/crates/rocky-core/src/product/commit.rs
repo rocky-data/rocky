@@ -31,16 +31,51 @@
 //! mutation. No on-disk manifest grants recovery authority: staged and
 //! previous manifests are exactly as forgeable as the journal itself.
 //!
+//! # Leaf containment: what is covered, and what is not
+//!
+//! ```text
+//!   vector                       unix                      windows
+//!   --------------------------------------------------------------------
+//!   symlink at the leaf          refused at the syscall    pre-check only
+//!                                (O_EXCL on a create,      (O_NOFOLLOW is
+//!                                O_NOFOLLOW on an          a unix flag)
+//!                                in-place write or read)
+//!   hardlink at the leaf         refused on the opened     not checked
+//!                                DESCRIPTOR (nlink > 1)    (see below)
+//!   parent directory swapped     NOT closed — only dirfd-relative APIs
+//!     after validation           close it, and v0 does not use them
+//! ```
+//!
 //! Stated residuals, accepted under the v0 same-machine threat posture.
 //! Path-based syscalls re-traverse the path at syscall time, so a
 //! DIRECTORY swapped for a symlink in the instant between validation and
 //! a rename/unlink is only fully closed by dirfd-relative APIs, which v0
 //! does not use. Every LEAF the protocol writes or reads is guarded at
-//! the syscall itself — O_EXCL on each write, `O_NOFOLLOW` on the backup
-//! read — but `O_NOFOLLOW` is unix only: on Windows that read still
-//! follows a symlink or junction planted at the leaf, and containment
-//! there rests on the pre-check alone. Windows reparse-point behaviour is
-//! untested; every symlink exploit test in this module is `#[cfg(unix)]`.
+//! the syscall itself — O_EXCL on each create, `O_NOFOLLOW` on an
+//! in-place write and on the backup read, and a link-count check on the
+//! descriptor those two already hold.
+//!
+//! That link-count check exists because a HARDLINK needs no timing at
+//! all. A second name for one inode IS an ordinary regular file, so every
+//! path-based check reports it correctly and passes, and `O_NOFOLLOW` has
+//! no link to refuse. Truncating one name truncates the other; reading
+//! one name reads the other's bytes. The two helpers that act on a file
+//! they did not create — [`write_no_follow`] (truncate in place) and the
+//! backing `read_no_follow` (the `.ff-prev` backup source, Phase B's
+//! sidecar read, the draft rollback snapshot) — therefore `fstat` their
+//! own descriptor and refuse `nlink > 1`. The O_EXCL create helpers are
+//! deliberately NOT checked: the descriptor they hand back names a file
+//! this process just created, so its link count is 1 by construction, and
+//! a link added afterwards is past anything an open-time check can see.
+//!
+//! Windows is a stated gap, not a claim. `O_NOFOLLOW` is a unix flag, and
+//! `std::os::windows::fs::MetadataExt::number_of_links` is unstable
+//! (`windows_by_handle`, rust-lang/rust#63010), so NEITHER leaf guard is
+//! present there and containment rests on the pre-check alone. This repo
+//! has no Windows `cargo test` lane, so a Windows guard would be untested
+//! code claiming a protection nobody had run. Windows reparse-point
+//! behaviour is untested; every symlink and hardlink exploit test in this
+//! module is `#[cfg(unix)]`.
 
 use std::path::{Path, PathBuf};
 
@@ -384,6 +419,63 @@ fn create_new_no_follow(path: &Path, mode: Option<u32>) -> std::io::Result<std::
     }
 }
 
+/// Refuse a file whose inode already carries more than one name.
+///
+/// A hardlink needs no timing at all — unlike every symlink vector in this
+/// module, there is no race to win. An attacker who can create a link
+/// inside the project points a second name at a file the project does not
+/// own, and from then on `symlink_metadata`, [`is_symlink`],
+/// [`contained_target`] and `O_NOFOLLOW` all report it correctly and pass:
+/// it IS an ordinary regular file, and there is no link to refuse to
+/// follow. One inode, two names — truncating one truncates the other,
+/// reading one reads the other's bytes.
+///
+/// The count comes off the DESCRIPTOR the caller already holds, never a
+/// second path lookup, so the thing counted is the thing already opened
+/// and no swap between the check and the use can reach it. Callers run
+/// this only AFTER proving the descriptor is a regular file, so a
+/// directory's structural link count (`.`, `..`, one per child) never
+/// arrives here; a regular file has exactly one link unless someone made
+/// a second.
+///
+/// Deliberately NOT applied to [`create_new_no_follow`] and the helpers
+/// over it: O_EXCL means the descriptor names a file this process just
+/// created, so its link count is 1 by construction. A check there could
+/// only fire on a link added after the create, which no open-time check
+/// can see — untestable code claiming a protection.
+///
+/// Unix only. `std::os::windows::fs::MetadataExt::number_of_links` is
+/// unstable (`windows_by_handle`, rust-lang/rust#63010) and this repo has
+/// no Windows `cargo test` lane, so a Windows arm would be untested code
+/// claiming a protection nobody had run. See the module header.
+///
+/// # Errors
+///
+/// The `fstat`'s own failure, or `InvalidInput` naming the path, the link
+/// count, the harm, and the remedy.
+#[cfg(unix)]
+fn refuse_hard_linked(
+    file: &std::fs::File,
+    path: &Path,
+    verb: &str,
+    harm: &str,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let links = file.metadata()?.nlink();
+    if links > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to {verb} {p} — {links} names refer to these bytes, so it is a hard \
+                 link. {harm} Replace it with an independent copy \
+                 (`cp {p} {p}.unlinked && mv {p}.unlinked {p}`), then re-run.",
+                p = path.display(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Write `bytes` to `path` in place, refusing to follow a symlink at the
 /// leaf.
 ///
@@ -399,14 +491,22 @@ fn create_new_no_follow(path: &Path, mode: Option<u32>) -> std::io::Result<std::
 /// opened cannot be swapped underneath it — so a FIFO, socket, or device is
 /// refused before a byte is written.
 ///
-/// Windows `OpenOptions` has no `O_NOFOLLOW` equivalent, so there this is a
-/// plain create-or-truncate write and the caller's pre-check is the only
-/// leaf guard: the same stated gap as [`read_no_follow`].
+/// The descriptor is also refused when it is a HARDLINK
+/// (`refuse_hard_linked`): a second name for the same inode passes every
+/// path check and gives `O_NOFOLLOW` nothing to refuse, yet truncating one
+/// name truncates the other — an out-of-project write with no race to win.
+///
+/// Windows `OpenOptions` has no `O_NOFOLLOW` equivalent and stable Rust has
+/// no link count for a Windows handle, so there this is a plain
+/// create-or-truncate write and the caller's pre-check is the only leaf
+/// guard: the same stated gap as [`read_no_follow`], set out in the module
+/// header.
 ///
 /// # Errors
 ///
 /// Any error from the open, the descriptor's metadata, the truncate, or the
-/// write; `InvalidInput` when what was opened is not a regular file.
+/// write; `InvalidInput` when what was opened is not a regular file, or (on
+/// unix) has more than one hard link.
 pub fn write_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut options = std::fs::OpenOptions::new();
@@ -426,6 +526,18 @@ pub fn write_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             format!("refusing to write {} — not a regular file", path.display()),
         ));
     }
+    // Before `set_len` touches a byte: a hardlink is a regular file, so the
+    // check above passes it and `O_NOFOLLOW` has no link to refuse, but this
+    // truncate would land on every other name too. The `is_file` return just
+    // above is also why a directory's structural link count never gets here.
+    #[cfg(unix)]
+    refuse_hard_linked(
+        &file,
+        path,
+        "write",
+        "Writing here would write through to every other name, including one this project \
+         does not own.",
+    )?;
     file.set_len(0)?;
     file.write_all(bytes)
 }
@@ -451,15 +563,21 @@ const MAX_BACKUP_BYTES: u64 = 16 * 1024 * 1024;
 /// file, and reads from that same descriptor — never a second path lookup.
 /// The read is bounded by [`MAX_BACKUP_BYTES`].
 ///
-/// Windows `OpenOptions` has no `O_NOFOLLOW` equivalent, so there the read
-/// still follows a symlink or junction and the caller's pre-check is the
-/// only leaf guard: the same stated gap as [`write_no_follow`].
+/// On unix a HARDLINKED source is refused too: reading one name reads the
+/// bytes of every other name, including one outside the project.
+///
+/// Windows `OpenOptions` has no `O_NOFOLLOW` equivalent and stable Rust has
+/// no link count for a Windows handle, so there neither guard is present,
+/// the read still follows a symlink or junction, and the caller's pre-check
+/// is the only leaf guard: the same stated gap as [`write_no_follow`], set
+/// out in the module header.
 ///
 /// # Errors
 ///
 /// Any error from the open or the read — `NotFound` when nothing is at the
 /// path, `ELOOP` for a symlinked leaf on unix; `InvalidInput` when what was
-/// opened is not a regular file, or is over the size bound.
+/// opened is not a regular file, has more than one hard link (unix), or is
+/// over the size bound.
 pub fn read_no_follow_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     read_no_follow(path).map(|(bytes, _)| bytes)
 }
@@ -474,6 +592,11 @@ pub fn read_no_follow_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
 /// equivalent, so there the read still follows a symlink or junction: that
 /// platform keeps the weaker pre-check-only guarantee, stated rather than
 /// papered over.
+///
+/// A HARDLINKED source is refused on that same descriptor
+/// (`refuse_hard_linked`). It needs no race: reading one name reads the
+/// other's bytes, so without the check [`copy_no_follow`] would stamp a
+/// file the project does not own into a `.ff-prev` INSIDE the project.
 ///
 /// The mode comes off the DESCRIPTOR, not a second path lookup, so it
 /// describes the same file the bytes came from.
@@ -503,6 +626,17 @@ fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions
             format!("refusing to read {} — not a regular file", path.display()),
         ));
     }
+    // Same descriptor, same reason as the write side, opposite direction of
+    // harm: a hardlink passes every path check and `O_NOFOLLOW`, and reading
+    // one name reads the other's bytes — which the `.ff-prev` backup would
+    // then stamp inside the project.
+    #[cfg(unix)]
+    refuse_hard_linked(
+        &file,
+        path,
+        "read",
+        "Reading here would copy another name's bytes into the project.",
+    )?;
     if metadata.len() > MAX_BACKUP_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -538,7 +672,10 @@ fn read_no_follow(path: &Path) -> std::io::Result<(Vec<u8>, std::fs::Permissions
 /// its target, and a link at the destination is written through to its.
 /// Both are TOCTOU against the containment pre-check, so each end takes a
 /// syscall-level guard instead — `O_NOFOLLOW` on the read (unix only, see
-/// [`read_no_follow`]) and O_EXCL on the create. The source's mode is
+/// [`read_no_follow`]) and O_EXCL on the create. The read end additionally
+/// refuses a HARDLINKED source (unix only): that one needs no race at all,
+/// and without it the backup would copy a file the project does not own
+/// into a `.ff-prev` inside the project. The source's mode is
 /// carried across, as `std::fs::copy` did, and is set on the destination
 /// DESCRIPTOR so a link swapped in at `dst` afterwards cannot catch a
 /// path-based `set_permissions`.
@@ -623,13 +760,18 @@ fn write_backup(
 /// / `.ff-prev` residue — which shares the final's now-contained parent —
 /// is additionally refused when its leaf is a symlink.
 ///
+/// This pre-check is pathname-based and symlink-specific by design, so a
+/// HARDLINK at a final is invisible to it — correctly: a second name for
+/// one inode IS a regular file. That case is refused later, on the
+/// descriptor, by the backup read ([`copy_no_follow`], unix only).
+///
 /// Stated residual, the conceded v0 boundary: a check-then-write is TOCTOU
 /// against a DIRECTORY swapped for a symlink between validation and the
 /// syscall, which only dirfd-relative APIs close. Every LEAF this pre-check
 /// covers is guarded a second time at the syscall itself: the staged,
 /// journal-temp and `.ff-prev` writes use O_EXCL ([`write_new_no_follow`]),
-/// and the `.ff-prev` backup reads its source with `O_NOFOLLOW`
-/// ([`copy_no_follow`]) — the read guard on unix only (see
+/// and the `.ff-prev` backup reads its source with `O_NOFOLLOW` and a
+/// link-count check ([`copy_no_follow`]) — both on unix only (see
 /// [`commit_generation`]).
 fn refuse_symlinked_write_targets<'a>(
     project_root: &Path,
@@ -721,7 +863,7 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 /// A prior generation may have crashed mid-commit; it is recovered first
 /// so this run stages on a consistent tree.
 ///
-/// # Symlink containment
+/// # Link containment
 ///
 /// Every write target is proven inside the project root through the shared
 /// [`contained_target`] primitive BEFORE the first mutation, refusing a
@@ -733,13 +875,23 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 /// `O_NOFOLLOW` ([`copy_no_follow`]). The backup copy has TWO symlink-follow
 /// ends — the SOURCE read and the DESTINATION write — and both are covered.
 ///
+/// A HARDLINKED final is a separate class and is covered separately: it
+/// passes the pathname pre-check (it is a regular file) and gives
+/// `O_NOFOLLOW` nothing to follow, so the backup read refuses it on the
+/// DESCRIPTOR instead, by link count. The commit itself never writes a
+/// final in place — it renames the staged file over it, which replaces the
+/// directory entry and leaves the other name's bytes alone — so the harm
+/// this closes is the backup copying an out-of-project file INTO the
+/// project, not an out-of-project write.
+///
 /// Two residuals remain, the conceded v0 boundary. A DIRECTORY swapped for
 /// a symlink between validation and a rename/unlink is closed only by
-/// dirfd-relative APIs, which v0 does not use. And `O_NOFOLLOW` is unix
-/// only: on Windows the backup read still follows a symlink or junction
-/// planted at the final, so containment there rests on the pre-check alone
-/// — and that platform is untested, because every symlink exploit test in
-/// this module is `#[cfg(unix)]`.
+/// dirfd-relative APIs, which v0 does not use. And both syscall-level leaf
+/// guards are unix only: on Windows the backup read still follows a symlink
+/// or junction planted at the final and does not check the link count, so
+/// containment there rests on the pre-check alone — and that platform is
+/// untested, because every symlink and hardlink exploit test in this module
+/// is `#[cfg(unix)]`.
 ///
 /// # Errors
 ///
@@ -2994,6 +3146,220 @@ mod tests {
         assert!(
             error.to_string().contains("exceeds the"),
             "expected the size refusal, got: {error}"
+        );
+    }
+
+    // ----- hardlink containment (#1500) -----------------------------------
+    //
+    // A hardlink is the one leaf vector with NO race to win. A second name
+    // for one inode IS an ordinary regular file, so every pathname check
+    // reports it correctly and passes, and `O_NOFOLLOW` has no link to
+    // refuse. The guard is therefore a link count on the DESCRIPTOR that is
+    // already open — which is why these pin the two helpers that act on a
+    // file they did not create, the commit path end to end, and the two
+    // negatives: an ordinary file must still write, and the O_EXCL create
+    // helpers must stay unguarded because they cannot need it.
+
+    #[cfg(unix)]
+    fn plant_hardlink(link: &Path, target: &Path) {
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::hard_link(target, link).expect("hard link");
+    }
+
+    /// The in-place write the MCP draft tools use (`draft_model`,
+    /// `draft_contract`, `draft_check`, `draft_metadata`, and the rollback
+    /// restore) — the one genuine write-THROUGH vector in this surface.
+    #[cfg(unix)]
+    #[test]
+    fn write_no_follow_refuses_a_hardlinked_leaf_and_leaves_both_names_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside-secret");
+        std::fs::write(&outside, b"a developer's private bytes outside the project")
+            .expect("write");
+        let project = seeded_project(dir.path());
+        let inside = project.join("models/revenue_daily.sql");
+        plant_hardlink(&inside, &outside);
+
+        let error =
+            write_no_follow(&inside, b"SELECT 1 AS id\n").expect_err("a hard link is refused");
+
+        assert!(
+            error.to_string().contains("hard link"),
+            "the refusal must name the vector, got: {error}"
+        );
+        assert!(
+            error.to_string().contains(&inside.display().to_string()),
+            "the refusal must name the path, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("still there"),
+            b"a developer's private bytes outside the project",
+            "the out-of-project name must be untouched"
+        );
+        assert_eq!(
+            std::fs::read(&inside).expect("still there"),
+            b"a developer's private bytes outside the project",
+            "and the in-project name too — the refusal came before the truncate"
+        );
+    }
+
+    /// The draft rollback's prior-bytes snapshot. Reading one name reads the
+    /// other's bytes, so an out-of-project file would otherwise ride the
+    /// sidecar merge and the rollback restore back into the project.
+    #[cfg(unix)]
+    #[test]
+    fn read_no_follow_bytes_refuses_a_hardlinked_leaf() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside-secret");
+        std::fs::write(&outside, b"private bytes the snapshot must not capture").expect("write");
+        let inside = dir.path().join("project/models/revenue_daily.toml");
+        plant_hardlink(&inside, &outside);
+
+        let error = read_no_follow_bytes(&inside).expect_err("a hard link is refused");
+
+        assert!(
+            error.to_string().contains("hard link"),
+            "the refusal must name the vector, got: {error}"
+        );
+    }
+
+    /// The `.ff-prev` backup source. The harm here is the reverse direction:
+    /// not a write out of the project, but a file the project does not own
+    /// being copied INTO it — so the assertion is that no backup exists.
+    #[cfg(unix)]
+    #[test]
+    fn the_backup_copy_refuses_a_hardlinked_source_and_produces_no_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside-secret");
+        std::fs::write(&outside, b"a developer's private bytes outside the project")
+            .expect("write");
+        let project = seeded_project(dir.path());
+        let final_path = project.join("models/revenue_daily.contract.toml");
+        plant_hardlink(&final_path, &outside);
+        let prev = prev_sibling(&final_path);
+
+        let error =
+            copy_no_follow(&final_path, &prev).expect_err("a hard-linked source is refused");
+
+        assert!(
+            !prev.exists(),
+            "no backup may be produced from a hard-linked source (error was {error})"
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("still there"),
+            b"a developer's private bytes outside the project",
+            "the out-of-project source must be untouched"
+        );
+    }
+
+    /// The wiring, end to end.
+    ///
+    /// An attacker pre-plants `models/<contract>` as a SECOND NAME for a file
+    /// outside the project. Nothing is a symlink, so the pathname pre-check
+    /// correctly passes it; the commit then backs the final up into
+    /// `.ff-prev`, and without the descriptor's link count that backup is a
+    /// copy of the outside file sitting inside the project.
+    #[cfg(unix)]
+    #[test]
+    fn fresh_commit_refuses_a_hardlinked_final_and_never_copies_it_into_the_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside-secret");
+        std::fs::write(&outside, b"a developer's private bytes outside the project")
+            .expect("write");
+        let project = seeded_project(dir.path());
+        let parsed = parsed_d3();
+        let final_path = project.join(contract_rel(&parsed));
+        plant_hardlink(&final_path, &outside);
+        let prev = prev_sibling(&final_path);
+
+        let error = run_phase_a(&project, SPEC_PATH, &parsed).expect_err("a hard-linked final");
+
+        assert_eq!(error.code, "commit-io");
+        assert!(
+            error.message.contains("hard link"),
+            "the refusal must name the vector, got: {}",
+            error.message
+        );
+        assert!(
+            !prev.exists(),
+            "no backup may be produced from a hard-linked final"
+        );
+        assert_eq!(
+            std::fs::read(&outside).expect("still there"),
+            b"a developer's private bytes outside the project",
+            "the out-of-project name must be untouched"
+        );
+        assert_eq!(
+            std::fs::read(&final_path).expect("still there"),
+            b"a developer's private bytes outside the project",
+            "and the in-project name still names the same untouched bytes"
+        );
+        assert!(!manifest_path(&project).exists(), "nothing was committed");
+    }
+
+    /// The negative that keeps the guard honest: one link is what EVERY
+    /// ordinary regular file has on macOS and Linux, so the refusal must
+    /// never fire on one — and the remedy the message prints must work.
+    #[cfg(unix)]
+    #[test]
+    fn the_hardlink_guard_does_not_fire_on_an_ordinary_single_link_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ordinary = dir.path().join("orders.toml");
+        std::fs::write(&ordinary, b"name = \"orders\"\n").expect("write");
+
+        write_no_follow(&ordinary, b"name = \"orders\"\nintent = \"draft\"\n")
+            .expect("an ordinary file writes in place");
+        assert_eq!(
+            read_no_follow_bytes(&ordinary).expect("an ordinary file reads"),
+            b"name = \"orders\"\nintent = \"draft\"\n",
+        );
+
+        // Add a second name: refused. Remove it again: writable once more.
+        let second_name = dir.path().join("orders.linked.toml");
+        plant_hardlink(&second_name, &ordinary);
+        write_no_follow(&ordinary, b"blocked").expect_err("two names are refused");
+        std::fs::remove_file(&second_name).expect("unlink the second name");
+        write_no_follow(&ordinary, b"name = \"orders\"\n").expect("one name writes again");
+        assert_eq!(
+            std::fs::read(&ordinary).expect("read"),
+            b"name = \"orders\"\n"
+        );
+    }
+
+    /// Why the O_EXCL create helpers carry NO link-count check, pinned rather
+    /// than asserted in prose: O_EXCL never opens a file it did not create.
+    /// A hardlinked squatter at a staged path takes the `AlreadyExists` arm,
+    /// whose `remove_file` unlinks only THIS name — the other name keeps its
+    /// bytes — and the retry creates a fresh file with exactly one link.
+    #[cfg(unix)]
+    #[test]
+    fn the_o_excl_create_unlinks_a_hardlinked_squatter_instead_of_writing_through_it() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = dir.path().join("outside-secret");
+        std::fs::write(&outside, b"private bytes the staged write must not reach").expect("write");
+        let staged = dir
+            .path()
+            .join("project/models/revenue_daily.contract.toml.ff-staged");
+        plant_hardlink(&staged, &outside);
+
+        write_new_no_follow(&staged, b"staged contract bytes").expect("the squatter is unlinked");
+
+        assert_eq!(
+            std::fs::read(&outside).expect("still there"),
+            b"private bytes the staged write must not reach",
+            "the out-of-project name must be untouched"
+        );
+        assert_eq!(
+            std::fs::read(&staged).expect("read"),
+            b"staged contract bytes"
+        );
+        assert_eq!(
+            std::fs::metadata(&staged).expect("stat").nlink(),
+            1,
+            "the retry created a fresh file with exactly one link"
         );
     }
 

@@ -6130,6 +6130,55 @@ mod tests {
         );
     }
 
+    /// A HARDLINKED draft path is the same class of harm with no race to
+    /// win. `resolve_draft_paths` sees a regular file — it IS one — and
+    /// `O_NOFOLLOW` has no link to refuse, so the descriptor's link count is
+    /// what refuses it. Without that the snapshot captures an out-of-project
+    /// file as the "prior content" the merge folds in and the rollback
+    /// restores, and the draft write truncates the other name too (#1500).
+    #[cfg(unix)]
+    #[test]
+    fn draft_paths_refuse_a_hardlinked_leaf_out_of_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        let outside = dir.path().join("outside.toml");
+        std::fs::write(&outside, "marker = \"OUTSIDE-SECRET\"\n").unwrap();
+        let sidecar = models.join("orders.toml");
+        std::fs::hard_link(&outside, &sidecar).unwrap();
+
+        // The read half: the rollback snapshot.
+        let refused = DraftRollback::snapshot([&sidecar])
+            .err()
+            .expect("a hard-linked leaf refuses the snapshot instead of being read through");
+        assert_eq!(refused.path, sidecar);
+        let err = refused.into_tool_error(&root);
+        assert!(
+            !err.0.message.contains("OUTSIDE-SECRET"),
+            "the outside file's content never reaches the caller: {}",
+            err.0.message
+        );
+
+        // The write half: every draft write and the rollback restore.
+        let write_error = write_no_follow(&sidecar, b"drafted bytes")
+            .expect_err("a hard-linked draft path refuses the write");
+        assert!(
+            write_error.to_string().contains("hard link"),
+            "the refusal names the vector: {write_error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "marker = \"OUTSIDE-SECRET\"\n",
+            "the file outside the project is untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            "marker = \"OUTSIDE-SECRET\"\n",
+            "and so is the in-project name — the refusal came before the truncate"
+        );
+    }
+
     /// A FIFO swapped in at a snapshot path is refused, and refused without
     /// blocking. Before the fix the snapshot's `std::fs::read` opened it and
     /// waited for a writer that never comes, parking the draft request
