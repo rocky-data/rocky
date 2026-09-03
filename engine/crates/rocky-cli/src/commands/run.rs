@@ -14056,6 +14056,28 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         resume_run_id: Option<&str>,
         resume_latest: bool,
     ) -> anyhow::Result<()> {
+        drive_shadowed_resume_test_run(
+            config_path,
+            state_path,
+            pipeline,
+            resume_run_id,
+            resume_latest,
+            None,
+        )
+        .await
+    }
+
+    /// The same driver with a `--shadow` / `--shadow-schema` / `--branch`
+    /// override, for the cases that need the run to route somewhere other
+    /// than its rendered `schema_template` (#1592).
+    async fn drive_shadowed_resume_test_run(
+        config_path: &std::path::Path,
+        state_path: &std::path::Path,
+        pipeline: &str,
+        resume_run_id: Option<&str>,
+        resume_latest: bool,
+        shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    ) -> anyhow::Result<()> {
         super::run(
             config_path,
             std::sync::Arc::new(
@@ -14070,7 +14092,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             false,
             resume_run_id,
             resume_latest,
-            None,
+            shadow_config,
             &PartitionRunOptions::default(),
             None,
             None,
@@ -14506,6 +14528,109 @@ auto_create_schemas = true
                 !target_table_exists(&db_path, "staging_p2__acme", "orders").await,
                 "the resumed run must skip the table the checkpoint completed \
                  (seeded record: {run_record_status:?})"
+            );
+        }
+    }
+
+    /// #1592 acceptance, end to end: the checkpoint key really is
+    /// `catalog.<override>.table`, so eliding the bypassed template is not
+    /// fail-open.
+    ///
+    /// A `--branch branch__feature` run writes into `branch__feature`
+    /// whatever `schema_template` says. This test seeds that run's
+    /// checkpoint, edits the template, then resumes under the same branch.
+    /// Two things must hold, and the second is the direction-of-harm proof:
+    ///
+    /// ```text
+    ///   run 1  --branch branch__feature   template staging_p1__{source}
+    ///          checkpoint: warehouse.branch__feature.orders = Success
+    ///   edit   template -> edited_p1__{source}
+    ///   run 2  --branch branch__feature   --resume-latest
+    ///          scope matches  ->  orders SKIPPED  ->  table never created
+    /// ```
+    ///
+    /// The resume is accepted (it refused before this fix), and the only
+    /// source table stays uncopied — which it can only do if the seeded key
+    /// equals the key run 2 would have written. Neither template names a
+    /// schema the run touches.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn resume_under_a_branch_skips_the_recorded_table_after_a_template_edit() {
+        use rocky_core::shadow::ShadowConfig;
+
+        let branch = ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__feature".to_string()),
+            cleanup_after: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) =
+            write_two_pipeline_project(dir.path(), "staging_p1__{source}", "staging_p2__{source}")
+                .await;
+
+        // The checkpoint a `--branch branch__feature` run leaves: the scope
+        // built by the run path's own helper, and the one source table
+        // recorded under the key that run writes. No run record — the crash
+        // shape, which stays resumable.
+        {
+            let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+            let (name, pipeline_config) =
+                registry::resolve_pipeline(&loaded.config, Some("p1")).unwrap();
+            let replication = pipeline_config.as_replication().unwrap();
+            let target = &replication.target;
+            let pattern = replication.schema_pattern().unwrap();
+            let scope = replication_resume_scope(
+                name,
+                target,
+                &loaded.config.adapters[&target.adapter],
+                None,
+                Some(&branch),
+                target.separator.as_deref().unwrap_or(&pattern.separator),
+                &pattern,
+            );
+            assert_eq!(
+                scope.target.as_ref().unwrap().schema_template,
+                None,
+                "the branch override bypasses the template, so it is not recorded"
+            );
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .init_run_progress("run-branch", 1, Some(&scope))
+                .unwrap();
+            store
+                .record_table_progress(
+                    "run-branch",
+                    &table_entry(
+                        0,
+                        "warehouse.branch__feature.orders",
+                        rocky_core::state::TableStatus::Success,
+                    ),
+                )
+                .unwrap();
+        }
+
+        // Edit the one field this change is about. Nothing else moves.
+        write_two_pipeline_config(
+            dir.path(),
+            &db_path,
+            "edited_p1__{source}",
+            "staging_p2__{source}",
+        );
+
+        drive_shadowed_resume_test_run(&config_path, &state_path, "p1", None, true, Some(&branch))
+            .await
+            .expect("a template edit the branch bypasses must not refuse the resume");
+
+        assert!(
+            !target_table_exists(&db_path, "branch__feature", "orders").await,
+            "the resumed run must skip the table the checkpoint completed — \
+             the seeded key is the key this run would write"
+        );
+        for schema in ["staging_p1__acme", "edited_p1__acme"] {
+            assert!(
+                !target_table_exists(&db_path, schema, "orders").await,
+                "'{schema}' comes from a template the override replaces; \
+                 no run may write there"
             );
         }
     }
