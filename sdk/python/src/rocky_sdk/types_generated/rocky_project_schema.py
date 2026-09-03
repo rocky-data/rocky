@@ -1593,22 +1593,6 @@ class SchemaCacheConfig(BaseModel):
     """
 
 
-class SchemaEvolutionConfig(BaseModel):
-    """
-    Schema evolution configuration.
-
-    Controls how Rocky handles columns that disappear from the source but still exist in the target table. Instead of immediately dropping them, Rocky can keep them for a grace period (filling with NULL) so downstream consumers have time to adapt.
-    """
-
-    model_config = ConfigDict(
-        extra="forbid",
-    )
-    grace_period_days: conint(ge=0) | None = 7
-    """
-    Number of days to keep a dropped column before removing it from the target table. During this window the column is filled with NULL for new rows and a warning is emitted on every run. Default: 7.
-    """
-
-
 class SchemaMismatchPolicy1(StrEnum):
     """
     Treat a forward-incompatible store as cold: log a single `WARN`, bootstrap a fresh local state, and **never write the downgraded state back** to the shared tier (so the newer state upgraded pods depend on is left intact). The run proceeds as a full refresh. Default — it turns a hard, run-stranding failure into a graceful one-time full refresh during the mixed-version window of a schema-changing upgrade.
@@ -3982,12 +3966,6 @@ class RockyConfig(BaseModel):
     )
     """
     Project-level schedule defaults for native demand reconciliation. Supplies the fallback timezone for per-pipeline `[…schedule]` cron blocks and the resident-loop poll cadence. See [`ScheduleDefaultsConfig`].
-    """
-    schema_evolution: SchemaEvolutionConfig | None = Field(
-        {"grace_period_days": 7}, validate_default=True
-    )
-    """
-    Schema evolution configuration (grace-period column drops).
     """
     state: StateConfig | None = Field(
         {

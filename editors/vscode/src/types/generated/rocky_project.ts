@@ -544,10 +544,6 @@ export interface RockyConfig {
    */
   schedule?: ScheduleDefaultsConfig;
   /**
-   * Schema evolution configuration (grace-period column drops).
-   */
-  schema_evolution?: SchemaEvolutionConfig;
-  /**
    * Global state persistence configuration.
    */
   state?: StateConfig;
@@ -2259,17 +2255,6 @@ export interface ScheduleDefaultsConfig {
    * Default IANA timezone for per-pipeline cron evaluation. Default `"UTC"`.
    */
   timezone?: string;
-}
-/**
- * Schema evolution configuration.
- *
- * Controls how Rocky handles columns that disappear from the source but still exist in the target table. Instead of immediately dropping them, Rocky can keep them for a grace period (filling with NULL) so downstream consumers have time to adapt.
- */
-export interface SchemaEvolutionConfig {
-  /**
-   * Number of days to keep a dropped column before removing it from the target table. During this window the column is filled with NULL for new rows and a warning is emitted on every run. Default: 7.
-   */
-  grace_period_days?: number;
 }
 /**
  * State persistence configuration.

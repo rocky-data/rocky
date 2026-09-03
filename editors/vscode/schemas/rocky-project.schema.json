@@ -3644,20 +3644,6 @@
       },
       "type": "object"
     },
-    "SchemaEvolutionConfig": {
-      "additionalProperties": false,
-      "description": "Schema evolution configuration.\n\nControls how Rocky handles columns that disappear from the source but still exist in the target table. Instead of immediately dropping them, Rocky can keep them for a grace period (filling with NULL) so downstream consumers have time to adapt.",
-      "properties": {
-        "grace_period_days": {
-          "default": 7,
-          "description": "Number of days to keep a dropped column before removing it from the target table. During this window the column is filled with NULL for new rows and a warning is emitted on every run. Default: 7.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
     "SchemaMismatchPolicy": {
       "description": "Policy applied when the engine opens a state store whose schema version is **newer** than the binary supports (a *forward*-incompatibility).\n\nThis is the deploy-safety knob for rolling upgrades that cross a redb schema version. During a rolling bump, pods on the *old* binary can read state written by *already-upgraded* pods through a shared tiered backend. The default ([`Recreate`][Self::Recreate]) degrades that window instead of breaking it: the old pod does one full-refresh run and succeeds, rather than stranding the orchestrated run in an hour-long retry spiral.\n\nOnly the *forward* case (on-disk newer than binary) is governed here. *Backward*-compatibility — a newer binary reading older state — always auto-migrates forward as before; there is no knob for it.",
       "oneOf": [
@@ -4785,17 +4771,6 @@
         "timezone": "UTC"
       },
       "description": "Project-level schedule defaults for native demand reconciliation. Supplies the fallback timezone for per-pipeline `[…schedule]` cron blocks and the resident-loop poll cadence. See [`ScheduleDefaultsConfig`]."
-    },
-    "schema_evolution": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/SchemaEvolutionConfig"
-        }
-      ],
-      "default": {
-        "grace_period_days": 7
-      },
-      "description": "Schema evolution configuration (grace-period column drops)."
     },
     "state": {
       "allOf": [
