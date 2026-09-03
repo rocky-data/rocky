@@ -49,7 +49,7 @@ pub fn run_compliance(
         .with_context(|| format!("failed to load Rocky config from {}", config_path.display()))?;
 
     let models = if models_dir.exists() {
-        load_all_models(models_dir)?
+        load_all_models(models_dir, Some(&cfg.freshness))?
     } else {
         Vec::new()
     };
@@ -204,8 +204,11 @@ fn strategy_wire_name(s: MaskStrategy) -> &'static str {
 
 /// Recursive model loader (top level + one level of subdirectories,
 /// including `.rocky` DSL files).
-fn load_all_models(models_dir: &Path) -> Result<Vec<Model>> {
-    let mut all = crate::models_loader::load_project_models(models_dir)?;
+fn load_all_models(
+    models_dir: &Path,
+    project_freshness: Option<&rocky_core::config::ProjectFreshnessConfig>,
+) -> Result<Vec<Model>> {
+    let mut all = crate::models_loader::load_project_models(models_dir, project_freshness)?;
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(all)
 }

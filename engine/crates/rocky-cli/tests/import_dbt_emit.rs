@@ -178,7 +178,7 @@ fn emit_runnable_repo_from_rich_fixture() {
     // Translated models must load via the canonical model loader. This is the
     // closest analog to "compiles" without booting DuckDB — model loading is
     // the first phase of `rocky compile` and what catches sidecar shape errors.
-    let models = rocky_core::models::load_models_from_dir(&models_dir)
+    let models = rocky_core::models::load_models_from_dir(&models_dir, None)
         .expect("translated models load via the standard sidecar loader");
     let names: Vec<&str> = models.iter().map(|m| m.config.name.as_str()).collect();
     assert!(names.contains(&"stg_customers"));

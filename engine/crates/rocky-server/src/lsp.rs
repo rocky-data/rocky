@@ -421,22 +421,16 @@ impl RockyLsp {
         // freshness coverage check fire in the LSP. Without `mask` +
         // `allow_unmasked` populated, the compiler's
         // `check_classification_tags` is a no-op and the IDE never sees
-        // the warning. Without `project_freshness_default`, W005 fires
+        // the warning. Without the project `[freshness]` block, W005 fires
         // on every model with a temporal column regardless of the
         // project-level default. Project root = `models_dir.parent()`
         // (the same assumption the schema-cache loader makes above).
         // Missing or unreadable `rocky.toml` falls back to empty defaults.
-        let (mask, allow_unmasked, project_freshness_default) = dir_path
+        let (mask, allow_unmasked, project_freshness) = dir_path
             .parent()
             .map(|root| root.join("rocky.toml"))
             .and_then(|toml_path| rocky_core::config::load_rocky_config(&toml_path).ok())
-            .map(|c| {
-                (
-                    c.mask,
-                    c.classifications.allow_unmasked,
-                    c.freshness.has_default(),
-                )
-            })
+            .map(|c| (c.mask, c.classifications.allow_unmasked, c.freshness))
             .unwrap_or_default();
 
         let config = CompilerConfig {
@@ -445,7 +439,7 @@ impl RockyLsp {
             source_schemas,
             mask,
             allow_unmasked,
-            project_freshness_default,
+            project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
         };
 
@@ -5691,14 +5685,14 @@ mod tests {
 
         // Mirror `recompile()`'s mask/allow_unmasked threading.
         let cfg = rocky_core::config::load_rocky_config(&root.join("rocky.toml")).unwrap();
-        let project_freshness_default = cfg.freshness.has_default();
+        let project_freshness = cfg.freshness.clone();
         let compile_config = rocky_compiler::compile::CompilerConfig {
             models_dir: models_dir.clone(),
             contracts_dir: None,
             source_schemas: HashMap::new(),
             mask: cfg.mask,
             allow_unmasked: cfg.classifications.allow_unmasked,
-            project_freshness_default,
+            project_freshness,
             run_vars: rocky_core::run_vars::RunVars::new(),
         };
         let result = rocky_compiler::compile::compile(&compile_config).unwrap();

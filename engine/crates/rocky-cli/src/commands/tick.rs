@@ -230,7 +230,12 @@ fn member_max_lags(tx: &TransformationPipelineConfig, config_path: &Path) -> Res
     };
     // Partial: a broken draft in one subdirectory must not drop every healthy
     // member budget and silently widen this pipeline to the project default.
-    let (models, load_errors) = crate::models_loader::load_project_models_partial(&models_dir);
+    // `None` on purpose: only own-declared budgets count as member lags (see
+    // this function's doc comment). Inheriting the project default here would
+    // put it into the MIN and silently narrow the pipeline's freshness budget
+    // to the project value whenever any model declares a wider one.
+    let (models, load_errors) =
+        crate::models_loader::load_project_models_partial(&models_dir, None);
     // Tolerant on purpose — the tick must not wedge on one broken model — but
     // never silent: a model missing from this set is invisible to schedule
     // evaluation, and that absence must be visible (#1262).
@@ -520,6 +525,76 @@ cron = "0 3 * * *"
                 .contains("pipeline 'typo' not found in config")
         );
         assert!(!state_path.exists());
+    }
+
+    /// The project `[freshness]` default must NOT become a member budget.
+    ///
+    /// #1435 wired project-level freshness inheritance into model config
+    /// resolution. `member_max_lags` deliberately loads without it, because
+    /// the reconciler already falls back to the project default when the
+    /// member list is empty. If inheritance leaked in here, every model
+    /// would contribute the project value, the MIN would collapse to it,
+    /// and a pipeline whose only declared budget is wider would silently
+    /// start firing on the narrower project window.
+    #[test]
+    fn the_project_freshness_default_is_not_a_member_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config_path = root.join("rocky.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[adapter.db]
+type = "duckdb"
+
+[freshness]
+expected_lag_seconds = 600
+
+[pipeline.silver]
+type = "transformation"
+models = "models/**"
+[pipeline.silver.target]
+adapter = "db"
+[pipeline.silver.schedule]
+freshness = true
+"#,
+        )
+        .unwrap();
+        let models = root.join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        // One model declares a WIDER budget than the project default, and one
+        // declares none at all.
+        std::fs::write(
+            models.join("declared.toml"),
+            "name = \"declared\"\ntarget = { catalog = \"c\", schema = \"s\", table = \"declared\" }\n\n[freshness]\nmax_lag_seconds = 3600\n",
+        )
+        .unwrap();
+        std::fs::write(models.join("declared.sql"), "SELECT 1").unwrap();
+        std::fs::write(
+            models.join("silent.toml"),
+            "name = \"silent\"\ntarget = { catalog = \"c\", schema = \"s\", table = \"silent\" }\n",
+        )
+        .unwrap();
+        std::fs::write(models.join("silent.sql"), "SELECT 1").unwrap();
+
+        let cfg = load_rocky_config(&config_path).unwrap();
+        let budgets = build_member_budgets(&cfg, &config_path, None);
+        assert_eq!(
+            budgets.get("silver").map(Vec::as_slice),
+            Some([3600u64].as_slice()),
+            "only the own-declared budget counts as a member lag"
+        );
+
+        let resolved = rocky_core::schedule::demand::resolve_freshness_budget(
+            budgets.get("silver").map(Vec::as_slice).unwrap_or_default(),
+            cfg.freshness.expected_lag_seconds,
+        );
+        assert_eq!(
+            resolved,
+            Some(3600),
+            "the pipeline's freshness budget must stay at the declared 3600s, \
+             not narrow to the 600s project default"
+        );
     }
 
     #[test]

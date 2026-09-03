@@ -260,8 +260,12 @@ pub fn list_sources(config_path: &Path, json: bool) -> Result<()> {
 }
 
 /// Load all models from a directory (with subdirectory scan, incl. `.rocky`).
+///
+/// No project `[freshness]` is threaded in: `rocky list` takes a models
+/// directory and never loads a `RockyConfig`, and no `ListModelEntry` field
+/// carries freshness.
 fn load_all_models(models_dir: &Path) -> Result<Vec<rocky_core::models::Model>> {
-    let mut all = crate::models_loader::load_project_models(models_dir)?;
+    let mut all = crate::models_loader::load_project_models(models_dir, None)?;
     all.sort_unstable_by(|a, b| a.config.name.cmp(&b.config.name));
     Ok(all)
 }

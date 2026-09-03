@@ -169,7 +169,7 @@ fn every_example_models_dir_loads() {
     let mut failures = Vec::new();
 
     for (_config, models_dir) in &projects {
-        if let Err(e) = rocky_cli::models_loader::load_project_models(models_dir) {
+        if let Err(e) = rocky_cli::models_loader::load_project_models(models_dir, None) {
             let rel = models_dir.strip_prefix(&root).unwrap_or(models_dir);
             failures.push(format!("  {}: {e:#}", rel.display()));
         }

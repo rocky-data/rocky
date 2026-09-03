@@ -527,7 +527,11 @@ pub(super) fn load_transformation_models(
         // same name twice (`transforms/orders` and `transforms/staging/orders`)
         // — that is a duplicate no matter how many pipelines exist.
         let mut seen_here: HashMap<String, String> = HashMap::new();
-        for model in crate::models_loader::load_project_models_matching(&dir, &models_glob)? {
+        for model in crate::models_loader::load_project_models_matching(
+            &dir,
+            &models_glob,
+            Some(&cfg.freshness),
+        )? {
             let canonical = std::fs::canonicalize(&model.file_path)
                 .unwrap_or_else(|_| PathBuf::from(&model.file_path));
 

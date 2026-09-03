@@ -110,7 +110,7 @@ fn emit_models(
         source_schemas: std::collections::HashMap::new(),
         mask: std::collections::BTreeMap::new(),
         allow_unmasked: vec![],
-        project_freshness_default: false,
+        project_freshness: Default::default(),
         run_vars: run_vars.clone(),
     };
     let result = match compile::compile(&config) {

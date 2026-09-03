@@ -25,7 +25,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Know this before you hand a read-only token to a browser.** The scope restricts that token; it is not a whole-server browser perimeter. `rocky serve --scheduler` bound to loopback with no `ROCKY_WEBHOOK_SECRET` accepts an *unsigned* webhook `POST` — a documented dev convenience, unchanged here — and spools work for the resident scheduler. Same-origin script can reach that with no token at all. Set `ROCKY_WEBHOOK_SECRET` whenever a browser can reach the sidecar.
 
+### Removed
+
+- **`[schema_evolution]` is gone, and a config that still declares it now fails to load.** The block held one key, `grace_period_days`, and nothing ever read it. Drift detection reports a column the source gained and a column whose type changed; it never reported a column the source lost, so Rocky never dropped one and the grace period never opened. The key parsed, validated, and did nothing.
+
+  Accepting a key that does nothing is the defect. Deleting the key quietly would have replaced one silence with another, so the section is refused instead, with a message that names the remedy:
+
+  ```
+  the `[schema_evolution]` section was removed because nothing ever read it: drift
+  detection never reported a column that disappeared from the source, so Rocky never
+  dropped one and `grace_period_days` never took effect. Delete the
+  `[schema_evolution]` section from this config; removing it changes no behaviour.
+  ```
+
+  **On upgrade:** a `rocky.toml` that declares `[schema_evolution]` stops loading, on every command. Delete the section. Nothing about your pipeline changes — no run ever started a grace period, warned while one was open, or dropped a column when one expired. The `schema_evolution` key also leaves the generated project JSON schema and the Pydantic / TypeScript bindings.
+
+  The feature itself is not cancelled, and it is closer than the issue recorded. The grace-period detector, the `ALTER TABLE ... DROP COLUMN` generator, the `GracePeriodRecord` type and its four state-store accessors all exist and are covered by twelve tests; the `grace_periods` redb table is eagerly created and registered in the snapshot registry. Only the call site is missing. That table is **kept** — removing it would be a persisted-state-shape change, and it is the persistence the feature needs. The work is tracked in #1616, and it will land behind an explicit opt-in, because dropping a column is destructive and must never become a default. (#1435)
+
 ### Fixed
+
+- **A model with no `[freshness]` block now inherits the project's.** `rocky.toml`'s top-level `[freshness]` set a project-wide staleness budget, and the model loader never looked at it. The engine even carried the conversion helper — `ModelFreshnessConfig::from_project_default` — with a doc comment describing the inheritance and no caller anywhere, including tests. A project that set `expected_lag_seconds`, `time_column` and `severity` there saw every model report no freshness at all.
+
+  Precedence is now, first match wins:
+
+  ```
+  model sidecar [freshness]  ->  models/_defaults.toml [freshness]  ->  project [freshness]
+  ```
+
+  Inheritance is whole-block. A model that declares its own `[freshness]` keeps exactly what it wrote and picks up nothing field by field, and a project block with no `expected_lag_seconds` supplies nothing, so `time_column` or `severity` alone still inherit nothing.
+
+  Two things deliberately did **not** change. The W005 freshness-coverage warning already treated a project `expected_lag_seconds` as covering every model, and still does. And the scheduler's freshness budget is unmoved: `rocky tick` collects member-model budgets to take their minimum, and it still collects only budgets a model declared for itself. Letting the project default in there would put it into that minimum, so a pipeline whose one declared budget was wider would silently start firing on the narrower project window. A test pins that: project default 600s plus one model declaring 3600s still resolves to 3600s. The reconciler's own fallback to the project value, when no member declares one, is unchanged.
+
+  Nothing reads `time_column` or `severity` at runtime on any level yet, so this changes what Rocky reports about a model, not what it executes. `rocky compile` and `rocky dag` now show the inherited block on a model that has no sidecar one. (#1435)
 
 - **A resume that cannot resume now stops instead of running everything from scratch.** `rocky run --resume <run-id>` and `rocky run --resume-latest` used to fall back to an ordinary run when the checkpoint was missing or the state store could not be read. A typo, an empty state directory or an expired checkpoint therefore launched a full production run and reported success. Both flags now exit non-zero before anything is discovered or written, and a state-store read error is reported with its cause rather than swallowed. A valid checkpoint that recorded zero completed tables is still a valid resume, and now records its `resumed_from` identity.
 

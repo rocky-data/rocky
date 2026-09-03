@@ -3127,10 +3127,14 @@ pub(crate) fn resolve_touched_apply_targets(
     // — those specific targets still fall back to defaults, which is exactly the
     // pre-existing limitation documented above.
     let (models, load_errors) = match (models_dir.as_deref(), models_glob.as_deref()) {
-        (Some(dir), Some(glob)) => {
-            crate::models_loader::load_project_models_matching_partial(dir, glob)
+        (Some(dir), Some(glob)) => crate::models_loader::load_project_models_matching_partial(
+            dir,
+            glob,
+            Some(&config.freshness),
+        ),
+        (Some(dir), None) => {
+            crate::models_loader::load_project_models_partial(dir, Some(&config.freshness))
         }
-        (Some(dir), None) => crate::models_loader::load_project_models_partial(dir),
         (None, _) => (Vec::new(), Vec::new()),
     };
     for e in &load_errors {
