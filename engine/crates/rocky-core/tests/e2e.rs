@@ -94,12 +94,14 @@ impl SqlDialect for TestDialect {
             }
         }
         for mc in metadata {
-            rocky_sql::validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
+            rocky_sql::validation::validate_identifier(mc.name()).map_err(AdapterError::new)?;
             use std::fmt::Write;
             write!(
                 sql,
                 ", CAST({} AS {}) AS {}",
-                mc.value, mc.data_type, mc.name
+                mc.value(),
+                mc.data_type(),
+                mc.name()
             )
             .unwrap();
         }

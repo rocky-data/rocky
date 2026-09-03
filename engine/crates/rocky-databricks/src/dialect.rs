@@ -112,23 +112,25 @@ impl SqlDialect for DatabricksSqlDialect {
         }
 
         for mc in metadata {
-            validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
+            validation::validate_identifier(mc.name()).map_err(AdapterError::new)?;
             // `data_type` is interpolated raw into the CAST — validate it as a
             // SQL type (the same guard the drift path uses) so a hostile
             // `rocky.toml` metadata `type` can't break out of the cast.
-            rocky_core::sql_gen::validate_sql_type(&mc.data_type).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(mc.data_type()).map_err(AdapterError::new)?;
             // `value` is an SQL expression, not an identifier, and it is NOT
             // trusted: `rocky-cli` substitutes `{placeholder}`s in it from source
             // schema names read back from the warehouse.
             // `rocky_ir::MetadataColumn::new` is the boundary that guards it;
             // this repeats the scan because `new_unchecked` and any future
             // construction path must not reach a raw splice.
-            validation::reject_statement_terminator("metadata_columns[].value", &mc.value)
+            validation::reject_statement_terminator("metadata_columns[].value", mc.value())
                 .map_err(AdapterError::new)?;
             write!(
                 sql,
                 ", CAST({} AS {}) AS {}",
-                mc.value, mc.data_type, mc.name
+                mc.value(),
+                mc.data_type(),
+                mc.name()
             )
             .unwrap();
         }

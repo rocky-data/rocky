@@ -3656,27 +3656,17 @@ pub async fn run(
                 }
                 claimed_targets.insert(target_identity, this_source);
 
-                // Validate AFTER `resolve_template`: the placeholders are
-                // filled from source schema names read back from the
-                // warehouse, so the resolved text — not the config text — is
-                // what reaches `select_clause`.
-                let metadata_columns: Vec<MetadataColumn> = pipeline
-                    .metadata_columns
-                    .iter()
-                    .map(|mc| {
-                        MetadataColumn::new(
-                            mc.name.clone(),
-                            mc.data_type.clone(),
-                            parsed.resolve_template(&mc.value, &pattern.separator),
-                        )
-                    })
-                    .collect::<Result<_, _>>()
-                    .with_context(|| {
-                        format!(
-                            "invalid [[pipeline.*.metadata_columns]] resolved for source schema '{}'",
-                            conn.schema
-                        )
-                    })?;
+                // The single producer `rocky plan` also uses, so the preview
+                // and the run cannot disagree. It substitutes the
+                // warehouse-derived schema components, checks each one is a
+                // plain identifier, and validates the resolved triple.
+                let metadata_columns: Vec<MetadataColumn> =
+                    rocky_core::schema::resolve_metadata_columns(
+                        &parsed,
+                        &pipeline.metadata_columns,
+                        &pattern.separator,
+                    )
+                    .with_context(|| format!("source schema '{}'", conn.schema))?;
 
                 tables_to_process.push(TableTask {
                     source_catalog: source_catalog.clone(),
@@ -11206,7 +11196,7 @@ fn resolve_merge_update_columns(
         .map(|c| Arc::from(c.name.as_str()))
         .collect();
     for m in metadata_columns {
-        cols.push(Arc::from(m.name.as_str()));
+        cols.push(Arc::from(m.name()));
     }
     MaterializationStrategy::Merge {
         unique_key: unique_key.clone(),

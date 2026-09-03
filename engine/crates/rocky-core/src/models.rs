@@ -1904,7 +1904,7 @@ pub fn apply_surrogate_keys(
     }
     let additions = surrogate_key_metadata_columns(specs, dialect, &model_ir.name)?
         .iter()
-        .map(|m| format!("CAST({} AS {}) AS {}", m.value, m.data_type, m.name))
+        .map(|m| format!("CAST({} AS {}) AS {}", m.value(), m.data_type(), m.name()))
         .collect::<Vec<_>>()
         .join(", ");
     let inner = model_ir.sql.trim().trim_end_matches(';');

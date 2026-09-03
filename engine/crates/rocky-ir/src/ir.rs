@@ -208,29 +208,37 @@ pub enum ColumnSelection {
 /// `value` is an SQL *expression* by design (`NULL`, `current_timestamp()`,
 /// `'{tenant}'`), so it cannot be an identifier allowlist. It is **not**
 /// trusted input: `rocky-cli` resolves `{placeholder}`s in it from source
-/// schema names read back from the warehouse, and `SchemaPattern::parse`
-/// splits those on a separator without any identifier check. Construct
-/// through [`MetadataColumn::new`] *after* that substitution so the resolved
-/// text is what gets scanned.
+/// schema names read back from the warehouse. Construct through
+/// [`MetadataColumn::new`] *after* that substitution so the resolved text is
+/// what gets scanned; `rocky_core::schema::resolve_metadata_columns` is the
+/// production producer and additionally holds every substituted component to
+/// a plain identifier.
 ///
-/// The struct is `#[non_exhaustive]` so no crate outside `rocky-ir` can build
-/// one with a struct literal and skip the checks. Field reads stay `pub`.
-/// [`Deserialize`] is the other constructor and runs the same checks via
-/// `#[serde(try_from)]`.
+/// # Why the fields are private
+///
+/// `#[non_exhaustive]` alone would stop a struct literal in another crate but
+/// not `col.value = hostile;` on a benignly-constructed one. Private fields
+/// plus [`Self::name`] / [`Self::data_type`] / [`Self::value`] readers make
+/// [`MetadataColumn::new`] and [`Deserialize`] the only two ways to obtain
+/// one — and both validate. (`new_unchecked` is a third, gated behind the
+/// `test-support` feature and off in a normal build.) The JSON shape is
+/// unchanged: `Serialize` is still derived over the same three fields.
 ///
 /// # Bound
 ///
-/// The `value` scan refuses a statement terminator; it does not bound reads.
-/// A `value` can still be a correlated subquery. That is the documented
-/// posture for every SQL fragment Rocky accepts from config, not a gap
-/// specific to this field.
+/// The `value` scan refuses a statement terminator; it does not bound reads
+/// or track parentheses. A `value` the project author writes can still be a
+/// correlated subquery. That is the documented posture for every SQL fragment
+/// Rocky accepts from config, not a gap specific to this field — and it is
+/// why warehouse-derived substitutions are held to the stricter identifier
+/// rule one layer up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "MetadataColumnRepr")]
 #[non_exhaustive]
 pub struct MetadataColumn {
-    pub name: String,
-    pub data_type: String,
-    pub value: String,
+    name: String,
+    data_type: String,
+    value: String,
 }
 
 /// Deserialization shadow for [`MetadataColumn`].
@@ -286,13 +294,33 @@ impl MetadataColumn {
         })
     }
 
+    /// The output column alias. A validated SQL identifier.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The cast target type. Validated by
+    /// [`validation::validate_sql_type`].
+    pub fn data_type(&self) -> &str {
+        &self.data_type
+    }
+
+    /// The SQL expression cast into the column. Scanned by
+    /// [`validation::reject_statement_terminator`].
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
     /// Builds a metadata column **without** validating any field.
     ///
     /// Exists so tests can construct the hostile inputs that
     /// [`MetadataColumn::new`] refuses, and drive them at a dialect's
     /// `select_clause` to prove the adapter-level defence in depth is live.
-    /// Production code must use [`MetadataColumn::new`].
-    #[doc(hidden)]
+    ///
+    /// Gated behind the `test-support` feature, which no normal build enables
+    /// — a `#[doc(hidden)]` `pub fn` is documentation, not access control.
+    /// Enable it in `[dev-dependencies]` only.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn new_unchecked(
         name: impl Into<String>,
         data_type: impl Into<String>,

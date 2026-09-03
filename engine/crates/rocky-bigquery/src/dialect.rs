@@ -112,13 +112,15 @@ impl SqlDialect for BigQueryDialect {
         // splice.
         let mut meta_cols: Vec<String> = Vec::with_capacity(metadata.len());
         for m in metadata {
-            validation::validate_identifier(&m.name).map_err(AdapterError::new)?;
-            rocky_core::sql_gen::validate_sql_type(&m.data_type).map_err(AdapterError::new)?;
-            validation::reject_statement_terminator("metadata_columns[].value", &m.value)
+            validation::validate_identifier(m.name()).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(m.data_type()).map_err(AdapterError::new)?;
+            validation::reject_statement_terminator("metadata_columns[].value", m.value())
                 .map_err(AdapterError::new)?;
             meta_cols.push(format!(
                 "CAST({} AS {}) AS {}",
-                m.value, m.data_type, m.name
+                m.value(),
+                m.data_type(),
+                m.name()
             ));
         }
 

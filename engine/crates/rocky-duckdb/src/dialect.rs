@@ -138,23 +138,25 @@ impl SqlDialect for DuckDbSqlDialect {
         }
 
         for mc in metadata {
-            validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
+            validation::validate_identifier(mc.name()).map_err(AdapterError::new)?;
             // Validate `data_type` before interpolating it raw into the CAST
             // (same guard as the drift path) — a metadata `type` from a
             // hostile config must not break out of the cast expression.
-            rocky_core::sql_gen::validate_sql_type(&mc.data_type).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(mc.data_type()).map_err(AdapterError::new)?;
             // `value` is an SQL expression, not an identifier, and it is NOT
             // trusted: `rocky-cli` substitutes `{placeholder}`s in it from source
             // schema names read back from the warehouse.
             // `rocky_ir::MetadataColumn::new` is the boundary that guards it;
             // this repeats the scan because `new_unchecked` and any future
             // construction path must not reach a raw splice.
-            validation::reject_statement_terminator("metadata_columns[].value", &mc.value)
+            validation::reject_statement_terminator("metadata_columns[].value", mc.value())
                 .map_err(AdapterError::new)?;
             write!(
                 sql,
                 ", CAST({} AS {}) AS {}",
-                mc.value, mc.data_type, mc.name
+                mc.value(),
+                mc.data_type(),
+                mc.name()
             )
             .unwrap();
         }
@@ -354,10 +356,10 @@ mod tests {
         let cols =
             rocky_core::models::surrogate_key_metadata_columns(&specs, &d, "fct_orders").unwrap();
         assert_eq!(cols.len(), 1);
-        assert_eq!(cols[0].name, "order_key");
-        assert_eq!(cols[0].data_type, "VARCHAR");
+        assert_eq!(cols[0].name(), "order_key");
+        assert_eq!(cols[0].data_type(), "VARCHAR");
         assert_eq!(
-            cols[0].value,
+            cols[0].value(),
             "md5(cast(coalesce(cast(order_id as VARCHAR), '_dbt_utils_surrogate_key_null_') as VARCHAR))"
         );
     }
