@@ -3886,12 +3886,15 @@ impl AdapterConfig {
     /// API request beside `database` and `schema` but selects the virtual
     /// warehouse that runs the statement — it resolves no name, so it
     /// cannot decide which `catalog.schema.table` a write lands in. The
-    /// one place it reaches emitted SQL is Snowflake's dynamic-table DDL
-    /// (`WAREHOUSE = <wh>`, the refresh compute stored on the object),
-    /// whose target is formatted separately from the model's own
-    /// catalog/schema/table. Keeping it in the identity refused a resume
-    /// after a compute resize that moved nothing; the catch-all arm below
-    /// has never treated it as a locator.
+    /// one place it reaches emitted SQL is a *transformation* model's
+    /// Snowflake dynamic-table DDL (`WAREHOUSE = <wh>`, the refresh
+    /// compute stored on the object), whose target is formatted
+    /// separately from the model's own catalog/schema/table; a
+    /// replication pipeline refuses `dynamic_table` before any DDL is
+    /// generated, and resume is replication-only, so no resumable path
+    /// emits it at all. Keeping it in the identity refused a resume after
+    /// a compute resize that moved nothing; the catch-all arm below has
+    /// never treated it as a locator.
     ///
     /// A `host` is split in two, because what routes and what is safe to
     /// show are not the same string. The `host` locator is the shown form,
