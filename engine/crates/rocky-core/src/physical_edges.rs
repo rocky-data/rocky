@@ -93,11 +93,46 @@ pub struct DerivedPhysicalEdges {
 /// returns, so folding the READ side here is defense-in-depth; the fold is
 /// load-bearing for the TARGET side (configured `[target]` components come
 /// through verbatim).
-fn fold(s: &str) -> String {
+///
+/// Public because the compile-time resolver asks the same question about the
+/// same two strings (#1354) and a second spelling of this fold is a second
+/// matcher that can disagree with this one.
+#[must_use]
+pub fn fold_identifier(s: &str) -> String {
     s.trim()
         .trim_matches('"')
         .trim_matches('`')
         .to_ascii_lowercase()
+}
+
+/// Whether a bare reference spelled with `model_name` names the table this
+/// model actually writes.
+///
+/// A bare `FROM x` carries no catalog and no schema, so the warehouse
+/// resolves it through connection state (search path / current schema) to a
+/// PHYSICAL table called `x`. That table can only be this model's output when
+/// the model's target table component is itself `x`. A model named
+/// `customers` whose configured target is `prod.customers_v2` therefore does
+/// not answer to a bare `FROM customers`: the name matches, the object does
+/// not (#1354).
+///
+/// This is a question about the WAREHOUSE. `rocky test` / `rocky ci` go
+/// through `rocky_engine::executor::execute_locally`, which materializes every
+/// model as `CREATE OR REPLACE TABLE <model name>` and ignores the configured
+/// target — there a bare read of the name always reaches the model, whatever
+/// this returns. Callers must know which execution they are reasoning about.
+///
+/// The comparison folds both sides through [`fold_identifier`], so a project
+/// that spells its targets in upper case (`[target] table = "CUSTOMERS"` for
+/// model `customers` — the common Snowflake shape) still binds.
+///
+/// Two callers, one spelling: `rocky_compiler::resolve::resolve_dependencies`
+/// (which reports the mismatch as D012 and keeps the edge — see #1354 for why
+/// dropping it is not that layer's call) and the content-reuse read resolver
+/// in `rocky-cli` (which refuses to bind the read, failing closed to a build).
+#[must_use]
+pub fn bare_name_binds(model_name: &str, target_table: &str) -> bool {
+    fold_identifier(model_name) == fold_identifier(target_table)
 }
 
 /// Derive physical-read ordering edges for `models`.
@@ -124,7 +159,11 @@ pub fn derive_physical_edges(
         if !m.materializes {
             continue;
         }
-        let key3 = (fold(m.catalog), fold(m.schema), fold(m.table));
+        let key3 = (
+            fold_identifier(m.catalog),
+            fold_identifier(m.schema),
+            fold_identifier(m.table),
+        );
         let key2 = (key3.1.clone(), key3.2.clone());
         by_table.entry(key3.2.clone()).or_default().push(m.name);
         by_three.entry(key3).or_default().push(m.name);
@@ -173,7 +212,7 @@ pub fn derive_physical_edges(
             }
         };
         for r in refs {
-            let parts: Vec<String> = r.split('.').map(fold).collect();
+            let parts: Vec<String> = r.split('.').map(fold_identifier).collect();
             let (tier, producers): (u8, Option<&Vec<&str>>) = match parts.len() {
                 3 => (
                     0,
@@ -316,6 +355,24 @@ mod tests {
             sql,
             materializes: true,
         }
+    }
+
+    /// The bare-name rule shared by the compile-time resolver (which reports
+    /// it) and the content-reuse read resolver (which refuses to bind on it) —
+    /// #1354. A bare read can only be a model's output when the model's
+    /// configured target table is spelled that way; case and quoting fold on
+    /// both sides so an upper-cased target is the SAME name, not a rename.
+    #[test]
+    fn bare_name_binds_only_when_the_model_writes_that_name() {
+        assert!(bare_name_binds("customers", "customers"));
+        assert!(bare_name_binds("customers", "CUSTOMERS"));
+        assert!(bare_name_binds("Customers", "customers"));
+        assert!(bare_name_binds("customers", "\"customers\""));
+        assert!(!bare_name_binds("customers", "customers_v2"));
+        // The shared fold trims, exactly as the physical producer index does
+        // — one fold, one answer.
+        assert!(bare_name_binds("customers", " customers "));
+        assert!(!bare_name_binds("stg_customers", "customers"));
     }
 
     /// The issue's repro: a 2-part physical read derives the edge that

@@ -6799,9 +6799,10 @@ pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules
                 the target. Where a component is a reserved word (`ORDER`, `SELECT`, …) only the \
                 quoting remedy is available: such a name cannot be read unquoted at all. An \
                 account that sets QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE, or a \
-                catalog-linked database with CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE, makes \
-                the two one object — but Rocky cannot read either setting (#1281), so the \
-                spelling still has to be unambiguous without them";
+                catalog-linked database with CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE, can \
+                make the two one object. Rocky can observe the first on a connection (#1281), but \
+                that answer describes one request and does not govern this one, so it cannot \
+                decide this — spell the reference unambiguously instead";
     }
     "Spell the reference exactly as the upstream's configured target, or rename one so they \
      differ by more than case (#1281 tracks reading the live setting instead of assuming it)"
@@ -9670,9 +9671,10 @@ fn build_reuse_target_by_model<'a, I>(models: I) -> std::collections::HashMap<St
 where
     I: IntoIterator<Item = (&'a str, &'a rocky_core::models::TargetConfig)>,
 {
-    // Each model contributes two lookup keys — its lowercased bare name and its
-    // lowercased 3-part `catalog.schema.table` — both resolving to the model's
-    // target full name. When two *different* models would claim the same key
+    // Each model contributes its lowercased 3-part `catalog.schema.table` key,
+    // plus its lowercased bare name when that name is what it writes (#1354),
+    // both resolving to the model's target full name.
+    // When two *different* models would claim the same key
     // with two *different* targets (case-colliding names, or a name that folds
     // onto another model's target), the key is **poisoned** (removed) rather
     // than resolved last-writer-wins: a consumer reading through an ambiguous
@@ -9685,7 +9687,40 @@ where
     let mut poisoned: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, t) in models {
         let target_full = format!("{}.{}.{}", t.catalog, t.schema, t.table);
-        for key in [target_full.to_lowercase(), name.to_lowercase()] {
+        // The bare-NAME key RESOLVES only when the model's configured target
+        // table is spelled like its name (#1354). A bare `FROM x` carries no
+        // schema, so the warehouse resolves it through the search path to a
+        // physical `x`; for a model named `x` whose target is `y`, binding
+        // that read to this model's column hashes compares the wrong producer
+        // and can SKIP a consumer whose real input moved (silent staleness).
+        //
+        // A model that does not qualify POISONS the key rather than merely
+        // skipping it. Model names collide case-insensitively (`Orders` and
+        // `orders` are both legal — only exact duplicates are rejected), and a
+        // silent skip would leave the *other* claimant resolving a key that is
+        // ambiguous today, turning a fail-closed BUILD into a possible skip.
+        // Poisoned or absent, the read resolves to `None`, no baseline is
+        // recorded, and the gate builds.
+        //
+        // `bare_name_binds` is the same question the compiler asks before
+        // raising D012 on the matching DAG edge — one spelling, two consumers,
+        // each taking the direction that costs work rather than correctness
+        // (the compiler keeps the edge and reports it, this drops the key).
+        let mut keys: Vec<String> = vec![target_full.to_lowercase()];
+        if rocky_core::physical_edges::bare_name_binds(name, &t.table) {
+            keys.push(name.to_lowercase());
+        } else if !name.contains('.') {
+            // Model names are not identifier-validated at load
+            // (`models.rs::parse_model_config`), so a model can be NAMED
+            // `cat.sch.orders`. Its folded name key would then be its own
+            // legitimate 3-part target key, and poisoning it would refuse a
+            // read that resolves correctly today. The bare-name namespace is
+            // the dot-free one; leave the qualified namespace alone.
+            let name_key = name.to_lowercase();
+            map.remove(&name_key);
+            poisoned.insert(name_key);
+        }
+        for key in keys {
             if poisoned.contains(&key) {
                 continue;
             }
@@ -10097,8 +10132,10 @@ fn propagate_skip_outputs(
 /// un-enumerable read can never be mistaken for "no raw-source reads". This is
 /// the same completeness fail-safe `skip_gate` uses.
 ///
-/// Only an UNAMBIGUOUS read resolves: a 1-part bare name (unique per project)
-/// or a 3-part `catalog.schema.table` (names a single catalog). A 2-part
+/// Only an UNAMBIGUOUS read resolves: a 1-part bare name (unique per project,
+/// and only for a model whose configured target table is spelled the same —
+/// #1354) or a 3-part
+/// `catalog.schema.table` (names a single catalog). A 2-part
 /// `schema.table` read is **catalog-ambiguous** — it binds to the session
 /// default catalog at runtime and `classify_table_ref` already treats it as an
 /// external source with no DAG edge — so it is refused here (returns `None` for
@@ -22008,47 +22045,58 @@ auto_create_schemas = true
     #[cfg(feature = "duckdb")]
     #[test]
     fn defer_on_snowflake_qualifies_a_reference_a_quoted_cte_does_not_bind() {
-        let tmp = tempfile::TempDir::new().expect("temp dir");
-        let models_dir = tmp.path().join("models");
-        std::fs::create_dir(&models_dir).expect("mkdir models");
-        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
-        write_model_with_target(
-            &models_dir,
-            "mart",
-            "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
-            "main",
-            "mart",
-        );
-        let mut compiled =
-            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
-                models_dir,
-                ..Default::default()
-            })
-            .expect("compile models");
+        fn deferred_sql(mart_sql: &str) -> String {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+            write_model_with_target(&models_dir, "mart", mart_sql, "main", "mart");
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            super::apply_defer_rewrite(
+                &mut compiled,
+                Some("mart"),
+                &super::DeferOptions {
+                    enabled: true,
+                    defer_to: None,
+                },
+                &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            )
+            .expect("defer rewrite must succeed");
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == "mart")
+                .expect("mart missing")
+                .sql
+                .clone()
+        }
 
-        super::apply_defer_rewrite(
-            &mut compiled,
-            Some("mart"),
-            &super::DeferOptions {
-                enabled: true,
-                defer_to: None,
-            },
-            &rocky_snowflake::dialect::SnowflakeSqlDialect,
-        )
-        .expect("defer rewrite must succeed");
-
-        let mart = compiled
-            .project
-            .models
-            .iter()
-            .find(|m| m.config.name == "mart")
-            .expect("mart missing")
-            .sql
-            .clone();
+        // Quoted alias, unquoted reference: Snowflake does not bind them, so the
+        // reference is the deferred model and is qualified to its target.
+        let freed = deferred_sql("WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders");
         assert!(
-            mart.contains("\"main\".\"orders\""),
-            "Snowflake does not bind the quoted alias to the bare reference, so the reference \
-             is the deferred model and is qualified to its target: {mart}"
+            freed.contains("\"main\".\"orders\""),
+            "a quoted alias does not bind an unquoted reference: {freed}"
+        );
+
+        // The other direction, and the one the disclosure has to cover too. The
+        // reference must still spell the model name exactly, because the
+        // deferred lookup is by model name and stays exact — only the ALIAS
+        // differs by case here. Two unquoted spellings are ONE name on
+        // Snowflake, so the CTE hides the reference and nothing is qualified.
+        // Under the previous exact alias comparison they were two names, the
+        // reference was not hidden, and it WAS qualified.
+        let hidden = deferred_sql("WITH Orders AS (SELECT 1 AS id) SELECT * FROM orders");
+        assert!(
+            !hidden.contains("\"main\".\"orders\""),
+            "an unquoted alias differing only by case is the same name, so it hides the \
+             reference: {hidden}"
         );
     }
 
@@ -25251,8 +25299,11 @@ auto_create_schemas = true
             !map.contains_key("marts.orders"),
             "a catalog-less schema.table key would let a 2-part read false-strong"
         );
-        assert_eq!(map.get("orders_a"), Some(&"cat1.marts.orders".to_string()));
-        assert_eq!(map.get("orders_b"), Some(&"cat2.marts.orders".to_string()));
+        // Neither model writes a table called by its own name, so neither
+        // contributes a bare-name key (#1354): `FROM orders_a` reads a physical
+        // `orders_a`, not `cat1.marts.orders`.
+        assert!(!map.contains_key("orders_a"), "{map:?}");
+        assert!(!map.contains_key("orders_b"), "{map:?}");
         assert_eq!(
             map.get("cat1.marts.orders"),
             Some(&"cat1.marts.orders".to_string())
@@ -25326,20 +25377,21 @@ auto_create_schemas = true
 
     #[test]
     fn reuse_one_part_bare_name_read_still_resolves() {
-        // (c) A 1-part bare model-name read still resolves (names are unique
-        // per project, so there is no ambiguity to refuse).
+        // (c) A 1-part bare model-name read still resolves when the model
+        // writes a table of that name (names are unique per project, so there
+        // is no ambiguity to refuse). The fixture used to be a model named
+        // `orders_a` writing `marts.orders`; that read resolves to a physical
+        // `orders_a`, not to this model, so it no longer binds (#1354) — see
+        // `reuse_bare_read_of_a_renamed_target_model_stays_unresolved`.
         let t1 = target_cfg("cat1", "marts", "orders");
-        let target_by_model = build_reuse_target_by_model([("orders_a", &t1)]);
+        let target_by_model = build_reuse_target_by_model([("orders", &t1)]);
 
         let mut outputs = std::collections::HashMap::new();
         outputs.insert("cat1.marts.orders".to_string(), "hash-cat1".to_string());
 
-        let resolved = resolve_read_set_content_upstreams(
-            "SELECT id FROM orders_a",
-            &target_by_model,
-            &outputs,
-        )
-        .expect("a 1-part bare-name read resolves");
+        let resolved =
+            resolve_read_set_content_upstreams("SELECT id FROM orders", &target_by_model, &outputs)
+                .expect("a 1-part bare-name read resolves");
         assert_eq!(resolved.len(), 1);
         match &resolved[0] {
             rocky_core::reuse::UpstreamIdentity::Content {
@@ -25465,6 +25517,114 @@ auto_create_schemas = true
         );
     }
 
+    /// #1354 in the content-reuse path: a bare read that merely matches a
+    /// model's NAME must not inherit that model's column hashes.
+    ///
+    /// Model `orders_a` writes `cat1.marts.orders`; `FROM orders_a` resolves
+    /// through the warehouse search path to a physical `orders_a`, which is a
+    /// different object. Binding it would compare the wrong producer and could
+    /// SKIP a consumer whose real input moved — silent staleness. Unresolved
+    /// fails closed: no baseline, the gate builds.
+    #[test]
+    fn reuse_bare_read_of_a_renamed_target_model_stays_unresolved() {
+        let t1 = target_cfg("cat1", "marts", "orders");
+        let target_by_model = build_reuse_target_by_model([("orders_a", &t1)]);
+
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert("cat1.marts.orders".to_string(), "hash-cat1".to_string());
+
+        assert!(
+            resolve_read_set_content_upstreams(
+                "SELECT id FROM orders_a",
+                &target_by_model,
+                &outputs,
+            )
+            .is_none(),
+            "a bare read matching only a model NAME must leave the consumer unindexed"
+        );
+        // The model's own physical name still resolves — nothing legitimate lost.
+        assert!(
+            resolve_read_set_content_upstreams(
+                "SELECT id FROM cat1.marts.orders",
+                &target_by_model,
+                &outputs,
+            )
+            .is_some(),
+            "the 3-part read of the real target must still resolve"
+        );
+    }
+
+    /// A model NAME may contain dots — nothing identifier-validates it at load
+    /// — and then its folded name key IS a legitimate 3-part target key.
+    /// Poisoning the bare-name namespace must not reach into the qualified
+    /// one, or a read that resolves correctly today would build forever.
+    #[test]
+    fn a_dotted_model_name_does_not_poison_its_own_three_part_key() {
+        let t = target_cfg("cat", "sch", "orders");
+        let map = build_reuse_target_by_model([("cat.sch.orders", &t)]);
+
+        assert_eq!(
+            map.get("cat.sch.orders"),
+            Some(&"cat.sch.orders".to_string()),
+            "the model's own 3-part target key must survive: {map:?}"
+        );
+    }
+
+    /// The mixed collision: two models whose names fold together, where only
+    /// ONE writes a table of that name.
+    ///
+    /// Before #1354's key filter, both claimed the folded key `orders` with
+    /// different targets, so it was poisoned and the consumer built. If the
+    /// renamed one merely stopped contributing, the surviving claimant would
+    /// resolve a key that is still ambiguous — turning a fail-closed BUILD
+    /// into a possible SKIP against the wrong producer's hashes. The renamed
+    /// model therefore POISONS the key instead of skipping it, and this test
+    /// drives the real consumer-baseline decision to prove it.
+    #[test]
+    fn consumer_baseline_fails_closed_when_only_one_case_colliding_model_writes_the_name() {
+        let t_a = target_cfg("cat", "sch_a", "a");
+        let t_b = target_cfg("cat", "sch_b", "orders");
+
+        // BOTH input orders. With the renamed model first, `poisoned.insert`
+        // does the work; with it second, `map.remove` does — a test that fixes
+        // the order proves only one of the two lines.
+        for (label, map) in [
+            (
+                "renamed first",
+                build_reuse_target_by_model([("Orders", &t_a), ("orders", &t_b)]),
+            ),
+            (
+                "renamed second",
+                build_reuse_target_by_model([("orders", &t_b), ("Orders", &t_a)]),
+            ),
+        ] {
+            assert!(
+                !map.contains_key("orders"),
+                "{label}: a folded name claimed by a model that does not write it must be \
+                 poisoned, not left to the other claimant: {map:?}"
+            );
+        }
+
+        let target_by_model = build_reuse_target_by_model([("Orders", &t_a), ("orders", &t_b)]);
+        assert_eq!(
+            target_by_model.get("cat.sch_b.orders"),
+            Some(&"cat.sch_b.orders".to_string()),
+            "the unambiguous 3-part key still resolves"
+        );
+
+        let mut built = std::collections::HashMap::new();
+        built.insert("cat.sch_a.a".to_string(), vec![ch("id", "h_id")]);
+        built.insert("cat.sch_b.orders".to_string(), vec![ch("id", "h_id")]);
+
+        let sigs = compute_consumer_baseline("SELECT id FROM orders", &target_by_model, &built)
+            .expect("consumed set is complete");
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(
+            sigs[0].consumed_column_hashes, None,
+            "no column baseline ⇒ the later gate builds (fail closed)"
+        );
+    }
+
     #[test]
     fn consumer_baseline_fails_closed_on_ambiguous_case_colliding_model_key() {
         // Two distinct models whose bare names collide case-insensitively
@@ -25474,8 +25634,12 @@ auto_create_schemas = true
         // `orders` would otherwise compare the wrong sibling's producer hashes
         // and could skip on a real content change (silent staleness). The read
         // yields no column baseline ⇒ the later gate builds (fail closed).
-        let t_a = target_cfg("cat", "sch", "a");
-        let t_b = target_cfg("cat", "sch", "b");
+        // Both models write a table spelled like their own name, so both
+        // contribute a bare-name key (#1354) — which is what makes the
+        // collision reachable at all. Distinct schemas keep their 3-part keys
+        // unambiguous.
+        let t_a = target_cfg("cat", "sch_a", "Orders");
+        let t_b = target_cfg("cat", "sch_b", "orders");
         let target_by_model = build_reuse_target_by_model([("Orders", &t_a), ("orders", &t_b)]);
 
         // The ambiguous bare-name key is dropped; the unambiguous full-target
@@ -25485,19 +25649,19 @@ auto_create_schemas = true
             "an ambiguous case-colliding model key must be poisoned, not resolved"
         );
         assert_eq!(
-            target_by_model.get("cat.sch.a"),
-            Some(&"cat.sch.a".to_string())
+            target_by_model.get("cat.sch_a.orders"),
+            Some(&"cat.sch_a.Orders".to_string())
         );
         assert_eq!(
-            target_by_model.get("cat.sch.b"),
-            Some(&"cat.sch.b".to_string())
+            target_by_model.get("cat.sch_b.orders"),
+            Some(&"cat.sch_b.orders".to_string())
         );
 
         // Even though the wrong sibling recorded matching hashes, the consumed
         // read via the poisoned key resolves to no baseline.
         let mut built = std::collections::HashMap::new();
-        built.insert("cat.sch.a".to_string(), vec![ch("id", "h_id")]);
-        built.insert("cat.sch.b".to_string(), vec![ch("id", "h_id")]);
+        built.insert("cat.sch_a.Orders".to_string(), vec![ch("id", "h_id")]);
+        built.insert("cat.sch_b.orders".to_string(), vec![ch("id", "h_id")]);
 
         let sigs = compute_consumer_baseline("SELECT id FROM orders", &target_by_model, &built)
             .expect("consumed set is complete");

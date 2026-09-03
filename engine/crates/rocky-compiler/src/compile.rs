@@ -457,6 +457,12 @@ pub fn compile_project(
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
+    // derived from a name match a warehouse run does not honour). Produced by
+    // `resolve::resolve_dependencies` and parked on the project until now;
+    // without this merge they were written and never read, so the one place
+    // that knows an edge is questionable said nothing.
+    diagnostics.extend(project.resolve_diagnostics.iter().cloned());
 
     let has_errors = diagnostics
         .iter()
@@ -665,6 +671,12 @@ pub fn compile_incremental(
     diagnostics.extend(lakehouse_diagnostics);
     diagnostics.extend(run_var_diagnostics);
     diagnostics.extend(target_collision_diagnostics(&project));
+    // Dependency-resolution warnings (D011 depends_on mismatch, D012 an edge
+    // derived from a name match a warehouse run does not honour). Produced by
+    // `resolve::resolve_dependencies` and parked on the project until now;
+    // without this merge they were written and never read, so the one place
+    // that knows an edge is questionable said nothing.
+    diagnostics.extend(project.resolve_diagnostics.iter().cloned());
 
     let has_errors = diagnostics
         .iter()
@@ -850,6 +862,93 @@ mod tests {
             .map(|d| d.model.clone())
             .collect();
         assert_eq!(models, expected, "{models:?}");
+    }
+
+    /// The wire, not the writer: `resolve::resolve_dependencies` produced
+    /// D011/D012 warnings that were parked on `Project::resolve_diagnostics`
+    /// and never read by anything. A warning nobody merges is a warning nobody
+    /// sees, so #1354's "this edge rests on a name match the warehouse does
+    /// not honour" would have been silent. This test fails if the merge is
+    /// removed.
+    #[test]
+    fn dependency_resolution_warnings_reach_the_diagnostic_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("customers.toml"),
+            "name = \"customers\"\n[target]\ncatalog = \"warehouse\"\nschema = \"prod\"\ntable = \"customers_v2\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("customers.sql"), "SELECT 1 AS id").unwrap();
+        std::fs::write(
+            dir.path().join("rollup.toml"),
+            "name = \"rollup\"\n[target]\ncatalog = \"warehouse\"\nschema = \"silver\"\ntable = \"rollup\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("rollup.sql"), "SELECT id FROM customers").unwrap();
+
+        let config = CompilerConfig {
+            models_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let result = compile(&config).unwrap();
+
+        let d012: Vec<&Diagnostic> = result
+            .diagnostics
+            .iter()
+            .filter(|d| &*d.code == "D012")
+            .collect();
+        assert_eq!(d012.len(), 1, "{:?}", result.diagnostics);
+        assert_eq!(d012[0].model, "rollup");
+        assert!(!result.has_errors, "D012 is a warning, not an error");
+
+        // The edge is reported, not removed — see the module docs in
+        // `resolve.rs` for why removing it is not this layer's call.
+        let rollup = result
+            .project
+            .dag_nodes
+            .iter()
+            .find(|n| n.name == "rollup")
+            .unwrap();
+        assert_eq!(rollup.depends_on, vec!["customers"]);
+
+        // The INCREMENTAL path merges diagnostics at its own site. The LSP
+        // recompiles through it on every debounced file change, so a wire test
+        // that only drives `compile()` leaves that merge unproven — and D012
+        // would vanish from the editor while `rocky compile` still showed it.
+        //
+        // The eight filler models are load-bearing: `compile_incremental`
+        // returns `compile(config)` outright when the project has fewer than
+        // ten models, or when the affected set exceeds half of them (the
+        // guardrail above `typecheck_project_incremental`). With two models
+        // this assertion silently re-ran the FULL path and proved nothing
+        // about the second merge site.
+        for i in 0..8 {
+            std::fs::write(
+                dir.path().join(format!("filler{i}.toml")),
+                format!(
+                    "name = \"filler{i}\"\n[target]\ncatalog = \"warehouse\"\n\
+                     schema = \"silver\"\ntable = \"filler{i}\"\n"
+                ),
+            )
+            .unwrap();
+            std::fs::write(dir.path().join(format!("filler{i}.sql")), "SELECT 1 AS id").unwrap();
+        }
+        let result = compile(&config).unwrap();
+        // Edit the file the incremental call is told changed, so the fixture
+        // is the shape the LSP actually hands it.
+        std::fs::write(dir.path().join("filler0.sql"), "SELECT 2 AS id").unwrap();
+        let incremental =
+            compile_incremental(&config, &[dir.path().join("filler0.sql")], &result).unwrap();
+        assert_eq!(
+            incremental
+                .diagnostics
+                .iter()
+                .filter(|d| &*d.code == "D012")
+                .count(),
+            1,
+            "{:?}",
+            incremental.diagnostics
+        );
     }
 
     #[test]
