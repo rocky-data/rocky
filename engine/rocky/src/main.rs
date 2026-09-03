@@ -3008,17 +3008,30 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
         .map(|(name, _)| *name)
 }
 
-/// How long process exit waits for warehouse work that is still in flight.
+/// How long process exit waits for blocking-pool work that is still running.
 ///
 /// Dropping a `tokio` runtime waits — with no bound — for every `spawn_blocking`
-/// task that has already started, and every Rocky warehouse statement runs in
-/// one. That wait is invisible while a command runs to completion, because
-/// nothing is in flight by then. It is reachable whenever a future is dropped
-/// mid-statement, which is exactly what `rocky run --watch` does when a signal
-/// lands during an iteration: the watch loop's `select!` drops the iteration,
-/// `main` returns, and the process then sat waiting for the abandoned statement
-/// — for minutes, against a real warehouse — after the operator pressed Ctrl-C
-/// (#1590).
+/// task that has already started. That wait is invisible while a command runs to
+/// completion, because nothing is in flight by then. It is reachable whenever a
+/// future is dropped mid-statement, which is exactly what `rocky run --watch`
+/// does when a signal lands during an iteration: the watch loop's `select!`
+/// drops the iteration, `main` returns, and the process then sat waiting for the
+/// abandoned statement after the operator pressed Ctrl-C (#1590).
+///
+/// # What this actually bounds
+///
+/// Only the **blocking pool**. Runtime shutdown drops async tasks immediately,
+/// with or without this timeout, so nothing changes for the adapters that await
+/// an async client — Databricks, Snowflake, BigQuery, Trino — or for the
+/// content-addressed S3 path. Those statements were already abandoned the
+/// instant the future was dropped.
+///
+/// The newly bounded surface is therefore exactly DuckDB, whose adapter runs
+/// every statement in `spawn_blocking`. Each of those closures issues a single
+/// statement, so cutting one is the same as a crash during it, and DuckDB's WAL
+/// covers that. The one closure that used to issue several — the loader's
+/// truncate-then-load — is now one explicit transaction for this reason
+/// (`rocky-duckdb/src/loader.rs`).
 ///
 /// # Why five seconds
 ///
@@ -3027,19 +3040,16 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
 /// regress. The number trades two things off:
 ///
 /// - **Long enough** that a statement about to land still lands. Finishing
-///   normally records the result in the state ledger and, for the embedded
-///   DuckDB adapter, avoids leaving the database file to WAL recovery.
+///   normally records the result in the state ledger and avoids leaving the
+///   DuckDB file to WAL recovery.
 /// - **Short enough** that the operator is not stuck. Once `main` returns there
 ///   is no escape hatch: `tokio`'s signal handler is still installed
 ///   process-wide, so a second Ctrl-C during this window does nothing and only
 ///   SIGKILL would work.
 ///
-/// Abandoning a statement is crash-parity, which is the posture the watch loop
-/// already documents: a remote warehouse owns its own transaction and the
-/// statement simply outlives the client's wait, and redb and DuckDB both have
-/// crash-safe commit protocols. Five seconds is a deliberate budget, not a
-/// default — it is well clear of a local statement's commit and well inside the
-/// patience of someone who has already asked rocky to stop.
+/// Five seconds is a deliberate budget, not a default — well clear of a local
+/// statement's commit, and well inside the patience of someone who has already
+/// asked rocky to stop.
 const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> Result<()> {

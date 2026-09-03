@@ -231,15 +231,34 @@ impl LoaderAdapter for DuckDbLoaderAdapter {
                 conn.execute_statement(&sql).map_err(AdapterError::new)?;
             } else {
                 // Table exists (or we were told not to create it).
-                if truncate_first {
-                    let sql = format!("DELETE FROM {target_ref}");
-                    debug!(sql = %sql, "truncating target before load");
-                    conn.execute_statement(&sql).map_err(AdapterError::new)?;
-                }
-
-                let sql = load_sql(&source, &target_ref, format, &options)?;
+                //
+                // Truncate + load is ONE transaction. As two autocommitted
+                // statements, anything that stopped the process between them
+                // left the target emptied and unloaded: a crash, a SIGKILL, or
+                // `rocky`'s bounded runtime shutdown, which abandons a blocking
+                // statement after `RUNTIME_SHUTDOWN_GRACE` (#1590). Uncommitted
+                // work is rolled back on the next open, so the target survives
+                // intact instead.
+                //
+                // The `create_table` branch above needs no wrapper: `CREATE
+                // TABLE ... AS SELECT` is already a single statement.
+                let load = load_sql(&source, &target_ref, format, &options)?;
+                let sql = if truncate_first {
+                    format!("BEGIN TRANSACTION; DELETE FROM {target_ref}; {load}; COMMIT")
+                } else {
+                    load
+                };
                 debug!(sql = %sql, "loading source into existing table");
-                conn.execute_statement(&sql).map_err(AdapterError::new)?;
+                if let Err(e) = conn.execute_statement(&sql) {
+                    // A DuckDB transaction that hit an error stays open and
+                    // poisons every later statement on this connection until it
+                    // is rolled back — including the row count below and every
+                    // subsequent load through the same shared connector.
+                    if truncate_first {
+                        let _ = conn.execute_statement("ROLLBACK");
+                    }
+                    return Err(AdapterError::new(e));
+                }
             }
 
             // Count rows in the target to report how many were loaded.
@@ -386,6 +405,64 @@ mod tests {
 
         // Truncated old row, loaded 1 new
         assert_eq!(result.rows_loaded, 1);
+    }
+
+    /// Truncate + load is one transaction, so a failed load leaves the target
+    /// as it was rather than emptied.
+    ///
+    /// The two used to be separate autocommitted statements. That made the
+    /// window between them a data-loss window for anything that stopped the
+    /// process there — a crash, a SIGKILL, or `rocky`'s bounded runtime
+    /// shutdown, which abandons a blocking statement after
+    /// `RUNTIME_SHUTDOWN_GRACE` (#1590). A failed load is the in-process way to
+    /// exhibit the same window: without the transaction the `DELETE` has
+    /// already committed by the time the load fails.
+    #[tokio::test]
+    async fn test_load_csv_truncate_rolls_back_when_the_load_fails() {
+        let adapter = loader();
+        {
+            let conn = adapter.shared_connector();
+            let guard = conn.lock().unwrap();
+            guard
+                .execute_statement(
+                    "CREATE TABLE main.keep (id INTEGER, name VARCHAR); \
+                     INSERT INTO main.keep VALUES (1, 'Alice'), (2, 'Bob')",
+                )
+                .unwrap();
+        }
+
+        // Three columns into a two-column table: the COPY fails, the DELETE
+        // that preceded it must not survive.
+        let file = csv_file("id,name,extra\n9,Zoe,x\n");
+        let err = adapter
+            .load(
+                &local(file.path()),
+                &target("keep"),
+                &LoadOptions {
+                    create_table: false,
+                    truncate_first: true,
+                    ..LoadOptions::default()
+                },
+            )
+            .await;
+        assert!(err.is_err(), "the load was expected to fail; got {err:?}");
+
+        let conn = adapter.shared_connector();
+        let guard = conn.lock().unwrap();
+        let qr = guard
+            .execute_sql("SELECT name FROM main.keep ORDER BY id")
+            .unwrap();
+        assert_eq!(
+            qr.rows.len(),
+            2,
+            "a failed load must leave the target's rows in place, not truncated"
+        );
+
+        // The connection is still usable — an unrolled-back aborted
+        // transaction would poison every later statement on it.
+        guard
+            .execute_sql("SELECT 1")
+            .expect("the shared connection must survive a failed load");
     }
 
     #[tokio::test]

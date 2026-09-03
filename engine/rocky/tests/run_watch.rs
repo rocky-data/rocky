@@ -697,14 +697,14 @@ fn mkfifo(path: &Path) {
 ///
 /// # What is asserted, and what deliberately is not
 ///
-/// The assertion is *promptness*, not the exit code. A mid-iteration drop also
-/// leaks the run's `RemoteStateSession` (its `Drop` tripwire at
-/// `rocky-core/src/state_sync.rs`), which is a `debug_assert!` — a panic in the
-/// test profile, a `warn!` in the shipped release binary. Asserting `success()`
-/// would therefore assert the build profile, not the shutdown. What is asserted
-/// instead is that the process exited *of its own accord* (`code().is_some()`,
-/// i.e. not killed by the default signal disposition) within the same
-/// run-scaled budget the sibling tests use.
+/// The assertion is *promptness*, within the same run-scaled budget the sibling
+/// tests use. The exit code is asserted only as one of two known values. A
+/// mid-iteration drop also leaks the run's `RemoteStateSession` (its `Drop`
+/// tripwire at `rocky-core/src/state_sync.rs`), which is a `debug_assert!` — a
+/// panic here, a `warn!` in the shipped release binary. So requiring `success()`
+/// would assert the build profile rather than the shutdown, while accepting any
+/// code would bless an unrelated failure. The release binary was measured
+/// separately at exit 0.
 #[test]
 fn run_watch_exits_on_a_signal_during_an_iteration() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -816,9 +816,17 @@ fn run_watch_exits_on_a_signal_during_an_iteration() {
     let outcome = wait_with_timeout(&mut child, shutdown_budget);
     let exit_latency = signalled.elapsed();
 
-    // Collect whatever else the child said before deciding anything, so every
-    // failure path below can report it.
-    while let Ok(line) = stderr_rx.recv_timeout(Duration::from_millis(200)) {
+    // Reap first, so the child's stderr pipe is at EOF and the reader thread is
+    // finishing, then drain to channel disconnect. A fixed short drain would
+    // make a descheduled reader look like a missing line — the same conflation
+    // of scheduling latency with product behaviour that #1315 is about. The
+    // timeout is only a guard against blocking forever if the pipe somehow
+    // stays open; the normal case returns on `Disconnected`.
+    if !matches!(outcome, WaitOutcome::Exited(_)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    while let Ok(line) = stderr_rx.recv_timeout(Duration::from_secs(5)) {
         transcript.push_str(&line);
         transcript.push('\n');
     }
@@ -826,8 +834,6 @@ fn run_watch_exits_on_a_signal_during_an_iteration() {
     let status = match outcome {
         WaitOutcome::Exited(status) => status,
         WaitOutcome::StillRunning => {
-            let _ = child.kill();
-            let _ = child.wait();
             panic!(
                 "rocky was still running {shutdown_budget:?} after SIGTERM landed with a \
                  DuckDB statement in flight (#1590). The statement was in flight by \
@@ -838,18 +844,21 @@ fn run_watch_exits_on_a_signal_during_an_iteration() {
             );
         }
         WaitOutcome::WaitFailed(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
             panic!("could not determine whether rocky exited after SIGTERM: {e}");
         }
     };
 
-    // Exited of its own accord rather than being killed by the default SIGTERM
-    // disposition. The exact code is left unasserted — see the doc comment.
+    // Two codes, and only two. `0` is the documented contract and what the
+    // release binary returns. `101` is this build profile's `RemoteStateSession`
+    // tripwire (see the doc comment): a `debug_assert!` that fires because the
+    // dropped iteration never finalized its session. Accepting any exit code —
+    // `status.code().is_some()` — would also bless a config error or an adapter
+    // failure, which would say nothing about shutdown.
+    let code = status.code();
     assert!(
-        status.code().is_some(),
-        "expected rocky to exit through its own signal arm; it was terminated by a signal \
-         instead ({status:?}).\nstderr:\n{transcript}"
+        matches!(code, Some(0 | 101)),
+        "expected exit 0 (the documented signal contract) or 101 (this profile's \
+         RemoteStateSession debug tripwire); got {status:?}.\nstderr:\n{transcript}"
     );
 
     // The signal arm is what ended the process.
