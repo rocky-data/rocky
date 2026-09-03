@@ -221,7 +221,7 @@ fn emit_models(
 
         let mut model_ir = model_ir.clone();
         if let Some(specs) = surrogate_keys.get(model_name) {
-            rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect.as_ref());
+            rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect.as_ref())?;
         }
 
         match sql_gen::generate_transformation_sql_with_warehouse(&model_ir, dialect.as_ref(), None)

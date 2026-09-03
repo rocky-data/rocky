@@ -453,7 +453,9 @@ mod tests {
                 write!(
                     sql,
                     ", CAST({} AS {}) AS {}",
-                    mc.value, mc.data_type, mc.name
+                    mc.value(),
+                    mc.data_type(),
+                    mc.name()
                 )
                 .unwrap();
             }

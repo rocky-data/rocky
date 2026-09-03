@@ -149,15 +149,25 @@ impl SqlDialect for DuckDbSqlDialect {
         }
 
         for mc in metadata {
-            validation::validate_identifier(&mc.name).map_err(AdapterError::new)?;
+            validation::validate_identifier(mc.name()).map_err(AdapterError::new)?;
             // Validate `data_type` before interpolating it raw into the CAST
             // (same guard as the drift path) — a metadata `type` from a
             // hostile config must not break out of the cast expression.
-            rocky_core::sql_gen::validate_sql_type(&mc.data_type).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(mc.data_type()).map_err(AdapterError::new)?;
+            // `value` is an SQL expression, not an identifier, and it is NOT
+            // trusted: `rocky-cli` substitutes `{placeholder}`s in it from source
+            // schema names read back from the warehouse.
+            // `rocky_ir::MetadataColumn::new` is the boundary that guards it;
+            // this repeats the scan because `new_unchecked` and any future
+            // construction path must not reach a raw splice.
+            validation::reject_statement_terminator("metadata_columns[].value", mc.value())
+                .map_err(AdapterError::new)?;
             write!(
                 sql,
                 ", CAST({} AS {}) AS {}",
-                mc.value, mc.data_type, mc.name
+                mc.value(),
+                mc.data_type(),
+                mc.name()
             )
             .unwrap();
         }
@@ -301,6 +311,44 @@ mod tests {
     }
 
     #[test]
+    fn select_clause_renders_metadata_columns() {
+        let d = dialect();
+        let meta = vec![MetadataColumn::new("_loaded_by", "VARCHAR", "NULL").unwrap()];
+        let sql = d.select_clause(&ColumnSelection::All, &meta).unwrap();
+        assert_eq!(sql, "SELECT *, CAST(NULL AS VARCHAR) AS _loaded_by");
+    }
+
+    /// #1594: `value` is spliced raw into the CAST alongside `name` and
+    /// `data_type`. The IR boundary (`rocky_ir::MetadataColumn::new`) refuses
+    /// this input, so `new_unchecked` is the only way to build it — which is
+    /// exactly what makes this a test of THIS dialect's own scan rather than
+    /// of the constructor. Both the serde path and any future construction
+    /// site land here.
+    #[test]
+    fn select_clause_rejects_a_hostile_metadata_value() {
+        let d = dialect();
+        // Ends Rocky's statement and starts another.
+        let terminator = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "VARCHAR",
+            "NULL) AS x; SELECT 1 --",
+        )];
+        assert!(d.select_clause(&ColumnSelection::All, &terminator).is_err());
+
+        // Unbalanced quote: pairs its quotes across the rest of the SELECT.
+        let unbalanced = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "VARCHAR",
+            "'o'brien'",
+        )];
+        assert!(d.select_clause(&ColumnSelection::All, &unbalanced).is_err());
+
+        // The benign expression still renders.
+        let ok = vec![MetadataColumn::new("_loaded_by", "VARCHAR", "NULL").unwrap()];
+        assert!(d.select_clause(&ColumnSelection::All, &ok).is_ok());
+    }
+
+    #[test]
     fn surrogate_key_uses_dbt_default_form() {
         let d = dialect();
         assert_eq!(
@@ -316,14 +364,52 @@ mod tests {
             name: "order_key".into(),
             columns: vec!["order_id".into()],
         }];
-        let cols = rocky_core::models::surrogate_key_metadata_columns(&specs, &d);
+        let cols =
+            rocky_core::models::surrogate_key_metadata_columns(&specs, &d, "fct_orders").unwrap();
         assert_eq!(cols.len(), 1);
-        assert_eq!(cols[0].name, "order_key");
-        assert_eq!(cols[0].data_type, "VARCHAR");
+        assert_eq!(cols[0].name(), "order_key");
+        assert_eq!(cols[0].data_type(), "VARCHAR");
         assert_eq!(
-            cols[0].value,
+            cols[0].value(),
             "md5(cast(coalesce(cast(order_id as VARCHAR), '_dbt_utils_surrogate_key_null_') as VARCHAR))"
         );
+    }
+
+    /// The spec precondition used to be a `debug_assert!` — compiled out of
+    /// the release binary users actually run, so a spec that skipped
+    /// `load_surrogate_keys_from_dir` interpolated straight into SQL there.
+    /// It is a real check in every build now.
+    ///
+    /// Note what this does NOT rely on: the rendered value
+    /// (`md5(cast(coalesce(cast(<col> …`) contains no statement terminator, so
+    /// `MetadataColumn::new`'s scan passes it. The spec check is the guard
+    /// that catches a hostile *input column*; the two are not interchangeable.
+    #[test]
+    fn apply_surrogate_keys_refuses_an_unvalidated_spec_in_every_build() {
+        let d = dialect();
+        let mut ir = rocky_core::models::parse_model_inline(
+            "---toml\n[target]\ncatalog = \"wh\"\nschema = \"marts\"\n---\n\nSELECT order_id FROM upstream",
+            "fct_orders.sql",
+            None,
+        )
+        .unwrap()
+        .to_model_ir();
+        let before = ir.sql.clone();
+
+        let hostile = vec![rocky_core::models::SurrogateKeySpec {
+            name: "order_key".into(),
+            columns: vec!["order_id) FROM secrets --".into()],
+        }];
+        let err = rocky_core::models::apply_surrogate_keys(&mut ir, &hostile, &d)
+            .expect_err("an unvalidated spec must not reach the SQL");
+        assert!(
+            matches!(
+                err,
+                rocky_core::models::ModelError::InvalidSurrogateKey { .. }
+            ),
+            "expected InvalidSurrogateKey, got {err:?}"
+        );
+        assert_eq!(ir.sql, before, "the SQL must be left untouched on refusal");
     }
 
     #[test]
@@ -340,7 +426,7 @@ mod tests {
         // No specs ⇒ the SQL is left byte-for-byte unchanged (preserves the
         // unkeyed model's skip-hash).
         let original = ir.sql.clone();
-        rocky_core::models::apply_surrogate_keys(&mut ir, &[], &d);
+        rocky_core::models::apply_surrogate_keys(&mut ir, &[], &d).unwrap();
         assert_eq!(ir.sql, original);
 
         // One spec ⇒ the SELECT is wrapped and the dbt-form hash appended as a
@@ -349,7 +435,7 @@ mod tests {
             name: "order_key".into(),
             columns: vec!["order_id".into()],
         }];
-        rocky_core::models::apply_surrogate_keys(&mut ir, &specs, &d);
+        rocky_core::models::apply_surrogate_keys(&mut ir, &specs, &d).unwrap();
         assert_eq!(
             ir.sql,
             "SELECT *, CAST(md5(cast(coalesce(cast(order_id as VARCHAR), \

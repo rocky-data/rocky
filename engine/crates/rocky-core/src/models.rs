@@ -1809,19 +1809,40 @@ pub fn load_surrogate_keys_from_dir_filtered(
 /// whose value is the dialect's `surrogate_key_expr` over the spec columns and
 /// whose type is the dialect's string type — rendered by `select_clause` as
 /// `CAST(<hash> AS <str>) AS <name>`.
+///
+/// # Errors
+///
+/// [`ModelError::InvalidSurrogateKey`] when a spec does not pass
+/// [`validate_surrogate_key_spec`], or when the rendered column does not pass
+/// [`rocky_ir::MetadataColumn::new`].
+///
+/// The two checks are different and neither replaces the other. The spec check
+/// covers the *input* column identifiers, which the rendered expression wraps
+/// in `cast(...)` calls — a hostile input column can produce a rendered value
+/// with no statement terminator in it at all. The constructor covers the
+/// rendered text that actually reaches `select_clause`.
 pub fn surrogate_key_metadata_columns(
     specs: &[SurrogateKeySpec],
     dialect: &dyn crate::traits::SqlDialect,
-) -> Vec<rocky_ir::MetadataColumn> {
+    model: &str,
+) -> Result<Vec<rocky_ir::MetadataColumn>, ModelError> {
     specs
         .iter()
         .map(|spec| {
+            validate_surrogate_key_spec(spec, model)?;
             let cols: Vec<&str> = spec.columns.iter().map(String::as_str).collect();
-            rocky_ir::MetadataColumn {
-                name: spec.name.clone(),
-                data_type: dialect.string_type_name().to_string(),
-                value: dialect.surrogate_key_expr(&cols),
-            }
+            rocky_ir::MetadataColumn::new(
+                spec.name.clone(),
+                dialect.string_type_name(),
+                dialect.surrogate_key_expr(&cols),
+            )
+            .map_err(|e| ModelError::InvalidSurrogateKey {
+                model: model.to_string(),
+                reason: format!(
+                    "key '{}' renders an unusable SQL expression: {e}",
+                    spec.name
+                ),
+            })
         })
         .collect()
 }
@@ -1864,37 +1885,31 @@ fn validate_surrogate_key_spec(spec: &SurrogateKeySpec, model: &str) -> Result<(
 /// skip-gate IR, so a model that *gains* a key re-materializes rather than being
 /// skipped as unchanged.
 ///
-/// # Precondition
+/// # Errors
 ///
-/// Every spec must already be validated by [`validate_surrogate_key_spec`] —
-/// [`load_surrogate_keys_from_dir`] does this at load. The spec's `name` and
-/// `columns` are interpolated into SQL without re-escaping (per the
-/// validate-before-interpolation rule), so passing an unvalidated spec is a
-/// SQL-injection vector. A `debug_assert!` re-checks the precondition in debug
-/// builds.
+/// [`ModelError::InvalidSurrogateKey`] when a spec fails
+/// [`validate_surrogate_key_spec`]. The spec's `name` and `columns` are
+/// interpolated into SQL without re-escaping (per the
+/// validate-before-interpolation rule), so an unvalidated spec is a
+/// SQL-injection vector. [`load_surrogate_keys_from_dir`] validates at load;
+/// this re-checks in *every* build rather than only in debug, because a
+/// release binary is where it matters and a `debug_assert!` is absent there.
 pub fn apply_surrogate_keys(
     model_ir: &mut rocky_ir::ModelIr,
     specs: &[SurrogateKeySpec],
     dialect: &dyn crate::traits::SqlDialect,
-) {
+) -> Result<(), ModelError> {
     if specs.is_empty() {
-        return;
+        return Ok(());
     }
-    debug_assert!(
-        specs
-            .iter()
-            .all(|s| validate_surrogate_key_spec(s, "").is_ok()),
-        "apply_surrogate_keys received an unvalidated SurrogateKeySpec — callers must validate \
-         via validate_surrogate_key_spec (load_surrogate_keys_from_dir does) before its fields \
-         are interpolated into SQL"
-    );
-    let additions = surrogate_key_metadata_columns(specs, dialect)
+    let additions = surrogate_key_metadata_columns(specs, dialect, &model_ir.name)?
         .iter()
-        .map(|m| format!("CAST({} AS {}) AS {}", m.value, m.data_type, m.name))
+        .map(|m| format!("CAST({} AS {}) AS {}", m.value(), m.data_type(), m.name()))
         .collect::<Vec<_>>()
         .join(", ");
     let inner = model_ir.sql.trim().trim_end_matches(';');
     model_ir.sql = format!("SELECT *, {additions}\nFROM (\n{inner}\n) AS __rocky_keyed");
+    Ok(())
 }
 
 fn split_frontmatter(content: &str) -> Option<(&str, &str)> {

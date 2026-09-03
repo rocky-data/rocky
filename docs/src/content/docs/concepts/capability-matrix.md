@@ -63,11 +63,21 @@ runs, and fails on any of these four errors:
 Two limits, stated plainly:
 
 - The type check (`E011`) applies only when Rocky infers a concrete type for
-  the column. When inference returns `Unknown`, the check is skipped by
-  design, so an unresolvable expression does not fail its contract.
-- `Decimal` matches on the name alone. A contract that says `Decimal(18,2)`
-  accepts any precision and scale today
-  ([#1466](https://github.com/rocky-data/rocky/issues/1466)).
+  the column. When inference returns `Unknown` the check does not run, so an
+  unresolvable expression never fails its contract. Rocky reports each such
+  column as `I003` at info severity, naming the column and the type the
+  contract declares. Info changes no exit code: `rocky compile`, `rocky test`
+  and `rocky ci` all still pass. To make the check run, give the compiler
+  source schemas: `rocky discover --with-schemas` fills the cache that
+  `rocky compile` reads, or use `rocky compile --with-seed`. Two limits on
+  that. `rocky test` and `rocky ci` always compile with no source schemas, so
+  every column that takes its type from a source table is `Unknown` under
+  them. And an expression whose result type depends on the warehouse — `AVG`
+  over a `DECIMAL` column — stays `Unknown` either way. A `CAST` only fixes
+  the column when the value it casts already has a known type.
+- A bare `Decimal` in a contract matches any precision and scale. A contract
+  that names the digits — `Decimal(18,2)` — must match the inferred precision
+  and scale exactly.
 
 Checked in `validate_contract` and `type_name_matches`,
 `engine/crates/rocky-compiler/src/contracts.rs`. Workflow:

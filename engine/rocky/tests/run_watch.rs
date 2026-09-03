@@ -216,57 +216,6 @@ fn run_watch_reruns_on_file_change_and_exits_clean_on_sigint() {
     // would silently break any tool piping `rocky run --watch -o json`.
     let stdout_collector = spawn_collecting_reader(stdout);
 
-    // Helper: wait for a line containing `needle` to arrive on stderr,
-    // up to `budget`. Returns the buffered transcript on failure for
-    // diagnostics.
-    let wait_for = |rx: &Receiver<String>, needle: &str, budget: Duration| -> WaitResult {
-        let start = Instant::now();
-        let mut buf = String::new();
-        loop {
-            let remaining = budget.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                return WaitResult {
-                    matched: false,
-                    buffered: buf,
-                };
-            }
-            match rx.recv_timeout(remaining) {
-                Ok(line) => {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                    if line.contains(needle) {
-                        return WaitResult {
-                            matched: true,
-                            buffered: buf,
-                        };
-                    }
-                }
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                    // Drain whatever is already queued before declaring a
-                    // timeout. The child may have written the line while this
-                    // thread was descheduled — reporting "never arrived" for a
-                    // line sitting in the channel is the same conflation of
-                    // scheduling latency with product behaviour that #1315 is
-                    // about, one level down.
-                    while let Ok(line) = rx.try_recv() {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                        if line.contains(needle) {
-                            return WaitResult {
-                                matched: true,
-                                buffered: buf,
-                            };
-                        }
-                    }
-                    return WaitResult {
-                        matched: false,
-                        buffered: buf,
-                    };
-                }
-            }
-        }
-    };
-
     // The first run doubles as a calibration: how long one full
     // spawn-compile-execute cycle costs on this machine, right now.
     //
@@ -391,6 +340,58 @@ fn run_watch_reruns_on_file_change_and_exits_clean_on_sigint() {
             Some("run"),
             "expected `command: \"run\"` on every iteration line; got {cmd:?} on line {i}"
         );
+    }
+}
+
+/// Wait for a line containing `needle` to arrive on `rx`, up to `budget`.
+///
+/// Returns the buffered transcript either way, so a failing caller can report
+/// what the child actually said instead of only that a deadline passed.
+fn wait_for(rx: &Receiver<String>, needle: &str, budget: Duration) -> WaitResult {
+    let start = Instant::now();
+    let mut buf = String::new();
+    loop {
+        let remaining = budget.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return WaitResult {
+                matched: false,
+                buffered: buf,
+            };
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                buf.push_str(&line);
+                buf.push('\n');
+                if line.contains(needle) {
+                    return WaitResult {
+                        matched: true,
+                        buffered: buf,
+                    };
+                }
+            }
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
+                // Drain whatever is already queued before declaring a
+                // timeout. The child may have written the line while this
+                // thread was descheduled — reporting "never arrived" for a
+                // line sitting in the channel is the same conflation of
+                // scheduling latency with product behaviour that #1315 is
+                // about, one level down.
+                while let Ok(line) = rx.try_recv() {
+                    buf.push_str(&line);
+                    buf.push('\n');
+                    if line.contains(needle) {
+                        return WaitResult {
+                            matched: true,
+                            buffered: buf,
+                        };
+                    }
+                }
+                return WaitResult {
+                    matched: false,
+                    buffered: buf,
+                };
+            }
+        }
     }
 }
 
@@ -591,5 +592,304 @@ fn run_watch_exits_on_sigterm() {
          {one_run:?}) — before #1405 the watch select had no SIGTERM arm, so \
          only SIGKILL could stop it. If one_run is far above a few seconds \
          this machine is loaded rather than rocky being stuck."
+    );
+}
+
+/// Fixture for the mid-iteration test: a transformation pipeline with exactly
+/// one model and `concurrency = 1`, so at most one warehouse statement is ever
+/// in flight and "the statement" is unambiguous.
+const BLOCKING_ROCKY_TOML: &str = r#"
+[adapter]
+type = "duckdb"
+path = "fixture.duckdb"
+
+[pipeline.transform]
+type = "transformation"
+
+[pipeline.transform.target]
+adapter = "default"
+
+[pipeline.transform.execution]
+concurrency = 1
+"#;
+
+/// The model reads a plain DuckDB view. The `read_csv(...)` call that makes it
+/// blockable lives inside the *view*, not here, because Rocky parses model SQL
+/// with sqlparser, which rejects DuckDB's struct-literal argument
+/// (`columns = {'id': 'INTEGER'}`) with "Expected: an expression, found: {".
+const BLOCKING_MODEL_SQL: &str = "SELECT id FROM main.blocking_source\n";
+
+const BLOCKING_MODEL_TOML: &str = r#"
+[target]
+catalog = "fixture"
+schema = "staging"
+"#;
+
+/// Name of the file the view reads. Deliberately `.csv`: `run_watch.rs`'s
+/// `event_path_is_relevant` only forwards `.sql` / `.rocky` / `.toml`, so
+/// swapping this file for a FIFO does not itself trigger a re-run. The test
+/// keeps the touch of `rocky.toml` as the single, deterministic trigger.
+const BLOCKING_SOURCE_FILE: &str = "blocking_source.csv";
+
+/// Seed SQL for the blocking fixture, with an absolute path to the source file
+/// so the view resolves identically from the test process (which creates it)
+/// and from the `rocky` child (whose cwd is the fixture dir).
+fn blocking_seed_sql(source_path: &Path) -> String {
+    format!(
+        "CREATE SCHEMA IF NOT EXISTS staging;\n\
+         CREATE OR REPLACE VIEW main.blocking_source AS\n\
+         SELECT id FROM read_csv('{}', columns = {{'id': 'INTEGER'}}, header = false);\n",
+        source_path.display()
+    )
+}
+
+/// Create a FIFO at `path`.
+///
+/// Unix-only, like the rest of this file. A FIFO is what makes the test below
+/// deterministic: opening one for writing blocks until a reader opens it, which
+/// is an exact handshake for "the child has the file open inside its statement".
+fn mkfifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .unwrap_or_else(|e| panic!("fixture path {} is not a C string: {e}", path.display()));
+    // SAFETY: `libc::mkfifo` with a valid NUL-terminated path and a permission
+    // mask only touches the filesystem; failure is reported through the return
+    // code, which is checked below.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(
+        rc,
+        0,
+        "mkfifo({}) failed: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+/// A signal landing **during** an iteration must still stop the process (#1590).
+///
+/// Both tests above signal *between* iterations —
+/// `run_watch_reruns_on_file_change_and_exits_clean_on_sigint` says so in its
+/// own comment ("by the time SIGINT is sent the run has already completed"),
+/// and `run_watch_exits_on_sigterm` waits for the first run to finish first. So
+/// the covered shape was:
+///
+/// ```text
+///   iteration ends ──▶ signal ──▶ select! fires ──▶ exit          covered
+///   signal mid-run ──▶ select! drops the iteration ──▶ ???        this test
+/// ```
+///
+/// Dropping the iteration future is not the end of the work. The dropped future
+/// was awaiting a `spawn_blocking` task, and a blocking task cannot be
+/// cancelled: it keeps running, and `Runtime::drop` waits for every one of them
+/// with no bound. Against the one-row fixtures above that wait is milliseconds,
+/// which is why nothing surfaced.
+///
+/// # Why a FIFO and not a slow query
+///
+/// A "deliberately slow" statement would make the assertion a timing guess: it
+/// could be slow to *start* rather than in flight when the signal lands, and a
+/// loaded CI box shifts every number. A FIFO removes the guess entirely.
+/// `open(O_WRONLY)` on a FIFO blocks until a reader opens it, so the moment the
+/// test's writer handle materialises, DuckDB has the file open inside
+/// `execute_statement`. The test then holds that write end open, so DuckDB's
+/// `read()` never sees EOF and the statement stays in flight for as long as the
+/// assertion needs. Nothing about the timing is load-dependent.
+///
+/// # What is asserted, and what deliberately is not
+///
+/// The assertion is *promptness*, within the same run-scaled budget the sibling
+/// tests use. The exit code is asserted only as one of two known values. A
+/// mid-iteration drop also leaks the run's `RemoteStateSession` (its `Drop`
+/// tripwire at `rocky-core/src/state_sync.rs`), which is a `debug_assert!` — a
+/// panic here, a `warn!` in the shipped release binary. So requiring `success()`
+/// would assert the build profile rather than the shutdown, while accepting any
+/// code would bless an unrelated failure. The release binary was measured
+/// separately at exit 0.
+#[test]
+fn run_watch_exits_on_a_signal_during_an_iteration() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path();
+
+    // The source file starts as an ordinary one-row CSV so the first run — the
+    // calibration run — completes normally and fast.
+    let source_path = dir.join(BLOCKING_SOURCE_FILE);
+    fs::write(&source_path, "1\n").expect("write source csv");
+
+    {
+        let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("open duckdb");
+        conn.execute_batch(&blocking_seed_sql(&source_path))
+            .expect("seed sql");
+    }
+
+    let cfg_path = dir.join("rocky.toml");
+    fs::write(&cfg_path, BLOCKING_ROCKY_TOML).expect("write rocky.toml");
+    let models_dir = dir.join("models");
+    fs::create_dir(&models_dir).expect("mkdir models");
+    fs::write(models_dir.join("blocking.sql"), BLOCKING_MODEL_SQL).expect("write model sql");
+    fs::write(models_dir.join("blocking.toml"), BLOCKING_MODEL_TOML).expect("write model toml");
+
+    // Clock starts before the spawn, for the reason the sibling tests spell
+    // out: everything up to the first completion line is one run's cost.
+    let calibration_start = Instant::now();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rocky"))
+        .arg("-c")
+        .arg(&cfg_path)
+        .arg("run")
+        .arg("--watch")
+        .current_dir(dir)
+        .env("RUST_LOG", "error")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rocky");
+
+    let pid = child.id();
+    let stderr = child.stderr.take().expect("stderr piped");
+    let stderr_rx = spawn_line_reader(stderr);
+    // Drain stdout too: an undrained pipe would eventually block the child.
+    let stdout = child.stdout.take().expect("stdout piped");
+    let _stdout_drain = spawn_collecting_reader(stdout);
+
+    let first = wait_for(&stderr_rx, "run completed in", BOOTSTRAP_BUDGET);
+    if !first.matched {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "first run never completed within {BOOTSTRAP_BUDGET:?}.\nstderr so far:\n{}",
+            first.buffered
+        );
+    }
+    let one_run = calibration_start.elapsed().max(Duration::from_millis(100));
+    let mut transcript = first.buffered;
+
+    // Swap the one-row CSV for a FIFO. Nothing reads it until the next
+    // iteration, and a `.csv` change is not itself a re-run trigger.
+    fs::remove_file(&source_path).expect("remove source csv");
+    mkfifo(&source_path);
+
+    // The handshake. This thread blocks in `open(O_WRONLY)` until the child
+    // opens the FIFO for reading; it then hands the write end to the test
+    // thread, which owns it for the rest of the test. Sending the handle rather
+    // than a bare notification is what keeps it open — if it were dropped, the
+    // child would see EOF, the statement would finish, and the signal would
+    // land between iterations, quietly re-testing the already-covered path.
+    let (open_tx, open_rx) = channel::<fs::File>();
+    let fifo_path = source_path.clone();
+    thread::spawn(move || {
+        if let Ok(write_end) = fs::OpenOptions::new().write(true).open(&fifo_path) {
+            let _ = open_tx.send(write_end);
+        }
+    });
+
+    // Single deterministic trigger for the re-run.
+    touch(&cfg_path);
+
+    let handshake_budget = scaled_budget(one_run, RERUN_BUDGET_RUNS);
+    let write_end = match open_rx.recv_timeout(handshake_budget) {
+        Ok(write_end) => write_end,
+        // Named as a fixture failure on purpose. A fixture that never reaches
+        // the statement and a shutdown that never completes are different bugs,
+        // and #1315 is exactly about a message that could not tell two causes
+        // apart.
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the re-run never opened the FIFO within {handshake_budget:?} ({e}) — the \
+                 FIXTURE did not put a statement in flight, so this run proves nothing about \
+                 shutdown. One run measured {one_run:?}.\nstderr so far:\n{transcript}"
+            );
+        }
+    };
+
+    // From here the child is provably inside `WarehouseAdapter::execute_statement`,
+    // blocked on a `read()` that will never return while `write_end` lives.
+    //
+    // SIGTERM rather than SIGINT: the two share one `select!` shape in
+    // `run_watch.rs`, and SIGTERM is the deterministic one — see
+    // `run_watch_exits_on_sigterm`.
+    sigterm(pid);
+    let signalled = Instant::now();
+
+    let shutdown_budget = scaled_budget(one_run, SHUTDOWN_BUDGET_RUNS);
+    let outcome = wait_with_timeout(&mut child, shutdown_budget);
+    let exit_latency = signalled.elapsed();
+
+    // Reap first, so the child's stderr pipe is at EOF and the reader thread is
+    // finishing, then drain to channel disconnect. A fixed short drain would
+    // make a descheduled reader look like a missing line — the same conflation
+    // of scheduling latency with product behaviour that #1315 is about. The
+    // timeout is only a guard against blocking forever if the pipe somehow
+    // stays open; the normal case returns on `Disconnected`.
+    if !matches!(outcome, WaitOutcome::Exited(_)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    while let Ok(line) = stderr_rx.recv_timeout(Duration::from_secs(5)) {
+        transcript.push_str(&line);
+        transcript.push('\n');
+    }
+
+    let status = match outcome {
+        WaitOutcome::Exited(status) => status,
+        WaitOutcome::StillRunning => {
+            panic!(
+                "rocky was still running {shutdown_budget:?} after SIGTERM landed with a \
+                 DuckDB statement in flight (#1590). The statement was in flight by \
+                 construction — the FIFO write end opened, which only happens once the child \
+                 has it open for reading — so this is the unbounded `Runtime::drop` wait on \
+                 the blocking pool, not a slow machine (one run measured \
+                 {one_run:?}).\nstderr:\n{transcript}"
+            );
+        }
+        WaitOutcome::WaitFailed(e) => {
+            panic!("could not determine whether rocky exited after SIGTERM: {e}");
+        }
+    };
+
+    // Two codes, and only two. `0` is the documented contract and what the
+    // release binary returns. `101` is this build profile's `RemoteStateSession`
+    // tripwire (see the doc comment): a `debug_assert!` that fires because the
+    // dropped iteration never finalized its session. Accepting any exit code —
+    // `status.code().is_some()` — would also bless a config error or an adapter
+    // failure, which would say nothing about shutdown.
+    let code = status.code();
+    assert!(
+        matches!(code, Some(0 | 101)),
+        "expected exit 0 (the documented signal contract) or 101 (this profile's \
+         RemoteStateSession debug tripwire); got {status:?}.\nstderr:\n{transcript}"
+    );
+
+    // The signal arm is what ended the process.
+    assert!(
+        transcript.contains("[watch] stopped"),
+        "expected the watch loop's '[watch] stopped' notice.\nstderr:\n{transcript}"
+    );
+
+    // Positive evidence that the signal landed *during* an iteration and not
+    // between two: the re-run started ("detected change") and never finished,
+    // so exactly one "run completed" line exists — the calibration run's.
+    assert!(
+        transcript.contains("detected change"),
+        "expected the re-run to have been triggered.\nstderr:\n{transcript}"
+    );
+    assert_eq!(
+        transcript.matches("run completed in").count(),
+        1,
+        "expected exactly one completed run (the calibration run); a second one means the \
+         iteration finished before the signal landed, which is the path the sibling tests \
+         already cover.\nstderr:\n{transcript}"
+    );
+
+    // Held open until here on purpose: dropping it earlier would release the
+    // statement and invalidate everything above.
+    drop(write_end);
+
+    // Reported rather than asserted: a bound this test can see but not pin,
+    // since the production grace period is a deliberate budget, not a promise.
+    eprintln!(
+        "run_watch_exits_on_a_signal_during_an_iteration: exited {exit_latency:?} after \
+         SIGTERM (budget {shutdown_budget:?}, one run {one_run:?})"
     );
 }
