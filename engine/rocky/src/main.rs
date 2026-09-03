@@ -3008,6 +3008,40 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
         .map(|(name, _)| *name)
 }
 
+/// How long process exit waits for warehouse work that is still in flight.
+///
+/// Dropping a `tokio` runtime waits — with no bound — for every `spawn_blocking`
+/// task that has already started, and every Rocky warehouse statement runs in
+/// one. That wait is invisible while a command runs to completion, because
+/// nothing is in flight by then. It is reachable whenever a future is dropped
+/// mid-statement, which is exactly what `rocky run --watch` does when a signal
+/// lands during an iteration: the watch loop's `select!` drops the iteration,
+/// `main` returns, and the process then sat waiting for the abandoned statement
+/// — for minutes, against a real warehouse — after the operator pressed Ctrl-C
+/// (#1590).
+///
+/// # Why five seconds
+///
+/// `shutdown_timeout` is strictly the bounded form of what the drop already
+/// does, so this can only make an exit faster; there is no slower path to
+/// regress. The number trades two things off:
+///
+/// - **Long enough** that a statement about to land still lands. Finishing
+///   normally records the result in the state ledger and, for the embedded
+///   DuckDB adapter, avoids leaving the database file to WAL recovery.
+/// - **Short enough** that the operator is not stuck. Once `main` returns there
+///   is no escape hatch: `tokio`'s signal handler is still installed
+///   process-wide, so a second Ctrl-C during this window does nothing and only
+///   SIGKILL would work.
+///
+/// Abandoning a statement is crash-parity, which is the posture the watch loop
+/// already documents: a remote warehouse owns its own transaction and the
+/// statement simply outlives the client's wait, and redb and DuckDB both have
+/// crash-safe commit protocols. Five seconds is a deliberate budget, not a
+/// default — it is well clear of a local statement's commit and well inside the
+/// patience of someone who has already asked rocky to stop.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 fn main() -> Result<()> {
     // Must run before `Cli::parse()`: clap emits `--help` / `--version`
     // through `println!`, which panics on EPIPE if SIGPIPE is ignored.
@@ -3030,7 +3064,24 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-    runtime.block_on(run_async(cli, json))
+
+    // Bound the shutdown wait — see `RUNTIME_SHUTDOWN_GRACE`.
+    //
+    // `shutdown_timeout` consumes the runtime, so it cannot be reached by a
+    // `?` or a panic escaping `block_on`. `catch_unwind` keeps the two ordered
+    // on every exit path: the payload is re-raised unchanged afterwards, so the
+    // panic message, the hook and the exit status are all what they were. In
+    // the release profile `panic = "abort"` means the `Err` arm is never taken;
+    // it is the debug binary `install-dev.sh` builds by default, and `cargo
+    // test`, that unwind.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(run_async(cli, json))
+    }));
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Install the process-level rustls [`CryptoProvider`] before any TLS.
