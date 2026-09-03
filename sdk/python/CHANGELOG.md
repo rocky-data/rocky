@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-09-03
+
+Pairs with engine 1.73.0.
+
+### Added
+
+- **`not_evaluated` on a cross-source overlap check result.** The generated `run_schema.py` and the hand-written runtime model in `types.py` both carry the new field. It is set, with the reason, whenever the engine could not run the check — a refused key expression, a misconfigured key, or a warehouse query failure (syntax, permission, transport). Such a check fails and stays in the tally. `overlap_count` is a measurement only while `not_evaluated` is `None`; before this field a check that never ran reported `overlap_count: 0`, which reads as "no overlap found". Older SDKs drop the field silently.
+
+### Removed
+
+- **`SchemaEvolutionConfig` and `RockyProject.schema_evolution`.** The engine removed the `[schema_evolution]` block, which nothing ever read. Its core config loader now refuses a config that declares it (`rocky run`, `plan`, `compile`, `validate`, `emit-sql`); eleven user-facing entrypoints — `rocky lineage`, eight MCP tools, the LSP's compile paths and `rocky serve`'s `POST /api/v1/compile` recompile path — still suppress that error and carry on (#1625). The `GET /api/v1/compile` this client calls reports it. The generated project model follows the loader.
+
+### Changed
+
+- The generated project model's docstrings for `unique_expr`, `expression` and the check `filter` fields now say what the engine does with them: spliced in as written, with a refusal for a statement terminator and for constructs the target dialects lex differently, and otherwise unbounded. They previously said the caller is responsible for sandboxing.
+
 ## [0.13.0] — 2026-08-26
 
 ### Added

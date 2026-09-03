@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.65.0] — 2026-09-03
+
+Pairs with engine 1.73.0 and `rocky-sdk` 0.14.0. The `rocky-sdk>=0.13.0` floor is unchanged: nothing here reads a field that 0.13.0 lacks.
+
+### Changed
+
+- **`I003` maps to the contract column-constraints check.** The engine now reports a contract-typed column whose type it could not infer (`I003`, informational). The check keeps passing and the code is listed in the check's metadata, next to `W010`, so an operator can see which contract columns the compiler could not confirm.
+- Regenerated test fixtures for engine 1.73.0: the state-store schema is v23, the `compile` and `ci` fixtures carry the `I003` diagnostic, and the `doctor` fixtures report `state schema v23 matches this binary`.
+
 ## [1.64.0] — 2026-08-26
 
 ### Added

@@ -574,10 +574,11 @@ const SNAPSHOT_MEMORY_WARN_BYTES: u64 = 128 * 1024 * 1024;
 ///   Guarded by `test_pre_release_v23_scope_forward_deserializes_target_none`,
 ///   `test_pre_release_v23_unclassified_separators_never_match` and
 ///   `test_pre_release_v23_verbatim_schema_template_deserializes`. No
-///   released build wrote any of them, so the version stays at 23. The
-///   reverse direction — an older *unreleased* binary reading a `null`
-///   `schema_template` — fails to parse, and that is acceptable only
-///   because no released build has this field at all.
+///   release wrote any of those incompatible pre-release shapes, so the
+///   version stays at 23; engine 1.73.0 is the first release to write this
+///   shape. The reverse direction — an older *unreleased* binary reading a
+///   `null` `schema_template` — fails to parse, and that is acceptable only
+///   because no release before 1.73.0 had this field at all.
 const CURRENT_SCHEMA_VERSION: u32 = 23;
 
 /// Errors from the embedded redb state store.
@@ -880,9 +881,9 @@ impl StateStore {
     /// flag so the caller can suppress writing the downgraded state back to a
     /// shared tier.
     ///
-    /// Only the `rocky run` path threads a non-default policy here (from
-    /// `[state] on_schema_mismatch`); every other caller uses the hard-fail
-    /// default via [`open`][Self::open].
+    /// Only the `rocky run` and `rocky load` paths thread a non-default policy
+    /// here (from `[state] on_schema_mismatch`); every other caller uses the
+    /// hard-fail default via [`open`][Self::open].
     pub fn open_with_policy(path: &Path, policy: SchemaMismatchPolicy) -> Result<Self, StateError> {
         Self::open_inner(path, OpenMode::ReadWrite, policy, None)
     }
