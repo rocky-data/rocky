@@ -356,11 +356,13 @@ const TRANSCRIPT_NAME_ATTEMPTS: u32 = 64;
 /// Create the transcript + outbox dirs and clear the outbox.
 ///
 /// Stated residual, not a leaf problem: these DIRECTORIES are not
-/// ancestor-checked. A `transcripts` or `.rocky/fulfillment` symlink planted
-/// out of the project redirects both `create_dir_all` calls, the outbox
-/// `remove_dir_all`, and the transcript create in [`create_transcript`].
-/// That is the same parent-directory class the commit protocol states as
-/// open; it needs dirfd-relative traversal, not another leaf guard.
+/// ancestor-checked. A symlink planted at `.rocky/fulfillment` (or at the
+/// product directory under it) is an ancestor of BOTH, so it redirects both
+/// `create_dir_all` calls, the outbox `remove_dir_all`, and the transcript
+/// create in [`create_transcript`]. A symlink at `transcripts` or at
+/// `outbox` alone redirects only its own side — the two are siblings. That
+/// is the same parent-directory class the commit protocol states as open; it
+/// needs dirfd-relative traversal, not another leaf guard.
 fn prepare_dirs(brief: &TaskBrief) -> Result<(), DriverError> {
     std::fs::create_dir_all(&brief.transcript_dir)
         .map_err(|e| DriverError::Spawn(format!("transcript dir: {e}")))?;
@@ -374,8 +376,15 @@ fn prepare_dirs(brief: &TaskBrief) -> Result<(), DriverError> {
 }
 
 /// CREATE this task's transcript and hand back the handle with the name it
-/// landed on. Called at the moment the old `std::fs::File::create` was, so a
-/// driver that refuses before spawning still leaves no transcript behind.
+/// landed on.
+///
+/// Called at the exact point the old `std::fs::File::create` was, so nothing
+/// that used to run before the transcript existed now runs after it — in
+/// particular [`ReplayDriver`] still reads and parses its session first, and
+/// a malformed session leaves no transcript behind. It is not a guarantee
+/// that a failed run never leaves one: the `try_clone` for stderr comes
+/// after this, and a failure there returns with the file already created,
+/// exactly as it did before.
 ///
 /// The file is created here, not merely named, because the name alone is not
 /// safe to hand to `std::fs::File::create`: that is O_CREAT|O_TRUNC, which
@@ -1442,11 +1451,15 @@ mod escape_scope_tests {
     }
 
     /// Plant a squatter at the transcript name for `seconds` consecutive UTC
-    /// seconds starting from ONE reading of the clock, so the run lands on a
-    /// planted name whatever second it starts in. Reading the clock once per
-    /// offset would let a second boundary between readings leave a hole the
-    /// run could fall into, and the test would then pass having exercised
-    /// nothing.
+    /// seconds starting from ONE reading of the clock, so a run that starts
+    /// within that window lands on a planted name.
+    ///
+    /// One reading, not one per offset: separate readings can straddle a
+    /// second boundary and leave a hole in the middle of the window for the
+    /// run to fall into. The window is still finite — a run that takes longer
+    /// than `seconds` to reach the create misses it — which is what the
+    /// caller's `replaced_by_this_run` assertion is for: a miss FAILS the
+    /// test rather than passing it having exercised nothing.
     fn plant_transcript_squatters(
         brief: &TaskBrief,
         seconds: i64,

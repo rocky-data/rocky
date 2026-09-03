@@ -60,10 +60,13 @@
 //! DIRECTORY swapped for a symlink in the instant between validation and
 //! a rename/unlink is only fully closed by dirfd-relative APIs, which v0
 //! does not use. Every leaf the protocol WRITES is guarded at the OPEN —
-//! O_EXCL on each create, `O_NOFOLLOW` on an in-place write — and so is
-//! every read whose bytes go on to LAND somewhere: the `.ff-prev` backup
-//! source, Phase B's sidecar read, the draft rollback snapshot. Those two
-//! carry a link-count check on the descriptor as well.
+//! O_EXCL on each create (portable), `O_NOFOLLOW` on an in-place write
+//! (unix) — and so is every read whose bytes go on to LAND somewhere: the
+//! `.ff-prev` backup source, Phase B's sidecar read, the draft rollback
+//! snapshot. Those two carry a link-count check on the descriptor as well,
+//! also unix. Read every claim below about an EXISTING leaf as unix-only;
+//! the Windows paragraph at the end of this header is the whole story
+//! there, and it is a weaker one.
 //!
 //! At the OPEN, precisely. Custody of the staged inode ends when the write
 //! closes it, and the rename that PUBLISHES it (`.ff-staged` → final, and
@@ -71,11 +74,14 @@
 //! the staged name with a symlink between the close and the rename gets that
 //! symlink renamed into place as the artifact, because `rename` acts on the
 //! name it is given and never follows it. Nothing is written through the
-//! link and the manifest digests still describe the staged bytes, so the
-//! next verification sees the mismatch — but a symlink lands where a regular
-//! file belongs. This is the same check-then-use class as the parent
-//! directory below, closed by the same fix (a dirfd plus `renameat`, or
-//! holding the staged descriptor through publication), and v0 accepts it.
+//! link — but a symlink now sits where a regular file belongs. This module's
+//! own later reads refuse it on unix (`read_no_follow` behind Phase B's
+//! sidecar read and the `.ff-prev` backup); [`verify_artifact_hashes`] does
+//! not — it is a plain `std::fs::read` and follows the link, so the swap
+//! surfaces there as content drift only when the link's target does not hold
+//! the staged bytes, and not at all as "this is a link". Same check-then-use class as the parent directory
+//! above, closed by the same fix (a dirfd plus `renameat`, or holding the
+//! staged descriptor through publication), and v0 accepts it.
 //!
 //! Not every read. Recovery's own `std::fs::read` of a final and of a
 //! committed manifest are pathname-based and follow a link; both are digest
@@ -96,15 +102,17 @@
 //! they did not create — [`write_no_follow`] (truncate in place) and the
 //! backing `read_no_follow` (the `.ff-prev` backup source, Phase B's
 //! sidecar read, the draft rollback snapshot) — therefore `fstat` their
-//! own descriptor and refuse `nlink > 1`. The O_EXCL create helpers are
+//! own descriptor and refuse `nlink > 1`, on unix. The O_EXCL create helpers are
 //! deliberately NOT checked: the descriptor they hand back names a file
 //! this process just created, so its link count is 1 by construction, and
 //! a link added afterwards is past anything an open-time check can see.
 //!
 //! The refusal cannot tell a hostile link from a benign one, so it is a
-//! stated COMPATIBILITY BREAK, not a free win: a project tree materialised
-//! with `cp -l` / `cp -al`, restored from an archive that preserves hard
-//! links, or deduplicated by its filesystem into shared names, is refused
+//! stated COMPATIBILITY BREAK on unix, not a free win: a project tree
+//! materialised
+//! there with `cp -l` / `cp -al`, restored from an archive that preserves
+//! hard links, or deduplicated by its filesystem into shared names, is
+//! refused
 //! at the first guarded touch — an in-place draft write, a `.ff-prev`
 //! backup, Phase B's sidecar read, or the MCP draft rollback snapshot,
 //! whichever comes first. That is the
@@ -947,10 +955,13 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 /// # Link containment
 ///
 /// Every write target is proven inside the project root through the shared
-/// [`contained_target`] primitive BEFORE the first mutation, refusing a
-/// symlinked ancestor directory (the static `models -> /outside` escape, no
-/// race) as well as a symlink at the leaf. Each leaf is then guarded a
-/// second time at its OPEN, so a link swapped in AFTER the pre-check is
+/// [`contained_target`] primitive BEFORE this generation's first mutation,
+/// refusing a symlinked ancestor directory (the static `models -> /outside`
+/// escape, no race) as well as a symlink at the leaf. (A prior crash is
+/// recovered before that, and [`recover_generation`] validates every path
+/// its journal names through the same primitive before it mutates anything.)
+/// Each leaf is then guarded a second time at its OPEN — on unix; Windows
+/// keeps the pre-check alone — so a link swapped in AFTER the pre-check is
 /// refused there rather than followed: the staged, journal-temp and
 /// `.ff-prev` writes use O_EXCL, and the `.ff-prev` backup reads its source
 /// with `O_NOFOLLOW` ([`copy_no_follow`]). The backup copy has TWO
@@ -972,10 +983,12 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 /// same shape: the open-time guard ends when the staged write closes its
 /// descriptor, and the rename that publishes it is pathname-based, so a
 /// symlink swapped in over `<final>.ff-staged` before that rename is renamed
-/// into place as the artifact (`rename` acts on the name, never follows it —
-/// nothing is written through the link, and the manifest digest no longer
-/// describes what the name holds, so the next verification catches it). And
-/// the guards that protect
+/// into place as the artifact (`rename` acts on the name, never follows it,
+/// so nothing is written through the link — but a symlink sits where a
+/// regular file belongs, and [`verify_artifact_hashes`] reads THROUGH it
+/// rather than refusing it, so the swap shows as content drift only when the
+/// link's target does not hold the staged bytes). And the guards that
+/// protect
 /// an EXISTING leaf are unix only — `O_NOFOLLOW` and the descriptor's link
 /// count; O_EXCL on a created leaf is portable. So on Windows the backup
 /// read still follows a symlink or junction planted at the final and does
