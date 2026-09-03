@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::diagnostic::{Diagnostic, E010, E011, E012, E013, E014, W010};
+use crate::diagnostic::{Diagnostic, E010, E011, E012, E013, E014, I003, W010};
 use crate::types::{RockyType, TypedColumn};
 
 /// A compile-time contract for a model's output schema.
@@ -138,10 +138,41 @@ pub fn validate_contract(
 
         match inferred {
             Some(col) => {
-                // Type check
+                // Type check.
+                //
+                // `Unknown` is handled here, before the matcher runs, and not
+                // by the matcher. Until #1240 the skip was spread across two
+                // places that each fail open on their own: this condition
+                // (`&& col.data_type != RockyType::Unknown`) and
+                // `type_name_matches`, whose `Unknown` arm returned `true`.
+                // Closing one alone would have left the other as the live
+                // path. The branch below is now the only place `Unknown`
+                // decides anything, and `type_name_matches` no longer treats
+                // it as a match.
                 if let Some(ref expected_type) = contract_col.type_name {
-                    let matches = type_name_matches(&col.data_type, expected_type);
-                    if !matches && col.data_type != RockyType::Unknown {
+                    if col.data_type == RockyType::Unknown {
+                        // Report, don't fail: see `I003` for why this is info
+                        // severity and not a warning.
+                        diagnostics.push(
+                            Diagnostic::info(
+                                I003,
+                                model_name,
+                                format!(
+                                    "column '{}' declares type {} in the contract, but Rocky could not \
+                                     work out the column's type, so it did not check the declared type",
+                                    contract_col.name, expected_type
+                                ),
+                            )
+                            .with_suggestion(format!(
+                                "give `rocky compile` source schemas so `{0}`'s type resolves — \
+                                 `rocky discover --with-schemas` fills the cache, or use \
+                                 `rocky compile --with-seed`; `rocky test` and `rocky ci` always \
+                                 compile without them. A CAST to {1} only helps when the value it \
+                                 casts already has a known type",
+                                contract_col.name, expected_type
+                            )),
+                        );
+                    } else if !type_name_matches(&col.data_type, expected_type) {
                         diagnostics.push(
                             Diagnostic::error(
                                 E011,
@@ -275,6 +306,10 @@ pub fn validate_contract(
 }
 
 /// Check if a RockyType matches a type name string from a contract.
+///
+/// Callers must handle [`RockyType::Unknown`] before calling: an inferred type
+/// Rocky withheld is neither a match nor a mismatch, and this function answers
+/// "not a match" so a caller that forgets cannot pass a contract by accident.
 fn type_name_matches(rocky_type: &RockyType, type_name: &str) -> bool {
     match rocky_type {
         RockyType::Boolean => type_name == "Boolean",
@@ -294,7 +329,12 @@ fn type_name_matches(rocky_type: &RockyType, type_name: &str) -> bool {
         RockyType::Map(_, _) => type_name == "Map" || type_name.starts_with("Map<"),
         RockyType::Struct(_) => type_name == "Struct",
         RockyType::Variant => type_name == "Variant",
-        RockyType::Unknown => true, // Unknown matches anything
+        // Not a match. `Unknown` means "Rocky withheld a type", which is not
+        // evidence that the declared type is right. `validate_contract` never
+        // reaches this arm — it branches on `Unknown` first and reports `I003`
+        // — so this value only decides what a future caller sees, and the safe
+        // answer there is "unverified", not "fine" (#1240).
+        RockyType::Unknown => false,
     }
 }
 
@@ -348,6 +388,7 @@ fn decimal_type_matches(precision: u8, scale: u8, type_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::Severity;
 
     fn typed_col(name: &str, ty: RockyType, nullable: bool) -> TypedColumn {
         TypedColumn {
@@ -573,8 +614,13 @@ mod tests {
         );
     }
 
+    /// An inferred `Unknown` still does not fail the build — but it is no
+    /// longer silent. Before #1240 this test was named
+    /// `test_unknown_type_passes` and asserted only the absence of `E011`,
+    /// which pinned the fail-open: any declared type passed and the user was
+    /// never told the check had not run.
     #[test]
-    fn test_unknown_type_passes() {
+    fn test_unknown_type_reports_i003_instead_of_passing_silently() {
         let schema = vec![typed_col("id", RockyType::Unknown, false)];
 
         let contract = CompilerContract {
@@ -588,8 +634,61 @@ mod tests {
         };
 
         let diags = validate_contract("test_model", &schema, &contract);
-        // Unknown type should not produce an error (we can't check)
-        assert!(diags.iter().all(|d| &*d.code != "E011"));
+
+        // Still not an error: an unresolvable type must not fail a build.
+        assert!(
+            diags.iter().all(|d| &*d.code != "E011"),
+            "an unresolved type must not produce E011: {diags:?}"
+        );
+
+        let i003 = diags
+            .iter()
+            .find(|d| &*d.code == "I003")
+            .expect("I003 must report the unchecked contract type");
+        assert_eq!(i003.severity, Severity::Info);
+        assert!(
+            i003.message.contains("'id'") && i003.message.contains("Int64"),
+            "I003 must name the column and the declared type: {i003:?}"
+        );
+        assert!(
+            i003.suggestion.is_some(),
+            "I003 must say how to make the check run: {i003:?}"
+        );
+    }
+
+    /// The second half of the #1240 fail-open. The gate branches on `Unknown`
+    /// before calling the matcher, so this arm is unreachable from
+    /// `validate_contract` today — it is pinned so a future caller that skips
+    /// the branch gets "not a match" rather than a silent pass.
+    #[test]
+    fn test_type_name_matches_does_not_accept_unknown() {
+        assert!(!type_name_matches(&RockyType::Unknown, "Int64"));
+        assert!(!type_name_matches(&RockyType::Unknown, "Boolean"));
+        assert!(!type_name_matches(&RockyType::Unknown, "Decimal"));
+    }
+
+    /// A contract column with no `type` declared is not a type claim, so it
+    /// must stay silent — `I003` reports an *unchecked declaration*, not an
+    /// unresolved column.
+    #[test]
+    fn test_unknown_type_without_a_declared_type_is_silent() {
+        let schema = vec![typed_col("id", RockyType::Unknown, false)];
+
+        let contract = CompilerContract {
+            columns: vec![ContractColumn {
+                name: "id".to_string(),
+                type_name: None,
+                nullable: None,
+                description: None,
+            }],
+            rules: ContractRules::default(),
+        };
+
+        let diags = validate_contract("test_model", &schema, &contract);
+        assert!(
+            diags.is_empty(),
+            "no type declared, nothing to report: {diags:?}"
+        );
     }
 
     /// Validate one decimal column against one contract type string.

@@ -729,7 +729,16 @@ fn validate_all_contracts(
 ) -> Vec<Diagnostic> {
     let mut all_diags = Vec::new();
 
-    for (model_name, contract) in contract_map {
+    // Sorted, not `HashMap` iteration order. Contract diagnostics are
+    // serialized into `rocky compile --output json`, and the dagster fixture
+    // corpus is byte-diffed in CI — so two runs of the same project must
+    // produce the same order. One contracted model hid this; a project with
+    // two or more does not.
+    let mut model_names: Vec<&String> = contract_map.keys().collect();
+    model_names.sort();
+
+    for model_name in model_names {
+        let contract = &contract_map[model_name];
         if let Some(schema) = typed_models.get(model_name) {
             let diags = contracts::validate_contract(model_name, schema, contract);
             all_diags.extend(diags);
@@ -789,6 +798,48 @@ pub fn default_type_mapper(warehouse_type: &str) -> RockyType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Contract diagnostics are serialized into `rocky compile --output json`
+    /// and the dagster fixture corpus is byte-diffed in CI, so two runs of the
+    /// same project must order them the same way. `HashMap` iteration does not
+    /// promise that; the model names are sorted for exactly this reason.
+    #[test]
+    fn contract_diagnostics_are_ordered_by_model_name() {
+        let contract = |type_name: &str| CompilerContract {
+            columns: vec![crate::contracts::ContractColumn {
+                name: "id".to_string(),
+                type_name: Some(type_name.to_string()),
+                nullable: None,
+                description: None,
+            }],
+            rules: crate::contracts::ContractRules::default(),
+        };
+        let unknown_id = vec![TypedColumn {
+            name: "id".to_string(),
+            data_type: RockyType::Unknown,
+            nullable: true,
+        }];
+
+        // Sixteen models, inserted in reverse name order. `HashMap` iteration
+        // is randomized per process, so a single pair could come out sorted by
+        // luck — with sixteen keys the chance that dropping the sort still
+        // yields this exact order is 1 in 16!, about 1 in 2e13.
+        let names: Vec<String> = (0..16).map(|i| format!("m{:02}", 15 - i)).collect();
+        let mut typed_models: IndexMap<String, Vec<TypedColumn>> = IndexMap::new();
+        let mut contract_map: HashMap<String, CompilerContract> = HashMap::new();
+        for name in &names {
+            typed_models.insert(name.clone(), unknown_id.clone());
+            contract_map.insert(name.clone(), contract("Int64"));
+        }
+
+        let mut expected = names.clone();
+        expected.sort();
+        let models: Vec<String> = validate_all_contracts(&contract_map, &typed_models)
+            .iter()
+            .map(|d| d.model.clone())
+            .collect();
+        assert_eq!(models, expected, "{models:?}");
+    }
 
     #[test]
     fn outer_join_rejects_non_null_contract() {

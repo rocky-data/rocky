@@ -231,6 +231,53 @@ pub const I001: &str = "I001";
 /// `SELECT *` as such: see the sole emitter in `typecheck.rs`.
 pub const I002: &str = "I002";
 
+/// A contract column's declared type could not be checked, because Rocky did
+/// not infer a type for the column.
+///
+/// Emitted by `validate_contract` (one per column) when a `.contract.toml`
+/// column sets `type = "..."` and the model's inferred type for that column is
+/// [`crate::types::RockyType::Unknown`]. The `E011` type check does not run for
+/// that column, so a wrong declared type would otherwise pass in silence
+/// (#1240).
+///
+/// # Why info and not a warning
+///
+/// `rocky test` and `rocky ci` compile with empty source schemas
+/// (`rocky-engine::test_runner`, `rocky-engine::ci`), so under those commands
+/// every column that takes its type from a source table infers `Unknown` — a
+/// literal or an expression over literals still resolves. That is most of a
+/// typical model. At warning severity this would fire on those columns in
+/// every project that ships a contract — noise at the severity users are
+/// asked to act on. It would also flip `rocky ci`'s reported exit code
+/// from 0 to 4 for each of those projects: `rocky_engine::ci::CiResult::
+/// exit_code` returns 4 when any diagnostic is a warning, and `rocky ci`
+/// prints that number and puts it in its JSON. (The process itself still
+/// exits 0 — the CLI only calls `process::exit` when compile or tests fail —
+/// so the shell status would not move, but every reader of that field would.)
+/// Info reports the gap and moves nothing. When `rocky test` / `rocky ci`
+/// gain a source-schema producer, this can be reconsidered.
+///
+/// # How to clear it
+///
+/// Give the compiler source schemas. Many commands read them from the schema
+/// cache, written by `rocky run` / `rocky discover --with-schemas`;
+/// `rocky compile` also accepts a seed file via `--with-seed`. Several
+/// commands do not — they build a `CompilerConfig` with an empty map, so
+/// nothing clears this code under them today. `rocky test` and `rocky ci`
+/// are the two that matter here (`rocky_engine::test_runner`,
+/// `rocky_engine::ci`); `rocky emit-sql`, `rocky preview-rows` and
+/// `rocky retention-status` do the same. Grep for `source_schemas:
+/// HashMap::new()` for the current list.
+///
+/// A `CAST` is *not* a general fix. `refine_casts` in `typecheck.rs` refines a
+/// cast column only when the cast's input type is already known, so
+/// `SELECT CAST(id AS BIGINT) AS id FROM source.raw.users` with no schema for
+/// `source.raw.users` still infers `Unknown`. And a warehouse-dependent
+/// expression — `AVG` over a `DECIMAL` input (#1238) — stays `Unknown` even
+/// with source schemas, because the result type is not knowable at this
+/// layer.
+pub const I003: &str = "I003";
+
 // Lints — portability + blast-radius
 /// Construct is not portable to the configured target dialect.
 /// Error severity, opt-in via `--target-dialect`. Emitted by the CLI.

@@ -241,7 +241,7 @@ error[E011]: column 'id' type mismatch
 
 Every diagnostic has: `code`, `severity` (Error/Warning/Info), `message`, `span` (file + line + col), `model`, and `suggestion`.
 
-The full set spans E001–E036, W001–W031, P001–P002, and I001–I002. Those ranges have gaps, so not every number in them is in use. The codes you meet most often:
+The full set spans E001–E036, W001–W031, P001–P002, and I001–I003. Those ranges have gaps, so not every number in them is in use. The codes you meet most often:
 - `E001` — Type-checking error (unresolved reference, type mismatch)
 - `E010`–`E013` — Contract violations (missing / retyped / nullability / protected-column removed)
 - `E020`–`E027` — Time-interval placeholders and budget ceiling

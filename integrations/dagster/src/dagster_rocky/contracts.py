@@ -73,6 +73,19 @@ _CONTRACT_CODE_TO_CHECK: dict[str, str] = {
     "W010": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
 }
 
+#: Compiler diagnostic codes that report a contract rule Rocky could *not*
+#: check. These are not violations, so they must never fail a check — but the
+#: check would otherwise claim a constraint was satisfied when it was never
+#: tested. They are attached to the check as metadata instead, and the result
+#: still passes. Keep them out of ``_CONTRACT_CODE_TO_CHECK``: anything mapped
+#: there fails the check, and only ``W010`` downgrades to WARN.
+#:
+#: ``I003``: the column's inferred type is ``Unknown``, so the contract's
+#: declared type was not compared against anything.
+_CONTRACT_UNVERIFIED_CODE_TO_CHECK: dict[str, str] = {
+    "I003": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+}
+
 
 @dataclass(frozen=True)
 class ContractRules:
@@ -224,9 +237,7 @@ def contract_check_specs_for_model(
         yield dg.AssetCheckSpec(
             name=CONTRACT_COLUMN_CONSTRAINTS_CHECK,
             asset=asset_key,
-            description=(
-                "Column types and nullability constraints from .contract.toml are satisfied"
-            ),
+            description="Column type and nullability constraints from .contract.toml",
             partitions_def=partitions_def,
         )
 
@@ -341,31 +352,42 @@ def contract_check_results_from_diagnostics(
         CONTRACT_PROTECTED_COLUMNS_CHECK: [],
         CONTRACT_COLUMN_CONSTRAINTS_CHECK: [],
     }
+    unverified_by_check: dict[str, list[Diagnostic]] = {
+        CONTRACT_REQUIRED_COLUMNS_CHECK: [],
+        CONTRACT_PROTECTED_COLUMNS_CHECK: [],
+        CONTRACT_COLUMN_CONSTRAINTS_CHECK: [],
+    }
     for diag in diagnostics:
         if diag.model != model_name:
             continue
         check_name = _CONTRACT_CODE_TO_CHECK.get(diag.code)
-        if check_name is None:
+        if check_name is not None:
+            by_check[check_name].append(diag)
             continue
-        by_check[check_name].append(diag)
+        unverified_name = _CONTRACT_UNVERIFIED_CODE_TO_CHECK.get(diag.code)
+        if unverified_name is not None:
+            unverified_by_check[unverified_name].append(diag)
 
     if rules.has_required:
         yield _result_for_check(
             check_name=CONTRACT_REQUIRED_COLUMNS_CHECK,
             asset_key=asset_key,
             diagnostics=by_check[CONTRACT_REQUIRED_COLUMNS_CHECK],
+            unverified=unverified_by_check[CONTRACT_REQUIRED_COLUMNS_CHECK],
         )
     if rules.has_protected:
         yield _result_for_check(
             check_name=CONTRACT_PROTECTED_COLUMNS_CHECK,
             asset_key=asset_key,
             diagnostics=by_check[CONTRACT_PROTECTED_COLUMNS_CHECK],
+            unverified=unverified_by_check[CONTRACT_PROTECTED_COLUMNS_CHECK],
         )
     if rules.has_column_constraints:
         yield _result_for_check(
             check_name=CONTRACT_COLUMN_CONSTRAINTS_CHECK,
             asset_key=asset_key,
             diagnostics=by_check[CONTRACT_COLUMN_CONSTRAINTS_CHECK],
+            unverified=unverified_by_check[CONTRACT_COLUMN_CONSTRAINTS_CHECK],
         )
 
 
@@ -374,18 +396,33 @@ def _result_for_check(
     check_name: str,
     asset_key: dg.AssetKey,
     diagnostics: list[Diagnostic],
+    unverified: list[Diagnostic] | None = None,
 ) -> dg.AssetCheckResult:
     """Build one AssetCheckResult from a filtered diagnostics list.
 
-    ``passed=True`` when the list is empty. When non-empty, the result
+    ``passed=True`` when ``diagnostics`` is empty. When non-empty, the result
     fails with severity matching the worst diagnostic (W010 → WARN, all
     others → ERROR) and metadata listing each diagnostic message.
+
+    ``unverified`` holds diagnostics that report a rule Rocky could not check
+    (``I003``). They never fail the check, but they are listed in metadata as
+    ``rocky/unverified_*`` so a passing check does not silently claim a
+    constraint was tested when it was not.
     """
+    unverified = unverified or []
+    unverified_metadata: dict[str, dg.MetadataValue] = {
+        f"rocky/unverified_{i}": dg.MetadataValue.text(f"[{d.code}] {d.message}")
+        for i, d in enumerate(unverified)
+    }
+    if unverified:
+        unverified_metadata["rocky/unverified_count"] = dg.MetadataValue.int(len(unverified))
+
     if not diagnostics:
         return dg.AssetCheckResult(
             asset_key=asset_key,
             check_name=check_name,
             passed=True,
+            metadata=unverified_metadata,
         )
 
     # WARN if every failing diagnostic is W010, ERROR otherwise
@@ -397,6 +434,7 @@ def _result_for_check(
         for i, d in enumerate(diagnostics)
     }
     metadata["rocky/violation_count"] = dg.MetadataValue.int(len(diagnostics))
+    metadata.update(unverified_metadata)
 
     return dg.AssetCheckResult(
         asset_key=asset_key,
