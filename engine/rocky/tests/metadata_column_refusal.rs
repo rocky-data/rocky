@@ -10,6 +10,19 @@
 //! These tests run the real binary against a DuckDB fixture and read the
 //! warehouse back to answer one question: on refusal, was the target schema
 //! created?
+//!
+//! # What this fixture can and cannot observe
+//!
+//! DuckDB's `create_catalog_sql` returns `None`, so `auto_create_schemas` is
+//! the FIRST governance mutation observable on this adapter — there is no
+//! catalog step to sit between the guard and the assertion. A guard placed
+//! between catalog and schema creation on a catalog-bearing warehouse would
+//! still pass here; proving that needs a recording adapter, which the tree
+//! does not have yet.
+//!
+//! The destination database FILE is created earlier still, by adapter
+//! construction. That is not this guard's doing: `rocky discover`, a
+//! read-only command, creates it too.
 
 use std::fs;
 use std::process::Command;
@@ -82,6 +95,20 @@ fn seed(dir: &std::path::Path, schema: &str) {
          CREATE TABLE \"{schema}\".orders AS SELECT * FROM (VALUES (1),(2)) t(id);"
     ))
     .expect("seed source");
+}
+
+fn table_exists(dir: &std::path::Path, schema: &str, table: &str) -> bool {
+    let conn = duckdb::Connection::open(dir.join("fixture.duckdb")).expect("reopen duckdb");
+    let mut stmt = conn
+        .prepare(
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_schema = ? AND table_name = ?",
+        )
+        .expect("prepare");
+    let n: i64 = stmt
+        .query_row([schema, table], |r| r.get(0))
+        .expect("query");
+    n > 0
 }
 
 fn schema_exists(dir: &std::path::Path, schema: &str) -> bool {
@@ -165,6 +192,10 @@ fn a_refused_metadata_value_leaves_no_warehouse_mutation_behind() {
     assert!(
         !schema_exists(dir, "staging"),
         "the refusal must land BEFORE governance setup — the target schema was created"
+    );
+    assert!(
+        !table_exists(dir, "staging", "orders"),
+        "the refusal must land before the copy — the target table was written"
     );
 }
 
