@@ -3018,20 +3018,36 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
 /// drops the iteration, `main` returns, and the process then sat waiting for the
 /// abandoned statement after the operator pressed Ctrl-C (#1590).
 ///
-/// # What this actually bounds
+/// # What this bounds, and what it does not
 ///
 /// Only the **blocking pool**. Runtime shutdown drops async tasks immediately,
 /// with or without this timeout, so nothing changes for the adapters that await
 /// an async client — Databricks, Snowflake, BigQuery, Trino — or for the
-/// content-addressed S3 path. Those statements were already abandoned the
-/// instant the future was dropped.
+/// content-addressed S3 path. Those were already abandoned the instant the
+/// future was dropped.
 ///
-/// The newly bounded surface is therefore exactly DuckDB, whose adapter runs
-/// every statement in `spawn_blocking`. Each of those closures issues a single
-/// statement, so cutting one is the same as a crash during it, and DuckDB's WAL
-/// covers that. The one closure that used to issue several — the loader's
-/// truncate-then-load — is now one explicit transaction for this reason
-/// (`rocky-duckdb/src/loader.rs`).
+/// The blocking pool carries two different kinds of work, and the timeout
+/// cannot tell them apart:
+///
+/// - **Warehouse statements.** The DuckDB adapter runs every statement in
+///   `spawn_blocking`. Each of those closures issues one statement, so cutting
+///   one is the same as a crash during it and the WAL covers it. The one
+///   closure that used to issue several — the loader's truncate-then-load — is
+///   now a single explicit transaction for this reason
+///   (`rocky-duckdb/src/loader.rs`).
+/// - **State-ledger commits.** Deferred watermarks, table-progress checkpoints
+///   and source markers are all handed to `spawn_blocking` so the redb fsync
+///   does not stall the async task (`rocky-cli/src/commands/run.rs`).
+///
+/// The second kind is the known cost of this timeout, and it is deliberate
+/// rather than overlooked. A redb batch is atomic, so a cut commit cannot tear
+/// the ledger — but it can leave it *logically stale*. If a replication table's
+/// rows committed in the warehouse and its watermark commit is then cut, the
+/// next run re-reads from the old watermark and appends the same delta twice.
+/// The unbounded drop this replaces would let that commit finish, at the price
+/// of the hang it also produces. Removing the trade-off needs a cancellation
+/// protocol that separates "stop starting warehouse work" from "settle the
+/// state tail", which a process-wide timer cannot express — tracked in #1606.
 ///
 /// # Why five seconds
 ///
@@ -3039,17 +3055,18 @@ fn offending_default_plan_flag(flags: &[(&'static str, bool)]) -> Option<&'stati
 /// does, so this can only make an exit faster; there is no slower path to
 /// regress. The number trades two things off:
 ///
-/// - **Long enough** that a statement about to land still lands. Finishing
-///   normally records the result in the state ledger and avoids leaving the
-///   DuckDB file to WAL recovery.
+/// - **Long enough** that work about to land still lands. A redb commit is
+///   normally milliseconds; five seconds is three orders of magnitude of
+///   headroom, which is what keeps the staleness above rare rather than
+///   routine.
 /// - **Short enough** that the operator is not stuck. Once `main` returns there
 ///   is no escape hatch: `tokio`'s signal handler is still installed
 ///   process-wide, so a second Ctrl-C during this window does nothing and only
 ///   SIGKILL would work.
 ///
 /// Five seconds is a deliberate budget, not a default — well clear of a local
-/// statement's commit, and well inside the patience of someone who has already
-/// asked rocky to stop.
+/// commit, and well inside the patience of someone who has already asked rocky
+/// to stop.
 const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> Result<()> {
