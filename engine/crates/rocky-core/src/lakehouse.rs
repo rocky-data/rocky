@@ -315,6 +315,10 @@ mod tests {
     struct TestDialect;
 
     impl SqlDialect for TestDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn name(&self) -> &'static str {
             "test"
         }
@@ -1058,6 +1062,10 @@ mod tests {
     struct NonSparkDialect;
 
     impl SqlDialect for NonSparkDialect {
+        fn literal_escape(&self) -> crate::traits::LiteralEscape {
+            crate::traits::LiteralEscape::Standard
+        }
+
         fn name(&self) -> &'static str {
             "non_spark"
         }

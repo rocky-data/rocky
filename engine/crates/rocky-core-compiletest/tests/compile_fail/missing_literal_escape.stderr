@@ -1,0 +1,7 @@
+error[E0046]: not all trait items implemented, missing: `literal_escape`
+  --> tests/compile_fail/missing_literal_escape.rs:22:1
+   |
+22 | impl SqlDialect for NoLexerFact {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `literal_escape` in implementation
+   |
+   = help: implement the missing item: `fn literal_escape(&self) -> LiteralEscape { todo!() }`

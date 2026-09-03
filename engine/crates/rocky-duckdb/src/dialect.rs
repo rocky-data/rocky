@@ -9,7 +9,7 @@
 
 use std::fmt::Write;
 
-use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
+use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
@@ -20,6 +20,17 @@ pub struct DuckDbSqlDialect;
 impl SqlDialect for DuckDbSqlDialect {
     fn name(&self) -> &'static str {
         "duckdb"
+    }
+
+    /// DuckDB's `'…'` literal has no backslash escape; a quote is doubled.
+    ///
+    /// DuckDB's `E'…'` prefix *does* process backslashes, but Rocky never
+    /// emits that form.
+    ///
+    /// Executed in-process on every CI run: `SELECT <literal>` round-trips
+    /// byte-identical (`crates/rocky-duckdb/tests/literal_escape_round_trip.rs`).
+    fn literal_escape(&self) -> LiteralEscape {
+        LiteralEscape::Standard
     }
 
     fn format_table_ref(&self, catalog: &str, schema: &str, table: &str) -> AdapterResult<String> {

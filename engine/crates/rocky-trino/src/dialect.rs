@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use rocky_core::traits::{AdapterError, AdapterResult, SqlDialect};
+use rocky_core::traits::{AdapterError, AdapterResult, LiteralEscape, SqlDialect};
 use rocky_ir::{ColumnSelection, MetadataColumn};
 use rocky_sql::validation;
 
@@ -25,6 +25,15 @@ impl TrinoDialect {
 impl SqlDialect for TrinoDialect {
     fn name(&self) -> &'static str {
         "trino"
+    }
+
+    /// Trino's `'…'` literal has no backslash escape; a quote is doubled.
+    ///
+    /// Executed: `SELECT <literal>` round-trips byte-identical against the
+    /// `trino-conformance` harness (`crates/rocky-trino/tests/conformance.rs`,
+    /// `literal_escape_round_trips_live`).
+    fn literal_escape(&self) -> LiteralEscape {
+        LiteralEscape::Standard
     }
 
     /// Trino's portable `CREATE TABLE ... AS` has no `OR REPLACE` across
