@@ -657,7 +657,21 @@ fn load_single_rocky_model_with_db(
             sources: vec![],
             adapter: None,
             intent: defaults.as_ref().and_then(|d| d.intent.clone()),
-            freshness: defaults.as_ref().and_then(|d| d.freshness.clone()),
+            // Same precedence as the sidecar path in
+            // `rocky_core::models::resolve_model_config`: directory
+            // `_defaults.toml` first, then the project `[freshness]` block
+            // (#1435). A `.rocky` model with no sidecar builds its config
+            // here instead of going through that function, so the project
+            // rung has to be repeated — without it, a DSL model would
+            // report no freshness where its `.sql` neighbour reports the
+            // inherited block.
+            freshness: defaults
+                .as_ref()
+                .and_then(|d| d.freshness.clone())
+                .or_else(|| {
+                    ctx.project_freshness
+                        .and_then(models::ModelFreshnessConfig::from_project_default)
+                }),
             tests: vec![],
             format: None,
             format_options: None,
@@ -971,6 +985,57 @@ mod tests {
         let models = load_dir_models_matching(d, &glob, None).expect("load matching model");
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].config.name, "agg");
+    }
+
+    /// A `.rocky` DSL model inherits the project `[freshness]` block, with
+    /// and without a `.toml` sidecar.
+    ///
+    /// The two shapes take different code paths: with a sidecar the config
+    /// comes from `resolve_model_config`; without one it is built inline in
+    /// `load_single_rocky_model_with_db`. Both must reach the project rung,
+    /// or a DSL model reports no freshness where its `.sql` neighbour
+    /// reports the inherited block (#1435).
+    #[test]
+    fn rocky_models_inherit_the_project_freshness_block() {
+        let _guard = crate::salsa_compile::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // With a sidecar that declares no freshness.
+        std::fs::write(d.join("with_sidecar.rocky"), "from orders\nselect { id }\n").unwrap();
+        std::fs::write(
+            d.join("with_sidecar.toml"),
+            "[target]\ncatalog = \"wh\"\nschema = \"s\"\n",
+        )
+        .unwrap();
+        // With no sidecar at all.
+        std::fs::write(d.join("bare.rocky"), "from orders\nselect { id }\n").unwrap();
+
+        let project = rocky_core::config::ProjectFreshnessConfig {
+            expected_lag_seconds: Some(1800),
+            time_column: Some("updated_at".to_string()),
+            severity: None,
+        };
+        let models = load_dir_models(d, Some(&project)).unwrap();
+
+        for name in ["with_sidecar", "bare"] {
+            let m = models
+                .iter()
+                .find(|m| m.config.name == name)
+                .unwrap_or_else(|| panic!("{name} loaded"));
+            let f = m
+                .config
+                .freshness
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} must inherit the project [freshness] block"));
+            assert_eq!(f.max_lag_seconds, 1800);
+            assert_eq!(f.time_column.as_deref(), Some("updated_at"));
+        }
+
+        // Baseline: with no project block, neither shape gains freshness.
+        let none = load_dir_models(d, None).unwrap();
+        assert!(none.iter().all(|m| m.config.freshness.is_none()));
     }
 
     /// Regression: a `.rocky` DSL model resolves a config group through the
