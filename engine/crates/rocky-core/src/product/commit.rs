@@ -74,12 +74,14 @@
 //! the staged name with a symlink between the close and the rename gets that
 //! symlink renamed into place as the artifact, because `rename` acts on the
 //! name it is given and never follows it. Nothing is written through the
-//! link — but a symlink now sits where a regular file belongs. This module's
-//! own later reads refuse it on unix (`read_no_follow` behind Phase B's
-//! sidecar read and the `.ff-prev` backup); [`verify_artifact_hashes`] does
-//! not — it is a plain `std::fs::read` and follows the link, so the swap
-//! surfaces there as content drift only when the link's target does not hold
-//! the staged bytes, and not at all as "this is a link". Same check-then-use class as the parent directory
+//! link — but a symlink now sits where a regular file belongs, and what
+//! happens next depends on which reader arrives. The `O_NOFOLLOW` readers
+//! refuse it on unix: `read_no_follow`, behind Phase B's sidecar read and
+//! the `.ff-prev` backup. The plain `std::fs::read` readers FOLLOW it —
+//! [`verify_artifact_hashes`] and `committed_manifest` among them — so the
+//! swap surfaces there as content drift only when the link's target does not
+//! hold the staged bytes, and never as "this is a link". Same check-then-use
+//! class as the parent directory
 //! above, closed by the same fix (a dirfd plus `renameat`, or holding the
 //! staged descriptor through publication), and v0 accepts it.
 //!
@@ -960,8 +962,10 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 /// escape, no race) as well as a symlink at the leaf. (A prior crash is
 /// recovered before that, and [`recover_generation`] validates every path
 /// its journal names through the same primitive before it mutates anything.)
-/// Each leaf is then guarded a second time at its OPEN — on unix; Windows
-/// keeps the pre-check alone — so a link swapped in AFTER the pre-check is
+/// Each leaf is then guarded a second time at its OPEN. O_EXCL on a CREATED
+/// leaf is portable; the guards on an EXISTING leaf (`O_NOFOLLOW`, the
+/// descriptor's link count) are unix only, so for those Windows keeps the
+/// pre-check alone. A link swapped in AFTER the pre-check is
 /// refused there rather than followed: the staged, journal-temp and
 /// `.ff-prev` writes use O_EXCL, and the `.ff-prev` backup reads its source
 /// with `O_NOFOLLOW` ([`copy_no_follow`]). The backup copy has TWO
