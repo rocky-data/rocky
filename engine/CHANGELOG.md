@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`rocky emit-sql` no longer emits another warehouse's SQL when `rocky.toml` does not load.** It swallowed every config error with `.ok()` and fell back to the DuckDB dialect, so a project whose config was broken got DuckDB SQL and no word about it. It now uses the same derivation `rocky compile` does: the credential-tolerant loader, so an unset `${VAR}` in an adapter's connection fields still does not stop a command that needs no credentials; a missing `rocky.toml` is still fine and still emits; every other config failure is reported. That also closes the one path where a config declaring the removed `[schema_evolution]` section ran as if nothing were wrong while every other command refused it. **On upgrade:** `rocky emit-sql` against a project whose `rocky.toml` is malformed now exits non-zero instead of emitting DuckDB SQL. (#1435)
+
+- **The LSP no longer loses `[mask]` and the project `[freshness]` block after the first keystroke.** Opening a project loaded `rocky.toml`, but the debounced `didChange` recompile built its compiler config from `Default`. So W004 (a classification tag with no masking strategy) fired on open and went quiet on the first edit, and a model's inherited freshness disappeared from the IDE's view of the project. Both compile paths now read the project config through one function. (#1435)
+
 - **A model with no `[freshness]` block now inherits the project's.** `rocky.toml`'s top-level `[freshness]` set a project-wide staleness budget, and the model loader never looked at it. The engine even carried the conversion helper — `ModelFreshnessConfig::from_project_default` — with a doc comment describing the inheritance and no caller anywhere, including tests. A project that set `expected_lag_seconds`, `time_column` and `severity` there saw every model report no freshness at all.
 
   Precedence is now, first match wins:
