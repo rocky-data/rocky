@@ -86,7 +86,8 @@ Matching follows the warehouse's own rule for identifier case, per component.
 | Warehouse | Case is part of object identity | What Rocky matches |
 |---|---|---|
 | DuckDB, Databricks, Trino | No | `Orders` and `orders` name one table, and either spelling is redirected |
-| BigQuery, Snowflake | Yes | The reference must match exactly |
+| BigQuery | Yes | The reference must match exactly |
+| Snowflake | Yes, and an unquoted reference is read as upper case | The reference must name the same object the target does |
 
 On BigQuery and Snowflake, a model reading `raw.Orders` is **not** redirected to
 the shadow of a model whose target is `raw.orders`. It never read that table.
@@ -105,14 +106,28 @@ created `is_case_insensitive`. Assuming the two targets are distinct could let
 both models write the same shadow table with no error. Rename one target so the
 two differ by more than case.
 
-:::note[Snowflake gap]
-One gap remains on Snowflake, unchanged from before this behaviour existed.
-Matching compares the spelled text of a reference. Snowflake resolves an
-*unquoted* identifier by upper-casing it, while Rocky writes its targets quoted.
-So a model's target may be configured in lower case and read by an unquoted
-reference. Rocky can redirect that read even though the two name different
-objects. Configuring Snowflake targets in upper case — the idiomatic choice —
-avoids it entirely. Tracked in issue #1282.
+:::caution[Snowflake: quoting is a second identity axis]
+Snowflake reads an *unquoted* identifier as upper case, and Rocky writes every
+Snowflake target double-quoted. A target configured as `main.orders` is the
+object `"main"."orders"`. A model's `FROM main.orders` names `MAIN.ORDERS`.
+Those are two different tables with the same text.
+
+Rocky resolves the reference the way Snowflake resolves it before matching. So
+an upper-case target read by an unquoted reference routes normally — that is the
+idiomatic Snowflake project, and nothing changes for it. A lower-case or
+mixed-case target read by an unquoted reference is refused instead of redirected.
+
+Two ways to fix a refusal, either one:
+
+- quote the reference so it spells the target exactly — `FROM "main"."orders"`;
+- or spell the configured target in upper case — `MAIN.ORDERS` — so an unquoted
+  reference resolves onto it.
+
+On an account with Snowflake's default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`,
+a lower-case target read unquoted could not be read on a plain run either. The
+refusal replaces a silent wrong read on a shape that was already broken. An
+account that sets that parameter to `TRUE` makes the two spellings one object,
+but Rocky cannot read that setting, so it still asks for an unambiguous spelling.
 :::
 
 ## Shadow target rewriting

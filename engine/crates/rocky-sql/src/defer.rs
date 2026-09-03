@@ -1825,6 +1825,48 @@ mod tests {
         assert!(out.case_fold_only_refs.is_empty());
     }
 
+    /// #1282's second surface: the same resolution reaches `--defer`, through
+    /// CTE shadowing.
+    ///
+    /// `qualify_deferred_refs` asks the scope stack whether a bare name is
+    /// shadowed by a CTE, and the stack answers with the dialect's own rules. On
+    /// Snowflake a CTE declared QUOTED lowercase is the name `orders`, while an
+    /// unquoted `FROM orders` resolves to `ORDERS`; Snowflake does not bind
+    /// those, so Rocky must not either. An unquoted alias folds exactly the way
+    /// the reference does and still shadows it, which is the common shape and is
+    /// unaffected.
+    #[test]
+    fn snowflake_cte_shadowing_honours_the_quoting_axis() {
+        let rules = IdentifierCaseRules::uniform_uppercasing(true);
+        let deferred = deferred_map(&[("orders", target("cat", "prod", "orders"))]);
+
+        let unquoted_alias = qualify_deferred_refs(
+            "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
+            &deferred,
+            rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
+        assert!(
+            !unquoted_alias.contains("prod"),
+            "an unquoted alias resolves upper exactly as the reference does, so it still \
+             shadows: {unquoted_alias}"
+        );
+
+        let quoted_alias = qualify_deferred_refs(
+            "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
+            &deferred,
+            rules,
+            RecursiveCteVisibility::PrecedingAndSelf,
+        )
+        .unwrap();
+        assert!(
+            quoted_alias.contains("prod"),
+            "the CTE is named `orders` and the reference resolves to `ORDERS`: Snowflake does \
+             not bind them, so the reference is the deferred upstream: {quoted_alias}"
+        );
+    }
+
     /// A CTE still shadows a bare name before any of this runs.
     #[test]
     fn cte_shadowing_wins_over_case_disambiguation() {

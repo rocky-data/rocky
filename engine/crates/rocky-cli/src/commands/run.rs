@@ -6519,7 +6519,11 @@ fn apply_defer_rewrite(
 /// ‼️ Keep this function's dialect arms in step with [`dialect_case_rules`].
 /// Both are called on the `--defer` and shadow paths, so a dialect added to one
 /// and not the other turns a supported warehouse into a hard refusal on a path
-/// nobody was thinking about.
+/// nobody was thinking about. "In step" means the same SET of dialect names, not
+/// the same grouping: `dialect_case_rules` splits `snowflake` out from
+/// `bigquery` because Snowflake also folds UNQUOTED identifiers, while this
+/// function groups `snowflake` with `trino` because both render double quotes.
+/// Those two groupings answer different questions and are meant to disagree.
 fn rewrite_quote_style(dialect: &dyn rocky_core::traits::SqlDialect) -> Result<Option<char>> {
     match dialect.name() {
         // `format_table_ref` renders bare identifiers.
@@ -6663,31 +6667,46 @@ pub(crate) fn dialect_case_rules(
         // therefore do not collide. That question is deliberately NOT asked here:
         // `apply_shadow_rewrite` answers it with its own always-folding
         // `collision_identity`. Do not reuse this function for it.
-        // ‼️ Snowflake has a SECOND identity axis this deliberately does not
-        // model yet: it resolves an UNQUOTED identifier by upper-casing it,
-        // while Rocky renders its targets QUOTED. So a configured target
-        // `orders` is the object `orders`, which an unquoted `FROM orders` does
-        // NOT name — it names `ORDERS`. Matching on spelled text therefore
-        // rewrites a read of one object to the replacement for another.
+        "bigquery" => Ok(uniform(true)),
+        // Snowflake carries a SECOND identity axis on top of case: it resolves
+        // an UNQUOTED identifier by upper-casing it, while
+        // `SnowflakeSqlDialect::format_table_ref` renders every component of a
+        // target QUOTED. So a configured target `orders` is the object
+        // `orders`, which an unquoted `FROM orders` does NOT name — that names
+        // `ORDERS`. Matching on spelled text alone therefore rewrote a read of
+        // one object to the replacement registered for another (#1282).
         //
-        // `IdentifierCaseRules::uniform_uppercasing` implements and tests that
-        // resolution (see `defer.rs`'s
-        // `snowflake_resolves_unquoted_identifiers_before_matching`), and
-        // enabling it here is a one-line change. It is NOT enabled because doing
-        // so refuses any lowercase-configured Snowflake project, and while the
-        // reasoning says such a project could not read its upstream in
-        // production either, that conclusion has not been verified against a
-        // live Snowflake account.
+        // `uniform_uppercasing` resolves the reference the way Snowflake
+        // resolves it before matching, so such a read becomes a reported
+        // near-miss and the caller refuses. The idiomatic uppercase-target
+        // project is unaffected: an unquoted reference resolves onto an
+        // uppercase target and routes exactly as before. See `defer.rs`'s
+        // `snowflake_resolves_unquoted_identifiers_before_matching` for the
+        // full matrix.
         //
-        // The in-repo blast radius is one test fixture, not the examples: the
-        // only Snowflake POC (`05-orchestration/08-circuit-breaker`) is
-        // uppercase throughout (`catalog = "ANALYTICS"`), so it is unaffected.
-        // Do not read this deferral as "it would break our own examples". Shipping it
-        // untested would trade a known, pre-existing and unchanged hazard for an
-        // unmeasured break. Tracked as #1282; #1281 would settle it exactly.
+        // What this refuses that it did not refuse before: a lowercase or
+        // mixed-case configured target read through an UNQUOTED reference. On
+        // an account with the default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`
+        // that project cannot read its upstream on a plain run either — Rocky
+        // created `"main"."orders"` and the model asks for `MAIN.ORDERS` — so
+        // the refusal replaces a silent wrong read on a shape that is already
+        // broken. On an account that sets that parameter to TRUE the read does
+        // resolve today and is now refused; that parameter is connection state
+        // Rocky cannot observe (#1281 tracks reading it), and the refusal names
+        // both remedies. The remedy is trivial either way: quote the reference
+        // so it spells the target exactly, or spell the target in upper case.
         //
-        // Unchanged from the behaviour on `main`, which also matched on text.
-        "bigquery" | "snowflake" => Ok(uniform(true)),
+        // The only in-repo Snowflake project
+        // (`examples/playground/pocs/07-adapters/01-snowflake-dynamic-table`)
+        // is uppercase throughout — `catalog = "ANALYTICS"`, `schema = "MARTS"`
+        // and `FROM RAW__ORDERS.ORDERS` — so it is unaffected.
+        //
+        // ‼️ This arm differs in SHAPE from the `bigquery` one above on purpose:
+        // BigQuery is case-sensitive but does not fold unquoted identifiers, so
+        // it takes `uniform`. Do not "tidy" the two back into one arm.
+        "snowflake" => Ok(rocky_sql::defer::IdentifierCaseRules::uniform_uppercasing(
+            true,
+        )),
         other => anyhow::bail!(
             "shadow/branch execution does not know whether '{other}' treats identifier case as \
              part of object identity, so it cannot tell whether two targets differing only by \
@@ -6695,6 +6714,35 @@ pub(crate) fn dialect_case_rules(
              `dialect_case_rules` after checking how it folds identifiers"
         ),
     }
+}
+
+/// What to tell an operator whose reference matched a routed upstream only when
+/// identifier case was ignored.
+///
+/// Shared by the shadow and the replay refusal so the two cannot drift, and
+/// keyed on the dialect's own rules because the right advice differs.
+///
+/// On a dialect that folds UNQUOTED identifiers the generic "spell the reference
+/// exactly as the configured target" line is not merely incomplete, it is wrong:
+/// the reference in such a near-miss is normally spelled EXACTLY like the target
+/// and still names a different object, because `format_table_ref` created the
+/// target quoted while the model wrote the reference bare. An operator following
+/// the generic advice would compare two identical strings and conclude Rocky was
+/// broken (#1282).
+pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules) -> &'static str {
+    if rules.unquoted_uppercases {
+        return "On this warehouse an UNQUOTED reference resolves UPPER-CASED, so \
+                `main.orders` names `MAIN.ORDERS` while Rocky creates a configured target \
+                `main.orders` quoted, as `\"main\".\"orders\"` — two different objects with \
+                identical text. Either quote the reference so it spells the configured target \
+                exactly (`\"main\".\"orders\"`), or spell the configured target in upper case \
+                (`MAIN.ORDERS`) so an unquoted reference resolves onto it. An account that sets \
+                QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE makes the two one object, but Rocky cannot \
+                read that setting (#1281), so the spelling still has to be unambiguous without \
+                it";
+    }
+    "Spell the reference exactly as the upstream's configured target, or rename one so they \
+     differ by more than case (#1281 tracks reading the live setting instead of assuming it)"
 }
 
 /// Route the models built by this invocation and their in-run dependency reads
@@ -7087,6 +7135,15 @@ fn apply_shadow_rewrite(
             // reads a table the model never named, while leaving it reads
             // PRODUCTION while this model writes its shadow — an isolation break
             // that exits 0 and then shows up as a clean `rocky compare`. Refuse.
+            //
+            // On a dialect that folds UNQUOTED identifiers the near-miss is
+            // usually not a spelling difference at all: the reference is spelled
+            // exactly like the configured target and STILL names a different
+            // object, because Rocky created the target quoted and the model
+            // wrote the reference bare. "Spell it the same" is useless advice
+            // there, so the message names quoting explicitly and gives both
+            // remedies — an operator must not have to read this file to learn
+            // what to change (#1282).
             anyhow::ensure!(
                 outcome.case_fold_only_refs.is_empty(),
                 "shadow mode cannot tell whether upstream reference(s) {:?} in model '{}' name a \
@@ -7094,11 +7151,10 @@ fn apply_shadow_rewrite(
                  whether case separates two objects depends on connection state Rocky cannot \
                  observe (a Snowflake account may set QUOTED_IDENTIFIERS_IGNORE_CASE, a BigQuery \
                  dataset may be is_case_insensitive). Redirecting could read the wrong table and \
-                 not redirecting would read production, so neither is safe. Spell the reference \
-                 exactly as the upstream's configured target, or rename one so they differ by \
-                 more than case (#1281 tracks reading the live setting instead of assuming it)",
+                 not redirecting would read production, so neither is safe. {}",
                 outcome.case_fold_only_refs,
-                model.config.name
+                model.config.name,
+                case_near_miss_remedy(case_rules)
             );
             // Every reference actually redirected is now a read of a table
             // THIS run produces, so it is a real dependency regardless of what
@@ -21353,19 +21409,32 @@ auto_create_schemas = true
     /// quoted too; DuckDB renders bare. Nothing else in the suite exercises
     /// these dialects, so this asserts the serialized SQL directly rather than
     /// reasoning about how each warehouse resolves it.
+    ///
+    /// The identifier case is a parameter because Snowflake resolves an
+    /// UNQUOTED reference upper-cased (#1282): the lowercase `main.orders` this
+    /// fixture used to write for every dialect is a shape Snowflake now refuses,
+    /// since the producer creates `"main"."orders"` and the consumer's bare
+    /// `FROM main.orders` names `MAIN.ORDERS`. The uppercase spelling is the
+    /// Snowflake-idiomatic one and keeps this test about QUOTING, which is what
+    /// it exists to pin. DuckDB keeps the lowercase spelling so the bare-render
+    /// assertion still means something.
     #[cfg(feature = "duckdb")]
     #[test]
     fn shadow_rewritten_reads_match_the_producer_quoting_per_dialect() {
-        fn rewritten_sql(dialect: &dyn rocky_core::traits::SqlDialect) -> String {
+        fn rewritten_sql(
+            dialect: &dyn rocky_core::traits::SqlDialect,
+            schema: &str,
+            table: &str,
+        ) -> String {
             let tmp = tempfile::TempDir::new().expect("temp dir");
             let models_dir = tmp.path().join("models");
             std::fs::create_dir(&models_dir).expect("mkdir models");
-            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", schema, table);
             write_model_with_target(
                 &models_dir,
                 "mart",
-                "SELECT id FROM main.orders",
-                "main",
+                &format!("SELECT id FROM {schema}.{table}"),
+                schema,
                 "mart",
             );
             let mut compiled =
@@ -21393,7 +21462,7 @@ auto_create_schemas = true
                 .clone()
         }
 
-        let duck = rewritten_sql(&rocky_duckdb::dialect::DuckDbSqlDialect);
+        let duck = rewritten_sql(&rocky_duckdb::dialect::DuckDbSqlDialect, "main", "orders");
         assert!(
             duck.contains("orders_rocky_shadow") && !duck.contains('"'),
             "DuckDB renders bare identifiers: {duck}"
@@ -21402,16 +21471,154 @@ auto_create_schemas = true
         for (name, sql) in [
             (
                 "snowflake",
-                rewritten_sql(&rocky_snowflake::dialect::SnowflakeSqlDialect),
+                rewritten_sql(
+                    &rocky_snowflake::dialect::SnowflakeSqlDialect,
+                    "MAIN",
+                    "ORDERS",
+                ),
             ),
-            ("trino", rewritten_sql(&rocky_trino::dialect::TrinoDialect)),
+            (
+                "trino",
+                rewritten_sql(&rocky_trino::dialect::TrinoDialect, "MAIN", "ORDERS"),
+            ),
         ] {
             assert!(
-                sql.contains("\"orders_rocky_shadow\""),
+                sql.contains("\"ORDERS_rocky_shadow\""),
                 "{name} quotes its targets, so the rewritten read must be quoted too or it \
                  folds case and names a different object: {sql}"
             );
         }
+    }
+
+    /// #1282: on Snowflake a lowercase configured target read through an
+    /// UNQUOTED reference must be REFUSED, not silently rewritten.
+    ///
+    /// `SnowflakeSqlDialect::format_table_ref` creates the target as
+    /// `"main"."orders"`. Snowflake resolves the consumer's bare
+    /// `FROM main.orders` to `MAIN.ORDERS`. Those are two different objects with
+    /// identical text, so the text match this fixture used to satisfy redirected
+    /// a read of one object to the other's shadow replacement.
+    ///
+    /// This goes through `apply_shadow_rewrite` on purpose. Constructing
+    /// `IdentifierCaseRules::uniform_uppercasing(true)` by hand passes with the
+    /// dialect table unchanged and proves only that the rules type works; the
+    /// thing under test is that `dialect_case_rules` hands Snowflake those
+    /// rules.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_refuses_a_snowflake_read_that_folds_to_a_different_object() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(
+            &models_dir,
+            "mart",
+            "SELECT id FROM main.orders",
+            "main",
+            "mart",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        let err = super::apply_shadow_rewrite(
+            &mut compiled,
+            None,
+            None,
+            &rocky_core::shadow::ShadowConfig::default(),
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+            false,
+        )
+        .expect_err("an unquoted read of a quoted lowercase target must be refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("[\"main.orders\"]"),
+            "the refusal must name the reference it could not decide: {message}"
+        );
+        // The remedy has to be in the message. An operator hitting this sees a
+        // reference spelled exactly like the target, so "spell it the same" on
+        // its own would send them hunting a difference that is not there.
+        assert!(
+            message.contains(
+                "Either quote the reference so it spells the configured target \
+                              exactly"
+            ),
+            "the refusal must name the quoting remedy: {message}"
+        );
+        assert!(
+            message.contains("spell the configured target in upper case"),
+            "the refusal must name the upper-case remedy: {message}"
+        );
+        assert!(
+            message.contains("QUOTED_IDENTIFIERS_IGNORE_CASE"),
+            "the refusal must name the account setting that makes this ambiguous: {message}"
+        );
+    }
+
+    /// #1282's other half: the shapes that must keep working.
+    ///
+    /// An uppercase configured target — the Snowflake-idiomatic spelling — is
+    /// what an unquoted reference resolves onto, so it routes exactly as before.
+    /// And the remedy the refusal message prints has to actually work: a
+    /// lowercase target read through a QUOTED reference names the object Rocky
+    /// created, so it routes too. Without this second half the change could have
+    /// been "refuse everything on Snowflake" and still looked correct.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn shadow_routes_snowflake_reads_that_name_the_object_rocky_created() {
+        fn routed_sql(schema: &str, table: &str, reference: &str) -> String {
+            let tmp = tempfile::TempDir::new().expect("temp dir");
+            let models_dir = tmp.path().join("models");
+            std::fs::create_dir(&models_dir).expect("mkdir models");
+            write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", schema, table);
+            write_model_with_target(
+                &models_dir,
+                "mart",
+                &format!("SELECT id FROM {reference}"),
+                schema,
+                "mart",
+            );
+            let mut compiled =
+                rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                    models_dir,
+                    ..Default::default()
+                })
+                .expect("compile models");
+            super::apply_shadow_rewrite(
+                &mut compiled,
+                None,
+                None,
+                &rocky_core::shadow::ShadowConfig::default(),
+                &rocky_snowflake::dialect::SnowflakeSqlDialect,
+                false,
+            )
+            .expect("a reference that names the created object must route");
+            compiled
+                .project
+                .models
+                .iter()
+                .find(|m| m.config.name == "mart")
+                .expect("mart missing")
+                .sql
+                .clone()
+        }
+
+        let idiomatic = routed_sql("MAIN", "ORDERS", "MAIN.ORDERS");
+        assert!(
+            idiomatic.contains("\"ORDERS_rocky_shadow\""),
+            "an uppercase target read unquoted must still route: {idiomatic}"
+        );
+
+        let quoted_remedy = routed_sql("main", "orders", "\"main\".\"orders\"");
+        assert!(
+            quoted_remedy.contains("\"orders_rocky_shadow\""),
+            "quoting the reference is the remedy the refusal prints, so it must route: \
+             {quoted_remedy}"
+        );
     }
 
     /// A run that routes a single model rewrites nothing — a model's own
