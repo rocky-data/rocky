@@ -1,5 +1,5 @@
-//! #1594: a refused `metadata_columns` value must land before any warehouse
-//! mutation.
+//! #1594: a refused `metadata_columns` value must land before any GOVERNANCE
+//! operation and before any table copy.
 //!
 //! `value` carries `{placeholder}`s that `rocky` fills from source schema
 //! names read back from the warehouse. Refusing one is correct; refusing it
@@ -11,6 +11,20 @@
 //! warehouse back to answer one question: on refusal, was the target schema
 //! created?
 //!
+//! # What this claim does NOT cover — read before widening it
+//!
+//! Two things happen before the guard on every `rocky run`, whatever the
+//! outcome, and neither is this guard's doing:
+//!
+//! - **The destination database file.** Adapter construction opens it, which
+//!   creates it when absent. `rocky discover`, a read-only command, creates it
+//!   too.
+//! - **The state store, and the end-of-run retention sweep.** The store opens
+//!   before any command logic, and the sweep runs on the `Err` path by design
+//!   (see the comment at the sweep site in `commands/run.rs`). The
+//!   target-collision refusal that shares this preflight block behaves
+//!   identically.
+//!
 //! # What this fixture can and cannot observe
 //!
 //! DuckDB's `create_catalog_sql` returns `None`, so `auto_create_schemas` is
@@ -19,10 +33,6 @@
 //! between catalog and schema creation on a catalog-bearing warehouse would
 //! still pass here; proving that needs a recording adapter, which the tree
 //! does not have yet.
-//!
-//! The destination database FILE is created earlier still, by adapter
-//! construction. That is not this guard's doing: `rocky discover`, a
-//! read-only command, creates it too.
 
 use std::fs;
 use std::process::Command;
@@ -125,6 +135,12 @@ fn run(dir: &std::path::Path) -> std::process::Output {
         .args(["--output", "json"])
         .arg("--config")
         .arg(dir.join("rocky.toml"))
+        // Pin the state store inside the temp dir so the reset between the
+        // control run and the guarded run is complete — otherwise a leftover
+        // store could route the second run down a resume or idempotency path
+        // and the observation would not be about the guard.
+        .arg("--state-path")
+        .arg(dir.join("state.redb"))
         .arg("run")
         .current_dir(dir)
         .env("RUST_LOG", "error")
@@ -149,7 +165,7 @@ fn run(dir: &std::path::Path) -> std::process::Output {
 /// control — the only thing that differs between the two runs is *when* the
 /// run stops, and therefore whether the target schema exists afterwards.
 #[test]
-fn a_refused_metadata_value_leaves_no_warehouse_mutation_behind() {
+fn a_refused_metadata_value_lands_before_governance_setup() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path();
     seed(dir, "raw__ship-it");
@@ -168,8 +184,10 @@ fn a_refused_metadata_value_leaves_no_warehouse_mutation_behind() {
          without this the assertion below proves nothing"
     );
 
-    // Reset the warehouse so the observation is about THIS run.
+    // Reset the warehouse AND the state store so the observation is about
+    // THIS run.
     fs::remove_file(dir.join("fixture.duckdb")).expect("drop fixture");
+    let _ = fs::remove_file(dir.join("state.redb"));
     let _ = fs::remove_dir_all(dir.join(".rocky"));
     seed(dir, "raw__ship-it");
     assert!(!schema_exists(dir, "staging"));
@@ -193,6 +211,10 @@ fn a_refused_metadata_value_leaves_no_warehouse_mutation_behind() {
         !schema_exists(dir, "staging"),
         "the refusal must land BEFORE governance setup — the target schema was created"
     );
+    // Weaker than the assertion above and deliberately kept: the control run
+    // also stops before writing this table, so it does not discriminate
+    // between the two runs. It guards the other direction — a future change
+    // that moved the guard past the copy.
     assert!(
         !table_exists(dir, "staging", "orders"),
         "the refusal must land before the copy — the target table was written"
