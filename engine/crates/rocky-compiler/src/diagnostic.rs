@@ -266,8 +266,12 @@ pub const I002: &str = "I002";
 /// nothing clears this code under them today. `rocky test` and `rocky ci`
 /// are the two that matter here (`rocky_engine::test_runner`,
 /// `rocky_engine::ci`); `rocky emit-sql`, `rocky preview-rows` and
-/// `rocky retention-status` do the same. Grep for `source_schemas:
-/// HashMap::new()` for the current list.
+/// `rocky retention-status` do the same. For the current list, run
+/// `rg 'source_schemas:\s*(std::collections::)?HashMap::new\(\)'` — the
+/// three commands above spell it `std::collections::HashMap::new()`, so a
+/// search for the short form alone finds none of them. It matches explicit
+/// initializers only; a caller that builds the map elsewhere and passes it in
+/// empty will not show up.
 ///
 /// A `CAST` is *not* a general fix. `refine_casts` in `typecheck.rs` refines a
 /// cast column only when the cast's input type is already known, so

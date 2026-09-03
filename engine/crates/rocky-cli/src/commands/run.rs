@@ -6799,10 +6799,16 @@ pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules
                 the target. Where a component is a reserved word (`ORDER`, `SELECT`, …) only the \
                 quoting remedy is available: such a name cannot be read unquoted at all. An \
                 account that sets QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE, or a \
+<<<<<<< HEAD
                 catalog-linked database with CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE, can \
                 make the two one object. Rocky can observe the first on a connection (#1281), but \
                 that answer describes one request and does not govern this one, so it cannot \
                 decide this — spell the reference unambiguously instead";
+=======
+                catalog-linked database with CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE, makes \
+                the two one object — but Rocky cannot read either setting (#1281), so the \
+                spelling still has to be unambiguous without them";
+>>>>>>> origin/main
     }
     "Spell the reference exactly as the upstream's configured target, or rename one so they \
      differ by more than case (#1281 tracks reading the live setting instead of assuming it)"
@@ -22009,6 +22015,7 @@ auto_create_schemas = true
     #[cfg(feature = "duckdb")]
     #[test]
     fn defer_on_snowflake_qualifies_a_reference_a_quoted_cte_does_not_bind() {
+<<<<<<< HEAD
         fn deferred_sql(mart_sql: &str) -> String {
             let tmp = tempfile::TempDir::new().expect("temp dir");
             let models_dir = tmp.path().join("models");
@@ -22061,6 +22068,49 @@ auto_create_schemas = true
             !hidden.contains("\"main\".\"orders\""),
             "an unquoted alias differing only by case is the same name, so it hides the \
              reference: {hidden}"
+=======
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(
+            &models_dir,
+            "mart",
+            "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
+            "main",
+            "mart",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        super::apply_defer_rewrite(
+            &mut compiled,
+            Some("mart"),
+            &super::DeferOptions {
+                enabled: true,
+                defer_to: None,
+            },
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+        )
+        .expect("defer rewrite must succeed");
+
+        let mart = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "mart")
+            .expect("mart missing")
+            .sql
+            .clone();
+        assert!(
+            mart.contains("\"main\".\"orders\""),
+            "Snowflake does not bind the quoted alias to the bare reference, so the reference \
+             is the deferred model and is qualified to its target: {mart}"
+>>>>>>> origin/main
         );
     }
 

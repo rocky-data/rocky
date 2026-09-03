@@ -135,15 +135,23 @@ remedy — it cannot be read unquoted at all.
 On an account with Snowflake's default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`,
 a lower-case target read unquoted could not be read on a plain run either. The
 refusal replaces a silent wrong read on a shape that was already broken. Two
+<<<<<<< HEAD
 settings can make the two spellings one object:
 `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` on the account, and
 `CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE` on a catalog-linked database. Rocky
 can observe the first on a connection, but that answer describes one request and
 does not govern the next, so it asks for an unambiguous spelling instead.
+=======
+settings would make the two spellings one object:
+`QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` on the account, and
+`CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE` on a catalog-linked database. Rocky
+can read neither, so it asks for an unambiguous spelling instead.
+>>>>>>> origin/main
 :::
 
 ### CTE names on Snowflake
 
+<<<<<<< HEAD
 The same rule decides whether a CTE hides a bare table name. Rocky now folds an
 unquoted CTE alias and an unquoted reference to upper case before comparing them,
 and leaves a quoted one as written — the way Snowflake reads them under its
@@ -158,6 +166,13 @@ default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`. Four pairs change answer:
 
 An unquoted alias with an identically spelled unquoted reference still hides it,
 which is the ordinary shape and does not change.
+=======
+The same rule decides whether a CTE hides a bare table name. Under Snowflake's
+default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE` that answer is now the
+warehouse's own: `WITH "orders" AS (…)` does not hide an unquoted `FROM orders`,
+and `WITH "ORDERS" AS (…)` does. An unquoted CTE alias still hides an unquoted
+reference, which is the ordinary shape.
+>>>>>>> origin/main
 
 In a shadow or branch run the freed reference goes to the matcher, which routes
 it or refuses it. `--defer` has no matcher and no refusal: the freed reference is
@@ -167,11 +182,17 @@ a table reference, and a bare name that matches a model name is that model, so
 With `QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` a double-quoted identifier folds to
 upper case too, so `WITH "orders"` does hide `FROM orders` and Rocky's answer is
 wrong. On `--defer` that is silent, because nothing on that path can refuse.
+<<<<<<< HEAD
 Rocky can *observe* the setting on a connection, but that answer describes one
 request and does not govern the next one, so it cannot decide this. The rule
 before this one had the mirror of that problem under the default setting, so the
 error now falls on an opt-out configuration rather than the common one. Tracked
 in issue #1622.
+=======
+Rocky cannot read the setting. The rule before this one had the mirror of that
+problem under the default setting, so the error now falls on an opt-out
+configuration rather than the common one. Tracked in issue #1622.
+>>>>>>> origin/main
 
 ## Shadow target rewriting
 
