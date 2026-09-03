@@ -111,9 +111,9 @@ impl DeferTarget {
 /// DEFAULT instead, which is what the rules before #1282 did. The change moves
 /// the error from the default configuration to an opt-out one; it does not
 /// create it. Closing it properly needs a three-valued binding — bound, free, or
-/// setting-dependent, refusing the third — or #1281's live probe. Deliberately
-/// not built here on an unverified reading of how that parameter treats a CTE
-/// alias.
+/// setting-dependent, refusing the third — or #1281's live probe. Tracked in
+/// #1622; deliberately not built here on an unverified reading of how that
+/// parameter treats a CTE alias.
 ///
 /// Unlike [`rewrite_upstream_refs`] this reports no case near-misses, and that
 /// asymmetry is deliberate rather than an omission. That matcher compares a

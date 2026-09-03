@@ -158,7 +158,7 @@ upper case too, so `WITH "orders"` does hide `FROM orders` and Rocky's answer is
 wrong. On `--defer` that is silent, because nothing on that path can refuse.
 Rocky cannot read the setting. The rule before this one had the mirror of that
 problem under the default setting, so the error now falls on an opt-out
-configuration rather than the common one.
+configuration rather than the common one. Tracked in issue #1622.
 
 ## Shadow target rewriting
 
