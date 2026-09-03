@@ -186,11 +186,7 @@ fn sample_replication_ir(strategy: MaterializationStrategy) -> ModelIr {
             table: "orders".into(),
         },
         ColumnSelection::All,
-        vec![MetadataColumn {
-            name: "_loaded_by".into(),
-            data_type: "STRING".into(),
-            value: "NULL".into(),
-        }],
+        vec![MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()],
         GovernanceConfig {
             permissions_file: None,
             auto_create_catalogs: false,
@@ -885,11 +881,11 @@ fn test_sql_injection_prevention() {
 
     // Unsafe metadata column name
     let mut bad_plan = sample_replication_ir(MaterializationStrategy::FullRefresh);
-    bad_plan.metadata_columns = vec![MetadataColumn {
-        name: "col; DROP TABLE".into(),
-        data_type: "STRING".into(),
-        value: "NULL".into(),
-    }];
+    bad_plan.metadata_columns = vec![MetadataColumn::new_unchecked(
+        "col; DROP TABLE",
+        "STRING",
+        "NULL",
+    )];
     assert!(
         sql_gen::generate_select_sql(&bad_plan, &dialect, None).is_err(),
         "should reject SQL injection in metadata column name"

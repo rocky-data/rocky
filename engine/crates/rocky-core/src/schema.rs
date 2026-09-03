@@ -512,6 +512,34 @@ mod tests {
         }
     }
 
+    /// The whole point of validating at the IR boundary rather than at config
+    /// load: `value` carries `{placeholder}`s that `resolve_template` fills
+    /// from **source schema names read back from the warehouse**, and
+    /// `SchemaPattern::parse` splits those on the separator with no identifier
+    /// check. A schema created upstream as `src__o'brien__shopify` therefore
+    /// puts an unbalanced quote into `value` — after the config was accepted.
+    ///
+    /// Scan order is what this pins: the config text passes, the resolved text
+    /// does not.
+    #[test]
+    fn a_hostile_source_schema_segment_is_refused_after_resolution() {
+        let pattern = sample_pattern();
+        let parsed = pattern.parse("src__o'brien__us_west__shopify").unwrap();
+        assert_eq!(parsed.get("tenant"), Some("o'brien"));
+
+        let template = "'{tenant}'";
+        // The template itself is a legitimate quoted literal.
+        assert!(rocky_ir::MetadataColumn::new("_tenant", "VARCHAR", template).is_ok());
+
+        // The resolved text is not, and that is the text `select_clause` sees.
+        let resolved = parsed.resolve_template(template, &pattern.separator);
+        assert_eq!(resolved, "'o'brien'");
+        assert!(
+            rocky_ir::MetadataColumn::new("_tenant", "VARCHAR", &resolved).is_err(),
+            "the RESOLVED value must be what the boundary refuses"
+        );
+    }
+
     #[test]
     fn test_parse_simple_schema() {
         let pattern = sample_pattern();

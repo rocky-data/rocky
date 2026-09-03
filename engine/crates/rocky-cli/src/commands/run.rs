@@ -3656,6 +3656,28 @@ pub async fn run(
                 }
                 claimed_targets.insert(target_identity, this_source);
 
+                // Validate AFTER `resolve_template`: the placeholders are
+                // filled from source schema names read back from the
+                // warehouse, so the resolved text — not the config text — is
+                // what reaches `select_clause`.
+                let metadata_columns: Vec<MetadataColumn> = pipeline
+                    .metadata_columns
+                    .iter()
+                    .map(|mc| {
+                        MetadataColumn::new(
+                            mc.name.clone(),
+                            mc.data_type.clone(),
+                            parsed.resolve_template(&mc.value, &pattern.separator),
+                        )
+                    })
+                    .collect::<Result<_, _>>()
+                    .with_context(|| {
+                        format!(
+                            "invalid [[pipeline.*.metadata_columns]] resolved for source schema '{}'",
+                            conn.schema
+                        )
+                    })?;
+
                 tables_to_process.push(TableTask {
                     source_catalog: source_catalog.clone(),
                     source_schema: conn.schema.clone(),
@@ -3697,15 +3719,7 @@ pub async fn run(
                         .iter()
                         .map(|mc| mc.name.clone())
                         .collect(),
-                    metadata_columns: pipeline
-                        .metadata_columns
-                        .iter()
-                        .map(|mc| MetadataColumn {
-                            name: mc.name.clone(),
-                            data_type: mc.data_type.clone(),
-                            value: parsed.resolve_template(&mc.value, &pattern.separator),
-                        })
-                        .collect(),
+                    metadata_columns,
                     governance_tags: governance.build_tags(&components),
                     // Populated later by batch pre-fetch phase
                     prefetched_source_cols: None,
@@ -8663,7 +8677,7 @@ pub(crate) async fn execute_models(
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                );
+                )?;
                 match gate
                     .evaluate(model, &typed_ir, warehouse, state_store)
                     .await
@@ -8944,7 +8958,7 @@ pub(crate) async fn execute_models(
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                );
+                )?;
                 if let ColumnSkipOutcome::Skip {
                     prior_output_column_hashes,
                     prior_blake3,
@@ -9041,7 +9055,7 @@ pub(crate) async fn execute_models(
                     exec_ctx.typed_models,
                     exec_ctx.surrogate_keys,
                     dialect,
-                );
+                )?;
                 let model_started_at = Utc::now();
                 let target_table_full_name = format!(
                     "{}.{}.{}",
@@ -10284,7 +10298,7 @@ fn typed_model_ir(
     typed_models: &indexmap::IndexMap<String, Vec<rocky_compiler::types::TypedColumn>>,
     surrogate_keys: &HashMap<String, Vec<rocky_core::models::SurrogateKeySpec>>,
     dialect: &dyn rocky_core::traits::SqlDialect,
-) -> rocky_ir::ModelIr {
+) -> Result<rocky_ir::ModelIr> {
     let mut ir = model.to_model_ir();
     if let Some(cols) = typed_models.get(&model.config.name) {
         ir.typed_columns = cols.clone();
@@ -10293,9 +10307,9 @@ fn typed_model_ir(
     // declared surrogate key: a model that *gains* a key changes its IR and
     // re-materializes instead of being skipped as unchanged.
     if let Some(specs) = surrogate_keys.get(&model.config.name) {
-        rocky_core::models::apply_surrogate_keys(&mut ir, specs, dialect);
+        rocky_core::models::apply_surrogate_keys(&mut ir, specs, dialect)?;
     }
-    ir
+    Ok(ir)
 }
 
 /// Execute exactly one "plain" single-statement transformation model:
@@ -10338,7 +10352,7 @@ async fn execute_one_plain_model(
     // replication-only metadata-column path), so the wrap is what surfaces the
     // computed column into the CTAS / merge-source schema.
     if let Some(specs) = exec_ctx.surrogate_keys.get(model_name) {
-        rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect);
+        rocky_core::models::apply_surrogate_keys(&mut model_ir, specs, dialect)?;
     }
     let target_ref = dialect
         .format_table_ref(
@@ -16415,11 +16429,8 @@ merge_keys_fallback = ["fallback_only"]
                 nullable: true,
             },
         ];
-        let metadata = vec![MetadataColumn {
-            name: "_loaded_at".to_string(),
-            data_type: "TIMESTAMP".to_string(),
-            value: "CURRENT_TIMESTAMP()".to_string(),
-        }];
+        let metadata =
+            vec![MetadataColumn::new("_loaded_at", "TIMESTAMP", "CURRENT_TIMESTAMP()").unwrap()];
 
         let resolved = resolve_merge_update_columns(&strategy, &source_cols, &metadata);
 
@@ -20762,7 +20773,7 @@ backend = "local"
         let surrogate_keys = std::collections::HashMap::new();
         let dialect = rocky_duckdb::dialect::DuckDbSqlDialect;
 
-        let ir = super::typed_model_ir(&model, &typed_models, &surrogate_keys, &dialect);
+        let ir = super::typed_model_ir(&model, &typed_models, &surrogate_keys, &dialect).unwrap();
         assert_eq!(
             ir.typed_columns.len(),
             2,

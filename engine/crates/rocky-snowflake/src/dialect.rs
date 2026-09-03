@@ -157,6 +157,14 @@ impl SqlDialect for SnowflakeSqlDialect {
             // (same guard as `alter_column_type_sql`) — a metadata `type` from
             // a hostile config must not break out of the cast expression.
             rocky_core::sql_gen::validate_sql_type(&mc.data_type).map_err(AdapterError::new)?;
+            // `value` is an SQL expression, not an identifier, and it is NOT
+            // trusted: `rocky-cli` substitutes `{placeholder}`s in it from source
+            // schema names read back from the warehouse.
+            // `rocky_ir::MetadataColumn::new` is the boundary that guards it;
+            // this repeats the scan because `new_unchecked` and any future
+            // construction path must not reach a raw splice.
+            validation::reject_statement_terminator("metadata_columns[].value", &mc.value)
+                .map_err(AdapterError::new)?;
             // Snowflake uses :: for casting: value::TYPE. Quote the output
             // alias so the materialized metadata column is stored
             // lowercase-preserving, consistent with the quoted column path
@@ -596,16 +604,42 @@ mod tests {
         );
     }
 
+    /// #1594: `value` is spliced raw into the CAST alongside `name` and
+    /// `data_type`. The IR boundary (`rocky_ir::MetadataColumn::new`) refuses
+    /// this input, so `new_unchecked` is the only way to build it — which is
+    /// exactly what makes this a test of THIS dialect's own scan rather than
+    /// of the constructor. Both the serde path and any future construction
+    /// site land here.
+    #[test]
+    fn select_clause_rejects_a_hostile_metadata_value() {
+        let d = dialect();
+        // Ends Rocky's statement and starts another.
+        let terminator = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "VARCHAR",
+            "NULL) AS x; SELECT 1 --",
+        )];
+        assert!(d.select_clause(&ColumnSelection::All, &terminator).is_err());
+
+        // Unbalanced quote: pairs its quotes across the rest of the SELECT.
+        let unbalanced = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "VARCHAR",
+            "'o'brien'",
+        )];
+        assert!(d.select_clause(&ColumnSelection::All, &unbalanced).is_err());
+
+        // The benign expression still renders.
+        let ok = vec![MetadataColumn::new("_loaded_by", "VARCHAR", "NULL").unwrap()];
+        assert!(d.select_clause(&ColumnSelection::All, &ok).is_ok());
+    }
+
     #[test]
     fn test_select_clause_double_quotes_columns_and_metadata_alias() {
         use rocky_ir::MetadataColumn;
         let d = dialect();
         let cols = ColumnSelection::Explicit(vec!["id".into(), "ts".into()]);
-        let meta = vec![MetadataColumn {
-            name: "_loaded_by".to_string(),
-            data_type: "VARCHAR".to_string(),
-            value: "'rocky'".to_string(),
-        }];
+        let meta = vec![MetadataColumn::new("_loaded_by", "VARCHAR", "'rocky'").unwrap()];
         let sql = d.select_clause(&cols, &meta).unwrap();
         // Data columns and the metadata alias are double-quoted so they
         // resolve / materialize lowercase, matching the quoted merge path.

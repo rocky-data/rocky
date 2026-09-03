@@ -453,21 +453,36 @@ impl SqlDialect for ProcessDialect {
         None
     }
 
+    /// Renders the SELECT list, refusing metadata columns.
+    ///
+    /// The five in-tree dialects validate all three fields of a metadata
+    /// column before splicing them into `CAST({value} AS {type}) AS {name}`.
+    /// This impl cannot: the SDK deliberately does not depend on `rocky-sql`
+    /// (see the "not yet in the SDK" list in `traits.rs`), so the shared
+    /// validators are out of reach, and re-implementing the fragment scanner
+    /// here would give the same rule two bodies that can drift.
+    ///
+    /// Splicing them unvalidated is the defect #1594 closes, so this refuses
+    /// instead — the same fail-closed shape `merge_into` above already uses.
+    /// Nothing reaches it today: `crate::traits::MetadataColumn` is a separate
+    /// struct from `rocky_ir::MetadataColumn`, no in-tree code converts one to
+    /// the other, and the conformance harness drives only `format_table_ref`.
+    /// When the SDK and IR types unify (the prerequisite named in
+    /// `traits.rs`), route this through `rocky_ir::MetadataColumn::new`.
     fn select_clause(
         &self,
         columns: &crate::traits::ColumnSelection,
         metadata: &[crate::traits::MetadataColumn],
     ) -> AdapterResult<String> {
+        if !metadata.is_empty() {
+            return Err(AdapterError::not_supported(
+                "select_clause with metadata columns (the process adapter cannot validate them)",
+            ));
+        }
         let mut sql = String::from("SELECT ");
         match columns {
             crate::traits::ColumnSelection::All => sql.push('*'),
             crate::traits::ColumnSelection::Explicit(cols) => sql.push_str(&cols.join(", ")),
-        }
-        for mc in metadata {
-            sql.push_str(&format!(
-                ", CAST({} AS {}) AS {}",
-                mc.value, mc.data_type, mc.name
-            ));
         }
         Ok(sql)
     }
@@ -594,6 +609,33 @@ mod tests {
         let sql = d.create_table_as("my_table", "SELECT 1");
         assert!(sql.contains("CREATE OR REPLACE TABLE my_table"));
         assert!(sql.contains("SELECT 1"));
+    }
+
+    /// The SDK deliberately has no `rocky-sql` dependency, so this dialect
+    /// cannot run the validators the five in-tree dialects run before
+    /// splicing a metadata column into `CAST({} AS {}) AS {}`. It refuses
+    /// instead of splicing unvalidated text (#1594). Nothing reaches it
+    /// today; the refusal is what keeps that true if something does.
+    #[test]
+    fn test_process_dialect_refuses_metadata_columns() {
+        let d = ProcessDialect {
+            name: "test".into(),
+        };
+        assert_eq!(
+            d.select_clause(&crate::traits::ColumnSelection::All, &[])
+                .unwrap(),
+            "SELECT *"
+        );
+        let meta = [crate::traits::MetadataColumn {
+            name: "_loaded_by".into(),
+            data_type: "STRING".into(),
+            value: "NULL".into(),
+        }];
+        assert!(
+            d.select_clause(&crate::traits::ColumnSelection::All, &meta)
+                .is_err(),
+            "an unvalidatable metadata column must be refused, not spliced"
+        );
     }
 
     #[test]

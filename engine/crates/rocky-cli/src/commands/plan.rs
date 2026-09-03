@@ -203,15 +203,27 @@ pub async fn plan(
             if !filter_table_matches(parsed_filter.as_ref(), &table.name) {
                 continue;
             }
+            // Validate AFTER `resolve_template`: the placeholders are filled
+            // from source schema names read back from the warehouse, so the
+            // resolved text — not the config text — is what reaches
+            // `select_clause`.
             let metadata_columns: Vec<MetadataColumn> = pipeline
                 .metadata_columns
                 .iter()
-                .map(|mc| MetadataColumn {
-                    name: mc.name.clone(),
-                    data_type: mc.data_type.clone(),
-                    value: parsed.resolve_template(&mc.value, &pattern.separator),
+                .map(|mc| {
+                    MetadataColumn::new(
+                        mc.name.clone(),
+                        mc.data_type.clone(),
+                        parsed.resolve_template(&mc.value, &pattern.separator),
+                    )
                 })
-                .collect();
+                .collect::<Result<_, _>>()
+                .with_context(|| {
+                    format!(
+                        "invalid [[pipeline.*.metadata_columns]] resolved for source schema '{}'",
+                        conn.schema
+                    )
+                })?;
 
             let target_label = if effective_target_catalog.is_empty() {
                 format!("{target_schema}.{}", table.name)

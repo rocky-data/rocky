@@ -196,11 +196,114 @@ pub enum ColumnSelection {
 }
 
 /// Extra columns to add during replication (e.g., `CAST(NULL AS STRING) AS _loaded_by`).
+///
+/// Every dialect renders one of these as `CAST({value} AS {data_type}) AS {name}`
+/// inside the replication SELECT, splicing all three fields raw. So all three
+/// are validated here, at the one boundary every path crosses:
+///
+/// - `name` — [`validation::validate_identifier`]
+/// - `data_type` — [`validation::validate_sql_type`]
+/// - `value` — [`validation::reject_statement_terminator`]
+///
+/// `value` is an SQL *expression* by design (`NULL`, `current_timestamp()`,
+/// `'{tenant}'`), so it cannot be an identifier allowlist. It is **not**
+/// trusted input: `rocky-cli` resolves `{placeholder}`s in it from source
+/// schema names read back from the warehouse, and `SchemaPattern::parse`
+/// splits those on a separator without any identifier check. Construct
+/// through [`MetadataColumn::new`] *after* that substitution so the resolved
+/// text is what gets scanned.
+///
+/// The struct is `#[non_exhaustive]` so no crate outside `rocky-ir` can build
+/// one with a struct literal and skip the checks. Field reads stay `pub`.
+/// [`Deserialize`] is the other constructor and runs the same checks via
+/// `#[serde(try_from)]`.
+///
+/// # Bound
+///
+/// The `value` scan refuses a statement terminator; it does not bound reads.
+/// A `value` can still be a correlated subquery. That is the documented
+/// posture for every SQL fragment Rocky accepts from config, not a gap
+/// specific to this field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "MetadataColumnRepr")]
+#[non_exhaustive]
 pub struct MetadataColumn {
     pub name: String,
     pub data_type: String,
     pub value: String,
+}
+
+/// Deserialization shadow for [`MetadataColumn`].
+///
+/// `#[serde(try_from)]` needs a plain struct to decode into before the
+/// validating conversion runs. Field names and types must mirror
+/// [`MetadataColumn`] exactly — the JSON shape is unchanged, only the
+/// acceptance rule is added.
+#[derive(Deserialize)]
+struct MetadataColumnRepr {
+    name: String,
+    data_type: String,
+    value: String,
+}
+
+impl TryFrom<MetadataColumnRepr> for MetadataColumn {
+    type Error = ValidationError;
+
+    fn try_from(repr: MetadataColumnRepr) -> Result<Self, Self::Error> {
+        Self::new(repr.name, repr.data_type, repr.value)
+    }
+}
+
+impl MetadataColumn {
+    /// Builds a validated metadata column.
+    ///
+    /// Call this **after** any `{placeholder}` substitution, so the text that
+    /// actually reaches `select_clause` is the text that was scanned.
+    ///
+    /// # Errors
+    ///
+    /// [`ValidationError::InvalidIdentifier`] / [`ValidationError::EmptyIdentifier`]
+    /// for `name`, [`ValidationError::InvalidSqlType`] /
+    /// [`ValidationError::EmptySqlType`] for `data_type`, and
+    /// [`ValidationError::StatementTerminator`],
+    /// [`ValidationError::UnterminatedSqlRegion`] or
+    /// [`ValidationError::AmbiguousSqlToken`] for `value`.
+    pub fn new(
+        name: impl Into<String>,
+        data_type: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, ValidationError> {
+        let name = name.into();
+        let data_type = data_type.into();
+        let value = value.into();
+        validation::validate_identifier(&name)?;
+        validation::validate_sql_type(&data_type)?;
+        validation::reject_statement_terminator("metadata_columns[].value", &value)?;
+        Ok(Self {
+            name,
+            data_type,
+            value,
+        })
+    }
+
+    /// Builds a metadata column **without** validating any field.
+    ///
+    /// Exists so tests can construct the hostile inputs that
+    /// [`MetadataColumn::new`] refuses, and drive them at a dialect's
+    /// `select_clause` to prove the adapter-level defence in depth is live.
+    /// Production code must use [`MetadataColumn::new`].
+    #[doc(hidden)]
+    pub fn new_unchecked(
+        name: impl Into<String>,
+        data_type: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            data_type: data_type.into(),
+            value: value.into(),
+        }
+    }
 }
 
 /// Governance configuration for catalog/schema lifecycle.
@@ -1170,6 +1273,120 @@ mod tests {
         }
     }
 
+    // ----- MetadataColumn boundary (#1594) -----
+
+    #[test]
+    fn metadata_column_accepts_the_expressions_replication_actually_uses() {
+        for value in [
+            "NULL",
+            "CURRENT_TIMESTAMP",
+            "current_timestamp()",
+            // A resolved `'{tenant}'` — the placeholder is already substituted
+            // by the time the constructor runs.
+            "'acme'",
+            // Doubling is the one escape every target dialect agrees on.
+            "'o''brien'",
+            "md5(cast(id as VARCHAR))",
+        ] {
+            assert!(
+                MetadataColumn::new("_loaded_by", "VARCHAR", value).is_ok(),
+                "should accept value: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_column_refuses_a_statement_terminator_in_value() {
+        let err = MetadataColumn::new("_loaded_by", "VARCHAR", "NULL) AS x; SELECT 1 --")
+            .expect_err("a ';' ends Rocky's statement and starts another");
+        assert!(matches!(err, ValidationError::StatementTerminator { .. }));
+        assert!(
+            err.to_string().contains("metadata_columns[].value"),
+            "the error must name the field: {err}"
+        );
+    }
+
+    #[test]
+    fn metadata_column_refuses_an_unbalanced_quote_in_value() {
+        // An odd quote pairs its quotes across whatever follows in the
+        // generated SELECT, so text the scan reads as a literal can be live
+        // SQL at the warehouse.
+        let err = MetadataColumn::new("_loaded_by", "VARCHAR", "'o'brien'")
+            .expect_err("an unterminated literal must be refused");
+        assert!(matches!(err, ValidationError::UnterminatedSqlRegion { .. }));
+    }
+
+    #[test]
+    fn metadata_column_refuses_a_backslash_inside_a_quoted_value() {
+        // Deliberate strictness, disclosed: Snowflake/DuckDB/BigQuery read
+        // `\'` as an escaped quote and standard SQL reads it as the closer, so
+        // the two readings pair every later quote differently. A Windows path
+        // literal is the shape a real user hits.
+        let err = MetadataColumn::new("_loaded_by", "VARCHAR", "'C:\\x'")
+            .expect_err("a backslash inside a literal is lexer-ambiguous");
+        assert!(matches!(err, ValidationError::AmbiguousSqlToken { .. }));
+    }
+
+    #[test]
+    fn metadata_column_still_validates_name_and_type() {
+        assert!(MetadataColumn::new("x, (SELECT 1) AS y", "VARCHAR", "NULL").is_err());
+        assert!(
+            MetadataColumn::new(
+                "_loaded_by",
+                "VARCHAR) AS x, (SELECT secret FROM creds) AS leak --",
+                "NULL",
+            )
+            .is_err()
+        );
+        assert!(MetadataColumn::new("_loaded_by", "", "NULL").is_err());
+    }
+
+    #[test]
+    fn metadata_column_deserialization_runs_the_same_checks() {
+        // `Deserialize` is the second constructor: `ModelIr` is rebuilt from
+        // persisted provenance JSON, so a blob written by an older engine (or
+        // edited in the state store) must not smuggle a value past the gate.
+        let ok = r#"{"name":"_loaded_by","data_type":"VARCHAR","value":"NULL"}"#;
+        let col: MetadataColumn = serde_json::from_str(ok).expect("a benign column deserializes");
+        assert_eq!(col.value, "NULL");
+
+        let hostile =
+            r#"{"name":"_loaded_by","data_type":"VARCHAR","value":"NULL) AS x; SELECT 1 --"}"#;
+        let err = serde_json::from_str::<MetadataColumn>(hostile)
+            .expect_err("a hostile value must not deserialize");
+        assert!(
+            err.to_string().contains("metadata_columns[].value"),
+            "serde must surface the field name: {err}"
+        );
+    }
+
+    #[test]
+    fn model_ir_deserialization_refuses_a_hostile_metadata_column() {
+        let mut ir = sample_replication_model();
+        ir.metadata_columns = vec![MetadataColumn::new_unchecked(
+            "_loaded_by",
+            "VARCHAR",
+            "NULL; DROP TABLE t",
+        )];
+        let json = serde_json::to_string(&ir).unwrap();
+        assert!(
+            serde_json::from_str::<ModelIr>(&json).is_err(),
+            "the whole ModelIr must fail to deserialize, not silently keep the column"
+        );
+    }
+
+    #[test]
+    fn metadata_column_serialization_shape_is_unchanged() {
+        // `#[serde(try_from)]` touches deserialization only. The canonical
+        // JSON that feeds `recipe_hash` and the ir-golden fixtures must be
+        // byte-identical to before.
+        let col = MetadataColumn::new("_loaded_by", "STRING", "'rocky'").unwrap();
+        assert_eq!(
+            serde_json::to_string(&col).unwrap(),
+            r#"{"name":"_loaded_by","data_type":"STRING","value":"'rocky'"}"#
+        );
+    }
+
     // ----- ModelIr / ProjectIr round-trip + recipe-hash tests -----
 
     use crate::lineage::{LineageEdge, QualifiedColumn};
@@ -1208,11 +1425,7 @@ mod tests {
             }),
             sources: vec![],
             columns: Some(ColumnSelection::All),
-            metadata_columns: vec![MetadataColumn {
-                name: "_loaded_by".into(),
-                data_type: "STRING".into(),
-                value: "NULL".into(),
-            }],
+            metadata_columns: vec![MetadataColumn::new("_loaded_by", "STRING", "NULL").unwrap()],
             unique_key: vec![],
             updated_at: None,
             invalidate_hard_deletes: false,
