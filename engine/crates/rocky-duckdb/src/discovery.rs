@@ -35,7 +35,11 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
             .lock()
             .map_err(|e| AdapterError::msg(format!("mutex poisoned: {e}")))?;
 
-        // 1. Find schemas matching the prefix.
+        // 1. Find schemas matching the prefix. Quote-doubling alone only holds
+        // where `''` is the sole escape; refuse a backslash rather than rely on
+        // DuckDB staying in its standard-SQL default (#1524).
+        rocky_sql::validation::reject_unquotable_literal("schema_pattern `prefix`", schema_prefix)
+            .map_err(AdapterError::new)?;
         let schema_sql = format!(
             "SELECT schema_name FROM information_schema.schemata \
              WHERE schema_name LIKE '{}%' \
@@ -91,6 +95,18 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn discover_refuses_a_backslash_in_the_schema_prefix() {
+        // `schema_pattern.prefix` reaches this literal from `rocky.toml`.
+        // Doubling quotes alone does not contain a backslash — see
+        // `rocky_sql::validation::reject_unquotable_literal` (#1524).
+        let connector = Arc::new(Mutex::new(DuckDbConnector::in_memory().unwrap()));
+        let adapter = DuckDbDiscoveryAdapter::new(connector);
+        let err = adapter.discover(r"raw\").await.unwrap_err();
+        assert!(err.to_string().contains("backslash"), "{err}");
+        assert!(err.to_string().contains("schema_pattern `prefix`"), "{err}");
+    }
 
     #[tokio::test]
     async fn test_discover_empty() {

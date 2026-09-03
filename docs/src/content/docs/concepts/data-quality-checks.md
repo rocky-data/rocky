@@ -154,7 +154,7 @@ filter = "region = 'US'"
 |---|---|---|---|
 | `not_null` | row | — | Column contains no NULL values. |
 | `unique` | set | — | Column contains only unique values. |
-| `unique_expr` | set | `key_expr: String` | A derived **key expression** is unique across rows (`GROUP BY <expr> HAVING COUNT(*) > 1`). For when the meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union) that neither `unique` (single column) nor `composite` (column tuple) can express. `key_expr` is passed through verbatim (trusted config, like `expression`); NULL keys are not excluded — use `filter` to scope them out. |
+| `unique_expr` | set | `key_expr: String` | A derived **key expression** is unique across rows (`GROUP BY <expr> HAVING COUNT(*) > 1`). For when the meaningful identity is a *computed* value (e.g. a surrogate built to be stable across a multi-tenant union) that neither `unique` (single column) nor `composite` (column tuple) can express. `key_expr` is passed through as written (like `expression`), subject to the one narrow refusal described under **Filters**. NULL keys are not excluded — use `filter` to scope them out. |
 | `accepted_values` | row | `values: [String]` | Every non-NULL value is in the fixed set. |
 | `relationships` | row | `to_table`, `to_column` | Every non-NULL value exists in `to_table.to_column` (referential integrity). |
 | `expression` | row | `expression: String` | Custom SQL boolean predicate must hold per row. |
@@ -241,7 +241,17 @@ min = "0"
 filter = "region = 'US' AND status != 'cancelled'"
 ```
 
-The filter is your SQL. You are responsible for making it valid in the target dialect. Rocky validates identifiers inside structured parameters, such as columns and values, but it passes the filter expression through verbatim.
+The filter is your SQL. You are responsible for making it valid in the target dialect. Rocky validates identifiers inside structured parameters, such as columns and values, but it passes the filter expression through as written.
+
+One check does apply, to `filter`, `expression` and `key_expr` alike. Rocky refuses a fragment that could end the query it is building, and refuses anything it cannot read the same way on every warehouse it targets:
+
+- a statement terminator `;` outside a string literal, a quoted identifier or a comment — including a trailing one;
+- an unbalanced quote, or a `/* */` comment that never closes;
+- a backslash inside a quoted literal, a triple-quoted string, a `$$…$$` dollar quote, a backtick, a `//` comment, or a nested `/*`. Snowflake, Databricks, BigQuery, DuckDB and Trino do not agree on these, so Rocky refuses rather than guess which reading applies.
+
+The check runs when Rocky builds the query, and it names the field and the table so you know which line to fix.
+
+Be clear about what this does not do. It stops the fragment ending Rocky's statement and starting another. It does **not** make the fragment a single expression: Rocky does not track parentheses, so a fragment can still close the parenthesis Rocky wraps it in and add its own clauses. And it does not limit what the expression may read — a subquery runs with the same warehouse credentials as the rest of the pipeline. Treat a check expression as code you are running, because it is.
 
 ### Row quarantine
 
@@ -296,7 +306,7 @@ max_overlap_rows = 0          # any overlap fails; raise to tolerate a known set
 sample = 20                   # overlapping keys attached to the result for triage
 ```
 
-Give exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression, passed through verbatim). This mirrors `unique` and `unique_expr`.
+Give exactly one of `keys` (a column tuple) or `key_expr` (a derived SQL expression, passed through as written). This mirrors `unique` and `unique_expr`.
 
 **How it works.** The runner buckets the pipeline's managed source tables into **sibling groups**. Siblings share a source type and a table name, and they landed in more than one target schema. That is the tenant or region fan-out that gets unioned downstream. Rocky tags each sibling's rows with its source identity and runs:
 

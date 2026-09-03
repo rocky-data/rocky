@@ -647,6 +647,12 @@ class CheckResult7(BaseModel):
     """
     Fully-qualified sibling tables that were compared.
     """
+    not_evaluated: str | None = None
+    """
+    Set when the check could NOT be evaluated, carrying the reason.
+
+    `overlap_count` is only a measurement when this is `None`. A refused key expression or a misconfigured key would otherwise report `overlap_count: 0`, which reads as "no overlap found" — the check never ran, and the tally must not imply that it did.
+    """
     overlap_count: conint(ge=0)
     """
     Count of distinct keys that appear in more than one sibling table.

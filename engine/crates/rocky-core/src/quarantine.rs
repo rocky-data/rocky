@@ -151,7 +151,7 @@ pub fn compile_quarantine_sql(
             &label,
             dialect,
         )?;
-        let valid_pred = wrap_filter(&assertion.test.filter, &base_pred);
+        let valid_pred = wrap_filter(&assertion.test.filter, &base_pred, &label)?;
         labeled.push(LabeledPredicate { label, valid_pred });
     }
 
@@ -321,6 +321,14 @@ fn lower_valid_predicate(
                     name: label.to_string(),
                 });
             }
+            // Same quote-doubling limit as `generate_test_sql_inner` — see
+            // `reject_unquotable_literal`.
+            for v in values {
+                validation::reject_unquotable_literal(
+                    &format!("quarantine assertion '{label}' accepted_values value"),
+                    v,
+                )?;
+            }
             let in_list = values
                 .iter()
                 .map(|v| format!("'{}'", v.replace('\'', "''")))
@@ -333,9 +341,16 @@ fn lower_valid_predicate(
                 return Err(QuarantineError::EmptyExpression);
             }
             // Expression is user-supplied SQL (same contract as
-            // `generate_test_sql`). Wrap in COALESCE so NULL expressions
-            // count as passing — matches the existing
-            // `WHERE NOT (expression)` semantic.
+            // `generate_test_sql`) — refuse anything that could end the CTAS
+            // and start another statement. The predicate is spliced twice into
+            // the quarantine CTAS (error-label column + WHERE), so the
+            // balanced-quote rule matters here too.
+            validation::reject_statement_terminator(
+                &format!("quarantine assertion '{label}' `expression`"),
+                expression,
+            )?;
+            // Wrap in COALESCE so NULL expressions count as passing — matches
+            // the existing `WHERE NOT (expression)` semantic.
             Ok(format!("COALESCE(({expression}), TRUE)"))
         }
         TestType::InRange { min, max } => {
@@ -418,10 +433,26 @@ fn required_column<'a>(
 /// Implemented as `CASE WHEN (filter) THEN base ELSE TRUE END` — a total
 /// boolean across all rows, so the top-level `AND` / `NOT` can't
 /// propagate NULL.
-fn wrap_filter(filter: &Option<String>, base_pred: &str) -> String {
+///
+/// The filter is user-supplied SQL, so it goes through
+/// [`validation::reject_statement_terminator`] first — the same gate the
+/// declarative-check builder applies.
+fn wrap_filter(
+    filter: &Option<String>,
+    base_pred: &str,
+    label: &str,
+) -> Result<String, QuarantineError> {
     match filter.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(f) => format!("(CASE WHEN ({f}) THEN ({base_pred}) ELSE TRUE END)"),
-        None => base_pred.to_string(),
+        Some(f) => {
+            validation::reject_statement_terminator(
+                &format!("quarantine assertion '{label}' `filter`"),
+                f,
+            )?;
+            Ok(format!(
+                "(CASE WHEN ({f}) THEN ({base_pred}) ELSE TRUE END)"
+            ))
+        }
+        None => Ok(base_pred.to_string()),
     }
 }
 
@@ -1072,5 +1103,93 @@ mod unit_tests {
             min: None,
             max: Some(10),
         }));
+    }
+
+    // ----- Statement-terminator refusal (issue #1524) -----
+
+    #[test]
+    fn quarantine_accepted_values_refuses_a_backslash_in_a_value() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::AcceptedValues {
+                values: vec!["ok".into(), "trailing_backslash\\".into()],
+            },
+            Some("status"),
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        assert!(err.to_string().contains("backslash"), "{err}");
+    }
+
+    #[test]
+    fn quarantine_expression_refuses_a_statement_terminator() {
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::Expression {
+                expression: "1=1), TRUE); SELECT 1; --".into(),
+            },
+            None,
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(msg.contains("`expression`"), "{msg}");
+    }
+
+    #[test]
+    fn quarantine_filter_refuses_a_statement_terminator() {
+        let cfg = split_config();
+        let assertions = vec![assertion_with_filter(
+            TestType::NotNull,
+            Some("customer_id"),
+            Some("1=1); SELECT 1; --"),
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statement terminator"), "{msg}");
+        assert!(msg.contains("`filter`"), "{msg}");
+    }
+
+    #[test]
+    fn quarantine_expression_refuses_an_unbalanced_quote() {
+        // The lowered predicate is spliced into the quarantine CTAS twice —
+        // the error-label column and the WHERE — so an odd quote count could
+        // pair across the two copies.
+        let cfg = split_config();
+        let assertions = vec![assertion(
+            None,
+            TestType::Expression {
+                expression: "note <> 'x".into(),
+            },
+            None,
+            TestSeverity::Error,
+        )];
+        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap_err();
+        assert!(err.to_string().contains("unterminated"), "{err}");
+    }
+
+    #[test]
+    fn quarantine_still_accepts_quoted_semicolons() {
+        let cfg = split_config();
+        let assertions = vec![assertion_with_filter(
+            TestType::NotNull,
+            Some("customer_id"),
+            Some("region = 'US;CA'"),
+        )];
+        let plan = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
+            .unwrap()
+            .unwrap();
+        assert!(
+            plan.statements[1].sql.contains("region = 'US;CA'"),
+            "{}",
+            plan.statements[1].sql
+        );
     }
 }
