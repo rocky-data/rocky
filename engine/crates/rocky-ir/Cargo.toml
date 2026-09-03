@@ -15,5 +15,11 @@ chrono = { workspace = true }
 blake3 = { workspace = true }
 thiserror = { workspace = true }
 
+[features]
+# Exposes `MetadataColumn::new_unchecked` so other crates' tests can build the
+# hostile inputs their dialects must refuse. Never enable it in a normal
+# dependency — only in `[dev-dependencies]`.
+test-support = []
+
 [lints]
 workspace = true

@@ -34,6 +34,10 @@ name = "wiremock_tests"
 required-features = ["test-support"]
 
 [dev-dependencies]
+# `test-support` exposes `MetadataColumn::new_unchecked`, which this crate's
+# tests use to build the hostile metadata columns `select_clause` must refuse.
+# Dev-only: resolver v2 keeps the feature out of normal builds.
+rocky-ir = { path = "../rocky-ir", features = ["test-support"] }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 wiremock = { workspace = true }

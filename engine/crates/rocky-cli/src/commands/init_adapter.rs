@@ -181,6 +181,11 @@ fn test_live_connection() {{
 /// Split out from [`run_init_adapter`] so a test can assert on the text
 /// without writing into the repository — `run_init_adapter` resolves its
 /// output against a relative `crates/` path.
+///
+/// Nothing in CI compiles this output: the `#[cfg(test)]` blocks *inside* the
+/// template belong to the new crate, not to this one. A guard dropped from the
+/// template would therefore ship silently, which is what
+/// `scaffold_select_clause_validates_every_spliced_field` exists to catch.
 fn render_dialect_rs(name: &str, name_pascal: &str) -> String {
     format!(
         r#"//! {name} SQL dialect implementation.
@@ -251,10 +256,30 @@ impl SqlDialect for {name_pascal}SqlDialect {{
         let mut sql = String::from("SELECT ");
         match columns {{
             ColumnSelection::All => sql.push('*'),
-            ColumnSelection::Explicit(cols) => sql.push_str(&cols.join(", ")),
+            ColumnSelection::Explicit(cols) => {{
+                for col in cols.iter() {{
+                    rocky_sql::validation::validate_identifier(col).map_err(AdapterError::new)?;
+                }}
+                sql.push_str(&cols.join(", "));
+            }}
         }}
+        // All three fields are spliced raw into the CAST, so all three are
+        // validated. Do not drop these: `value` carries `{{placeholder}}`s
+        // resolved from source schema names read back from the warehouse.
         for mc in metadata {{
-            sql.push_str(&format!(", CAST({{}} AS {{}}) AS {{}}", mc.value, mc.data_type, mc.name));
+            rocky_sql::validation::validate_identifier(mc.name()).map_err(AdapterError::new)?;
+            rocky_core::sql_gen::validate_sql_type(mc.data_type()).map_err(AdapterError::new)?;
+            rocky_sql::validation::reject_statement_terminator(
+                "metadata_columns[].value",
+                mc.value(),
+            )
+            .map_err(AdapterError::new)?;
+            sql.push_str(&format!(
+                ", CAST({{}} AS {{}}) AS {{}}",
+                mc.value(),
+                mc.data_type(),
+                mc.name()
+            ));
         }}
         Ok(sql)
     }}
@@ -347,6 +372,37 @@ fn to_pascal_case(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scaffold's `select_clause` splices `value`, `data_type` and `name`
+    /// straight into a `CAST`. A new adapter that ships without the three
+    /// guards reintroduces #1594, and nothing in CI would notice: the
+    /// generated crate is never compiled here. Assert on the emitted text.
+    #[test]
+    fn scaffold_select_clause_validates_every_spliced_field() {
+        let src = render_dialect_rs("redshift", "Redshift");
+        assert!(
+            src.contains("validate_identifier(mc.name())"),
+            "scaffold must validate the metadata column name"
+        );
+        assert!(
+            src.contains("validate_sql_type(mc.data_type())"),
+            "scaffold must validate the metadata column type"
+        );
+        assert!(
+            src.contains(
+                "reject_statement_terminator(\n                \"metadata_columns[].value\",\n                mc.value(),\n            )"
+            ),
+            "scaffold must scan the metadata column value"
+        );
+        assert!(
+            src.contains("validate_identifier(col)"),
+            "scaffold must validate explicitly selected columns"
+        );
+        assert!(
+            src.contains("RedshiftSqlDialect"),
+            "pascal name is rendered"
+        );
+    }
 
     #[test]
     fn test_pascal_case() {
