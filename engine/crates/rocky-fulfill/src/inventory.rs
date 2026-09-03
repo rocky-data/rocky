@@ -82,6 +82,17 @@ const CONSUMED_ENGINE_PATHS: &[&str] = &[
     // depend on this crate, which sits above it. This crate re-exports
     // it, so the ownership probe and every caller are unchanged.
     "rocky_core::process::process_liveness",
+    // The worker transcript's O_EXCL no-follow create. Added DELIBERATELY
+    // (#1500): the driver used `std::fs::File::create`, which is
+    // O_CREAT|O_TRUNC — it follows a symlink at the leaf and truncates
+    // through a hardlink, and the transcript name is a plain UTC-second
+    // stamp in a directory a lower-privilege process can write. This is the
+    // STRICT O_EXCL sibling of `write_new_no_follow`, which this crate
+    // already consumes: it surfaces `AlreadyExists` instead of unlinking,
+    // because a colliding transcript name may belong to a LIVE peer. The
+    // alternative was a second copy of a guard that is easy to get subtly
+    // wrong.
+    "rocky_core::product::commit::create_new_no_follow_strict",
     // Spec identity + the confined write target (the runner's candidate
     // write and the snapshot re-verification).
     "rocky_core::product::commit::contained_write_target",

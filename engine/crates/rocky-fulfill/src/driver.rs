@@ -258,22 +258,13 @@ impl AgentDriver for SubprocessDriver {
         brief: &TaskBrief,
         on_group: &mut (dyn FnMut(GroupStamp) -> anyhow::Result<()> + Send),
     ) -> Result<DriverOutcome, DriverError> {
-        let transcript_path = prepare_dirs(brief)?;
+        let (transcript, transcript_path) = prepare_dirs(brief)?;
         let argv: Vec<String> = self
             .command
             .iter()
             .map(|a| a.replace("{brief}", &brief.text))
             .collect();
 
-        // NOT `std::fs::File::create`: O_CREAT|O_TRUNC follows a symlink at
-        // the leaf and truncates through a hardlink, and the transcript name
-        // is a plain UTC-second stamp in a directory a lower-privilege
-        // process can write. A squatter planted there took the worker's whole
-        // stdout/stderr out of the project, or emptied a file the project
-        // does not own, with no race to win. The O_EXCL create only ever
-        // opens a file it just created (#1500).
-        let transcript = rocky_core::product::commit::create_new_no_follow_handle(&transcript_path)
-            .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;
         let transcript_err = transcript
             .try_clone()
             .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;
@@ -356,9 +347,38 @@ impl AgentDriver for SubprocessDriver {
     }
 }
 
-/// Create the transcript + outbox dirs, clear the outbox, and name this
-/// task's transcript file.
-fn prepare_dirs(brief: &TaskBrief) -> Result<PathBuf, DriverError> {
+/// How many stamped transcript names to try before giving up. One UTC
+/// second holding this many live transcripts for one product and one task
+/// kind is not a collision, it is a runaway.
+const TRANSCRIPT_NAME_ATTEMPTS: u32 = 64;
+
+/// Create the transcript + outbox dirs, clear the outbox, then CREATE this
+/// task's transcript and hand back the handle with the name it landed on.
+///
+/// The file is created HERE, not merely named, because the name alone is not
+/// safe to hand to `std::fs::File::create`: that is O_CREAT|O_TRUNC, which
+/// follows a symlink at the leaf and truncates through a hardlink. The name
+/// is a plain UTC-second stamp in a directory a lower-privilege process can
+/// write, so a squatter planted there took the worker's whole stdout and
+/// stderr out of the project, or emptied a file the project does not own —
+/// with no race to win. `create_new_no_follow_strict` is O_EXCL: what comes
+/// back is always a file this process just created (#1500).
+///
+/// A UTC-second stamp also collides when two tasks of the same kind for the
+/// same product start inside one second. The collision is resolved by trying
+/// the next name, never by unlinking: unlinking would leave the first task
+/// writing to an inode with no name and lose its transcript outright, which
+/// is worse than what `File::create` did (it truncated, so both tasks at
+/// least still had a file).
+///
+/// Stated residual, unchanged here and not a leaf problem: the transcript
+/// and outbox DIRECTORIES are not ancestor-checked. A `transcripts` or
+/// `.rocky/fulfillment` symlink planted out of the project redirects the
+/// `create_dir_all` and this create, exactly as it redirects the outbox
+/// `remove_dir_all` below. That is the same parent-directory class the
+/// commit protocol states as open; it needs dirfd-relative traversal, not
+/// another leaf guard.
+fn prepare_dirs(brief: &TaskBrief) -> Result<(std::fs::File, PathBuf), DriverError> {
     std::fs::create_dir_all(&brief.transcript_dir)
         .map_err(|e| DriverError::Spawn(format!("transcript dir: {e}")))?;
     if brief.outbox_dir.exists() {
@@ -368,9 +388,28 @@ fn prepare_dirs(brief: &TaskBrief) -> Result<PathBuf, DriverError> {
     std::fs::create_dir_all(&brief.outbox_dir)
         .map_err(|e| DriverError::Spawn(format!("outbox dir: {e}")))?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-    Ok(brief
-        .transcript_dir
-        .join(format!("{stamp}-{}.log", brief.kind.as_str())))
+    let kind = brief.kind.as_str();
+    for attempt in 0..TRANSCRIPT_NAME_ATTEMPTS {
+        let name = if attempt == 0 {
+            format!("{stamp}-{kind}.log")
+        } else {
+            format!("{stamp}-{kind}.{}.log", attempt + 1)
+        };
+        let path = brief.transcript_dir.join(name);
+        match rocky_core::product::commit::create_new_no_follow_strict(&path) {
+            Ok(file) => return Ok((file, path)),
+            // Occupied — by a live peer's transcript, or by a squatter the
+            // O_EXCL create refused to open. Either way: take another name,
+            // never remove what is there.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(DriverError::Spawn(format!("transcript file: {e}"))),
+        }
+    }
+    Err(DriverError::Spawn(format!(
+        "transcript file: every one of {TRANSCRIPT_NAME_ATTEMPTS} names for this second is \
+         already taken under {}",
+        brief.transcript_dir.display()
+    )))
 }
 
 /// Read the typed outcome for the task kind (elicitation: the outbox
@@ -731,7 +770,7 @@ impl AgentDriver for ReplayDriver {
         brief: &TaskBrief,
         on_group: &mut (dyn FnMut(GroupStamp) -> anyhow::Result<()> + Send),
     ) -> Result<DriverOutcome, DriverError> {
-        let transcript_path = prepare_dirs(brief)?;
+        let (mut transcript, transcript_path) = prepare_dirs(brief)?;
         let raw = std::fs::read(&self.session_path)
             .map_err(|e| DriverError::Session(format!("{}: {e}", self.session_path.display())))?;
         let session: ReplaySession = serde_json::from_slice(&raw)
@@ -759,12 +798,6 @@ impl AgentDriver for ReplayDriver {
             }
         };
 
-        // Same O_EXCL no-follow create as the subprocess driver above: a
-        // symlink or hardlink squatter at the stamped transcript name is
-        // unlinked, never written through (#1500).
-        let mut transcript =
-            rocky_core::product::commit::create_new_no_follow_handle(&transcript_path)
-                .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;
         let stderr_file = transcript
             .try_clone()
             .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;
@@ -1381,88 +1414,6 @@ mod escape_scope_tests {
         }
     }
 
-    /// Plant a squatter at the transcript name for `seconds` consecutive
-    /// UTC seconds starting now, so the run lands on one of them whatever
-    /// second it happens to start in, and hand back the paths.
-    fn plant_transcript_squatters(
-        brief: &TaskBrief,
-        seconds: i64,
-        mut plant: impl FnMut(&Path),
-    ) -> Vec<PathBuf> {
-        std::fs::create_dir_all(&brief.transcript_dir).expect("mkdir");
-        (0..seconds)
-            .map(|offset| {
-                let stamp = (Utc::now() + chrono::Duration::seconds(offset))
-                    .format("%Y%m%dT%H%M%SZ")
-                    .to_string();
-                let path = brief
-                    .transcript_dir
-                    .join(format!("{stamp}-{}.log", brief.kind.as_str()));
-                plant(&path);
-                path
-            })
-            .collect()
-    }
-
-    fn run_a_trivial_task(brief: &TaskBrief) {
-        let driver = SubprocessDriver::new(
-            vec!["python3".into(), "-c".into(), "print(\"{brief}\")".into()],
-            vec!["PATH".into()],
-            Duration::from_secs(20),
-            Duration::from_millis(300),
-        )
-        .expect("valid");
-        let mut on_group = |_group: GroupStamp| Ok(());
-        let runtime = tokio::runtime::Handle::current();
-        let _ = runtime.block_on(async { driver.run_task(brief, &mut on_group).await });
-    }
-
-    /// The worker's transcript is the one file this driver creates at a
-    /// PREDICTABLE name (a UTC-second stamp) in a directory a lower-privilege
-    /// process can write. `std::fs::File::create` truncated through a hard
-    /// link planted there — no race to win — emptying a file outside the
-    /// project before the worker even started (#1500).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_hardlinked_transcript_name_is_never_truncated_through() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let victim = dir.path().join("outside-secret");
-        std::fs::write(&victim, b"private bytes the transcript must not truncate").expect("write");
-        let brief = brief(dir.path());
-        plant_transcript_squatters(&brief, 4, |path| {
-            std::fs::hard_link(&victim, path).expect("hard link");
-        });
-
-        tokio::task::block_in_place(|| run_a_trivial_task(&brief));
-
-        assert_eq!(
-            std::fs::read(&victim).expect("still there"),
-            b"private bytes the transcript must not truncate",
-            "the out-of-project name must be untouched"
-        );
-    }
-
-    /// The same leaf, the other link kind: `File::create` FOLLOWED a symlink
-    /// planted at the transcript name and redirected the worker's entire
-    /// stdout and stderr through it.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_symlinked_transcript_name_is_never_written_through() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let victim = dir.path().join("outside-secret");
-        std::fs::write(&victim, b"private bytes the transcript must not overwrite").expect("write");
-        let brief = brief(dir.path());
-        plant_transcript_squatters(&brief, 4, |path| {
-            std::os::unix::fs::symlink(&victim, path).expect("symlink");
-        });
-
-        tokio::task::block_in_place(|| run_a_trivial_task(&brief));
-
-        assert_eq!(
-            std::fs::read(&victim).expect("still there"),
-            b"private bytes the transcript must not overwrite",
-            "the out-of-project target must be untouched"
-        );
-    }
-
     async fn wait_for_pid_file(path: &Path) -> u32 {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1478,6 +1429,185 @@ mod escape_scope_tests {
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+    }
+
+    /// Plant a squatter at the transcript name for `seconds` consecutive UTC
+    /// seconds starting from ONE reading of the clock, so the run lands on a
+    /// planted name whatever second it starts in. Reading the clock once per
+    /// offset would let a second boundary between readings leave a hole the
+    /// run could fall into, and the test would then pass having exercised
+    /// nothing.
+    fn plant_transcript_squatters(
+        brief: &TaskBrief,
+        seconds: i64,
+        mut plant: impl FnMut(&Path),
+    ) -> Vec<PathBuf> {
+        std::fs::create_dir_all(&brief.transcript_dir).expect("mkdir");
+        let now = Utc::now();
+        (0..seconds)
+            .map(|offset| {
+                let stamp = (now + chrono::Duration::seconds(offset))
+                    .format("%Y%m%dT%H%M%SZ")
+                    .to_string();
+                let path = brief
+                    .transcript_dir
+                    .join(format!("{stamp}-{}.log", brief.kind.as_str()));
+                plant(&path);
+                path
+            })
+            .collect()
+    }
+
+    /// The worker prints its brief, so a transcript this run actually wrote
+    /// holds exactly these bytes.
+    const WORKER_OUTPUT: &[u8] = b"battery\n";
+
+    fn run_a_trivial_task(brief: &TaskBrief) {
+        let driver = SubprocessDriver::new(
+            vec!["python3".into(), "-c".into(), "print(\"{brief}\")".into()],
+            vec!["PATH".into()],
+            Duration::from_secs(20),
+            Duration::from_millis(300),
+        )
+        .expect("valid");
+        let mut on_group = |_group: GroupStamp| Ok(());
+        let runtime = tokio::runtime::Handle::current();
+        let outcome = runtime.block_on(async { driver.run_task(brief, &mut on_group).await });
+        assert!(
+            matches!(outcome, Ok(DriverOutcome::Drafting { .. })),
+            "the trivial task must complete: {outcome:?}"
+        );
+    }
+
+    /// The `.2.log` sibling of each name — where a run that found the first
+    /// name occupied must have written instead.
+    fn next_names(planted: &[PathBuf]) -> Vec<PathBuf> {
+        planted
+            .iter()
+            .map(|path| {
+                let name = path.file_name().expect("name").to_string_lossy();
+                path.with_file_name(name.replace(".log", ".2.log"))
+            })
+            .collect()
+    }
+
+    /// How many of `paths` are now a REGULAR file holding this run's output.
+    ///
+    /// The anti-vacuity assertion. An occupied name is taken AROUND, so the
+    /// proof that the run actually met the squatter is that it wrote the next
+    /// name. If the run never reached a planted second this is 0, and a test
+    /// that only checked the victim would pass having proved nothing.
+    fn replaced_by_this_run(paths: &[PathBuf]) -> usize {
+        paths
+            .iter()
+            .filter(|path| {
+                std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+                    && std::fs::read(path).is_ok_and(|bytes| bytes == WORKER_OUTPUT)
+            })
+            .count()
+    }
+
+    /// The worker's transcript is the one file this driver creates at a
+    /// PREDICTABLE name (a UTC-second stamp) in a directory a lower-privilege
+    /// process can write. `std::fs::File::create` truncated through a hard
+    /// link planted there — no race to win — emptying a file outside the
+    /// project before the worker even started (#1500).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hardlinked_transcript_name_is_never_truncated_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("outside-secret");
+        std::fs::write(&victim, b"private bytes the transcript must not truncate").expect("write");
+        let brief = brief(dir.path());
+        let planted = plant_transcript_squatters(&brief, 4, |path| {
+            std::fs::hard_link(&victim, path).expect("hard link");
+        });
+
+        tokio::task::block_in_place(|| run_a_trivial_task(&brief));
+
+        assert_eq!(
+            std::fs::read(&victim).expect("still there"),
+            b"private bytes the transcript must not truncate",
+            "the out-of-project name must be untouched"
+        );
+        for path in &planted {
+            assert!(
+                std::fs::read(path).expect("still there")
+                    == b"private bytes the transcript must not truncate",
+                "the planted link is left in place, not unlinked: {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            replaced_by_this_run(&next_names(&planted)),
+            1,
+            "the run must have met a planted name and written the next one — \
+             otherwise it never reached a planted second and this proves nothing"
+        );
+    }
+
+    /// The same leaf, the other link kind: `File::create` FOLLOWED a symlink
+    /// planted at the transcript name and redirected the worker's entire
+    /// stdout and stderr through it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symlinked_transcript_name_is_never_written_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("outside-secret");
+        std::fs::write(&victim, b"private bytes the transcript must not overwrite").expect("write");
+        let brief = brief(dir.path());
+        let planted = plant_transcript_squatters(&brief, 4, |path| {
+            std::os::unix::fs::symlink(&victim, path).expect("symlink");
+        });
+
+        tokio::task::block_in_place(|| run_a_trivial_task(&brief));
+
+        assert_eq!(
+            std::fs::read(&victim).expect("still there"),
+            b"private bytes the transcript must not overwrite",
+            "the out-of-project target must be untouched"
+        );
+        for path in &planted {
+            assert!(
+                std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()),
+                "the planted link is left in place, not unlinked: {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            replaced_by_this_run(&next_names(&planted)),
+            1,
+            "the run must have met a planted name and written the next one — \
+             otherwise it never reached a planted second and this proves nothing"
+        );
+    }
+
+    /// The other half of the O_EXCL choice: a stamped name can legitimately
+    /// be held by a LIVE peer, so the collision takes the NEXT name. Clearing
+    /// it — as the commit protocol's own scratch create does for its own
+    /// names — would leave that peer writing to an unlinked inode and lose
+    /// its transcript, which is worse than the truncate this replaced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transcript_name_already_held_is_taken_around_not_unlinked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let brief = brief(dir.path());
+        let held = plant_transcript_squatters(&brief, 4, |path| {
+            std::fs::write(path, b"a live peer's transcript").expect("write");
+        });
+
+        tokio::task::block_in_place(|| run_a_trivial_task(&brief));
+
+        for path in &held {
+            assert_eq!(
+                std::fs::read(path).expect("still there"),
+                b"a live peer's transcript",
+                "a held name is neither unlinked nor truncated: {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            replaced_by_this_run(&next_names(&held)),
+            1,
+            "the run must have written the next name instead"
+        );
     }
 
     /// A DIRECT child that `setsid()`s out of the group escapes

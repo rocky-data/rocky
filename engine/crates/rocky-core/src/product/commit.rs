@@ -65,12 +65,15 @@
 //! backup source, Phase B's sidecar read, the draft rollback snapshot.
 //! Those two carry a link-count check on the descriptor as well.
 //!
-//! Not every read: recovery's own `std::fs::read` of the journal, of a
-//! final, and of a committed manifest are pathname-based and follow a link.
-//! They are digest COMPARISONS — the bytes are hashed and dropped, never
-//! written anywhere — and the journal is already declared untrusted input
-//! whose every named path is validated, so a link there redirects a
-//! comparison, not a mutation. Stated rather than swept into the sentence
+//! Not every read. Recovery's own `std::fs::read` of a final and of a
+//! committed manifest are pathname-based and follow a link; both are digest
+//! COMPARISONS — the bytes are hashed and dropped, never written anywhere.
+//! Recovery's read of the JOURNAL is pathname-based too, and those bytes are
+//! not dropped: they are parsed and drive the restores and removals. That is
+//! deliberate and already stated above — the journal is untrusted input, not
+//! authority, so every path it names is re-validated before anything mutates,
+//! and a link at the journal hands an attacker nothing they did not have by
+//! writing the journal itself. Named here rather than swept into the sentence
 //! above.
 //!
 //! That link-count check exists because a HARDLINK needs no timing at
@@ -90,7 +93,9 @@
 //! stated COMPATIBILITY BREAK, not a free win: a project tree materialised
 //! with `cp -l` / `cp -al`, restored from an archive that preserves hard
 //! links, or deduplicated by its filesystem into shared names, is refused
-//! at the first in-place draft write or `.ff-prev` backup. That is the
+//! at the first guarded touch — an in-place draft write, a `.ff-prev`
+//! backup, Phase B's sidecar read, or the MCP draft rollback snapshot,
+//! whichever comes first. That is the
 //! accepted trade — writing through a link the project does not own is
 //! silent, and refusing is loud, rare, and prints how to undo it — but it
 //! is a break, and a report of a legitimately hard-linked models tree is
@@ -417,22 +422,35 @@ pub fn write_new_no_follow(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     create_new_no_follow(path, None)?.write_all(bytes)
 }
 
-/// The handle half of [`write_new_no_follow`], for a caller that hands the
-/// DESCRIPTOR to something else — a child process's stdout, say — instead
-/// of writing bytes itself.
+/// Create a brand-new file and hand back the HANDLE, for a caller that gives
+/// the descriptor to something else — a child process's stdout, say — rather
+/// than writing bytes itself.
 ///
-/// Same guarantee, same single legitimate `AlreadyExists` recovery.
-/// `std::fs::File::create` (O_CREAT|O_TRUNC) follows a symlink at the leaf
-/// and truncates through a hardlink; this cannot, because O_EXCL only ever
-/// opens a file it just created. A stale squatter from a prior crash is
-/// cleared with `remove_file`, which unlinks THAT name and leaves any other
-/// name's bytes untouched, and the create is retried once.
+/// `create_new` (O_CREAT|O_EXCL) neither follows a symlink at the final
+/// component nor opens an existing file, so what comes back is always a file
+/// this process just created: it can never write through a planted link of
+/// either kind. `std::fs::File::create` (O_CREAT|O_TRUNC) does both — it
+/// follows a symlink at the leaf and truncates through a hardlink.
+///
+/// Unlike [`write_new_no_follow`], an `AlreadyExists` is NOT swallowed here;
+/// it comes back to the caller. That helper clears its own crash scratch,
+/// whose name only it writes. A caller whose name can legitimately be held
+/// by a LIVE peer must never unlink it — that leaves the peer writing to an
+/// inode with no name, losing its output outright — so it has to see the
+/// collision and pick another name.
+///
+/// Guards the LEAF only. The directory the path names is not checked here:
+/// a symlinked ancestor still redirects this create, which is the same
+/// parent-directory residual the module header states.
 ///
 /// # Errors
 ///
-/// Any error from the create, or from clearing a stale squatter.
-pub fn create_new_no_follow_handle(path: &Path) -> std::io::Result<std::fs::File> {
-    create_new_no_follow(path, None)
+/// Any error from the create, `AlreadyExists` included.
+pub fn create_new_no_follow_strict(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// The open half of [`write_new_no_follow`], handing back the handle so a
@@ -937,12 +955,13 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 ///
 /// Two residuals remain, the conceded v0 boundary. A DIRECTORY swapped for
 /// a symlink between validation and a rename/unlink is closed only by
-/// dirfd-relative APIs, which v0 does not use. And both syscall-level leaf
-/// guards are unix only: on Windows the backup read still follows a symlink
-/// or junction planted at the final and does not check the link count, so
-/// containment there rests on the pre-check alone — and that platform is
-/// untested, because every symlink and hardlink exploit test in this module
-/// is `#[cfg(unix)]`.
+/// dirfd-relative APIs, which v0 does not use. And the guards that protect
+/// an EXISTING leaf are unix only — `O_NOFOLLOW` and the descriptor's link
+/// count; O_EXCL on a created leaf is portable. So on Windows the backup
+/// read still follows a symlink or junction planted at the final and does
+/// not check the link count, and containment there rests on the pre-check
+/// alone — a platform that is untested, because every symlink and hardlink
+/// exploit test in this module is `#[cfg(unix)]`.
 ///
 /// # Errors
 ///
