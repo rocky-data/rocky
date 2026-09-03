@@ -1432,6 +1432,16 @@ fn require_resume_progress(
 /// touch the catalog. Classifying a bypassed template recorded a fact that
 /// did not hold and refused a resume over an edit that moved nothing.
 ///
+/// The same predicate decides whether `schema_template` itself is recorded
+/// (#1592). A template the resolver never reads is not part of this run's
+/// routing, and editing it between two `--branch branch__feature` runs
+/// refused the later resume for a difference that changed nothing. Eliding
+/// it is not fail-open, because [`ResumeShadow::Schema`] above already
+/// records the override — the physical schema every table task is keyed by
+/// (`table_key` is `{target_catalog}.{target_schema}.{target_table_name}`,
+/// and `target_schema` is the override verbatim). `catalog_template` stays
+/// recorded on every path: the override does not replace it.
+///
 /// **The separator must be target-only.** `[target] separator` is: it
 /// moves rendered target names and nothing else. The source pattern's is
 /// not, and `separator` falls back to it when the target pins none.
@@ -1448,6 +1458,7 @@ fn require_resume_progress(
 /// [`SchemaPattern::separator_joins_a_placeholder`]: rocky_core::schema::SchemaPattern::separator_joins_a_placeholder
 /// [`SchemaPattern::parse`]: rocky_core::schema::SchemaPattern::parse
 /// [`ResumeSeparator::Unused`]: rocky_core::state::ResumeSeparator::Unused
+/// [`ResumeShadow::Schema`]: rocky_core::state::ResumeShadow::Schema
 fn replication_resume_scope(
     pipeline_name: &str,
     target: &rocky_core::config::PipelineTargetConfig,
@@ -1494,7 +1505,16 @@ fn replication_resume_scope(
         target: Some(ResumeTarget {
             adapter: target.adapter.clone(),
             catalog_template: target.catalog_template.clone(),
-            schema_template: target.schema_template.clone(),
+            // Recorded only when this run renders it — the same predicate,
+            // and the same reading of it, that decided the separator above
+            // (#1592). Under a schema override the resolver takes the
+            // override string and never reads the template, so a difference
+            // here moves no name. `ResumeShadow::Schema` above carries the
+            // override, which is what keeps the elision from being
+            // fail-open: it pins the physical schema every table is keyed
+            // by. `catalog_template` is NOT elided — the override does not
+            // replace it.
+            schema_template: renders_schema_template.then(|| target.schema_template.clone()),
             separator_role: Some(separator_role),
             endpoint: target_adapter.endpoint_identity(),
             shadow,
@@ -12463,7 +12483,8 @@ mod tests {
             target: Some(ResumeTarget {
                 adapter: "default".to_string(),
                 catalog_template: "wh".to_string(),
-                schema_template: format!("staging_{pipeline}__{{source}}"),
+                // `shadow: None`, so the run renders the template (#1592).
+                schema_template: Some(format!("staging_{pipeline}__{{source}}")),
                 // `{source}` is single-valued, so no separator joins it.
                 separator_role: Some(rocky_core::state::ResumeSeparator::Unused),
                 endpoint: rocky_core::config::EndpointIdentity {
@@ -12650,7 +12671,10 @@ token = "dapi-SECRET"
                 "target": {
                     "adapter": "default",
                     "catalog_template": "wh",
-                    "schema_template": "staging__{regions}",
+                    // The branch override supplies the schema, so the
+                    // template this run never renders is not recorded
+                    // (#1592). The catalog template is, on every path.
+                    "schema_template": null,
                     "separator_role": { "joins": "__" },
                     "endpoint": {
                         "adapter_type": "databricks",
@@ -12668,7 +12692,7 @@ token = "dapi-SECRET"
         assert_eq!(
             scope.to_string(),
             format!(
-                "pipeline 'p1', filter 'client=acme', target default:wh.staging__{{regions}} \
+                "pipeline 'p1', filter 'client=acme', target default:wh.<overridden> \
                  separator(__) endpoint(databricks host=https://adb-1.azuredatabricks.net \
                  host_route_digest={DATABRICKS_ROUTE_DIGEST} \
                  http_path=/sql/1.0/warehouses/abc) shadow(schema=branch__feature)"
@@ -12748,6 +12772,26 @@ token = "dapi-SECRET"
             serde_json::Value::Null
         );
         assert_ne!(plain, shadowed);
+        // The recorded half of #1592, pinned on the same `[target]` block
+        // the override elided it from: with no override the run renders the
+        // template, so its exact text rides in the blob. A `--shadow`
+        // suffix does not replace the schema either, so it records it too.
+        for (label, scope) in [("no override", &plain), ("suffix shadow", &shadowed)] {
+            assert_eq!(
+                serde_json::to_value(scope).unwrap()["target"]["schema_template"],
+                serde_json::json!("staging__{regions}"),
+                "{label} renders the schema template"
+            );
+            assert!(
+                scope.to_string().contains("wh.staging__{regions} "),
+                "{label} must name the template it renders: {scope}"
+            );
+        }
+        assert_ne!(
+            plain.target.as_ref().unwrap().schema_template,
+            scope.target.as_ref().unwrap().schema_template,
+            "the override case records no template at all"
+        );
 
         // The delimiter-injection pair: an `http_path` spelled to close the
         // old `endpoint(...)` text and open a `shadow(schema=x)` of its own
@@ -12759,11 +12803,17 @@ token = "dapi-SECRET"
         // instead and the collision would not be exercised. The variadic
         // placeholder therefore sits in the CATALOG template, which an
         // override does not replace: both sides classify as `joins` (#1586).
+        //
+        // The schema template is spelled `<overridden>` for the same
+        // reason: that is what the message shows for the elided template
+        // (#1592), and nothing stops a config from spelling it literally.
+        // The sentinel is forgeable exactly like the delimiters — which is
+        // the point. Only the structured comparison tells the two apart.
         let injection_target: PipelineTargetConfig = toml::from_str(
             r#"
 adapter = "default"
 catalog_template = "wh__{regions}"
-schema_template = "staging__{regions}"
+schema_template = "<overridden>"
 "#,
         )
         .unwrap();
@@ -12808,7 +12858,18 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         );
         assert_ne!(
             forged, genuine,
-            "the structured scopes must not: shadow and endpoint are separate fields"
+            "the structured scopes must not: shadow, endpoint and the \
+             schema template are separate fields"
+        );
+        assert_eq!(
+            genuine.target.as_ref().unwrap().schema_template,
+            None,
+            "the override elides the template it bypasses"
+        );
+        assert_eq!(
+            forged.target.as_ref().unwrap().schema_template,
+            Some("<overridden>".to_string()),
+            "the forged side records the template it really renders"
         );
 
         // The endpoint is the data location, not the alias: the same
@@ -13057,13 +13118,18 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
     /// exactly like this invocation's but differs field-wise is another
     /// scope. `--resume <id>` refuses it and `--resume-latest` never
     /// selects it — the comparison is structural at both seams.
+    ///
+    /// The template is spelled `<overridden>` because that is what the
+    /// message shows where an override elided one (#1592), and a config can
+    /// spell it literally. Forging it is exactly as easy as forging the
+    /// `endpoint(...)` delimiters, and just as ineffective.
     #[test]
     fn resume_refuses_a_checkpoint_whose_scope_only_renders_the_same() {
         use rocky_core::config::{AdapterConfig, PipelineTargetConfig};
         use rocky_core::shadow::ShadowConfig;
 
         let target: PipelineTargetConfig = toml::from_str(
-            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"staging\"\n",
+            "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"<overridden>\"\n",
         )
         .unwrap();
         let injected: AdapterConfig = toml::from_str(
@@ -13547,6 +13613,138 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         );
     }
 
+    /// The template itself, not just the separator that joins it (#1592).
+    ///
+    /// A `--shadow --shadow-schema` or `--branch` override supplies the
+    /// target schema name outright, so the resolver never reads
+    /// `schema_template` — the two `schema_override.clone().unwrap_or_else(..)`
+    /// sites in this file take the override and never call the closure.
+    /// Editing the template between two `--branch branch__feature` runs
+    /// therefore refused the later resume over a difference that moved
+    /// nothing.
+    ///
+    /// Why eliding it is not fail-open, which is the question that matters:
+    /// a resume skips a table by its `table_key`
+    /// (`{target_catalog}.{target_schema}.{target_table_name}`), and under
+    /// an override `target_schema` is the override string verbatim.
+    /// [`ResumeShadow::Schema`] records that string, so the physical schema
+    /// is pinned whatever the template says. Two scopes that differ only in
+    /// `schema_template` really do write the same objects. With no
+    /// override the template IS the schema, and a change to it still
+    /// refuses — the second half of this test.
+    ///
+    /// [`ResumeShadow::Schema`]: rocky_core::state::ResumeShadow::Schema
+    #[test]
+    fn resume_survives_a_schema_template_change_an_override_bypasses() {
+        use rocky_core::config::PipelineTargetConfig;
+        use rocky_core::shadow::ShadowConfig;
+
+        let branch = ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__feature".to_string()),
+            cleanup_after: false,
+        };
+        let adapter = test_duckdb_adapter(None);
+        let pattern = test_schema_pattern();
+        // Both fixtures pin the SAME `[target] separator` and a catalog
+        // template with no placeholder, so `separator_role` classifies as
+        // `Unused` on both sides. `schema_template` is then the only field
+        // that moves — otherwise the case would pass for the wrong reason.
+        let target = |schema_template: &str| -> PipelineTargetConfig {
+            toml::from_str(&format!(
+                "adapter = \"default\"\ncatalog_template = \"wh\"\nschema_template = \"{schema_template}\"\nseparator = \"--\"\n"
+            ))
+            .unwrap()
+        };
+        let scope = |target: &PipelineTargetConfig, shadow: Option<&ShadowConfig>| -> ResumeScope {
+            replication_resume_scope(
+                "p1",
+                target,
+                &adapter,
+                None,
+                shadow,
+                target.separator.as_deref().unwrap_or(&pattern.separator),
+                &pattern,
+            )
+        };
+        // A source schema whose `regions` binds TWO values, so a template
+        // edit that could move a name would show.
+        let parsed = pattern
+            .parse("src__acme__us_west__us_central__shopify")
+            .unwrap();
+        assert_ne!(
+            parsed.resolve_template("raw__{regions}", "--"),
+            parsed.resolve_template("staging__{regions}", "--"),
+            "the two templates really would resolve different schemas"
+        );
+
+        let written = scope(&target("raw__{regions}"), Some(&branch));
+        let edited = scope(&target("staging__{regions}"), Some(&branch));
+        assert_eq!(
+            serde_json::to_value(&written).unwrap()["target"]["schema_template"],
+            serde_json::Value::Null,
+            "a bypassed template is not recorded"
+        );
+        assert_eq!(
+            written, edited,
+            "an edit the override bypasses moves no name"
+        );
+        // Why skipping stays correct: every table this run checkpoints is
+        // keyed `wh.branch__feature.<table>` under either template, and
+        // `shadow(schema=branch__feature)` is what the scope compares.
+        assert_eq!(
+            written.target.as_ref().unwrap().shadow,
+            Some(rocky_core::state::ResumeShadow::Schema(
+                "branch__feature".to_string()
+            )),
+            "the physical schema is pinned by the shadow, not by the template"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-written", 1, Some(&written))
+            .unwrap();
+        resolve_resume_progress(&store, Some("run-written"), false, &edited)
+            .expect("a bypassed template edit must still resume")
+            .expect("the checkpoint is found");
+        resolve_resume_progress(&store, None, true, &edited)
+            .expect("a bypassed template edit must still resume")
+            .expect("--resume-latest selects it");
+
+        // The carve-out, and the reason this is not fail-open: with no
+        // override the resolver renders the template, so the same edit
+        // moves every target schema and the resume refuses.
+        let plain_written = scope(&target("raw__{regions}"), None);
+        let plain_edited = scope(&target("staging__{regions}"), None);
+        assert_eq!(
+            serde_json::to_value(&plain_written).unwrap()["target"]["schema_template"],
+            serde_json::json!("raw__{regions}"),
+            "a rendered template is recorded verbatim"
+        );
+        assert_ne!(
+            plain_written, plain_edited,
+            "a rendered template edit resolves other names"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
+        store
+            .init_run_progress("run-plain", 1, Some(&plain_written))
+            .unwrap();
+        let err = resolve_resume_progress(&store, Some("run-plain"), false, &plain_edited)
+            .expect_err("another schema template's checkpoint must not resume");
+        assert!(
+            err.to_string().contains("different pipeline scope"),
+            "unexpected error: {err:#}"
+        );
+        let err = resolve_resume_progress(&store, None, true, &plain_edited)
+            .expect_err("--resume-latest must not select it");
+        assert!(
+            err.to_string().contains("no progress found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
     /// The other half of #1586, and the dangerous one. Eliding a separator
     /// is only sound when the value is **target-only**. With no `[target]
     /// separator` the run inherits the source pattern's, and
@@ -13858,6 +14056,28 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
         resume_run_id: Option<&str>,
         resume_latest: bool,
     ) -> anyhow::Result<()> {
+        drive_shadowed_resume_test_run(
+            config_path,
+            state_path,
+            pipeline,
+            resume_run_id,
+            resume_latest,
+            None,
+        )
+        .await
+    }
+
+    /// The same driver with a `--shadow` / `--shadow-schema` / `--branch`
+    /// override, for the cases that need the run to route somewhere other
+    /// than its rendered `schema_template` (#1592).
+    async fn drive_shadowed_resume_test_run(
+        config_path: &std::path::Path,
+        state_path: &std::path::Path,
+        pipeline: &str,
+        resume_run_id: Option<&str>,
+        resume_latest: bool,
+        shadow_config: Option<&rocky_core::shadow::ShadowConfig>,
+    ) -> anyhow::Result<()> {
         super::run(
             config_path,
             std::sync::Arc::new(
@@ -13872,7 +14092,7 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
             false,
             resume_run_id,
             resume_latest,
-            None,
+            shadow_config,
             &PartitionRunOptions::default(),
             None,
             None,
@@ -14308,6 +14528,109 @@ auto_create_schemas = true
                 !target_table_exists(&db_path, "staging_p2__acme", "orders").await,
                 "the resumed run must skip the table the checkpoint completed \
                  (seeded record: {run_record_status:?})"
+            );
+        }
+    }
+
+    /// #1592 acceptance, end to end: the checkpoint key really is
+    /// `catalog.<override>.table`, so eliding the bypassed template is not
+    /// fail-open.
+    ///
+    /// A `--branch branch__feature` run writes into `branch__feature`
+    /// whatever `schema_template` says. This test seeds that run's
+    /// checkpoint, edits the template, then resumes under the same branch.
+    /// Two things must hold, and the second is the direction-of-harm proof:
+    ///
+    /// ```text
+    ///   run 1  --branch branch__feature   template staging_p1__{source}
+    ///          checkpoint: warehouse.branch__feature.orders = Success
+    ///   edit   template -> edited_p1__{source}
+    ///   run 2  --branch branch__feature   --resume-latest
+    ///          scope matches  ->  orders SKIPPED  ->  table never created
+    /// ```
+    ///
+    /// The resume is accepted (it refused before this fix), and the only
+    /// source table stays uncopied — which it can only do if the seeded key
+    /// equals the key run 2 would have written. Neither template names a
+    /// schema the run touches.
+    #[cfg(feature = "duckdb")]
+    #[tokio::test]
+    async fn resume_under_a_branch_skips_the_recorded_table_after_a_template_edit() {
+        use rocky_core::shadow::ShadowConfig;
+
+        let branch = ShadowConfig {
+            suffix: "_rocky_shadow".to_string(),
+            schema_override: Some("branch__feature".to_string()),
+            cleanup_after: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (config_path, state_path, db_path) =
+            write_two_pipeline_project(dir.path(), "staging_p1__{source}", "staging_p2__{source}")
+                .await;
+
+        // The checkpoint a `--branch branch__feature` run leaves: the scope
+        // built by the run path's own helper, and the one source table
+        // recorded under the key that run writes. No run record — the crash
+        // shape, which stays resumable.
+        {
+            let loaded = rocky_core::config::load_rocky_config_fingerprinted(&config_path).unwrap();
+            let (name, pipeline_config) =
+                registry::resolve_pipeline(&loaded.config, Some("p1")).unwrap();
+            let replication = pipeline_config.as_replication().unwrap();
+            let target = &replication.target;
+            let pattern = replication.schema_pattern().unwrap();
+            let scope = replication_resume_scope(
+                name,
+                target,
+                &loaded.config.adapters[&target.adapter],
+                None,
+                Some(&branch),
+                target.separator.as_deref().unwrap_or(&pattern.separator),
+                &pattern,
+            );
+            assert_eq!(
+                scope.target.as_ref().unwrap().schema_template,
+                None,
+                "the branch override bypasses the template, so it is not recorded"
+            );
+            let store = StateStore::open(&state_path).unwrap();
+            store
+                .init_run_progress("run-branch", 1, Some(&scope))
+                .unwrap();
+            store
+                .record_table_progress(
+                    "run-branch",
+                    &table_entry(
+                        0,
+                        "warehouse.branch__feature.orders",
+                        rocky_core::state::TableStatus::Success,
+                    ),
+                )
+                .unwrap();
+        }
+
+        // Edit the one field this change is about. Nothing else moves.
+        write_two_pipeline_config(
+            dir.path(),
+            &db_path,
+            "edited_p1__{source}",
+            "staging_p2__{source}",
+        );
+
+        drive_shadowed_resume_test_run(&config_path, &state_path, "p1", None, true, Some(&branch))
+            .await
+            .expect("a template edit the branch bypasses must not refuse the resume");
+
+        assert!(
+            !target_table_exists(&db_path, "branch__feature", "orders").await,
+            "the resumed run must skip the table the checkpoint completed — \
+             the seeded key is the key this run would write"
+        );
+        for schema in ["staging_p1__acme", "edited_p1__acme"] {
+            assert!(
+                !target_table_exists(&db_path, schema, "orders").await,
+                "'{schema}' comes from a template the override replaces; \
+                 no run may write there"
             );
         }
     }
