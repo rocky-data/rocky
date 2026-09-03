@@ -119,16 +119,36 @@ mixed-case target read by an unquoted reference is refused instead of redirected
 
 Two ways to fix a refusal, either one:
 
-- quote the reference so it spells the target exactly — `FROM "main"."orders"`;
-- or spell the configured target in upper case — `MAIN.ORDERS` — so an unquoted
-  reference resolves onto it.
+- quote every component of the reference so it spells the target exactly —
+  `FROM "main"."orders"`;
+- or leave every component unquoted and spell the configured target in upper
+  case — `MAIN.ORDERS` — so the reference resolves onto it.
+
+A half-quoted reference such as `"main".orders` needs both: the quoted part must
+match the target's spelling, and the unquoted part must be upper case in the
+target.
 
 On an account with Snowflake's default `QUOTED_IDENTIFIERS_IGNORE_CASE = FALSE`,
 a lower-case target read unquoted could not be read on a plain run either. The
-refusal replaces a silent wrong read on a shape that was already broken. An
-account that sets that parameter to `TRUE` makes the two spellings one object,
-but Rocky cannot read that setting, so it still asks for an unambiguous spelling.
+refusal replaces a silent wrong read on a shape that was already broken. Two
+settings would make the two spellings one object:
+`QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE` on the account, and
+`CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE` on a catalog-linked database. Rocky
+can read neither, so it asks for an unambiguous spelling instead.
 :::
+
+### CTE names on Snowflake
+
+The same rule decides whether a CTE hides a bare table name. On Snowflake that
+answer is now Snowflake's own: `WITH "orders" AS (…)` does not hide an unquoted
+`FROM orders`, because the warehouse does not bind those two names either. An
+unquoted CTE alias still hides an unquoted reference, which is the ordinary
+shape.
+
+In a shadow or branch run the freed reference goes to the matcher, which routes
+it or refuses it. `--defer` has no matcher and no refusal: the freed reference is
+a table reference, and a bare name that matches a model name is that model, so
+`--defer` qualifies it to that model's target.
 
 ## Shadow target rewriting
 

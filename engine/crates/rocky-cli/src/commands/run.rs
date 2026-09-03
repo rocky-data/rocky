@@ -6466,6 +6466,17 @@ fn apply_defer_rewrite(
     // Governs CTE-alias comparison inside the rewrite, not the `deferred`
     // lookup (which is by exact model name). Same dialect table the shadow path
     // uses, deliberately shared rather than copied.
+    //
+    // ‼️ #1282 makes one thing reachable here that was latent before. These rules
+    // reach `qualify_deferred_refs` ONLY as the CTE-shadowing question, and on
+    // Snowflake that question now has Snowflake's answer: a quoted lowercase
+    // alias does not hide an unquoted reference, because the warehouse does not
+    // bind those either. The reference is then a table reference, and `--defer`
+    // qualifies it to the deferred model's target — a bare name matching a model
+    // name IS that model (`resolve::classify_table_ref`). There is no near-miss
+    // to report on this path, so the answer has to be right rather than
+    // reported; see the note on `qualify_deferred_refs` for why matching the
+    // warehouse is the right answer and clearing the axis would be worse.
     let case_rules = dialect_case_rules(dialect)?;
     let recursive_visibility = dialect_recursive_cte_visibility(dialect);
 
@@ -6731,15 +6742,19 @@ pub(crate) fn dialect_case_rules(
 /// broken (#1282).
 pub(crate) fn case_near_miss_remedy(rules: rocky_sql::defer::IdentifierCaseRules) -> &'static str {
     if rules.unquoted_uppercases {
-        return "On this warehouse an UNQUOTED reference resolves UPPER-CASED, so \
+        return "On this warehouse an UNQUOTED identifier resolves UPPER-CASED, so \
                 `main.orders` names `MAIN.ORDERS` while Rocky creates a configured target \
                 `main.orders` quoted, as `\"main\".\"orders\"` — two different objects with \
-                identical text. Either quote the reference so it spells the configured target \
-                exactly (`\"main\".\"orders\"`), or spell the configured target in upper case \
-                (`MAIN.ORDERS`) so an unquoted reference resolves onto it. An account that sets \
-                QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE makes the two one object, but Rocky cannot \
-                read that setting (#1281), so the spelling still has to be unambiguous without \
-                it";
+                identical text. Make the reference name the object the target is, per component: \
+                either quote EVERY component of the reference so it spells the target exactly \
+                (`\"main\".\"orders\"`), or leave every component unquoted AND spell the \
+                configured target in upper case (`MAIN.ORDERS`), so the reference resolves onto \
+                it. A half-quoted reference such as `\"main\".orders` needs both — its quoted \
+                part must match the target's spelling and its unquoted part must be upper case in \
+                the target. An account that sets QUOTED_IDENTIFIERS_IGNORE_CASE = TRUE, or a \
+                catalog-linked database with CATALOG_CASE_SENSITIVITY = CASE_INSENSITIVE, makes \
+                the two one object — but Rocky cannot read either setting (#1281), so the \
+                spelling still has to be unambiguous without them";
     }
     "Spell the reference exactly as the upstream's configured target, or rename one so they \
      differ by more than case (#1281 tracks reading the live setting instead of assuming it)"
@@ -21543,10 +21558,7 @@ auto_create_schemas = true
         // reference spelled exactly like the target, so "spell it the same" on
         // its own would send them hunting a difference that is not there.
         assert!(
-            message.contains(
-                "Either quote the reference so it spells the configured target \
-                              exactly"
-            ),
+            message.contains("quote EVERY component of the reference so it spells the target"),
             "the refusal must name the quoting remedy: {message}"
         );
         assert!(
@@ -21618,6 +21630,78 @@ auto_create_schemas = true
             quoted_remedy.contains("\"orders_rocky_shadow\""),
             "quoting the reference is the remedy the refusal prints, so it must route: \
              {quoted_remedy}"
+        );
+
+        // This one is a LOOSENING, not a break. Before #1282 the matcher
+        // compared spelled text, so a lowercase unquoted reference to an
+        // uppercase target failed the exact comparison, matched only when case
+        // was ignored, and the run was REFUSED. Snowflake resolves that
+        // reference to `MAIN.ORDERS`, which is exactly the target, so it now
+        // routes. Reverting the arm makes this assertion fail, which is what
+        // makes "it used to be refused" evidence rather than a claim.
+        let case_insensitive_unquoted = routed_sql("MAIN", "ORDERS", "main.orders");
+        assert!(
+            case_insensitive_unquoted.contains("\"ORDERS_rocky_shadow\""),
+            "an unquoted reference in any case resolves onto an uppercase target: \
+             {case_insensitive_unquoted}"
+        );
+    }
+
+    /// `--defer` is the third path these rules reach, and this proves the
+    /// wiring rather than the rule: it runs `apply_defer_rewrite` with the real
+    /// Snowflake dialect.
+    ///
+    /// The behaviour is a change and is disclosed as one. A quoted lowercase CTE
+    /// alias no longer hides an unquoted reference, because Snowflake does not
+    /// bind those two names. The reference is then a table reference, and a bare
+    /// name matching a model name is that model, so `--defer` qualifies it to
+    /// the deferred model's target. There is no refusal on this path — the
+    /// qualifier substitutes on an exact model-name match and reports no
+    /// near-miss — so the scope answer has to be the warehouse's own.
+    #[cfg(feature = "duckdb")]
+    #[test]
+    fn defer_on_snowflake_qualifies_a_reference_a_quoted_cte_does_not_bind() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let models_dir = tmp.path().join("models");
+        std::fs::create_dir(&models_dir).expect("mkdir models");
+        write_model_with_target(&models_dir, "orders", "SELECT 1 AS id", "main", "orders");
+        write_model_with_target(
+            &models_dir,
+            "mart",
+            "WITH \"orders\" AS (SELECT 1 AS id) SELECT * FROM orders",
+            "main",
+            "mart",
+        );
+        let mut compiled =
+            rocky_compiler::compile::compile(&rocky_compiler::compile::CompilerConfig {
+                models_dir,
+                ..Default::default()
+            })
+            .expect("compile models");
+
+        super::apply_defer_rewrite(
+            &mut compiled,
+            Some("mart"),
+            &super::DeferOptions {
+                enabled: true,
+                defer_to: None,
+            },
+            &rocky_snowflake::dialect::SnowflakeSqlDialect,
+        )
+        .expect("defer rewrite must succeed");
+
+        let mart = compiled
+            .project
+            .models
+            .iter()
+            .find(|m| m.config.name == "mart")
+            .expect("mart missing")
+            .sql
+            .clone();
+        assert!(
+            mart.contains("\"main\".\"orders\""),
+            "Snowflake does not bind the quoted alias to the bare reference, so the reference \
+             is the deferred model and is qualified to its target: {mart}"
         );
     }
 
