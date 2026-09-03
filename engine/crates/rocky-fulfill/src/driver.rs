@@ -258,13 +258,14 @@ impl AgentDriver for SubprocessDriver {
         brief: &TaskBrief,
         on_group: &mut (dyn FnMut(GroupStamp) -> anyhow::Result<()> + Send),
     ) -> Result<DriverOutcome, DriverError> {
-        let (transcript, transcript_path) = prepare_dirs(brief)?;
+        prepare_dirs(brief)?;
         let argv: Vec<String> = self
             .command
             .iter()
             .map(|a| a.replace("{brief}", &brief.text))
             .collect();
 
+        let (transcript, transcript_path) = create_transcript(brief)?;
         let transcript_err = transcript
             .try_clone()
             .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;
@@ -352,10 +353,31 @@ impl AgentDriver for SubprocessDriver {
 /// kind is not a collision, it is a runaway.
 const TRANSCRIPT_NAME_ATTEMPTS: u32 = 64;
 
-/// Create the transcript + outbox dirs, clear the outbox, then CREATE this
-/// task's transcript and hand back the handle with the name it landed on.
+/// Create the transcript + outbox dirs and clear the outbox.
 ///
-/// The file is created HERE, not merely named, because the name alone is not
+/// Stated residual, not a leaf problem: these DIRECTORIES are not
+/// ancestor-checked. A `transcripts` or `.rocky/fulfillment` symlink planted
+/// out of the project redirects both `create_dir_all` calls, the outbox
+/// `remove_dir_all`, and the transcript create in [`create_transcript`].
+/// That is the same parent-directory class the commit protocol states as
+/// open; it needs dirfd-relative traversal, not another leaf guard.
+fn prepare_dirs(brief: &TaskBrief) -> Result<(), DriverError> {
+    std::fs::create_dir_all(&brief.transcript_dir)
+        .map_err(|e| DriverError::Spawn(format!("transcript dir: {e}")))?;
+    if brief.outbox_dir.exists() {
+        std::fs::remove_dir_all(&brief.outbox_dir)
+            .map_err(|e| DriverError::Spawn(format!("outbox clear: {e}")))?;
+    }
+    std::fs::create_dir_all(&brief.outbox_dir)
+        .map_err(|e| DriverError::Spawn(format!("outbox dir: {e}")))?;
+    Ok(())
+}
+
+/// CREATE this task's transcript and hand back the handle with the name it
+/// landed on. Called at the moment the old `std::fs::File::create` was, so a
+/// driver that refuses before spawning still leaves no transcript behind.
+///
+/// The file is created here, not merely named, because the name alone is not
 /// safe to hand to `std::fs::File::create`: that is O_CREAT|O_TRUNC, which
 /// follows a symlink at the leaf and truncates through a hardlink. The name
 /// is a plain UTC-second stamp in a directory a lower-privilege process can
@@ -371,22 +393,9 @@ const TRANSCRIPT_NAME_ATTEMPTS: u32 = 64;
 /// is worse than what `File::create` did (it truncated, so both tasks at
 /// least still had a file).
 ///
-/// Stated residual, unchanged here and not a leaf problem: the transcript
-/// and outbox DIRECTORIES are not ancestor-checked. A `transcripts` or
-/// `.rocky/fulfillment` symlink planted out of the project redirects the
-/// `create_dir_all` and this create, exactly as it redirects the outbox
-/// `remove_dir_all` below. That is the same parent-directory class the
-/// commit protocol states as open; it needs dirfd-relative traversal, not
-/// another leaf guard.
-fn prepare_dirs(brief: &TaskBrief) -> Result<(std::fs::File, PathBuf), DriverError> {
-    std::fs::create_dir_all(&brief.transcript_dir)
-        .map_err(|e| DriverError::Spawn(format!("transcript dir: {e}")))?;
-    if brief.outbox_dir.exists() {
-        std::fs::remove_dir_all(&brief.outbox_dir)
-            .map_err(|e| DriverError::Spawn(format!("outbox clear: {e}")))?;
-    }
-    std::fs::create_dir_all(&brief.outbox_dir)
-        .map_err(|e| DriverError::Spawn(format!("outbox dir: {e}")))?;
+/// The ancestor residual on [`prepare_dirs`] applies here too — this create
+/// guards the LEAF only.
+fn create_transcript(brief: &TaskBrief) -> Result<(std::fs::File, PathBuf), DriverError> {
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ");
     let kind = brief.kind.as_str();
     for attempt in 0..TRANSCRIPT_NAME_ATTEMPTS {
@@ -770,7 +779,7 @@ impl AgentDriver for ReplayDriver {
         brief: &TaskBrief,
         on_group: &mut (dyn FnMut(GroupStamp) -> anyhow::Result<()> + Send),
     ) -> Result<DriverOutcome, DriverError> {
-        let (mut transcript, transcript_path) = prepare_dirs(brief)?;
+        prepare_dirs(brief)?;
         let raw = std::fs::read(&self.session_path)
             .map_err(|e| DriverError::Session(format!("{}: {e}", self.session_path.display())))?;
         let session: ReplaySession = serde_json::from_slice(&raw)
@@ -798,6 +807,7 @@ impl AgentDriver for ReplayDriver {
             }
         };
 
+        let (mut transcript, transcript_path) = create_transcript(brief)?;
         let stderr_file = transcript
             .try_clone()
             .map_err(|e| DriverError::Spawn(format!("transcript file: {e}")))?;

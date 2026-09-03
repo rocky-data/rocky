@@ -59,11 +59,23 @@
 //! Path-based syscalls re-traverse the path at syscall time, so a
 //! DIRECTORY swapped for a symlink in the instant between validation and
 //! a rename/unlink is only fully closed by dirfd-relative APIs, which v0
-//! does not use. Every leaf the protocol WRITES is guarded at the syscall
-//! itself — O_EXCL on each create, `O_NOFOLLOW` on an in-place write — and
-//! so is every read whose bytes go on to LAND somewhere: the `.ff-prev`
-//! backup source, Phase B's sidecar read, the draft rollback snapshot.
-//! Those two carry a link-count check on the descriptor as well.
+//! does not use. Every leaf the protocol WRITES is guarded at the OPEN —
+//! O_EXCL on each create, `O_NOFOLLOW` on an in-place write — and so is
+//! every read whose bytes go on to LAND somewhere: the `.ff-prev` backup
+//! source, Phase B's sidecar read, the draft rollback snapshot. Those two
+//! carry a link-count check on the descriptor as well.
+//!
+//! At the OPEN, precisely. Custody of the staged inode ends when the write
+//! closes it, and the rename that PUBLISHES it (`.ff-staged` → final, and
+//! recovery's `.ff-prev` → final) is pathname-based: a writer who replaces
+//! the staged name with a symlink between the close and the rename gets that
+//! symlink renamed into place as the artifact, because `rename` acts on the
+//! name it is given and never follows it. Nothing is written through the
+//! link and the manifest digests still describe the staged bytes, so the
+//! next verification sees the mismatch — but a symlink lands where a regular
+//! file belongs. This is the same check-then-use class as the parent
+//! directory below, closed by the same fix (a dirfd plus `renameat`, or
+//! holding the staged descriptor through publication), and v0 accepts it.
 //!
 //! Not every read. Recovery's own `std::fs::read` of a final and of a
 //! committed manifest are pathname-based and follow a link; both are digest
@@ -938,11 +950,12 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 /// [`contained_target`] primitive BEFORE the first mutation, refusing a
 /// symlinked ancestor directory (the static `models -> /outside` escape, no
 /// race) as well as a symlink at the leaf. Each leaf is then guarded a
-/// second time at the syscall, so a link swapped in AFTER the pre-check is
-/// refused rather than followed: the staged, journal-temp and `.ff-prev`
-/// writes use O_EXCL, and the `.ff-prev` backup reads its source with
-/// `O_NOFOLLOW` ([`copy_no_follow`]). The backup copy has TWO symlink-follow
-/// ends — the SOURCE read and the DESTINATION write — and both are covered.
+/// second time at its OPEN, so a link swapped in AFTER the pre-check is
+/// refused there rather than followed: the staged, journal-temp and
+/// `.ff-prev` writes use O_EXCL, and the `.ff-prev` backup reads its source
+/// with `O_NOFOLLOW` ([`copy_no_follow`]). The backup copy has TWO
+/// symlink-follow ends — the SOURCE read and the DESTINATION write — and
+/// both are covered.
 ///
 /// A HARDLINKED final is a separate class and is covered separately: it
 /// passes the pathname pre-check (it is a regular file) and gives
@@ -953,9 +966,16 @@ fn io_reject(action: &str, path: &Path, err: &std::io::Error) -> SpecRejected {
 /// this closes is the backup copying an out-of-project file INTO the
 /// project, not an out-of-project write.
 ///
-/// Two residuals remain, the conceded v0 boundary. A DIRECTORY swapped for
+/// Three residuals remain, the conceded v0 boundary. A DIRECTORY swapped for
 /// a symlink between validation and a rename/unlink is closed only by
-/// dirfd-relative APIs, which v0 does not use. And the guards that protect
+/// dirfd-relative APIs, which v0 does not use. The staged LEAF NAME has the
+/// same shape: the open-time guard ends when the staged write closes its
+/// descriptor, and the rename that publishes it is pathname-based, so a
+/// symlink swapped in over `<final>.ff-staged` before that rename is renamed
+/// into place as the artifact (`rename` acts on the name, never follows it —
+/// nothing is written through the link, and the manifest digest no longer
+/// describes what the name holds, so the next verification catches it). And
+/// the guards that protect
 /// an EXISTING leaf are unix only — `O_NOFOLLOW` and the descriptor's link
 /// count; O_EXCL on a created leaf is portable. So on Windows the backup
 /// read still follows a symlink or junction planted at the final and does
