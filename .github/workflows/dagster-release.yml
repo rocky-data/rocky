@@ -4,7 +4,12 @@ name: dagster-release
 # when a dagster-v* tag is pushed. Supports both workflows:
 #   1. CI-only: push tag → this workflow creates the GH Release + publishes to PyPI
 #   2. Local-first: scripts/release.sh creates the GH Release, push tag → CI publishes to PyPI
-# The ensure-release job is idempotent — it skips if the release already exists.
+# The GitHub Release is created as a draft and published by the last step only,
+# after the PyPI upload and the asset upload both succeed. A failed build or
+# publish therefore leaves a draft, which the public release list omits, not
+# an empty or partial public release. `ensure-release` accepts an existing
+# draft (the scripts/release.sh path) and refuses a release that is already
+# published: nothing here may attach to, or re-publish, a live release.
 
 on:
   push:
@@ -34,13 +39,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists (created by scripts/release.sh)"
+          # `gh release view` finds a draft by its pending tag too, so a draft
+          # made by scripts/release.sh is seen here. Any other failure falls
+          # through to `create`, which fails on its own if the release exists.
+          if is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release $TAG already exists and is published. Refusing to publish again on top of a live release. If scripts/release.sh --publish made it, this run has nothing left to do. Otherwise convert it back to a draft (gh release edit $TAG --repo $GITHUB_REPOSITORY --draft) or delete it, then re-run."
+              exit 1
+            fi
+            echo "Release $TAG already exists as a draft (scripts/release.sh path); this run will publish it"
           else
-            echo "Creating release $TAG"
+            echo "Creating draft release $TAG"
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --generate-notes \
+              --draft \
               --latest=false \
               --title "$TAG"
           fi
@@ -82,3 +95,17 @@ jobs:
           gh release upload "${GITHUB_REF_NAME}" "${artifacts[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
+
+      # Last on purpose: a failure in any step above leaves the release a
+      # draft. `--latest=false` again here, because GitHub's API defaults
+      # `make_latest` to true when a draft is published, and the engine
+      # release owns the repo's "Latest" badge.
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest=false
+          echo "Published ${GITHUB_REF_NAME}"

@@ -274,14 +274,18 @@ jobs:
           echo "Published ${GITHUB_REF_NAME}"
 
   # Create the GitHub Release if it doesn't already exist (supports both
-  # CI-only releases and the local scripts/release.sh workflow where the
-  # release is created before the tag push).
+  # CI-only releases and the local scripts/release.sh workflow, which creates
+  # the release itself, as a draft, around the tag push).
   #
   # Created as a draft so it stays out of the public `/releases` listing until
-  # `publish` runs — see the header comment. An existing release (the
-  # scripts/release.sh path) is left exactly as it is: it already carries the
-  # artifacts that path uploaded, so forcing it back to draft would briefly
-  # retract something deliberately published.
+  # `publish` runs — see the header comment. An existing draft (the
+  # scripts/release.sh path) is used as it is: the matrix overwrites its
+  # archives and `publish` flips it. An existing release that is already
+  # published stops the run instead. Attaching to it would put the build
+  # window, and any failed target, on a release the public can already
+  # resolve. Converting it back to a draft here would retract a live release
+  # on every full re-run of this workflow, and leave it retracted if that
+  # re-run fails. Refusing changes nothing and names the fix.
   ensure-release:
     name: Ensure GitHub Release exists
     runs-on: ubuntu-24.04
@@ -296,8 +300,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists (created by scripts/release.sh)"
+          # `gh release view` finds a draft by its pending tag too (it falls
+          # back to the release list when /releases/tags/<tag> is a 404), so a
+          # draft made by scripts/release.sh is seen here. Any other failure
+          # falls through to `create`, which fails on its own if the release
+          # exists after all.
+          if is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release $TAG already exists and is published. Refusing to attach a new build to a live release. Convert it back to a draft (gh release edit $TAG --repo $GITHUB_REPOSITORY --draft) or delete it, then re-run."
+              exit 1
+            fi
+            echo "Release $TAG already exists as a draft (scripts/release.sh path); the matrix will attach to it"
           else
             echo "Creating draft release $TAG"
             gh release create "$TAG" \
