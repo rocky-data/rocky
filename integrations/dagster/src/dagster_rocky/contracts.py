@@ -17,7 +17,10 @@ This module provides:
 
 * :func:`contract_check_results_from_diagnostics` — yields one
   :class:`AssetCheckResult` per check spec, mapping compiler diagnostics with
-  contract-related codes (E010-E013, W010) to pass/fail status.
+  contract-related codes (E010-E013, W010) to pass/fail status. Pass
+  ``diagnostics=None`` when there is no ``rocky compile`` output at all:
+  every declared check then fails as "not verified" instead of passing on
+  an empty list (#1619).
 
 Mapping from compiler diagnostic codes to dagster check names:
 
@@ -85,6 +88,12 @@ _CONTRACT_CODE_TO_CHECK: dict[str, str] = {
 _CONTRACT_UNVERIFIED_CODE_TO_CHECK: dict[str, str] = {
     "I003": CONTRACT_COLUMN_CONSTRAINTS_CHECK,
 }
+
+#: Metadata key stamped (``True``) on a contract check result that was not
+#: evaluated because there was no ``rocky compile`` output to read. The
+#: result also fails, so this key only tells a "not verified" failure apart
+#: from a real violation; it is never present on a passing result.
+CONTRACT_COMPILE_MISSING_METADATA_KEY: str = "rocky/compile_missing"
 
 
 @dataclass(frozen=True)
@@ -312,7 +321,7 @@ def configured_check_specs_for_model(
 
 
 def contract_check_results_from_diagnostics(
-    diagnostics: list[Diagnostic],
+    diagnostics: list[Diagnostic] | None,
     *,
     asset_key: dg.AssetKey,
     model_name: str,
@@ -333,10 +342,18 @@ def contract_check_results_from_diagnostics(
     * E010-E013 → ``AssetCheckSeverity.ERROR``
     * W010      → ``AssetCheckSeverity.WARN``
 
+    An empty list and ``None`` are different inputs. An empty list means the
+    compile ran and reported nothing for this model, so the checks pass.
+    ``None`` means there is no compile output at all (``rocky compile``
+    failed, or never ran), so nothing was checked: every declared check then
+    fails with ``AssetCheckSeverity.WARN`` and
+    :data:`CONTRACT_COMPILE_MISSING_METADATA_KEY` set, instead of passing
+    on the empty list (#1619).
+
     Args:
-        diagnostics: Compile-time diagnostics from :class:`CompileResult`.
-            Both contract codes and other codes are tolerated; non-contract
-            codes are ignored.
+        diagnostics: Compile-time diagnostics from :class:`CompileResult`,
+            or ``None`` when there is no compile result. Both contract codes
+            and other codes are tolerated; non-contract codes are ignored.
         asset_key: The Dagster asset key the checks belong to.
         model_name: The compiled model name to filter diagnostics by.
         rules: ContractRules — only check kinds with declared rules
@@ -346,6 +363,21 @@ def contract_check_results_from_diagnostics(
         ``dg.AssetCheckResult`` events. The number of yields equals the
         number of declared rule kinds in ``rules``.
     """
+    if diagnostics is None:
+        if rules.has_required:
+            yield _not_verified_result(
+                check_name=CONTRACT_REQUIRED_COLUMNS_CHECK, asset_key=asset_key
+            )
+        if rules.has_protected:
+            yield _not_verified_result(
+                check_name=CONTRACT_PROTECTED_COLUMNS_CHECK, asset_key=asset_key
+            )
+        if rules.has_column_constraints:
+            yield _not_verified_result(
+                check_name=CONTRACT_COLUMN_CONSTRAINTS_CHECK, asset_key=asset_key
+            )
+        return
+
     # Group diagnostics by which check they belong to
     by_check: dict[str, list[Diagnostic]] = {
         CONTRACT_REQUIRED_COLUMNS_CHECK: [],
@@ -389,6 +421,33 @@ def contract_check_results_from_diagnostics(
             diagnostics=by_check[CONTRACT_COLUMN_CONSTRAINTS_CHECK],
             unverified=unverified_by_check[CONTRACT_COLUMN_CONSTRAINTS_CHECK],
         )
+
+
+def _not_verified_result(*, check_name: str, asset_key: dg.AssetKey) -> dg.AssetCheckResult:
+    """Build the failing result for a contract check that could not be evaluated.
+
+    Used when there is no ``rocky compile`` output to read. The check fails
+    (the contract may be violated and nothing looked), at ``WARN`` severity
+    like the integration's other "not checked" placeholders, and carries
+    :data:`CONTRACT_COMPILE_MISSING_METADATA_KEY` so it can be told apart
+    from a real violation.
+    """
+    status = (
+        "not verified: no rocky compile output in the cached state (rocky compile "
+        "failed, or did not run, when the state was written), so this contract "
+        "was not checked — refresh the state after rocky compile succeeds"
+    )
+    return dg.AssetCheckResult(
+        asset_key=asset_key,
+        check_name=check_name,
+        passed=False,
+        severity=dg.AssetCheckSeverity.WARN,
+        description="contract not verified: no rocky compile output",
+        metadata={
+            "status": dg.MetadataValue.text(status),
+            CONTRACT_COMPILE_MISSING_METADATA_KEY: dg.MetadataValue.bool(True),
+        },
+    )
 
 
 def _result_for_check(

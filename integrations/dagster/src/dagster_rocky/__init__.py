@@ -26,6 +26,7 @@ from .component import (
 )
 from .contracts import (
     CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    CONTRACT_COMPILE_MISSING_METADATA_KEY,
     CONTRACT_PROTECTED_COLUMNS_CHECK,
     CONTRACT_REQUIRED_COLUMNS_CHECK,
     ContractParseError,
@@ -203,6 +204,7 @@ __all__ = [
     "CONTRACT_REQUIRED_COLUMNS_CHECK",
     "CONTRACT_PROTECTED_COLUMNS_CHECK",
     "CONTRACT_COLUMN_CONSTRAINTS_CHECK",
+    "CONTRACT_COMPILE_MISSING_METADATA_KEY",
     "ContractRules",
     "ContractParseError",
     "discover_contract_rules",
