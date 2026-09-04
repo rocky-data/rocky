@@ -135,7 +135,21 @@ jobs:
         # never returns (it contends on the target/ lock) and the bench blows
         # the --timeout, failing the whole job. tarpaulin's default target set
         # (lib + bins + tests) is what we want coverage for anyway.
-        run: cargo tarpaulin --timeout 600 --out xml --output-dir coverage/
+        #
+        # --no-dead-code: tarpaulin 0.31.2 adds `-Clink-dead-code` for BOTH
+        # engines (the check sits outside the `engine == Llvm` branch in
+        # src/cargo.rs), and `--no-dead-code` is the only flag that removes
+        # it. Linking every dead symbol is the one size term this tool lets
+        # us drop, and the instrumented build needs ~105 GB of the runner's
+        # 145 GB disk (#1638). The other suspected term, debuginfo, is not
+        # testable here: tarpaulin forces `-Cdebuginfo=2` into RUSTFLAGS and
+        # strips any profile setting, so it always wins.
+        #
+        # It changes the DENOMINATOR. Dead code that is no longer linked can
+        # no longer be reported as uncovered, so the reported percentage may
+        # RISE while the raw covered and uncovered line counts both FALL.
+        # Compare raw counts against the last green report, not percentages.
+        run: cargo tarpaulin --timeout 600 --no-dead-code --out xml --output-dir coverage/
       - name: Machine state after coverage
         # `always()` so a failing coverage step still reports. Note the
         # limit: when the disk fills hard enough the runner AGENT dies, and
