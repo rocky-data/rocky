@@ -9,6 +9,7 @@ import pytest
 
 from dagster_rocky.contracts import (
     CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    CONTRACT_COMPILE_MISSING_METADATA_KEY,
     CONTRACT_PROTECTED_COLUMNS_CHECK,
     CONTRACT_REQUIRED_COLUMNS_CHECK,
     ContractParseError,
@@ -551,3 +552,79 @@ def test_results_only_yield_for_declared_rules():
     assert len(results) == 1
     assert results[0].check_name == CONTRACT_REQUIRED_COLUMNS_CHECK
     assert results[0].passed is True
+
+
+# ---------------------------------------------------------------------------
+# No compile output at all (#1619)
+# ---------------------------------------------------------------------------
+
+
+def test_results_not_verified_when_there_is_no_compile_output():
+    """``diagnostics=None`` means ``rocky compile`` produced no output.
+
+    That is not the same as an empty diagnostics list: nothing was checked,
+    so every declared check must report a not-verified failure instead of
+    the green it reported before (#1619).
+    """
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=True, has_protected=True, has_column_constraints=True)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=None,
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert [r.check_name for r in results] == [
+        CONTRACT_REQUIRED_COLUMNS_CHECK,
+        CONTRACT_PROTECTED_COLUMNS_CHECK,
+        CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    ]
+    for r in results:
+        assert r.passed is False, r.check_name
+        assert r.severity == dg.AssetCheckSeverity.WARN
+        assert r.asset_key == asset_key
+        assert r.metadata[CONTRACT_COMPILE_MISSING_METADATA_KEY].value is True
+        assert "not verified" in (r.description or "")
+        assert "not verified" in r.metadata["status"].value
+
+
+def test_results_not_verified_only_for_declared_rules():
+    """The not-verified result is still gated on the declared rule kinds."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=True, has_protected=False, has_column_constraints=False)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=None,
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].check_name == CONTRACT_REQUIRED_COLUMNS_CHECK
+    assert results[0].passed is False
+
+
+def test_results_empty_diagnostics_still_pass_without_compile_missing_marker():
+    """An empty list is "compiled, nothing to report": green, and not marked."""
+    asset_key = dg.AssetKey(["orders"])
+    rules = ContractRules(has_required=True, has_protected=False, has_column_constraints=False)
+
+    results = list(
+        contract_check_results_from_diagnostics(
+            diagnostics=[],
+            asset_key=asset_key,
+            model_name="orders",
+            rules=rules,
+        )
+    )
+
+    assert len(results) == 1
+    assert results[0].passed is True
+    assert CONTRACT_COMPILE_MISSING_METADATA_KEY not in results[0].metadata

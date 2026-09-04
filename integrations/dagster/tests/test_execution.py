@@ -8,11 +8,17 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import dagster as dg
 
 from dagster_rocky.component import RockyComponent
+from dagster_rocky.contracts import (
+    CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+    CONTRACT_COMPILE_MISSING_METADATA_KEY,
+    CONTRACT_PROTECTED_COLUMNS_CHECK,
+    CONTRACT_REQUIRED_COLUMNS_CHECK,
+)
 from dagster_rocky.resource import RockyResource
 from dagster_rocky.types import DiscoverResult, RunResult
 
@@ -926,3 +932,164 @@ def test_quota_exceeded_with_none_cooldown_falls_back_to_default(
         "None engine-supplied cooldown must fall back to "
         "_FIVETRAN_QUOTA_COOLDOWN_DEFAULT_SECONDS (300)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Contract checks against the cached compile slot (#1619)
+# ---------------------------------------------------------------------------
+
+_ORDERS_KEY = dg.AssetKey(["fivetran", "acme", "us_west", "shopify", "orders"])
+_CONTRACT_CHECK_NAMES = {
+    CONTRACT_REQUIRED_COLUMNS_CHECK,
+    CONTRACT_PROTECTED_COLUMNS_CHECK,
+    CONTRACT_COLUMN_CONSTRAINTS_CHECK,
+}
+
+
+def _write_orders_contract(tmp_path: Path) -> Path:
+    """A contract for ``orders`` that declares all three rule kinds."""
+    contracts_dir = tmp_path / "contracts"
+    contracts_dir.mkdir()
+    (contracts_dir / "orders.contract.toml").write_text(
+        '[rules]\nrequired = ["id"]\nprotected = ["id"]\n\n'
+        '[[columns]]\nname = "id"\ntype = "Int64"\n',
+        encoding="utf-8",
+    )
+    return contracts_dir
+
+
+def _build_defs_with_contracts(
+    discover_json: str,
+    tmp_path: Path,
+    *,
+    compile_json: str | None = None,
+    execution_mode: str = "streaming",
+) -> dg.Definitions:
+    """Like :func:`_build_defs`, with a ``contracts_dir`` that matches ``orders``."""
+    state_file = tmp_path / "state.json"
+    state: dict = {"discover": json.loads(discover_json)}
+    if compile_json:
+        state["compile"] = json.loads(compile_json)
+    state_file.write_text(json.dumps(state))
+    component = RockyComponent(
+        config_path="rocky.toml",
+        contracts_dir=str(_write_orders_contract(tmp_path)),
+        execution_mode=execution_mode,  # type: ignore[arg-type]
+    )
+    return component.build_defs_from_state(context=None, state_path=state_file)
+
+
+def _contract_evaluations(exec_result: dg.ExecuteInProcessResult) -> list:
+    return [
+        ev
+        for ev in exec_result.get_asset_check_evaluations()
+        if ev.check_name in _CONTRACT_CHECK_NAMES
+    ]
+
+
+def test_streaming_contract_checks_report_not_verified_when_compile_slot_is_missing(
+    discover_json: str, run_json: str, tmp_path: Path
+):
+    """No ``compile`` slot in state → every contract check fails as not verified.
+
+    Before the fix this run did two wrong things: the placeholder pass
+    emitted each contract check as ``passed=True`` ("not produced by
+    rocky"), and the contract pass then emitted the same check again, so
+    Dagster failed the step with "returned an output multiple times".
+    """
+    defs = _build_defs_with_contracts(discover_json, tmp_path)
+    run_result = RunResult.model_validate_json(run_json)
+
+    exec_result = _materialize_subset(defs, run_result, [_ORDERS_KEY])
+
+    assert exec_result.success
+    evals = _contract_evaluations(exec_result)
+    assert {ev.check_name for ev in evals} == _CONTRACT_CHECK_NAMES
+    assert len(evals) == 3, "exactly one evaluation per declared contract check"
+    for ev in evals:
+        assert ev.asset_key == _ORDERS_KEY
+        assert ev.passed is False, ev.check_name
+        assert ev.severity == dg.AssetCheckSeverity.WARN
+        assert ev.metadata[CONTRACT_COMPILE_MISSING_METADATA_KEY].value is True
+
+
+def test_streaming_contract_checks_pass_when_compile_slot_is_clean_for_the_model(
+    discover_json: str, run_json: str, compile_json: str, tmp_path: Path
+):
+    """A cached compile with no diagnostics for ``orders`` → green, once each.
+
+    The compile fixture carries diagnostics for other models only, so this
+    is the "compiled, nothing to report" side of the distinction.
+    """
+    defs = _build_defs_with_contracts(discover_json, tmp_path, compile_json=compile_json)
+    run_result = RunResult.model_validate_json(run_json)
+
+    exec_result = _materialize_subset(defs, run_result, [_ORDERS_KEY])
+
+    assert exec_result.success
+    evals = _contract_evaluations(exec_result)
+    assert {ev.check_name for ev in evals} == _CONTRACT_CHECK_NAMES
+    assert len(evals) == 3, "exactly one evaluation per declared contract check"
+    for ev in evals:
+        assert ev.passed is True, ev.check_name
+        assert CONTRACT_COMPILE_MISSING_METADATA_KEY not in ev.metadata
+
+
+def test_pipes_contract_checks_report_not_verified_when_compile_slot_is_missing(
+    discover_json: str, tmp_path: Path
+):
+    """Pipes mode has no placeholder pass; the contract pass alone must not go green."""
+    defs = _build_defs_with_contracts(discover_json, tmp_path, execution_mode="pipes")
+
+    fake_invocation = MagicMock()
+    fake_invocation.get_results = MagicMock(
+        return_value=iter([dg.MaterializeResult(asset_key=_ORDERS_KEY)])
+    )
+    with patch.object(RockyResource, "run_pipes", return_value=fake_invocation):
+        exec_result = dg.materialize(
+            list(defs.assets or []),
+            resources={"rocky": RockyResource(config_path="rocky.toml")},
+            selection=[_ORDERS_KEY],
+            raise_on_error=False,
+        )
+
+    assert exec_result.success
+    evals = _contract_evaluations(exec_result)
+    assert {ev.check_name for ev in evals} == _CONTRACT_CHECK_NAMES
+    assert len(evals) == 3
+    for ev in evals:
+        assert ev.passed is False, ev.check_name
+        assert ev.metadata[CONTRACT_COMPILE_MISSING_METADATA_KEY].value is True
+
+
+def test_streaming_contract_checks_are_recorded_before_a_quota_breach_raises(
+    discover_json: str, run_json: str, tmp_path: Path
+):
+    """A quota breach raises after the run; the contract record must land first.
+
+    The retriable failure is raised after the materializations so partial
+    progress is kept. The contract results are known before the run, so
+    they are yielded before that raise too: with no compile slot, the three
+    not-verified failures are on record even though the step fails.
+    """
+    from dagster_rocky.types import TableError  # noqa: PLC0415
+
+    defs = _build_defs_with_contracts(discover_json, tmp_path)
+    run_result = RunResult.model_validate_json(run_json)
+    run_result.errors = [
+        TableError(
+            asset_key=["fivetran", "acme", "us_west", "shopify", "payments"],
+            error="rate limited — retry after backoff",
+            failure_kind="quota-exceeded",
+        )
+    ]
+
+    exec_result = _materialize_subset(defs, run_result, [_ORDERS_KEY])
+
+    assert not exec_result.success, "quota-exceeded must still surface as a failure"
+    evals = _contract_evaluations(exec_result)
+    assert {ev.check_name for ev in evals} == _CONTRACT_CHECK_NAMES
+    assert len(evals) == 3
+    for ev in evals:
+        assert ev.passed is False, ev.check_name
+        assert ev.metadata[CONTRACT_COMPILE_MISSING_METADATA_KEY].value is True
