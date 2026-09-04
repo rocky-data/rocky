@@ -321,17 +321,9 @@ fn lower_valid_predicate(
                     name: label.to_string(),
                 });
             }
-            // Same quote-doubling limit as `generate_test_sql_inner` — see
-            // `reject_unquotable_literal`.
-            for v in values {
-                validation::reject_unquotable_literal(
-                    &format!("quarantine assertion '{label}' accepted_values value"),
-                    v,
-                )?;
-            }
             let in_list = values
                 .iter()
-                .map(|v| format!("'{}'", v.replace('\'', "''")))
+                .map(|v| crate::sql_gen::string_literal(dialect, v))
                 .collect::<Vec<_>>()
                 .join(", ");
             Ok(format!("({col} IS NULL OR {col} IN ({in_list}))"))
@@ -1109,23 +1101,59 @@ mod unit_tests {
         }));
     }
 
-    // ----- Statement-terminator refusal (issue #1524) -----
+    // ----- Dialect-owned literal encoding (issue #1596) -----
 
+    /// Each `accepted_values` entry is encoded by the dialect's own lexer
+    /// rule: a backslash stands for itself under `Standard` (DuckDB, Trino)
+    /// and is doubled under `Backslash` (Snowflake, Databricks, BigQuery),
+    /// where the quote is `\'` rather than `''`.
     #[test]
-    fn quarantine_accepted_values_refuses_a_backslash_in_a_value() {
+    fn quarantine_accepted_values_encodes_a_backslash_and_a_quote_per_dialect() {
+        use crate::traits::LiteralEscape;
+        use crate::traits::test_dialects::StubDialect;
+
         let cfg = split_config();
         let assertions = vec![assertion(
             None,
             TestType::AcceptedValues {
-                values: vec!["ok".into(), "trailing_backslash\\".into()],
+                values: vec!["ok".into(), r"trailing\".into(), "it's".into()],
             },
             Some("status"),
             TestSeverity::Error,
         )];
-        let err = compile_quarantine_sql(&assertions, "orders", &table(), &TestDialect, &cfg)
-            .unwrap_err();
-        assert!(err.to_string().contains("backslash"), "{err}");
+
+        let standard = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &StubDialect(LiteralEscape::Standard),
+            &cfg,
+        )
+        .unwrap()
+        .unwrap();
+        let sql = &standard.statements[1].sql;
+        assert!(
+            sql.contains(r"(status IS NULL OR status IN ('ok', 'trailing\', 'it''s'))"),
+            "{sql}"
+        );
+
+        let backslash = compile_quarantine_sql(
+            &assertions,
+            "orders",
+            &table(),
+            &StubDialect(LiteralEscape::Backslash),
+            &cfg,
+        )
+        .unwrap()
+        .unwrap();
+        let sql = &backslash.statements[1].sql;
+        assert!(
+            sql.contains(r"(status IS NULL OR status IN ('ok', 'trailing\\', 'it\'s'))"),
+            "{sql}"
+        );
     }
+
+    // ----- Statement-terminator refusal (issue #1524) -----
 
     #[test]
     fn quarantine_expression_refuses_a_statement_terminator() {
