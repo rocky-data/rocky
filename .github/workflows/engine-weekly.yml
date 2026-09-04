@@ -111,6 +111,17 @@ jobs:
       - name: Install cargo-tarpaulin
         # Pinned + --locked for the same reason as cargo-audit above.
         run: cargo install cargo-tarpaulin --version 0.31.2 --locked
+      # Kept permanently, not just while #1638 is open. The failure this job
+      # hit for six weeks was `collect2: fatal error: ld terminated with
+      # signal 7 [Bus error]` while linking a test binary, and the log said
+      # nothing about the machine it happened on. A linker writes its output
+      # through mmap, so a filesystem that fills mid-link faults instead of
+      # returning ENOSPC — the one failure mode whose evidence is exactly
+      # these two numbers, and exactly what no log had.
+      - name: Machine state before coverage
+        run: |
+          df -h / /mnt /tmp || true
+          free -m || true
       - name: Run coverage
         # No --all-targets: that pulls the criterion benches into the run, and
         # the `binary_startup` bench shells out to `cargo run` on every
@@ -118,7 +129,22 @@ jobs:
         # never returns (it contends on the target/ lock) and the bench blows
         # the --timeout, failing the whole job. tarpaulin's default target set
         # (lib + bins + tests) is what we want coverage for anyway.
-        run: cargo tarpaulin --timeout 600 --out xml --output-dir coverage/
+        #
+        # `--jobs 1`: the workflow-level `CARGO_BUILD_JOBS: 4` had four of
+        # these linking at once. Each `rocky-cli` test binary pulls in every
+        # adapter, DuckDB, aws-lc, ring and the OpenTelemetry stack — the
+        # failing link listed several hundred rlibs — and tarpaulin's
+        # instrumentation inflates every object on top of that. Four
+        # concurrent links of that size is the cheapest explanation for the
+        # bus error, and serialising them is the cheapest test of it.
+        run: cargo tarpaulin --timeout 600 --out xml --output-dir coverage/ --jobs 1
+      - name: Machine state after coverage
+        # Runs even when the step above fails: on a failure this is the
+        # reading that matters.
+        if: always()
+        run: |
+          df -h / /mnt /tmp || true
+          free -m || true
       - name: Upload coverage report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
