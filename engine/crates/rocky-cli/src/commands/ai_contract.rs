@@ -517,6 +517,7 @@ pub async fn run_ai_contract(
             contract_toml: drafted.toml.clone(),
             saved_path: saved_path.clone(),
             profile: profile_out,
+            unverified_types: drafted.unverified_types.clone(),
         };
         print_json(&output)?;
     } else {
@@ -524,6 +525,18 @@ pub async fn run_ai_contract(
         println!("Attempts: {}", drafted.attempts);
         if let Some(path) = &saved_path {
             println!("Wrote: {path}");
+        }
+        // Said out loud, because the draft otherwise reads as verified.
+        if !drafted.unverified_types.is_empty() {
+            println!();
+            println!(
+                "{} declared type(s) were NOT checked — Rocky could not work out the \
+                 column's own type, so it compared nothing:",
+                drafted.unverified_types.len()
+            );
+            for message in &drafted.unverified_types {
+                println!("  - {message}");
+            }
         }
         println!();
         println!("{}", drafted.toml);

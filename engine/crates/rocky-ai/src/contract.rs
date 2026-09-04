@@ -64,6 +64,15 @@ pub struct DraftedContract {
     pub toml: String,
     /// Number of LLM attempts taken.
     pub attempts: usize,
+    /// Declared column types the compiler could NOT check, one message each.
+    ///
+    /// The verify loop only fails on error-severity diagnostics. A column
+    /// whose type Rocky could not infer produces `I003` instead, and the
+    /// declared type is then accepted without ever being compared. With a
+    /// cold schema cache that is every leaf column, so an empty error list
+    /// is not evidence the types are right (#1618). Empty when every
+    /// declared type was actually checked.
+    pub unverified_types: Vec<String>,
 }
 
 /// Map a Rocky `Display` type rendering (e.g. `INT64`, `DECIMAL(10,2)`) to the
@@ -193,11 +202,20 @@ pub fn extract_toml(content: &str) -> String {
 /// Returns the parsed contract on success, or a human-readable error string
 /// (TOML parse failure or contract diagnostics) suitable for feeding back into
 /// the next retry's error context.
+/// A contract that passed the verify loop, plus what the loop could not check.
+#[derive(Debug)]
+struct VerifiedContract {
+    contract: CompilerContract,
+    /// `I003` messages: declared types the compiler did not compare because it
+    /// could not infer the column's own type.
+    unverified_types: Vec<String>,
+}
+
 fn verify_contract_toml(
     toml_body: &str,
     model_name: &str,
     inferred_schema: &[TypedColumn],
-) -> Result<CompilerContract, String> {
+) -> Result<VerifiedContract, String> {
     if toml_body.trim().is_empty() {
         return Err("generated contract is empty".to_string());
     }
@@ -211,11 +229,23 @@ fn verify_contract_toml(
         .map(std::string::ToString::to_string)
         .collect();
 
-    if errors.is_empty() {
-        Ok(contract)
-    } else {
-        Err(errors.join("\n"))
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
     }
+
+    // Carried, not dropped. An `I003` says a declared type was accepted
+    // without being compared, which is not the same as a type that checked
+    // out, and the caller has no other way to tell the two apart (#1618).
+    let unverified_types: Vec<String> = diagnostics
+        .iter()
+        .filter(|d| &*d.code == rocky_compiler::diagnostic::I003)
+        .map(|d| d.message.to_string())
+        .collect();
+
+    Ok(VerifiedContract {
+        contract,
+        unverified_types,
+    })
 }
 
 /// Draft a data contract for a model from its observed profile.
@@ -248,16 +278,18 @@ pub async fn draft_contract(
 
         let toml_body = extract_toml(&response.content);
         match verify_contract_toml(&toml_body, &profile.model, inferred_schema) {
-            Ok(contract) => {
+            Ok(verified) => {
                 // Re-serialize from the parsed struct so the on-disk file is
                 // canonical TOML regardless of the LLM's formatting.
-                let toml = toml::to_string_pretty(&contract).map_err(|e| AiError::Api {
-                    message: format!("contract re-serialize failed: {e}"),
-                })?;
+                let toml =
+                    toml::to_string_pretty(&verified.contract).map_err(|e| AiError::Api {
+                        message: format!("contract re-serialize failed: {e}"),
+                    })?;
                 return Ok(DraftedContract {
-                    contract,
+                    contract: verified.contract,
                     toml,
                     attempts: attempt,
+                    unverified_types: verified.unverified_types,
                 });
             }
             Err(errors) => {
@@ -420,9 +452,47 @@ nullable = false
 required = ["id"]
 protected = ["id"]
 "#;
-        let contract = verify_contract_toml(toml_body, "orders", &schema).expect("should verify");
-        assert_eq!(contract.columns.len(), 2);
-        assert_eq!(contract.rules.required, vec!["id".to_string()]);
+        let verified = verify_contract_toml(toml_body, "orders", &schema).expect("should verify");
+        assert_eq!(verified.contract.columns.len(), 2);
+        assert_eq!(verified.contract.rules.required, vec!["id".to_string()]);
+        assert!(
+            verified.unverified_types.is_empty(),
+            "every declared type was checked against a known column type: {:?}",
+            verified.unverified_types
+        );
+    }
+
+    /// #1618: a column whose type Rocky could not infer produces `I003`, not
+    /// an error, so the declared type is accepted without ever being
+    /// compared. The verify loop passes — and must say what it did not check.
+    /// With a cold schema cache this is every leaf column.
+    #[test]
+    fn verify_reports_a_declared_type_it_could_not_check() {
+        let schema = vec![
+            tc("id", RockyType::Int64, false),
+            tc("amount", RockyType::Unknown, true),
+        ];
+        let toml_body = r#"
+[[columns]]
+name = "id"
+type = "Int64"
+
+[[columns]]
+name = "amount"
+type = "Decimal"
+"#;
+        let verified = verify_contract_toml(toml_body, "orders", &schema).expect("should verify");
+        assert_eq!(
+            verified.unverified_types.len(),
+            1,
+            "expected one unchecked declared type: {:?}",
+            verified.unverified_types
+        );
+        let only = &verified.unverified_types[0];
+        assert!(
+            only.contains("amount") && only.contains("could not work out"),
+            "the message must name the column and say the type was not checked: {only}"
+        );
     }
 
     #[test]

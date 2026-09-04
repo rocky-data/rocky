@@ -56,4 +56,10 @@ class AiContractOutput(BaseModel):
     """
     Path the contract was written to, when `--save` was passed.
     """
+    unverified_types: list[str] | None = None
+    """
+    Declared column types the compiler could NOT check, one message each.
+
+    The drafting loop only fails on error-severity diagnostics. A column whose type Rocky could not infer reports `I003` instead, and the declared type is then accepted without being compared to anything. With a cold schema cache that is every leaf column, so an empty `errors` list is not evidence the declared types are right. Empty when every declared type was actually checked.
+    """
     version: str
