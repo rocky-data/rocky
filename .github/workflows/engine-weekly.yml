@@ -1,8 +1,9 @@
 name: engine-weekly
 
 # Expensive-but-advisory jobs that don't need to run on every PR.
-# Coverage (tarpaulin) and security audit run weekly on main and can
-# be triggered manually for one-off checks.
+# Coverage (tarpaulin), the security audit, the POC smoke suite and a
+# Windows compile check run weekly on main and can be triggered manually
+# for one-off checks.
 
 on:
   schedule:
@@ -46,6 +47,43 @@ jobs:
         # Advisory ignores (with rationale) live in engine/.cargo/audit.toml,
         # which cargo-audit reads from this working directory.
         run: cargo audit
+
+  windows-check:
+    name: Windows compile check
+    runs-on: windows-2022
+    # Advisory, like every job here. `engine-release.yml` builds
+    # `x86_64-pc-windows-msvc` only on an `engine-v*` tag, so before this job
+    # the first Windows compile of a release happened AFTER the tag was
+    # pushed. A `cfg(unix)`-only item that escapes its gate, a non-exhaustive
+    # match missing the Windows arm, or a lockfile change touching a
+    # Windows-only dependency edge all surfaced there, and the fix cost a new
+    # version and a new tag. Grepping for `std::os::unix` catches the first of
+    # those and neither of the others.
+    #
+    # `cargo check`, not `build`: it answers the same question without paying
+    # DuckDB's C++ compile, which is what makes the release build slow.
+    # Not a required check — promote it once its runtime and flake rate are
+    # known. Runs natively because `ring` and `aws-lc-sys` build scripts want
+    # the real MSVC toolchain, which is why a cross-check from macOS does not
+    # work.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # Pinned like every other Rust job here: an unpinned `stable` let
+          # the 1.98.0 release land mid-day (2026-08-20) and turn required
+          # checks red with no code change. Bump deliberately.
+          toolchain: 1.98.0
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: engine
+          # Restore only, matching the other weekly jobs: a cache written here
+          # would sit unread for seven days while competing for the repo's
+          # 10 GB budget against caches that every PR restores from.
+          save-if: false
+      - name: cargo check (x86_64-pc-windows-msvc)
+        run: cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
 
   coverage:
     name: Coverage
@@ -118,9 +156,11 @@ jobs:
       # The playground POC run.sh scripts shell out to the standalone `duckdb`
       # CLI to seed data and inspect Parquet companions. The runner doesn't
       # ship it, so without this step every DuckDB-seeding POC fails with
-      # `duckdb: command not found`. Pin to 1.5.3 to match the DuckDB version
-      # the engine bundles (libduckdb-sys 1.10503.1) so seeded .duckdb files
-      # round-trip through `rocky`.
+      # `duckdb: command not found`. The engine bundles DuckDB 1.5.5
+      # (libduckdb-sys 1.10505.0 since #1251); the CLI stays pinned at 1.5.3
+      # because a 1.5.3-seeded file is readable by the 1.5.5 engine and the
+      # pair has passed the POC suite every week since. Bump deliberately —
+      # an unpinned CLI would change the seed format under the suite.
       - name: Install DuckDB CLI
         working-directory: ${{ github.workspace }}
         run: |
