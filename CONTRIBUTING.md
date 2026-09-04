@@ -191,7 +191,7 @@ The engine matrix builds five targets: macOS ARM64, macOS Intel, Linux x86_64, L
 
 `scripts/release.sh engine|sdk|dagster|vscode <version>` is a local-build fallback for a hotfix when CI is unavailable. Run the engine path on an Apple Silicon Mac. It packages the native host build as the macOS ARM64 archive without checking the host architecture, and builds Linux x86_64 in Docker.
 
-Four `just` recipes wrap that same script: `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`. Without `--publish`, the sdk, dagster, and vscode paths build the artifact and create the GitHub Release, but never reach PyPI or the Marketplace. `just release-engine` takes no `--publish`, because the engine publishes to GitHub Releases only.
+Four `just` recipes wrap that same script: `just release-engine <version>`, `just release-sdk <version> [--publish]`, `just release-dagster <version> [--publish]`, and `just release-vscode <version> [--publish]`. Without `--publish`, the sdk, dagster, and vscode paths build the artifact and create the GitHub Release as a draft, but never reach PyPI or the Marketplace; the tag push's CI run publishes the draft after its own registry upload. `just release-engine` takes no `--publish`, because the engine publishes to GitHub Releases only.
 
 Prefer the tag-driven flow for a normal release. The `rocky-release` skill, mirrored at `.agents/skills/rocky-release/` and `.claude/skills/rocky-release/`, walks the full checklist.
 

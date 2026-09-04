@@ -53,10 +53,27 @@ confirm_tag() {
 
 create_release() {
     local tag="$1"; shift
-    info "Creating GitHub Release $tag"
+    info "Creating GitHub Release $tag as a draft"
     gh release create "$tag" \
         --repo rocky-data/rocky \
         --generate-notes \
+        --draft \
+        "$@"
+}
+
+# Publish a draft that already has every asset attached.
+#
+# Always a separate step from `create_release`. `gh release create` does keep
+# a release with assets as a draft until the uploads finish, but relying on
+# that puts the guarantee inside gh's internals, where a version bump could
+# move it. Creating a draft and flipping it here states the ordering in this
+# script, and matches what the release workflows do.
+publish_release() {
+    local tag="$1"; shift
+    info "Publishing GitHub Release $tag"
+    gh release edit "$tag" \
+        --repo rocky-data/rocky \
+        --draft=false \
         "$@"
 }
 
@@ -103,21 +120,25 @@ release_engine() {
     git -C "$WORKSPACE_ROOT" push origin "$tag" \
         || die "git push origin $tag failed"
 
-    # 4. Create GitHub Release with macOS + Linux
-    # The tag push also triggers engine-release.yml which builds all 5 targets.
-    # CI will overwrite these two and add macOS Intel, Linux ARM64, and Windows.
-    # --latest: the engine binary is the artifact users install, so it owns
-    # the repo's "Latest" GitHub Release badge regardless of which tag (engine
-    # vs sdk/dagster/vscode) is pushed last in a coupled release.
+    # 4. Create the GitHub Release as a DRAFT with macOS + Linux.
+    # The tag push also triggers engine-release.yml, which builds all 5
+    # targets, overwrites these two, adds checksums.txt, and publishes the
+    # draft with --latest (the engine binary owns the repo's "Latest" badge).
+    # A draft is invisible to engine/install.sh's "latest" lookup, so the
+    # public never resolves a release the matrix has not finished, or one it
+    # failed. A published release here would be resolvable but not
+    # installable: this script builds neither checksums.txt nor the rocky-lsp
+    # archives that install.sh downloads.
     create_release "$tag" \
-        --latest \
         "$macos_archive" \
         "$linux_archive"
 
     echo
-    info "Engine release $tag created with macOS ARM64 + Linux x86_64 binaries."
-    info "CI will build all 5 targets and attach them to this release."
+    info "Engine release $tag created as a DRAFT with macOS ARM64 + Linux x86_64 binaries."
+    info "CI will build all 5 targets, attach them with checksums.txt, and publish the draft."
     info "Monitor: gh run list --repo rocky-data/rocky --workflow engine-release"
+    info "If CI cannot run, publish by hand: gh release edit $tag --repo rocky-data/rocky --draft=false --latest"
+    info "  (install.sh will still fail on it: no checksums.txt and no rocky-lsp archives)"
 }
 
 # --- Dagster -----------------------------------------------------------------
@@ -156,16 +177,30 @@ release_dagster() {
     git -C "$WORKSPACE_ROOT" push origin "$tag" \
         || die "git push origin $tag failed"
 
-    # 4. Create GitHub Release
+    # 4. Create the GitHub Release as a draft with the wheel attached, then
+    # publish it in a separate step below.
     # --latest=false: never let a wheel grab the "Latest" badge — the engine
     # release owns it (see release_engine).
     create_release "$tag" \
         --latest=false \
         "$WORKSPACE_ROOT/integrations/dagster/dist/"*
 
+    # Public only once the registry has the artifact AND every asset is
+    # attached. With --publish the registry upload happened in step 2 and the
+    # create above has finished, so publishing here is safe; without it, the
+    # tag push's CI run publishes to the registry and then flips the draft.
+    if [[ "$publish" == "--publish" ]]; then
+        publish_release "$tag" --latest=false
+    fi
+
     echo
-    info "Dagster release $tag created."
-    [[ "$publish" == "--publish" ]] && info "Published to PyPI." || info "Skipped PyPI publish (pass --publish to enable)."
+    if [[ "$publish" == "--publish" ]]; then
+        info "Dagster release $tag created and published to PyPI."
+        info "The tag push's CI run stops at ensure-release (already published); that is expected."
+    else
+        info "Dagster release $tag created as a DRAFT. CI publishes it after its PyPI upload."
+        info "If CI cannot run, publish by hand: gh release edit $tag --repo rocky-data/rocky --draft=false --latest=false"
+    fi
 }
 
 # --- SDK ---------------------------------------------------------------------
@@ -204,15 +239,29 @@ release_sdk() {
     git -C "$WORKSPACE_ROOT" push origin "$tag" \
         || die "git push origin $tag failed"
 
-    # 4. Create GitHub Release
+    # 4. Create the GitHub Release as a draft with the wheel attached, then
+    # publish it in a separate step below.
     # --latest=false: the engine release owns the "Latest" badge.
     create_release "$tag" \
         --latest=false \
         "$WORKSPACE_ROOT/sdk/python/dist/"*
 
+    # Public only once the registry has the artifact AND every asset is
+    # attached. With --publish the registry upload happened in step 2 and the
+    # create above has finished, so publishing here is safe; without it, the
+    # tag push's CI run publishes to the registry and then flips the draft.
+    if [[ "$publish" == "--publish" ]]; then
+        publish_release "$tag" --latest=false
+    fi
+
     echo
-    info "SDK release $tag created."
-    [[ "$publish" == "--publish" ]] && info "Published to PyPI." || info "Skipped PyPI publish (pass --publish to enable)."
+    if [[ "$publish" == "--publish" ]]; then
+        info "SDK release $tag created and published to PyPI."
+        info "The tag push's CI run stops at ensure-release (already published); that is expected."
+    else
+        info "SDK release $tag created as a DRAFT. CI publishes it after its PyPI upload."
+        info "If CI cannot run, publish by hand: gh release edit $tag --repo rocky-data/rocky --draft=false --latest=false"
+    fi
 }
 
 # --- VS Code -----------------------------------------------------------------
@@ -257,15 +306,29 @@ release_vscode() {
     git -C "$WORKSPACE_ROOT" push origin "$tag" \
         || die "git push origin $tag failed"
 
-    # 4. Create GitHub Release
+    # 4. Create the GitHub Release as a draft with the VSIX attached, then
+    # publish it in a separate step below.
     # --latest=false: the engine release owns the "Latest" badge.
     create_release "$tag" \
         --latest=false \
         "$WORKSPACE_ROOT/editors/vscode/"*.vsix
 
+    # Public only once the Marketplace has the extension AND every asset is
+    # attached. With --publish the Marketplace publish happened in step 2 and
+    # the create above has finished, so publishing here is safe; without it,
+    # the tag push's CI run publishes and then flips the draft.
+    if [[ "$publish" == "--publish" ]]; then
+        publish_release "$tag" --latest=false
+    fi
+
     echo
-    info "VS Code release $tag created."
-    [[ "$publish" == "--publish" ]] && info "Published to VS Code Marketplace." || info "Skipped Marketplace publish (pass --publish to enable)."
+    if [[ "$publish" == "--publish" ]]; then
+        info "VS Code release $tag created and published to the Marketplace."
+        info "The tag push's CI run stops at ensure-release (already published); that is expected."
+    else
+        info "VS Code release $tag created as a DRAFT. CI publishes it after its Marketplace upload."
+        info "If CI cannot run, publish by hand: gh release edit $tag --repo rocky-data/rocky --draft=false --latest=false"
+    fi
 }
 
 # --- Main --------------------------------------------------------------------
@@ -275,7 +338,7 @@ usage() {
 Usage: ./scripts/release.sh <component> <version> [--publish]
 
 Components:
-  engine  <version>              Build macOS + Linux, create GH release (Windows via CI)
+  engine  <version>              Build macOS + Linux, create a DRAFT GH release (CI completes + publishes it)
   sdk     <version> [--publish]  Build wheel, create GH release, optionally publish to PyPI
   dagster <version> [--publish]  Build wheel, create GH release, optionally publish to PyPI
   vscode  <version> [--publish]  Build VSIX, create GH release, optionally publish to Marketplace
