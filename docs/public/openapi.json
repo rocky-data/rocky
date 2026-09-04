@@ -19479,6 +19479,13 @@
             ],
             "description": "Results from declarative `[[tests]]` in model sidecars. Present only when `--declarative` is used."
           },
+          "diagnostics": {
+            "description": "Compiler diagnostics from the compile `rocky test` ran.\n\nErrors already fail the command, so what shows up here is everything that does not: `W001`, `W004`, `W005`, `P002`, `I001`, `I002`, `I003`. The runner has always carried them and the output dropped them (#1617). `rocky test` is the command most likely to run in CI, and it compiles with empty source schemas, so it is where an unchecked-contract report is most likely to exist. Empty when the compile reported nothing.",
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "type": "array"
+          },
           "failed": {
             "format": "uint",
             "minimum": 0.0,
