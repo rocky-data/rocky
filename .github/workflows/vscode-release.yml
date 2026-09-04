@@ -110,10 +110,10 @@ jobs:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         # `if: env.VSCE_PAT != ''` doesn't work — the `env` context isn't
         # available in step-level `if:` evaluation. Guard inline instead. A
-        # fork without the secret gets a soft no-op (matches the pattern in
-        # engine-wasm-release.yml). In rocky-data/rocky an unset VSCE_PAT is a
-        # missing or rotated secret, and a green run that never reached the
-        # Marketplace would hide exactly that, so it fails instead.
+        # fork without the secret gets a soft no-op; in rocky-data/rocky an
+        # unset VSCE_PAT is a missing or rotated secret, and a green run that
+        # never reached the Marketplace would hide exactly that, so it fails
+        # instead. engine-wasm-release.yml guards NPM_TOKEN the same way.
         run: |
           if [ -z "$VSCE_PAT" ]; then
             if [ "$GITHUB_REPOSITORY" = "rocky-data/rocky" ]; then

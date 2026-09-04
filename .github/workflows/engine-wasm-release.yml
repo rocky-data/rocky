@@ -2,6 +2,13 @@ name: engine-wasm-release
 
 # Build rocky-wasm and publish to npm.
 # Triggered by engine-wasm-v* tags (independent of CLI binary releases).
+#
+# The GitHub Release is created as a draft and published by the last step
+# only, after the npm publish and the asset upload both succeed. A failed
+# build or publish therefore leaves a draft, which the public release list
+# omits, not an empty or partial public release. In rocky-data/rocky a
+# missing NPM_TOKEN fails the run; a fork without the secret gets a soft
+# no-op instead.
 
 on:
   push:
@@ -32,13 +39,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists"
+          # `gh release view` finds a draft by its pending tag too, so a draft
+          # made by scripts/release.sh is seen here. Any other failure falls
+          # through to `create`, which fails on its own if the release exists.
+          if is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release $TAG already exists and is published. Refusing to publish again on top of a live release. Convert it back to a draft (gh release edit $TAG --repo $GITHUB_REPOSITORY --draft) or delete it, then re-run."
+              exit 1
+            fi
+            echo "Release $TAG already exists as a draft; this run will publish it"
           else
-            echo "Creating release $TAG"
+            echo "Creating draft release $TAG"
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --generate-notes \
+              --draft \
               --latest=false \
               --title "$TAG"
           fi
@@ -149,9 +164,31 @@ jobs:
           # reads $NODE_AUTH_TOKEN from the environment at publish time, so
           # the token never hits disk.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          REPO: ${{ github.repository }}
         run: |
           if [ -z "${NODE_AUTH_TOKEN}" ]; then
-            echo "NPM_TOKEN secret not set — skipping npm publish"
+            # On a fork the secret is absent by design. On this repository it
+            # means a missing or rotated secret, and a green run that never
+            # reached npm would hide exactly that.
+            if [ "${REPO}" = "rocky-data/rocky" ]; then
+              echo "::error::NPM_TOKEN is not set. Refusing to report a successful release that never published to npm. Set the secret and re-run; the GitHub Release stays a draft until this step succeeds."
+              exit 1
+            fi
+            echo "NPM_TOKEN secret not set — skipping npm publish (expected on forks)"
             exit 0
           fi
           npm publish
+
+      # Last on purpose: a failure in any step above leaves the release a
+      # draft. `--latest=false` again here, because GitHub's API defaults
+      # `make_latest` to true when a draft is published, and the engine
+      # release owns the repo's "Latest" badge.
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest=false
+          echo "Published ${GITHUB_REF_NAME}"
