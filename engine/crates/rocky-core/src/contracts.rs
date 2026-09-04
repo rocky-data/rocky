@@ -310,35 +310,49 @@ pub fn warehouse_type_to_rocky(warehouse_type: &str) -> RockyType {
         // (Snowflake's fixed-point name). Snowflake's `DESCRIBE` returns
         // `NUMBER(38,0)`, so it must normalize to the same RockyType as a
         // contract written `DECIMAL(38,0)` for the contract to port.
-        _ if upper.starts_with("DECIMAL")
-            || upper.starts_with("BIGNUMERIC")
-            || upper.starts_with("NUMERIC")
-            || upper.starts_with("NUMBER") =>
-        {
-            if let Some(params) = upper
-                .strip_prefix("DECIMAL(")
-                .or_else(|| upper.strip_prefix("BIGNUMERIC("))
-                .or_else(|| upper.strip_prefix("NUMERIC("))
-                .or_else(|| upper.strip_prefix("NUMBER("))
-                .and_then(|s| s.strip_suffix(')'))
-            {
-                let parts: Vec<&str> = params.split(',').collect();
-                if parts.len() == 2
-                    && let (Ok(p), Ok(s)) = (parts[0].trim().parse(), parts[1].trim().parse())
-                {
-                    return RockyType::Decimal {
-                        precision: p,
-                        scale: s,
-                    };
-                }
-            }
-            RockyType::Decimal {
+        _ => decimal_family_type(&upper),
+    }
+}
+
+/// The decimal family: `DECIMAL`, `NUMERIC`, `BIGNUMERIC` (ANSI, Databricks,
+/// BigQuery) and `NUMBER` (Snowflake). Three spellings are a type Rocky
+/// understands: the exact bare name, read as `(38, 0)`; `NAME(p,s)`; and
+/// `NAME(p)`, which means scale 0 exactly as the compile-time gate reads
+/// `Decimal(p)`. Anything else that starts with one of the names —
+/// `NUMBER(nope)`, `DECIMAL(10,2,3)`, `NUMBERWANG` — is
+/// [`RockyType::Unknown`], so the load gate reports it instead of comparing
+/// a made-up `(38, 0)`. Until #1614 every such string was read as
+/// `(38, 0)`; the bare BigQuery names are still read as `(38, 0)` when
+/// their real default is wider (#1646).
+fn decimal_family_type(upper: &str) -> RockyType {
+    const NAMES: [&str; 4] = ["DECIMAL", "BIGNUMERIC", "NUMERIC", "NUMBER"];
+    for name in NAMES {
+        if upper == name {
+            return RockyType::Decimal {
                 precision: 38,
                 scale: 0,
-            }
+            };
         }
-        _ => RockyType::Unknown,
+        let Some(params) = upper
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+        else {
+            continue;
+        };
+        // `NAME(p)` means scale 0, the same reading the compile-time gate
+        // gives `Decimal(p)` (`rocky-compiler`'s `decimal_type_matches`).
+        // The two gates must read one spelling the same way.
+        let (precision, scale) = match params.split_once(',') {
+            Some((precision, scale)) => (precision.trim(), scale.trim()),
+            None => (params.trim(), "0"),
+        };
+        if let (Ok(precision), Ok(scale)) = (precision.parse(), scale.parse()) {
+            return RockyType::Decimal { precision, scale };
+        }
+        return RockyType::Unknown;
     }
+    RockyType::Unknown
 }
 
 /// Whether a landed column type conforms to a contract's expected type: the
@@ -777,6 +791,10 @@ mod tests {
             w.contains("'geo'") && w.contains("'GEOMETRY'") && w.contains("'BIGINT'"),
             "the warning must name the column, the landed type and the declared type: {w}"
         );
+        assert!(
+            w.contains("does not recognise the landed type"),
+            "the warning must say which side was not recognised: {w}"
+        );
     }
 
     /// The declared side has the same hole: a contract type string the
@@ -800,6 +818,10 @@ mod tests {
             w.contains("'id'") && w.contains("'SOMETHING_WEIRD'") && w.contains("'BIGINT'"),
             "the warning must name the column, the declared type and the landed type: {w}"
         );
+        assert!(
+            w.contains("does not recognise the declared type"),
+            "the warning must say which side was not recognised: {w}"
+        );
     }
 
     /// Both sides unrecognised is one unchecked column, so one warning.
@@ -822,6 +844,101 @@ mod tests {
             w.contains("'geo'") && w.contains("'GEOMETRY'") && w.contains("'GEOM'"),
             "the warning must name the column and both type strings: {w}"
         );
+        assert!(
+            w.contains("recognises neither type"),
+            "the warning must say that neither side was recognised: {w}"
+        );
+    }
+
+    /// The decimal family has a grammar. A string that starts with one of its
+    /// names but is neither the bare name nor `NAME(p,s)` is not a type Rocky
+    /// understands; until #1614 it was read as `DECIMAL(38,0)` and compared
+    /// as if that were true.
+    #[test]
+    fn test_warehouse_type_to_rocky_decimal_family_grammar() {
+        let d38 = RockyType::Decimal {
+            precision: 38,
+            scale: 0,
+        };
+        for bare in ["NUMBER", "DECIMAL", "NUMERIC", "BIGNUMERIC", "number"] {
+            assert_eq!(warehouse_type_to_rocky(bare), d38, "{bare}");
+        }
+        assert_eq!(
+            warehouse_type_to_rocky("NUMERIC(10, 2)"),
+            RockyType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
+        // `NAME(p)` is scale 0, the reading the compile-time gate gives
+        // `Decimal(p)`. The two gates must not disagree about one spelling.
+        assert_eq!(
+            warehouse_type_to_rocky("DECIMAL(10)"),
+            RockyType::Decimal {
+                precision: 10,
+                scale: 0
+            }
+        );
+        for malformed in [
+            "NUMBER(nope)",
+            "DECIMAL(10,2,3)",
+            "NUMBERWANG",
+            "DECIMALX",
+            "NUMERIC()",
+            "NUMBER(300,0)",
+        ] {
+            assert_eq!(
+                warehouse_type_to_rocky(malformed),
+                RockyType::Unknown,
+                "{malformed} must not become a made-up decimal"
+            );
+        }
+    }
+
+    /// A malformed decimal on the declared side is reported, not read as
+    /// `DECIMAL(38,0)` and matched against the landed `NUMBER(38,0)`.
+    #[test]
+    fn test_typed_malformed_declared_decimal_is_reported() {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "amount".into(),
+                data_type: "NUMBER(nope)".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let result = validate_contract_typed(&contract, &[col_n("amount", "NUMBER(38,0)", true)]);
+        assert!(result.passed, "violations: {:?}", result.violations);
+        assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
+        let w = &result.warnings[0];
+        assert!(
+            w.contains("'NUMBER(nope)'") && w.contains("does not recognise the declared type"),
+            "{w}"
+        );
+    }
+
+    /// A malformed decimal on the landed side is reported too. Before #1614 it
+    /// was read as `DECIMAL(38,0)` and failed a narrower contract for a made-up
+    /// reason.
+    #[test]
+    fn test_typed_malformed_landed_decimal_is_reported() {
+        let contract = ContractConfig {
+            required_columns: vec![RequiredColumn {
+                name: "amount".into(),
+                data_type: "DECIMAL(12,4)".into(),
+                nullable: true,
+            }],
+            ..Default::default()
+        };
+        let result =
+            validate_contract_typed(&contract, &[col_n("amount", "DECIMAL(10,2,3)", true)]);
+        assert!(result.passed, "violations: {:?}", result.violations);
+        assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
+        let w = &result.warnings[0];
+        assert!(
+            w.contains("'DECIMAL(10,2,3)'") && w.contains("does not recognise the landed type"),
+            "{w}"
+        );
     }
 
     /// The matcher must answer "not a match" for `Unknown` on either side.
@@ -830,9 +947,18 @@ mod tests {
     /// that forgets the branch gets a violation, not a silent pass.
     #[test]
     fn test_landed_type_conforms_rejects_unknown_on_either_side() {
-        assert!(!landed_type_conforms(&RockyType::Unknown, &RockyType::Int64));
-        assert!(!landed_type_conforms(&RockyType::Int64, &RockyType::Unknown));
-        assert!(!landed_type_conforms(&RockyType::Unknown, &RockyType::Unknown));
+        assert!(!landed_type_conforms(
+            &RockyType::Unknown,
+            &RockyType::Int64
+        ));
+        assert!(!landed_type_conforms(
+            &RockyType::Int64,
+            &RockyType::Unknown
+        ));
+        assert!(!landed_type_conforms(
+            &RockyType::Unknown,
+            &RockyType::Unknown
+        ));
         // Sanity: known widening still conforms.
         assert!(landed_type_conforms(&RockyType::Int32, &RockyType::Int64));
     }
