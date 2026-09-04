@@ -39,14 +39,17 @@ impl DiscoveryAdapter for DuckDbDiscoveryAdapter {
 
         // 1. Find schemas matching the prefix. The prefix is user text from
         // `schema_pattern.prefix`, encoded by this dialect's own lexer rule.
-        // `%` is the LIKE wildcard; a backslash is a plain character in
-        // DuckDB's LIKE (there is no default ESCAPE), so it needs no second
-        // encoding for the pattern.
+        //
+        // `starts_with`, not `LIKE '<prefix>%'`: in a LIKE pattern `_` matches
+        // any one character, so a prefix like `src__` also matched `srcab`
+        // (#1649). `starts_with` reads the prefix as plain text, which is what
+        // a prefix means, and it drops the `%` too. BigQuery's adapter uses
+        // `STARTS_WITH` for the same reason.
         let schema_sql = format!(
             "SELECT schema_name FROM information_schema.schemata \
-             WHERE schema_name LIKE {} \
+             WHERE starts_with(schema_name, {}) \
              ORDER BY schema_name",
-            string_literal(&DuckDbSqlDialect, &format!("{schema_prefix}%"))
+            string_literal(&DuckDbSqlDialect, schema_prefix)
         );
         let schema_result = conn.execute_sql(&schema_sql).map_err(AdapterError::new)?;
 
@@ -158,11 +161,22 @@ mod tests {
             conn.execute_statement("CREATE SCHEMA other").unwrap();
             conn.execute_statement("CREATE TABLE other.ignored (id INT)")
                 .unwrap();
+            // `_` is a single-character wildcard in a LIKE pattern, so
+            // `LIKE 'raw__%'` also matched this one (#1649).
+            conn.execute_statement("CREATE SCHEMA rawXY").unwrap();
+            conn.execute_statement("CREATE TABLE rawXY.decoy (id INT)")
+                .unwrap();
         }
 
         let adapter = DuckDbDiscoveryAdapter::new(connector);
         let result = adapter.discover("raw__").await.unwrap();
-        assert_eq!(result.connectors.len(), 2, "expected 2 raw__ schemas");
+        assert_eq!(
+            result.connectors.len(),
+            2,
+            "expected exactly the 2 raw__ schemas, not the `rawXY` a LIKE \
+             wildcard would also match: {:?}",
+            result.connectors
+        );
         assert!(result.failed.is_empty());
 
         let orders = result
