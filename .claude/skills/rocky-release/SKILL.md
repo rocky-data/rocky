@@ -223,7 +223,7 @@ Path-filtered workflows in `.github/workflows/`:
 
 ## Post-release checklist
 
-- [ ] `gh release view <tag>` shows all expected artifacts (**11 for engine**: 10 archives + `checksums.txt`; 2 for sdk; 2 for dagster; 1 for vscode)
+- [ ] `gh release view <tag>` shows all expected artifacts (**11 for engine**: 10 archives + `checksums.txt`; **4 for sdk and 4 for dagster**: wheel, sdist and one `.publish.attestation` for each, uploaded by the PyPI trusted-publisher step; 1 for vscode)
 - [ ] Install script (`engine/install.sh` or `install.ps1`) resolves and installs the new version on a clean machine
 - [ ] Downstream consumers that vendor the binary + Python wheel atomically have been updated — see `scripts/vendor_rocky.sh` for the vendoring workflow
 - [ ] Changelog is on `main` (it merged with the release PR, but double-check)
