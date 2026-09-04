@@ -103,14 +103,31 @@ jobs:
           # while competing for the repo's 10 GB budget against caches that
           # every PR restores from. Latency does not matter on a schedule.
           save-if: false
+      # Headroom for the coverage build, which is the largest thing this
+      # repository builds anywhere. It buys back roughly 25 GB and it is NOT
+      # enough: the instrumented build needs ~105 GB and still fills the
+      # 145 GB disk, so this job remains red. See #1638 — closing it means
+      # changing what the job is (a bigger runner, per-crate runs, or a
+      # different coverage engine), not freeing more space.
       - name: Free disk space and add swap
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/share/swift \
+                      /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
           sudo fallocate -l 4G /mnt/swapfile && sudo chmod 600 /mnt/swapfile && sudo mkswap /mnt/swapfile && sudo swapon /mnt/swapfile || true
       - run: sudo apt-get update && sudo apt-get install -y cmake
       - name: Install cargo-tarpaulin
         # Pinned + --locked for the same reason as cargo-audit above.
         run: cargo install cargo-tarpaulin --version 0.31.2 --locked
+      # Kept permanently. Every failure since 2026-08-24 carried a bus error
+      # and no word about the machine it happened on, and the cause turned
+      # out to be the one thing these two numbers show immediately. Headroom
+      # here is the early warning for the next time the build grows.
+      - name: Machine state before coverage
+        run: |
+          df -h / /mnt /tmp || true
+          free -m || true
       - name: Run coverage
         # No --all-targets: that pulls the criterion benches into the run, and
         # the `binary_startup` bench shells out to `cargo run` on every
@@ -119,6 +136,18 @@ jobs:
         # the --timeout, failing the whole job. tarpaulin's default target set
         # (lib + bins + tests) is what we want coverage for anyway.
         run: cargo tarpaulin --timeout 600 --out xml --output-dir coverage/
+      - name: Machine state after coverage
+        # `always()` so a failing coverage step still reports. Note the
+        # limit: when the disk fills hard enough the runner AGENT dies, and
+        # then no step runs and no logs upload at all. A job that ends with
+        # `Run coverage` having no conclusion and an empty log has lost its
+        # runner — which the disk does cause here, but so do cancellation
+        # and ordinary infrastructure loss. Check the job's annotations for
+        # the agent's own error before concluding which.
+        if: always()
+        run: |
+          df -h / /mnt /tmp || true
+          free -m || true
       - name: Upload coverage report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
