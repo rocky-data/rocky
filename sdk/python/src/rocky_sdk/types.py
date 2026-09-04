@@ -261,12 +261,16 @@ class CheckResult(BaseModel):
     # the failing-row count. ``kind`` is snake_case (e.g. ``"not_null"``).
     kind: str | None = None
     failing_rows: int | None = None
-    # Cross-source-overlap check fields. ``not_evaluated`` carries the reason
-    # when the check could NOT run; ``overlap_count`` is only a measurement
-    # while it is ``None``.
+    # Cross-source-overlap check fields.
     contributing_tables: list[str] | None = None
     overlap_count: int | None = None
     sample: list[str] | None = None
+    #: Set when the engine could not RUN this check, carrying the reason. It
+    #: applies to every check kind, not just cross-source overlap: a failed
+    #: query, an unreadable result cell, a refused SQL fragment and a
+    #: misconfigured key all land here. While it is set, ``passed`` is
+    #: ``False`` and the numeric fields above are placeholders, not readings —
+    #: a row count of ``0`` here never means "the counts matched".
     not_evaluated: str | None = None
 
 
