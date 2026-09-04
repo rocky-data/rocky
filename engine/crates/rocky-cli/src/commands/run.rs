@@ -1544,8 +1544,11 @@ fn ensure_resume_scope(progress: &RunProgress, current: &ResumeScope) -> Result<
     Ok(())
 }
 
-/// Refuse `--resume-latest` when the selected run's own [`RunRecord`] says it
-/// left no work to recover (#1548). The failure statuses stay resumable.
+/// Refuse a resume when the selected run's own [`RunRecord`] says it left no
+/// work to recover (#1548). Applies to both `--resume-latest` and an explicit
+/// `--resume <run-id>` (#1635): a run id names the same checkpoint either
+/// way, and a succeeded one has nothing to recover however it was chosen.
+/// The failure statuses stay resumable.
 /// No record at all is the crash case — the run never reached a terminal
 /// status — and stays resumable whatever the checkpoint shows: a run killed
 /// after its last table copy still has post-copy work (checks, hooks, the
@@ -1556,7 +1559,7 @@ fn ensure_resume_scope(progress: &RunProgress, current: &ResumeScope) -> Result<
 /// refused run.
 ///
 /// [`RunRecord`]: rocky_core::state::RunRecord
-fn ensure_latest_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> Result<()> {
+fn ensure_run_is_resumable(state_store: &StateStore, progress: &RunProgress) -> Result<()> {
     let record = state_store
         .get_run(&progress.run_id)
         .with_context(|| format!("failed to load the run record for '{}'", progress.run_id))?;
@@ -1591,7 +1594,7 @@ fn resolve_resume_progress(
             &format!("the latest run for {scope}"),
         )?;
         ensure_resume_scope(&progress, scope)?;
-        ensure_latest_run_is_resumable(state_store, &progress)?;
+        ensure_run_is_resumable(state_store, &progress)?;
         return Ok(Some(progress));
     }
     if let Some(run_id) = resume_run_id {
@@ -1600,6 +1603,7 @@ fn resolve_resume_progress(
             &format!("run '{run_id}'"),
         )?;
         ensure_resume_scope(&progress, scope)?;
+        ensure_run_is_resumable(state_store, &progress)?;
         return Ok(Some(progress));
     }
     Ok(None)
@@ -13364,30 +13368,39 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
     /// record says the run succeeded or was a no-work skip; it stays
     /// resumable on failure statuses and on the crash case (no record).
     #[test]
-    fn resume_latest_refuses_runs_with_nothing_to_recover() {
+    fn resume_refuses_runs_with_nothing_to_recover() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
         store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
 
+        // Both entry points, because a run id names the same checkpoint
+        // either way. `--resume <id>` skipped this gate entirely until
+        // #1635, so a pinned stale id exited 0 having copied nothing.
+        let entry_points = [(None, true), (Some("run-1"), false)];
+
         seed_run_record(&store, "run-1", "Success");
-        let err = resolve_resume_progress(&store, None, true, &scope)
-            .expect_err("a succeeded run must not resume");
-        assert!(
-            err.to_string()
-                .contains("nothing to resume: run run-1 already succeeded"),
-            "unexpected error: {err:#}"
-        );
+        for (resume_run_id, resume_latest) in entry_points {
+            let err = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                .expect_err("a succeeded run must not resume");
+            assert!(
+                err.to_string()
+                    .contains("nothing to resume: run run-1 already succeeded"),
+                "unexpected error for {resume_run_id:?}/{resume_latest}: {err:#}"
+            );
+        }
 
         for status in ["SkippedIdempotent", "SkippedInFlight"] {
             seed_run_record(&store, "run-1", status);
-            let err = resolve_resume_progress(&store, None, true, &scope)
-                .expect_err("a no-work skip left no partial state to recover");
-            let message = err.to_string();
-            assert!(
-                message.contains("nothing to resume") && message.contains(status),
-                "unexpected error: {message}"
-            );
+            for (resume_run_id, resume_latest) in entry_points {
+                let err = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                    .expect_err("a no-work skip left no partial state to recover");
+                let message = err.to_string();
+                assert!(
+                    message.contains("nothing to resume") && message.contains(status),
+                    "unexpected error for {resume_run_id:?}/{resume_latest}: {message}"
+                );
+            }
         }
     }
 
@@ -13395,24 +13408,32 @@ http_path = "/sql/1.0/warehouses/abc) shadow(schema=x"
     /// checkpoint with no run record at all (the crash case — the run never
     /// reached a terminal status).
     #[test]
-    fn resume_latest_allows_failed_and_crashed_runs() {
+    fn resume_allows_failed_and_crashed_runs() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::open(&dir.path().join("state.redb")).unwrap();
         let scope = test_resume_scope("p1");
         store.init_run_progress("run-1", 1, Some(&scope)).unwrap();
 
-        // Crash case: no RunRecord exists.
-        let progress = resolve_resume_progress(&store, None, true, &scope)
-            .unwrap()
-            .unwrap();
-        assert_eq!(progress.run_id, "run-1");
+        let entry_points = [(None, true), (Some("run-1"), false)];
 
-        for status in ["Failure", "PartialFailure"] {
-            seed_run_record(&store, "run-1", status);
-            let progress = resolve_resume_progress(&store, None, true, &scope)
+        // Crash case: no RunRecord exists. Resumable on both entry points —
+        // widening the gate must not close the case it was written to keep.
+        for (resume_run_id, resume_latest) in entry_points {
+            let progress = resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
                 .unwrap()
                 .unwrap();
             assert_eq!(progress.run_id, "run-1");
+        }
+
+        for status in ["Failure", "PartialFailure"] {
+            seed_run_record(&store, "run-1", status);
+            for (resume_run_id, resume_latest) in entry_points {
+                let progress =
+                    resolve_resume_progress(&store, resume_run_id, resume_latest, &scope)
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(progress.run_id, "run-1");
+            }
         }
     }
 
